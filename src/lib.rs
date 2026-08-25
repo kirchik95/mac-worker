@@ -1,11 +1,77 @@
+use std::{collections::BTreeMap, path::PathBuf};
+
+use cli::{Cli, Command, HostCommand};
+use config::{Config, WorkerEntry};
+use error::WorkerError;
+use install::Installer;
+use output::CommandOutput;
+use paths::PathLayout;
+use probe::ProbeCollector;
+use process::ProcessRunner;
+use protocol::{PROTOCOL_VERSION, SetupReport};
+use transport::{SshTransport, WorkersService};
+
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod install;
+pub mod output;
 pub mod paths;
 pub mod probe;
 pub mod process;
 pub mod protocol;
 pub mod transport;
+
+pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutput, WorkerError> {
+    match cli.command {
+        Command::Setup { hosts } => {
+            let config = load_config(cli.config)?;
+            let selected = select_workers(&config, &hosts)?;
+            let current_exe = std::env::current_exe()?;
+            let workers = selected
+                .into_iter()
+                .map(|worker| Installer::new(runner).install(&current_exe, &worker))
+                .collect();
+            Ok(CommandOutput::Setup(SetupReport {
+                protocol_version: PROTOCOL_VERSION,
+                workers,
+            }))
+        }
+        Command::Workers => {
+            let config = load_config(cli.config)?;
+            let service = WorkersService::new(SshTransport::new(runner));
+            Ok(CommandOutput::Workers(service.inspect(&config)))
+        }
+        Command::Host {
+            command: HostCommand::Probe,
+        } => Ok(CommandOutput::Probe(ProbeCollector::collect()?)),
+    }
+}
+
+fn load_config(config_override: Option<PathBuf>) -> Result<Config, WorkerError> {
+    let env = std::env::vars_os().collect::<BTreeMap<_, _>>();
+    let home = env
+        .get(&std::ffi::OsString::from("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let paths = PathLayout::discover(config_override, &env, &home)?;
+    Config::load(&paths.config)
+}
+
+fn select_workers(config: &Config, hosts: &[String]) -> Result<Vec<WorkerEntry>, WorkerError> {
+    if hosts.is_empty() {
+        return Ok(config.workers.clone());
+    }
+
+    hosts
+        .iter()
+        .map(|host| {
+            config.worker(host).cloned().ok_or_else(|| {
+                WorkerError::Config(format!("worker {host:?} is not present in the inventory"))
+            })
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {

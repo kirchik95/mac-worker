@@ -24,6 +24,12 @@ pub trait ProcessRunner: Send + Sync {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError>;
 }
 
+impl<T: ProcessRunner + ?Sized> ProcessRunner for &T {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        (**self).run(request)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemProcessRunner;
 
