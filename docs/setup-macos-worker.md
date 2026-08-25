@@ -108,21 +108,79 @@ If inspection shows an expected state, run this complete cleanup block as one co
         printf '%s\n' "$1" | /usr/bin/grep -Eq '^[0-9a-f]{64}$'
     }
 
-    setup_root="$HOME/.local/share/mac-worker/setup"
+    require_regular_file() {
+        if [ -L "$1" ] || [ ! -f "$1" ]; then
+            fail "$2 is missing, a symlink, or not a regular file; retain the lock and stop"
+        fi
+    }
+
+    allow_absent_regular_file() {
+        if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then
+            fail "$2 is a symlink or not a regular file; retain the lock and stop"
+        fi
+    }
+
+    verify_setup_directory() {
+        if [ -L "$setup_root" ] || [ ! -d "$setup_root" ]; then
+            fail 'setup directory is missing or a symlink; retain the lock and stop'
+        fi
+        setup_physical="$(cd -P "$setup_root" 2>/dev/null && /bin/pwd)" \
+            || fail 'setup directory cannot be resolved; retain the lock and stop'
+        if [ "$setup_physical" != "$data_root/setup" ]; then
+            fail 'setup directory is outside the mac-worker data root; retain the lock and stop'
+        fi
+    }
+
+    verify_lock_directory() {
+        if [ -L "$lock_dir" ] || [ ! -d "$lock_dir" ]; then
+            fail 'setup lock directory is missing or a symlink; retain the lock and stop'
+        fi
+        lock_physical="$(cd -P "$lock_dir" 2>/dev/null && /bin/pwd)" \
+            || fail 'setup lock directory cannot be resolved; retain the lock and stop'
+        if [ "$lock_physical" != "$setup_physical/.install-lock" ]; then
+            fail 'setup lock directory is outside the setup directory; retain the lock and stop'
+        fi
+    }
+
+    verify_transaction_directory() {
+        if [ -L "$transaction" ] || [ ! -d "$transaction" ]; then
+            fail 'owner-scoped setup transaction is missing or a symlink; retain the lock and stop'
+        fi
+        transaction_physical="$(cd -P "$transaction" 2>/dev/null && /bin/pwd)" \
+            || fail 'owner-scoped setup transaction cannot be resolved; retain the lock and stop'
+        if [ "$transaction_physical" != "$setup_physical/$owner" ]; then
+            fail 'owner-scoped setup transaction is outside the setup directory; retain the lock and stop'
+        fi
+    }
+
+    verify_cleanup_file_types() {
+        allow_absent_regular_file "$transaction/worker.new" 'staged helper'
+        allow_absent_regular_file "$transaction/worker.previous" 'previous helper'
+        allow_absent_regular_file "$transaction/candidate.sha256" 'candidate digest'
+        allow_absent_regular_file "$transaction/previous.sha256" 'previous digest'
+        allow_absent_regular_file "$transaction/no-previous" 'no-previous marker'
+        allow_absent_regular_file "$transaction/state" 'setup state marker'
+    }
+
+    data_root="$(cd -P "$HOME/.local/share/mac-worker" 2>/dev/null && /bin/pwd)" \
+        || fail 'mac-worker data root cannot be resolved; retain the lock and stop'
+    setup_root="$data_root/setup"
     lock_dir="$setup_root/.install-lock"
     transaction_owner_path="$lock_dir/owner"
     worker="$HOME/.local/bin/worker"
 
+    verify_setup_directory
+    verify_lock_directory
+    require_regular_file "$transaction_owner_path" 'setup lock owner'
     owner="$(/bin/cat "$transaction_owner_path" 2>/dev/null)" \
-        || fail 'setup lock owner is missing; retain the lock and stop'
+        || fail 'setup lock owner cannot be read; retain the lock and stop'
     if ! valid_owner "$owner"; then
         fail 'setup lock owner is invalid; retain the lock and stop'
     fi
 
     transaction="$setup_root/$owner"
-    if [ ! -d "$transaction" ]; then
-        fail 'owner-scoped setup transaction is missing; retain the lock and stop'
-    fi
+    verify_transaction_directory
+    verify_cleanup_file_types
 
     candidate_present=0
     candidate_digest=''
@@ -164,14 +222,16 @@ If inspection shows an expected state, run this complete cleanup block as one co
         fail 'active helper probe failed; retain the lock and stop'
     fi
 
+    verify_setup_directory
+    verify_lock_directory
+    require_regular_file "$transaction_owner_path" 'setup lock owner'
     current_owner="$(/bin/cat "$transaction_owner_path" 2>/dev/null)" \
-        || fail 'setup lock owner disappeared before cleanup; retain the lock and stop'
+        || fail 'setup lock owner cannot be read before cleanup; retain the lock and stop'
     if ! valid_owner "$current_owner" || [ "$current_owner" != "$owner" ]; then
         fail 'setup lock owner changed or is invalid; retain the lock and stop'
     fi
-    if [ ! -d "$transaction" ]; then
-        fail 'owner-scoped setup transaction changed; retain the lock and stop'
-    fi
+    verify_transaction_directory
+    verify_cleanup_file_types
 
     current_candidate_present=0
     current_candidate_digest=''
@@ -212,6 +272,17 @@ If inspection shows an expected state, run this complete cleanup block as one co
         || { [ "$current_active_digest" != "$candidate_digest" ] && [ "$current_active_digest" != "$previous_digest" ]; }; then
         fail 'active helper digest changed before cleanup; retain the lock and stop'
     fi
+
+    verify_setup_directory
+    verify_lock_directory
+    require_regular_file "$transaction_owner_path" 'setup lock owner'
+    final_owner="$(/bin/cat "$transaction_owner_path" 2>/dev/null)" \
+        || fail 'setup lock owner cannot be read immediately before cleanup; retain the lock and stop'
+    if ! valid_owner "$final_owner" || [ "$final_owner" != "$owner" ]; then
+        fail 'setup lock owner changed or is invalid immediately before cleanup; retain the lock and stop'
+    fi
+    verify_transaction_directory
+    verify_cleanup_file_types
 
     /bin/rm -f "$transaction/worker.new" "$transaction/worker.previous" \
         "$transaction/candidate.sha256" "$transaction/previous.sha256" \
