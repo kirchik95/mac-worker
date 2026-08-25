@@ -9,7 +9,7 @@ use std::{
 
 use mac_worker::{
     config::{Config, WorkerEntry},
-    error::WorkerError,
+    error::{ProcessError, ProcessStream, WorkerError},
     output::CommandOutput,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::{
@@ -125,6 +125,7 @@ fn probe_uses_batch_ssh_and_the_fixed_host_command() {
                 "mac1".into(),
                 "~/.local/bin/worker host probe".into(),
             ],
+            environment: Vec::new(),
             stdin: None,
             policy: probe_policy(),
         }]
@@ -160,6 +161,24 @@ fn process_launch_failure_is_reported_as_unavailable() {
 
     assert_eq!(health.status, HealthStatus::Unavailable);
     assert_eq!(health.error_code.as_deref(), Some("SSH_UNAVAILABLE"));
+    assert!(health.error_message.is_some());
+}
+
+#[test]
+fn stdout_probe_response_overflow_is_reported_as_an_invalid_response() {
+    // This catches classifying an oversized protocol response as a transport outage.
+    let runner = RecordingRunner::returning_result(Err(WorkerError::Process(
+        ProcessError::OutputLimitExceeded {
+            stream: ProcessStream::Stdout,
+            limit: 1024 * 1024,
+        },
+    )));
+    let transport = SshTransport::new(runner);
+
+    let health = transport.probe(&worker("mini-1", "mac1", &[]));
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
     assert!(health.error_message.is_some());
 }
 
@@ -319,6 +338,7 @@ fn system_runner_passes_arguments_without_shell_interpretation() {
     let request = ProcessRequest {
         program: "/usr/bin/printf".into(),
         args: vec!["%s".into(), literal.into()],
+        environment: Vec::new(),
         stdin: None,
         policy: local_test_policy(),
     };
@@ -335,6 +355,7 @@ fn system_runner_writes_the_requested_stdin() {
     let request = ProcessRequest {
         program: "/bin/cat".into(),
         args: Vec::new(),
+        environment: Vec::new(),
         stdin: Some(b"raw stdin bytes\n".to_vec()),
         policy: local_test_policy(),
     };

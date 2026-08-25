@@ -21,6 +21,7 @@ pub struct ProcessPolicy {
 pub struct ProcessRequest {
     pub program: OsString,
     pub args: Vec<OsString>,
+    pub environment: Vec<(OsString, OsString)>,
     pub stdin: Option<Vec<u8>>,
     pub policy: ProcessPolicy,
 }
@@ -50,6 +51,7 @@ impl ProcessRunner for SystemProcessRunner {
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
+            .envs(request.environment.iter().map(|(key, value)| (key, value)))
             .process_group(0)
             .stdin(if request.stdin.is_some() {
                 Stdio::piped()

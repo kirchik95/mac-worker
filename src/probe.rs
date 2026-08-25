@@ -2,7 +2,7 @@ use std::{
     fs, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    time::Duration,
 };
 
 #[cfg(target_os = "macos")]
@@ -10,6 +10,7 @@ use std::ffi::{c_char, c_int, c_void};
 
 use crate::{
     error::WorkerError,
+    process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse},
 };
 
@@ -22,6 +23,11 @@ const CONTROLLED_HOST_PATHS: &[&str] = &[
     "/usr/sbin",
     "/sbin",
 ];
+const HOST_COMMAND_POLICY: ProcessPolicy = ProcessPolicy {
+    stdout_limit: 64 * 1024,
+    stderr_limit: 64 * 1024,
+    deadline: Duration::from_secs(5),
+};
 
 struct ProcessOutput {
     code: Option<i32>,
@@ -37,22 +43,44 @@ trait MemoryPressureQuery {
     fn current_level(&self) -> io::Result<u32>;
 }
 
-struct SystemCommandExecutor;
+struct SystemCommandExecutor {
+    policy: ProcessPolicy,
+}
 
 struct SystemMemoryPressureQuery;
 
 impl CommandExecutor for SystemCommandExecutor {
     fn output(&self, program: &Path, args: &[&str]) -> io::Result<ProcessOutput> {
-        let output = Command::new(program)
-            .args(args)
-            .env("PATH", CONTROLLED_HOST_PATH)
-            .output()?;
+        let output = SystemProcessRunner
+            .run(&ProcessRequest {
+                program: program.as_os_str().into(),
+                args: args.iter().map(|argument| (*argument).into()).collect(),
+                environment: vec![("PATH".into(), CONTROLLED_HOST_PATH.into())],
+                stdin: None,
+                policy: self.policy,
+            })
+            .map_err(io::Error::other)?;
 
         Ok(ProcessOutput {
             code: output.status.code(),
             stdout: output.stdout,
             stderr: output.stderr,
         })
+    }
+}
+
+impl Default for SystemCommandExecutor {
+    fn default() -> Self {
+        Self {
+            policy: HOST_COMMAND_POLICY,
+        }
+    }
+}
+
+impl SystemCommandExecutor {
+    #[cfg(test)]
+    fn with_policy(policy: ProcessPolicy) -> Self {
+        Self { policy }
     }
 }
 
@@ -114,7 +142,7 @@ impl ProbeCollector {
             .map(PathBuf::from)
             .collect::<Vec<_>>();
         Self::collect_with(
-            &SystemCommandExecutor,
+            &SystemCommandExecutor::default(),
             &SystemMemoryPressureQuery,
             &search_paths,
             std::env::consts::OS,
@@ -357,18 +385,28 @@ mod tests {
         fs, io,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
+        time::{Duration, Instant},
     };
 
     use tempfile::tempdir;
 
     use super::{
-        CommandExecutor, MemoryPressureQuery, ProbeCollector, ProcessOutput, collect_json,
-        collect_memory_pressure,
+        CommandExecutor, MemoryPressureQuery, ProbeCollector, ProcessOutput, SystemCommandExecutor,
+        collect_json, collect_memory_pressure,
     };
     use crate::{
-        error::WorkerError,
+        error::{ProcessError, ProcessStream, WorkerError},
+        process::ProcessPolicy,
         protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse},
     };
+
+    fn host_test_policy(stdout_limit: usize, deadline: Duration) -> ProcessPolicy {
+        ProcessPolicy {
+            stdout_limit,
+            stderr_limit: 1024,
+            deadline,
+        }
+    }
 
     #[derive(Default)]
     struct FixtureExecutor {
@@ -449,6 +487,77 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
         path
+    }
+
+    #[test]
+    fn system_executor_bounds_host_command_stdout() {
+        // This catches routing host facts through an unbounded capture path.
+        let executor =
+            SystemCommandExecutor::with_policy(host_test_policy(32, Duration::from_secs(1)));
+
+        let error = match executor.output(
+            Path::new("/bin/sh"),
+            &["-c", "while :; do printf 0123456789; done"],
+        ) {
+            Ok(_) => panic!("a host command exceeding stdout policy must fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<WorkerError>()),
+                Some(WorkerError::Process(ProcessError::OutputLimitExceeded {
+                    stream: ProcessStream::Stdout,
+                    limit: 32,
+                }))
+            ),
+            "unexpected host command error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn system_executor_enforces_host_command_deadline() {
+        // This catches a host fact command keeping the helper alive past its policy deadline.
+        let executor =
+            SystemCommandExecutor::with_policy(host_test_policy(1024, Duration::from_millis(100)));
+        let started = Instant::now();
+
+        let error = match executor.output(Path::new("/bin/sleep"), &["5"]) {
+            Ok(_) => panic!("a non-exiting host command must hit its deadline"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<WorkerError>()),
+            Some(WorkerError::Process(ProcessError::DeadlineExceeded { .. }))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn system_executor_kills_descendants_that_retain_host_command_pipes() {
+        // This catches killing only the direct child after it exits while a descendant
+        // keeps its inherited output pipes open.
+        let executor =
+            SystemCommandExecutor::with_policy(host_test_policy(1024, Duration::from_millis(100)));
+        let started = Instant::now();
+
+        let error = match executor.output(Path::new("/bin/sh"), &["-c", "sleep 5 & exit 0"]) {
+            Ok(_) => panic!("a pipe-holding descendant must be terminated at the deadline"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<WorkerError>()),
+            Some(WorkerError::Process(ProcessError::DeadlineExceeded { .. }))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

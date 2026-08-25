@@ -20,6 +20,7 @@ fn stdout_overflow_terminates_the_child_with_a_typed_error() {
     let request = ProcessRequest {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "while :; do printf 0123456789; done".into()],
+        environment: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_secs(2)),
     };
@@ -47,6 +48,7 @@ fn stderr_overflow_terminates_the_child_with_a_typed_error() {
             "-c".into(),
             "while :; do printf 0123456789 >&2; done".into(),
         ],
+        environment: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_secs(2)),
     };
@@ -68,6 +70,7 @@ fn deadline_terminates_and_reaps_a_non_exiting_child() {
     let request = ProcessRequest {
         program: "/bin/sleep".into(),
         args: vec!["5".into()],
+        environment: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_millis(100)),
     };
@@ -90,6 +93,7 @@ fn deadline_terminates_descendants_that_hold_inherited_pipes_open() {
     let request = ProcessRequest {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "sleep 5 & exit 0".into()],
+        environment: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_millis(100)),
     };
@@ -112,6 +116,7 @@ fn normal_process_preserves_literal_argv() {
     let request = ProcessRequest {
         program: "/usr/bin/printf".into(),
         args: vec!["%s".into(), literal.into()],
+        environment: Vec::new(),
         stdin: None,
         policy: policy(1024, 1024, Duration::from_secs(2)),
     };
@@ -124,12 +129,33 @@ fn normal_process_preserves_literal_argv() {
 }
 
 #[test]
+fn requested_environment_reaches_the_child_as_literal_os_strings() {
+    // This catches dropping the controlled host PATH override or introducing
+    // shell parsing while passing environment overrides to host commands.
+    let literal = "$(printf injected); $HOME *";
+    let request = ProcessRequest {
+        program: "/usr/bin/printenv".into(),
+        args: vec!["WORKER_LITERAL".into()],
+        environment: vec![("WORKER_LITERAL".into(), literal.into())],
+        stdin: None,
+        policy: policy(1024, 1024, Duration::from_secs(2)),
+    };
+
+    let result = SystemProcessRunner.run(&request).unwrap();
+
+    assert!(result.status.success());
+    assert_eq!(result.stdout, format!("{literal}\n").as_bytes());
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
 fn normal_process_receives_the_complete_stdin_payload() {
     // This catches the concurrent capture implementation dropping stdin or
     // closing it before the requested bytes have been written.
     let request = ProcessRequest {
         program: "/bin/cat".into(),
         args: Vec::new(),
+        environment: Vec::new(),
         stdin: Some(b"raw stdin bytes\n".to_vec()),
         policy: policy(1024, 1024, Duration::from_secs(2)),
     };

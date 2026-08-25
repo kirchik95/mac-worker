@@ -59,3 +59,69 @@ After the SSH prerequisite succeeds, use the local phase-one commands:
 ```
 
 `setup` is safe to run again for the same worker; it replaces the helper installation. Phase one only supports setup and inventory/probe reporting. `worker run`, snapshots, queues, logs, and artifacts are not yet implemented.
+
+## Recovery from retained setup state
+
+If `setup` reports `INSTALL_LOCKED`, `UNKNOWN_INSTALLATION_STATE`, or a cleanup/rollback warning, connect as the dedicated worker account and recover only the transaction owned by the retained lock. Do not retry setup until the following checks are complete. Never use `sudo`, `rm -rf`, globs, or broad cleanup under `~/.local/share/mac-worker/setup/`.
+
+Read and validate the exact lock owner before forming a transaction path. The owner must be the 32-character lowercase hexadecimal installation ID; otherwise retain the lock and stop.
+
+```bash
+setup_root="$HOME/.local/share/mac-worker/setup"
+lock_dir="$setup_root/.install-lock"
+owner="$(/bin/cat "$lock_dir/owner" 2>/dev/null)"
+
+if ! printf '%s\n' "$owner" | /usr/bin/grep -Eq '^[0-9a-f]{32}$'; then
+    printf '%s\n' 'setup lock owner is missing or invalid; retain the lock and stop' >&2
+    exit 1
+fi
+
+transaction="$setup_root/$owner"
+if [ ! -d "$transaction" ]; then
+    printf '%s\n' 'owner-scoped setup transaction is missing; retain the lock and stop' >&2
+    exit 1
+fi
+
+/bin/ls -ld "$lock_dir" "$transaction"
+/bin/cat "$transaction/state" 2>/dev/null
+/bin/cat "$transaction/candidate.sha256" 2>/dev/null
+/bin/cat "$transaction/previous.sha256" 2>/dev/null
+/usr/bin/shasum -a 256 "$HOME/.local/bin/worker" 2>/dev/null
+```
+
+Only proceed if the lock owner still equals `$owner`, the active helper SHA-256 equals the recorded `candidate.sha256` or `previous.sha256`, and the active helper succeeds:
+
+```bash
+active_digest="$(/usr/bin/shasum -a 256 "$HOME/.local/bin/worker" 2>/dev/null | /usr/bin/awk '{print $1}')"
+candidate_digest="$(/bin/cat "$transaction/candidate.sha256" 2>/dev/null)"
+previous_digest="$(/bin/cat "$transaction/previous.sha256" 2>/dev/null)"
+current_owner="$(/bin/cat "$lock_dir/owner" 2>/dev/null)"
+
+if [ "$current_owner" != "$owner" ] || { [ "$active_digest" != "$candidate_digest" ] && [ "$active_digest" != "$previous_digest" ]; }; then
+    printf '%s\n' 'setup state or helper digest is unknown; retain the lock and stop' >&2
+    exit 1
+fi
+
+"$HOME/.local/bin/worker" host probe
+```
+
+After that probe succeeds, re-read the owner and digest immediately before performing the targeted cleanup. This removes only the named files from the exact owner-scoped transaction and releases only its matching lock.
+
+```bash
+current_owner="$(/bin/cat "$lock_dir/owner" 2>/dev/null)"
+active_digest="$(/usr/bin/shasum -a 256 "$HOME/.local/bin/worker" 2>/dev/null | /usr/bin/awk '{print $1}')"
+
+if [ "$current_owner" != "$owner" ] || { [ "$active_digest" != "$candidate_digest" ] && [ "$active_digest" != "$previous_digest" ]; }; then
+    printf '%s\n' 'ownership or helper digest changed; retain the lock and stop' >&2
+    exit 1
+fi
+
+/bin/rm -f "$transaction/worker.new" "$transaction/worker.previous" \
+    "$transaction/candidate.sha256" "$transaction/previous.sha256" \
+    "$transaction/no-previous" "$transaction/state"
+/bin/rmdir "$transaction"
+/bin/rm -f "$lock_dir/owner"
+/bin/rmdir "$lock_dir"
+```
+
+If any inspection, identity check, probe, removal, or `rmdir` step fails, stop and retain the remaining state for investigation. Do not delete unrelated setup directories or release a lock whose owner no longer matches.

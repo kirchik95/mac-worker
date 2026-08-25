@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::{
     config::{Config, WorkerEntry},
+    error::{ProcessError, ProcessStream, WorkerError},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::{
         HealthStatus, PROTOCOL_VERSION, ProbeResponse, WorkerHealth, WorkersReport,
@@ -55,6 +56,7 @@ impl<R: ProcessRunner> SshTransport<R> {
                 worker.ssh.clone().into(),
                 REMOTE_PROBE_COMMAND.into(),
             ],
+            environment: Vec::new(),
             stdin: None,
             policy: ProcessPolicy {
                 stdout_limit: MAX_PROBE_RESPONSE_BYTES,
@@ -64,6 +66,21 @@ impl<R: ProcessRunner> SshTransport<R> {
         }) {
             Ok(result) => result,
             Err(error) => {
+                if matches!(
+                    &error,
+                    WorkerError::Process(ProcessError::OutputLimitExceeded {
+                        stream: ProcessStream::Stdout,
+                        ..
+                    })
+                ) {
+                    return unavailable(
+                        worker,
+                        "INVALID_RESPONSE",
+                        format!("SSH probe response exceeded {MAX_PROBE_RESPONSE_BYTES} bytes"),
+                        None,
+                        Vec::new(),
+                    );
+                }
                 return unavailable(
                     worker,
                     "SSH_UNAVAILABLE",
