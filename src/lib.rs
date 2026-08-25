@@ -2,6 +2,8 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod paths;
+pub mod probe;
+pub mod protocol;
 
 #[cfg(test)]
 mod tests {
