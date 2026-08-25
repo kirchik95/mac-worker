@@ -1,16 +1,27 @@
 use std::{
     ffi::OsString,
-    io::Write,
-    process::{Command, ExitStatus, Stdio},
+    io::{self, Read, Write},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
 };
 
-use crate::error::WorkerError;
+use crate::error::{ProcessError, ProcessStream, WorkerError};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessPolicy {
+    pub stdout_limit: usize,
+    pub stderr_limit: usize,
+    pub deadline: Duration,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessRequest {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub stdin: Option<Vec<u8>>,
+    pub policy: ProcessPolicy,
 }
 
 #[derive(Debug)]
@@ -47,21 +58,167 @@ impl ProcessRunner for SystemProcessRunner {
             .stderr(Stdio::piped());
 
         let mut child = command.spawn()?;
-        if let Some(input) = &request.stdin {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("child process stdout was not available"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("child process stderr was not available"))?;
+
+        let (sender, receiver) = mpsc::channel();
+        let stdout_handle = spawn_capture(
+            stdout,
+            ProcessStream::Stdout,
+            request.policy.stdout_limit,
+            sender.clone(),
+        );
+        let stderr_handle = spawn_capture(
+            stderr,
+            ProcessStream::Stderr,
+            request.policy.stderr_limit,
+            sender.clone(),
+        );
+        let stdin_handle = if let Some(input) = request.stdin.clone() {
             let mut stdin = child.stdin.take().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
                     "child process stdin was not available",
                 )
             })?;
-            stdin.write_all(input)?;
-        }
-        let output = child.wait_with_output()?;
+            let sender = sender.clone();
+            Some(thread::spawn(move || {
+                let result = stdin.write_all(&input);
+                let _ = sender.send(ProcessEvent::Stdin(result));
+            }))
+        } else {
+            None
+        };
+        drop(sender);
 
+        let started = Instant::now();
+        let mut status = None;
+        let mut stdout = None;
+        let mut stderr = None;
+        let mut stdin_complete = stdin_handle.is_none();
+
+        loop {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    ProcessEvent::Captured(stream, Ok(CaptureOutcome::Complete(bytes))) => {
+                        match stream {
+                            ProcessStream::Stdout => stdout = Some(bytes),
+                            ProcessStream::Stderr => stderr = Some(bytes),
+                        }
+                    }
+                    ProcessEvent::Captured(stream, Ok(CaptureOutcome::LimitExceeded)) => {
+                        terminate_and_reap(&mut child)?;
+                        join_threads(stdout_handle, stderr_handle, stdin_handle)?;
+                        let limit = match stream {
+                            ProcessStream::Stdout => request.policy.stdout_limit,
+                            ProcessStream::Stderr => request.policy.stderr_limit,
+                        };
+                        return Err(ProcessError::OutputLimitExceeded { stream, limit }.into());
+                    }
+                    ProcessEvent::Captured(_, Err(error)) | ProcessEvent::Stdin(Err(error)) => {
+                        terminate_and_reap(&mut child)?;
+                        join_threads(stdout_handle, stderr_handle, stdin_handle)?;
+                        return Err(error.into());
+                    }
+                    ProcessEvent::Stdin(Ok(())) => stdin_complete = true,
+                }
+            }
+
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if status.is_some() && stdout.is_some() && stderr.is_some() && stdin_complete {
+                break;
+            }
+
+            if started.elapsed() >= request.policy.deadline {
+                terminate_and_reap(&mut child)?;
+                join_threads(stdout_handle, stderr_handle, stdin_handle)?;
+                return Err(ProcessError::DeadlineExceeded {
+                    deadline: request.policy.deadline,
+                }
+                .into());
+            }
+
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        join_threads(stdout_handle, stderr_handle, stdin_handle)?;
         Ok(ProcessResult {
-            status: output.status,
-            stdout: output.stdout,
-            stderr: output.stderr,
+            status: status.expect("completed child must have an exit status"),
+            stdout: stdout.expect("completed stdout capture must have bytes"),
+            stderr: stderr.expect("completed stderr capture must have bytes"),
         })
     }
+}
+
+enum ProcessEvent {
+    Captured(ProcessStream, io::Result<CaptureOutcome>),
+    Stdin(io::Result<()>),
+}
+
+enum CaptureOutcome {
+    Complete(Vec<u8>),
+    LimitExceeded,
+}
+
+fn spawn_capture<R: Read + Send + 'static>(
+    mut reader: R,
+    stream: ProcessStream,
+    limit: usize,
+    sender: mpsc::Sender<ProcessEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut captured = Vec::with_capacity(limit.min(8 * 1024));
+        let mut buffer = [0_u8; 8 * 1024];
+        let result = loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break Ok(CaptureOutcome::Complete(captured)),
+                Ok(read) => {
+                    let remaining = limit.saturating_sub(captured.len());
+                    let accepted = remaining.min(read);
+                    captured.extend_from_slice(&buffer[..accepted]);
+                    if read > remaining {
+                        break Ok(CaptureOutcome::LimitExceeded);
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = sender.send(ProcessEvent::Captured(stream, result));
+    })
+}
+
+fn terminate_and_reap(child: &mut Child) -> io::Result<()> {
+    match child.kill() {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+        Err(error) => return Err(error),
+    }
+    child.wait().map(|_| ())
+}
+
+fn join_threads(
+    stdout: thread::JoinHandle<()>,
+    stderr: thread::JoinHandle<()>,
+    stdin: Option<thread::JoinHandle<()>>,
+) -> io::Result<()> {
+    stdout
+        .join()
+        .map_err(|_| io::Error::other("stdout capture thread panicked"))?;
+    stderr
+        .join()
+        .map_err(|_| io::Error::other("stderr capture thread panicked"))?;
+    if let Some(stdin) = stdin {
+        stdin
+            .join()
+            .map_err(|_| io::Error::other("stdin writer thread panicked"))?;
+    }
+    Ok(())
 }

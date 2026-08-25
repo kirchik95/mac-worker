@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use crate::{
     config::{Config, WorkerEntry},
-    process::{ProcessRequest, ProcessRunner},
+    process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::{
         HealthStatus, PROTOCOL_VERSION, ProbeResponse, WorkerHealth, WorkersReport,
         missing_capabilities,
@@ -49,10 +51,16 @@ impl<R: ProcessRunner> SshTransport<R> {
                 "BatchMode=yes".into(),
                 "-o".into(),
                 "ConnectTimeout=5".into(),
+                "--".into(),
                 worker.ssh.clone().into(),
                 REMOTE_PROBE_COMMAND.into(),
             ],
             stdin: None,
+            policy: ProcessPolicy {
+                stdout_limit: MAX_PROBE_RESPONSE_BYTES,
+                stderr_limit: MAX_PROBE_RESPONSE_BYTES,
+                deadline: Duration::from_secs(15),
+            },
         }) {
             Ok(result) => result,
             Err(error) => {

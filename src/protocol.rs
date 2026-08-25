@@ -53,6 +53,21 @@ pub struct SetupHostResult {
     pub protocol_version: Option<u32>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<SetupWarning>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SetupWarning {
+    pub code: SetupWarningCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SetupWarningCode {
+    CleanupFailed,
+    RollbackFailed,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -161,6 +176,7 @@ mod tests {
                 protocol_version: Some(PROTOCOL_VERSION),
                 error_code: None,
                 error_message: None,
+                warnings: Vec::new(),
             }],
         };
 

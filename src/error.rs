@@ -1,9 +1,34 @@
+use std::time::Duration;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitKind {
     Usage = 64,
     Unavailable = 69,
     Infrastructure = 70,
     Io = 74,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStream {
+    Stdout,
+    Stderr,
+}
+
+impl std::fmt::Display for ProcessStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdout => formatter.write_str("stdout"),
+            Self::Stderr => formatter.write_str("stderr"),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessError {
+    #[error("process {stream} exceeded its {limit}-byte capture limit")]
+    OutputLimitExceeded { stream: ProcessStream, limit: usize },
+    #[error("process exceeded its {deadline:?} execution deadline")]
+    DeadlineExceeded { deadline: Duration },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -16,6 +41,8 @@ pub enum WorkerError {
     Protocol(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("process error: {0}")]
+    Process(#[from] ProcessError),
 }
 
 impl WorkerError {
@@ -23,7 +50,7 @@ impl WorkerError {
         match self {
             Self::Config(_) => ExitKind::Usage,
             Self::Unavailable(_) => ExitKind::Unavailable,
-            Self::Protocol(_) => ExitKind::Infrastructure,
+            Self::Protocol(_) | Self::Process(_) => ExitKind::Infrastructure,
             Self::Io(_) => ExitKind::Io,
         }
     }

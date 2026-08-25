@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
 use cli::{Cli, Command, HostCommand};
 use config::{Config, WorkerEntry};
@@ -46,6 +46,42 @@ pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutpu
             command: HostCommand::Probe,
         } => Ok(CommandOutput::Probe(ProbeCollector::collect()?)),
     }
+}
+
+pub fn run_with_io(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let json = cli.json;
+    let raw_probe = matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::Probe
+        }
+    );
+
+    match execute_with(cli, runner) {
+        Ok(output) => {
+            let exit = output.aggregate_exit_kind().map_or(0, |kind| kind as u8);
+            match output.write_to(stdout, json, raw_probe) {
+                Ok(()) => exit,
+                Err(error) => {
+                    write_error(stderr, &error);
+                    error.exit_kind() as u8
+                }
+            }
+        }
+        Err(error) => {
+            write_error(stderr, &error);
+            error.exit_kind() as u8
+        }
+    }
+}
+
+fn write_error(stderr: &mut dyn Write, error: &WorkerError) {
+    let _ = writeln!(stderr, "{error}");
 }
 
 fn load_config(config_override: Option<PathBuf>) -> Result<Config, WorkerError> {
@@ -176,6 +212,23 @@ mod tests {
         ] {
             let config = Config::parse(contents).unwrap();
             assert!(matches!(config.validate(), Err(WorkerError::Config(_))));
+        }
+    }
+
+    #[test]
+    fn ssh_destinations_must_start_with_an_ascii_alphanumeric_character() {
+        // This catches accepting a destination that OpenSSH can interpret as
+        // another command-line option before its operand boundary.
+        for destination in ["-V", "-Efoo"] {
+            let config = Config::parse(&format!(
+                "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = {destination:?}\nslots = 1"
+            ))
+            .unwrap();
+
+            assert!(
+                matches!(config.validate(), Err(WorkerError::Config(_))),
+                "destination {destination:?} must be rejected"
+            );
         }
     }
 

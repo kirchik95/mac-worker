@@ -68,7 +68,7 @@ impl Config {
                     worker.name
                 )));
             }
-            if !valid_identifier(&worker.ssh) {
+            if !valid_ssh_destination(&worker.ssh) {
                 return Err(WorkerError::Config(format!(
                     "invalid SSH destination {:?}",
                     worker.ssh
@@ -121,4 +121,12 @@ fn valid_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'))
+}
+
+fn valid_ssh_destination(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        && valid_identifier(value)
 }

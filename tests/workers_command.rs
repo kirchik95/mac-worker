@@ -4,13 +4,17 @@ use std::{
     os::unix::process::ExitStatusExt,
     process::ExitStatus,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use mac_worker::{
     config::{Config, WorkerEntry},
     error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::HealthStatus,
+    output::CommandOutput,
+    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    protocol::{
+        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth, WorkersReport,
+    },
     transport::{SshTransport, WorkersService},
 };
 
@@ -81,8 +85,26 @@ fn worker(name: &str, ssh: &str, capabilities: &[&str]) -> WorkerEntry {
     }
 }
 
+fn probe_policy() -> ProcessPolicy {
+    ProcessPolicy {
+        stdout_limit: 1024 * 1024,
+        stderr_limit: 1024 * 1024,
+        deadline: Duration::from_secs(15),
+    }
+}
+
+fn local_test_policy() -> ProcessPolicy {
+    ProcessPolicy {
+        stdout_limit: 1024,
+        stderr_limit: 1024,
+        deadline: Duration::from_secs(2),
+    }
+}
+
 #[test]
 fn probe_uses_batch_ssh_and_the_fixed_host_command() {
+    // This catches either allowing the destination to remain in OpenSSH's
+    // option namespace or dropping the bounded probe execution policy.
     let runner = RecordingRunner::returning_json(valid_probe_json());
     let transport = SshTransport::new(runner.clone());
     let worker = worker("mini-1", "mac1", &["darwin-arm64"]);
@@ -99,10 +121,12 @@ fn probe_uses_batch_ssh_and_the_fixed_host_command() {
                 "BatchMode=yes".into(),
                 "-o".into(),
                 "ConnectTimeout=5".into(),
+                "--".into(),
                 "mac1".into(),
                 "~/.local/bin/worker host probe".into(),
             ],
             stdin: None,
+            policy: probe_policy(),
         }]
     );
 }
@@ -296,6 +320,7 @@ fn system_runner_passes_arguments_without_shell_interpretation() {
         program: "/usr/bin/printf".into(),
         args: vec!["%s".into(), literal.into()],
         stdin: None,
+        policy: local_test_policy(),
     };
 
     let result = SystemProcessRunner.run(&request).unwrap();
@@ -311,6 +336,7 @@ fn system_runner_writes_the_requested_stdin() {
         program: "/bin/cat".into(),
         args: Vec::new(),
         stdin: Some(b"raw stdin bytes\n".to_vec()),
+        policy: local_test_policy(),
     };
 
     let result = SystemProcessRunner.run(&request).unwrap();
@@ -318,4 +344,86 @@ fn system_runner_writes_the_requested_stdin() {
     assert!(result.status.success());
     assert_eq!(result.stdout, b"raw stdin bytes\n");
     assert!(result.stderr.is_empty());
+}
+
+#[test]
+fn human_workers_output_includes_all_parsed_health_facts() {
+    // This catches dropping detected capabilities or host resource facts from
+    // the stable human view while JSON remains complete.
+    let output = CommandOutput::Workers(WorkersReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![WorkerHealth {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            status: HealthStatus::Ready,
+            probe: Some(ProbeResponse {
+                protocol_version: PROTOCOL_VERSION,
+                hostname: "mini-1.local".into(),
+                arch: "arm64".into(),
+                os_version: "26.2".into(),
+                free_disk_bytes: 536_870_912,
+                memory_pressure: MemoryPressure::Warn,
+                swap_used_bytes: Some(134_217_728),
+                capabilities: vec!["darwin-arm64".into(), "git".into()],
+            }),
+            missing_capabilities: Vec::new(),
+            error_code: None,
+            error_message: None,
+        }],
+    });
+
+    let rendered = output.render_human();
+
+    for fragment in [
+        "capabilities: darwin-arm64, git",
+        "free disk bytes: 536870912",
+        "memory pressure: warn",
+        "swap used bytes: 134217728",
+    ] {
+        assert!(
+            rendered.contains(fragment),
+            "missing {fragment:?} in {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn human_unavailable_worker_keeps_error_missing_capabilities_and_unknown_swap_visible() {
+    // This catches treating a parsed but capability-ineligible probe as if no
+    // diagnostic or missing-capability detail existed.
+    let output = CommandOutput::Workers(WorkersReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![WorkerHealth {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            status: HealthStatus::Unavailable,
+            probe: Some(ProbeResponse {
+                protocol_version: PROTOCOL_VERSION,
+                hostname: "mini-1.local".into(),
+                arch: "arm64".into(),
+                os_version: "26.2".into(),
+                free_disk_bytes: 536_870_912,
+                memory_pressure: MemoryPressure::Unknown,
+                swap_used_bytes: None,
+                capabilities: vec!["darwin-arm64".into()],
+            }),
+            missing_capabilities: vec!["docker".into(), "swift".into()],
+            error_code: Some("MISSING_CAPABILITIES".into()),
+            error_message: Some("worker is missing declared capabilities".into()),
+        }],
+    });
+
+    let rendered = output.render_human();
+
+    for fragment in [
+        "mini-1: unavailable [MISSING_CAPABILITIES]: worker is missing declared capabilities",
+        "missing capabilities: docker, swift",
+        "capabilities: darwin-arm64",
+        "swap used bytes: unavailable",
+    ] {
+        assert!(
+            rendered.contains(fragment),
+            "missing {fragment:?} in {rendered:?}"
+        );
+    }
 }
