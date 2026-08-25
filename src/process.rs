@@ -1,6 +1,7 @@
 use std::{
     ffi::OsString,
     io::{self, Read, Write},
+    os::unix::process::CommandExt,
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc,
     thread,
@@ -49,6 +50,7 @@ impl ProcessRunner for SystemProcessRunner {
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
+            .process_group(0)
             .stdin(if request.stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -58,6 +60,7 @@ impl ProcessRunner for SystemProcessRunner {
             .stderr(Stdio::piped());
 
         let mut child = command.spawn()?;
+        let process_group = child.id() as libc::pid_t;
         let stdout = child
             .stdout
             .take()
@@ -113,7 +116,7 @@ impl ProcessRunner for SystemProcessRunner {
                         }
                     }
                     ProcessEvent::Captured(stream, Ok(CaptureOutcome::LimitExceeded)) => {
-                        terminate_and_reap(&mut child)?;
+                        terminate_and_reap(&mut child, process_group)?;
                         join_threads(stdout_handle, stderr_handle, stdin_handle)?;
                         let limit = match stream {
                             ProcessStream::Stdout => request.policy.stdout_limit,
@@ -122,7 +125,7 @@ impl ProcessRunner for SystemProcessRunner {
                         return Err(ProcessError::OutputLimitExceeded { stream, limit }.into());
                     }
                     ProcessEvent::Captured(_, Err(error)) | ProcessEvent::Stdin(Err(error)) => {
-                        terminate_and_reap(&mut child)?;
+                        terminate_and_reap(&mut child, process_group)?;
                         join_threads(stdout_handle, stderr_handle, stdin_handle)?;
                         return Err(error.into());
                     }
@@ -138,7 +141,7 @@ impl ProcessRunner for SystemProcessRunner {
             }
 
             if started.elapsed() >= request.policy.deadline {
-                terminate_and_reap(&mut child)?;
+                terminate_and_reap(&mut child, process_group)?;
                 join_threads(stdout_handle, stderr_handle, stdin_handle)?;
                 return Err(ProcessError::DeadlineExceeded {
                     deadline: request.policy.deadline,
@@ -168,13 +171,19 @@ enum CaptureOutcome {
     LimitExceeded,
 }
 
+struct CaptureThread {
+    handle: thread::JoinHandle<()>,
+    limit_release: mpsc::Sender<()>,
+}
+
 fn spawn_capture<R: Read + Send + 'static>(
     mut reader: R,
     stream: ProcessStream,
     limit: usize,
     sender: mpsc::Sender<ProcessEvent>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
+) -> CaptureThread {
+    let (limit_release, release_receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
         let mut captured = Vec::with_capacity(limit.min(8 * 1024));
         let mut buffer = [0_u8; 8 * 1024];
         let result = loop {
@@ -185,34 +194,60 @@ fn spawn_capture<R: Read + Send + 'static>(
                     let accepted = remaining.min(read);
                     captured.extend_from_slice(&buffer[..accepted]);
                     if read > remaining {
-                        break Ok(CaptureOutcome::LimitExceeded);
+                        let _ = sender.send(ProcessEvent::Captured(
+                            stream,
+                            Ok(CaptureOutcome::LimitExceeded),
+                        ));
+                        let _ = release_receiver.recv();
+                        return;
                     }
                 }
                 Err(error) => break Err(error),
             }
         };
         let _ = sender.send(ProcessEvent::Captured(stream, result));
-    })
+    });
+    CaptureThread {
+        handle,
+        limit_release,
+    }
 }
 
-fn terminate_and_reap(child: &mut Child) -> io::Result<()> {
-    match child.kill() {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
-        Err(error) => return Err(error),
-    }
+fn terminate_and_reap(child: &mut Child, process_group: libc::pid_t) -> io::Result<()> {
+    terminate_process_group(process_group)?;
     child.wait().map(|_| ())
 }
 
+fn terminate_process_group(process_group: libc::pid_t) -> io::Result<()> {
+    if process_group <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid child process group",
+        ));
+    }
+
+    if unsafe { libc::killpg(process_group, libc::SIGKILL) } == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn join_threads(
-    stdout: thread::JoinHandle<()>,
-    stderr: thread::JoinHandle<()>,
+    stdout: CaptureThread,
+    stderr: CaptureThread,
     stdin: Option<thread::JoinHandle<()>>,
 ) -> io::Result<()> {
+    let _ = stdout.limit_release.send(());
+    let _ = stderr.limit_release.send(());
     stdout
+        .handle
         .join()
         .map_err(|_| io::Error::other("stdout capture thread panicked"))?;
     stderr
+        .handle
         .join()
         .map_err(|_| io::Error::other("stderr capture thread panicked"))?;
     if let Some(stdin) = stdin {

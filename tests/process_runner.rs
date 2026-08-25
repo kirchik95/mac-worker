@@ -83,6 +83,28 @@ fn deadline_terminates_and_reaps_a_non_exiting_child() {
 }
 
 #[test]
+fn deadline_terminates_descendants_that_hold_inherited_pipes_open() {
+    // This catches regressing teardown to kill only the direct child: its
+    // backgrounded descendant retains stdout and stderr, so the capture
+    // threads cannot reach EOF until the descendant's five-second sleep ends.
+    let request = ProcessRequest {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 5 & exit 0".into()],
+        stdin: None,
+        policy: policy(32, 32, Duration::from_millis(100)),
+    };
+    let started = Instant::now();
+
+    let error = SystemProcessRunner.run(&request).unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Process(ProcessError::DeadlineExceeded { .. })
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
 fn normal_process_preserves_literal_argv() {
     // This catches reintroducing a shell parsing step while adding the policy
     // enforcement machinery.
