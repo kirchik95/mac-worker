@@ -301,44 +301,54 @@ fn parse_byte_quantity(value: &str) -> Option<u64> {
 struct ToolProbe {
     capability: &'static str,
     executables: &'static [&'static str],
+    argv: &'static [&'static str],
 }
 
 const TOOL_PROBES: &[ToolProbe] = &[
     ToolProbe {
         capability: "git",
         executables: &["git"],
+        argv: &["--version"],
     },
     ToolProbe {
         capability: "rsync",
         executables: &["rsync"],
+        argv: &["--version"],
     },
     ToolProbe {
         capability: "node",
         executables: &["node"],
+        argv: &["--version"],
     },
     ToolProbe {
         capability: "ruby",
         executables: &["ruby"],
+        argv: &["--version"],
     },
     ToolProbe {
         capability: "python",
         executables: &["python3", "python"],
+        argv: &["--version"],
     },
     ToolProbe {
         capability: "go",
         executables: &["go"],
+        argv: &["version"],
     },
     ToolProbe {
         capability: "dotnet",
         executables: &["dotnet"],
+        argv: &["--version"],
     },
     ToolProbe {
         capability: "swift",
         executables: &["swift"],
+        argv: &["--version"],
     },
     ToolProbe {
         capability: "docker",
         executables: &["docker"],
+        argv: &["--version"],
     },
 ];
 
@@ -357,7 +367,7 @@ fn collect_capabilities(
         let detected = probe.executables.iter().any(|executable| {
             find_executable(search_paths, executable).is_some_and(|program| {
                 executor
-                    .output(&program, &["--version"])
+                    .output(&program, probe.argv)
                     .is_ok_and(|output| output.code == Some(0))
             })
         });
@@ -385,6 +395,7 @@ mod tests {
         fs, io,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
+        sync::Mutex,
         time::{Duration, Instant},
     };
 
@@ -416,6 +427,11 @@ mod tests {
 
     struct FixtureMemoryPressureQuery {
         level: Option<u32>,
+    }
+
+    #[derive(Default)]
+    struct CapabilityRecordingExecutor {
+        calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
     }
 
     impl FixtureMemoryPressureQuery {
@@ -474,6 +490,41 @@ mod tests {
 
             Ok(ProcessOutput {
                 code,
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    impl CommandExecutor for CapabilityRecordingExecutor {
+        fn output(&self, program: &Path, args: &[&str]) -> io::Result<ProcessOutput> {
+            self.calls.lock().unwrap().push((
+                program.to_path_buf(),
+                args.iter().map(|arg| (*arg).to_owned()).collect(),
+            ));
+            let name = program
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let stdout = match (name, args) {
+                ("hostname", []) => "mini-1.local\n",
+                ("sw_vers", ["-productVersion"]) => "26.2\n",
+                ("sysctl", ["-n", "vm.swapusage"]) => {
+                    "total = 4096.00M  used = 1.50G  free = 2560.00M\n"
+                }
+                ("df", ["-k", "/"]) => {
+                    "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 1000 100 333 24% /\n"
+                }
+                _ if program.is_absolute() => "tool version\n",
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unexpected fixture command: {} {args:?}", program.display()),
+                    ));
+                }
+            };
+            Ok(ProcessOutput {
+                code: Some(0),
                 stdout: stdout.as_bytes().to_vec(),
                 stderr: Vec::new(),
             })
@@ -587,6 +638,66 @@ mod tests {
                 swap_used_bytes: Some(1_610_612_736),
                 capabilities: vec!["darwin-arm64".into(), "git".into(), "python".into()],
             }
+        );
+    }
+
+    #[test]
+    fn capability_detection_uses_each_tools_literal_version_argv_without_a_shell() {
+        // Catches applying a universal --version convention to Go or routing
+        // controlled executable paths through a shell.
+        let directory = tempdir().unwrap();
+        for name in [
+            "git", "rsync", "node", "ruby", "python3", "python", "go", "dotnet", "swift", "docker",
+        ] {
+            executable(directory.path(), name);
+        }
+        let executor = CapabilityRecordingExecutor::default();
+
+        let response = ProbeCollector::collect_with(
+            &executor,
+            &FixtureMemoryPressureQuery::available(0),
+            &[directory.path().to_path_buf()],
+            "macos",
+            "arm64",
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.capabilities,
+            vec![
+                "darwin-arm64",
+                "git",
+                "rsync",
+                "node",
+                "ruby",
+                "python",
+                "go",
+                "dotnet",
+                "swift",
+                "docker",
+            ]
+        );
+        let capability_calls = executor
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(program, _)| program.starts_with(directory.path()))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            capability_calls,
+            vec![
+                (directory.path().join("git"), vec!["--version".into()]),
+                (directory.path().join("rsync"), vec!["--version".into()]),
+                (directory.path().join("node"), vec!["--version".into()]),
+                (directory.path().join("ruby"), vec!["--version".into()]),
+                (directory.path().join("python3"), vec!["--version".into()]),
+                (directory.path().join("go"), vec!["version".into()]),
+                (directory.path().join("dotnet"), vec!["--version".into()]),
+                (directory.path().join("swift"), vec!["--version".into()]),
+                (directory.path().join("docker"), vec!["--version".into()]),
+            ]
         );
     }
 

@@ -162,6 +162,36 @@ If inspection shows an expected state, run this complete cleanup block as one co
         allow_absent_regular_file "$transaction/state" 'setup state marker'
     }
 
+    verify_transaction_entries() {
+        transaction_entries="$(/usr/bin/find "$transaction" ! -path "$transaction" -prune -print)" \
+            || fail 'owner-scoped setup transaction cannot be enumerated; retain the lock and stop'
+        while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            case "$entry" in
+                "$transaction/worker.new"|"$transaction/worker.previous"|\
+                "$transaction/candidate.sha256"|"$transaction/previous.sha256"|\
+                "$transaction/no-previous"|"$transaction/state") ;;
+                *) fail "unexpected owner-scoped transaction entry: $entry; retain the lock and stop" ;;
+            esac
+        done <<EOF
+$transaction_entries
+EOF
+    }
+
+    verify_lock_entries() {
+        lock_entries="$(/usr/bin/find "$lock_dir" ! -path "$lock_dir" -prune -print)" \
+            || fail 'setup lock directory cannot be enumerated; retain the lock and stop'
+        while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            case "$entry" in
+                "$transaction_owner_path") ;;
+                *) fail "unexpected setup lock entry: $entry; retain the lock and stop" ;;
+            esac
+        done <<EOF
+$lock_entries
+EOF
+    }
+
     data_root="$(cd -P "$HOME/.local/share/mac-worker" 2>/dev/null && /bin/pwd)" \
         || fail 'mac-worker data root cannot be resolved; retain the lock and stop'
     setup_root="$data_root/setup"
@@ -181,6 +211,8 @@ If inspection shows an expected state, run this complete cleanup block as one co
     transaction="$setup_root/$owner"
     verify_transaction_directory
     verify_cleanup_file_types
+    verify_transaction_entries
+    verify_lock_entries
 
     candidate_present=0
     candidate_digest=''
@@ -283,6 +315,8 @@ If inspection shows an expected state, run this complete cleanup block as one co
     fi
     verify_transaction_directory
     verify_cleanup_file_types
+    verify_transaction_entries
+    verify_lock_entries
 
     /bin/rm -f "$transaction/worker.new" "$transaction/worker.previous" \
         "$transaction/candidate.sha256" "$transaction/previous.sha256" \

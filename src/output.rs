@@ -87,9 +87,21 @@ impl CommandOutput {
 
     pub fn aggregate_exit_kind(&self) -> Option<crate::error::ExitKind> {
         match self {
-            Self::Setup(report) if report.workers.iter().any(|worker| !worker.installed) => {
-                Some(crate::error::ExitKind::Unavailable)
-            }
+            Self::Setup(report) => report
+                .workers
+                .iter()
+                .filter(|worker| !worker.installed)
+                .map(|worker| {
+                    worker
+                        .failure_kind
+                        .unwrap_or(crate::protocol::SetupFailureKind::Infrastructure)
+                })
+                .max_by_key(|kind| match kind {
+                    crate::protocol::SetupFailureKind::Unavailable => 0,
+                    crate::protocol::SetupFailureKind::Infrastructure => 1,
+                    crate::protocol::SetupFailureKind::Io => 2,
+                })
+                .map(crate::protocol::SetupFailureKind::exit_kind),
             _ => None,
         }
     }

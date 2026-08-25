@@ -17,7 +17,10 @@ use mac_worker::{
     install::Installer,
     output::CommandOutput,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::{PROTOCOL_VERSION, SetupHostResult, SetupReport, SetupWarning, SetupWarningCode},
+    protocol::{
+        PROTOCOL_VERSION, SetupFailureKind, SetupHostResult, SetupReport, SetupWarning,
+        SetupWarningCode,
+    },
     run_with_io,
 };
 use tempfile::tempdir;
@@ -186,7 +189,7 @@ fn promotion_command() -> String {
 
 fn reconciliation_command() -> String {
     format!(
-        "target=$(/usr/bin/shasum -a 256 ~/.local/bin/worker 2>/dev/null) && target=${{target%% *}}; if [ \"$target\" = {CANDIDATE_DIGEST} ]; then printf '%s\\n' promoted; elif [ -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/previous.sha256 ] && [ \"$target\" = \"$(/bin/cat ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/previous.sha256)\" ]; then printf '%s\\n' previous; elif [ -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/no-previous ] && [ ! -e ~/.local/bin/worker ]; then printf '%s\\n' previous; else printf '%s\\n' unknown; fi"
+        "target=$(/usr/bin/shasum -a 256 ~/.local/bin/worker 2>/dev/null) && target=${{target%% *}}; state=$(/bin/cat ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/state 2>/dev/null) || state=; if [ \"$target\" = {CANDIDATE_DIGEST} ] && [ \"$state\" = promoted ]; then printf '%s\\n' promoted; elif [ -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/previous.sha256 ] && [ \"$target\" = \"$(/bin/cat ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/previous.sha256)\" ]; then printf '%s\\n' previous; elif [ -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/no-previous ] && [ ! -e ~/.local/bin/worker ]; then printf '%s\\n' previous; else printf '%s\\n' unknown; fi"
     )
 }
 
@@ -417,6 +420,129 @@ fn disconnected_promotion_reconciled_as_candidate_continues_to_probe() {
 }
 
 #[test]
+fn disconnected_promotion_reconciled_as_previous_retains_owned_state() {
+    // Catches treating a lost SSH result plus one observation of the previous
+    // target as proof that the remote promotion command has stopped.
+    let (_directory, current_exe) = executable_fixture();
+    let runner = RecordingRunner::returning_results(vec![
+        Ok(result(0, valid_probe_json(), b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"match\n", b"")),
+        Ok(result(0, b"", b"")),
+        Err(WorkerError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "promotion connection lost",
+        ))),
+        Ok(result(0, b"previous\n", b"")),
+        Ok(result(0, b"", b"")),
+    ]);
+    let installer =
+        Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+
+    let installed = installer.install(&current_exe, &worker());
+
+    assert!(!installed.installed);
+    assert_eq!(
+        installed.error_code.as_deref(),
+        Some("UNKNOWN_INSTALLATION_STATE")
+    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 7);
+    assert_eq!(
+        requests[6],
+        ssh_request(reconciliation_command(), control_policy())
+    );
+    assert!(!requests.contains(&ssh_request(cleanup_command(), control_policy())));
+    assert!(!requests.contains(&ssh_request(rollback_command(), control_policy())));
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.args.last() == Some(&promotion_command().into()))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn ssh_transport_failure_reconciled_as_previous_retains_owned_state() {
+    // Catches treating SSH's reserved transport-error status as a concrete
+    // remote promotion failure eligible for cleanup.
+    let (_directory, current_exe) = executable_fixture();
+    let runner = RecordingRunner::returning(vec![
+        result(0, valid_probe_json(), b""),
+        result(0, b"", b""),
+        result(0, b"", b""),
+        result(0, b"match\n", b""),
+        result(0, b"", b""),
+        result(255, b"", b"connection lost"),
+        result(0, b"previous\n", b""),
+        result(0, b"", b""),
+    ]);
+    let installer =
+        Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+
+    let installed = installer.install(&current_exe, &worker());
+
+    assert!(!installed.installed);
+    assert_eq!(
+        installed.error_code.as_deref(),
+        Some("UNKNOWN_INSTALLATION_STATE")
+    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 7);
+    assert!(!requests.contains(&ssh_request(cleanup_command(), control_policy())));
+    assert!(!requests.contains(&ssh_request(rollback_command(), control_policy())));
+}
+
+#[test]
+fn reconciliation_requires_candidate_digest_and_final_promoted_marker() {
+    // Catches classifying candidate bytes as promoted while the owner
+    // transaction still records an in-progress promotion.
+    let (directory, current_exe) = executable_fixture();
+    let runner = RecordingRunner::returning_results(vec![
+        Ok(result(0, valid_probe_json(), b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"match\n", b"")),
+        Ok(result(0, b"", b"")),
+        Err(WorkerError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "promotion connection lost",
+        ))),
+        Ok(result(0, b"unknown\n", b"")),
+    ]);
+    let installer =
+        Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+    let _ = installer.install(&current_exe, &worker());
+    let command = runner.requests()[6]
+        .args
+        .last()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let home = directory.path().join("home");
+    let transaction = home
+        .join(".local/share/mac-worker/setup")
+        .join(INSTALLATION_ID);
+    fs::create_dir_all(home.join(".local/bin")).unwrap();
+    fs::create_dir_all(&transaction).unwrap();
+    fs::write(home.join(".local/bin/worker"), b"test worker").unwrap();
+    fs::write(transaction.join("state"), b"promoting\n").unwrap();
+
+    let output = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"unknown\n");
+}
+
+#[test]
 fn unrecoverable_promotion_state_retains_lock_and_scoped_data() {
     // Catches guessing rollback/cleanup when neither byte state is provable.
     let (_directory, current_exe) = executable_fixture();
@@ -621,6 +747,7 @@ fn setup_json_and_human_output_keep_per_host_results() {
                 protocol_version: Some(PROTOCOL_VERSION),
                 error_code: None,
                 error_message: None,
+                failure_kind: None,
                 warnings: Vec::new(),
             },
             SetupHostResult {
@@ -630,6 +757,7 @@ fn setup_json_and_human_output_keep_per_host_results() {
                 protocol_version: None,
                 error_code: Some("INSTALL_FAILED".into()),
                 error_message: Some("transfer failed".into()),
+                failure_kind: Some(SetupFailureKind::Infrastructure),
                 warnings: Vec::new(),
             },
         ],
@@ -659,6 +787,7 @@ fn setup_human_output_surfaces_cleanup_warning_after_verified_success() {
             protocol_version: Some(PROTOCOL_VERSION),
             error_code: None,
             error_message: None,
+            failure_kind: None,
             warnings: vec![SetupWarning {
                 code: SetupWarningCode::CleanupFailed,
                 message: "lock release failed".into(),
@@ -744,6 +873,133 @@ fn executable_setup_all_failed_renders_every_host_and_exits_unavailable() {
     assert_eq!(value["workers"][0]["installed"], false);
     assert_eq!(value["workers"][1]["name"], "second");
     assert_eq!(value["workers"][1]["installed"], false);
+}
+
+#[test]
+fn executable_setup_integrity_failure_renders_report_then_exits_infrastructure() {
+    // Catches flattening a digest/integrity failure into retryable worker
+    // unavailability or returning before the typed report is rendered.
+    let directory = tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+    )
+    .unwrap();
+    let runner = RecordingRunner::returning(vec![
+        result(0, valid_probe_json(), b""),
+        result(0, b"", b""),
+        result(0, b"", b""),
+        result(0, b"mismatch\n", b""),
+        result(0, b"", b""),
+    ]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_with_io(
+        Cli {
+            config: Some(config_path),
+            json: true,
+            command: Command::Setup { hosts: Vec::new() },
+        },
+        &runner,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 70);
+    assert!(stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(
+        value["workers"][0]["error_code"],
+        "CANDIDATE_DIGEST_MISMATCH"
+    );
+}
+
+#[test]
+fn executable_setup_local_io_failure_renders_report_then_exits_io() {
+    // Catches losing the local I/O category when preflight turns the failure
+    // into the stable LOCAL_BINARY_INVALID report code.
+    let directory = tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+    )
+    .unwrap();
+    let runner =
+        RecordingRunner::returning_results(vec![Err(WorkerError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot execute candidate",
+        )))]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_with_io(
+        Cli {
+            config: Some(config_path),
+            json: true,
+            command: Command::Setup { hosts: Vec::new() },
+        },
+        &runner,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 74);
+    assert!(stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["workers"][0]["error_code"], "LOCAL_BINARY_INVALID");
+}
+
+#[test]
+fn executable_setup_mixed_failures_render_all_hosts_and_use_strongest_category() {
+    // Catches first/last-result aggregation and proves I/O outranks
+    // infrastructure, which in turn outranks retryable unavailability.
+    let directory = tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[[workers]]\nname = \"retryable\"\nssh = \"mac1\"\nslots = 1\n[[workers]]\nname = \"integrity\"\nssh = \"mac2\"\nslots = 1\n[[workers]]\nname = \"local-io\"\nssh = \"mac3\"\nslots = 1\n",
+    )
+    .unwrap();
+    let runner = RecordingRunner::returning_results(vec![
+        Ok(result(0, valid_probe_json(), b"")),
+        Ok(result(75, b"", b"lock busy")),
+        Ok(result(0, valid_probe_json(), b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"mismatch\n", b"")),
+        Ok(result(0, b"", b"")),
+        Err(WorkerError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot execute candidate",
+        ))),
+    ]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_with_io(
+        Cli {
+            config: Some(config_path),
+            json: true,
+            command: Command::Setup { hosts: Vec::new() },
+        },
+        &runner,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 74);
+    assert!(stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["workers"].as_array().unwrap().len(), 3);
+    assert_eq!(value["workers"][0]["error_code"], "INSTALL_LOCKED");
+    assert_eq!(
+        value["workers"][1]["error_code"],
+        "CANDIDATE_DIGEST_MISMATCH"
+    );
+    assert_eq!(value["workers"][2]["error_code"], "LOCAL_BINARY_INVALID");
 }
 
 #[test]

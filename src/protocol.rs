@@ -53,8 +53,27 @@ pub struct SetupHostResult {
     pub protocol_version: Option<u32>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    #[serde(skip)]
+    pub failure_kind: Option<SetupFailureKind>,
     #[serde(default)]
     pub warnings: Vec<SetupWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupFailureKind {
+    Unavailable,
+    Infrastructure,
+    Io,
+}
+
+impl SetupFailureKind {
+    pub fn exit_kind(self) -> crate::error::ExitKind {
+        match self {
+            Self::Unavailable => crate::error::ExitKind::Unavailable,
+            Self::Infrastructure => crate::error::ExitKind::Infrastructure,
+            Self::Io => crate::error::ExitKind::Io,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -176,6 +195,7 @@ mod tests {
                 protocol_version: Some(PROTOCOL_VERSION),
                 error_code: None,
                 error_message: None,
+                failure_kind: None,
                 warnings: Vec::new(),
             }],
         };

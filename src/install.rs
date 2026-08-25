@@ -7,8 +7,8 @@ use crate::{
     config::WorkerEntry,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
-        HealthStatus, PROTOCOL_VERSION, ProbeResponse, SetupHostResult, SetupWarning,
-        SetupWarningCode,
+        HealthStatus, PROTOCOL_VERSION, ProbeResponse, SetupFailureKind, SetupHostResult,
+        SetupWarning, SetupWarningCode,
     },
     transport::SshTransport,
 };
@@ -40,7 +40,15 @@ impl<'a> Installer<'a> {
     pub fn install(&self, current_exe: &Path, worker: &WorkerEntry) -> SetupHostResult {
         let digest = match self.preflight(current_exe) {
             Ok(digest) => digest,
-            Err(message) => return failed(worker, "LOCAL_BINARY_INVALID", message, Vec::new()),
+            Err(error) => {
+                return failed(
+                    worker,
+                    "LOCAL_BINARY_INVALID",
+                    error.message,
+                    error.failure_kind,
+                    Vec::new(),
+                );
+            }
         };
         let id = self.installation_id.simple().to_string();
 
@@ -52,6 +60,7 @@ impl<'a> Installer<'a> {
                     worker,
                     "INSTALL_LOCKED",
                     process_failure("installation lock", &result),
+                    SetupFailureKind::Unavailable,
                     Vec::new(),
                 );
             }
@@ -63,6 +72,7 @@ impl<'a> Installer<'a> {
                         "installation lock acquisition was inconclusive; scoped state was retained: {}",
                         process_failure("installation lock", &result)
                     ),
+                    SetupFailureKind::Infrastructure,
                     Vec::new(),
                 );
             }
@@ -73,6 +83,7 @@ impl<'a> Installer<'a> {
                     format!(
                         "installation lock acquisition result was lost; scoped state was retained: {error}"
                     ),
+                    SetupFailureKind::Infrastructure,
                     Vec::new(),
                 );
             }
@@ -100,7 +111,13 @@ impl<'a> Installer<'a> {
         };
         if let Err(message) = run_success(self.runner, &transfer) {
             let warnings = self.cleanup_warnings(worker, &id);
-            return failed(worker, "TRANSFER_FAILED", message, warnings);
+            return failed(
+                worker,
+                "TRANSFER_FAILED",
+                message,
+                SetupFailureKind::Unavailable,
+                warnings,
+            );
         }
 
         let digest_request = ssh_request(worker, digest_command(&id, &digest), control_policy());
@@ -109,7 +126,13 @@ impl<'a> Installer<'a> {
             Ok(result) => {
                 let message = process_failure("staged candidate digest verification", &result);
                 let warnings = self.cleanup_warnings(worker, &id);
-                return failed(worker, "DIGEST_VERIFICATION_FAILED", message, warnings);
+                return failed(
+                    worker,
+                    "DIGEST_VERIFICATION_FAILED",
+                    message,
+                    SetupFailureKind::Infrastructure,
+                    warnings,
+                );
             }
             Err(error) => {
                 let warnings = self.cleanup_warnings(worker, &id);
@@ -117,6 +140,7 @@ impl<'a> Installer<'a> {
                     worker,
                     "DIGEST_VERIFICATION_FAILED",
                     format!("failed to verify staged candidate digest: {error}"),
+                    SetupFailureKind::Infrastructure,
                     warnings,
                 );
             }
@@ -129,6 +153,7 @@ impl<'a> Installer<'a> {
                     worker,
                     "CANDIDATE_DIGEST_MISMATCH",
                     format!("staged candidate SHA-256 did not match expected digest {digest}"),
+                    SetupFailureKind::Infrastructure,
                     warnings,
                 );
             }
@@ -138,6 +163,7 @@ impl<'a> Installer<'a> {
                     worker,
                     "DIGEST_VERIFICATION_FAILED",
                     "staged candidate digest verification returned an invalid response".into(),
+                    SetupFailureKind::Infrastructure,
                     warnings,
                 );
             }
@@ -146,31 +172,75 @@ impl<'a> Installer<'a> {
         let prepare = ssh_request(worker, prepare_command(&id), control_policy());
         if let Err(message) = run_success(self.runner, &prepare) {
             let warnings = self.cleanup_warnings(worker, &id);
-            return failed(worker, "INSTALL_FAILED", message, warnings);
+            return failed(
+                worker,
+                "INSTALL_FAILED",
+                message,
+                SetupFailureKind::Infrastructure,
+                warnings,
+            );
         }
 
         let promotion = ssh_request(worker, promotion_command(&id), control_policy());
-        let promotion_error = run_success(self.runner, &promotion).err();
+        let promotion_result = match self.runner.run(&promotion) {
+            Ok(result) if result.status.success() => PromotionResult::AcknowledgedSuccess,
+            Ok(result) if matches!(result.status.code(), Some(code) if code != 255) => {
+                PromotionResult::AcknowledgedFailure(process_failure("promotion", &result))
+            }
+            Ok(result) => PromotionResult::Ambiguous(process_failure("promotion", &result)),
+            Err(error) => PromotionResult::Ambiguous(format!(
+                "failed to launch {}: {error}",
+                promotion.program.to_string_lossy()
+            )),
+        };
         let reconciliation = self.reconcile(worker, &id, &digest);
         match reconciliation {
             Reconciliation::Promoted => {}
             Reconciliation::Previous => {
-                let message = promotion_error.unwrap_or_else(|| {
-                    "promotion completed without activating the expected candidate bytes".into()
-                });
-                let warnings = self.cleanup_warnings(worker, &id);
-                return failed(worker, "PROMOTION_FAILED", message, warnings);
+                if let PromotionResult::AcknowledgedFailure(message) = promotion_result {
+                    let warnings = self.cleanup_warnings(worker, &id);
+                    return failed(
+                        worker,
+                        "PROMOTION_FAILED",
+                        message,
+                        SetupFailureKind::Infrastructure,
+                        warnings,
+                    );
+                }
+                let reason = match promotion_result {
+                    PromotionResult::AcknowledgedSuccess => {
+                        "promotion reported success but the previous target remained active".into()
+                    }
+                    PromotionResult::Ambiguous(error) => format!(
+                        "{error}; the previous target is currently observable but promotion completion is unproven"
+                    ),
+                    PromotionResult::AcknowledgedFailure(_) => unreachable!(),
+                };
+                return failed(
+                    worker,
+                    "UNKNOWN_INSTALLATION_STATE",
+                    format!("{reason}; installation lock and scoped state were retained"),
+                    SetupFailureKind::Infrastructure,
+                    Vec::new(),
+                );
             }
             Reconciliation::Unknown(reason) => {
-                let message = match promotion_error {
-                    Some(error) => format!(
+                let message = match promotion_result {
+                    PromotionResult::AcknowledgedSuccess => format!(
+                        "promotion reported success but reconciliation could not prove completion: {reason}; installation lock and scoped state were retained"
+                    ),
+                    PromotionResult::AcknowledgedFailure(error)
+                    | PromotionResult::Ambiguous(error) => format!(
                         "{error}; reconciliation could not determine the active target: {reason}; installation lock and scoped state were retained"
                     ),
-                    None => format!(
-                        "reconciliation could not determine the active target: {reason}; installation lock and scoped state were retained"
-                    ),
                 };
-                return failed(worker, "UNKNOWN_INSTALLATION_STATE", message, Vec::new());
+                return failed(
+                    worker,
+                    "UNKNOWN_INSTALLATION_STATE",
+                    message,
+                    SetupFailureKind::Infrastructure,
+                    Vec::new(),
+                );
             }
         }
 
@@ -188,7 +258,13 @@ impl<'a> Installer<'a> {
                 })
                 .into_iter()
                 .collect();
-            return failed(worker, "VERIFICATION_FAILED", message, warnings);
+            return failed(
+                worker,
+                "VERIFICATION_FAILED",
+                message,
+                SetupFailureKind::Infrastructure,
+                warnings,
+            );
         }
 
         let protocol_version = health.probe.map(|probe| probe.protocol_version);
@@ -200,29 +276,35 @@ impl<'a> Installer<'a> {
             protocol_version,
             error_code: None,
             error_message: None,
+            failure_kind: None,
             warnings,
         }
     }
 
-    fn preflight(&self, current_exe: &Path) -> Result<String, String> {
-        let metadata = current_exe.metadata().map_err(|error| {
-            format!(
+    fn preflight(&self, current_exe: &Path) -> Result<String, PreflightError> {
+        let metadata = current_exe.metadata().map_err(|error| PreflightError {
+            message: format!(
                 "failed to inspect candidate executable {}: {error}",
                 current_exe.display()
-            )
+            ),
+            failure_kind: SetupFailureKind::Io,
         })?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-            return Err(format!(
-                "candidate executable {} is not a regular executable file",
-                current_exe.display()
-            ));
+            return Err(PreflightError {
+                message: format!(
+                    "candidate executable {} is not a regular executable file",
+                    current_exe.display()
+                ),
+                failure_kind: SetupFailureKind::Infrastructure,
+            });
         }
 
-        let digest = sha256_file(current_exe).map_err(|error| {
-            format!(
+        let digest = sha256_file(current_exe).map_err(|error| PreflightError {
+            message: format!(
                 "failed to hash candidate executable {}: {error}",
                 current_exe.display()
-            )
+            ),
+            failure_kind: SetupFailureKind::Io,
         })?;
         let result = self
             .runner
@@ -233,17 +315,33 @@ impl<'a> Installer<'a> {
                 stdin: None,
                 policy: probe_policy(),
             })
-            .map_err(|error| format!("failed to launch candidate executable: {error}"))?;
+            .map_err(|error| PreflightError {
+                failure_kind: if matches!(error, crate::error::WorkerError::Io(_)) {
+                    SetupFailureKind::Io
+                } else {
+                    SetupFailureKind::Infrastructure
+                },
+                message: format!("failed to launch candidate executable: {error}"),
+            })?;
         if !result.status.success() {
-            return Err(process_failure("candidate executable probe", &result));
+            return Err(PreflightError {
+                message: process_failure("candidate executable probe", &result),
+                failure_kind: SetupFailureKind::Infrastructure,
+            });
         }
-        let probe: ProbeResponse = serde_json::from_slice(&result.stdout)
-            .map_err(|error| format!("candidate executable returned an invalid probe: {error}"))?;
+        let probe: ProbeResponse =
+            serde_json::from_slice(&result.stdout).map_err(|error| PreflightError {
+                message: format!("candidate executable returned an invalid probe: {error}"),
+                failure_kind: SetupFailureKind::Infrastructure,
+            })?;
         if probe.protocol_version != PROTOCOL_VERSION {
-            return Err(format!(
-                "candidate protocol version {} does not match required version {PROTOCOL_VERSION}",
-                probe.protocol_version
-            ));
+            return Err(PreflightError {
+                message: format!(
+                    "candidate protocol version {} does not match required version {PROTOCOL_VERSION}",
+                    probe.protocol_version
+                ),
+                failure_kind: SetupFailureKind::Infrastructure,
+            });
         }
 
         Ok(digest)
@@ -283,6 +381,17 @@ enum Reconciliation {
     Promoted,
     Previous,
     Unknown(String),
+}
+
+enum PromotionResult {
+    AcknowledgedSuccess,
+    AcknowledgedFailure(String),
+    Ambiguous(String),
+}
+
+struct PreflightError {
+    message: String,
+    failure_kind: SetupFailureKind,
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -343,7 +452,7 @@ fn promotion_command(id: &str) -> String {
 
 fn reconciliation_command(id: &str, digest: &str) -> String {
     format!(
-        "target=$(/usr/bin/shasum -a 256 ~/.local/bin/worker 2>/dev/null) && target=${{target%% *}}; if [ \"$target\" = {digest} ]; then printf '%s\\n' promoted; elif [ -f ~/.local/share/mac-worker/setup/{id}/previous.sha256 ] && [ \"$target\" = \"$(/bin/cat ~/.local/share/mac-worker/setup/{id}/previous.sha256)\" ]; then printf '%s\\n' previous; elif [ -f ~/.local/share/mac-worker/setup/{id}/no-previous ] && [ ! -e ~/.local/bin/worker ]; then printf '%s\\n' previous; else printf '%s\\n' unknown; fi"
+        "target=$(/usr/bin/shasum -a 256 ~/.local/bin/worker 2>/dev/null) && target=${{target%% *}}; state=$(/bin/cat ~/.local/share/mac-worker/setup/{id}/state 2>/dev/null) || state=; if [ \"$target\" = {digest} ] && [ \"$state\" = promoted ]; then printf '%s\\n' promoted; elif [ -f ~/.local/share/mac-worker/setup/{id}/previous.sha256 ] && [ \"$target\" = \"$(/bin/cat ~/.local/share/mac-worker/setup/{id}/previous.sha256)\" ]; then printf '%s\\n' previous; elif [ -f ~/.local/share/mac-worker/setup/{id}/no-previous ] && [ ! -e ~/.local/bin/worker ]; then printf '%s\\n' previous; else printf '%s\\n' unknown; fi"
     )
 }
 
@@ -414,6 +523,7 @@ fn failed(
     worker: &WorkerEntry,
     code: &str,
     message: String,
+    failure_kind: SetupFailureKind,
     warnings: Vec<SetupWarning>,
 ) -> SetupHostResult {
     SetupHostResult {
@@ -423,6 +533,7 @@ fn failed(
         protocol_version: None,
         error_code: Some(code.into()),
         error_message: Some(message),
+        failure_kind: Some(failure_kind),
         warnings,
     }
 }
