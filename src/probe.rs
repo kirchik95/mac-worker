@@ -5,6 +5,9 @@ use std::{
     process::Command,
 };
 
+#[cfg(target_os = "macos")]
+use std::ffi::{c_char, c_int, c_void};
+
 use crate::{
     error::WorkerError,
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse},
@@ -30,7 +33,13 @@ trait CommandExecutor {
     fn output(&self, program: &Path, args: &[&str]) -> io::Result<ProcessOutput>;
 }
 
+trait MemoryPressureQuery {
+    fn current_level(&self) -> io::Result<u32>;
+}
+
 struct SystemCommandExecutor;
+
+struct SystemMemoryPressureQuery;
 
 impl CommandExecutor for SystemCommandExecutor {
     fn output(&self, program: &Path, args: &[&str]) -> io::Result<ProcessOutput> {
@@ -47,6 +56,55 @@ impl CommandExecutor for SystemCommandExecutor {
     }
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn sysctlbyname(
+        name: *const c_char,
+        old_value: *mut c_void,
+        old_length: *mut usize,
+        new_value: *mut c_void,
+        new_length: usize,
+    ) -> c_int;
+}
+
+impl MemoryPressureQuery for SystemMemoryPressureQuery {
+    fn current_level(&self) -> io::Result<u32> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut level = 0_u32;
+            let mut length = size_of::<u32>();
+            // SAFETY: the name is a static NUL-terminated C string, and the output pointers
+            // reference live, correctly sized values for the duration of the call.
+            let result = unsafe {
+                sysctlbyname(
+                    c"kern.memorystatus_vm_pressure_level".as_ptr(),
+                    (&raw mut level).cast(),
+                    &raw mut length,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if length != size_of::<u32>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected macOS memory-pressure level size",
+                ));
+            }
+
+            Ok(level)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "memory-pressure queries require macOS",
+        ))
+    }
+}
+
 pub struct ProbeCollector;
 
 impl ProbeCollector {
@@ -57,6 +115,7 @@ impl ProbeCollector {
             .collect::<Vec<_>>();
         Self::collect_with(
             &SystemCommandExecutor,
+            &SystemMemoryPressureQuery,
             &search_paths,
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -65,6 +124,7 @@ impl ProbeCollector {
 
     fn collect_with(
         executor: &impl CommandExecutor,
+        memory_pressure_query: &impl MemoryPressureQuery,
         search_paths: &[PathBuf],
         os: &str,
         arch: &str,
@@ -84,7 +144,7 @@ impl ProbeCollector {
             "free disk space",
         )?;
         let free_disk_bytes = parse_free_disk_bytes(&disk)?;
-        let memory_pressure = collect_memory_pressure(executor);
+        let memory_pressure = collect_memory_pressure(memory_pressure_query);
         let swap_used_bytes = collect_swap_used_bytes(executor);
         let capabilities = collect_capabilities(executor, search_paths, os, &arch);
 
@@ -173,12 +233,11 @@ fn parse_free_disk_bytes(output: &str) -> Result<u64, WorkerError> {
         .ok_or_else(|| WorkerError::Protocol("free disk space overflowed u64".into()))
 }
 
-fn collect_memory_pressure(executor: &impl CommandExecutor) -> MemoryPressure {
-    let output = executor.output(Path::new("/usr/bin/memory_pressure"), &["-Q"]);
-    match output.ok().and_then(|output| output.code) {
-        Some(0) => MemoryPressure::Normal,
-        Some(1) => MemoryPressure::Warn,
-        Some(2) => MemoryPressure::Critical,
+fn collect_memory_pressure(query: &impl MemoryPressureQuery) -> MemoryPressure {
+    match query.current_level() {
+        Ok(0) => MemoryPressure::Normal,
+        Ok(1 | 2) => MemoryPressure::Warn,
+        Ok(3) => MemoryPressure::Critical,
         _ => MemoryPressure::Unknown,
     }
 }
@@ -302,7 +361,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{CommandExecutor, ProbeCollector, ProcessOutput, collect_json};
+    use super::{
+        CommandExecutor, MemoryPressureQuery, ProbeCollector, ProcessOutput, collect_json,
+        collect_memory_pressure,
+    };
     use crate::{
         error::WorkerError,
         protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse},
@@ -311,7 +373,28 @@ mod tests {
     #[derive(Default)]
     struct FixtureExecutor {
         failed_command: Option<(&'static str, Vec<&'static str>)>,
-        fail_optional_metrics: bool,
+        fail_swap_metric: bool,
+    }
+
+    struct FixtureMemoryPressureQuery {
+        level: Option<u32>,
+    }
+
+    impl FixtureMemoryPressureQuery {
+        fn available(level: u32) -> Self {
+            Self { level: Some(level) }
+        }
+
+        fn unavailable() -> Self {
+            Self { level: None }
+        }
+    }
+
+    impl MemoryPressureQuery for FixtureMemoryPressureQuery {
+        fn current_level(&self) -> io::Result<u32> {
+            self.level
+                .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "fixture failure"))
+        }
     }
 
     impl CommandExecutor for FixtureExecutor {
@@ -326,7 +409,7 @@ mod tests {
                 .is_some_and(|(failed_name, failed_args)| {
                     name == *failed_name && args == failed_args.as_slice()
                 })
-                || (self.fail_optional_metrics && matches!(name, "memory_pressure" | "sysctl"))
+                || (self.fail_swap_metric && name == "sysctl")
             {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "fixture failure"));
             }
@@ -334,7 +417,6 @@ mod tests {
             let (code, stdout) = match (name, args) {
                 ("hostname", []) => (Some(0), "mini-1.local\n"),
                 ("sw_vers", ["-productVersion"]) => (Some(0), "26.2\n"),
-                ("memory_pressure", ["-Q"]) => (Some(1), ""),
                 ("sysctl", ["-n", "vm.swapusage"]) => {
                     (Some(0), "total = 4096.00M  used = 1.50G  free = 2560.00M\n")
                 }
@@ -377,6 +459,7 @@ mod tests {
 
         let response = ProbeCollector::collect_with(
             &FixtureExecutor::default(),
+            &FixtureMemoryPressureQuery::available(1),
             &[directory.path().to_path_buf()],
             "macos",
             "aarch64",
@@ -399,12 +482,28 @@ mod tests {
     }
 
     #[test]
+    fn documented_macos_pressure_levels_map_to_wire_states() {
+        for (level, expected) in [
+            (0, MemoryPressure::Normal),
+            (1, MemoryPressure::Warn),
+            (2, MemoryPressure::Warn),
+            (3, MemoryPressure::Critical),
+        ] {
+            assert_eq!(
+                collect_memory_pressure(&FixtureMemoryPressureQuery::available(level)),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn optional_metric_failures_degrade_to_typed_unknown_values() {
         let response = ProbeCollector::collect_with(
             &FixtureExecutor {
-                fail_optional_metrics: true,
+                fail_swap_metric: true,
                 ..FixtureExecutor::default()
             },
+            &FixtureMemoryPressureQuery::unavailable(),
             &[],
             "macos",
             "arm64",
@@ -427,6 +526,7 @@ mod tests {
                     failed_command: Some(failed_command),
                     ..FixtureExecutor::default()
                 },
+                &FixtureMemoryPressureQuery::available(0),
                 &[],
                 "macos",
                 "arm64",
@@ -439,8 +539,14 @@ mod tests {
 
     #[test]
     fn an_empty_architecture_is_a_protocol_error() {
-        let error = ProbeCollector::collect_with(&FixtureExecutor::default(), &[], "macos", "")
-            .expect_err("an unknown architecture must not produce a partial probe");
+        let error = ProbeCollector::collect_with(
+            &FixtureExecutor::default(),
+            &FixtureMemoryPressureQuery::available(0),
+            &[],
+            "macos",
+            "",
+        )
+        .expect_err("an unknown architecture must not produce a partial probe");
 
         assert!(matches!(error, WorkerError::Protocol(_)));
     }
