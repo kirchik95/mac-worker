@@ -1,0 +1,321 @@
+use std::{
+    collections::VecDeque,
+    ffi::OsString,
+    os::unix::process::ExitStatusExt,
+    process::ExitStatus,
+    sync::{Arc, Mutex},
+};
+
+use mac_worker::{
+    config::{Config, WorkerEntry},
+    error::WorkerError,
+    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    protocol::HealthStatus,
+    transport::{SshTransport, WorkersService},
+};
+
+#[derive(Clone)]
+struct RecordingRunner {
+    requests: Arc<Mutex<Vec<ProcessRequest>>>,
+    results: Arc<Mutex<VecDeque<Result<ProcessResult, WorkerError>>>>,
+}
+
+impl RecordingRunner {
+    fn returning_json(stdout: Vec<u8>) -> Self {
+        Self::returning(ProcessResult {
+            status: exit_status(0),
+            stdout,
+            stderr: Vec::new(),
+        })
+    }
+
+    fn returning(result: ProcessResult) -> Self {
+        Self::returning_result(Ok(result))
+    }
+
+    fn returning_result(result: Result<ProcessResult, WorkerError>) -> Self {
+        Self::returning_results(vec![result])
+    }
+
+    fn returning_results(results: Vec<Result<ProcessResult, WorkerError>>) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            results: Arc::new(Mutex::new(VecDeque::from(results))),
+        }
+    }
+
+    fn requests(&self) -> Vec<ProcessRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl ProcessRunner for RecordingRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.requests.lock().unwrap().push(request.clone());
+        self.results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("a predetermined process result")
+    }
+}
+
+fn exit_status(code: i32) -> ExitStatus {
+    ExitStatus::from_raw(code << 8)
+}
+
+fn valid_probe_json() -> Vec<u8> {
+    br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":["darwin-arm64","git"]}"#.to_vec()
+}
+
+fn worker(name: &str, ssh: &str, capabilities: &[&str]) -> WorkerEntry {
+    WorkerEntry {
+        name: name.into(),
+        ssh: ssh.into(),
+        slots: 1,
+        capabilities: capabilities
+            .iter()
+            .map(|capability| (*capability).into())
+            .collect(),
+        remote_binary: "~/.local/bin/worker".into(),
+    }
+}
+
+#[test]
+fn probe_uses_batch_ssh_and_the_fixed_host_command() {
+    let runner = RecordingRunner::returning_json(valid_probe_json());
+    let transport = SshTransport::new(runner.clone());
+    let worker = worker("mini-1", "mac1", &["darwin-arm64"]);
+
+    let health = transport.probe(&worker);
+
+    assert_eq!(health.status, HealthStatus::Ready);
+    assert_eq!(
+        runner.requests(),
+        vec![ProcessRequest {
+            program: OsString::from("/usr/bin/ssh"),
+            args: vec![
+                "-o".into(),
+                "BatchMode=yes".into(),
+                "-o".into(),
+                "ConnectTimeout=5".into(),
+                "mac1".into(),
+                "~/.local/bin/worker host probe".into(),
+            ],
+            stdin: None,
+        }]
+    );
+}
+
+#[test]
+fn nonzero_ssh_exit_is_reported_as_unavailable() {
+    let runner = RecordingRunner::returning(ProcessResult {
+        status: exit_status(255),
+        stdout: Vec::new(),
+        stderr: b"connection refused".to_vec(),
+    });
+    let transport = SshTransport::new(runner);
+
+    let health = transport.probe(&worker("mini-1", "mac1", &[]));
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("SSH_UNAVAILABLE"));
+    assert!(health.error_message.is_some());
+    assert!(health.probe.is_none());
+}
+
+#[test]
+fn process_launch_failure_is_reported_as_unavailable() {
+    let runner = RecordingRunner::returning_result(Err(WorkerError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "ssh was not found",
+    ))));
+    let transport = SshTransport::new(runner);
+
+    let health = transport.probe(&worker("mini-1", "mac1", &[]));
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("SSH_UNAVAILABLE"));
+    assert!(health.error_message.is_some());
+}
+
+#[test]
+fn malformed_json_is_reported_as_an_invalid_response() {
+    let runner = RecordingRunner::returning_json(b"not JSON".to_vec());
+    let transport = SshTransport::new(runner);
+
+    let health = transport.probe(&worker("mini-1", "mac1", &[]));
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
+    assert!(health.error_message.is_some());
+    assert!(health.probe.is_none());
+}
+
+#[test]
+fn invalid_utf8_is_reported_as_an_invalid_response() {
+    let runner = RecordingRunner::returning_json(vec![0xff]);
+    let transport = SshTransport::new(runner);
+
+    let health = transport.probe(&worker("mini-1", "mac1", &[]));
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
+    assert!(health.error_message.is_some());
+}
+
+#[test]
+fn output_larger_than_one_mib_is_reported_as_an_invalid_response() {
+    let runner = RecordingRunner::returning_json(vec![b' '; 1024 * 1024 + 1]);
+    let transport = SshTransport::new(runner);
+
+    let health = transport.probe(&worker("mini-1", "mac1", &[]));
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
+    assert!(health.error_message.is_some());
+}
+
+#[test]
+fn protocol_mismatch_is_reported_as_unavailable() {
+    let response = valid_probe_json()
+        .into_iter()
+        .enumerate()
+        .map(|(index, byte)| if index == 20 { b'2' } else { byte })
+        .collect();
+    let runner = RecordingRunner::returning_json(response);
+    let transport = SshTransport::new(runner);
+
+    let health = transport.probe(&worker("mini-1", "mac1", &[]));
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
+    assert!(health.error_message.is_some());
+    assert_eq!(
+        health.probe.as_ref().map(|probe| probe.protocol_version),
+        Some(2)
+    );
+}
+
+#[test]
+fn absent_declared_capabilities_exclude_the_worker() {
+    let runner = RecordingRunner::returning_json(valid_probe_json());
+    let transport = SshTransport::new(runner);
+
+    let health = transport.probe(&worker("mini-1", "mac1", &["docker", "swift"]));
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("MISSING_CAPABILITIES"));
+    assert_eq!(health.missing_capabilities, vec!["docker", "swift"]);
+    assert!(health.error_message.is_some());
+    assert!(health.probe.is_some());
+}
+
+#[test]
+fn inventory_keeps_ready_and_failed_workers_in_config_order() {
+    let protocol_mismatch = valid_probe_json()
+        .into_iter()
+        .enumerate()
+        .map(|(index, byte)| if index == 20 { b'2' } else { byte })
+        .collect();
+    let runner = RecordingRunner::returning_results(vec![
+        Ok(ProcessResult {
+            status: exit_status(0),
+            stdout: valid_probe_json(),
+            stderr: Vec::new(),
+        }),
+        Ok(ProcessResult {
+            status: exit_status(255),
+            stdout: Vec::new(),
+            stderr: b"offline".to_vec(),
+        }),
+        Ok(ProcessResult {
+            status: exit_status(0),
+            stdout: b"not JSON".to_vec(),
+            stderr: Vec::new(),
+        }),
+        Ok(ProcessResult {
+            status: exit_status(0),
+            stdout: protocol_mismatch,
+            stderr: Vec::new(),
+        }),
+    ]);
+    let config = Config {
+        version: 1,
+        workers: vec![
+            worker("ready", "mac1", &["darwin-arm64"]),
+            worker("offline", "mac2", &[]),
+            worker("malformed", "mac3", &[]),
+            worker("mismatched", "mac4", &[]),
+        ],
+    };
+    let service = WorkersService::new(SshTransport::new(runner));
+
+    let report = service.inspect(&config);
+
+    assert_eq!(report.protocol_version, 1);
+    assert_eq!(
+        report
+            .workers
+            .iter()
+            .map(|health| health.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ready", "offline", "malformed", "mismatched"]
+    );
+    assert_eq!(report.workers[0].status, HealthStatus::Ready);
+    assert_eq!(report.workers[0].error_code, None);
+    assert_eq!(
+        report.workers[1].error_code.as_deref(),
+        Some("SSH_UNAVAILABLE")
+    );
+    assert_eq!(
+        report.workers[2].error_code.as_deref(),
+        Some("INVALID_RESPONSE")
+    );
+    assert_eq!(
+        report.workers[3].error_code.as_deref(),
+        Some("PROTOCOL_MISMATCH")
+    );
+    assert!(
+        report.workers[1..]
+            .iter()
+            .all(|health| health.status == HealthStatus::Unavailable
+                && health.error_message.is_some())
+    );
+
+    let json = serde_json::to_string(&report).expect("workers report must serialize as JSON");
+    let value: serde_json::Value =
+        serde_json::from_str(&json).expect("serialized workers report must be valid JSON");
+    assert_eq!(value["workers"][1]["error_code"], "SSH_UNAVAILABLE");
+}
+
+#[test]
+fn system_runner_passes_arguments_without_shell_interpretation() {
+    let literal = "$(printf injected); $HOME *";
+    let request = ProcessRequest {
+        program: "/usr/bin/printf".into(),
+        args: vec!["%s".into(), literal.into()],
+        stdin: None,
+    };
+
+    let result = SystemProcessRunner.run(&request).unwrap();
+
+    assert!(result.status.success());
+    assert_eq!(result.stdout, literal.as_bytes());
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
+fn system_runner_writes_the_requested_stdin() {
+    let request = ProcessRequest {
+        program: "/bin/cat".into(),
+        args: Vec::new(),
+        stdin: Some(b"raw stdin bytes\n".to_vec()),
+    };
+
+    let result = SystemProcessRunner.run(&request).unwrap();
+
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"raw stdin bytes\n");
+    assert!(result.stderr.is_empty());
+}

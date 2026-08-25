@@ -3,7 +3,9 @@ pub mod config;
 pub mod error;
 pub mod paths;
 pub mod probe;
+pub mod process;
 pub mod protocol;
+pub mod transport;
 
 #[cfg(test)]
 mod tests {
