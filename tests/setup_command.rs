@@ -259,7 +259,7 @@ fn failed_verification_restores_only_the_installation_scoped_backup() {
                 "ConnectTimeout=5".into(),
                 "mac1".into(),
                 format!(
-                    "rm -f ~/.local/bin/worker && if [ -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.previous ]; then mv ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.previous ~/.local/bin/worker; fi && rm -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.new && rmdir ~/.local/share/mac-worker/setup/{INSTALLATION_ID}"
+                    "if [ -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.previous ]; then mv ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.previous ~/.local/bin/worker; else rm -f ~/.local/bin/worker; fi && rm -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.new && rmdir ~/.local/share/mac-worker/setup/{INSTALLATION_ID}"
                 )
                 .into(),
             ],

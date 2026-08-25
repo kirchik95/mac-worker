@@ -90,7 +90,7 @@ impl<'a> Installer<'a> {
                 args: ssh_args(
                     worker,
                     format!(
-                        "rm -f ~/.local/bin/worker && if [ -f {staging}/worker.previous ]; then mv {staging}/worker.previous ~/.local/bin/worker; fi && rm -f {staging}/worker.new && rmdir {staging}"
+                        "if [ -f {staging}/worker.previous ]; then mv {staging}/worker.previous ~/.local/bin/worker; else rm -f ~/.local/bin/worker; fi && rm -f {staging}/worker.new && rmdir {staging}"
                     ),
                 ),
                 stdin: None,
