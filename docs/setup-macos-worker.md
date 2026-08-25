@@ -89,39 +89,137 @@ fi
 /usr/bin/shasum -a 256 "$HOME/.local/bin/worker" 2>/dev/null
 ```
 
-Only proceed if the lock owner still equals `$owner`, the active helper SHA-256 equals the recorded `candidate.sha256` or `previous.sha256`, and the active helper succeeds:
+If inspection shows an expected state, run this complete cleanup block as one command. It deliberately recomputes every value rather than relying on the inspection block, so it is safe to copy independently. It performs no removal until the owner, transaction, recorded digests, active helper, and probe have all been validated, then reads them again immediately before cleanup.
 
 ```bash
-active_digest="$(/usr/bin/shasum -a 256 "$HOME/.local/bin/worker" 2>/dev/null | /usr/bin/awk '{print $1}')"
-candidate_digest="$(/bin/cat "$transaction/candidate.sha256" 2>/dev/null)"
-previous_digest="$(/bin/cat "$transaction/previous.sha256" 2>/dev/null)"
-current_owner="$(/bin/cat "$lock_dir/owner" 2>/dev/null)"
+(
+    set -eu
 
-if [ "$current_owner" != "$owner" ] || { [ "$active_digest" != "$candidate_digest" ] && [ "$active_digest" != "$previous_digest" ]; }; then
-    printf '%s\n' 'setup state or helper digest is unknown; retain the lock and stop' >&2
-    exit 1
-fi
+    fail() {
+        printf '%s\n' "$1" >&2
+        exit 1
+    }
 
-"$HOME/.local/bin/worker" host probe
+    valid_owner() {
+        printf '%s\n' "$1" | /usr/bin/grep -Eq '^[0-9a-f]{32}$'
+    }
+
+    valid_digest() {
+        printf '%s\n' "$1" | /usr/bin/grep -Eq '^[0-9a-f]{64}$'
+    }
+
+    setup_root="$HOME/.local/share/mac-worker/setup"
+    lock_dir="$setup_root/.install-lock"
+    transaction_owner_path="$lock_dir/owner"
+    worker="$HOME/.local/bin/worker"
+
+    owner="$(/bin/cat "$transaction_owner_path" 2>/dev/null)" \
+        || fail 'setup lock owner is missing; retain the lock and stop'
+    if ! valid_owner "$owner"; then
+        fail 'setup lock owner is invalid; retain the lock and stop'
+    fi
+
+    transaction="$setup_root/$owner"
+    if [ ! -d "$transaction" ]; then
+        fail 'owner-scoped setup transaction is missing; retain the lock and stop'
+    fi
+
+    candidate_present=0
+    candidate_digest=''
+    if [ -f "$transaction/candidate.sha256" ]; then
+        candidate_present=1
+        candidate_digest="$(/bin/cat "$transaction/candidate.sha256" 2>/dev/null)" \
+            || fail 'candidate digest cannot be read; retain the lock and stop'
+        if ! valid_digest "$candidate_digest"; then
+            fail 'candidate digest is invalid; retain the lock and stop'
+        fi
+    fi
+
+    previous_present=0
+    previous_digest=''
+    if [ -f "$transaction/previous.sha256" ]; then
+        previous_present=1
+        previous_digest="$(/bin/cat "$transaction/previous.sha256" 2>/dev/null)" \
+            || fail 'previous digest cannot be read; retain the lock and stop'
+        if ! valid_digest "$previous_digest"; then
+            fail 'previous digest is invalid; retain the lock and stop'
+        fi
+    fi
+
+    if [ "$candidate_present" -eq 0 ] && [ "$previous_present" -eq 0 ]; then
+        fail 'no recorded helper digest is present; retain the lock and stop'
+    fi
+
+    active_digest="$(/usr/bin/shasum -a 256 "$worker" 2>/dev/null)" \
+        || fail 'active helper digest cannot be read; retain the lock and stop'
+    active_digest="${active_digest%% *}"
+    if ! valid_digest "$active_digest"; then
+        fail 'active helper digest is invalid; retain the lock and stop'
+    fi
+    if [ "$active_digest" != "$candidate_digest" ] && [ "$active_digest" != "$previous_digest" ]; then
+        fail 'active helper digest is not a recorded digest; retain the lock and stop'
+    fi
+
+    if ! "$worker" host probe; then
+        fail 'active helper probe failed; retain the lock and stop'
+    fi
+
+    current_owner="$(/bin/cat "$transaction_owner_path" 2>/dev/null)" \
+        || fail 'setup lock owner disappeared before cleanup; retain the lock and stop'
+    if ! valid_owner "$current_owner" || [ "$current_owner" != "$owner" ]; then
+        fail 'setup lock owner changed or is invalid; retain the lock and stop'
+    fi
+    if [ ! -d "$transaction" ]; then
+        fail 'owner-scoped setup transaction changed; retain the lock and stop'
+    fi
+
+    current_candidate_present=0
+    current_candidate_digest=''
+    if [ -f "$transaction/candidate.sha256" ]; then
+        current_candidate_present=1
+        current_candidate_digest="$(/bin/cat "$transaction/candidate.sha256" 2>/dev/null)" \
+            || fail 'candidate digest changed before cleanup; retain the lock and stop'
+        if ! valid_digest "$current_candidate_digest"; then
+            fail 'candidate digest is invalid before cleanup; retain the lock and stop'
+        fi
+    fi
+
+    current_previous_present=0
+    current_previous_digest=''
+    if [ -f "$transaction/previous.sha256" ]; then
+        current_previous_present=1
+        current_previous_digest="$(/bin/cat "$transaction/previous.sha256" 2>/dev/null)" \
+            || fail 'previous digest changed before cleanup; retain the lock and stop'
+        if ! valid_digest "$current_previous_digest"; then
+            fail 'previous digest is invalid before cleanup; retain the lock and stop'
+        fi
+    fi
+
+    if [ "$current_candidate_present" -ne "$candidate_present" ] \
+        || [ "$current_previous_present" -ne "$previous_present" ] \
+        || [ "$current_candidate_digest" != "$candidate_digest" ] \
+        || [ "$current_previous_digest" != "$previous_digest" ]; then
+        fail 'recorded helper digests changed before cleanup; retain the lock and stop'
+    fi
+
+    current_active_digest="$(/usr/bin/shasum -a 256 "$worker" 2>/dev/null)" \
+        || fail 'active helper digest disappeared before cleanup; retain the lock and stop'
+    current_active_digest="${current_active_digest%% *}"
+    if ! valid_digest "$current_active_digest"; then
+        fail 'active helper digest is invalid before cleanup; retain the lock and stop'
+    fi
+    if [ "$current_active_digest" != "$active_digest" ] \
+        || { [ "$current_active_digest" != "$candidate_digest" ] && [ "$current_active_digest" != "$previous_digest" ]; }; then
+        fail 'active helper digest changed before cleanup; retain the lock and stop'
+    fi
+
+    /bin/rm -f "$transaction/worker.new" "$transaction/worker.previous" \
+        "$transaction/candidate.sha256" "$transaction/previous.sha256" \
+        "$transaction/no-previous" "$transaction/state"
+    /bin/rmdir "$transaction"
+    /bin/rm -f "$transaction_owner_path"
+    /bin/rmdir "$lock_dir"
+)
 ```
 
-After that probe succeeds, re-read the owner and digest immediately before performing the targeted cleanup. This removes only the named files from the exact owner-scoped transaction and releases only its matching lock.
-
-```bash
-current_owner="$(/bin/cat "$lock_dir/owner" 2>/dev/null)"
-active_digest="$(/usr/bin/shasum -a 256 "$HOME/.local/bin/worker" 2>/dev/null | /usr/bin/awk '{print $1}')"
-
-if [ "$current_owner" != "$owner" ] || { [ "$active_digest" != "$candidate_digest" ] && [ "$active_digest" != "$previous_digest" ]; }; then
-    printf '%s\n' 'ownership or helper digest changed; retain the lock and stop' >&2
-    exit 1
-fi
-
-/bin/rm -f "$transaction/worker.new" "$transaction/worker.previous" \
-    "$transaction/candidate.sha256" "$transaction/previous.sha256" \
-    "$transaction/no-previous" "$transaction/state"
-/bin/rmdir "$transaction"
-/bin/rm -f "$lock_dir/owner"
-/bin/rmdir "$lock_dir"
-```
-
-If any inspection, identity check, probe, removal, or `rmdir` step fails, stop and retain the remaining state for investigation. Do not delete unrelated setup directories or release a lock whose owner no longer matches.
+If any inspection, identity check, probe, removal, or `rmdir` step fails, stop, retain the lock and transaction as evidence, and do not retry setup. Do not delete unrelated setup directories or release a lock whose owner no longer matches.
