@@ -1,7 +1,7 @@
 # mac-worker v1 design
 
 - Date: 2026-08-25
-- Status: proposed for implementation
+- Status: approved for implementation
 - Repository: `mac-worker`
 - User-facing command: `worker`
 
