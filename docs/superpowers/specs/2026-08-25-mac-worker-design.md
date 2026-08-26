@@ -330,6 +330,12 @@ Every accepted job records:
 
 No telemetry leaves the local network in v1. Human-readable output and JSON output derive from the same typed records.
 
+### 19.1 Local operational dashboard
+
+After the three-worker scheduler is complete, phase 4.5 adds an optional read-only dashboard started by `worker dashboard`. It binds only to loopback on the MacBook, embeds its assets in the existing binary, and derives worker, queue, job, and log views from the same typed state used by the CLI. It is not a daemon, an authority for job state, or a service installed on the Mac minis.
+
+The detailed scope, security boundary, data flow, and acceptance criteria are defined in [the local dashboard design](2026-08-26-local-dashboard-design.md).
+
 ## 20. Verification strategy
 
 ### 20.1 Automated tests
@@ -373,7 +379,7 @@ The design advances beyond v1 only if:
 
 ## 21. Delivery boundary
 
-V1 is complete when `setup`, `doctor`, `run`, `workers`, `status`, reconnectable `logs`, `cancel`, `fetch`, and safe `gc` work against the three configured Macs for trusted batch commands, and the automated correctness/lifecycle suites pass.
+The V1 execution core is complete when `setup`, `doctor`, `run`, `workers`, `status`, reconnectable `logs`, `cancel`, `fetch`, and safe `gc` work against the three configured Macs for trusted batch commands, and the automated correctness/lifecycle suites pass. The personal V1 roadmap is complete when the phase-4.5 read-only local dashboard also passes its acceptance criteria; dashboard availability never becomes a prerequisite for CLI execution.
 
 The following require a new design review rather than incremental scope creep:
 
@@ -382,7 +388,7 @@ The following require a new design review rather than incremental scope creep:
 - untrusted-code isolation;
 - automatic runtime provisioning;
 - multi-user scheduling and quotas;
-- a central service or web UI;
+- a remotely hosted, multi-user, or non-loopback service or web UI;
 - Git-history-aware snapshots;
 - Kubernetes, Coder, or a remote-execution control plane.
 
