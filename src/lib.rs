@@ -24,6 +24,7 @@ pub mod project;
 pub mod project_config;
 pub mod protocol;
 pub mod requirements;
+pub mod rooted_fs;
 pub mod transport;
 
 pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutput, WorkerError> {
