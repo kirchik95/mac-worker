@@ -149,6 +149,52 @@ fn malformed_nul_streams_and_non_utf8_names_have_stable_failures() {
 }
 
 #[test]
+fn attribute_output_requires_one_ordered_matching_triplet_per_selected_path() {
+    // Catches empty, shortened, duplicate, unexpected, reordered, or excess
+    // check-attr output bypassing filter enforcement for selected inputs.
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("a.txt"), b"a\n").unwrap();
+    fs::write(directory.path().join("b.txt"), b"b\n").unwrap();
+    let a = attribute_triplet("a.txt");
+    let b = attribute_triplet("b.txt");
+    let other = attribute_triplet("other.txt");
+    let cases = [
+        ("empty", Vec::new()),
+        ("shortened", a.clone()),
+        ("duplicate", [a.as_slice(), a.as_slice()].concat()),
+        ("unexpected", [a.as_slice(), other.as_slice()].concat()),
+        ("reordered", [b.as_slice(), a.as_slice()].concat()),
+        (
+            "excess",
+            [a.as_slice(), b.as_slice(), b.as_slice()].concat(),
+        ),
+    ];
+
+    let observed = cases
+        .into_iter()
+        .map(|(label, attributes)| {
+            let result = InputSelector::new(&AttributeOutputRunner { attributes }).select(
+                &synthetic_context(directory.path()),
+                &settings(&[], &[], &[]),
+            );
+            (label, result.err().map(|error| error.code))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        observed,
+        vec![
+            ("empty", Some("INVALID_GIT_OUTPUT")),
+            ("shortened", Some("INVALID_GIT_OUTPUT")),
+            ("duplicate", Some("INVALID_GIT_OUTPUT")),
+            ("unexpected", Some("INVALID_GIT_OUTPUT")),
+            ("reordered", Some("INVALID_GIT_OUTPUT")),
+            ("excess", Some("INVALID_GIT_OUTPUT")),
+        ]
+    );
+}
+
+#[test]
 fn tracked_worktree_entries_and_deletions_are_selected_deterministically() {
     // Catches reading committed blobs instead of selecting the current staged
     // and unstaged filesystem entries, and catches nondeterministic manifests.
@@ -255,6 +301,37 @@ fn explicit_patterns_admit_non_ignored_and_ignored_inputs_with_their_origins() {
 }
 
 #[test]
+fn nested_attributes_block_lfs_on_an_included_untracked_file() {
+    // Catches checking attributes before explicit untracked inputs have joined
+    // the selected filesystem-entry set.
+    let repo = GitRepo::init();
+    repo.write("nested/.gitattributes", b"*.bin filter=lfs\n");
+    repo.commit_all("track nested attributes");
+    repo.write("nested/local.bin", b"untracked lfs materialization\n");
+
+    let error = select(&repo, &settings(&["nested/*.bin"], &[], &[])).unwrap_err();
+
+    assert_eq!(error.code, "UNSUPPORTED_LFS");
+    assert_eq!(error.paths[0].as_str(), "nested/local.bin");
+}
+
+#[test]
+fn nested_attributes_block_custom_filters_on_an_included_ignored_file() {
+    // Catches checking attributes only for tracked entries while an ignored
+    // input with a nested custom filter is explicitly admitted.
+    let repo = GitRepo::init();
+    repo.write(".gitignore", b"nested/*.dat\n");
+    repo.write("nested/.gitattributes", b"*.dat filter=custom\n");
+    repo.commit_all("track nested ignore and attributes");
+    repo.write("nested/local.dat", b"ignored filtered materialization\n");
+
+    let error = select(&repo, &settings(&["nested/*.dat"], &[], &[])).unwrap_err();
+
+    assert_eq!(error.code, "UNSUPPORTED_FILTER");
+    assert_eq!(error.paths[0].as_str(), "nested/local.dat");
+}
+
+#[test]
 fn only_existing_physical_empty_directories_are_admitted() {
     // Catches declared empty directories escaping through a symlink or being
     // accepted after they gained contents.
@@ -284,6 +361,24 @@ fn only_existing_physical_empty_directories_are_admitted() {
         assert_eq!(error.code, "INVALID_EMPTY_DIRECTORY", "{declaration}");
         assert_eq!(error.paths[0].as_str(), declaration);
     }
+}
+
+#[test]
+fn empty_directory_declarations_reject_an_in_worktree_parent_symlink() {
+    // Catches validating only the final empty-directory component while an
+    // earlier component redirects traversal through a symlink.
+    let repo = GitRepo::init();
+    create_directory(repo.root().join("fixtures/actual/empty"));
+    symlink("actual", repo.root().join("fixtures/link")).unwrap();
+
+    let error = select(
+        &repo,
+        &settings(&["fixtures/link"], &["fixtures/link/empty"], &[]),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code, "INVALID_EMPTY_DIRECTORY");
+    assert_eq!(error.paths[0].as_str(), "fixtures/link/empty");
 }
 
 #[test]
@@ -450,6 +545,7 @@ fn input_count_and_git_request_policies_are_bounded_and_isolated() {
             vec![
                 ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+                ("GIT_ATTR_NOSYSTEM".into(), "1".into()),
             ]
         );
         for name in [
@@ -463,8 +559,17 @@ fn input_count_and_git_request_policies_are_bounded_and_isolated() {
             "GIT_DISCOVERY_ACROSS_FILESYSTEM",
             "GIT_CONFIG_COUNT",
             "GIT_CONFIG_PARAMETERS",
+            "GIT_ATTR_SOURCE",
+            "GIT_CONFIG",
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
         ] {
             assert!(request.environment_remove.contains(&name.into()));
+        }
+        for preserved in ["HOME", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"] {
+            assert!(!request.environment_remove.contains(&preserved.into()));
         }
     }
     let ignored = requests
@@ -500,6 +605,40 @@ impl ProcessRunner for FixedOutputRunner {
         Ok(ProcessResult {
             status: ExitStatus::from_raw(0),
             stdout: self.stdout.clone(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+fn attribute_triplet(path: &str) -> Vec<u8> {
+    [path.as_bytes(), b"\0filter\0unspecified\0"].concat()
+}
+
+struct AttributeOutputRunner {
+    attributes: Vec<u8>,
+}
+
+impl ProcessRunner for AttributeOutputRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let (status, stdout) = if request.args.iter().any(|arg| arg == "--stage") {
+            (
+                ExitStatus::from_raw(0),
+                [
+                    b"100644 0123456789012345678901234567890123456789 0\ta.txt\0".as_slice(),
+                    b"100644 0123456789012345678901234567890123456789 0\tb.txt\0",
+                ]
+                .concat(),
+            )
+        } else if request.args.iter().any(|arg| arg == "--get-regexp") {
+            (ExitStatus::from_raw(1 << 8), Vec::new())
+        } else if request.args.iter().any(|arg| arg == "check-attr") {
+            (ExitStatus::from_raw(0), self.attributes.clone())
+        } else {
+            (ExitStatus::from_raw(0), Vec::new())
+        };
+        Ok(ProcessResult {
+            status,
+            stdout,
             stderr: Vec::new(),
         })
     }

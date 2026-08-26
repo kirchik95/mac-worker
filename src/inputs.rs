@@ -31,6 +31,12 @@ const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
+    "GIT_ATTR_SOURCE",
+    "GIT_CONFIG",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -192,7 +198,6 @@ impl<'a> InputSelector<'a> {
         }
 
         self.reject_configured_filters(context)?;
-        self.reject_attributes(context, selected.keys())?;
 
         for path in empty_directories {
             reject_forbidden(&path)?;
@@ -259,6 +264,14 @@ impl<'a> InputSelector<'a> {
             }
         }
 
+        self.reject_attributes(
+            context,
+            selected
+                .values()
+                .filter(|entry| entry.kind == SelectedInputKind::FilesystemEntry)
+                .map(|entry| &entry.path),
+        )?;
+
         let mut warnings = Vec::new();
         let mut blocked_sensitive = Vec::new();
         for entry in selected.values() {
@@ -323,8 +336,12 @@ impl<'a> InputSelector<'a> {
         context: &ProjectContext,
         paths: impl Iterator<Item = &'b RelativePath>,
     ) -> Result<(), SelectionFailure> {
+        let expected = paths.collect::<Vec<_>>();
+        if expected.len() > GIT_ENTRY_LIMIT {
+            return Err(input_set_too_large());
+        }
         let mut stdin = Vec::new();
-        for path in paths {
+        for path in &expected {
             stdin.extend_from_slice(path.as_str().as_bytes());
             stdin.push(0);
         }
@@ -337,8 +354,10 @@ impl<'a> InputSelector<'a> {
             Some(stdin),
         )?;
         let mut records = nul_records(&output.stdout)?;
-        let mut entry_count = 0;
-        while let Some(path_bytes) = records.next() {
+        for expected_path in expected {
+            let path_bytes = records
+                .next()
+                .ok_or_else(|| invalid_git_output("Git omitted requested attribute output"))?;
             let attribute = records
                 .next()
                 .ok_or_else(|| invalid_git_output("Git returned malformed attribute output"))?;
@@ -348,11 +367,11 @@ impl<'a> InputSelector<'a> {
             reject_empty_record(path_bytes)?;
             reject_empty_record(attribute)?;
             reject_empty_record(value_bytes)?;
-            entry_count += 1;
-            if entry_count > GIT_ENTRY_LIMIT {
-                return Err(input_set_too_large());
+            if path_bytes != expected_path.as_str().as_bytes() {
+                return Err(invalid_git_output(
+                    "Git returned attributes for an unexpected or reordered path",
+                ));
             }
-            let path = RelativePath::parse(path_bytes)?;
             if attribute != b"filter" {
                 return Err(invalid_git_output(
                     "Git returned an unexpected attribute name",
@@ -363,19 +382,24 @@ impl<'a> InputSelector<'a> {
             if value == "lfs" {
                 return Err(failure(
                     "UNSUPPORTED_LFS",
-                    format!("Git LFS input {} is not supported", path),
-                    vec![path],
+                    format!("Git LFS input {} is not supported", expected_path),
+                    vec![expected_path.clone()],
                     1,
                 ));
             }
             if !matches!(value, "unspecified" | "unset") {
                 return Err(failure(
                     "UNSUPPORTED_FILTER",
-                    format!("filtered Git input {} is not supported", path),
-                    vec![path],
+                    format!("filtered Git input {} is not supported", expected_path),
+                    vec![expected_path.clone()],
                     1,
                 ));
             }
+        }
+        if records.next().is_some() {
+            return Err(invalid_git_output(
+                "Git returned excess or duplicate attribute output",
+            ));
         }
         Ok(())
     }
@@ -421,6 +445,7 @@ impl<'a> InputSelector<'a> {
                     OsString::from("/dev/null"),
                 ),
                 (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+                (OsString::from("GIT_ATTR_NOSYSTEM"), OsString::from("1")),
             ],
             environment_remove: GIT_ENVIRONMENT_REMOVALS
                 .iter()
@@ -615,24 +640,28 @@ fn reject_empty_record(record: &[u8]) -> Result<(), SelectionFailure> {
 
 fn validate_empty_directory(root: &Path, path: &RelativePath) -> Result<(), SelectionFailure> {
     let candidate = root.join(path.as_path());
-    let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
-        failure(
-            "INVALID_EMPTY_DIRECTORY",
-            format!("declared empty directory {} is unavailable: {error}", path),
-            vec![path.clone()],
-            1,
-        )
-    })?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(failure(
-            "INVALID_EMPTY_DIRECTORY",
-            format!(
-                "declared empty directory {} is not a physical directory",
-                path
-            ),
-            vec![path.clone()],
-            1,
-        ));
+    let mut traversed = root.to_path_buf();
+    for component in path.as_str().split('/') {
+        traversed.push(component);
+        let metadata = fs::symlink_metadata(&traversed).map_err(|error| {
+            failure(
+                "INVALID_EMPTY_DIRECTORY",
+                format!("declared empty directory {} is unavailable: {error}", path),
+                vec![path.clone()],
+                1,
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(failure(
+                "INVALID_EMPTY_DIRECTORY",
+                format!(
+                    "declared empty directory {} traverses a non-directory or symlink",
+                    path
+                ),
+                vec![path.clone()],
+                1,
+            ));
+        }
     }
     let physical_root = fs::canonicalize(root).map_err(|error| {
         failure(
