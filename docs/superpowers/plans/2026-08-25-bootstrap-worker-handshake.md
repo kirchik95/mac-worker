@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the first production-shaped vertical slice of `mac-worker`: one Rust binary that loads the worker inventory on the MacBook, installs itself without sudo into an already-provisioned macOS worker account, probes every configured worker over system SSH, and renders the same typed health report as human-readable or JSON output.
+**Goal:** Build the first production-shaped vertical slice of `mac-worker`: one Rust binary that loads the worker inventory on the MacBook, installs itself without sudo into the configured existing macOS account, probes every configured worker over system SSH, and renders the same typed health report as human-readable or JSON output.
 
 **Architecture:** The public client and hidden host helper are subcommands of the same `worker` binary. The client owns configuration and invokes fixed host-helper commands through an injectable process boundary; the helper gathers host facts and emits one versioned JSON response on stdout. This slice deliberately stops before project snapshots and user command execution, so the next plan can build `worker run` on a verified transport and protocol rather than a throwaway prototype.
 
@@ -20,7 +20,7 @@
 - Every v1 worker declares exactly one heavy slot.
 - Machine-readable responses are versioned typed records; diagnostics never contaminate JSON stdout.
 - SSH aliases and worker names are data, never interpolated into a shell expression.
-- Setup requires an existing dedicated non-admin account and working non-interactive SSH authentication.
+- Setup requires an existing macOS account selected for worker jobs and working non-interactive SSH authentication; a dedicated non-admin account is optional hardening.
 - No personal credentials, SSH-agent forwarding, project files, or secrets are copied in this slice.
 
 ## Delivery Sequence
@@ -678,12 +678,12 @@ git commit -m "feat: install worker host helper"
 
 The guide must state exactly:
 
-1. Create a dedicated standard macOS account manually; `worker setup` never creates or elevates accounts.
-2. Enable Remote Login for only that account through macOS settings.
-3. Install one dedicated public key in that account's `~/.ssh/authorized_keys` with modes `0700` for `.ssh` and `0600` for the file.
+1. Select the existing macOS account that will run worker jobs; `worker setup` never creates or elevates accounts.
+2. Enable Remote Login for that account through macOS settings and limit access to accounts that need it.
+3. Install one worker-specific public key in that account's `~/.ssh/authorized_keys` with modes `0700` for `.ssh` and `0600` for the file.
 4. Pin the worker host key locally and disable SSH agent forwarding for each worker alias.
 5. Confirm `ssh -o BatchMode=yes -o ConnectTimeout=5 mac1 /usr/bin/true` exits `0` without a prompt.
-6. Keep Codex, Claude, personal cloud credentials, production credentials, and sudo access out of the worker account.
+6. Only run trusted code, avoid passwordless sudo, and keep production or other high-value credentials off the worker machines where practical.
 
 - [ ] **Step 2: Update the README with the phase-one quick start**
 
@@ -732,7 +732,7 @@ git commit -m "docs: add worker bootstrap guide"
 
 ## Plan Self-Review Results
 
-- Spec coverage: this plan covers the shared binary, XDG config, worker inventory, SSH transport, protocol versioning, host probe, non-sudo setup, capability visibility, JSON/human output, and dedicated-account prerequisite. Snapshot, execution lifecycle, scheduling, artifacts, Docker, and GC are assigned to plans 2–5 rather than partially implemented here.
+- Spec coverage: this plan covers the shared binary, XDG config, worker inventory, SSH transport, protocol versioning, host probe, non-sudo setup, capability visibility, JSON/human output, and configured-account prerequisite. Snapshot, execution lifecycle, scheduling, artifacts, Docker, and GC are assigned to plans 2–5 rather than partially implemented here.
 - Placeholder scan: every task names concrete files, interfaces, commands, expected results, and commit boundaries; no deferred implementation marker is used.
 - Type consistency: `WorkerEntry`, `ProbeResponse`, `WorkerHealth`, `WorkersReport`, `ProcessRequest`, `ProcessRunner`, `SshTransport`, and `Installer` have a single spelling and ownership point throughout the plan.
 - Safety check: no test or setup step creates accounts, enables Remote Login, changes sudo policy, disables host-key checking, forwards an agent, or deletes paths outside the exact setup staging directory and binary backup.

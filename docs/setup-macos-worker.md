@@ -1,35 +1,35 @@
 # Set up a macOS worker
 
-This guide prepares a trusted Mac mini for the phase-one `worker setup` and `worker workers` commands. It deliberately separates account administration from tool installation: `worker setup` installs the worker helper, but does not create accounts, grant privileges, or change Remote Login settings.
+This guide prepares a trusted Mac mini for the phase-one `worker setup` and `worker workers` commands. It deliberately separates account administration from tool installation: `worker setup` installs the worker helper into the selected account, but does not create accounts, grant privileges, or change Remote Login settings.
 
-## 1. Create the worker account
+## 1. Choose the worker account
 
-Create a dedicated standard macOS account manually. `worker setup` never creates or elevates accounts. Do not make this account an administrator and do not grant it sudo access.
+For this deployment, use the existing macOS account on each Mac mini. A dedicated standard account remains an optional hardening step, but is not required. `worker setup` never creates accounts, elevates privileges, or invokes `sudo`.
 
-Keep Codex, Claude, personal cloud credentials, production credentials, and sudo access out of the worker account. Treat this account as a narrowly scoped execution identity, not as a personal login.
+Remote jobs inherit everything that the selected account can access, including its files, processes, Keychain items available without interaction, development credentials, and Docker state. Only dispatch trusted code, avoid passwordless sudo, and keep production or other high-value credentials off these worker machines where practical.
 
-## 2. Enable SSH only for that account
+## 2. Enable SSH for the selected account
 
-In macOS **System Settings**, enable **General → Sharing → Remote Login** and allow access only for the dedicated worker account. Do not enable Remote Login for general users merely to make the worker reachable.
+In macOS **System Settings**, enable **General → Sharing → Remote Login** and allow access for the selected account. Limit Remote Login to only the accounts that actually need worker access.
 
-Install one dedicated public key in that account's `~/.ssh/authorized_keys`. Set mode `0700` on `.ssh` and `0600` on `authorized_keys`:
+Install one worker-specific public key in that account's `~/.ssh/authorized_keys`. Set mode `0700` on `.ssh` and `0600` on `authorized_keys`:
 
 ```bash
 chmod 0700 ~/.ssh
 chmod 0600 ~/.ssh/authorized_keys
 ```
 
-Use the worker account's own shell for these commands. The key must be dedicated to this worker access path; do not reuse a personal key that has broader access.
+Use the selected account's own shell for these commands. The key should be dedicated to this worker access path; do not reuse a personal key that has broader access.
 
 ## 3. Configure the local SSH alias
 
-Configure the alias used by `config.example.toml` (for example, `mac1`) to log in as the dedicated worker account. Pin the worker host key locally and disable SSH agent forwarding for each worker alias. A representative `~/.ssh/config` entry is:
+Configure the alias used by `config.example.toml` (for example, `mac1`) to log in as the selected existing account. Pin the worker host key locally and disable SSH agent forwarding for each worker alias. A representative `~/.ssh/config` entry is:
 
 ```sshconfig
 Host mac1
     HostName <worker-hostname-or-address>
-    User <dedicated-worker-account>
-    IdentityFile ~/.ssh/<dedicated-worker-key>
+    User <existing-macos-account>
+    IdentityFile ~/.ssh/<worker-specific-key>
     IdentitiesOnly yes
     UserKnownHostsFile ~/.ssh/known_hosts
     StrictHostKeyChecking yes
@@ -46,7 +46,7 @@ Before installing anything, confirm that the exact alias completes a non-interac
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes -- mac1 /usr/bin/true
 ```
 
-This command must exit `0`, print no stdout, and never prompt. If it fails, correct the dedicated-account, key, or pinned-host-key setup first. Do not run `worker setup` until it succeeds.
+This command must exit `0`, print no stdout, and never prompt. If it fails, correct the selected-account, key, or pinned-host-key setup first. Do not run `worker setup` until it succeeds.
 
 ## 5. Install and check the helper
 
@@ -64,7 +64,7 @@ Before creating or changing setup state, the installer resolves the account home
 
 ## Recovery from retained setup state
 
-If `setup` reports `INSTALL_LOCKED`, `UNKNOWN_INSTALLATION_STATE`, or a cleanup/rollback warning, connect as the dedicated worker account and recover only the transaction owned by the retained lock. Do not retry setup until the following checks are complete. Never use `sudo`, `rm -rf`, globs, or broad cleanup under `~/.local/share/mac-worker/setup/`.
+If `setup` reports `INSTALL_LOCKED`, `UNKNOWN_INSTALLATION_STATE`, or a cleanup/rollback warning, connect as the configured worker account and recover only the transaction owned by the retained lock. Do not retry setup until the following checks are complete. Never use `sudo`, `rm -rf`, globs, or broad cleanup under `~/.local/share/mac-worker/setup/`.
 
 Read and validate the exact lock owner before forming a transaction path. The owner file must contain exactly 32 lowercase hexadecimal bytes followed by one newline and no other bytes or lines. Recorded digest files use the same canonical representation with 64 lowercase hexadecimal bytes followed by one newline. Any other representation must retain the lock and stop.
 

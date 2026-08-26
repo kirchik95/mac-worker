@@ -49,16 +49,16 @@ The local projects include Node with npm, Yarn, and pnpm; Rails and native gems;
 
 ## 5. Trust and isolation model
 
-All v1 jobs are trusted code owned by the user. A unique job directory prevents accidental filesystem collisions but is not a security boundary. Jobs on the same macOS account can potentially inspect that account, its processes, and shared caches. Docker access grants broad access to the Docker VM.
+All v1 jobs are trusted code owned by the user. A unique job directory prevents accidental filesystem collisions but is not a security boundary. Jobs can inspect anything available to the configured macOS account, including its files, processes, shared caches, and non-interactive credentials. Docker access grants broad access to the Docker VM.
 
-Each worker uses a dedicated non-admin account that has:
+Each worker may use the existing macOS account selected by the operator. A dedicated non-admin account is optional hardening, not a v1 prerequisite. The supported current-account deployment requires:
 
-- no sudo access;
+- no privilege elevation by `worker` and no reliance on passwordless sudo;
 - no SSH agent forwarding;
-- no Codex, personal, production, or cloud-administrator credentials;
-- a pinned SSH host key and a dedicated client key;
+- no production or cloud-administrator credentials exposed to remote jobs;
+- a pinned SSH host key and a worker-specific client key;
 - only read-only, project-specific package-registry credentials when unavoidable;
-- no unrelated personal files.
+- explicit acceptance that trusted jobs share the selected account's access and state.
 
 Untrusted jobs require a VM or equivalent isolation layer and are outside v1.
 
@@ -96,7 +96,7 @@ The current directory may be below the worktree root. The same relative working 
 
 If no compatible worker is available, the command waits in a FIFO queue by default. `--no-wait` returns immediately with a capacity error. The CLI never silently falls back to local execution and never automatically retries an accepted command.
 
-`worker setup` installs or updates the current `worker` binary for the dedicated remote account and creates owned state directories. It does not create accounts, modify FileVault, enable SSH, install project runtimes, install a persistent daemon, or provision credentials.
+`worker setup` installs or updates the current `worker` binary for the configured remote account and creates owned state directories. It does not create accounts, modify FileVault, enable SSH, install project runtimes, install a persistent daemon, or provision credentials.
 
 ## 7. Architecture
 

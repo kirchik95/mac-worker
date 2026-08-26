@@ -4,7 +4,7 @@
 
 ## Phase-one quick start
 
-First provision each host according to the [macOS worker setup guide](docs/setup-macos-worker.md). In particular, the worker alias must support non-interactive SSH with the dedicated, standard worker account before running setup.
+First provision each host according to the [macOS worker setup guide](docs/setup-macos-worker.md). In particular, the worker alias must support non-interactive SSH with the existing macOS account selected for worker jobs before running setup. A separate worker-only account is optional hardening, not a prerequisite.
 
 ```bash
 cargo test --all-targets
