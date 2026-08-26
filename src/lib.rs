@@ -14,6 +14,7 @@ use transport::{SshTransport, WorkersService};
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod inputs;
 pub mod install;
 pub mod output;
 pub mod paths;
