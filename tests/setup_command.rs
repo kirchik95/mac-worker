@@ -1063,6 +1063,7 @@ fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv
             program: current_exe.clone().into_os_string(),
             args: vec!["host".into(), "probe".into()],
             environment: Vec::new(),
+            environment_remove: Vec::new(),
             stdin: None,
             policy: preflight_policy(),
         }

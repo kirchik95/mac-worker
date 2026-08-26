@@ -21,6 +21,7 @@ fn stdout_overflow_terminates_the_child_with_a_typed_error() {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "while :; do printf 0123456789; done".into()],
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_secs(2)),
     };
@@ -49,6 +50,7 @@ fn stderr_overflow_terminates_the_child_with_a_typed_error() {
             "while :; do printf 0123456789 >&2; done".into(),
         ],
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_secs(2)),
     };
@@ -71,6 +73,7 @@ fn deadline_terminates_and_reaps_a_non_exiting_child() {
         program: "/bin/sleep".into(),
         args: vec!["5".into()],
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_millis(100)),
     };
@@ -94,6 +97,7 @@ fn deadline_terminates_descendants_that_hold_inherited_pipes_open() {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "sleep 5 & exit 0".into()],
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_millis(100)),
     };
@@ -117,6 +121,7 @@ fn normal_process_preserves_literal_argv() {
         program: "/usr/bin/printf".into(),
         args: vec!["%s".into(), literal.into()],
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: None,
         policy: policy(1024, 1024, Duration::from_secs(2)),
     };
@@ -137,6 +142,7 @@ fn requested_environment_reaches_the_child_as_literal_os_strings() {
         program: "/usr/bin/printenv".into(),
         args: vec!["WORKER_LITERAL".into()],
         environment: vec![("WORKER_LITERAL".into(), literal.into())],
+        environment_remove: Vec::new(),
         stdin: None,
         policy: policy(1024, 1024, Duration::from_secs(2)),
     };
@@ -149,6 +155,31 @@ fn requested_environment_reaches_the_child_as_literal_os_strings() {
 }
 
 #[test]
+fn requested_environment_removals_do_not_clear_unrelated_xdg_variables() {
+    // This catches applying a full environment clear to remove a Git override,
+    // which would silently discard the caller's XDG configuration semantics.
+    let request = ProcessRequest {
+        program: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "test -z \"${GIT_DIR+x}\" && printf %s \"$XDG_CONFIG_HOME\"".into(),
+        ],
+        environment: vec![
+            ("GIT_DIR".into(), "/tmp/redirected-git-dir".into()),
+            ("XDG_CONFIG_HOME".into(), "/tmp/preserved-xdg".into()),
+        ],
+        environment_remove: vec!["GIT_DIR".into()],
+        stdin: None,
+        policy: policy(1024, 1024, Duration::from_secs(2)),
+    };
+
+    let result = SystemProcessRunner.run(&request).unwrap();
+
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"/tmp/preserved-xdg");
+}
+
+#[test]
 fn normal_process_receives_the_complete_stdin_payload() {
     // This catches the concurrent capture implementation dropping stdin or
     // closing it before the requested bytes have been written.
@@ -156,6 +187,7 @@ fn normal_process_receives_the_complete_stdin_payload() {
         program: "/bin/cat".into(),
         args: Vec::new(),
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: Some(b"raw stdin bytes\n".to_vec()),
         policy: policy(1024, 1024, Duration::from_secs(2)),
     };
@@ -178,6 +210,7 @@ fn nonzero_exit_remains_authoritative_after_stdin_broken_pipe() {
             "exec 0<&-; printf '%s\n' rejected >&2; exit 23".into(),
         ],
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: Some(vec![b'x'; 16 * 1024 * 1024]),
         policy: policy(1024, 1024, Duration::from_secs(2)),
     };
@@ -197,6 +230,7 @@ fn successful_exit_does_not_hide_stdin_broken_pipe() {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "exec 0<&-; exit 0".into()],
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: Some(vec![b'x'; 16 * 1024 * 1024]),
         policy: policy(1024, 1024, Duration::from_secs(2)),
     };

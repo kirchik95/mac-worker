@@ -56,6 +56,53 @@ fn origin_credentials_never_change_or_appear_in_the_public_identity() {
 }
 
 #[test]
+fn inspection_and_fixture_ignore_ambient_git_config_overrides() {
+    // This catches ambient GIT_CONFIG_COUNT entries overriding the local
+    // origin, which would both contaminate fixture setup and change the public
+    // project identity selected by inspection.
+    const CHILD: &str = "PROJECT_INSPECTION_CONTAMINATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "inspection_and_fixture_ignore_ambient_git_config_overrides",
+            ])
+            .env(CHILD, "1")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "remote.origin.url")
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                "https://evil.example/overridden/project.git",
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
+    let repo = GitRepo::init();
+    assert!(
+        repo.git(&[
+            "config",
+            "remote.origin.url",
+            "https://example.com/acme/app.git",
+        ])
+        .status
+        .success()
+    );
+
+    let context = ProjectInspector::new(&SystemProcessRunner)
+        .inspect(repo.root())
+        .unwrap();
+    let expected = format!(
+        "{:x}",
+        Sha256::digest(b"origin\0https://example.com/acme/app.git")
+    );
+
+    assert_eq!(context.project_id, expected);
+}
+
+#[test]
 fn inspection_reports_a_detached_head_without_inventing_a_branch() {
     // This catches treating a detached commit as a branch named HEAD.
     let repo = GitRepo::init();

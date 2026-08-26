@@ -22,6 +22,7 @@ pub struct ProcessRequest {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
+    pub environment_remove: Vec<OsString>,
     pub stdin: Option<Vec<u8>>,
     pub policy: ProcessPolicy,
 }
@@ -51,7 +52,11 @@ impl ProcessRunner for SystemProcessRunner {
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
-            .envs(request.environment.iter().map(|(key, value)| (key, value)))
+            .envs(request.environment.iter().map(|(key, value)| (key, value)));
+        for key in &request.environment_remove {
+            command.env_remove(key);
+        }
+        command
             .process_group(0)
             .stdin(if request.stdin.is_some() {
                 Stdio::piped()

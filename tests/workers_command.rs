@@ -130,6 +130,7 @@ fn probe_disables_forwarding_and_uses_the_fixed_host_command() {
                 "~/.local/bin/worker host probe".into(),
             ],
             environment: Vec::new(),
+            environment_remove: Vec::new(),
             stdin: None,
             policy: probe_policy(),
         }]
@@ -343,6 +344,7 @@ fn system_runner_passes_arguments_without_shell_interpretation() {
         program: "/usr/bin/printf".into(),
         args: vec!["%s".into(), literal.into()],
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: None,
         policy: local_test_policy(),
     };
@@ -360,6 +362,7 @@ fn system_runner_writes_the_requested_stdin() {
         program: "/bin/cat".into(),
         args: Vec::new(),
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: Some(b"raw stdin bytes\n".to_vec()),
         policy: local_test_policy(),
     };

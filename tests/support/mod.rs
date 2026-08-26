@@ -4,6 +4,19 @@ use std::{
     process::{Command, Output},
 };
 
+const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+];
+
 pub struct GitRepo {
     directory: tempfile::TempDir,
 }
@@ -44,11 +57,16 @@ impl GitRepo {
     }
 
     pub fn git(&self, args: &[&str]) -> Output {
-        Command::new("/usr/bin/git")
+        let mut command = Command::new("/usr/bin/git");
+        command
             .current_dir(self.root())
             .env("HOME", self.root().join("home"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        for name in GIT_ENVIRONMENT_REMOVALS {
+            command.env_remove(name);
+        }
+        command
             .args(args)
             .output()
             .expect("run isolated git fixture command")

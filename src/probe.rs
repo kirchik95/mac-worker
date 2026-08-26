@@ -56,6 +56,7 @@ impl CommandExecutor for SystemCommandExecutor {
                 program: program.as_os_str().into(),
                 args: args.iter().map(|argument| (*argument).into()).collect(),
                 environment: vec![("PATH".into(), CONTROLLED_HOST_PATH.into())],
+                environment_remove: Vec::new(),
                 stdin: None,
                 policy: self.policy,
             })

@@ -238,6 +238,7 @@ pub(crate) fn ssh_request(
             remote_command.into(),
         ],
         environment: Vec::new(),
+        environment_remove: Vec::new(),
         stdin: None,
         policy,
     }

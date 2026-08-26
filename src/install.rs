@@ -328,6 +328,7 @@ impl<'a> Installer<'a> {
                 program: current_exe.as_os_str().into(),
                 args: vec!["host".into(), "probe".into()],
                 environment: Vec::new(),
+                environment_remove: Vec::new(),
                 stdin: None,
                 policy: probe_policy(),
             })

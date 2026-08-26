@@ -17,6 +17,18 @@ use crate::{
 const GIT_PROGRAM: &str = "/usr/bin/git";
 const GIT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const GIT_DEADLINE: Duration = Duration::from_secs(5);
+const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectContext {
@@ -181,6 +193,10 @@ impl<'a> ProjectInspector<'a> {
                 ),
                 (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
             ],
+            environment_remove: GIT_ENVIRONMENT_REMOVALS
+                .iter()
+                .map(OsString::from)
+                .collect(),
             stdin: None,
             policy: ProcessPolicy {
                 stdout_limit: GIT_OUTPUT_LIMIT,
