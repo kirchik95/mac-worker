@@ -94,8 +94,10 @@ Read and validate the exact lock owner before forming a transaction path. The ow
         if [ "$byte_count" -ne "$((hex_length + 1))" ]; then
             fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
         fi
-        hex_value=$(/bin/cat "$hex_file") \
-            || fail "$3 cannot be read; retain the lock and stop"
+        hex_value=''
+        if ! IFS= read -r hex_value < "$hex_file"; then
+            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
+        fi
         if [ "${#hex_value}" -ne "$hex_length" ]; then
             fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
         fi
@@ -167,8 +169,10 @@ If inspection shows an expected state, run this complete cleanup block as one co
         if [ "$byte_count" -ne "$((hex_length + 1))" ]; then
             fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
         fi
-        hex_value=$(/bin/cat "$hex_file") \
-            || fail "$3 cannot be read; retain the lock and stop"
+        hex_value=''
+        if ! IFS= read -r hex_value < "$hex_file"; then
+            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
+        fi
         if ! valid_hex_value "$hex_value" "$hex_length"; then
             fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
         fi

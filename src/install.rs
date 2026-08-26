@@ -1,4 +1,4 @@
-use std::{fs::File, io::Read, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -15,7 +15,6 @@ use crate::{
 };
 
 const SSH_PROGRAM: &str = "/usr/bin/ssh";
-const SCP_PROGRAM: &str = "/usr/bin/scp";
 
 pub struct Installer<'a> {
     runner: &'a dyn ProcessRunner,
@@ -39,8 +38,8 @@ impl<'a> Installer<'a> {
     }
 
     pub fn install(&self, current_exe: &Path, worker: &WorkerEntry) -> SetupHostResult {
-        let digest = match self.preflight(current_exe) {
-            Ok(digest) => digest,
+        let candidate = match self.preflight(current_exe) {
+            Ok(candidate) => candidate,
             Err(error) => {
                 return failed(
                     worker,
@@ -51,6 +50,7 @@ impl<'a> Installer<'a> {
                 );
             }
         };
+        let CandidatePayload { bytes, digest } = candidate;
         let id = self.installation_id.simple().to_string();
 
         let acquire = ssh_request(worker, acquire_command(&id), control_policy());
@@ -90,26 +90,8 @@ impl<'a> Installer<'a> {
             }
         }
 
-        let transfer = ProcessRequest {
-            program: SCP_PROGRAM.into(),
-            args: vec![
-                "-q".into(),
-                "-o".into(),
-                "BatchMode=yes".into(),
-                "-o".into(),
-                "ConnectTimeout=5".into(),
-                "--".into(),
-                current_exe.as_os_str().into(),
-                format!(
-                    "{}:~/.local/share/mac-worker/setup/{id}/worker.new",
-                    worker.ssh
-                )
-                .into(),
-            ],
-            environment: Vec::new(),
-            stdin: None,
-            policy: transfer_policy(),
-        };
+        let mut transfer = ssh_request(worker, upload_command(&id), transfer_policy());
+        transfer.stdin = Some(bytes);
         let transfer_failure = match self.runner.run(&transfer) {
             Ok(result) if result.status.success() => None,
             Ok(result) => Some((
@@ -316,7 +298,7 @@ impl<'a> Installer<'a> {
         }
     }
 
-    fn preflight(&self, current_exe: &Path) -> Result<String, PreflightError> {
+    fn preflight(&self, current_exe: &Path) -> Result<CandidatePayload, PreflightError> {
         let metadata = current_exe.metadata().map_err(|error| PreflightError {
             message: format!(
                 "failed to inspect candidate executable {}: {error}",
@@ -334,13 +316,14 @@ impl<'a> Installer<'a> {
             });
         }
 
-        let digest = sha256_file(current_exe).map_err(|error| PreflightError {
+        let bytes = fs::read(current_exe).map_err(|error| PreflightError {
             message: format!(
-                "failed to hash candidate executable {}: {error}",
+                "failed to read candidate executable {}: {error}",
                 current_exe.display()
             ),
             failure_kind: SetupFailureKind::Io,
         })?;
+        let digest = sha256_bytes(&bytes);
         let result = self
             .runner
             .run(&ProcessRequest {
@@ -379,7 +362,7 @@ impl<'a> Installer<'a> {
             });
         }
 
-        Ok(digest)
+        Ok(CandidatePayload { bytes, digest })
     }
 
     fn reconcile(&self, worker: &WorkerEntry, id: &str, digest: &str) -> Reconciliation {
@@ -448,18 +431,15 @@ struct PreflightError {
     failure_kind: SetupFailureKind,
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = File::open(path)?;
+struct CandidatePayload {
+    bytes: Vec<u8>,
+    digest: String,
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn ssh_request(worker: &WorkerEntry, command: String, policy: ProcessPolicy) -> ProcessRequest {
@@ -581,11 +561,8 @@ require_exact_file() {
     expected_value=$2
     expected_length=$3
     require_regular_file "$exact_path" || return 1
-    file_bytes=$(/usr/bin/wc -c < "$exact_path") || return 1
-    [ "$file_bytes" -eq "$((expected_length + 1))" ] || return 1
-    actual_value=$(/bin/cat "$exact_path") || return 1
-    [ "${#actual_value}" -eq "$expected_length" ] || return 1
-    [ "$actual_value" = "$expected_value" ]
+    [ "${#expected_value}" -eq "$expected_length" ] || return 1
+    printf '%s\n' "$expected_value" | /usr/bin/cmp -s - "$exact_path"
 }
 read_canonical_hex() {
     hex_path=$1
@@ -593,7 +570,8 @@ read_canonical_hex() {
     require_regular_file "$hex_path" || return 1
     file_bytes=$(/usr/bin/wc -c < "$hex_path") || return 1
     [ "$file_bytes" -eq "$((hex_length + 1))" ] || return 1
-    hex_value=$(/bin/cat "$hex_path") || return 1
+    hex_value=''
+    IFS= read -r hex_value < "$hex_path" || return 1
     [ "${#hex_value}" -eq "$hex_length" ] || return 1
     case "$hex_value" in
         *[!0-9a-f]*) return 1 ;;
@@ -673,6 +651,21 @@ resolve_locked_context() {
     require_directory "$lock_dir" "$setup_root/.install-lock" || return 1
     require_directory "$transaction" "$setup_root/$expected_owner" || return 1
 }"#;
+
+const UPLOAD_BODY: &str = r#"verify_upload_input() {
+    require_exact_file "$transaction/state" acquired 8 || return 1
+    require_absent "$transaction/worker.new" || return 1
+    require_absent "$transaction/candidate.sha256" || return 1
+    require_absent "$transaction/worker.previous" || return 1
+    require_absent "$transaction/previous.sha256" || return 1
+    require_absent "$transaction/no-previous" || return 1
+}
+resolve_locked_context || exit 76
+verify_upload_input || exit 77
+resolve_locked_context || exit 76
+verify_upload_input || exit 77
+(set -C; /bin/cat > "$transaction/worker.new") || exit 77
+require_regular_file "$transaction/worker.new" || exit 77"#;
 
 const DIGEST_BODY: &str = r#"verify_digest_input() {
     require_exact_file "$transaction/state" acquired 8 || return 1
@@ -896,6 +889,10 @@ fn acquire_command(id: &str) -> String {
 
 fn locked_command(id: &str, body: &str) -> String {
     format!("{LOCKED_CONTEXT}\nexpected_owner='{id}'\n{body}")
+}
+
+fn upload_command(id: &str) -> String {
+    locked_command(id, UPLOAD_BODY)
 }
 
 fn digest_command(id: &str, digest: &str) -> String {

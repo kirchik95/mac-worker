@@ -8,7 +8,7 @@ use std::{
         process::ExitStatusExt,
     },
     path::{Path, PathBuf},
-    process::{ExitStatus, Output},
+    process::{ExitStatus, Output, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -37,6 +37,11 @@ const CANDIDATE_DIGEST: &str = "04802bb988238c79cc29d0a1c8ded9bbc728ad5e5bbec2ae
 struct RecordingRunner {
     requests: Arc<Mutex<Vec<ProcessRequest>>>,
     results: Arc<Mutex<VecDeque<Result<ProcessResult, WorkerError>>>>,
+}
+
+struct CandidateMutatingRunner {
+    inner: RecordingRunner,
+    candidate: PathBuf,
 }
 
 struct BrokenWriter;
@@ -95,6 +100,18 @@ impl ProcessRunner for RecordingRunner {
     }
 }
 
+impl ProcessRunner for CandidateMutatingRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let result = self.inner.run(request);
+        if request.program == self.candidate.as_os_str()
+            && request.args == [OsString::from("host"), OsString::from("probe")]
+        {
+            fs::write(&self.candidate, b"candidate changed after preflight read").unwrap();
+        }
+        result
+    }
+}
+
 fn result(code: i32, stdout: &[u8], stderr: &[u8]) -> ProcessResult {
     ProcessResult {
         status: ExitStatus::from_raw(code << 8),
@@ -149,7 +166,7 @@ fn transfer_policy() -> ProcessPolicy {
     }
 }
 
-fn assert_ssh_request_shape(request: &ProcessRequest, policy: ProcessPolicy) {
+fn assert_ssh_request_argv_and_policy(request: &ProcessRequest, policy: ProcessPolicy) {
     assert_eq!(request.program, OsString::from("/usr/bin/ssh"));
     assert_eq!(request.args.len(), 7);
     assert_eq!(
@@ -165,8 +182,17 @@ fn assert_ssh_request_shape(request: &ProcessRequest, policy: ProcessPolicy) {
     );
     assert!(!request.args[6].is_empty());
     assert!(request.environment.is_empty());
-    assert!(request.stdin.is_none());
     assert_eq!(request.policy, policy);
+}
+
+fn assert_ssh_request_shape(request: &ProcessRequest, policy: ProcessPolicy) {
+    assert_ssh_request_argv_and_policy(request, policy);
+    assert!(request.stdin.is_none());
+}
+
+fn assert_upload_request_shape(request: &ProcessRequest, expected_stdin: &[u8]) {
+    assert_ssh_request_argv_and_policy(request, transfer_policy());
+    assert_eq!(request.stdin.as_deref(), Some(expected_stdin));
 }
 
 fn success_results() -> Vec<Result<ProcessResult, WorkerError>> {
@@ -185,6 +211,7 @@ fn success_results() -> Vec<Result<ProcessResult, WorkerError>> {
 
 struct GeneratedSetupCommands {
     acquire: String,
+    upload: ProcessRequest,
     digest: String,
     prepare: String,
     promotion: String,
@@ -236,6 +263,7 @@ fn generated_setup_commands() -> GeneratedSetupCommands {
 
     GeneratedSetupCommands {
         acquire: request_command(&requests[1]),
+        upload: requests[2].clone(),
         digest: request_command(&requests[3]),
         prepare: request_command(&requests[4]),
         promotion: request_command(&requests[5]),
@@ -253,6 +281,25 @@ fn run_remote_command(command: &str, home: &Path) -> Output {
         .env("HOME", home)
         .output()
         .unwrap()
+}
+
+fn run_remote_request(request: &ProcessRequest, home: &Path) -> Output {
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(request_command(request))
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(request.stdin.as_deref().unwrap_or_default())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 fn file_digest(path: &Path) -> String {
@@ -366,6 +413,229 @@ fn generated_acquisition_rejects_a_symlinked_setup_before_touching_its_target() 
     );
     assert!(!outside.join(".install-lock").exists());
     assert!(!outside.join(INSTALLATION_ID).exists());
+}
+
+#[test]
+fn generated_upload_writes_exact_stdin_bytes_only_after_validating_the_acquired_transaction() {
+    // Catches replacing the guarded upload with a separate path-based transfer
+    // or consuming bytes without creating the exact owner-scoped regular file.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    fs::create_dir(&home).unwrap();
+    assert!(
+        run_remote_command(&commands.acquire, &home)
+            .status
+            .success()
+    );
+
+    assert_upload_request_shape(&commands.upload, b"test worker");
+    let output = run_remote_request(&commands.upload, &home);
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let transaction = home
+        .join(".local/share/mac-worker/setup")
+        .join(INSTALLATION_ID);
+    let staged = transaction.join("worker.new");
+    assert_eq!(fs::read(&staged).unwrap(), b"test worker");
+    assert_eq!(
+        fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(fs::read(transaction.join("state")).unwrap(), b"acquired\n");
+    assert!(!transaction.join("candidate.sha256").exists());
+}
+
+#[test]
+fn generated_upload_rejects_a_swapped_transaction_symlink_without_touching_its_target() {
+    // Catches opening worker.new through a transaction path swapped to a
+    // symlink after acquisition but before the upload request executes.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    let outside = directory.path().join("outside");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("sentinel"), b"outside unchanged").unwrap();
+    assert!(
+        run_remote_command(&commands.acquire, &home)
+            .status
+            .success()
+    );
+    let transaction = home
+        .join(".local/share/mac-worker/setup")
+        .join(INSTALLATION_ID);
+    fs::rename(&transaction, home.join("retained-transaction")).unwrap();
+    symlink(&outside, &transaction).unwrap();
+
+    assert_upload_request_shape(&commands.upload, b"test worker");
+    let output = run_remote_request(&commands.upload, &home);
+
+    assert!(!output.status.success());
+    assert!(!outside.join("worker.new").exists());
+    assert_eq!(
+        fs::read(outside.join("sentinel")).unwrap(),
+        b"outside unchanged"
+    );
+}
+
+#[test]
+fn candidate_path_change_after_preflight_cannot_split_upload_bytes_from_the_expected_digest() {
+    // Catches hashing one local read but uploading bytes from a later path
+    // read after the executable changes during protocol preflight.
+    let (directory, current_exe) = executable_fixture();
+    let inner = RecordingRunner::returning_results(success_results());
+    let runner = CandidateMutatingRunner {
+        inner: inner.clone(),
+        candidate: current_exe.clone(),
+    };
+    let installer =
+        Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+
+    let installed = installer.install(&current_exe, &worker());
+
+    assert!(installed.installed);
+    assert_eq!(
+        fs::read(&current_exe).unwrap(),
+        b"candidate changed after preflight read"
+    );
+    let requests = inner.requests();
+    assert_upload_request_shape(&requests[2], b"test worker");
+    let home = directory.path().join("home");
+    fs::create_dir(&home).unwrap();
+    assert!(
+        run_remote_command(&request_command(&requests[1]), &home)
+            .status
+            .success()
+    );
+    assert!(run_remote_request(&requests[2], &home).status.success());
+    let digest = run_remote_command(&request_command(&requests[3]), &home);
+    assert!(digest.status.success());
+    assert_eq!(digest.stdout, b"match\n");
+}
+
+#[test]
+fn generated_locked_context_rejects_owner_with_terminal_nul_and_preserves_acquired_evidence() {
+    // Catches whole-file command substitution dropping a terminal NUL from
+    // the lock owner and allowing the digest phase to mutate the transaction.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    fs::create_dir(&home).unwrap();
+    assert!(
+        run_remote_command(&commands.acquire, &home)
+            .status
+            .success()
+    );
+    assert!(run_remote_request(&commands.upload, &home).status.success());
+    let setup = home.join(".local/share/mac-worker/setup");
+    let lock = setup.join(".install-lock");
+    let transaction = setup.join(INSTALLATION_ID);
+    let active = home.join(".local/bin/worker");
+    fs::write(&active, b"active helper unchanged").unwrap();
+    let mut malformed_owner = INSTALLATION_ID.as_bytes().to_vec();
+    malformed_owner.push(0);
+    fs::write(lock.join("owner"), &malformed_owner).unwrap();
+
+    let output = run_remote_command(&commands.digest, &home);
+
+    assert!(!output.status.success());
+    assert_eq!(fs::read(lock.join("owner")).unwrap(), malformed_owner);
+    assert_eq!(fs::read(&active).unwrap(), b"active helper unchanged");
+    assert_eq!(
+        fs::read(transaction.join("worker.new")).unwrap(),
+        b"test worker"
+    );
+    assert_eq!(fs::read(transaction.join("state")).unwrap(), b"acquired\n");
+    assert!(!transaction.join("candidate.sha256").exists());
+}
+
+#[test]
+fn generated_locked_context_rejects_non_lf_exact_state_bytes_before_mutation() {
+    // Catches accepting a terminal NUL as the required LF on a fixed state;
+    // companion CRLF and missing-LF cases protect the complete byte layout.
+    let commands = generated_setup_commands();
+    let cases: &[(&str, &[u8])] = &[
+        ("terminal NUL", b"acquired\0"),
+        ("CRLF", b"acquired\r\n"),
+        ("missing LF", b"acquired"),
+    ];
+
+    for (label, malformed_state) in cases {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        fs::create_dir(&home).unwrap();
+        assert!(
+            run_remote_command(&commands.acquire, &home)
+                .status
+                .success()
+        );
+        assert!(run_remote_request(&commands.upload, &home).status.success());
+        let transaction = home
+            .join(".local/share/mac-worker/setup")
+            .join(INSTALLATION_ID);
+        fs::write(transaction.join("state"), malformed_state).unwrap();
+
+        let output = run_remote_command(&commands.digest, &home);
+
+        assert!(!output.status.success(), "accepted {label}");
+        assert_eq!(
+            fs::read(transaction.join("state")).unwrap(),
+            *malformed_state,
+            "mutated {label}"
+        );
+        assert_eq!(
+            fs::read(transaction.join("worker.new")).unwrap(),
+            b"test worker"
+        );
+        assert!(!transaction.join("candidate.sha256").exists());
+    }
+}
+
+#[test]
+fn generated_canonical_hex_reader_rejects_digest_with_terminal_nul_and_preserves_staged_evidence() {
+    // Catches command substitution erasing the digest's terminal NUL and
+    // allowing prepare to create backup evidence or advance state.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    fs::create_dir(&home).unwrap();
+    assert!(
+        run_remote_command(&commands.acquire, &home)
+            .status
+            .success()
+    );
+    assert!(run_remote_request(&commands.upload, &home).status.success());
+    assert!(run_remote_command(&commands.digest, &home).status.success());
+    let setup = home.join(".local/share/mac-worker/setup");
+    let lock = setup.join(".install-lock");
+    let transaction = setup.join(INSTALLATION_ID);
+    let active = home.join(".local/bin/worker");
+    fs::write(&active, b"active helper unchanged").unwrap();
+    let mut malformed_digest = CANDIDATE_DIGEST.as_bytes().to_vec();
+    malformed_digest.push(0);
+    fs::write(transaction.join("candidate.sha256"), &malformed_digest).unwrap();
+
+    let output = run_remote_command(&commands.prepare, &home);
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read(lock.join("owner")).unwrap(),
+        format!("{INSTALLATION_ID}\n").as_bytes()
+    );
+    assert_eq!(fs::read(&active).unwrap(), b"active helper unchanged");
+    assert_eq!(
+        fs::read(transaction.join("candidate.sha256")).unwrap(),
+        malformed_digest
+    );
+    assert_eq!(
+        fs::read(transaction.join("worker.new")).unwrap(),
+        b"test worker"
+    );
+    assert_eq!(fs::read(transaction.join("state")).unwrap(), b"staged\n");
+    assert!(!transaction.join("worker.previous").exists());
+    assert!(!transaction.join("previous.sha256").exists());
+    assert!(!transaction.join("no-previous").exists());
 }
 
 #[test]
@@ -691,8 +961,8 @@ fn generated_rollback_rejects_every_unexpected_direct_entry_before_mutation() {
 
 #[test]
 fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv() {
-    // Catches skipping a transaction boundary, an option terminator/policy,
-    // or the fixed-literal plus lowercase-hex remote-expression contract.
+    // Catches reintroducing a separate SCP mutation, skipping a transaction
+    // boundary, or dropping the SSH option terminator, stdin, or policy.
     let (_directory, current_exe) = executable_fixture();
     let runner = RecordingRunner::returning_results(success_results());
     let installer =
@@ -716,30 +986,17 @@ fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv
         }
     );
     assert_ssh_request_shape(&requests[1], control_policy());
-    assert_eq!(
-        requests[2],
-        ProcessRequest {
-            program: OsString::from("/usr/bin/scp"),
-            args: vec![
-                "-q".into(),
-                "-o".into(),
-                "BatchMode=yes".into(),
-                "-o".into(),
-                "ConnectTimeout=5".into(),
-                "--".into(),
-                current_exe.as_os_str().into(),
-                format!("mac1:~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.new").into(),
-            ],
-            environment: Vec::new(),
-            stdin: None,
-            policy: transfer_policy(),
-        }
-    );
+    assert_upload_request_shape(&requests[2], b"test worker");
     for request in [&requests[3], &requests[4], &requests[5], &requests[6]] {
         assert_ssh_request_shape(request, control_policy());
     }
     assert_ssh_request_shape(&requests[7], preflight_policy());
     assert_ssh_request_shape(&requests[8], control_policy());
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.program != "/usr/bin/scp")
+    );
 }
 
 #[test]
@@ -763,9 +1020,9 @@ fn competing_installation_is_rejected_before_transfer_or_target_access() {
 }
 
 #[test]
-fn scp_failure_attempts_owned_cleanup_without_losing_primary_error() {
-    // Catches returning from a partial transfer or replacing its primary error
-    // with a later cleanup failure.
+fn upload_failure_attempts_owned_cleanup_without_losing_primary_error() {
+    // Catches returning from a partial guarded upload or replacing its primary
+    // error with a later cleanup failure.
     let (_directory, current_exe) = executable_fixture();
     let runner = RecordingRunner::returning(vec![
         result(0, valid_probe_json(), b""),
@@ -798,7 +1055,7 @@ fn scp_failure_attempts_owned_cleanup_without_losing_primary_error() {
 
 #[test]
 fn changed_candidate_digest_is_never_prepared_or_promoted() {
-    // Catches promoting bytes that changed while SCP read the local candidate.
+    // Catches promoting staged bytes that no longer match the local snapshot.
     let (_directory, current_exe) = executable_fixture();
     let runner = RecordingRunner::returning(vec![
         result(0, valid_probe_json(), b""),
@@ -1553,9 +1810,9 @@ fn executable_setup_verification_io_rolls_back_renders_report_and_exits_io() {
 }
 
 #[test]
-fn executable_setup_scp_local_io_renders_transfer_report_cleans_up_and_exits_io() {
-    // Catches flattening a local SCP launch/read I/O failure into the stable
-    // TRANSFER_FAILED report's retryable unavailable category.
+fn executable_setup_upload_io_renders_transfer_report_cleans_up_and_exits_io() {
+    // Catches flattening typed SSH upload I/O into retryable unavailability,
+    // omitting the complete report, or skipping owner-scoped cleanup.
     let directory = tempdir().unwrap();
     let config_path = directory.path().join("config.toml");
     fs::write(
@@ -1567,7 +1824,7 @@ fn executable_setup_scp_local_io_renders_transfer_report_cleans_up_and_exits_io(
         Ok(result(0, valid_probe_json(), b"")),
         Ok(result(0, b"", b"")),
         Err(WorkerError::Io(std::io::Error::other(
-            "local SCP read failed",
+            "upload result read failed",
         ))),
         Ok(result(0, b"", b"")),
     ]);
@@ -1589,17 +1846,19 @@ fn executable_setup_scp_local_io_renders_transfer_report_cleans_up_and_exits_io(
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"TRANSFER_FAILED\",\"error_message\":\"failed to launch /usr/bin/scp: I/O error: local SCP read failed\",\"warnings\":[]}]}\n"
+        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"TRANSFER_FAILED\",\"error_message\":\"failed to launch /usr/bin/ssh: I/O error: upload result read failed\",\"warnings\":[]}]}\n"
     );
     let requests = runner.requests();
     assert_eq!(requests.len(), 4);
-    assert_eq!(requests[3].program, OsString::from("/usr/bin/ssh"));
+    let executable_bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
+    assert_upload_request_shape(&requests[2], &executable_bytes);
+    assert_ssh_request_shape(&requests[3], control_policy());
 }
 
 #[test]
-fn executable_setup_scp_nonzero_renders_transfer_report_cleans_up_and_exits_unavailable() {
-    // Catches classifying an acknowledged remote SCP failure as local I/O
-    // instead of the stable retryable transfer failure category.
+fn executable_setup_upload_nonzero_renders_transfer_report_cleans_up_and_exits_unavailable() {
+    // Catches classifying an acknowledged remote SSH upload failure as local
+    // I/O, omitting the complete report, or skipping owner-scoped cleanup.
     let directory = tempdir().unwrap();
     let config_path = directory.path().join("config.toml");
     fs::write(
@@ -1631,11 +1890,13 @@ fn executable_setup_scp_nonzero_renders_transfer_report_cleans_up_and_exits_unav
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"TRANSFER_FAILED\",\"error_message\":\"/usr/bin/scp failed with exit 1: transfer interrupted\",\"warnings\":[]}]}\n"
+        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"TRANSFER_FAILED\",\"error_message\":\"/usr/bin/ssh failed with exit 1: transfer interrupted\",\"warnings\":[]}]}\n"
     );
     let requests = runner.requests();
     assert_eq!(requests.len(), 4);
-    assert_eq!(requests[3].program, OsString::from("/usr/bin/ssh"));
+    let executable_bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
+    assert_upload_request_shape(&requests[2], &executable_bytes);
+    assert_ssh_request_shape(&requests[3], control_policy());
 }
 
 #[test]
