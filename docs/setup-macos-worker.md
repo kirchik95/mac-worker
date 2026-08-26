@@ -60,33 +60,76 @@ After the SSH prerequisite succeeds, use the local phase-one commands:
 
 `setup` is safe to run again for the same worker; it replaces the helper installation. Phase one only supports setup and inventory/probe reporting. `worker run`, snapshots, queues, logs, and artifacts are not yet implemented.
 
+Before creating or changing setup state, the installer resolves the account home physically, creates missing `.local` directories one level at a time, and rejects symlinks or non-directories at `.local`, `.local/bin`, `.local/share`, `.local/share/mac-worker`, `setup`, the installation lock, and the owner transaction. It repeats those containment and type checks before digest recording, backup preparation, promotion, verification, cleanup, and rollback. A rejected or changed path leaves owner-scoped evidence in place and is reported as a setup failure or cleanup/rollback warning.
+
 ## Recovery from retained setup state
 
 If `setup` reports `INSTALL_LOCKED`, `UNKNOWN_INSTALLATION_STATE`, or a cleanup/rollback warning, connect as the dedicated worker account and recover only the transaction owned by the retained lock. Do not retry setup until the following checks are complete. Never use `sudo`, `rm -rf`, globs, or broad cleanup under `~/.local/share/mac-worker/setup/`.
 
-Read and validate the exact lock owner before forming a transaction path. The owner must be the 32-character lowercase hexadecimal installation ID; otherwise retain the lock and stop.
+Read and validate the exact lock owner before forming a transaction path. The owner file must contain exactly 32 lowercase hexadecimal bytes followed by one newline and no other bytes or lines. Recorded digest files use the same canonical representation with 64 lowercase hexadecimal bytes followed by one newline. Any other representation must retain the lock and stop.
 
 ```bash
-setup_root="$HOME/.local/share/mac-worker/setup"
-lock_dir="$setup_root/.install-lock"
-owner="$(/bin/cat "$lock_dir/owner" 2>/dev/null)"
+(
+    set -eu
+    LC_ALL=C
+    export LC_ALL
 
-if ! printf '%s\n' "$owner" | /usr/bin/grep -Eq '^[0-9a-f]{32}$'; then
-    printf '%s\n' 'setup lock owner is missing or invalid; retain the lock and stop' >&2
-    exit 1
-fi
+    fail() {
+        printf '%s\n' "$1" >&2
+        exit 1
+    }
 
-transaction="$setup_root/$owner"
-if [ ! -d "$transaction" ]; then
-    printf '%s\n' 'owner-scoped setup transaction is missing; retain the lock and stop' >&2
-    exit 1
-fi
+    require_regular_file() {
+        if [ -L "$1" ] || [ ! -f "$1" ]; then
+            fail "$2 is missing, a symlink, or not a regular file; retain the lock and stop"
+        fi
+    }
 
-/bin/ls -ld "$lock_dir" "$transaction"
-/bin/cat "$transaction/state" 2>/dev/null
-/bin/cat "$transaction/candidate.sha256" 2>/dev/null
-/bin/cat "$transaction/previous.sha256" 2>/dev/null
-/usr/bin/shasum -a 256 "$HOME/.local/bin/worker" 2>/dev/null
+    read_canonical_hex_file() {
+        hex_file=$1
+        hex_length=$2
+        require_regular_file "$hex_file" "$3"
+        byte_count=$(/usr/bin/wc -c < "$hex_file") \
+            || fail "$3 cannot be sized; retain the lock and stop"
+        if [ "$byte_count" -ne "$((hex_length + 1))" ]; then
+            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
+        fi
+        hex_value=$(/bin/cat "$hex_file") \
+            || fail "$3 cannot be read; retain the lock and stop"
+        if [ "${#hex_value}" -ne "$hex_length" ]; then
+            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
+        fi
+        case "$hex_value" in
+            *[!0-9a-f]*)
+                fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
+                ;;
+        esac
+        canonical_hex=$hex_value
+    }
+
+    setup_root="$HOME/.local/share/mac-worker/setup"
+    lock_dir="$setup_root/.install-lock"
+    owner_path="$lock_dir/owner"
+    read_canonical_hex_file "$owner_path" 32 'setup lock owner'
+    owner=$canonical_hex
+
+    transaction="$setup_root/$owner"
+    if [ -L "$transaction" ] || [ ! -d "$transaction" ]; then
+        fail 'owner-scoped setup transaction is missing or a symlink; retain the lock and stop'
+    fi
+
+    /bin/ls -ld "$lock_dir" "$transaction"
+    /bin/cat "$transaction/state" 2>/dev/null
+    if [ -e "$transaction/candidate.sha256" ] || [ -L "$transaction/candidate.sha256" ]; then
+        read_canonical_hex_file "$transaction/candidate.sha256" 64 'candidate digest'
+        printf '%s\n' "$canonical_hex"
+    fi
+    if [ -e "$transaction/previous.sha256" ] || [ -L "$transaction/previous.sha256" ]; then
+        read_canonical_hex_file "$transaction/previous.sha256" 64 'previous digest'
+        printf '%s\n' "$canonical_hex"
+    fi
+    /usr/bin/shasum -a 256 "$HOME/.local/bin/worker" 2>/dev/null
+)
 ```
 
 If inspection shows an expected state, run this complete cleanup block as one command. It deliberately recomputes every value rather than relying on the inspection block, so it is safe to copy independently. It performs no removal until the owner, transaction, recorded digests, active helper, and probe have all been validated, then reads them again immediately before cleanup.
@@ -94,24 +137,42 @@ If inspection shows an expected state, run this complete cleanup block as one co
 ```bash
 (
     set -eu
+    LC_ALL=C
+    export LC_ALL
 
     fail() {
         printf '%s\n' "$1" >&2
         exit 1
     }
 
-    valid_owner() {
-        printf '%s\n' "$1" | /usr/bin/grep -Eq '^[0-9a-f]{32}$'
-    }
-
-    valid_digest() {
-        printf '%s\n' "$1" | /usr/bin/grep -Eq '^[0-9a-f]{64}$'
+    valid_hex_value() {
+        [ "${#1}" -eq "$2" ] || return 1
+        case "$1" in
+            *[!0-9a-f]*) return 1 ;;
+        esac
     }
 
     require_regular_file() {
         if [ -L "$1" ] || [ ! -f "$1" ]; then
             fail "$2 is missing, a symlink, or not a regular file; retain the lock and stop"
         fi
+    }
+
+    read_canonical_hex_file() {
+        hex_file=$1
+        hex_length=$2
+        require_regular_file "$hex_file" "$3"
+        byte_count=$(/usr/bin/wc -c < "$hex_file") \
+            || fail "$3 cannot be sized; retain the lock and stop"
+        if [ "$byte_count" -ne "$((hex_length + 1))" ]; then
+            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
+        fi
+        hex_value=$(/bin/cat "$hex_file") \
+            || fail "$3 cannot be read; retain the lock and stop"
+        if ! valid_hex_value "$hex_value" "$hex_length"; then
+            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
+        fi
+        canonical_hex=$hex_value
     }
 
     allow_absent_regular_file() {
@@ -209,12 +270,8 @@ If inspection shows an expected state, run this complete cleanup block as one co
 
     verify_setup_directory
     verify_lock_directory
-    require_regular_file "$transaction_owner_path" 'setup lock owner'
-    owner="$(/bin/cat "$transaction_owner_path" 2>/dev/null)" \
-        || fail 'setup lock owner cannot be read; retain the lock and stop'
-    if ! valid_owner "$owner"; then
-        fail 'setup lock owner is invalid; retain the lock and stop'
-    fi
+    read_canonical_hex_file "$transaction_owner_path" 32 'setup lock owner'
+    owner=$canonical_hex
 
     transaction="$setup_root/$owner"
     verify_transaction_directory
@@ -226,22 +283,16 @@ If inspection shows an expected state, run this complete cleanup block as one co
     candidate_digest=''
     if [ -f "$transaction/candidate.sha256" ]; then
         candidate_present=1
-        candidate_digest="$(/bin/cat "$transaction/candidate.sha256" 2>/dev/null)" \
-            || fail 'candidate digest cannot be read; retain the lock and stop'
-        if ! valid_digest "$candidate_digest"; then
-            fail 'candidate digest is invalid; retain the lock and stop'
-        fi
+        read_canonical_hex_file "$transaction/candidate.sha256" 64 'candidate digest'
+        candidate_digest=$canonical_hex
     fi
 
     previous_present=0
     previous_digest=''
     if [ -f "$transaction/previous.sha256" ]; then
         previous_present=1
-        previous_digest="$(/bin/cat "$transaction/previous.sha256" 2>/dev/null)" \
-            || fail 'previous digest cannot be read; retain the lock and stop'
-        if ! valid_digest "$previous_digest"; then
-            fail 'previous digest is invalid; retain the lock and stop'
-        fi
+        read_canonical_hex_file "$transaction/previous.sha256" 64 'previous digest'
+        previous_digest=$canonical_hex
     fi
 
     if [ "$candidate_present" -eq 0 ] && [ "$previous_present" -eq 0 ]; then
@@ -251,7 +302,7 @@ If inspection shows an expected state, run this complete cleanup block as one co
     active_digest="$(/usr/bin/shasum -a 256 "$worker" 2>/dev/null)" \
         || fail 'active helper digest cannot be read; retain the lock and stop'
     active_digest="${active_digest%% *}"
-    if ! valid_digest "$active_digest"; then
+    if ! valid_hex_value "$active_digest" 64; then
         fail 'active helper digest is invalid; retain the lock and stop'
     fi
     if [ "$active_digest" != "$candidate_digest" ] && [ "$active_digest" != "$previous_digest" ]; then
@@ -264,10 +315,9 @@ If inspection shows an expected state, run this complete cleanup block as one co
 
     verify_setup_directory
     verify_lock_directory
-    require_regular_file "$transaction_owner_path" 'setup lock owner'
-    current_owner="$(/bin/cat "$transaction_owner_path" 2>/dev/null)" \
-        || fail 'setup lock owner cannot be read before cleanup; retain the lock and stop'
-    if ! valid_owner "$current_owner" || [ "$current_owner" != "$owner" ]; then
+    read_canonical_hex_file "$transaction_owner_path" 32 'setup lock owner before cleanup'
+    current_owner=$canonical_hex
+    if [ "$current_owner" != "$owner" ]; then
         fail 'setup lock owner changed or is invalid; retain the lock and stop'
     fi
     verify_transaction_directory
@@ -277,22 +327,16 @@ If inspection shows an expected state, run this complete cleanup block as one co
     current_candidate_digest=''
     if [ -f "$transaction/candidate.sha256" ]; then
         current_candidate_present=1
-        current_candidate_digest="$(/bin/cat "$transaction/candidate.sha256" 2>/dev/null)" \
-            || fail 'candidate digest changed before cleanup; retain the lock and stop'
-        if ! valid_digest "$current_candidate_digest"; then
-            fail 'candidate digest is invalid before cleanup; retain the lock and stop'
-        fi
+        read_canonical_hex_file "$transaction/candidate.sha256" 64 'candidate digest before cleanup'
+        current_candidate_digest=$canonical_hex
     fi
 
     current_previous_present=0
     current_previous_digest=''
     if [ -f "$transaction/previous.sha256" ]; then
         current_previous_present=1
-        current_previous_digest="$(/bin/cat "$transaction/previous.sha256" 2>/dev/null)" \
-            || fail 'previous digest changed before cleanup; retain the lock and stop'
-        if ! valid_digest "$current_previous_digest"; then
-            fail 'previous digest is invalid before cleanup; retain the lock and stop'
-        fi
+        read_canonical_hex_file "$transaction/previous.sha256" 64 'previous digest before cleanup'
+        current_previous_digest=$canonical_hex
     fi
 
     if [ "$current_candidate_present" -ne "$candidate_present" ] \
@@ -305,7 +349,7 @@ If inspection shows an expected state, run this complete cleanup block as one co
     current_active_digest="$(/usr/bin/shasum -a 256 "$worker" 2>/dev/null)" \
         || fail 'active helper digest disappeared before cleanup; retain the lock and stop'
     current_active_digest="${current_active_digest%% *}"
-    if ! valid_digest "$current_active_digest"; then
+    if ! valid_hex_value "$current_active_digest" 64; then
         fail 'active helper digest is invalid before cleanup; retain the lock and stop'
     fi
     if [ "$current_active_digest" != "$active_digest" ] \
@@ -315,10 +359,9 @@ If inspection shows an expected state, run this complete cleanup block as one co
 
     verify_setup_directory
     verify_lock_directory
-    require_regular_file "$transaction_owner_path" 'setup lock owner'
-    final_owner="$(/bin/cat "$transaction_owner_path" 2>/dev/null)" \
-        || fail 'setup lock owner cannot be read immediately before cleanup; retain the lock and stop'
-    if ! valid_owner "$final_owner" || [ "$final_owner" != "$owner" ]; then
+    read_canonical_hex_file "$transaction_owner_path" 32 'setup lock owner immediately before cleanup'
+    final_owner=$canonical_hex
+    if [ "$final_owner" != "$owner" ]; then
         fail 'setup lock owner changed or is invalid immediately before cleanup; retain the lock and stop'
     fi
     verify_transaction_directory

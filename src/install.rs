@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     config::WorkerEntry,
+    error::WorkerError,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
         HealthStatus, PROTOCOL_VERSION, ProbeResponse, SetupFailureKind, SetupHostResult,
@@ -83,7 +84,7 @@ impl<'a> Installer<'a> {
                     format!(
                         "installation lock acquisition result was lost; scoped state was retained: {error}"
                     ),
-                    SetupFailureKind::Infrastructure,
+                    runner_failure_kind(&error, SetupFailureKind::Infrastructure),
                     Vec::new(),
                 );
             }
@@ -116,11 +117,7 @@ impl<'a> Installer<'a> {
                 SetupFailureKind::Unavailable,
             )),
             Err(error) => {
-                let failure_kind = if matches!(&error, crate::error::WorkerError::Io(_)) {
-                    SetupFailureKind::Io
-                } else {
-                    SetupFailureKind::Unavailable
-                };
+                let failure_kind = runner_failure_kind(&error, SetupFailureKind::Unavailable);
                 Some((
                     format!(
                         "failed to launch {}: {error}",
@@ -155,7 +152,7 @@ impl<'a> Installer<'a> {
                     worker,
                     "DIGEST_VERIFICATION_FAILED",
                     format!("failed to verify staged candidate digest: {error}"),
-                    SetupFailureKind::Infrastructure,
+                    runner_failure_kind(&error, SetupFailureKind::Infrastructure),
                     warnings,
                 );
             }
@@ -185,13 +182,13 @@ impl<'a> Installer<'a> {
         }
 
         let prepare = ssh_request(worker, prepare_command(&id), control_policy());
-        if let Err(message) = run_success(self.runner, &prepare) {
+        if let Err(failure) = run_success(self.runner, &prepare, SetupFailureKind::Infrastructure) {
             let warnings = self.cleanup_warnings(worker, &id);
             return failed(
                 worker,
                 "INSTALL_FAILED",
-                message,
-                SetupFailureKind::Infrastructure,
+                failure.message,
+                failure.kind,
                 warnings,
             );
         }
@@ -200,34 +197,48 @@ impl<'a> Installer<'a> {
         let promotion_result = match self.runner.run(&promotion) {
             Ok(result) if result.status.success() => PromotionResult::AcknowledgedSuccess,
             Ok(result) if matches!(result.status.code(), Some(code) if code != 255) => {
-                PromotionResult::AcknowledgedFailure(process_failure("promotion", &result))
+                PromotionResult::AcknowledgedFailure(ProcessFailure {
+                    message: process_failure("promotion", &result),
+                    kind: SetupFailureKind::Infrastructure,
+                })
             }
-            Ok(result) => PromotionResult::Ambiguous(process_failure("promotion", &result)),
-            Err(error) => PromotionResult::Ambiguous(format!(
-                "failed to launch {}: {error}",
-                promotion.program.to_string_lossy()
-            )),
+            Ok(result) => PromotionResult::Ambiguous(ProcessFailure {
+                message: process_failure("promotion", &result),
+                kind: SetupFailureKind::Infrastructure,
+            }),
+            Err(error) => PromotionResult::Ambiguous(ProcessFailure {
+                message: format!(
+                    "failed to launch {}: {error}",
+                    promotion.program.to_string_lossy()
+                ),
+                kind: runner_failure_kind(&error, SetupFailureKind::Infrastructure),
+            }),
         };
         let reconciliation = self.reconcile(worker, &id, &digest);
         match reconciliation {
             Reconciliation::Promoted => {}
             Reconciliation::Previous => {
-                if let PromotionResult::AcknowledgedFailure(message) = promotion_result {
+                if let PromotionResult::AcknowledgedFailure(failure) = promotion_result {
                     let warnings = self.cleanup_warnings(worker, &id);
                     return failed(
                         worker,
                         "PROMOTION_FAILED",
-                        message,
-                        SetupFailureKind::Infrastructure,
+                        failure.message,
+                        failure.kind,
                         warnings,
                     );
                 }
-                let reason = match promotion_result {
-                    PromotionResult::AcknowledgedSuccess => {
-                        "promotion reported success but the previous target remained active".into()
-                    }
-                    PromotionResult::Ambiguous(error) => format!(
-                        "{error}; the previous target is currently observable but promotion completion is unproven"
+                let (reason, failure_kind) = match promotion_result {
+                    PromotionResult::AcknowledgedSuccess => (
+                        "promotion reported success but the previous target remained active".into(),
+                        SetupFailureKind::Infrastructure,
+                    ),
+                    PromotionResult::Ambiguous(failure) => (
+                        format!(
+                            "{}; the previous target is currently observable but promotion completion is unproven",
+                            failure.message
+                        ),
+                        failure.kind,
                     ),
                     PromotionResult::AcknowledgedFailure(_) => unreachable!(),
                 };
@@ -235,41 +246,50 @@ impl<'a> Installer<'a> {
                     worker,
                     "UNKNOWN_INSTALLATION_STATE",
                     format!("{reason}; installation lock and scoped state were retained"),
-                    SetupFailureKind::Infrastructure,
+                    failure_kind,
                     Vec::new(),
                 );
             }
-            Reconciliation::Unknown(reason) => {
-                let message = match promotion_result {
-                    PromotionResult::AcknowledgedSuccess => format!(
-                        "promotion reported success but reconciliation could not prove completion: {reason}; installation lock and scoped state were retained"
+            Reconciliation::Unknown(reconciliation_failure) => {
+                let (message, failure_kind) = match promotion_result {
+                    PromotionResult::AcknowledgedSuccess => (
+                        format!(
+                            "promotion reported success but reconciliation could not prove completion: {}; installation lock and scoped state were retained",
+                            reconciliation_failure.message
+                        ),
+                        reconciliation_failure.kind,
                     ),
-                    PromotionResult::AcknowledgedFailure(error)
-                    | PromotionResult::Ambiguous(error) => format!(
-                        "{error}; reconciliation could not determine the active target: {reason}; installation lock and scoped state were retained"
+                    PromotionResult::AcknowledgedFailure(promotion_failure)
+                    | PromotionResult::Ambiguous(promotion_failure) => (
+                        format!(
+                            "{}; reconciliation could not determine the active target: {}; installation lock and scoped state were retained",
+                            promotion_failure.message, reconciliation_failure.message
+                        ),
+                        strongest_failure_kind(promotion_failure.kind, reconciliation_failure.kind),
                     ),
                 };
                 return failed(
                     worker,
                     "UNKNOWN_INSTALLATION_STATE",
                     message,
-                    SetupFailureKind::Infrastructure,
+                    failure_kind,
                     Vec::new(),
                 );
             }
         }
 
-        let health = SshTransport::new(self.runner).probe(worker);
+        let (health, probe_failure_kind) = SshTransport::new(self.runner)
+            .probe_with_command_and_failure_kind(worker, verification_command(&id, &digest));
         if health.status != HealthStatus::Ready {
             let message = health
                 .error_message
                 .unwrap_or_else(|| "installed worker failed verification".into());
             let rollback = ssh_request(worker, rollback_command(&id), control_policy());
-            let warnings = run_success(self.runner, &rollback)
+            let warnings = run_success(self.runner, &rollback, SetupFailureKind::Infrastructure)
                 .err()
-                .map(|message| SetupWarning {
+                .map(|failure| SetupWarning {
                     code: SetupWarningCode::RollbackFailed,
-                    message,
+                    message: failure.message,
                 })
                 .into_iter()
                 .collect();
@@ -277,7 +297,7 @@ impl<'a> Installer<'a> {
                 worker,
                 "VERIFICATION_FAILED",
                 message,
-                SetupFailureKind::Infrastructure,
+                probe_failure_kind.unwrap_or(SetupFailureKind::Infrastructure),
                 warnings,
             );
         }
@@ -366,26 +386,40 @@ impl<'a> Installer<'a> {
         let request = ssh_request(worker, reconciliation_command(id, digest), control_policy());
         let result = match self.runner.run(&request) {
             Ok(result) => result,
-            Err(error) => return Reconciliation::Unknown(error.to_string()),
+            Err(error) => {
+                return Reconciliation::Unknown(ProcessFailure {
+                    message: error.to_string(),
+                    kind: runner_failure_kind(&error, SetupFailureKind::Infrastructure),
+                });
+            }
         };
         if !result.status.success() {
-            return Reconciliation::Unknown(process_failure("promotion reconciliation", &result));
+            return Reconciliation::Unknown(ProcessFailure {
+                message: process_failure("promotion reconciliation", &result),
+                kind: SetupFailureKind::Infrastructure,
+            });
         }
         match result.stdout.as_slice() {
             b"promoted\n" => Reconciliation::Promoted,
             b"previous\n" => Reconciliation::Previous,
-            b"unknown\n" => Reconciliation::Unknown("remote state is unknown".into()),
-            _ => Reconciliation::Unknown("remote query returned an invalid response".into()),
+            b"unknown\n" => Reconciliation::Unknown(ProcessFailure {
+                message: "remote state is unknown".into(),
+                kind: SetupFailureKind::Infrastructure,
+            }),
+            _ => Reconciliation::Unknown(ProcessFailure {
+                message: "remote query returned an invalid response".into(),
+                kind: SetupFailureKind::Infrastructure,
+            }),
         }
     }
 
     fn cleanup_warnings(&self, worker: &WorkerEntry, id: &str) -> Vec<SetupWarning> {
         let cleanup = ssh_request(worker, cleanup_command(id), control_policy());
-        run_success(self.runner, &cleanup)
+        run_success(self.runner, &cleanup, SetupFailureKind::Infrastructure)
             .err()
-            .map(|message| SetupWarning {
+            .map(|failure| SetupWarning {
                 code: SetupWarningCode::CleanupFailed,
-                message,
+                message: failure.message,
             })
             .into_iter()
             .collect()
@@ -395,13 +429,18 @@ impl<'a> Installer<'a> {
 enum Reconciliation {
     Promoted,
     Previous,
-    Unknown(String),
+    Unknown(ProcessFailure),
 }
 
 enum PromotionResult {
     AcknowledgedSuccess,
-    AcknowledgedFailure(String),
-    Ambiguous(String),
+    AcknowledgedFailure(ProcessFailure),
+    Ambiguous(ProcessFailure),
+}
+
+struct ProcessFailure {
+    message: String,
+    kind: SetupFailureKind,
 }
 
 struct PreflightError {
@@ -441,46 +480,456 @@ fn ssh_request(worker: &WorkerEntry, command: String, policy: ProcessPolicy) -> 
     }
 }
 
+const ACQUIRE_CONTEXT: &str = r#"set -eu
+LC_ALL=C
+export LC_ALL
+umask 077
+require_directory() {
+    directory_path=$1
+    expected_path=$2
+    [ ! -L "$directory_path" ] || return 1
+    [ -d "$directory_path" ] || return 1
+    physical_path=$(cd -P "$directory_path" 2>/dev/null && /bin/pwd -P) || return 1
+    [ "$physical_path" = "$expected_path" ]
+}
+validate_directory_slot() {
+    directory_path=$1
+    expected_path=$2
+    [ ! -L "$directory_path" ] || return 1
+    if [ -e "$directory_path" ]; then
+        require_directory "$directory_path" "$expected_path"
+    fi
+}
+ensure_directory() {
+    directory_path=$1
+    expected_path=$2
+    validate_directory_slot "$directory_path" "$expected_path" || return 1
+    if [ ! -d "$directory_path" ]; then
+        /bin/mkdir "$directory_path" || return 1
+    fi
+    require_directory "$directory_path" "$expected_path"
+}
+home_root=$(cd -P "$HOME" 2>/dev/null && /bin/pwd -P) || exit 78
+[ -n "$home_root" ] || exit 78
+local_root="$home_root/.local"
+bin_root="$local_root/bin"
+share_root="$local_root/share"
+data_root="$share_root/mac-worker"
+setup_root="$data_root/setup"
+lock_dir="$setup_root/.install-lock"
+transaction="$setup_root/$expected_owner"
+validate_directory_slot "$local_root" "$home_root/.local" || exit 78
+if [ -d "$local_root" ]; then
+    validate_directory_slot "$bin_root" "$local_root/bin" || exit 78
+    validate_directory_slot "$share_root" "$local_root/share" || exit 78
+    if [ -d "$share_root" ]; then
+        validate_directory_slot "$data_root" "$share_root/mac-worker" || exit 78
+        if [ -d "$data_root" ]; then
+            validate_directory_slot "$setup_root" "$data_root/setup" || exit 78
+            if [ -d "$setup_root" ]; then
+                validate_directory_slot "$lock_dir" "$setup_root/.install-lock" || exit 78
+                validate_directory_slot "$transaction" "$setup_root/$expected_owner" || exit 78
+            fi
+        fi
+    fi
+fi
+ensure_directory "$local_root" "$home_root/.local" || exit 78
+ensure_directory "$bin_root" "$local_root/bin" || exit 78
+ensure_directory "$share_root" "$local_root/share" || exit 78
+ensure_directory "$data_root" "$share_root/mac-worker" || exit 78
+ensure_directory "$setup_root" "$data_root/setup" || exit 78
+validate_directory_slot "$lock_dir" "$setup_root/.install-lock" || exit 78
+[ ! -d "$lock_dir" ] || exit 75
+validate_directory_slot "$transaction" "$setup_root/$expected_owner" || exit 78
+[ ! -d "$transaction" ] || exit 76
+/bin/mkdir "$lock_dir" || exit 75
+require_directory "$lock_dir" "$setup_root/.install-lock" || exit 78
+printf '%s\n' "$expected_owner" > "$lock_dir/owner" || exit 76
+/bin/mkdir "$transaction" || exit 76
+require_directory "$transaction" "$setup_root/$expected_owner" || exit 78
+printf '%s\n' acquired > "$transaction/state""#;
+
+const LOCKED_CONTEXT: &str = r#"set -eu
+LC_ALL=C
+export LC_ALL
+umask 077
+require_directory() {
+    directory_path=$1
+    expected_path=$2
+    [ ! -L "$directory_path" ] || return 1
+    [ -d "$directory_path" ] || return 1
+    physical_path=$(cd -P "$directory_path" 2>/dev/null && /bin/pwd -P) || return 1
+    [ "$physical_path" = "$expected_path" ]
+}
+require_regular_file() {
+    [ ! -L "$1" ] && [ -f "$1" ]
+}
+allow_absent_regular_file() {
+    [ ! -L "$1" ] || return 1
+    [ ! -e "$1" ] || [ -f "$1" ]
+}
+require_absent() {
+    [ ! -L "$1" ] && [ ! -e "$1" ]
+}
+require_empty_regular_file() {
+    require_regular_file "$1" || return 1
+    file_bytes=$(/usr/bin/wc -c < "$1") || return 1
+    [ "$file_bytes" -eq 0 ]
+}
+require_exact_file() {
+    exact_path=$1
+    expected_value=$2
+    expected_length=$3
+    require_regular_file "$exact_path" || return 1
+    file_bytes=$(/usr/bin/wc -c < "$exact_path") || return 1
+    [ "$file_bytes" -eq "$((expected_length + 1))" ] || return 1
+    actual_value=$(/bin/cat "$exact_path") || return 1
+    [ "${#actual_value}" -eq "$expected_length" ] || return 1
+    [ "$actual_value" = "$expected_value" ]
+}
+read_canonical_hex() {
+    hex_path=$1
+    hex_length=$2
+    require_regular_file "$hex_path" || return 1
+    file_bytes=$(/usr/bin/wc -c < "$hex_path") || return 1
+    [ "$file_bytes" -eq "$((hex_length + 1))" ] || return 1
+    hex_value=$(/bin/cat "$hex_path") || return 1
+    [ "${#hex_value}" -eq "$hex_length" ] || return 1
+    case "$hex_value" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    canonical_hex=$hex_value
+}
+digest_regular_file() {
+    require_regular_file "$1" || return 1
+    digest_line=$(/usr/bin/shasum -a 256 "$1" 2>/dev/null) || return 1
+    digest_value=${digest_line%% *}
+    [ "${#digest_value}" -eq 64 ] || return 1
+    case "$digest_value" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    canonical_digest=$digest_value
+}
+verify_transaction_entries() {
+    /usr/bin/find "$transaction" ! -path "$transaction" -prune \
+        -exec /bin/sh -c '
+            transaction=$1
+            shift
+            for entry do
+                case "$entry" in
+                    "$transaction/worker.new"|"$transaction/worker.previous"|\
+                    "$transaction/candidate.sha256"|"$transaction/previous.sha256"|\
+                    "$transaction/no-previous"|"$transaction/state") ;;
+                    *) exit 1 ;;
+                esac
+            done
+        ' sh "$transaction" {} +
+}
+verify_lock_entries() {
+    /usr/bin/find "$lock_dir" ! -path "$lock_dir" -prune \
+        -exec /bin/sh -c '
+            owner_path=$1
+            shift
+            for entry do
+                case "$entry" in
+                    "$owner_path") ;;
+                    *) exit 1 ;;
+                esac
+            done
+        ' sh "$owner_path" {} +
+}
+verify_known_transaction_types() {
+    allow_absent_regular_file "$transaction/worker.new" || return 1
+    allow_absent_regular_file "$transaction/worker.previous" || return 1
+    allow_absent_regular_file "$transaction/candidate.sha256" || return 1
+    allow_absent_regular_file "$transaction/previous.sha256" || return 1
+    allow_absent_regular_file "$transaction/no-previous" || return 1
+    allow_absent_regular_file "$transaction/state" || return 1
+}
+resolve_locked_context() {
+    home_root=$(cd -P "$HOME" 2>/dev/null && /bin/pwd -P) || return 1
+    [ -n "$home_root" ] || return 1
+    local_root="$home_root/.local"
+    require_directory "$local_root" "$home_root/.local" || return 1
+    bin_root="$local_root/bin"
+    require_directory "$bin_root" "$local_root/bin" || return 1
+    share_root="$local_root/share"
+    require_directory "$share_root" "$local_root/share" || return 1
+    data_root="$share_root/mac-worker"
+    require_directory "$data_root" "$share_root/mac-worker" || return 1
+    setup_root="$data_root/setup"
+    require_directory "$setup_root" "$data_root/setup" || return 1
+    lock_dir="$setup_root/.install-lock"
+    require_directory "$lock_dir" "$setup_root/.install-lock" || return 1
+    owner_path="$lock_dir/owner"
+    require_exact_file "$owner_path" "$expected_owner" 32 || return 1
+    transaction="$setup_root/$expected_owner"
+    require_directory "$transaction" "$setup_root/$expected_owner" || return 1
+    worker_path="$bin_root/worker"
+    allow_absent_regular_file "$worker_path" || return 1
+    verify_known_transaction_types || return 1
+    verify_transaction_entries || return 1
+    verify_lock_entries || return 1
+    require_directory "$lock_dir" "$setup_root/.install-lock" || return 1
+    require_directory "$transaction" "$setup_root/$expected_owner" || return 1
+}"#;
+
+const DIGEST_BODY: &str = r#"verify_digest_input() {
+    require_exact_file "$transaction/state" acquired 8 || return 1
+    require_regular_file "$transaction/worker.new" || return 1
+    require_absent "$transaction/candidate.sha256" || return 1
+    require_absent "$transaction/worker.previous" || return 1
+    require_absent "$transaction/previous.sha256" || return 1
+    require_absent "$transaction/no-previous" || return 1
+}
+resolve_locked_context || exit 76
+verify_digest_input || exit 77
+digest_regular_file "$transaction/worker.new" || exit 77
+first_digest=$canonical_digest
+if [ "$first_digest" != "$expected_digest" ]; then
+    printf '%s\n' mismatch
+    exit 0
+fi
+resolve_locked_context || exit 76
+verify_digest_input || exit 77
+digest_regular_file "$transaction/worker.new" || exit 77
+[ "$canonical_digest" = "$expected_digest" ] || {
+    printf '%s\n' mismatch
+    exit 0
+}
+printf '%s\n' "$expected_digest" > "$transaction/candidate.sha256"
+printf '%s\n' staged > "$transaction/state"
+printf '%s\n' match"#;
+
+const PREPARE_BODY: &str = r#"verify_staged_state() {
+    require_exact_file "$transaction/state" staged 6 || return 1
+    read_canonical_hex "$transaction/candidate.sha256" 64 || return 1
+    staged_digest=$canonical_hex
+    digest_regular_file "$transaction/worker.new" || return 1
+    [ "$canonical_digest" = "$staged_digest" ] || return 1
+    require_absent "$transaction/worker.previous" || return 1
+    require_absent "$transaction/previous.sha256" || return 1
+    require_absent "$transaction/no-previous" || return 1
+}
+resolve_locked_context || exit 76
+verify_staged_state || exit 77
+if [ -f "$worker_path" ]; then
+    digest_regular_file "$worker_path" || exit 77
+    previous_digest=$canonical_digest
+    resolve_locked_context || exit 76
+    verify_staged_state || exit 77
+    require_regular_file "$worker_path" || exit 77
+    digest_regular_file "$worker_path" || exit 77
+    [ "$canonical_digest" = "$previous_digest" ] || exit 77
+    /bin/cp -p "$worker_path" "$transaction/worker.previous"
+    printf '%s\n' "$previous_digest" > "$transaction/previous.sha256"
+else
+    resolve_locked_context || exit 76
+    verify_staged_state || exit 77
+    require_absent "$worker_path" || exit 77
+    : > "$transaction/no-previous"
+fi
+printf '%s\n' prepared > "$transaction/state""#;
+
+const PROMOTION_BODY: &str = r#"verify_prepared_state() {
+    require_exact_file "$transaction/state" prepared 8 || return 1
+    read_canonical_hex "$transaction/candidate.sha256" 64 || return 1
+    candidate_digest=$canonical_hex
+    digest_regular_file "$transaction/worker.new" || return 1
+    [ "$canonical_digest" = "$candidate_digest" ] || return 1
+    if [ -f "$transaction/worker.previous" ]; then
+        require_absent "$transaction/no-previous" || return 1
+        read_canonical_hex "$transaction/previous.sha256" 64 || return 1
+        previous_digest=$canonical_hex
+        digest_regular_file "$transaction/worker.previous" || return 1
+        [ "$canonical_digest" = "$previous_digest" ] || return 1
+        digest_regular_file "$worker_path" || return 1
+        [ "$canonical_digest" = "$previous_digest" ] || return 1
+    else
+        require_absent "$transaction/previous.sha256" || return 1
+        require_empty_regular_file "$transaction/no-previous" || return 1
+        require_absent "$worker_path" || return 1
+    fi
+}
+resolve_locked_context || exit 76
+verify_prepared_state || exit 77
+resolve_locked_context || exit 76
+verify_prepared_state || exit 77
+printf '%s\n' promoting > "$transaction/state"
+/bin/chmod 0755 "$transaction/worker.new"
+/bin/mv "$transaction/worker.new" "$worker_path"
+printf '%s\n' promoted > "$transaction/state""#;
+
+const RECONCILIATION_BODY: &str = r#"resolve_locked_context || exit 76
+read_canonical_hex "$transaction/candidate.sha256" 64 || exit 77
+candidate_digest=$canonical_hex
+[ "$candidate_digest" = "$expected_digest" ] || exit 77
+if require_exact_file "$transaction/state" promoted 8 \
+    && require_absent "$transaction/worker.new" \
+    && digest_regular_file "$worker_path" \
+    && [ "$canonical_digest" = "$candidate_digest" ]; then
+    printf '%s\n' promoted
+    exit 0
+fi
+if { require_exact_file "$transaction/state" prepared 8 \
+        || require_exact_file "$transaction/state" promoting 9; } \
+    && digest_regular_file "$transaction/worker.new" \
+    && [ "$canonical_digest" = "$candidate_digest" ]; then
+    if [ -f "$transaction/worker.previous" ]; then
+        require_absent "$transaction/no-previous" || exit 77
+        read_canonical_hex "$transaction/previous.sha256" 64 || exit 77
+        previous_digest=$canonical_hex
+        digest_regular_file "$transaction/worker.previous" || exit 77
+        [ "$canonical_digest" = "$previous_digest" ] || exit 77
+        if digest_regular_file "$worker_path" \
+            && [ "$canonical_digest" = "$previous_digest" ]; then
+            printf '%s\n' previous
+            exit 0
+        fi
+    elif require_absent "$transaction/previous.sha256" \
+        && require_empty_regular_file "$transaction/no-previous" \
+        && require_absent "$worker_path"; then
+        printf '%s\n' previous
+        exit 0
+    fi
+fi
+printf '%s\n' unknown"#;
+
+const VERIFICATION_BODY: &str = r#"resolve_locked_context || exit 76
+require_exact_file "$transaction/state" promoted 8 || exit 77
+require_absent "$transaction/worker.new" || exit 77
+read_canonical_hex "$transaction/candidate.sha256" 64 || exit 77
+[ "$canonical_hex" = "$expected_digest" ] || exit 77
+digest_regular_file "$worker_path" || exit 77
+[ "$canonical_digest" = "$expected_digest" ] || exit 77
+exec "$worker_path" host probe"#;
+
+const CLEANUP_BODY: &str = r#"verify_cleanup_state() {
+    require_exact_file "$transaction/state" acquired 8 \
+        || require_exact_file "$transaction/state" staged 6 \
+        || require_exact_file "$transaction/state" prepared 8 \
+        || require_exact_file "$transaction/state" promoting 9 \
+        || require_exact_file "$transaction/state" promoted 8 \
+        || return 1
+    if [ -f "$transaction/candidate.sha256" ]; then
+        read_canonical_hex "$transaction/candidate.sha256" 64 || return 1
+    fi
+    if [ -f "$transaction/previous.sha256" ]; then
+        read_canonical_hex "$transaction/previous.sha256" 64 || return 1
+        [ -f "$transaction/worker.previous" ] || return 1
+    fi
+    if [ -f "$transaction/no-previous" ]; then
+        require_empty_regular_file "$transaction/no-previous" || return 1
+        require_absent "$transaction/worker.previous" || return 1
+        require_absent "$transaction/previous.sha256" || return 1
+    fi
+}
+resolve_locked_context || exit 76
+verify_cleanup_state || exit 77
+resolve_locked_context || exit 76
+verify_cleanup_state || exit 77
+/bin/rm -f "$transaction/worker.new" "$transaction/worker.previous" \
+    "$transaction/candidate.sha256" "$transaction/previous.sha256" \
+    "$transaction/no-previous" "$transaction/state"
+/bin/rmdir "$transaction"
+/bin/rm -f "$owner_path"
+/bin/rmdir "$lock_dir""#;
+
+const ROLLBACK_BODY: &str = r#"verify_rollback_state() {
+    require_exact_file "$transaction/state" promoted 8 || return 1
+    require_absent "$transaction/worker.new" || return 1
+    read_canonical_hex "$transaction/candidate.sha256" 64 || return 1
+    candidate_digest=$canonical_hex
+    digest_regular_file "$worker_path" || return 1
+    [ "$canonical_digest" = "$candidate_digest" ] || return 1
+    if [ -f "$transaction/worker.previous" ]; then
+        require_absent "$transaction/no-previous" || return 1
+        read_canonical_hex "$transaction/previous.sha256" 64 || return 1
+        previous_digest=$canonical_hex
+        digest_regular_file "$transaction/worker.previous" || return 1
+        [ "$canonical_digest" = "$previous_digest" ] || return 1
+        rollback_previous=1
+    else
+        require_absent "$transaction/previous.sha256" || return 1
+        require_empty_regular_file "$transaction/no-previous" || return 1
+        rollback_previous=0
+    fi
+}
+verify_rolled_back_state() {
+    require_exact_file "$transaction/state" rolled_back 11 || return 1
+    require_absent "$transaction/worker.new" || return 1
+    require_absent "$transaction/worker.previous" || return 1
+    read_canonical_hex "$transaction/candidate.sha256" 64 || return 1
+    if [ -f "$transaction/previous.sha256" ]; then
+        read_canonical_hex "$transaction/previous.sha256" 64 || return 1
+        restored_digest=$canonical_hex
+        digest_regular_file "$worker_path" || return 1
+        [ "$canonical_digest" = "$restored_digest" ] || return 1
+        require_absent "$transaction/no-previous" || return 1
+    else
+        require_empty_regular_file "$transaction/no-previous" || return 1
+        require_absent "$worker_path" || return 1
+    fi
+}
+resolve_locked_context || exit 76
+verify_rollback_state || exit 77
+resolve_locked_context || exit 76
+verify_rollback_state || exit 77
+if [ "$rollback_previous" -eq 1 ]; then
+    /bin/mv "$transaction/worker.previous" "$worker_path"
+else
+    /bin/rm -f "$worker_path"
+fi
+printf '%s\n' rolled_back > "$transaction/state"
+resolve_locked_context || exit 76
+verify_rolled_back_state || exit 77
+/bin/rm -f "$transaction/worker.new" "$transaction/worker.previous" \
+    "$transaction/candidate.sha256" "$transaction/previous.sha256" \
+    "$transaction/no-previous" "$transaction/state"
+/bin/rmdir "$transaction"
+/bin/rm -f "$owner_path"
+/bin/rmdir "$lock_dir""#;
+
 fn acquire_command(id: &str) -> String {
-    format!(
-        "umask 077 && mkdir -p ~/.local/bin ~/.local/share/mac-worker/setup && if mkdir ~/.local/share/mac-worker/setup/.install-lock; then printf '%s\\n' {id} > ~/.local/share/mac-worker/setup/.install-lock/owner; else exit 75; fi && mkdir ~/.local/share/mac-worker/setup/{id} && printf '%s\\n' acquired > ~/.local/share/mac-worker/setup/{id}/state"
-    )
+    format!("expected_owner='{id}'\n{ACQUIRE_CONTEXT}")
+}
+
+fn locked_command(id: &str, body: &str) -> String {
+    format!("{LOCKED_CONTEXT}\nexpected_owner='{id}'\n{body}")
 }
 
 fn digest_command(id: &str, digest: &str) -> String {
-    format!(
-        "candidate=$(/usr/bin/shasum -a 256 ~/.local/share/mac-worker/setup/{id}/worker.new) && candidate=${{candidate%% *}} && if [ \"$candidate\" = {digest} ]; then printf '%s\\n' {digest} > ~/.local/share/mac-worker/setup/{id}/candidate.sha256 && printf '%s\\n' staged > ~/.local/share/mac-worker/setup/{id}/state && printf '%s\\n' match; else printf '%s\\n' mismatch; fi"
-    )
+    locked_command(id, &format!("expected_digest='{digest}'\n{DIGEST_BODY}"))
 }
 
 fn prepare_command(id: &str) -> String {
-    format!(
-        "if [ -f ~/.local/bin/worker ]; then cp -p ~/.local/bin/worker ~/.local/share/mac-worker/setup/{id}/worker.previous && previous=$(/usr/bin/shasum -a 256 ~/.local/bin/worker) && printf '%s\\n' \"${{previous%% *}}\" > ~/.local/share/mac-worker/setup/{id}/previous.sha256; else : > ~/.local/share/mac-worker/setup/{id}/no-previous; fi && printf '%s\\n' prepared > ~/.local/share/mac-worker/setup/{id}/state"
-    )
+    locked_command(id, PREPARE_BODY)
 }
 
 fn promotion_command(id: &str) -> String {
-    format!(
-        "printf '%s\\n' promoting > ~/.local/share/mac-worker/setup/{id}/state && chmod 0755 ~/.local/share/mac-worker/setup/{id}/worker.new && mv ~/.local/share/mac-worker/setup/{id}/worker.new ~/.local/bin/worker && printf '%s\\n' promoted > ~/.local/share/mac-worker/setup/{id}/state"
-    )
+    locked_command(id, PROMOTION_BODY)
 }
 
 fn reconciliation_command(id: &str, digest: &str) -> String {
-    format!(
-        "target=$(/usr/bin/shasum -a 256 ~/.local/bin/worker 2>/dev/null) && target=${{target%% *}}; state=$(/bin/cat ~/.local/share/mac-worker/setup/{id}/state 2>/dev/null) || state=; if [ \"$target\" = {digest} ] && [ \"$state\" = promoted ]; then printf '%s\\n' promoted; elif [ -f ~/.local/share/mac-worker/setup/{id}/previous.sha256 ] && [ \"$target\" = \"$(/bin/cat ~/.local/share/mac-worker/setup/{id}/previous.sha256)\" ]; then printf '%s\\n' previous; elif [ -f ~/.local/share/mac-worker/setup/{id}/no-previous ] && [ ! -e ~/.local/bin/worker ]; then printf '%s\\n' previous; else printf '%s\\n' unknown; fi"
+    locked_command(
+        id,
+        &format!("expected_digest='{digest}'\n{RECONCILIATION_BODY}"),
+    )
+}
+
+fn verification_command(id: &str, digest: &str) -> String {
+    locked_command(
+        id,
+        &format!("expected_digest='{digest}'\n{VERIFICATION_BODY}"),
     )
 }
 
 fn cleanup_command(id: &str) -> String {
-    format!(
-        "if [ \"$(/bin/cat ~/.local/share/mac-worker/setup/.install-lock/owner 2>/dev/null)\" = {id} ]; then rm -f ~/.local/share/mac-worker/setup/{id}/worker.new ~/.local/share/mac-worker/setup/{id}/worker.previous ~/.local/share/mac-worker/setup/{id}/candidate.sha256 ~/.local/share/mac-worker/setup/{id}/previous.sha256 ~/.local/share/mac-worker/setup/{id}/no-previous ~/.local/share/mac-worker/setup/{id}/state && rmdir ~/.local/share/mac-worker/setup/{id} && rm -f ~/.local/share/mac-worker/setup/.install-lock/owner && rmdir ~/.local/share/mac-worker/setup/.install-lock; else exit 76; fi"
-    )
+    locked_command(id, CLEANUP_BODY)
 }
 
 fn rollback_command(id: &str) -> String {
-    format!(
-        "if [ \"$(/bin/cat ~/.local/share/mac-worker/setup/.install-lock/owner 2>/dev/null)\" = {id} ]; then if [ -f ~/.local/share/mac-worker/setup/{id}/worker.previous ]; then mv ~/.local/share/mac-worker/setup/{id}/worker.previous ~/.local/bin/worker; elif [ -f ~/.local/share/mac-worker/setup/{id}/no-previous ]; then rm -f ~/.local/bin/worker; else exit 77; fi && printf '%s\\n' rolled_back > ~/.local/share/mac-worker/setup/{id}/state && rm -f ~/.local/share/mac-worker/setup/{id}/worker.new ~/.local/share/mac-worker/setup/{id}/candidate.sha256 ~/.local/share/mac-worker/setup/{id}/previous.sha256 ~/.local/share/mac-worker/setup/{id}/no-previous ~/.local/share/mac-worker/setup/{id}/state && rmdir ~/.local/share/mac-worker/setup/{id} && rm -f ~/.local/share/mac-worker/setup/.install-lock/owner && rmdir ~/.local/share/mac-worker/setup/.install-lock; else exit 76; fi"
-    )
+    locked_command(id, ROLLBACK_BODY)
 }
 
 fn probe_policy() -> ProcessPolicy {
@@ -507,17 +956,49 @@ fn transfer_policy() -> ProcessPolicy {
     }
 }
 
-fn run_success(runner: &dyn ProcessRunner, request: &ProcessRequest) -> Result<(), String> {
-    let result = runner.run(request).map_err(|error| {
-        format!(
+fn run_success(
+    runner: &dyn ProcessRunner,
+    request: &ProcessRequest,
+    default_kind: SetupFailureKind,
+) -> Result<(), ProcessFailure> {
+    let result = runner.run(request).map_err(|error| ProcessFailure {
+        message: format!(
             "failed to launch {}: {error}",
             request.program.to_string_lossy()
-        )
+        ),
+        kind: runner_failure_kind(&error, default_kind),
     })?;
     if result.status.success() {
         Ok(())
     } else {
-        Err(process_failure(&request.program.to_string_lossy(), &result))
+        Err(ProcessFailure {
+            message: process_failure(&request.program.to_string_lossy(), &result),
+            kind: default_kind,
+        })
+    }
+}
+
+fn runner_failure_kind(error: &WorkerError, default_kind: SetupFailureKind) -> SetupFailureKind {
+    if matches!(error, WorkerError::Io(_)) {
+        SetupFailureKind::Io
+    } else {
+        default_kind
+    }
+}
+
+fn strongest_failure_kind(first: SetupFailureKind, second: SetupFailureKind) -> SetupFailureKind {
+    fn rank(kind: SetupFailureKind) -> u8 {
+        match kind {
+            SetupFailureKind::Unavailable => 0,
+            SetupFailureKind::Infrastructure => 1,
+            SetupFailureKind::Io => 2,
+        }
+    }
+
+    if rank(first) >= rank(second) {
+        first
+    } else {
+        second
     }
 }
 

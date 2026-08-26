@@ -3,8 +3,12 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, Write},
-    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
-    process::ExitStatus,
+    os::unix::{
+        fs::{PermissionsExt, symlink},
+        process::ExitStatusExt,
+    },
+    path::{Path, PathBuf},
+    process::{ExitStatus, Output},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -145,64 +149,24 @@ fn transfer_policy() -> ProcessPolicy {
     }
 }
 
-fn ssh_request(command: String, policy: ProcessPolicy) -> ProcessRequest {
-    ProcessRequest {
-        program: OsString::from("/usr/bin/ssh"),
-        args: vec![
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=5".into(),
-            "--".into(),
-            "mac1".into(),
-            command.into(),
-        ],
-        environment: Vec::new(),
-        stdin: None,
-        policy,
-    }
-}
-
-fn acquire_command() -> String {
-    format!(
-        "umask 077 && mkdir -p ~/.local/bin ~/.local/share/mac-worker/setup && if mkdir ~/.local/share/mac-worker/setup/.install-lock; then printf '%s\\n' {INSTALLATION_ID} > ~/.local/share/mac-worker/setup/.install-lock/owner; else exit 75; fi && mkdir ~/.local/share/mac-worker/setup/{INSTALLATION_ID} && printf '%s\\n' acquired > ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/state"
-    )
-}
-
-fn digest_command() -> String {
-    format!(
-        "candidate=$(/usr/bin/shasum -a 256 ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.new) && candidate=${{candidate%% *}} && if [ \"$candidate\" = {CANDIDATE_DIGEST} ]; then printf '%s\\n' {CANDIDATE_DIGEST} > ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/candidate.sha256 && printf '%s\\n' staged > ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/state && printf '%s\\n' match; else printf '%s\\n' mismatch; fi"
-    )
-}
-
-fn prepare_command() -> String {
-    format!(
-        "if [ -f ~/.local/bin/worker ]; then cp -p ~/.local/bin/worker ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.previous && previous=$(/usr/bin/shasum -a 256 ~/.local/bin/worker) && printf '%s\\n' \"${{previous%% *}}\" > ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/previous.sha256; else : > ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/no-previous; fi && printf '%s\\n' prepared > ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/state"
-    )
-}
-
-fn promotion_command() -> String {
-    format!(
-        "printf '%s\\n' promoting > ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/state && chmod 0755 ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.new && mv ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.new ~/.local/bin/worker && printf '%s\\n' promoted > ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/state"
-    )
-}
-
-fn reconciliation_command() -> String {
-    format!(
-        "target=$(/usr/bin/shasum -a 256 ~/.local/bin/worker 2>/dev/null) && target=${{target%% *}}; state=$(/bin/cat ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/state 2>/dev/null) || state=; if [ \"$target\" = {CANDIDATE_DIGEST} ] && [ \"$state\" = promoted ]; then printf '%s\\n' promoted; elif [ -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/previous.sha256 ] && [ \"$target\" = \"$(/bin/cat ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/previous.sha256)\" ]; then printf '%s\\n' previous; elif [ -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/no-previous ] && [ ! -e ~/.local/bin/worker ]; then printf '%s\\n' previous; else printf '%s\\n' unknown; fi"
-    )
-}
-
-fn cleanup_command() -> String {
-    format!(
-        "if [ \"$(/bin/cat ~/.local/share/mac-worker/setup/.install-lock/owner 2>/dev/null)\" = {INSTALLATION_ID} ]; then rm -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.new ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.previous ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/candidate.sha256 ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/previous.sha256 ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/no-previous ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/state && rmdir ~/.local/share/mac-worker/setup/{INSTALLATION_ID} && rm -f ~/.local/share/mac-worker/setup/.install-lock/owner && rmdir ~/.local/share/mac-worker/setup/.install-lock; else exit 76; fi"
-    )
-}
-
-fn rollback_command() -> String {
-    format!(
-        "if [ \"$(/bin/cat ~/.local/share/mac-worker/setup/.install-lock/owner 2>/dev/null)\" = {INSTALLATION_ID} ]; then if [ -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.previous ]; then mv ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.previous ~/.local/bin/worker; elif [ -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/no-previous ]; then rm -f ~/.local/bin/worker; else exit 77; fi && printf '%s\\n' rolled_back > ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/state && rm -f ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.new ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/candidate.sha256 ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/previous.sha256 ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/no-previous ~/.local/share/mac-worker/setup/{INSTALLATION_ID}/state && rmdir ~/.local/share/mac-worker/setup/{INSTALLATION_ID} && rm -f ~/.local/share/mac-worker/setup/.install-lock/owner && rmdir ~/.local/share/mac-worker/setup/.install-lock; else exit 76; fi"
-    )
+fn assert_ssh_request_shape(request: &ProcessRequest, policy: ProcessPolicy) {
+    assert_eq!(request.program, OsString::from("/usr/bin/ssh"));
+    assert_eq!(request.args.len(), 7);
+    assert_eq!(
+        &request.args[..6],
+        [
+            OsString::from("-o"),
+            OsString::from("BatchMode=yes"),
+            OsString::from("-o"),
+            OsString::from("ConnectTimeout=5"),
+            OsString::from("--"),
+            OsString::from("mac1"),
+        ]
+    );
+    assert!(!request.args[6].is_empty());
+    assert!(request.environment.is_empty());
+    assert!(request.stdin.is_none());
+    assert_eq!(request.policy, policy);
 }
 
 fn success_results() -> Vec<Result<ProcessResult, WorkerError>> {
@@ -219,6 +183,512 @@ fn success_results() -> Vec<Result<ProcessResult, WorkerError>> {
     ]
 }
 
+struct GeneratedSetupCommands {
+    acquire: String,
+    digest: String,
+    prepare: String,
+    promotion: String,
+    reconciliation: String,
+    verification: String,
+    cleanup: String,
+    rollback: String,
+}
+
+fn request_command(request: &ProcessRequest) -> String {
+    request
+        .args
+        .last()
+        .expect("an SSH request must contain a remote command")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn assert_remote_command(request: &ProcessRequest, expected: &str) {
+    assert_eq!(request_command(request), expected);
+}
+
+fn contains_remote_command(requests: &[ProcessRequest], expected: &str) -> bool {
+    requests
+        .iter()
+        .filter(|request| request.program == "/usr/bin/ssh")
+        .any(|request| request_command(request) == expected)
+}
+
+fn generated_setup_commands() -> GeneratedSetupCommands {
+    let (_directory, current_exe) = executable_fixture();
+    let runner = RecordingRunner::returning_results(success_results());
+    let installer =
+        Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+    let installed = installer.install(&current_exe, &worker());
+    assert!(installed.installed);
+    let requests = runner.requests();
+
+    let mut rollback_results = success_results();
+    rollback_results[7] = Ok(result(255, b"", b"candidate failed"));
+    let rollback_runner = RecordingRunner::returning_results(rollback_results);
+    let rollback_installer = Installer::with_installation_id(
+        &rollback_runner,
+        Uuid::parse_str(INSTALLATION_ID).unwrap(),
+    );
+    let failed = rollback_installer.install(&current_exe, &worker());
+    assert_eq!(failed.error_code.as_deref(), Some("VERIFICATION_FAILED"));
+    let rollback_requests = rollback_runner.requests();
+
+    GeneratedSetupCommands {
+        acquire: request_command(&requests[1]),
+        digest: request_command(&requests[3]),
+        prepare: request_command(&requests[4]),
+        promotion: request_command(&requests[5]),
+        reconciliation: request_command(&requests[6]),
+        verification: request_command(&requests[7]),
+        cleanup: request_command(&requests[8]),
+        rollback: request_command(&rollback_requests[8]),
+    }
+}
+
+fn run_remote_command(command: &str, home: &Path) -> Output {
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .env("HOME", home)
+        .output()
+        .unwrap()
+}
+
+fn file_digest(path: &Path) -> String {
+    let output = std::process::Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .into()
+}
+
+fn promoted_fixture(home: &Path, previous: Option<&[u8]>) -> (PathBuf, PathBuf, PathBuf) {
+    let bin = home.join(".local/bin");
+    let setup = home.join(".local/share/mac-worker/setup");
+    let lock = setup.join(".install-lock");
+    let transaction = setup.join(INSTALLATION_ID);
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&lock).unwrap();
+    fs::create_dir_all(&transaction).unwrap();
+    let active = bin.join("worker");
+    fs::write(&active, b"test worker").unwrap();
+    fs::write(lock.join("owner"), format!("{INSTALLATION_ID}\n")).unwrap();
+    fs::write(
+        transaction.join("candidate.sha256"),
+        format!("{CANDIDATE_DIGEST}\n"),
+    )
+    .unwrap();
+    fs::write(transaction.join("state"), b"promoted\n").unwrap();
+    if let Some(previous) = previous {
+        let backup = transaction.join("worker.previous");
+        fs::write(&backup, previous).unwrap();
+        fs::write(
+            transaction.join("previous.sha256"),
+            format!("{}\n", file_digest(&backup)),
+        )
+        .unwrap();
+    } else {
+        fs::write(transaction.join("no-previous"), b"").unwrap();
+    }
+    (active, lock, transaction)
+}
+
+fn run_executable_setup(
+    results: Vec<Result<ProcessResult, WorkerError>>,
+) -> (u8, Vec<u8>, Vec<u8>, Vec<ProcessRequest>) {
+    let directory = tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+    )
+    .unwrap();
+    let runner = RecordingRunner::returning_results(results);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_io(
+        Cli {
+            config: Some(config_path),
+            json: true,
+            command: Command::Setup { hosts: Vec::new() },
+        },
+        &runner,
+        &mut stdout,
+        &mut stderr,
+    );
+    (exit, stdout, stderr, runner.requests())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UnexpectedEntryKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+fn plant_unexpected_entry(root: &Path, name: &str, kind: UnexpectedEntryKind) -> PathBuf {
+    let path = root.join(name);
+    match kind {
+        UnexpectedEntryKind::File => fs::write(&path, b"unexpected").unwrap(),
+        UnexpectedEntryKind::Directory => fs::create_dir(&path).unwrap(),
+        UnexpectedEntryKind::Symlink => symlink("state", &path).unwrap(),
+    }
+    path
+}
+
+#[test]
+fn generated_acquisition_rejects_a_symlinked_setup_before_touching_its_target() {
+    // Catches following an existing setup symlink while creating the lock and
+    // owner transaction. The generated production command itself is executed.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    let outside = directory.path().join("outside");
+    fs::create_dir_all(home.join(".local/bin")).unwrap();
+    fs::create_dir_all(home.join(".local/share/mac-worker")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, home.join(".local/share/mac-worker/setup")).unwrap();
+
+    let output = run_remote_command(&commands.acquire, &home);
+
+    assert!(
+        !output.status.success(),
+        "symlinked setup was accepted and mutated {}",
+        outside.display()
+    );
+    assert!(!outside.join(".install-lock").exists());
+    assert!(!outside.join(INSTALLATION_ID).exists());
+}
+
+#[test]
+fn generated_setup_phases_complete_and_cleanup_only_owned_evidence() {
+    // Catches a containment guard that rejects the normal replacement flow or
+    // a cleanup command that removes the promoted helper.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    fs::create_dir(&home).unwrap();
+
+    assert!(
+        run_remote_command(&commands.acquire, &home)
+            .status
+            .success()
+    );
+    let transaction = home
+        .join(".local/share/mac-worker/setup")
+        .join(INSTALLATION_ID);
+    let active = home.join(".local/bin/worker");
+    fs::write(&active, b"previous worker").unwrap();
+    fs::write(transaction.join("worker.new"), b"test worker").unwrap();
+
+    let digest = run_remote_command(&commands.digest, &home);
+    assert!(digest.status.success());
+    assert_eq!(digest.stdout, b"match\n");
+    assert!(
+        run_remote_command(&commands.prepare, &home)
+            .status
+            .success()
+    );
+    assert!(
+        run_remote_command(&commands.promotion, &home)
+            .status
+            .success()
+    );
+    let reconciliation = run_remote_command(&commands.reconciliation, &home);
+    assert!(reconciliation.status.success());
+    assert_eq!(reconciliation.stdout, b"promoted\n");
+    assert!(
+        run_remote_command(&commands.cleanup, &home)
+            .status
+            .success()
+    );
+
+    assert_eq!(fs::read(&active).unwrap(), b"test worker");
+    assert!(!transaction.exists());
+    assert!(
+        !home
+            .join(".local/share/mac-worker/setup/.install-lock")
+            .exists()
+    );
+}
+
+#[test]
+fn generated_rollback_restores_the_owned_backup_and_releases_evidence() {
+    // Catches validation that cannot recognize the exact legitimate rollback
+    // state produced by acquisition, digest, prepare, and promotion.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    fs::create_dir(&home).unwrap();
+
+    assert!(
+        run_remote_command(&commands.acquire, &home)
+            .status
+            .success()
+    );
+    let transaction = home
+        .join(".local/share/mac-worker/setup")
+        .join(INSTALLATION_ID);
+    let active = home.join(".local/bin/worker");
+    fs::write(&active, b"previous worker").unwrap();
+    fs::write(transaction.join("worker.new"), b"test worker").unwrap();
+    assert!(run_remote_command(&commands.digest, &home).status.success());
+    assert!(
+        run_remote_command(&commands.prepare, &home)
+            .status
+            .success()
+    );
+    assert!(
+        run_remote_command(&commands.promotion, &home)
+            .status
+            .success()
+    );
+
+    let rollback = run_remote_command(&commands.rollback, &home);
+
+    assert!(rollback.status.success());
+    assert_eq!(fs::read(&active).unwrap(), b"previous worker");
+    assert!(!transaction.exists());
+    assert!(
+        !home
+            .join(".local/share/mac-worker/setup/.install-lock")
+            .exists()
+    );
+}
+
+#[test]
+fn generated_rollback_removes_a_failed_first_install_and_releases_evidence() {
+    // Catches a rollback implementation that handles replacements but cannot
+    // safely remove the owned candidate when no previous helper existed.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    fs::create_dir(&home).unwrap();
+
+    assert!(
+        run_remote_command(&commands.acquire, &home)
+            .status
+            .success()
+    );
+    let transaction = home
+        .join(".local/share/mac-worker/setup")
+        .join(INSTALLATION_ID);
+    let active = home.join(".local/bin/worker");
+    fs::write(transaction.join("worker.new"), b"test worker").unwrap();
+    assert!(run_remote_command(&commands.digest, &home).status.success());
+    assert!(
+        run_remote_command(&commands.prepare, &home)
+            .status
+            .success()
+    );
+    assert!(
+        run_remote_command(&commands.promotion, &home)
+            .status
+            .success()
+    );
+    assert!(active.is_file());
+
+    let rollback = run_remote_command(&commands.rollback, &home);
+
+    assert!(rollback.status.success());
+    assert!(!active.exists());
+    assert!(!transaction.exists());
+    assert!(
+        !home
+            .join(".local/share/mac-worker/setup/.install-lock")
+            .exists()
+    );
+}
+
+#[test]
+fn generated_promotion_rejects_a_swapped_symlinked_bin_without_touching_its_target() {
+    // Catches promotion following a bin-directory swap between SSH requests.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    let outside = directory.path().join("outside");
+    let setup = home.join(".local/share/mac-worker/setup");
+    let lock = setup.join(".install-lock");
+    let transaction = setup.join(INSTALLATION_ID);
+    fs::create_dir_all(home.join(".local/share/mac-worker/setup/.install-lock")).unwrap();
+    fs::create_dir(&transaction).unwrap();
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, home.join(".local/bin")).unwrap();
+    fs::write(outside.join("worker"), b"outside worker").unwrap();
+    fs::write(lock.join("owner"), format!("{INSTALLATION_ID}\n")).unwrap();
+    fs::write(transaction.join("worker.new"), b"test worker").unwrap();
+    fs::write(
+        transaction.join("candidate.sha256"),
+        format!("{CANDIDATE_DIGEST}\n"),
+    )
+    .unwrap();
+    fs::write(transaction.join("state"), b"prepared\n").unwrap();
+    fs::write(transaction.join("worker.previous"), b"outside worker").unwrap();
+    fs::write(
+        transaction.join("previous.sha256"),
+        format!("{}\n", file_digest(&transaction.join("worker.previous"))),
+    )
+    .unwrap();
+
+    let output = run_remote_command(&commands.promotion, &home);
+
+    assert!(!output.status.success());
+    assert_eq!(fs::read(outside.join("worker")).unwrap(), b"outside worker");
+    assert_eq!(
+        fs::read(transaction.join("worker.new")).unwrap(),
+        b"test worker"
+    );
+    assert_eq!(fs::read(transaction.join("state")).unwrap(), b"prepared\n");
+}
+
+#[test]
+fn generated_rollback_rejects_a_swapped_symlinked_bin_without_touching_its_target() {
+    // Catches rollback following a bin-directory swap before restoring or
+    // removing the active helper.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    let outside = directory.path().join("outside");
+    let (_active, lock, transaction) = promoted_fixture(&home, Some(b"previous worker"));
+    fs::rename(home.join(".local/bin"), home.join("original-bin")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("worker"), b"test worker").unwrap();
+    symlink(&outside, home.join(".local/bin")).unwrap();
+
+    let output = run_remote_command(&commands.rollback, &home);
+
+    assert!(!output.status.success());
+    assert_eq!(fs::read(outside.join("worker")).unwrap(), b"test worker");
+    assert_eq!(
+        fs::read(transaction.join("worker.previous")).unwrap(),
+        b"previous worker"
+    );
+    assert!(lock.join("owner").is_file());
+}
+
+#[test]
+fn generated_verification_rejects_a_swapped_symlinked_bin_without_running_its_target() {
+    // Catches the post-reconciliation probe following a bin-directory swap
+    // and executing a helper outside the validated installation root.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    let outside = directory.path().join("outside");
+    let marker = home.join("outside-probe-ran");
+    let (_active, lock, transaction) = promoted_fixture(&home, None);
+    fs::rename(home.join(".local/bin"), home.join("original-bin")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let outside_worker = outside.join("worker");
+    fs::write(
+        &outside_worker,
+        b"#!/bin/sh\nprintf '%s\\n' ran > \"$HOME/outside-probe-ran\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&outside_worker, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&outside, home.join(".local/bin")).unwrap();
+
+    let output = run_remote_command(&commands.verification, &home);
+
+    assert!(!output.status.success());
+    assert!(!marker.exists());
+    assert!(lock.join("owner").is_file());
+    assert!(transaction.join("candidate.sha256").is_file());
+    assert!(transaction.join("state").is_file());
+}
+
+#[test]
+fn generated_cleanup_rejects_every_unexpected_direct_entry_before_mutation() {
+    // Catches partial cleanup before direct-entry validation, including names
+    // that cannot be represented safely as newline-delimited text.
+    let commands = generated_setup_commands();
+    let cases = [
+        (false, "unexpected", UnexpectedEntryKind::File),
+        (false, ".unexpected", UnexpectedEntryKind::File),
+        (false, "unexpected-dir", UnexpectedEntryKind::Directory),
+        (false, "unexpected-link", UnexpectedEntryKind::Symlink),
+        (false, "embedded\nnewline", UnexpectedEntryKind::File),
+        (false, "trailing-newline\n", UnexpectedEntryKind::File),
+        (true, "unexpected", UnexpectedEntryKind::File),
+        (true, ".unexpected", UnexpectedEntryKind::File),
+        (true, "unexpected-dir", UnexpectedEntryKind::Directory),
+        (true, "unexpected-link", UnexpectedEntryKind::Symlink),
+        (true, "embedded\nnewline", UnexpectedEntryKind::File),
+        (true, "trailing-newline\n", UnexpectedEntryKind::File),
+    ];
+
+    for (in_lock, name, kind) in cases {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let (active, lock, transaction) = promoted_fixture(&home, None);
+        let root = if in_lock { &lock } else { &transaction };
+        let unexpected = plant_unexpected_entry(root, name, kind);
+        let output = run_remote_command(&commands.cleanup, &home);
+
+        assert!(
+            !output.status.success(),
+            "cleanup accepted {kind:?} entry {name:?} in {}",
+            root.display()
+        );
+        assert_eq!(fs::read(&active).unwrap(), b"test worker");
+        assert!(lock.join("owner").is_file());
+        assert!(transaction.join("candidate.sha256").is_file());
+        assert!(transaction.join("no-previous").is_file());
+        assert!(transaction.join("state").is_file());
+        assert!(fs::symlink_metadata(&unexpected).is_ok());
+    }
+}
+
+#[test]
+fn generated_rollback_rejects_every_unexpected_direct_entry_before_mutation() {
+    // Catches restoring/removing the active helper before validating every
+    // transaction and lock entry with pathname-safe argv semantics.
+    let commands = generated_setup_commands();
+    let cases = [
+        (false, "unexpected", UnexpectedEntryKind::File),
+        (false, ".unexpected", UnexpectedEntryKind::File),
+        (false, "unexpected-dir", UnexpectedEntryKind::Directory),
+        (false, "unexpected-link", UnexpectedEntryKind::Symlink),
+        (false, "embedded\nnewline", UnexpectedEntryKind::File),
+        (false, "trailing-newline\n", UnexpectedEntryKind::File),
+        (true, "unexpected", UnexpectedEntryKind::File),
+        (true, ".unexpected", UnexpectedEntryKind::File),
+        (true, "unexpected-dir", UnexpectedEntryKind::Directory),
+        (true, "unexpected-link", UnexpectedEntryKind::Symlink),
+        (true, "embedded\nnewline", UnexpectedEntryKind::File),
+        (true, "trailing-newline\n", UnexpectedEntryKind::File),
+    ];
+
+    for (in_lock, name, kind) in cases {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let (active, lock, transaction) = promoted_fixture(&home, Some(b"previous worker"));
+        let root = if in_lock { &lock } else { &transaction };
+        let unexpected = plant_unexpected_entry(root, name, kind);
+        let output = run_remote_command(&commands.rollback, &home);
+
+        assert!(
+            !output.status.success(),
+            "rollback accepted {kind:?} entry {name:?} in {}",
+            root.display()
+        );
+        assert_eq!(fs::read(&active).unwrap(), b"test worker");
+        assert!(lock.join("owner").is_file());
+        assert!(transaction.join("candidate.sha256").is_file());
+        assert!(transaction.join("worker.previous").is_file());
+        assert!(transaction.join("previous.sha256").is_file());
+        assert!(transaction.join("state").is_file());
+        assert!(fs::symlink_metadata(&unexpected).is_ok());
+    }
+}
+
 #[test]
 fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv() {
     // Catches skipping a transaction boundary, an option terminator/policy,
@@ -233,42 +703,43 @@ fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv
     assert!(installed.installed);
     assert_eq!(installed.protocol_version, Some(1));
     assert!(installed.warnings.is_empty());
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 9);
     assert_eq!(
-        runner.requests(),
-        vec![
-            ProcessRequest {
-                program: current_exe.clone().into_os_string(),
-                args: vec!["host".into(), "probe".into()],
-                environment: Vec::new(),
-                stdin: None,
-                policy: preflight_policy(),
-            },
-            ssh_request(acquire_command(), control_policy()),
-            ProcessRequest {
-                program: OsString::from("/usr/bin/scp"),
-                args: vec![
-                    "-q".into(),
-                    "-o".into(),
-                    "BatchMode=yes".into(),
-                    "-o".into(),
-                    "ConnectTimeout=5".into(),
-                    "--".into(),
-                    current_exe.as_os_str().into(),
-                    format!("mac1:~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.new")
-                        .into(),
-                ],
-                environment: Vec::new(),
-                stdin: None,
-                policy: transfer_policy(),
-            },
-            ssh_request(digest_command(), control_policy()),
-            ssh_request(prepare_command(), control_policy()),
-            ssh_request(promotion_command(), control_policy()),
-            ssh_request(reconciliation_command(), control_policy()),
-            ssh_request("~/.local/bin/worker host probe".into(), preflight_policy(),),
-            ssh_request(cleanup_command(), control_policy()),
-        ]
+        requests[0],
+        ProcessRequest {
+            program: current_exe.clone().into_os_string(),
+            args: vec!["host".into(), "probe".into()],
+            environment: Vec::new(),
+            stdin: None,
+            policy: preflight_policy(),
+        }
     );
+    assert_ssh_request_shape(&requests[1], control_policy());
+    assert_eq!(
+        requests[2],
+        ProcessRequest {
+            program: OsString::from("/usr/bin/scp"),
+            args: vec![
+                "-q".into(),
+                "-o".into(),
+                "BatchMode=yes".into(),
+                "-o".into(),
+                "ConnectTimeout=5".into(),
+                "--".into(),
+                current_exe.as_os_str().into(),
+                format!("mac1:~/.local/share/mac-worker/setup/{INSTALLATION_ID}/worker.new").into(),
+            ],
+            environment: Vec::new(),
+            stdin: None,
+            policy: transfer_policy(),
+        }
+    );
+    for request in [&requests[3], &requests[4], &requests[5], &requests[6]] {
+        assert_ssh_request_shape(request, control_policy());
+    }
+    assert_ssh_request_shape(&requests[7], preflight_policy());
+    assert_ssh_request_shape(&requests[8], control_policy());
 }
 
 #[test]
@@ -288,10 +759,7 @@ fn competing_installation_is_rejected_before_transfer_or_target_access() {
     assert_eq!(installed.error_code.as_deref(), Some("INSTALL_LOCKED"));
     let requests = runner.requests();
     assert_eq!(requests.len(), 2);
-    assert_eq!(
-        requests[1],
-        ssh_request(acquire_command(), control_policy())
-    );
+    assert_ssh_request_shape(&requests[1], control_policy());
 }
 
 #[test]
@@ -322,10 +790,10 @@ fn scp_failure_attempts_owned_cleanup_without_losing_primary_error() {
     assert_eq!(installed.warnings.len(), 1);
     assert_eq!(installed.warnings[0].code, SetupWarningCode::CleanupFailed);
     assert!(installed.warnings[0].message.contains("cleanup refused"));
-    assert_eq!(
-        runner.requests().last(),
-        Some(&ssh_request(cleanup_command(), control_policy()))
-    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 4);
+    assert_ssh_request_shape(&requests[3], control_policy());
+    assert_remote_command(&requests[3], &generated_setup_commands().cleanup);
 }
 
 #[test]
@@ -349,11 +817,10 @@ fn changed_candidate_digest_is_never_prepared_or_promoted() {
         installed.error_code.as_deref(),
         Some("CANDIDATE_DIGEST_MISMATCH")
     );
-    assert_eq!(runner.requests().len(), 5);
-    assert_eq!(
-        runner.requests().last(),
-        Some(&ssh_request(cleanup_command(), control_policy()))
-    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 5);
+    assert_ssh_request_shape(&requests[4], control_policy());
+    assert_remote_command(&requests[4], &generated_setup_commands().cleanup);
 }
 
 #[test]
@@ -378,14 +845,12 @@ fn promotion_failure_before_move_reconciles_previous_target_then_cleans_up() {
     assert!(!installed.installed);
     assert_eq!(installed.error_code.as_deref(), Some("PROMOTION_FAILED"));
     let requests = runner.requests();
-    assert_eq!(
-        requests[6],
-        ssh_request(reconciliation_command(), control_policy())
-    );
-    assert_eq!(
-        requests[7],
-        ssh_request(cleanup_command(), control_policy())
-    );
+    assert_eq!(requests.len(), 8);
+    assert_ssh_request_shape(&requests[6], control_policy());
+    assert_ssh_request_shape(&requests[7], control_policy());
+    let commands = generated_setup_commands();
+    assert_remote_command(&requests[6], &commands.reconciliation);
+    assert_remote_command(&requests[7], &commands.cleanup);
 }
 
 #[test]
@@ -406,14 +871,18 @@ fn disconnected_promotion_reconciled_as_candidate_continues_to_probe() {
 
     assert!(installed.installed);
     let requests = runner.requests();
-    assert_eq!(
-        requests[6],
-        ssh_request(reconciliation_command(), control_policy())
-    );
+    assert_eq!(requests.len(), 9);
+    assert_ssh_request_shape(&requests[5], control_policy());
+    assert_ssh_request_shape(&requests[6], control_policy());
+    let commands = generated_setup_commands();
+    assert_remote_command(&requests[5], &commands.promotion);
+    assert_remote_command(&requests[6], &commands.reconciliation);
     assert_eq!(
         requests
             .iter()
-            .filter(|request| request.args.last() == Some(&promotion_command().into()))
+            .filter(|request| {
+                request.program == "/usr/bin/ssh" && request_command(request) == commands.promotion
+            })
             .count(),
         1
     );
@@ -449,19 +918,13 @@ fn disconnected_promotion_reconciled_as_previous_retains_owned_state() {
     );
     let requests = runner.requests();
     assert_eq!(requests.len(), 7);
-    assert_eq!(
-        requests[6],
-        ssh_request(reconciliation_command(), control_policy())
-    );
-    assert!(!requests.contains(&ssh_request(cleanup_command(), control_policy())));
-    assert!(!requests.contains(&ssh_request(rollback_command(), control_policy())));
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.args.last() == Some(&promotion_command().into()))
-            .count(),
-        1
-    );
+    assert_ssh_request_shape(&requests[5], control_policy());
+    assert_ssh_request_shape(&requests[6], control_policy());
+    let commands = generated_setup_commands();
+    assert_remote_command(&requests[5], &commands.promotion);
+    assert_remote_command(&requests[6], &commands.reconciliation);
+    assert!(!contains_remote_command(&requests, &commands.cleanup));
+    assert!(!contains_remote_command(&requests, &commands.rollback));
 }
 
 #[test]
@@ -491,8 +954,13 @@ fn ssh_transport_failure_reconciled_as_previous_retains_owned_state() {
     );
     let requests = runner.requests();
     assert_eq!(requests.len(), 7);
-    assert!(!requests.contains(&ssh_request(cleanup_command(), control_policy())));
-    assert!(!requests.contains(&ssh_request(rollback_command(), control_policy())));
+    assert_ssh_request_shape(&requests[5], control_policy());
+    assert_ssh_request_shape(&requests[6], control_policy());
+    let commands = generated_setup_commands();
+    assert_remote_command(&requests[5], &commands.promotion);
+    assert_remote_command(&requests[6], &commands.reconciliation);
+    assert!(!contains_remote_command(&requests, &commands.cleanup));
+    assert!(!contains_remote_command(&requests, &commands.rollback));
 }
 
 #[test]
@@ -523,20 +991,10 @@ fn reconciliation_requires_candidate_digest_and_final_promoted_marker() {
         .into_owned();
 
     let home = directory.path().join("home");
-    let transaction = home
-        .join(".local/share/mac-worker/setup")
-        .join(INSTALLATION_ID);
-    fs::create_dir_all(home.join(".local/bin")).unwrap();
-    fs::create_dir_all(&transaction).unwrap();
-    fs::write(home.join(".local/bin/worker"), b"test worker").unwrap();
+    let (_active, _lock, transaction) = promoted_fixture(&home, None);
     fs::write(transaction.join("state"), b"promoting\n").unwrap();
 
-    let output = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .env("HOME", &home)
-        .output()
-        .unwrap();
+    let output = run_remote_command(&command, &home);
 
     assert!(output.status.success());
     assert_eq!(output.stdout, b"unknown\n");
@@ -570,12 +1028,11 @@ fn unrecoverable_promotion_state_retains_lock_and_scoped_data() {
     );
     let requests = runner.requests();
     assert_eq!(requests.len(), 7);
-    assert_eq!(
-        requests[6],
-        ssh_request(reconciliation_command(), control_policy())
-    );
-    assert!(!requests.contains(&ssh_request(cleanup_command(), control_policy())));
-    assert!(!requests.contains(&ssh_request(rollback_command(), control_policy())));
+    assert_ssh_request_shape(&requests[6], control_policy());
+    let commands = generated_setup_commands();
+    assert_remote_command(&requests[6], &commands.reconciliation);
+    assert!(!contains_remote_command(&requests, &commands.cleanup));
+    assert!(!contains_remote_command(&requests, &commands.rollback));
 }
 
 #[test]
@@ -600,10 +1057,10 @@ fn failed_verification_restores_owned_backup_and_releases_lock() {
 
     assert!(!installed.installed);
     assert_eq!(installed.error_code.as_deref(), Some("VERIFICATION_FAILED"));
-    assert_eq!(
-        runner.requests().last(),
-        Some(&ssh_request(rollback_command(), control_policy()))
-    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 9);
+    assert_ssh_request_shape(&requests[8], control_policy());
+    assert_remote_command(&requests[8], &generated_setup_commands().rollback);
 }
 
 #[test]
@@ -953,6 +1410,149 @@ fn executable_setup_local_io_failure_renders_report_then_exits_io() {
 }
 
 #[test]
+fn executable_setup_acquisition_io_retains_state_renders_report_and_exits_io() {
+    // Catches flattening a local acquisition runner I/O cause while the
+    // stable unknown-state report retains remote evidence.
+    let (exit, stdout, stderr, requests) = run_executable_setup(vec![
+        Ok(result(0, valid_probe_json(), b"")),
+        Err(WorkerError::Io(std::io::Error::other(
+            "acquisition result read failed",
+        ))),
+    ]);
+
+    assert_eq!(exit, 74);
+    assert!(stderr.is_empty());
+    assert_eq!(
+        stdout,
+        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"UNKNOWN_INSTALLATION_STATE\",\"error_message\":\"installation lock acquisition result was lost; scoped state was retained: I/O error: acquisition result read failed\",\"warnings\":[]}]}\n"
+    );
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn executable_setup_digest_io_cleans_up_renders_report_and_exits_io() {
+    // Catches assigning infrastructure after a typed local digest runner I/O
+    // failure while preserving the phase-specific public report.
+    let (exit, stdout, stderr, requests) = run_executable_setup(vec![
+        Ok(result(0, valid_probe_json(), b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Err(WorkerError::Io(std::io::Error::other(
+            "digest result read failed",
+        ))),
+        Ok(result(0, b"", b"")),
+    ]);
+
+    assert_eq!(exit, 74);
+    assert!(stderr.is_empty());
+    assert_eq!(
+        stdout,
+        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"DIGEST_VERIFICATION_FAILED\",\"error_message\":\"failed to verify staged candidate digest: I/O error: digest result read failed\",\"warnings\":[]}]}\n"
+    );
+    assert_eq!(requests.len(), 5);
+}
+
+#[test]
+fn executable_setup_prepare_io_cleans_up_renders_report_and_exits_io() {
+    // Catches run-success string flattening at the prepare boundary.
+    let (exit, stdout, stderr, requests) = run_executable_setup(vec![
+        Ok(result(0, valid_probe_json(), b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"match\n", b"")),
+        Err(WorkerError::Io(std::io::Error::other(
+            "prepare result read failed",
+        ))),
+        Ok(result(0, b"", b"")),
+    ]);
+
+    assert_eq!(exit, 74);
+    assert!(stderr.is_empty());
+    assert_eq!(
+        stdout,
+        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"INSTALL_FAILED\",\"error_message\":\"failed to launch /usr/bin/ssh: I/O error: prepare result read failed\",\"warnings\":[]}]}\n"
+    );
+    assert_eq!(requests.len(), 6);
+}
+
+#[test]
+fn executable_setup_promotion_io_retains_ambiguous_state_and_exits_io() {
+    // Catches losing the typed promotion cause when reconciliation observes
+    // the previous helper but cannot prove the remote command has stopped.
+    let (exit, stdout, stderr, requests) = run_executable_setup(vec![
+        Ok(result(0, valid_probe_json(), b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"match\n", b"")),
+        Ok(result(0, b"", b"")),
+        Err(WorkerError::Io(std::io::Error::other(
+            "promotion result read failed",
+        ))),
+        Ok(result(0, b"previous\n", b"")),
+    ]);
+
+    assert_eq!(exit, 74);
+    assert!(stderr.is_empty());
+    assert_eq!(
+        stdout,
+        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"UNKNOWN_INSTALLATION_STATE\",\"error_message\":\"failed to launch /usr/bin/ssh: I/O error: promotion result read failed; the previous target is currently observable but promotion completion is unproven; installation lock and scoped state were retained\",\"warnings\":[]}]}\n"
+    );
+    assert_eq!(requests.len(), 7);
+}
+
+#[test]
+fn executable_setup_reconciliation_io_retains_state_renders_report_and_exits_io() {
+    // Catches converting the typed reconciliation runner cause to a string
+    // before aggregate classification.
+    let (exit, stdout, stderr, requests) = run_executable_setup(vec![
+        Ok(result(0, valid_probe_json(), b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"match\n", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Err(WorkerError::Io(std::io::Error::other(
+            "reconciliation result read failed",
+        ))),
+    ]);
+
+    assert_eq!(exit, 74);
+    assert!(stderr.is_empty());
+    assert_eq!(
+        stdout,
+        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"UNKNOWN_INSTALLATION_STATE\",\"error_message\":\"promotion reported success but reconciliation could not prove completion: I/O error: reconciliation result read failed; installation lock and scoped state were retained\",\"warnings\":[]}]}\n"
+    );
+    assert_eq!(requests.len(), 7);
+}
+
+#[test]
+fn executable_setup_verification_io_rolls_back_renders_report_and_exits_io() {
+    // Catches SshTransport rendering away the verification runner cause before
+    // Installer assigns the aggregate setup category.
+    let (exit, stdout, stderr, requests) = run_executable_setup(vec![
+        Ok(result(0, valid_probe_json(), b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"match\n", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"promoted\n", b"")),
+        Err(WorkerError::Io(std::io::Error::other(
+            "verification result read failed",
+        ))),
+        Ok(result(0, b"", b"")),
+    ]);
+
+    assert_eq!(exit, 74);
+    assert!(stderr.is_empty());
+    assert_eq!(
+        stdout,
+        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"VERIFICATION_FAILED\",\"error_message\":\"failed to launch SSH probe: I/O error: verification result read failed\",\"warnings\":[]}]}\n"
+    );
+    assert_eq!(requests.len(), 9);
+}
+
+#[test]
 fn executable_setup_scp_local_io_renders_transfer_report_cleans_up_and_exits_io() {
     // Catches flattening a local SCP launch/read I/O failure into the stable
     // TRANSFER_FAILED report's retryable unavailable category.
@@ -1057,9 +1657,10 @@ fn executable_setup_mixed_failures_render_all_hosts_and_use_strongest_category()
         Ok(result(0, b"", b"")),
         Ok(result(0, b"mismatch\n", b"")),
         Ok(result(0, b"", b"")),
+        Ok(result(0, valid_probe_json(), b"")),
         Err(WorkerError::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "cannot execute candidate",
+            "cannot read acquisition result",
         ))),
     ]);
     let mut stdout = Vec::new();
@@ -1085,7 +1686,10 @@ fn executable_setup_mixed_failures_render_all_hosts_and_use_strongest_category()
         value["workers"][1]["error_code"],
         "CANDIDATE_DIGEST_MISMATCH"
     );
-    assert_eq!(value["workers"][2]["error_code"], "LOCAL_BINARY_INVALID");
+    assert_eq!(
+        value["workers"][2]["error_code"],
+        "UNKNOWN_INSTALLATION_STATE"
+    );
 }
 
 #[test]

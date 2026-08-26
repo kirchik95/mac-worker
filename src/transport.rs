@@ -5,8 +5,8 @@ use crate::{
     error::{ProcessError, ProcessStream, WorkerError},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::{
-        HealthStatus, PROTOCOL_VERSION, ProbeResponse, WorkerHealth, WorkersReport,
-        missing_capabilities,
+        HealthStatus, PROTOCOL_VERSION, ProbeResponse, SetupFailureKind, WorkerHealth,
+        WorkersReport, missing_capabilities,
     },
 };
 
@@ -45,6 +45,21 @@ impl<R: ProcessRunner> SshTransport<R> {
     }
 
     pub fn probe(&self, worker: &WorkerEntry) -> WorkerHealth {
+        self.probe_with_failure_kind(worker).0
+    }
+
+    pub(crate) fn probe_with_failure_kind(
+        &self,
+        worker: &WorkerEntry,
+    ) -> (WorkerHealth, Option<SetupFailureKind>) {
+        self.probe_with_command_and_failure_kind(worker, REMOTE_PROBE_COMMAND.into())
+    }
+
+    pub(crate) fn probe_with_command_and_failure_kind(
+        &self,
+        worker: &WorkerEntry,
+        remote_command: String,
+    ) -> (WorkerHealth, Option<SetupFailureKind>) {
         let result = match self.runner.run(&ProcessRequest {
             program: SSH_PROGRAM.into(),
             args: vec![
@@ -54,7 +69,7 @@ impl<R: ProcessRunner> SshTransport<R> {
                 "ConnectTimeout=5".into(),
                 "--".into(),
                 worker.ssh.clone().into(),
-                REMOTE_PROBE_COMMAND.into(),
+                remote_command.into(),
             ],
             environment: Vec::new(),
             stdin: None,
@@ -73,20 +88,31 @@ impl<R: ProcessRunner> SshTransport<R> {
                         ..
                     })
                 ) {
-                    return unavailable(
-                        worker,
-                        "INVALID_RESPONSE",
-                        format!("SSH probe response exceeded {MAX_PROBE_RESPONSE_BYTES} bytes"),
-                        None,
-                        Vec::new(),
+                    return (
+                        unavailable(
+                            worker,
+                            "INVALID_RESPONSE",
+                            format!("SSH probe response exceeded {MAX_PROBE_RESPONSE_BYTES} bytes"),
+                            None,
+                            Vec::new(),
+                        ),
+                        Some(SetupFailureKind::Infrastructure),
                     );
                 }
-                return unavailable(
-                    worker,
-                    "SSH_UNAVAILABLE",
-                    format!("failed to launch SSH probe: {error}"),
-                    None,
-                    Vec::new(),
+                let failure_kind = if matches!(&error, WorkerError::Io(_)) {
+                    SetupFailureKind::Io
+                } else {
+                    SetupFailureKind::Infrastructure
+                };
+                return (
+                    unavailable(
+                        worker,
+                        "SSH_UNAVAILABLE",
+                        format!("failed to launch SSH probe: {error}"),
+                        None,
+                        Vec::new(),
+                    ),
+                    Some(failure_kind),
                 );
             }
         };
@@ -103,80 +129,101 @@ impl<R: ProcessRunner> SshTransport<R> {
             } else {
                 format!("SSH probe failed with {status}: {detail}")
             };
-            return unavailable(worker, "SSH_UNAVAILABLE", message, None, Vec::new());
+            return (
+                unavailable(worker, "SSH_UNAVAILABLE", message, None, Vec::new()),
+                None,
+            );
         }
 
         if result.stdout.len() > MAX_PROBE_RESPONSE_BYTES {
-            return unavailable(
-                worker,
-                "INVALID_RESPONSE",
-                format!("SSH probe response exceeded {MAX_PROBE_RESPONSE_BYTES} bytes"),
+            return (
+                unavailable(
+                    worker,
+                    "INVALID_RESPONSE",
+                    format!("SSH probe response exceeded {MAX_PROBE_RESPONSE_BYTES} bytes"),
+                    None,
+                    Vec::new(),
+                ),
                 None,
-                Vec::new(),
             );
         }
 
         let response = match std::str::from_utf8(&result.stdout) {
             Ok(response) => response,
             Err(error) => {
-                return unavailable(
-                    worker,
-                    "INVALID_RESPONSE",
-                    format!("SSH probe response was not valid UTF-8: {error}"),
+                return (
+                    unavailable(
+                        worker,
+                        "INVALID_RESPONSE",
+                        format!("SSH probe response was not valid UTF-8: {error}"),
+                        None,
+                        Vec::new(),
+                    ),
                     None,
-                    Vec::new(),
                 );
             }
         };
         let probe: ProbeResponse = match serde_json::from_str(response) {
             Ok(probe) => probe,
             Err(error) => {
-                return unavailable(
-                    worker,
-                    "INVALID_RESPONSE",
-                    format!("SSH probe response was not valid JSON: {error}"),
+                return (
+                    unavailable(
+                        worker,
+                        "INVALID_RESPONSE",
+                        format!("SSH probe response was not valid JSON: {error}"),
+                        None,
+                        Vec::new(),
+                    ),
                     None,
-                    Vec::new(),
                 );
             }
         };
 
         if probe.protocol_version != PROTOCOL_VERSION {
-            return unavailable(
-                worker,
-                "PROTOCOL_MISMATCH",
-                format!(
-                    "worker protocol version {} does not match required version {PROTOCOL_VERSION}",
-                    probe.protocol_version
+            return (
+                unavailable(
+                    worker,
+                    "PROTOCOL_MISMATCH",
+                    format!(
+                        "worker protocol version {} does not match required version {PROTOCOL_VERSION}",
+                        probe.protocol_version
+                    ),
+                    Some(probe),
+                    Vec::new(),
                 ),
-                Some(probe),
-                Vec::new(),
+                None,
             );
         }
 
         let missing = missing_capabilities(&worker.capabilities, &probe);
         if !missing.is_empty() {
-            return unavailable(
-                worker,
-                "MISSING_CAPABILITIES",
-                format!(
-                    "worker is missing declared capabilities: {}",
-                    missing.join(", ")
+            return (
+                unavailable(
+                    worker,
+                    "MISSING_CAPABILITIES",
+                    format!(
+                        "worker is missing declared capabilities: {}",
+                        missing.join(", ")
+                    ),
+                    Some(probe),
+                    missing,
                 ),
-                Some(probe),
-                missing,
+                None,
             );
         }
 
-        WorkerHealth {
-            name: worker.name.clone(),
-            ssh: worker.ssh.clone(),
-            status: HealthStatus::Ready,
-            probe: Some(probe),
-            missing_capabilities: Vec::new(),
-            error_code: None,
-            error_message: None,
-        }
+        (
+            WorkerHealth {
+                name: worker.name.clone(),
+                ssh: worker.ssh.clone(),
+                status: HealthStatus::Ready,
+                probe: Some(probe),
+                missing_capabilities: Vec::new(),
+                error_code: None,
+                error_message: None,
+            },
+            None,
+        )
     }
 }
 
