@@ -16,6 +16,7 @@ pub mod config;
 pub mod error;
 pub mod inputs;
 pub mod install;
+pub mod manifest;
 pub mod output;
 pub mod paths;
 pub mod probe;
@@ -25,6 +26,7 @@ pub mod project_config;
 pub mod protocol;
 pub mod requirements;
 pub mod rooted_fs;
+pub mod snapshot;
 pub mod transport;
 
 pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutput, WorkerError> {
