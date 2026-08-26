@@ -1,7 +1,7 @@
 # mac-worker local dashboard design
 
 - Date: 2026-08-26
-- Status: proposed for written review
+- Status: approved for implementation
 - Repository: `mac-worker`
 - User-facing commands: `worker dashboard`, later `worker watch`
 - Depends on: durable job lifecycle and three-worker scheduler
