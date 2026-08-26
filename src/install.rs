@@ -109,15 +109,30 @@ impl<'a> Installer<'a> {
             stdin: None,
             policy: transfer_policy(),
         };
-        if let Err(message) = run_success(self.runner, &transfer) {
-            let warnings = self.cleanup_warnings(worker, &id);
-            return failed(
-                worker,
-                "TRANSFER_FAILED",
-                message,
+        let transfer_failure = match self.runner.run(&transfer) {
+            Ok(result) if result.status.success() => None,
+            Ok(result) => Some((
+                process_failure(&transfer.program.to_string_lossy(), &result),
                 SetupFailureKind::Unavailable,
-                warnings,
-            );
+            )),
+            Err(error) => {
+                let failure_kind = if matches!(&error, crate::error::WorkerError::Io(_)) {
+                    SetupFailureKind::Io
+                } else {
+                    SetupFailureKind::Unavailable
+                };
+                Some((
+                    format!(
+                        "failed to launch {}: {error}",
+                        transfer.program.to_string_lossy()
+                    ),
+                    failure_kind,
+                ))
+            }
+        };
+        if let Some((message, failure_kind)) = transfer_failure {
+            let warnings = self.cleanup_warnings(worker, &id);
+            return failed(worker, "TRANSFER_FAILED", message, failure_kind, warnings);
         }
 
         let digest_request = ssh_request(worker, digest_command(&id, &digest), control_policy());

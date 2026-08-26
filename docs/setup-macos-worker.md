@@ -163,33 +163,41 @@ If inspection shows an expected state, run this complete cleanup block as one co
     }
 
     verify_transaction_entries() {
-        transaction_entries="$(/usr/bin/find "$transaction" ! -path "$transaction" -prune -print)" \
-            || fail 'owner-scoped setup transaction cannot be enumerated; retain the lock and stop'
-        while IFS= read -r entry; do
-            [ -z "$entry" ] && continue
-            case "$entry" in
-                "$transaction/worker.new"|"$transaction/worker.previous"|\
-                "$transaction/candidate.sha256"|"$transaction/previous.sha256"|\
-                "$transaction/no-previous"|"$transaction/state") ;;
-                *) fail "unexpected owner-scoped transaction entry: $entry; retain the lock and stop" ;;
-            esac
-        done <<EOF
-$transaction_entries
-EOF
+        /usr/bin/find "$transaction" ! -path "$transaction" -prune \
+            -exec /bin/sh -c '
+                transaction=$1
+                shift
+                for entry do
+                    case "$entry" in
+                        "$transaction/worker.new"|"$transaction/worker.previous"|\
+                        "$transaction/candidate.sha256"|"$transaction/previous.sha256"|\
+                        "$transaction/no-previous"|"$transaction/state") ;;
+                        *)
+                            printf "%s\n" "unexpected owner-scoped transaction entry: $entry; retain the lock and stop" >&2
+                            exit 1
+                            ;;
+                    esac
+                done
+            ' sh "$transaction" {} + \
+            || fail 'owner-scoped setup transaction cannot be enumerated or contains unexpected entries; retain the lock and stop'
     }
 
     verify_lock_entries() {
-        lock_entries="$(/usr/bin/find "$lock_dir" ! -path "$lock_dir" -prune -print)" \
-            || fail 'setup lock directory cannot be enumerated; retain the lock and stop'
-        while IFS= read -r entry; do
-            [ -z "$entry" ] && continue
-            case "$entry" in
-                "$transaction_owner_path") ;;
-                *) fail "unexpected setup lock entry: $entry; retain the lock and stop" ;;
-            esac
-        done <<EOF
-$lock_entries
-EOF
+        /usr/bin/find "$lock_dir" ! -path "$lock_dir" -prune \
+            -exec /bin/sh -c '
+                transaction_owner_path=$1
+                shift
+                for entry do
+                    case "$entry" in
+                        "$transaction_owner_path") ;;
+                        *)
+                            printf "%s\n" "unexpected setup lock entry: $entry; retain the lock and stop" >&2
+                            exit 1
+                            ;;
+                    esac
+                done
+            ' sh "$transaction_owner_path" {} + \
+            || fail 'setup lock directory cannot be enumerated or contains unexpected entries; retain the lock and stop'
     }
 
     data_root="$(cd -P "$HOME/.local/share/mac-worker" 2>/dev/null && /bin/pwd)" \
