@@ -997,6 +997,48 @@ fn executable_setup_scp_local_io_renders_transfer_report_cleans_up_and_exits_io(
 }
 
 #[test]
+fn executable_setup_scp_nonzero_renders_transfer_report_cleans_up_and_exits_unavailable() {
+    // Catches classifying an acknowledged remote SCP failure as local I/O
+    // instead of the stable retryable transfer failure category.
+    let directory = tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+    )
+    .unwrap();
+    let runner = RecordingRunner::returning(vec![
+        result(0, valid_probe_json(), b""),
+        result(0, b"", b""),
+        result(1, b"", b"transfer interrupted"),
+        result(0, b"", b""),
+    ]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_with_io(
+        Cli {
+            config: Some(config_path),
+            json: true,
+            command: Command::Setup { hosts: Vec::new() },
+        },
+        &runner,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 69);
+    assert!(stderr.is_empty());
+    assert_eq!(
+        stdout,
+        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"TRANSFER_FAILED\",\"error_message\":\"/usr/bin/scp failed with exit 1: transfer interrupted\",\"warnings\":[]}]}\n"
+    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[3].program, OsString::from("/usr/bin/ssh"));
+}
+
+#[test]
 fn executable_setup_mixed_failures_render_all_hosts_and_use_strongest_category() {
     // Catches first/last-result aggregation and proves I/O outranks
     // infrastructure, which in turn outranks retryable unavailability.
