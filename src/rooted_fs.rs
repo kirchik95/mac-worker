@@ -230,8 +230,13 @@ impl RootedDir {
     pub fn remove_owned_tree(&self) -> io::Result<()> {
         self.verify_root_name()?;
         remove_directory_contents(self.root.as_raw_fd())?;
-        self.verify_root_name()?;
-        unlink_at(self.parent.as_raw_fd(), &self.root_name, libc::AT_REMOVEDIR)
+        let current = stat_at(self.parent.as_raw_fd(), &self.root_name)?;
+        if file_type(current.st_mode) != libc::S_IFDIR
+            || FileIdentity::from_stat(&current) != self.root_identity
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        QuarantinedEntry::acquire(self.parent.as_raw_fd(), &self.root_name, &current)?.remove()
     }
 
     fn open_parent(
@@ -276,7 +281,7 @@ impl RootedDir {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -508,7 +513,7 @@ fn copy_regular_with_clone(
         temporary_name,
         mode,
     )?;
-    publish_no_replace(
+    publish_regular_no_replace(
         operation.directory.as_raw_fd(),
         temporary_name,
         destination_parent.as_raw_fd(),
@@ -562,13 +567,7 @@ fn remove_failed_clone_destination(parent: RawFd, name: &CStr) -> io::Result<()>
     if file_type(metadata.st_mode) != libc::S_IFREG {
         return Err(os_error(libc::EEXIST));
     }
-    let opened = open_regular_at(parent, name)?;
-    let opened_metadata = stat_fd(opened.as_raw_fd())?;
-    if !same_file(&metadata, &opened_metadata) {
-        return Err(os_error(libc::ESTALE));
-    }
-    drop(opened);
-    unlink_at(parent, name, 0)
+    QuarantinedEntry::acquire(parent, name, &metadata)?.remove()
 }
 
 struct OperationDirectory {
@@ -617,7 +616,7 @@ impl OperationDirectory {
         {
             return Err(os_error(libc::ESTALE));
         }
-        unlink_at(self.parent.as_raw_fd(), &self.name, libc::AT_REMOVEDIR)
+        QuarantinedEntry::acquire(self.parent.as_raw_fd(), &self.name, &current)?.remove()
     }
 }
 
@@ -628,7 +627,7 @@ impl Drop for OperationDirectory {
 }
 
 #[cfg(target_vendor = "apple")]
-fn publish_no_replace(
+fn rename_no_replace(
     source_parent: RawFd,
     source_name: &CStr,
     destination_parent: RawFd,
@@ -648,7 +647,7 @@ fn publish_no_replace(
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn publish_no_replace(
+fn rename_no_replace(
     source_parent: RawFd,
     source_name: &CStr,
     destination_parent: RawFd,
@@ -668,24 +667,100 @@ fn publish_no_replace(
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-fn publish_no_replace(
+fn rename_no_replace(
     source_parent: RawFd,
     source_name: &CStr,
     destination_parent: RawFd,
     destination_name: &CStr,
 ) -> io::Result<()> {
-    // SAFETY: linkat atomically creates the absent final name without
-    // following either component; all arguments remain live for the call.
-    cvt(unsafe {
-        libc::linkat(
-            source_parent,
-            source_name.as_ptr(),
-            destination_parent,
-            destination_name.as_ptr(),
-            0,
-        )
-    })?;
-    unlink_at(source_parent, source_name, 0)
+    unsupported_rename_no_replace(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+    )
+}
+
+#[cfg(any(
+    test,
+    not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
+))]
+fn unsupported_rename_no_replace(
+    _source_parent: RawFd,
+    _source_name: &CStr,
+    _destination_parent: RawFd,
+    _destination_name: &CStr,
+) -> io::Result<()> {
+    Err(os_error(libc::ENOTSUP))
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn publish_regular_no_replace(
+    source_parent: RawFd,
+    source_name: &CStr,
+    destination_parent: RawFd,
+    destination_name: &CStr,
+) -> io::Result<()> {
+    rename_no_replace(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+    )
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn publish_regular_no_replace(
+    source_parent: RawFd,
+    source_name: &CStr,
+    destination_parent: RawFd,
+    destination_name: &CStr,
+) -> io::Result<()> {
+    publish_regular_with_link_ops(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+        |source_parent, source_name, destination_parent, destination_name| {
+            // SAFETY: linkat atomically creates the absent final name without
+            // following either component; all arguments remain live.
+            cvt(unsafe {
+                libc::linkat(
+                    source_parent,
+                    source_name.as_ptr(),
+                    destination_parent,
+                    destination_name.as_ptr(),
+                    0,
+                )
+            })
+        },
+        |source_parent, source_name| unlink_at(source_parent, source_name, 0),
+    )
+}
+
+#[cfg(any(
+    test,
+    not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
+))]
+fn publish_regular_with_link_ops(
+    source_parent: RawFd,
+    source_name: &CStr,
+    destination_parent: RawFd,
+    destination_name: &CStr,
+    link: impl FnOnce(RawFd, &CStr, RawFd, &CStr) -> io::Result<()>,
+    unlink: impl FnOnce(RawFd, &CStr) -> io::Result<()>,
+) -> io::Result<()> {
+    link(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+    )?;
+    // Once linkat succeeds, the exclusive final name is published. Failure
+    // to remove the operation-owned temporary link is cleanup work and must
+    // not turn successful publication into a reported failure.
+    let _ = unlink(source_parent, source_name);
+    Ok(())
 }
 
 fn copy_regular_bytes(
@@ -740,15 +815,7 @@ fn make_directory_read_only(directory: RawFd) -> io::Result<()> {
                 let child = open_verified_child_directory(directory, &name, &metadata)?;
                 make_directory_read_only(child.as_raw_fd())?;
             }
-            libc::S_IFREG => {
-                let file = open_regular_at(directory, &name)?;
-                let mode = if metadata.st_mode & 0o111 != 0 {
-                    0o555
-                } else {
-                    0o444
-                };
-                chmod_fd(file.as_raw_fd(), mode)?;
-            }
+            libc::S_IFREG => make_regular_read_only_with_hook(directory, &name, &metadata, || {})?,
             libc::S_IFLNK => {}
             _ => return Err(invalid_type_error()),
         }
@@ -756,17 +823,49 @@ fn make_directory_read_only(directory: RawFd) -> io::Result<()> {
     chmod_fd(directory, 0o555)
 }
 
+fn make_regular_read_only_with_hook(
+    parent: RawFd,
+    name: &CStr,
+    initial: &libc::stat,
+    before_open: impl FnOnce(),
+) -> io::Result<()> {
+    if file_type(initial.st_mode) != libc::S_IFREG {
+        return Err(invalid_type_error());
+    }
+    let parent_device = stat_fd(parent)?.st_dev;
+    if initial.st_dev != parent_device {
+        return Err(os_error(libc::EXDEV));
+    }
+    before_open();
+    let file = open_regular_at(parent, name)?;
+    let opened = stat_fd(file.as_raw_fd())?;
+    if opened.st_dev != parent_device {
+        return Err(os_error(libc::EXDEV));
+    }
+    if file_type(opened.st_mode) != libc::S_IFREG || !same_file(initial, &opened) {
+        return Err(os_error(libc::ESTALE));
+    }
+    let mode = if opened.st_mode & 0o111 != 0 {
+        0o555
+    } else {
+        0o444
+    };
+    chmod_fd(file.as_raw_fd(), mode)
+}
+
 fn remove_directory_contents(directory: RawFd) -> io::Result<()> {
     chmod_fd(directory, 0o700)?;
     for name in directory_entries(directory)? {
         let metadata = stat_at(directory, &name)?;
-        match file_type(metadata.st_mode) {
-            libc::S_IFDIR => {
-                let quarantined = QuarantinedDirectory::acquire(directory, &name, &metadata)?;
-                remove_directory_contents(quarantined.directory.as_raw_fd())?;
+        let kind = file_type(metadata.st_mode);
+        match kind {
+            libc::S_IFDIR | libc::S_IFREG | libc::S_IFLNK => {
+                let quarantined = QuarantinedEntry::acquire(directory, &name, &metadata)?;
+                if kind == libc::S_IFDIR {
+                    remove_directory_contents(quarantined.directory()?.as_raw_fd())?;
+                }
                 quarantined.remove()?;
             }
-            libc::S_IFREG | libc::S_IFLNK => unlink_at(directory, &name, 0)?,
             _ => return Err(invalid_type_error()),
         }
     }
@@ -796,59 +895,185 @@ fn open_verified_child_directory(
     Ok(child)
 }
 
-struct QuarantinedDirectory {
+#[derive(Debug)]
+struct QuarantinedEntry {
     parent: OwnedFd,
     name: CString,
-    directory: OwnedFd,
+    descriptor: Option<OwnedFd>,
     identity: FileIdentity,
+    kind: libc::mode_t,
 }
 
-impl QuarantinedDirectory {
+impl QuarantinedEntry {
     fn acquire(parent: RawFd, original_name: &CStr, initial: &libc::stat) -> io::Result<Self> {
+        Self::acquire_with_hooks(parent, original_name, initial, || {}, || {})
+    }
+
+    fn acquire_with_hooks(
+        parent: RawFd,
+        original_name: &CStr,
+        initial: &libc::stat,
+        before_rename: impl FnOnce(),
+        after_rename: impl FnOnce(),
+    ) -> io::Result<Self> {
         let parent = duplicate_fd(parent)?;
         let parent_device = stat_fd(parent.as_raw_fd())?.st_dev;
-        if file_type(initial.st_mode) != libc::S_IFDIR {
-            return Err(os_error(libc::ENOTDIR));
+        let kind = file_type(initial.st_mode);
+        if !matches!(kind, libc::S_IFDIR | libc::S_IFREG | libc::S_IFLNK) {
+            return Err(invalid_type_error());
         }
         if initial.st_dev != parent_device {
             return Err(os_error(libc::EXDEV));
         }
-        let directory = open_verified_child_directory(parent.as_raw_fd(), original_name, initial)?;
-        let original_mode = initial.st_mode & 0o7777;
-        chmod_fd(directory.as_raw_fd(), 0o700)?;
+
+        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        if kind == libc::S_IFDIR {
+            return Err(os_error(libc::ENOTSUP));
+        }
+
+        let (descriptor, original_mode) = match kind {
+            libc::S_IFDIR => {
+                let directory =
+                    open_verified_child_directory(parent.as_raw_fd(), original_name, initial)?;
+                let opened = stat_fd(directory.as_raw_fd())?;
+                let original_mode = opened.st_mode & 0o7777;
+                chmod_fd(directory.as_raw_fd(), 0o700)?;
+                (Some(directory), Some(original_mode))
+            }
+            libc::S_IFREG => {
+                let regular = open_regular_at(parent.as_raw_fd(), original_name)?;
+                let opened = stat_fd(regular.as_raw_fd())?;
+                if opened.st_dev != parent_device {
+                    return Err(os_error(libc::EXDEV));
+                }
+                if file_type(opened.st_mode) != libc::S_IFREG || !same_file(initial, &opened) {
+                    return Err(os_error(libc::ESTALE));
+                }
+                (Some(regular), None)
+            }
+            libc::S_IFLNK => (None, None),
+            _ => unreachable!("entry kind was validated above"),
+        };
+
         let name = CString::new(format!(".mac-worker-remove-{}", uuid::Uuid::new_v4()))
             .expect("UUID quarantine name has no NUL");
+        before_rename();
         if let Err(error) =
-            publish_no_replace(parent.as_raw_fd(), original_name, parent.as_raw_fd(), &name)
+            rename_no_replace(parent.as_raw_fd(), original_name, parent.as_raw_fd(), &name)
         {
-            let _ = chmod_fd(directory.as_raw_fd(), original_mode);
-            return Err(error);
+            return match Self::restore_mode(&descriptor, original_mode) {
+                Ok(()) => Err(error),
+                Err(restoration_error) => Err(restoration_error),
+            };
         }
-        let quarantined = stat_at(parent.as_raw_fd(), &name)?;
-        let opened = stat_fd(directory.as_raw_fd())?;
-        if !same_file(initial, &quarantined) || !same_file(&quarantined, &opened) {
-            let _ =
-                publish_no_replace(parent.as_raw_fd(), &name, parent.as_raw_fd(), original_name);
-            let _ = chmod_fd(directory.as_raw_fd(), original_mode);
-            return Err(os_error(libc::ESTALE));
+        after_rename();
+
+        let identity = FileIdentity::from_stat(initial);
+        let validation = stat_at(parent.as_raw_fd(), &name).and_then(|quarantined| {
+            Self::validate(kind, identity, descriptor.as_ref(), &quarantined)
+        });
+        if let Err(validation_error) = validation {
+            let rename_restoration =
+                rename_no_replace(parent.as_raw_fd(), &name, parent.as_raw_fd(), original_name);
+            let mode_restoration = Self::restore_mode(&descriptor, original_mode);
+            let restoration = rename_restoration.and(mode_restoration);
+            return match restoration {
+                Ok(()) => Err(validation_error),
+                Err(restoration_error) => Err(restoration_error),
+            };
         }
-        let identity = FileIdentity::from_stat(&opened);
+
         Ok(Self {
             parent,
             name,
-            directory,
+            descriptor,
             identity,
+            kind,
         })
     }
 
+    fn directory(&self) -> io::Result<&OwnedFd> {
+        if self.kind != libc::S_IFDIR {
+            return Err(os_error(libc::ENOTDIR));
+        }
+        self.descriptor
+            .as_ref()
+            .ok_or_else(|| os_error(libc::ESTALE))
+    }
+
     fn remove(self) -> io::Result<()> {
+        self.remove_with_hook(|| {})
+    }
+
+    fn remove_with_hook(self, before_final_quarantine: impl FnOnce()) -> io::Result<()> {
         let current = stat_at(self.parent.as_raw_fd(), &self.name)?;
-        if file_type(current.st_mode) != libc::S_IFDIR
-            || FileIdentity::from_stat(&current) != self.identity
+        Self::validate(self.kind, self.identity, self.descriptor.as_ref(), &current)?;
+        before_final_quarantine();
+
+        let final_name = CString::new(format!(".mac-worker-unlink-{}", uuid::Uuid::new_v4()))
+            .expect("UUID final-removal name has no NUL");
+        rename_no_replace(
+            self.parent.as_raw_fd(),
+            &self.name,
+            self.parent.as_raw_fd(),
+            &final_name,
+        )?;
+        let final_validation = stat_at(self.parent.as_raw_fd(), &final_name).and_then(|metadata| {
+            Self::validate(
+                self.kind,
+                self.identity,
+                self.descriptor.as_ref(),
+                &metadata,
+            )
+        });
+        if let Err(validation_error) = final_validation {
+            return match rename_no_replace(
+                self.parent.as_raw_fd(),
+                &final_name,
+                self.parent.as_raw_fd(),
+                &self.name,
+            ) {
+                Ok(()) => Err(validation_error),
+                Err(restoration_error) => Err(restoration_error),
+            };
+        }
+
+        let flags = if self.kind == libc::S_IFDIR {
+            libc::AT_REMOVEDIR
+        } else {
+            0
+        };
+        unlink_at(self.parent.as_raw_fd(), &final_name, flags)
+    }
+
+    fn validate(
+        expected_kind: libc::mode_t,
+        expected_identity: FileIdentity,
+        descriptor: Option<&OwnedFd>,
+        metadata: &libc::stat,
+    ) -> io::Result<()> {
+        if file_type(metadata.st_mode) != expected_kind
+            || FileIdentity::from_stat(metadata) != expected_identity
         {
             return Err(os_error(libc::ESTALE));
         }
-        unlink_at(self.parent.as_raw_fd(), &self.name, libc::AT_REMOVEDIR)
+        if let Some(descriptor) = descriptor {
+            let opened = stat_fd(descriptor.as_raw_fd())?;
+            if file_type(opened.st_mode) != expected_kind || !same_file(metadata, &opened) {
+                return Err(os_error(libc::ESTALE));
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_mode(
+        descriptor: &Option<OwnedFd>,
+        original_mode: Option<libc::mode_t>,
+    ) -> io::Result<()> {
+        match (descriptor, original_mode) {
+            (Some(descriptor), Some(mode)) => chmod_fd(descriptor.as_raw_fd(), mode),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -991,11 +1216,14 @@ mod tests {
         fs,
         io::Write,
         os::{fd::AsRawFd, unix::fs::PermissionsExt},
+        path::Path,
     };
 
     use super::{
-        QuarantinedDirectory, RootedDir, copy_regular, copy_regular_with_clone, create_regular_at,
-        open_directory_path, open_regular_at, open_verified_child_directory, stat_at,
+        QuarantinedEntry, RootedDir, copy_regular, copy_regular_with_clone, create_regular_at,
+        make_regular_read_only_with_hook, open_directory_path, open_regular_at,
+        open_verified_child_directory, publish_regular_with_link_ops, stat_at,
+        unsupported_rename_no_replace,
     };
     use crate::inputs::RelativePath;
 
@@ -1157,12 +1385,21 @@ mod tests {
                 & 0o777,
             0o755
         );
+        assert_eq!(
+            fs::metadata(root_path.join("moved-child"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
     }
 
     #[test]
-    fn cleanup_quarantine_rejects_a_swapped_child_without_mutating_it() {
+    fn cleanup_quarantine_rejects_a_directory_swapped_after_open_before_rename() {
         // Catches recursively deleting a replacement directory moved into the
-        // owned name after fstatat but before destructive traversal.
+        // owned name after the original descriptor is acquired but before
+        // quarantine rename.
         let fixture = tempfile::tempdir().unwrap();
         let physical = fixture.path().canonicalize().unwrap();
         let root_path = physical.join("root");
@@ -1174,12 +1411,18 @@ mod tests {
         let root = RootedDir::open(&root_path).unwrap();
         let child = std::ffi::CString::new("child").unwrap();
         let initial = stat_at(root.root.as_raw_fd(), &child).unwrap();
-        fs::rename(root_path.join("child"), root_path.join("moved-child")).unwrap();
-        fs::rename(&outside_path, root_path.join("child")).unwrap();
-
-        let error = QuarantinedDirectory::acquire(root.root.as_raw_fd(), &child, &initial)
-            .err()
-            .expect("replacement must not become cleanup-owned");
+        let error = QuarantinedEntry::acquire_with_hooks(
+            root.root.as_raw_fd(),
+            &child,
+            &initial,
+            || {
+                fs::rename(root_path.join("child"), root_path.join("moved-child")).unwrap();
+                fs::rename(&outside_path, root_path.join("child")).unwrap();
+            },
+            || {},
+        )
+        .err()
+        .expect("replacement must not become cleanup-owned");
 
         assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
         assert_eq!(
@@ -1194,6 +1437,265 @@ mod tests {
                 & 0o777,
             0o755
         );
+        assert_eq!(
+            fs::metadata(root_path.join("moved-child"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn publication_regular_chmod_rejects_a_swap_after_stat_before_open() {
+        // Catches chmodding a replacement regular file opened after fstatat
+        // observed the originally owned file.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let root_path = physical.join("root");
+        let outside_path = physical.join("outside.txt");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned\n").unwrap();
+        fs::write(&outside_path, b"outside\n").unwrap();
+        fs::set_permissions(root_path.join("value"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&outside_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+        let value = std::ffi::CString::new("value").unwrap();
+        let initial = stat_at(root.root.as_raw_fd(), &value).unwrap();
+
+        let error =
+            make_regular_read_only_with_hook(root.root.as_raw_fd(), &value, &initial, || {
+                fs::rename(root_path.join("value"), root_path.join("moved-value")).unwrap();
+                fs::rename(&outside_path, root_path.join("value")).unwrap();
+            })
+            .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(
+            fs::metadata(root_path.join("value"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(root_path.join("moved-value"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn cleanup_regular_and_symlink_swaps_are_restored_without_unlinking_replacements() {
+        // Catches unlinking the pathname after a regular file or symlink was
+        // swapped between acquisition and quarantine rename.
+        for kind in ["regular", "symlink"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let physical = fixture.path().canonicalize().unwrap();
+            let root_path = physical.join("root");
+            fs::create_dir(&root_path).unwrap();
+            let original = root_path.join("value");
+            let replacement = physical.join("replacement");
+            if kind == "regular" {
+                fs::write(&original, b"owned\n").unwrap();
+                fs::write(&replacement, b"replacement\n").unwrap();
+            } else {
+                std::os::unix::fs::symlink("owned-target", &original).unwrap();
+                std::os::unix::fs::symlink("replacement-target", &replacement).unwrap();
+            }
+            let root = RootedDir::open(&root_path).unwrap();
+            let value = std::ffi::CString::new("value").unwrap();
+            let initial = stat_at(root.root.as_raw_fd(), &value).unwrap();
+
+            let error = QuarantinedEntry::acquire_with_hooks(
+                root.root.as_raw_fd(),
+                &value,
+                &initial,
+                || {
+                    fs::rename(&original, root_path.join("moved-value")).unwrap();
+                    fs::rename(&replacement, &original).unwrap();
+                },
+                || {},
+            )
+            .err()
+            .expect("replacement must not become cleanup-owned");
+
+            assert_eq!(error.raw_os_error(), Some(libc::ESTALE), "{kind}");
+            if kind == "regular" {
+                assert_eq!(fs::read(&original).unwrap(), b"replacement\n");
+                assert_eq!(fs::read(root_path.join("moved-value")).unwrap(), b"owned\n");
+            } else {
+                assert_eq!(
+                    fs::read_link(&original).unwrap(),
+                    Path::new("replacement-target")
+                );
+                assert_eq!(
+                    fs::read_link(root_path.join("moved-value")).unwrap(),
+                    Path::new("owned-target")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quarantine_restoration_failure_is_returned() {
+        // Catches discarding the error when a mismatched quarantined entry
+        // cannot be restored because the original name was reoccupied.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let root_path = physical.join("root");
+        let replacement = physical.join("replacement.txt");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned\n").unwrap();
+        fs::write(&replacement, b"replacement\n").unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+        let value = std::ffi::CString::new("value").unwrap();
+        let initial = stat_at(root.root.as_raw_fd(), &value).unwrap();
+
+        let error = QuarantinedEntry::acquire_with_hooks(
+            root.root.as_raw_fd(),
+            &value,
+            &initial,
+            || {
+                fs::rename(root_path.join("value"), root_path.join("moved-value")).unwrap();
+                fs::rename(&replacement, root_path.join("value")).unwrap();
+            },
+            || {
+                fs::write(root_path.join("value"), b"block restore\n").unwrap();
+            },
+        )
+        .err()
+        .expect("failed restoration must be reported");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(
+            fs::read(root_path.join("value")).unwrap(),
+            b"block restore\n"
+        );
+    }
+
+    #[test]
+    fn final_quarantine_removal_rejects_a_replacement() {
+        // Catches unlinking a replacement swapped into the first quarantine
+        // after final-removal stat but before atomic re-quarantine.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned\n").unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+        let value = std::ffi::CString::new("value").unwrap();
+        let initial = stat_at(root.root.as_raw_fd(), &value).unwrap();
+        let quarantined = QuarantinedEntry::acquire_with_hooks(
+            root.root.as_raw_fd(),
+            &value,
+            &initial,
+            || {},
+            || {},
+        )
+        .unwrap();
+
+        let error = quarantined
+            .remove_with_hook(|| {
+                let quarantine = fs::read_dir(&root_path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".mac-worker-remove-")
+                    })
+                    .unwrap();
+                fs::rename(&quarantine, root_path.join("moved-quarantine")).unwrap();
+                fs::write(&quarantine, b"replacement\n").unwrap();
+            })
+            .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        let replacement = fs::read_dir(&root_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".mac-worker-remove-")
+            })
+            .unwrap();
+        assert_eq!(fs::read(replacement).unwrap(), b"replacement\n");
+        assert_eq!(
+            fs::read(root_path.join("moved-quarantine")).unwrap(),
+            b"owned\n"
+        );
+    }
+
+    #[test]
+    fn portable_regular_link_publication_succeeds_once_final_name_exists() {
+        // Catches returning an error after linkat already published the final
+        // regular file merely because temporary-name unlink failed.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let source = physical.join("source");
+        let destination = physical.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(source.join("data"), b"bytes\n").unwrap();
+        let source_fd = open_directory_path(&source).unwrap();
+        let destination_fd = open_directory_path(&destination).unwrap();
+
+        let result = publish_regular_with_link_ops(
+            source_fd.as_raw_fd(),
+            c"data",
+            destination_fd.as_raw_fd(),
+            c"final",
+            |source_parent, source_name, destination_parent, destination_name| {
+                // SAFETY: descriptors and C strings are live for this test syscall.
+                super::cvt(unsafe {
+                    libc::linkat(
+                        source_parent,
+                        source_name.as_ptr(),
+                        destination_parent,
+                        destination_name.as_ptr(),
+                        0,
+                    )
+                })
+            },
+            |_source_parent, _source_name| Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(fs::read(destination.join("final")).unwrap(), b"bytes\n");
+        assert_eq!(fs::read(source.join("data")).unwrap(), b"bytes\n");
+    }
+
+    #[test]
+    fn portable_directory_quarantine_fails_before_mutation_without_atomic_rename() {
+        // Catches the generic fallback attempting a forbidden directory hard
+        // link or partially moving a directory without atomic rename support.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let parent = physical.join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(parent.join("child")).unwrap();
+        let parent_fd = open_directory_path(&parent).unwrap();
+
+        let error = unsupported_rename_no_replace(
+            parent_fd.as_raw_fd(),
+            c"child",
+            parent_fd.as_raw_fd(),
+            c"quarantine",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTSUP));
+        assert!(parent.join("child").is_dir());
+        assert!(!parent.join("quarantine").exists());
     }
 
     #[test]
