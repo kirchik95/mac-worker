@@ -7,7 +7,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::ffi::OsStrExt,
     },
-    path::Path,
+    path::{Component, Path},
 };
 
 use crate::inputs::RelativePath;
@@ -182,8 +182,6 @@ impl RootedDir {
         let (destination_parent, destination_name) = destination.open_parent(path, true)?;
 
         copy_regular(
-            &source_parent,
-            &source_name,
             source,
             &destination_parent,
             &destination_name,
@@ -306,12 +304,27 @@ fn split_root_path(path: &Path) -> io::Result<(&Path, CString)> {
 }
 
 fn open_directory_path(path: &Path) -> io::Result<OwnedFd> {
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(interior_nul_error)?;
-    // SAFETY: `path` is a live NUL-terminated byte string, and `open` does
-    // not retain its pointer after the call.
-    let descriptor = unsafe { libc::open(path.as_ptr(), DIRECTORY_OPEN_FLAGS) };
-    owned_fd(descriptor)
-        .or_else(|error| normalize_directory_symlink_error(error, libc::AT_FDCWD, &path))
+    let start = if path.is_absolute() { c"/" } else { c"." };
+    // SAFETY: `start` is a static NUL-terminated path. This acquires only the
+    // trusted filesystem root or current-directory base and retains no pointer.
+    let descriptor = unsafe { libc::open(start.as_ptr(), DIRECTORY_OPEN_FLAGS) };
+    let mut current = owned_fd(descriptor)?;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(component) => {
+                let component = CString::new(component.as_bytes()).map_err(interior_nul_error)?;
+                current = open_directory_at(current.as_raw_fd(), &component)?;
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "physical root path contains unsupported traversal",
+                ));
+            }
+        }
+    }
+    Ok(current)
 }
 
 fn open_directory_at(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
@@ -456,50 +469,78 @@ fn read_link_at(parent: RawFd, name: &CStr, reported_size: libc::off_t) -> io::R
 
 #[cfg(target_os = "macos")]
 fn copy_regular(
-    source_parent: &OwnedFd,
-    source_name: &CStr,
     source: OwnedFd,
     destination_parent: &OwnedFd,
     destination_name: &CStr,
     mode: libc::mode_t,
 ) -> io::Result<()> {
-    // SAFETY: both directory descriptors and component strings remain live;
-    // clonefileat retains none of them after returning.
-    let result = unsafe {
-        libc::clonefileat(
-            source_parent.as_raw_fd(),
-            source_name.as_ptr(),
-            destination_parent.as_raw_fd(),
-            destination_name.as_ptr(),
-            0,
-        )
-    };
-    let result = if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    };
-    complete_clone_or_copy(
-        result,
+    copy_regular_with_clone(
         source,
-        destination_parent.as_raw_fd(),
+        destination_parent,
         destination_name,
         mode,
+        |source, temporary_parent, temporary_name| {
+            // SAFETY: the verified source descriptor, owned temporary
+            // directory, and component remain live for this non-retaining call.
+            cvt(unsafe { libc::fclonefileat(source, temporary_parent, temporary_name.as_ptr(), 0) })
+        },
     )
 }
 
-#[cfg(target_os = "macos")]
-fn complete_clone_or_copy(
-    clone_result: io::Result<()>,
+fn copy_regular_with_clone(
     source: OwnedFd,
-    destination_parent: RawFd,
+    destination_parent: &OwnedFd,
+    destination_name: &CStr,
+    mode: libc::mode_t,
+    clone_attempt: impl FnOnce(RawFd, RawFd, &CStr) -> io::Result<()>,
+) -> io::Result<()> {
+    let operation = OperationDirectory::create(destination_parent.as_raw_fd())?;
+    let temporary_name = c"data";
+    let clone_result = clone_attempt(
+        source.as_raw_fd(),
+        operation.directory.as_raw_fd(),
+        temporary_name,
+    );
+    complete_clone_or_copy(
+        clone_result,
+        source,
+        operation.directory.as_raw_fd(),
+        temporary_name,
+        mode,
+    )?;
+    publish_no_replace(
+        operation.directory.as_raw_fd(),
+        temporary_name,
+        destination_parent.as_raw_fd(),
+        destination_name,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_regular(
+    source: OwnedFd,
+    destination_parent: &OwnedFd,
     destination_name: &CStr,
     mode: libc::mode_t,
 ) -> io::Result<()> {
+    copy_regular_with_clone(
+        source,
+        destination_parent,
+        destination_name,
+        mode,
+        |_source, _temporary_parent, _temporary_name| Err(os_error(libc::ENOTSUP)),
+    )
+}
+
+fn complete_clone_or_copy(
+    clone_result: io::Result<()>,
+    source: OwnedFd,
+    temporary_parent: RawFd,
+    temporary_name: &CStr,
+    mode: libc::mode_t,
+) -> io::Result<()> {
     let error = match clone_result {
-        Ok(()) => {
-            return finish_created_regular(destination_parent, destination_name, mode);
-        }
+        Ok(()) => return finish_created_regular(temporary_parent, temporary_name, mode),
         Err(error) => error,
     };
     if !matches!(
@@ -508,28 +549,10 @@ fn complete_clone_or_copy(
     ) {
         return Err(error);
     }
-    remove_failed_clone_destination(destination_parent, destination_name)?;
-    copy_regular_bytes(source, destination_parent, destination_name, mode)
+    remove_failed_clone_destination(temporary_parent, temporary_name)?;
+    copy_regular_bytes(source, temporary_parent, temporary_name, mode)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn copy_regular(
-    _source_parent: &OwnedFd,
-    _source_name: &CStr,
-    source: OwnedFd,
-    destination_parent: &OwnedFd,
-    destination_name: &CStr,
-    mode: libc::mode_t,
-) -> io::Result<()> {
-    copy_regular_bytes(
-        source,
-        destination_parent.as_raw_fd(),
-        destination_name,
-        mode,
-    )
-}
-
-#[cfg(target_os = "macos")]
 fn remove_failed_clone_destination(parent: RawFd, name: &CStr) -> io::Result<()> {
     let metadata = match stat_at(parent, name) {
         Ok(metadata) => metadata,
@@ -546,6 +569,123 @@ fn remove_failed_clone_destination(parent: RawFd, name: &CStr) -> io::Result<()>
     }
     drop(opened);
     unlink_at(parent, name, 0)
+}
+
+struct OperationDirectory {
+    parent: OwnedFd,
+    name: CString,
+    directory: OwnedFd,
+    identity: FileIdentity,
+}
+
+impl OperationDirectory {
+    fn create(parent: RawFd) -> io::Result<Self> {
+        let parent = duplicate_fd(parent)?;
+        let parent_device = stat_fd(parent.as_raw_fd())?.st_dev;
+        for _ in 0..16 {
+            let name = CString::new(format!(".mac-worker-copy-{}", uuid::Uuid::new_v4()))
+                .expect("UUID temporary name has no NUL");
+            match mkdir_at(parent.as_raw_fd(), &name, 0o700) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(error) => return Err(error),
+            }
+            let initial = stat_at(parent.as_raw_fd(), &name)?;
+            let directory = open_directory_at(parent.as_raw_fd(), &name)?;
+            let opened = stat_fd(directory.as_raw_fd())?;
+            if file_type(initial.st_mode) != libc::S_IFDIR
+                || !same_file(&initial, &opened)
+                || opened.st_dev != parent_device
+            {
+                return Err(os_error(libc::ESTALE));
+            }
+            return Ok(Self {
+                parent,
+                name,
+                directory,
+                identity: FileIdentity::from_stat(&opened),
+            });
+        }
+        Err(os_error(libc::EEXIST))
+    }
+
+    fn cleanup(&self) -> io::Result<()> {
+        remove_directory_contents(self.directory.as_raw_fd())?;
+        let current = stat_at(self.parent.as_raw_fd(), &self.name)?;
+        if file_type(current.st_mode) != libc::S_IFDIR
+            || FileIdentity::from_stat(&current) != self.identity
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        unlink_at(self.parent.as_raw_fd(), &self.name, libc::AT_REMOVEDIR)
+    }
+}
+
+impl Drop for OperationDirectory {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn publish_no_replace(
+    source_parent: RawFd,
+    source_name: &CStr,
+    destination_parent: RawFd,
+    destination_name: &CStr,
+) -> io::Result<()> {
+    // SAFETY: both live directory descriptors and NUL-terminated components
+    // remain valid for this non-retaining atomic rename.
+    cvt(unsafe {
+        libc::renameatx_np(
+            source_parent,
+            source_name.as_ptr(),
+            destination_parent,
+            destination_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn publish_no_replace(
+    source_parent: RawFd,
+    source_name: &CStr,
+    destination_parent: RawFd,
+    destination_name: &CStr,
+) -> io::Result<()> {
+    // SAFETY: both live directory descriptors and NUL-terminated components
+    // remain valid for this non-retaining atomic rename.
+    cvt(unsafe {
+        libc::renameat2(
+            source_parent,
+            source_name.as_ptr(),
+            destination_parent,
+            destination_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    })
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn publish_no_replace(
+    source_parent: RawFd,
+    source_name: &CStr,
+    destination_parent: RawFd,
+    destination_name: &CStr,
+) -> io::Result<()> {
+    // SAFETY: linkat atomically creates the absent final name without
+    // following either component; all arguments remain live for the call.
+    cvt(unsafe {
+        libc::linkat(
+            source_parent,
+            source_name.as_ptr(),
+            destination_parent,
+            destination_name.as_ptr(),
+            0,
+        )
+    })?;
+    unlink_at(source_parent, source_name, 0)
 }
 
 fn copy_regular_bytes(
@@ -597,7 +737,7 @@ fn make_directory_read_only(directory: RawFd) -> io::Result<()> {
         let metadata = stat_at(directory, &name)?;
         match file_type(metadata.st_mode) {
             libc::S_IFDIR => {
-                let child = open_directory_at(directory, &name)?;
+                let child = open_verified_child_directory(directory, &name, &metadata)?;
                 make_directory_read_only(child.as_raw_fd())?;
             }
             libc::S_IFREG => {
@@ -622,22 +762,94 @@ fn remove_directory_contents(directory: RawFd) -> io::Result<()> {
         let metadata = stat_at(directory, &name)?;
         match file_type(metadata.st_mode) {
             libc::S_IFDIR => {
-                let child = open_directory_at(directory, &name)?;
-                let identity = FileIdentity::from_stat(&stat_fd(child.as_raw_fd())?);
-                remove_directory_contents(child.as_raw_fd())?;
-                let current = stat_at(directory, &name)?;
-                if file_type(current.st_mode) != libc::S_IFDIR
-                    || FileIdentity::from_stat(&current) != identity
-                {
-                    return Err(os_error(libc::ESTALE));
-                }
-                unlink_at(directory, &name, libc::AT_REMOVEDIR)?;
+                let quarantined = QuarantinedDirectory::acquire(directory, &name, &metadata)?;
+                remove_directory_contents(quarantined.directory.as_raw_fd())?;
+                quarantined.remove()?;
             }
             libc::S_IFREG | libc::S_IFLNK => unlink_at(directory, &name, 0)?,
             _ => return Err(invalid_type_error()),
         }
     }
     Ok(())
+}
+
+fn open_verified_child_directory(
+    parent: RawFd,
+    name: &CStr,
+    initial: &libc::stat,
+) -> io::Result<OwnedFd> {
+    if file_type(initial.st_mode) != libc::S_IFDIR {
+        return Err(os_error(libc::ENOTDIR));
+    }
+    let parent_device = stat_fd(parent)?.st_dev;
+    if initial.st_dev != parent_device {
+        return Err(os_error(libc::EXDEV));
+    }
+    let child = open_directory_at(parent, name)?;
+    let opened = stat_fd(child.as_raw_fd())?;
+    if opened.st_dev != parent_device {
+        return Err(os_error(libc::EXDEV));
+    }
+    if file_type(opened.st_mode) != libc::S_IFDIR || !same_file(initial, &opened) {
+        return Err(os_error(libc::ESTALE));
+    }
+    Ok(child)
+}
+
+struct QuarantinedDirectory {
+    parent: OwnedFd,
+    name: CString,
+    directory: OwnedFd,
+    identity: FileIdentity,
+}
+
+impl QuarantinedDirectory {
+    fn acquire(parent: RawFd, original_name: &CStr, initial: &libc::stat) -> io::Result<Self> {
+        let parent = duplicate_fd(parent)?;
+        let parent_device = stat_fd(parent.as_raw_fd())?.st_dev;
+        if file_type(initial.st_mode) != libc::S_IFDIR {
+            return Err(os_error(libc::ENOTDIR));
+        }
+        if initial.st_dev != parent_device {
+            return Err(os_error(libc::EXDEV));
+        }
+        let directory = open_verified_child_directory(parent.as_raw_fd(), original_name, initial)?;
+        let original_mode = initial.st_mode & 0o7777;
+        chmod_fd(directory.as_raw_fd(), 0o700)?;
+        let name = CString::new(format!(".mac-worker-remove-{}", uuid::Uuid::new_v4()))
+            .expect("UUID quarantine name has no NUL");
+        if let Err(error) =
+            publish_no_replace(parent.as_raw_fd(), original_name, parent.as_raw_fd(), &name)
+        {
+            let _ = chmod_fd(directory.as_raw_fd(), original_mode);
+            return Err(error);
+        }
+        let quarantined = stat_at(parent.as_raw_fd(), &name)?;
+        let opened = stat_fd(directory.as_raw_fd())?;
+        if !same_file(initial, &quarantined) || !same_file(&quarantined, &opened) {
+            let _ =
+                publish_no_replace(parent.as_raw_fd(), &name, parent.as_raw_fd(), original_name);
+            let _ = chmod_fd(directory.as_raw_fd(), original_mode);
+            return Err(os_error(libc::ESTALE));
+        }
+        let identity = FileIdentity::from_stat(&opened);
+        Ok(Self {
+            parent,
+            name,
+            directory,
+            identity,
+        })
+    }
+
+    fn remove(self) -> io::Result<()> {
+        let current = stat_at(self.parent.as_raw_fd(), &self.name)?;
+        if file_type(current.st_mode) != libc::S_IFDIR
+            || FileIdentity::from_stat(&current) != self.identity
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        unlink_at(self.parent.as_raw_fd(), &self.name, libc::AT_REMOVEDIR)
+    }
 }
 
 fn directory_entries(directory: RawFd) -> io::Result<Vec<CString>> {
@@ -781,16 +993,20 @@ mod tests {
         os::{fd::AsRawFd, unix::fs::PermissionsExt},
     };
 
-    use super::{RootedDir, complete_clone_or_copy, create_regular_at, open_regular_at};
+    use super::{
+        QuarantinedDirectory, RootedDir, copy_regular, copy_regular_with_clone, create_regular_at,
+        open_directory_path, open_regular_at, open_verified_child_directory, stat_at,
+    };
     use crate::inputs::RelativePath;
 
     #[test]
-    fn clone_fallback_removes_only_a_failed_regular_clone_before_byte_copy() {
-        // Catches byte fallback opening a partial clone without O_EXCL, or
-        // leaving its wrong bytes/mode in the destination.
+    fn clone_fallback_replaces_only_its_owned_partial_before_byte_copy() {
+        // Catches byte fallback publishing a partial clone or leaving its
+        // operation-owned temporary directory behind.
         let fixture = tempfile::tempdir().unwrap();
-        let source_path = fixture.path().join("source");
-        let destination_path = fixture.path().join("destination");
+        let physical = fixture.path().canonicalize().unwrap();
+        let source_path = physical.join("source");
+        let destination_path = physical.join("destination");
         fs::create_dir(&source_path).unwrap();
         fs::write(source_path.join("value"), b"source bytes\n").unwrap();
         fs::set_permissions(source_path.join("value"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -801,18 +1017,20 @@ mod tests {
         let source = open_regular_at(source_parent.as_raw_fd(), &source_name).unwrap();
         let (destination_parent, destination_name) =
             destination_root.open_parent(&selected, true).unwrap();
-        let mut partial = std::fs::File::from(
-            create_regular_at(destination_parent.as_raw_fd(), &destination_name).unwrap(),
-        );
-        partial.write_all(b"partial clone").unwrap();
-        drop(partial);
 
-        complete_clone_or_copy(
-            Err(std::io::Error::from_raw_os_error(libc::ENOTSUP)),
+        copy_regular_with_clone(
             source,
-            destination_parent.as_raw_fd(),
+            &destination_parent,
             &destination_name,
             0o555,
+            |_source, temporary_parent, temporary_name| {
+                let mut partial = std::fs::File::from(
+                    create_regular_at(temporary_parent, temporary_name).unwrap(),
+                );
+                partial.write_all(b"partial clone").unwrap();
+                drop(partial);
+                Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+            },
         )
         .unwrap();
 
@@ -828,5 +1046,166 @@ mod tests {
                 & 0o777,
             0o555
         );
+        assert_eq!(fs::read_dir(&destination_path).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn clone_fallback_never_removes_a_preexisting_final_destination() {
+        // Catches treating an unrelated final regular file as a partial clone
+        // after a fallback errno and unlinking it before byte copy.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let source_path = physical.join("source");
+        let destination_path = physical.join("destination");
+        fs::create_dir(&source_path).unwrap();
+        fs::write(source_path.join("value"), b"source bytes\n").unwrap();
+        let source_root = RootedDir::open(&source_path).unwrap();
+        let destination_root = RootedDir::create(&destination_path).unwrap();
+        fs::write(destination_path.join("value"), b"keep existing\n").unwrap();
+        let selected = RelativePath::parse(b"value").unwrap();
+        let (source_parent, source_name) = source_root.open_parent(&selected, false).unwrap();
+        let source = open_regular_at(source_parent.as_raw_fd(), &source_name).unwrap();
+        let (destination_parent, destination_name) =
+            destination_root.open_parent(&selected, true).unwrap();
+
+        let error = copy_regular_with_clone(
+            source,
+            &destination_parent,
+            &destination_name,
+            0o444,
+            |_source, temporary_parent, temporary_name| {
+                let mut partial = std::fs::File::from(
+                    create_regular_at(temporary_parent, temporary_name).unwrap(),
+                );
+                partial.write_all(b"partial clone").unwrap();
+                drop(partial);
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(
+            fs::read(destination_path.join("value")).unwrap(),
+            b"keep existing\n"
+        );
+        assert_eq!(fs::read_dir(&destination_path).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn clone_reads_the_opened_source_after_its_name_becomes_an_outside_symlink() {
+        // Catches clonefileat resolving source_name again after the regular
+        // source descriptor was opened and identity-verified.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let source_path = physical.join("source");
+        let destination_path = physical.join("destination");
+        let outside_path = physical.join("outside.txt");
+        fs::create_dir(&source_path).unwrap();
+        fs::write(source_path.join("value"), b"opened source\n").unwrap();
+        fs::write(&outside_path, b"outside bytes\n").unwrap();
+        let source_root = RootedDir::open(&source_path).unwrap();
+        let destination_root = RootedDir::create(&destination_path).unwrap();
+        let selected = RelativePath::parse(b"value").unwrap();
+        let (source_parent, source_name) = source_root.open_parent(&selected, false).unwrap();
+        let source = open_regular_at(source_parent.as_raw_fd(), &source_name).unwrap();
+        let (destination_parent, destination_name) =
+            destination_root.open_parent(&selected, true).unwrap();
+        fs::rename(source_path.join("value"), source_path.join("moved-value")).unwrap();
+        std::os::unix::fs::symlink(&outside_path, source_path.join("value")).unwrap();
+
+        copy_regular(source, &destination_parent, &destination_name, 0o444).unwrap();
+
+        assert_eq!(
+            fs::read(destination_path.join("value")).unwrap(),
+            b"opened source\n"
+        );
+        assert_eq!(fs::read(&outside_path).unwrap(), b"outside bytes\n");
+    }
+
+    #[test]
+    fn publication_rejects_a_child_directory_swapped_after_initial_stat() {
+        // Catches recursively chmodding a replacement directory opened after
+        // fstatat observed the originally owned child.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let root_path = physical.join("root");
+        let outside_path = physical.join("outside");
+        fs::create_dir(&root_path).unwrap();
+        fs::create_dir(&outside_path).unwrap();
+        fs::create_dir(root_path.join("child")).unwrap();
+        fs::write(outside_path.join("sentinel.txt"), b"outside\n").unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+        let child = std::ffi::CString::new("child").unwrap();
+        let initial = stat_at(root.root.as_raw_fd(), &child).unwrap();
+        fs::rename(root_path.join("child"), root_path.join("moved-child")).unwrap();
+        fs::rename(&outside_path, root_path.join("child")).unwrap();
+
+        let error =
+            open_verified_child_directory(root.root.as_raw_fd(), &child, &initial).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(
+            fs::read(root_path.join("child/sentinel.txt")).unwrap(),
+            b"outside\n"
+        );
+        assert_eq!(
+            fs::metadata(root_path.join("child"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn cleanup_quarantine_rejects_a_swapped_child_without_mutating_it() {
+        // Catches recursively deleting a replacement directory moved into the
+        // owned name after fstatat but before destructive traversal.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let root_path = physical.join("root");
+        let outside_path = physical.join("outside");
+        fs::create_dir(&root_path).unwrap();
+        fs::create_dir(&outside_path).unwrap();
+        fs::create_dir(root_path.join("child")).unwrap();
+        fs::write(outside_path.join("sentinel.txt"), b"outside\n").unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+        let child = std::ffi::CString::new("child").unwrap();
+        let initial = stat_at(root.root.as_raw_fd(), &child).unwrap();
+        fs::rename(root_path.join("child"), root_path.join("moved-child")).unwrap();
+        fs::rename(&outside_path, root_path.join("child")).unwrap();
+
+        let error = QuarantinedDirectory::acquire(root.root.as_raw_fd(), &child, &initial)
+            .err()
+            .expect("replacement must not become cleanup-owned");
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(
+            fs::read(root_path.join("child/sentinel.txt")).unwrap(),
+            b"outside\n"
+        );
+        assert_eq!(
+            fs::metadata(root_path.join("child"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn recursive_directory_open_rejects_cross_device_mounts() {
+        // Catches publication or cleanup descending from the filesystem root
+        // into the separately mounted device filesystem.
+        let root = open_directory_path(std::path::Path::new("/")).unwrap();
+        let dev = std::ffi::CString::new("dev").unwrap();
+        let metadata = stat_at(root.as_raw_fd(), &dev).unwrap();
+
+        let error = open_verified_child_directory(root.as_raw_fd(), &dev, &metadata).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
     }
 }

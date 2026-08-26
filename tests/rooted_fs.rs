@@ -24,9 +24,10 @@ struct RootFixture {
 impl RootFixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source");
-        let destination = directory.path().join("destination");
-        let outside = directory.path().join("outside");
+        let physical_directory = directory.path().canonicalize().unwrap();
+        let source = physical_directory.join("source");
+        let destination = physical_directory.join("destination");
+        let outside = physical_directory.join("outside");
         fs::create_dir(&source).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("sentinel.txt"), b"outside sentinel\n").unwrap();
@@ -71,6 +72,58 @@ impl RootFixture {
         assert!(!self.outside.join("copied.txt").exists());
         assert!(!self.outside.join("created").exists());
     }
+}
+
+#[test]
+fn physical_root_paths_reject_first_and_middle_ancestor_symlinks() {
+    // Catches acquiring the root with one pathname-based open, which follows
+    // symlinks in parent_path before descriptor-relative traversal begins.
+    let fixture = tempfile::tempdir().unwrap();
+    let physical = fixture.path().canonicalize().unwrap();
+    let real = physical.join("real");
+    let outside = physical.join("outside");
+    fs::create_dir_all(real.join("middle/source")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("sentinel.txt"), b"outside\n").unwrap();
+    symlink(&real, physical.join("first-link")).unwrap();
+    symlink(&outside, real.join("middle-link")).unwrap();
+
+    for path in [
+        physical.join("first-link/middle/source"),
+        real.join("middle-link"),
+    ] {
+        let error = RootedDir::open(&path)
+            .err()
+            .expect("ancestor link rejected");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ELOOP),
+            "{}",
+            path.display()
+        );
+    }
+
+    for path in [
+        physical.join("first-link/created"),
+        real.join("middle-link/created"),
+    ] {
+        let error = RootedDir::create(&path)
+            .err()
+            .expect("ancestor link rejected");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ELOOP),
+            "{}",
+            path.display()
+        );
+    }
+
+    assert!(!real.join("created").exists());
+    assert!(!outside.join("created").exists());
+    assert_eq!(
+        fs::read(outside.join("sentinel.txt")).unwrap(),
+        b"outside\n"
+    );
 }
 
 fn relative(path: &str) -> RelativePath {
