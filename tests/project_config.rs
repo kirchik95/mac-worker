@@ -3,7 +3,7 @@ mod support;
 use std::{fs, os::unix::fs::symlink, time::Duration};
 
 use mac_worker::{
-    error::WorkerError,
+    error::{ExitKind, WorkerError},
     project_config::{ProjectSettings, ResourceClass},
     requirements::RequirementDetector,
 };
@@ -27,6 +27,19 @@ fn absent_project_settings_file_uses_v1_defaults() {
     assert_eq!(settings.snapshot.allow_sensitive, Vec::<String>::new());
     assert_eq!(settings.artifacts.include, Vec::<String>::new());
     assert_eq!(settings.artifacts.max_total_bytes, None);
+}
+
+#[test]
+fn project_settings_preserve_local_io_errors_when_config_cannot_be_read_as_a_file() {
+    // This catches collapsing a local filesystem fault into invalid user
+    // configuration, which would change the process exit contract.
+    let repo = GitRepo::init();
+    fs::create_dir(repo.root().join(".worker.toml")).unwrap();
+
+    let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
+
+    assert!(matches!(error, WorkerError::Io(_)), "{error}");
+    assert_eq!(error.exit_kind(), ExitKind::Io);
 }
 
 #[test]

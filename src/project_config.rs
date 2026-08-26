@@ -93,12 +93,7 @@ impl ProjectSettings {
                 timeout: default_timeout(),
                 ..RawProjectSettings::default()
             },
-            Err(error) => {
-                return Err(WorkerError::Config(format!(
-                    "failed to read {}: {error}",
-                    config_path.display()
-                )));
-            }
+            Err(error) => return Err(WorkerError::Io(error)),
         };
 
         Self::validate(raw, cli_includes)
