@@ -43,4 +43,87 @@ fn env_path(env: &BTreeMap<OsString, OsString>, key: &str) -> Option<PathBuf> {
     env.get(OsStr::new(key))
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        os::unix::ffi::OsStringExt,
+        path::{Path, PathBuf},
+    };
+
+    use super::PathLayout;
+
+    fn relative_xdg_env() -> BTreeMap<OsString, OsString> {
+        BTreeMap::from([
+            ("XDG_CONFIG_HOME".into(), "relative/config".into()),
+            ("XDG_STATE_HOME".into(), "relative/state".into()),
+            ("XDG_CACHE_HOME".into(), "relative/cache".into()),
+            ("XDG_DATA_HOME".into(), "relative/data".into()),
+        ])
+    }
+
+    #[test]
+    fn relative_xdg_base_directories_fall_back_to_home_defaults() {
+        // Regression: relative XDG roots were accepted and resolved against
+        // the process working directory instead of being ignored.
+        let paths =
+            PathLayout::discover(None, &relative_xdg_env(), Path::new("/Users/tester")).unwrap();
+
+        assert_eq!(
+            paths.config,
+            PathBuf::from("/Users/tester/.config/mac-worker/config.toml")
+        );
+        assert_eq!(
+            paths.state,
+            PathBuf::from("/Users/tester/.local/state/mac-worker")
+        );
+        assert_eq!(
+            paths.cache,
+            PathBuf::from("/Users/tester/.cache/mac-worker")
+        );
+        assert_eq!(
+            paths.data,
+            PathBuf::from("/Users/tester/.local/share/mac-worker")
+        );
+    }
+
+    #[test]
+    fn explicit_relative_config_still_overrides_relative_xdg_values() {
+        // Regression guard: filtering XDG roots must not filter the explicit
+        // CLI config path, whose relative form remains intentional.
+        let paths = PathLayout::discover(
+            Some(PathBuf::from("relative/config.toml")),
+            &relative_xdg_env(),
+            Path::new("/Users/tester"),
+        )
+        .unwrap();
+
+        assert_eq!(paths.config, PathBuf::from("relative/config.toml"));
+        assert_eq!(
+            paths.state,
+            PathBuf::from("/Users/tester/.local/state/mac-worker")
+        );
+    }
+
+    #[test]
+    fn absolute_non_utf8_xdg_base_directory_is_preserved() {
+        // Regression guard: absolute-path filtering must remain byte-oriented
+        // and must not discard a valid non-UTF-8 Unix path.
+        let config_home = OsString::from_vec(b"/tmp/config-\xff".to_vec());
+        let paths = PathLayout::discover(
+            None,
+            &BTreeMap::from([("XDG_CONFIG_HOME".into(), config_home.clone())]),
+            Path::new("/Users/tester"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            paths.config,
+            PathBuf::from(config_home).join("mac-worker/config.toml")
+        );
+    }
 }

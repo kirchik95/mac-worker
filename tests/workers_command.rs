@@ -102,9 +102,9 @@ fn local_test_policy() -> ProcessPolicy {
 }
 
 #[test]
-fn probe_uses_batch_ssh_and_the_fixed_host_command() {
-    // This catches either allowing the destination to remain in OpenSSH's
-    // option namespace or dropping the bounded probe execution policy.
+fn probe_disables_forwarding_and_uses_the_fixed_host_command() {
+    // Regression: probe requests inherited forwarding settings from SSH
+    // configuration because the fixed argv did not disable them explicitly.
     let runner = RecordingRunner::returning_json(valid_probe_json());
     let transport = SshTransport::new(runner.clone());
     let worker = worker("mini-1", "mac1", &["darwin-arm64"]);
@@ -121,6 +121,10 @@ fn probe_uses_batch_ssh_and_the_fixed_host_command() {
                 "BatchMode=yes".into(),
                 "-o".into(),
                 "ConnectTimeout=5".into(),
+                "-o".into(),
+                "ForwardAgent=no".into(),
+                "-o".into(),
+                "ClearAllForwardings=yes".into(),
                 "--".into(),
                 "mac1".into(),
                 "~/.local/bin/worker host probe".into(),

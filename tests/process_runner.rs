@@ -166,3 +166,45 @@ fn normal_process_receives_the_complete_stdin_payload() {
     assert_eq!(result.stdout, b"raw stdin bytes\n");
     assert!(result.stderr.is_empty());
 }
+
+#[test]
+fn nonzero_exit_remains_authoritative_after_stdin_broken_pipe() {
+    // Regression: a fast SSH rejection closed stdin while the parent was
+    // uploading, and the writer's BrokenPipe hid the remote exit and stderr.
+    let request = ProcessRequest {
+        program: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "exec 0<&-; printf '%s\n' rejected >&2; exit 23".into(),
+        ],
+        environment: Vec::new(),
+        stdin: Some(vec![b'x'; 16 * 1024 * 1024]),
+        policy: policy(1024, 1024, Duration::from_secs(2)),
+    };
+
+    let result = SystemProcessRunner.run(&request).unwrap();
+
+    assert_eq!(result.status.code(), Some(23));
+    assert!(result.stdout.is_empty());
+    assert_eq!(result.stderr, b"rejected\n");
+}
+
+#[test]
+fn successful_exit_does_not_hide_stdin_broken_pipe() {
+    // Regression guard: deferring a stdin error until the child exits must
+    // not turn an incomplete upload into a successful request.
+    let request = ProcessRequest {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "exec 0<&-; exit 0".into()],
+        environment: Vec::new(),
+        stdin: Some(vec![b'x'; 16 * 1024 * 1024]),
+        policy: policy(1024, 1024, Duration::from_secs(2)),
+    };
+
+    let error = SystemProcessRunner.run(&request).unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Io(ref error) if error.kind() == std::io::ErrorKind::BrokenPipe
+    ));
+}

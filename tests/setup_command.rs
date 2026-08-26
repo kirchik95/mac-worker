@@ -167,20 +167,26 @@ fn transfer_policy() -> ProcessPolicy {
 }
 
 fn assert_ssh_request_argv_and_policy(request: &ProcessRequest, policy: ProcessPolicy) {
+    // Regression: setup requests inherited forwarding settings from SSH
+    // configuration because the fixed argv did not disable them explicitly.
     assert_eq!(request.program, OsString::from("/usr/bin/ssh"));
-    assert_eq!(request.args.len(), 7);
+    assert_eq!(request.args.len(), 11);
     assert_eq!(
-        &request.args[..6],
+        &request.args[..10],
         [
             OsString::from("-o"),
             OsString::from("BatchMode=yes"),
             OsString::from("-o"),
             OsString::from("ConnectTimeout=5"),
+            OsString::from("-o"),
+            OsString::from("ForwardAgent=no"),
+            OsString::from("-o"),
+            OsString::from("ClearAllForwardings=yes"),
             OsString::from("--"),
             OsString::from("mac1"),
         ]
     );
-    assert!(!request.args[6].is_empty());
+    assert!(!request.args[10].is_empty());
     assert!(request.environment.is_empty());
     assert_eq!(request.policy, policy);
 }
@@ -217,6 +223,7 @@ struct GeneratedSetupCommands {
     promotion: String,
     reconciliation: String,
     verification: String,
+    success_cleanup: String,
     cleanup: String,
     rollback: String,
 }
@@ -261,6 +268,18 @@ fn generated_setup_commands() -> GeneratedSetupCommands {
     assert_eq!(failed.error_code.as_deref(), Some("VERIFICATION_FAILED"));
     let rollback_requests = rollback_runner.requests();
 
+    let cleanup_runner = RecordingRunner::returning(vec![
+        result(0, valid_probe_json(), b""),
+        result(0, b"", b""),
+        result(1, b"", b"upload refused"),
+        result(0, b"", b""),
+    ]);
+    let cleanup_installer =
+        Installer::with_installation_id(&cleanup_runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+    let failed = cleanup_installer.install(&current_exe, &worker());
+    assert_eq!(failed.error_code.as_deref(), Some("TRANSFER_FAILED"));
+    let cleanup_requests = cleanup_runner.requests();
+
     GeneratedSetupCommands {
         acquire: request_command(&requests[1]),
         upload: requests[2].clone(),
@@ -269,7 +288,8 @@ fn generated_setup_commands() -> GeneratedSetupCommands {
         promotion: request_command(&requests[5]),
         reconciliation: request_command(&requests[6]),
         verification: request_command(&requests[7]),
-        cleanup: request_command(&requests[8]),
+        success_cleanup: request_command(&requests[8]),
+        cleanup: request_command(&cleanup_requests[3]),
         rollback: request_command(&rollback_requests[8]),
     }
 }
@@ -676,7 +696,7 @@ fn generated_setup_phases_complete_and_cleanup_only_owned_evidence() {
     assert!(reconciliation.status.success());
     assert_eq!(reconciliation.stdout, b"promoted\n");
     assert!(
-        run_remote_command(&commands.cleanup, &home)
+        run_remote_command(&commands.success_cleanup, &home)
             .status
             .success()
     );
@@ -687,6 +707,68 @@ fn generated_setup_phases_complete_and_cleanup_only_owned_evidence() {
         !home
             .join(".local/share/mac-worker/setup/.install-lock")
             .exists()
+    );
+}
+
+#[test]
+fn verified_success_cleanup_rejects_changed_active_bytes_and_preserves_evidence() {
+    // Regression: post-verification cleanup reused the failure cleanup guard,
+    // so a replaced active helper could not prevent deletion of the proof.
+    let commands = generated_setup_commands();
+    let cases: [(&str, Option<&[u8]>); 2] = [
+        ("replacement install", Some(b"previous worker")),
+        ("first install", None),
+    ];
+
+    for (label, previous) in cases {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let (active, lock, transaction) = promoted_fixture(&home, previous);
+        fs::write(&active, b"replacement bytes").unwrap();
+
+        let output = run_remote_command(&commands.success_cleanup, &home);
+
+        assert!(!output.status.success(), "cleanup accepted {label}");
+        assert_eq!(fs::read(&active).unwrap(), b"replacement bytes");
+        assert_eq!(
+            fs::read(lock.join("owner")).unwrap(),
+            format!("{INSTALLATION_ID}\n").as_bytes()
+        );
+        assert_eq!(
+            fs::read(transaction.join("candidate.sha256")).unwrap(),
+            format!("{CANDIDATE_DIGEST}\n").as_bytes()
+        );
+        assert_eq!(fs::read(transaction.join("state")).unwrap(), b"promoted\n");
+        if previous.is_some() {
+            assert_eq!(
+                fs::read(transaction.join("worker.previous")).unwrap(),
+                b"previous worker"
+            );
+            assert!(transaction.join("previous.sha256").is_file());
+        } else {
+            assert_eq!(fs::read(transaction.join("no-previous")).unwrap(), b"");
+        }
+    }
+}
+
+#[test]
+fn verified_success_request_binds_cleanup_to_the_verification_digest() {
+    // Regression: the success cleanup request carried no candidate digest,
+    // unlike the immediately preceding verification request.
+    let commands = generated_setup_commands();
+    let expected_assignment = format!("expected_digest='{CANDIDATE_DIGEST}'");
+
+    assert!(
+        commands
+            .verification
+            .lines()
+            .any(|line| line == expected_assignment)
+    );
+    assert!(
+        commands
+            .success_cleanup
+            .lines()
+            .any(|line| line == expected_assignment)
     );
 }
 

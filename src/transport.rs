@@ -60,25 +60,15 @@ impl<R: ProcessRunner> SshTransport<R> {
         worker: &WorkerEntry,
         remote_command: String,
     ) -> (WorkerHealth, Option<SetupFailureKind>) {
-        let result = match self.runner.run(&ProcessRequest {
-            program: SSH_PROGRAM.into(),
-            args: vec![
-                "-o".into(),
-                "BatchMode=yes".into(),
-                "-o".into(),
-                "ConnectTimeout=5".into(),
-                "--".into(),
-                worker.ssh.clone().into(),
-                remote_command.into(),
-            ],
-            environment: Vec::new(),
-            stdin: None,
-            policy: ProcessPolicy {
+        let result = match self.runner.run(&ssh_request(
+            worker,
+            remote_command,
+            ProcessPolicy {
                 stdout_limit: MAX_PROBE_RESPONSE_BYTES,
                 stderr_limit: MAX_PROBE_RESPONSE_BYTES,
                 deadline: Duration::from_secs(15),
             },
-        }) {
+        )) {
             Ok(result) => result,
             Err(error) => {
                 if matches!(
@@ -224,6 +214,32 @@ impl<R: ProcessRunner> SshTransport<R> {
             },
             None,
         )
+    }
+}
+
+pub(crate) fn ssh_request(
+    worker: &WorkerEntry,
+    remote_command: String,
+    policy: ProcessPolicy,
+) -> ProcessRequest {
+    ProcessRequest {
+        program: SSH_PROGRAM.into(),
+        args: vec![
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=5".into(),
+            "-o".into(),
+            "ForwardAgent=no".into(),
+            "-o".into(),
+            "ClearAllForwardings=yes".into(),
+            "--".into(),
+            worker.ssh.clone().into(),
+            remote_command.into(),
+        ],
+        environment: Vec::new(),
+        stdin: None,
+        policy,
     }
 }
 

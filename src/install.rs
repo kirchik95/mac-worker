@@ -11,10 +11,8 @@ use crate::{
         HealthStatus, PROTOCOL_VERSION, ProbeResponse, SetupFailureKind, SetupHostResult,
         SetupWarning, SetupWarningCode,
     },
-    transport::SshTransport,
+    transport::{SshTransport, ssh_request},
 };
-
-const SSH_PROGRAM: &str = "/usr/bin/ssh";
 
 pub struct Installer<'a> {
     runner: &'a dyn ProcessRunner,
@@ -285,7 +283,7 @@ impl<'a> Installer<'a> {
         }
 
         let protocol_version = health.probe.map(|probe| probe.protocol_version);
-        let warnings = self.cleanup_warnings(worker, &id);
+        let warnings = self.success_cleanup_warnings(worker, &id, &digest);
         SetupHostResult {
             name: worker.name.clone(),
             ssh: worker.ssh.clone(),
@@ -398,7 +396,25 @@ impl<'a> Installer<'a> {
 
     fn cleanup_warnings(&self, worker: &WorkerEntry, id: &str) -> Vec<SetupWarning> {
         let cleanup = ssh_request(worker, cleanup_command(id), control_policy());
-        run_success(self.runner, &cleanup, SetupFailureKind::Infrastructure)
+        self.run_cleanup(&cleanup)
+    }
+
+    fn success_cleanup_warnings(
+        &self,
+        worker: &WorkerEntry,
+        id: &str,
+        digest: &str,
+    ) -> Vec<SetupWarning> {
+        let cleanup = ssh_request(
+            worker,
+            success_cleanup_command(id, digest),
+            control_policy(),
+        );
+        self.run_cleanup(&cleanup)
+    }
+
+    fn run_cleanup(&self, cleanup: &ProcessRequest) -> Vec<SetupWarning> {
+        run_success(self.runner, cleanup, SetupFailureKind::Infrastructure)
             .err()
             .map(|failure| SetupWarning {
                 code: SetupWarningCode::CleanupFailed,
@@ -440,24 +456,6 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
-}
-
-fn ssh_request(worker: &WorkerEntry, command: String, policy: ProcessPolicy) -> ProcessRequest {
-    ProcessRequest {
-        program: SSH_PROGRAM.into(),
-        args: vec![
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=5".into(),
-            "--".into(),
-            worker.ssh.clone().into(),
-            command.into(),
-        ],
-        environment: Vec::new(),
-        stdin: None,
-        policy,
-    }
 }
 
 const ACQUIRE_CONTEXT: &str = r#"set -eu
@@ -828,6 +826,35 @@ verify_cleanup_state || exit 77
 /bin/rm -f "$owner_path"
 /bin/rmdir "$lock_dir""#;
 
+const SUCCESS_CLEANUP_BODY: &str = r#"verify_success_cleanup_state() {
+    require_exact_file "$transaction/state" promoted 8 || return 1
+    require_absent "$transaction/worker.new" || return 1
+    read_canonical_hex "$transaction/candidate.sha256" 64 || return 1
+    [ "$canonical_hex" = "$expected_digest" ] || return 1
+    digest_regular_file "$worker_path" || return 1
+    [ "$canonical_digest" = "$expected_digest" ] || return 1
+    if [ -f "$transaction/worker.previous" ]; then
+        require_absent "$transaction/no-previous" || return 1
+        read_canonical_hex "$transaction/previous.sha256" 64 || return 1
+        previous_digest=$canonical_hex
+        digest_regular_file "$transaction/worker.previous" || return 1
+        [ "$canonical_digest" = "$previous_digest" ] || return 1
+    else
+        require_absent "$transaction/previous.sha256" || return 1
+        require_empty_regular_file "$transaction/no-previous" || return 1
+    fi
+}
+resolve_locked_context || exit 76
+verify_success_cleanup_state || exit 77
+resolve_locked_context || exit 76
+verify_success_cleanup_state || exit 77
+/bin/rm -f "$transaction/worker.new" "$transaction/worker.previous" \
+    "$transaction/candidate.sha256" "$transaction/previous.sha256" \
+    "$transaction/no-previous" "$transaction/state"
+/bin/rmdir "$transaction"
+/bin/rm -f "$owner_path"
+/bin/rmdir "$lock_dir""#;
+
 const ROLLBACK_BODY: &str = r#"verify_rollback_state() {
     require_exact_file "$transaction/state" promoted 8 || return 1
     require_absent "$transaction/worker.new" || return 1
@@ -923,6 +950,13 @@ fn verification_command(id: &str, digest: &str) -> String {
 
 fn cleanup_command(id: &str) -> String {
     locked_command(id, CLEANUP_BODY)
+}
+
+fn success_cleanup_command(id: &str, digest: &str) -> String {
+    locked_command(
+        id,
+        &format!("expected_digest='{digest}'\n{SUCCESS_CLEANUP_BODY}"),
+    )
 }
 
 fn rollback_command(id: &str) -> String {

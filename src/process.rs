@@ -107,6 +107,7 @@ impl ProcessRunner for SystemProcessRunner {
         let mut stdout = None;
         let mut stderr = None;
         let mut stdin_complete = stdin_handle.is_none();
+        let mut stdin_error = None;
 
         loop {
             while let Ok(event) = receiver.try_recv() {
@@ -126,10 +127,14 @@ impl ProcessRunner for SystemProcessRunner {
                         };
                         return Err(ProcessError::OutputLimitExceeded { stream, limit }.into());
                     }
-                    ProcessEvent::Captured(_, Err(error)) | ProcessEvent::Stdin(Err(error)) => {
+                    ProcessEvent::Captured(_, Err(error)) => {
                         terminate_and_reap(&mut child, process_group)?;
                         join_threads(stdout_handle, stderr_handle, stdin_handle)?;
                         return Err(error.into());
+                    }
+                    ProcessEvent::Stdin(Err(error)) => {
+                        stdin_error = Some(error);
+                        stdin_complete = true;
                     }
                     ProcessEvent::Stdin(Ok(())) => stdin_complete = true,
                 }
@@ -155,8 +160,14 @@ impl ProcessRunner for SystemProcessRunner {
         }
 
         join_threads(stdout_handle, stderr_handle, stdin_handle)?;
+        let status = status.expect("completed child must have an exit status");
+        if status.success()
+            && let Some(error) = stdin_error
+        {
+            return Err(error.into());
+        }
         Ok(ProcessResult {
-            status: status.expect("completed child must have an exit status"),
+            status,
             stdout: stdout.expect("completed stdout capture must have bytes"),
             stderr: stderr.expect("completed stderr capture must have bytes"),
         })
