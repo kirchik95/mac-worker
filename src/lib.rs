@@ -19,6 +19,7 @@ pub mod output;
 pub mod paths;
 pub mod probe;
 pub mod process;
+pub mod project;
 pub mod protocol;
 pub mod transport;
 
