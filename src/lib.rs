@@ -20,7 +20,9 @@ pub mod paths;
 pub mod probe;
 pub mod process;
 pub mod project;
+pub mod project_config;
 pub mod protocol;
+pub mod requirements;
 pub mod transport;
 
 pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutput, WorkerError> {
