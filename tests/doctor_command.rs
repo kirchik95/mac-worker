@@ -192,7 +192,7 @@ impl ProcessRunner for DoctorRunner {
                 .iter()
                 .any(|argument| argument == "--show-toplevel")
             && let Some(mutation) = &self.after_capture_mutation
-            && mutation.project_inspections.fetch_add(1, Ordering::SeqCst) == 2
+            && mutation.project_inspections.fetch_add(1, Ordering::SeqCst) == 3
         {
             fs::write(mutation.root.join(".worker.toml"), b"version = 1\n")?;
         }

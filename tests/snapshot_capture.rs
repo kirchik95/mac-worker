@@ -547,9 +547,13 @@ fn real_capture_digest_tracks_relative_working_directory() {
 
     assert_eq!(root.manifest.relative_working_dir, "");
     assert_eq!(nested.manifest.relative_working_dir, "nested");
-    assert_eq!(root.manifest.entries, nested.manifest.entries);
+    assert_eq!(entry(&nested, "nested").kind, ManifestEntryKind::Directory);
+    assert!(nested.root.join("nested").is_dir());
     let mut normalized_nested = nested.manifest.clone();
     normalized_nested.relative_working_dir = root.manifest.relative_working_dir.clone();
+    normalized_nested
+        .entries
+        .retain(|entry| entry.path != "nested");
     assert_eq!(root.manifest, normalized_nested);
     assert_ne!(root.digest, nested.digest);
 

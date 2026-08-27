@@ -1,21 +1,16 @@
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::path::PathBuf;
 
 use crate::{
     config::Config,
     error::WorkerError,
-    inputs::{InputSelector, SelectionFailure, SelectionWarning},
+    inputs::{SelectionFailure, SelectionWarning},
     paths::PathLayout,
     process::ProcessRunner,
-    project::{ProjectContext, ProjectInspector},
-    project_config::ProjectSettings,
+    project::ProjectContext,
+    project_state::{ProjectPreparationError, ProjectPreparationRequest, ProjectState},
     protocol::{
         DoctorIssue, DoctorProject, DoctorReport, HealthStatus, IssueSeverity, WorkerHealth,
     },
-    requirements::RequirementDetector,
-    snapshot::SnapshotBuilder,
     transport::{SshTransport, WorkersService},
 };
 
@@ -38,41 +33,16 @@ pub struct DoctorService<'a> {
     pub paths: &'a PathLayout,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LocalProjectState {
-    context: ProjectContext,
-    settings: ProjectSettings,
-    requirements: Vec<String>,
-}
-
-impl LocalProjectState {
-    fn load(
-        runner: &dyn ProcessRunner,
-        project: &Path,
-        cli_includes: &[String],
-    ) -> Result<Self, WorkerError> {
-        let context = ProjectInspector::new(runner).inspect(project)?;
-        let settings = ProjectSettings::load(&context.root, cli_includes)?;
-        let detected = RequirementDetector::detect(&context.root)?;
-        let requirements = merge_project_requirements(&settings.requires, detected);
-        Ok(Self {
-            context,
-            settings,
-            requirements,
-        })
-    }
-}
-
 impl DoctorService<'_> {
     pub fn inspect(&self, request: DoctorRequest) -> Result<DoctorReport, WorkerError> {
         let before_probes =
-            LocalProjectState::load(self.runner, &request.project, &request.cli_includes)?;
+            ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
 
         let mut workers = WorkersService::new(SshTransport::new(self.runner))
             .inspect_with_requirements(self.config, &before_probes.requirements)
             .workers;
         let after_probes =
-            LocalProjectState::load(self.runner, &request.project, &request.cli_includes)?;
+            ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
         let eligible_worker_count = workers.iter().filter(|worker| is_eligible(worker)).count();
         let mut issues = worker_issues(&mut workers, eligible_worker_count);
         if before_probes != after_probes {
@@ -87,50 +57,42 @@ impl DoctorService<'_> {
             ));
         }
 
-        let snapshot = match InputSelector::new(self.runner)
-            .select(&after_probes.context, &after_probes.settings.snapshot)
-        {
-            Ok(selection) => {
-                issues.extend(selection.warnings.iter().map(selection_warning_issue));
-                match SnapshotBuilder::new(self.runner, &self.paths.cache).capture(
-                    &after_probes.context,
-                    &after_probes.settings.snapshot,
-                    selection,
-                ) {
-                    Ok(snapshot) => {
-                        let after_capture = match LocalProjectState::load(
-                            self.runner,
-                            &request.project,
-                            &request.cli_includes,
-                        ) {
-                            Ok(state) => state,
-                            Err(error) => {
-                                return match snapshot.cleanup() {
-                                    Ok(()) => Err(error),
-                                    Err(cleanup_error) => Err(cleanup_error),
-                                };
-                            }
-                        };
-                        if after_probes == after_capture {
-                            let summary = snapshot.summary();
-                            snapshot.cleanup()?;
-                            Some(summary)
-                        } else {
-                            snapshot.cleanup()?;
-                            issues.push(local_state_changed_issue());
-                            None
-                        }
-                    }
-                    Err(WorkerError::Snapshot { code, message }) => {
+        let snapshot = match ProjectState::prepare(
+            self.runner,
+            &self.paths.cache,
+            ProjectPreparationRequest {
+                project: request.project,
+                cli_includes: request.cli_includes,
+            },
+            &after_probes,
+        ) {
+            Ok(prepared) => {
+                issues.extend(
+                    prepared
+                        .selection_warnings
+                        .iter()
+                        .map(selection_warning_issue),
+                );
+                let summary = prepared.snapshot.summary();
+                prepared.cleanup()?;
+                Some(summary)
+            }
+            Err(ProjectPreparationError::Selection(failure)) => {
+                issues.push(selection_failure_issue(failure));
+                None
+            }
+            Err(ProjectPreparationError::Worker {
+                error,
+                selection_warnings,
+            }) => {
+                issues.extend(selection_warnings.iter().map(selection_warning_issue));
+                match error {
+                    WorkerError::Snapshot { code, message } => {
                         issues.push(issue(IssueSeverity::Blocker, code, &message, Vec::new()));
                         None
                     }
-                    Err(error) => return Err(error),
+                    error => return Err(error),
                 }
-            }
-            Err(failure) => {
-                issues.push(selection_failure_issue(failure));
-                None
             }
         };
 
@@ -146,7 +108,7 @@ impl DoctorService<'_> {
 }
 
 fn doctor_report(
-    state: &LocalProjectState,
+    state: &ProjectState,
     snapshot: Option<crate::snapshot::SnapshotSummary>,
     workers: Vec<WorkerHealth>,
     issues: Vec<DoctorIssue>,
@@ -175,19 +137,6 @@ fn local_state_changed_issue() -> DoctorIssue {
         "project policy, requirements, or Git metadata changed during doctor inspection",
         Vec::new(),
     )
-}
-
-fn merge_project_requirements(configured: &[String], mut detected: Vec<String>) -> Vec<String> {
-    detected.sort();
-    detected.dedup();
-
-    let mut seen = HashSet::new();
-    configured
-        .iter()
-        .chain(&detected)
-        .filter(|requirement| seen.insert(requirement.as_str()))
-        .cloned()
-        .collect()
 }
 
 fn doctor_project(context: &ProjectContext) -> DoctorProject {
@@ -403,7 +352,7 @@ mod tests {
                     .args
                     .iter()
                     .any(|argument| argument == "--show-toplevel")
-                && self.project_inspections.fetch_add(1, Ordering::SeqCst) == 2
+                && self.project_inspections.fetch_add(1, Ordering::SeqCst) == 3
             {
                 fs::write(self.root.join(".worker.toml"), b"version = 1\n")?;
             }

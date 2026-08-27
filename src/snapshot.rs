@@ -18,7 +18,9 @@ use uuid::Uuid;
 
 use crate::{
     error::WorkerError,
-    inputs::{InputOrigin, InputSelection, InputSelector, SelectedInput, SelectedInputKind},
+    inputs::{
+        InputOrigin, InputSelection, InputSelector, RelativePath, SelectedInput, SelectedInputKind,
+    },
     manifest::{ManifestEntry, ManifestEntryKind, SnapshotManifest},
     process::ProcessRunner,
     project::ProjectContext,
@@ -66,6 +68,7 @@ pub struct Snapshot {
     pub total_bytes: u64,
     included_untracked_count: usize,
     warning_count: usize,
+    publication_root: PathBuf,
     owned_capture: RootedDir,
 }
 
@@ -95,6 +98,10 @@ pub struct SnapshotSummary {
 }
 
 impl Snapshot {
+    pub fn publication_root(&self) -> &Path {
+        &self.publication_root
+    }
+
     pub fn summary(&self) -> SnapshotSummary {
         SnapshotSummary {
             digest: self.digest.clone(),
@@ -218,6 +225,7 @@ impl<'a> SnapshotBuilder<'a> {
                 .filter(|entry| entry.origin != InputOrigin::Tracked)
                 .count(),
             warning_count: initial.warnings.len(),
+            publication_root: ready_capture,
             owned_capture: partial,
         })
     }
@@ -231,9 +239,20 @@ impl<'a> SnapshotBuilder<'a> {
         tree: &RootedDir,
     ) -> Result<PreparedCapture, WorkerError> {
         let source = RootedDir::open(&context.root).map_err(map_source_error)?;
-        let mut entries = Vec::with_capacity(initial.entries.len());
+        let working_directory = validated_working_directory(context)?;
+        let mut entries =
+            Vec::with_capacity(initial.entries.len() + usize::from(working_directory.is_some()));
         for selected in &initial.entries {
             let fingerprint = materialize_entry(&source, tree, selected)?;
+            entries.push(fingerprint);
+        }
+        if let Some(working_directory) = &working_directory
+            && !initial
+                .entries
+                .iter()
+                .any(|selected| selected.path == working_directory.path)
+        {
+            let fingerprint = materialize_entry(&source, tree, working_directory)?;
             entries.push(fingerprint);
         }
         remove_empty_rooted_fs_namespace(
@@ -319,6 +338,72 @@ impl<'a> SnapshotBuilder<'a> {
             total_bytes,
         })
     }
+}
+
+fn validated_working_directory(
+    context: &ProjectContext,
+) -> Result<Option<SelectedInput>, WorkerError> {
+    if context.relative_cwd.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let path = RelativePath::parse(context.relative_cwd.as_os_str().as_bytes()).map_err(|_| {
+        snapshot_error(
+            "UNSUPPORTED_PATH_ENCODING",
+            "the relative working directory is not a safe UTF-8 path",
+        )
+    })?;
+    open_existing_directory_chain(&context.root.join(path.as_path())).map_err(|error| {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP | libc::ESTALE)
+        ) {
+            snapshot_error(
+                "SNAPSHOT_CHANGED",
+                "the relative working directory changed before capture",
+            )
+        } else {
+            WorkerError::Io(error)
+        }
+    })?;
+    Ok(Some(SelectedInput {
+        path,
+        origin: InputOrigin::IncludedUntracked,
+        kind: SelectedInputKind::EmptyDirectory,
+    }))
+}
+
+fn open_existing_directory_chain(path: &Path) -> io::Result<()> {
+    let start = if path.is_absolute() { c"/" } else { c"." };
+    let mut current = open_directory_at(libc::AT_FDCWD, start)?;
+    let mut saw_component = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(component) => {
+                saw_component = true;
+                let name = CString::new(component.as_bytes()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "working directory contains a NUL byte",
+                    )
+                })?;
+                current = open_directory_at(current.as_raw_fd(), &name)?;
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "working directory contains unsupported traversal",
+                ));
+            }
+        }
+    }
+    if !saw_component {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "working directory must identify a directory",
+        ));
+    }
+    Ok(())
 }
 
 struct PreparedCapture {
