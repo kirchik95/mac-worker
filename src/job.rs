@@ -15,6 +15,8 @@ pub const MAX_ARG_BYTES: usize = 16 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 128 * 1024;
 pub const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1000;
+pub const MAX_CONTROL_CODE_BYTES: usize = 128;
+pub const MAX_CONTROL_MESSAGE_BYTES: usize = 4 * 1024;
 
 macro_rules! canonical_uuid_id {
     ($name:ident) => {
@@ -1362,11 +1364,86 @@ impl<'de> Deserialize<'de> for JobMeta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteUncertainty {
+    None,
+    UnknownRemote { code: String },
+    CleanupPending { code: String },
+}
+
+impl RemoteUncertainty {
+    pub fn unknown_remote(code: impl Into<String>) -> Result<Self, WorkerError> {
+        let uncertainty = Self::UnknownRemote { code: code.into() };
+        uncertainty.validate()?;
+        Ok(uncertainty)
+    }
+
+    pub fn cleanup_pending(code: impl Into<String>) -> Result<Self, WorkerError> {
+        let uncertainty = Self::CleanupPending { code: code.into() };
+        uncertainty.validate()?;
+        Ok(uncertainty)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        match self {
+            Self::None => Ok(()),
+            Self::UnknownRemote { code } | Self::CleanupPending { code } => {
+                validate_control_code(code, "remote uncertainty code")
+            }
+        }
+    }
+
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::UnknownRemote { code } | Self::CleanupPending { code } => Some(code),
+        }
+    }
+}
+
+impl Serialize for RemoteUncertainty {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        #[derive(Serialize)]
+        #[serde(tag = "state", rename_all = "snake_case")]
+        enum Wire<'a> {
+            None,
+            UnknownRemote { code: &'a str },
+            CleanupPending { code: &'a str },
+        }
+        match self {
+            Self::None => Wire::None,
+            Self::UnknownRemote { code } => Wire::UnknownRemote { code },
+            Self::CleanupPending { code } => Wire::CleanupPending { code },
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteUncertainty {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            None {},
+            UnknownRemote { code: String },
+            CleanupPending { code: String },
+        }
+        let uncertainty = match Wire::deserialize(deserializer)? {
+            Wire::None {} => Self::None,
+            Wire::UnknownRemote { code } => Self::UnknownRemote { code },
+            Wire::CleanupPending { code } => Self::CleanupPending { code },
+        };
+        uncertainty.validate().map_err(de::Error::custom)?;
+        Ok(uncertainty)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalJobRecord {
     meta: JobMeta,
     lease_token: LeaseToken,
     last_status: Option<JobStatus>,
-    cleanup_pending: bool,
+    remote_uncertainty: RemoteUncertainty,
 }
 
 impl Serialize for LocalJobRecord {
@@ -1376,7 +1453,7 @@ impl Serialize for LocalJobRecord {
         record.serialize_field("meta", &self.meta)?;
         record.serialize_field("lease_token", &self.lease_token)?;
         record.serialize_field("last_status", &self.last_status)?;
-        record.serialize_field("cleanup_pending", &self.cleanup_pending)?;
+        record.serialize_field("remote_uncertainty", &self.remote_uncertainty)?;
         record.end()
     }
 }
@@ -1386,13 +1463,13 @@ impl LocalJobRecord {
         meta: JobMeta,
         lease_token: LeaseToken,
         last_status: Option<JobStatus>,
-        cleanup_pending: bool,
+        remote_uncertainty: RemoteUncertainty,
     ) -> Result<Self, WorkerError> {
         let record = Self {
             meta,
             lease_token,
             last_status,
-            cleanup_pending,
+            remote_uncertainty,
         };
         record.validate()?;
         Ok(record)
@@ -1403,7 +1480,7 @@ impl LocalJobRecord {
         if let Some(status) = &self.last_status {
             status.validate()?;
         }
-        Ok(())
+        self.remote_uncertainty.validate()
     }
 
     pub fn meta(&self) -> &JobMeta {
@@ -1415,8 +1492,8 @@ impl LocalJobRecord {
     pub fn last_status(&self) -> Option<&JobStatus> {
         self.last_status.as_ref()
     }
-    pub fn cleanup_pending(&self) -> bool {
-        self.cleanup_pending
+    pub fn remote_uncertainty(&self) -> &RemoteUncertainty {
+        &self.remote_uncertainty
     }
 }
 
@@ -1428,14 +1505,14 @@ impl<'de> Deserialize<'de> for LocalJobRecord {
             meta: JobMeta,
             lease_token: LeaseToken,
             last_status: Option<JobStatus>,
-            cleanup_pending: bool,
+            remote_uncertainty: RemoteUncertainty,
         }
         let wire = Wire::deserialize(deserializer)?;
         let record = Self {
             meta: wire.meta,
             lease_token: wire.lease_token,
             last_status: wire.last_status,
-            cleanup_pending: wire.cleanup_pending,
+            remote_uncertainty: wire.remote_uncertainty,
         };
         record.validate().map_err(de::Error::custom)?;
         Ok(record)
@@ -1802,6 +1879,261 @@ impl<'de> Deserialize<'de> for SubmitRequest {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolveOrAbandonRequest {
+    protocol_version: u32,
+    job_id: JobId,
+    client_id: ClientId,
+    lease_token: LeaseToken,
+    request_fingerprint: RequestFingerprint,
+    worker_name: String,
+    project_id: String,
+    worktree_id: String,
+    manifest_digest: String,
+    relative_working_dir: String,
+    timeout_millis: u64,
+    resource_class: String,
+    command_summary: CommandSummary,
+}
+
+impl fmt::Debug for ResolveOrAbandonRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolveOrAbandonRequest")
+            .field("protocol_version", &self.protocol_version)
+            .field("job_id", &self.job_id)
+            .field("client_id", &self.client_id)
+            .field("lease_token", &"[REDACTED]")
+            .field("request_fingerprint", &self.request_fingerprint)
+            .field("worker_name", &self.worker_name)
+            .field("project_id", &self.project_id)
+            .field("worktree_id", &self.worktree_id)
+            .field("manifest_digest", &self.manifest_digest)
+            .field("relative_working_dir", &self.relative_working_dir)
+            .field("timeout_millis", &self.timeout_millis)
+            .field("resource_class", &self.resource_class)
+            .field("command_summary", &self.command_summary)
+            .finish()
+    }
+}
+
+impl ResolveOrAbandonRequest {
+    pub fn from_submit_request(request: &SubmitRequest) -> Result<Self, WorkerError> {
+        request.validate()?;
+        let material = request.material();
+        Self::from_parts(
+            material.job_id(),
+            material.client_id(),
+            material.lease_token(),
+            request.request_fingerprint().clone(),
+            material.worker_name().into(),
+            material.project_id().into(),
+            material.worktree_id().into(),
+            material.manifest_digest().into(),
+            material.relative_working_dir().into(),
+            material.timeout_millis(),
+            material.resource_class().into(),
+            material.command().summary()?,
+        )
+    }
+
+    pub fn from_local_record(record: &LocalJobRecord) -> Result<Self, WorkerError> {
+        record.validate()?;
+        let meta = record.meta();
+        Self::from_parts(
+            meta.job_id(),
+            meta.client_id(),
+            record.lease_token(),
+            meta.request_fingerprint().clone(),
+            meta.worker_name().into(),
+            meta.project_id().into(),
+            meta.worktree_id().into(),
+            meta.manifest_digest().into(),
+            meta.relative_working_dir().into(),
+            meta.timeout_millis(),
+            meta.resource_class().into(),
+            meta.command_summary().clone(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        job_id: JobId,
+        client_id: ClientId,
+        lease_token: LeaseToken,
+        request_fingerprint: RequestFingerprint,
+        worker_name: String,
+        project_id: String,
+        worktree_id: String,
+        manifest_digest: String,
+        relative_working_dir: String,
+        timeout_millis: u64,
+        resource_class: String,
+        command_summary: CommandSummary,
+    ) -> Result<Self, WorkerError> {
+        let request = Self {
+            protocol_version: PROTOCOL_VERSION,
+            job_id,
+            client_id,
+            lease_token,
+            request_fingerprint,
+            worker_name,
+            project_id,
+            worktree_id,
+            manifest_digest,
+            relative_working_dir,
+            timeout_millis,
+            resource_class,
+            command_summary,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "resolve-or-abandon request has an incompatible protocol version",
+            ));
+        }
+        validate_non_nul(&self.worker_name, 128, "worker name")?;
+        validate_hex_component(&self.project_id, "project ID")?;
+        validate_hex_component(&self.worktree_id, "worktree ID")?;
+        validate_hex_component(&self.manifest_digest, "manifest digest")?;
+        if self.relative_working_dir.as_bytes().contains(&0)
+            || self.relative_working_dir.len() > MAX_COMMAND_BYTES
+        {
+            return Err(protocol_error(
+                "resolve-or-abandon relative working directory is invalid",
+            ));
+        }
+        if self.timeout_millis == 0 || self.timeout_millis > MAX_TIMEOUT_MILLIS {
+            return Err(protocol_error(
+                "resolve-or-abandon timeout is outside the supported range",
+            ));
+        }
+        validate_non_nul(&self.resource_class, 64, "resource class")?;
+        self.command_summary.validate()
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+    pub fn job_id(&self) -> JobId {
+        self.job_id
+    }
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+    pub fn lease_token(&self) -> LeaseToken {
+        self.lease_token
+    }
+    pub fn request_fingerprint(&self) -> &RequestFingerprint {
+        &self.request_fingerprint
+    }
+    pub fn worker_name(&self) -> &str {
+        &self.worker_name
+    }
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub fn worktree_id(&self) -> &str {
+        &self.worktree_id
+    }
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+    pub fn relative_working_dir(&self) -> &str {
+        &self.relative_working_dir
+    }
+    pub fn timeout_millis(&self) -> u64 {
+        self.timeout_millis
+    }
+    pub fn resource_class(&self) -> &str {
+        &self.resource_class
+    }
+    pub fn command_summary(&self) -> &CommandSummary {
+        &self.command_summary
+    }
+}
+
+impl TryFrom<&SubmitRequest> for ResolveOrAbandonRequest {
+    type Error = WorkerError;
+
+    fn try_from(request: &SubmitRequest) -> Result<Self, Self::Error> {
+        Self::from_submit_request(request)
+    }
+}
+
+impl TryFrom<&LocalJobRecord> for ResolveOrAbandonRequest {
+    type Error = WorkerError;
+
+    fn try_from(record: &LocalJobRecord) -> Result<Self, Self::Error> {
+        Self::from_local_record(record)
+    }
+}
+
+impl Serialize for ResolveOrAbandonRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("ResolveOrAbandonRequest", 13)?;
+        record.serialize_field("protocol_version", &self.protocol_version)?;
+        record.serialize_field("job_id", &self.job_id)?;
+        record.serialize_field("client_id", &self.client_id)?;
+        record.serialize_field("lease_token", &self.lease_token)?;
+        record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
+        record.serialize_field("worker_name", &self.worker_name)?;
+        record.serialize_field("project_id", &self.project_id)?;
+        record.serialize_field("worktree_id", &self.worktree_id)?;
+        record.serialize_field("manifest_digest", &self.manifest_digest)?;
+        record.serialize_field("relative_working_dir", &self.relative_working_dir)?;
+        record.serialize_field("timeout_millis", &self.timeout_millis)?;
+        record.serialize_field("resource_class", &self.resource_class)?;
+        record.serialize_field("command_summary", &self.command_summary)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolveOrAbandonRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            protocol_version: u32,
+            job_id: JobId,
+            client_id: ClientId,
+            lease_token: LeaseToken,
+            request_fingerprint: RequestFingerprint,
+            worker_name: String,
+            project_id: String,
+            worktree_id: String,
+            manifest_digest: String,
+            relative_working_dir: String,
+            timeout_millis: u64,
+            resource_class: String,
+            command_summary: CommandSummary,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let request = Self {
+            protocol_version: wire.protocol_version,
+            job_id: wire.job_id,
+            client_id: wire.client_id,
+            lease_token: wire.lease_token,
+            request_fingerprint: wire.request_fingerprint,
+            worker_name: wire.worker_name,
+            project_id: wire.project_id,
+            worktree_id: wire.worktree_id,
+            manifest_digest: wire.manifest_digest,
+            relative_working_dir: wire.relative_working_dir,
+            timeout_millis: wire.timeout_millis,
+            resource_class: wire.resource_class,
+            command_summary: wire.command_summary,
+        };
+        request.validate().map_err(de::Error::custom)?;
+        Ok(request)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitResponse {
     Accepted {
@@ -1870,8 +2202,69 @@ impl<'de> Deserialize<'de> for SubmitResponse {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusRequest {
+    protocol_version: u32,
+    job_id: JobId,
+}
+
+impl StatusRequest {
+    pub fn new(job_id: JobId) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            job_id,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "status request has an incompatible protocol version",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn protocol_version(self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn job_id(self) -> JobId {
+        self.job_id
+    }
+}
+
+impl Serialize for StatusRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("StatusRequest", 2)?;
+        record.serialize_field("protocol_version", &self.protocol_version)?;
+        record.serialize_field("job_id", &self.job_id)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            protocol_version: u32,
+            job_id: JobId,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let request = Self {
+            protocol_version: wire.protocol_version,
+            job_id: wire.job_id,
+        };
+        request.validate().map_err(de::Error::custom)?;
+        Ok(request)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusResponse {
+    protocol_version: u32,
     meta: JobMeta,
     status: JobStatus,
 }
@@ -1879,7 +2272,8 @@ pub struct StatusResponse {
 impl Serialize for StatusResponse {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("StatusResponse", 2)?;
+        let mut record = serializer.serialize_struct("StatusResponse", 3)?;
+        record.serialize_field("protocol_version", &self.protocol_version)?;
         record.serialize_field("meta", &self.meta)?;
         record.serialize_field("status", &self.status)?;
         record.end()
@@ -1891,11 +2285,13 @@ impl<'de> Deserialize<'de> for StatusResponse {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
+            protocol_version: u32,
             meta: JobMeta,
             status: JobStatus,
         }
         let wire = Wire::deserialize(deserializer)?;
         let response = Self {
+            protocol_version: wire.protocol_version,
             meta: wire.meta,
             status: wire.status,
         };
@@ -1906,14 +2302,33 @@ impl<'de> Deserialize<'de> for StatusResponse {
 
 impl StatusResponse {
     pub fn new(meta: JobMeta, status: JobStatus) -> Result<Self, WorkerError> {
-        let response = Self { meta, status };
+        let response = Self {
+            protocol_version: PROTOCOL_VERSION,
+            meta,
+            status,
+        };
         response.validate()?;
         Ok(response)
     }
 
     pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "status response has an incompatible protocol version",
+            ));
+        }
         self.meta.validate()?;
-        self.status.validate()
+        self.status.validate()?;
+        if self.status.updated_at_millis() < self.meta.created_at_millis() {
+            return Err(protocol_error(
+                "status response timestamp predates job acceptance",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
     }
 
     pub fn meta(&self) -> &JobMeta {
@@ -1929,6 +2344,89 @@ impl StatusResponse {
 pub enum LogStream {
     Stdout,
     Stderr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogChunkRequest {
+    protocol_version: u32,
+    job_id: JobId,
+    stream: LogStream,
+    offset: u64,
+    limit: u32,
+}
+
+impl LogChunkRequest {
+    pub fn new(job_id: JobId, stream: LogStream, offset: u64, limit: u32) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            job_id,
+            stream,
+            offset,
+            limit,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "log chunk request has an incompatible protocol version",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn protocol_version(self) -> u32 {
+        self.protocol_version
+    }
+    pub fn job_id(self) -> JobId {
+        self.job_id
+    }
+    pub fn stream(self) -> LogStream {
+        self.stream
+    }
+    pub fn offset(self) -> u64 {
+        self.offset
+    }
+    pub fn limit(self) -> u32 {
+        self.limit
+    }
+}
+
+impl Serialize for LogChunkRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("LogChunkRequest", 5)?;
+        record.serialize_field("protocol_version", &self.protocol_version)?;
+        record.serialize_field("job_id", &self.job_id)?;
+        record.serialize_field("stream", &self.stream)?;
+        record.serialize_field("offset", &self.offset)?;
+        record.serialize_field("limit", &self.limit)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for LogChunkRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            protocol_version: u32,
+            job_id: JobId,
+            stream: LogStream,
+            offset: u64,
+            limit: u32,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let request = Self {
+            protocol_version: wire.protocol_version,
+            job_id: wire.job_id,
+            stream: wire.stream,
+            offset: wire.offset,
+            limit: wire.limit,
+        };
+        request.validate().map_err(de::Error::custom)?;
+        Ok(request)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2023,6 +2521,461 @@ impl<'de> Deserialize<'de> for LogChunk {
         };
         chunk.validate().map_err(de::Error::custom)?;
         Ok(chunk)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogChunkResponse {
+    protocol_version: u32,
+    chunk: LogChunk,
+}
+
+impl LogChunkResponse {
+    pub fn new(chunk: LogChunk) -> Result<Self, WorkerError> {
+        let response = Self {
+            protocol_version: PROTOCOL_VERSION,
+            chunk,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "log chunk response has an incompatible protocol version",
+            ));
+        }
+        self.chunk.validate()
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+    pub fn chunk(&self) -> &LogChunk {
+        &self.chunk
+    }
+    pub fn into_chunk(self) -> LogChunk {
+        self.chunk
+    }
+}
+
+impl Serialize for LogChunkResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("LogChunkResponse", 2)?;
+        record.serialize_field("protocol_version", &self.protocol_version)?;
+        record.serialize_field("chunk", &self.chunk)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for LogChunkResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            protocol_version: u32,
+            chunk: LogChunk,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let response = Self {
+            protocol_version: wire.protocol_version,
+            chunk: wire.chunk,
+        };
+        response.validate().map_err(de::Error::custom)?;
+        Ok(response)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+// The control-plane contract owns the complete accepted response so callers
+// can pattern-match it without a second allocation or lifetime wrapper.
+#[allow(clippy::large_enum_variant)]
+pub enum ResolveOrAbandonOutcome {
+    Accepted { response: StatusResponse },
+    Abandoned,
+    CleanupPending { code: String },
+}
+
+impl ResolveOrAbandonOutcome {
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        match self {
+            Self::Accepted { response } => response.validate(),
+            Self::Abandoned => Ok(()),
+            Self::CleanupPending { code } => validate_control_code(code, "cleanup-pending code"),
+        }
+    }
+}
+
+impl Serialize for ResolveOrAbandonOutcome {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        match self {
+            Self::Accepted { response } => {
+                let mut record = serializer.serialize_struct("ResolveOrAbandonOutcome", 2)?;
+                record.serialize_field("outcome", "accepted")?;
+                record.serialize_field("response", response)?;
+                record.end()
+            }
+            Self::Abandoned => {
+                let mut record = serializer.serialize_struct("ResolveOrAbandonOutcome", 1)?;
+                record.serialize_field("outcome", "abandoned")?;
+                record.end()
+            }
+            Self::CleanupPending { code } => {
+                let mut record = serializer.serialize_struct("ResolveOrAbandonOutcome", 2)?;
+                record.serialize_field("outcome", "cleanup_pending")?;
+                record.serialize_field("code", code)?;
+                record.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolveOrAbandonOutcome {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Accepted { response: Box<StatusResponse> },
+            Abandoned {},
+            CleanupPending { code: String },
+        }
+        let outcome = match Wire::deserialize(deserializer)? {
+            Wire::Accepted { response } => Self::Accepted {
+                response: *response,
+            },
+            Wire::Abandoned {} => Self::Abandoned,
+            Wire::CleanupPending { code } => Self::CleanupPending { code },
+        };
+        outcome.validate().map_err(de::Error::custom)?;
+        Ok(outcome)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveOrAbandonResponse {
+    protocol_version: u32,
+    outcome: ResolveOrAbandonOutcome,
+}
+
+impl ResolveOrAbandonResponse {
+    pub fn new(outcome: ResolveOrAbandonOutcome) -> Result<Self, WorkerError> {
+        let response = Self {
+            protocol_version: PROTOCOL_VERSION,
+            outcome,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn accepted(response: StatusResponse) -> Result<Self, WorkerError> {
+        Self::new(ResolveOrAbandonOutcome::Accepted { response })
+    }
+
+    pub fn abandoned() -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            outcome: ResolveOrAbandonOutcome::Abandoned,
+        }
+    }
+
+    pub fn cleanup_pending(code: impl Into<String>) -> Result<Self, WorkerError> {
+        Self::new(ResolveOrAbandonOutcome::CleanupPending { code: code.into() })
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "resolve-or-abandon response has an incompatible protocol version",
+            ));
+        }
+        self.outcome.validate()
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+    pub fn outcome(&self) -> &ResolveOrAbandonOutcome {
+        &self.outcome
+    }
+}
+
+impl Serialize for ResolveOrAbandonResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        match &self.outcome {
+            ResolveOrAbandonOutcome::Accepted { response } => {
+                let mut record = serializer.serialize_struct("ResolveOrAbandonResponse", 3)?;
+                record.serialize_field("protocol_version", &self.protocol_version)?;
+                record.serialize_field("outcome", "accepted")?;
+                record.serialize_field("response", response)?;
+                record.end()
+            }
+            ResolveOrAbandonOutcome::Abandoned => {
+                let mut record = serializer.serialize_struct("ResolveOrAbandonResponse", 2)?;
+                record.serialize_field("protocol_version", &self.protocol_version)?;
+                record.serialize_field("outcome", "abandoned")?;
+                record.end()
+            }
+            ResolveOrAbandonOutcome::CleanupPending { code } => {
+                let mut record = serializer.serialize_struct("ResolveOrAbandonResponse", 3)?;
+                record.serialize_field("protocol_version", &self.protocol_version)?;
+                record.serialize_field("outcome", "cleanup_pending")?;
+                record.serialize_field("code", code)?;
+                record.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolveOrAbandonResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Accepted {
+                protocol_version: u32,
+                response: Box<StatusResponse>,
+            },
+            Abandoned {
+                protocol_version: u32,
+            },
+            CleanupPending {
+                protocol_version: u32,
+                code: String,
+            },
+        }
+        let (protocol_version, outcome) = match Wire::deserialize(deserializer)? {
+            Wire::Accepted {
+                protocol_version,
+                response,
+            } => (
+                protocol_version,
+                ResolveOrAbandonOutcome::Accepted {
+                    response: *response,
+                },
+            ),
+            Wire::Abandoned { protocol_version } => {
+                (protocol_version, ResolveOrAbandonOutcome::Abandoned)
+            }
+            Wire::CleanupPending {
+                protocol_version,
+                code,
+            } => (
+                protocol_version,
+                ResolveOrAbandonOutcome::CleanupPending { code },
+            ),
+        };
+        let response = Self {
+            protocol_version,
+            outcome,
+        };
+        response.validate().map_err(de::Error::custom)?;
+        Ok(response)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+// This low-frequency recovery result deliberately matches the public contract.
+#[allow(clippy::large_enum_variant)]
+pub enum PreacceptanceDisposition {
+    Accepted(StatusResponse),
+    Abandoned,
+    CleanupPending { code: String },
+    UnknownRemote { code: String },
+}
+
+impl PreacceptanceDisposition {
+    pub fn cleanup_pending(code: impl Into<String>) -> Result<Self, WorkerError> {
+        let disposition = Self::CleanupPending { code: code.into() };
+        disposition.validate()?;
+        Ok(disposition)
+    }
+
+    pub fn unknown_remote(code: impl Into<String>) -> Result<Self, WorkerError> {
+        let disposition = Self::UnknownRemote { code: code.into() };
+        disposition.validate()?;
+        Ok(disposition)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        match self {
+            Self::Accepted(response) => response.validate(),
+            Self::Abandoned => Ok(()),
+            Self::CleanupPending { code } => validate_control_code(code, "cleanup-pending code"),
+            Self::UnknownRemote { code } => validate_control_code(code, "unknown-remote code"),
+        }
+    }
+}
+
+impl Serialize for PreacceptanceDisposition {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        match self {
+            Self::Accepted(response) => {
+                let mut record = serializer.serialize_struct("PreacceptanceDisposition", 2)?;
+                record.serialize_field("disposition", "accepted")?;
+                record.serialize_field("response", response)?;
+                record.end()
+            }
+            Self::Abandoned => {
+                let mut record = serializer.serialize_struct("PreacceptanceDisposition", 1)?;
+                record.serialize_field("disposition", "abandoned")?;
+                record.end()
+            }
+            Self::CleanupPending { code } => {
+                let mut record = serializer.serialize_struct("PreacceptanceDisposition", 2)?;
+                record.serialize_field("disposition", "cleanup_pending")?;
+                record.serialize_field("code", code)?;
+                record.end()
+            }
+            Self::UnknownRemote { code } => {
+                let mut record = serializer.serialize_struct("PreacceptanceDisposition", 2)?;
+                record.serialize_field("disposition", "unknown_remote")?;
+                record.serialize_field("code", code)?;
+                record.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PreacceptanceDisposition {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Accepted { response: Box<StatusResponse> },
+            Abandoned {},
+            CleanupPending { code: String },
+            UnknownRemote { code: String },
+        }
+        let disposition = match Wire::deserialize(deserializer)? {
+            Wire::Accepted { response } => Self::Accepted(*response),
+            Wire::Abandoned {} => Self::Abandoned,
+            Wire::CleanupPending { code } => Self::CleanupPending { code },
+            Wire::UnknownRemote { code } => Self::UnknownRemote { code },
+        };
+        disposition.validate().map_err(de::Error::custom)?;
+        Ok(disposition)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostControlErrorDetail {
+    code: String,
+    message: String,
+}
+
+impl HostControlErrorDetail {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Result<Self, WorkerError> {
+        let detail = Self {
+            code: code.into(),
+            message: message.into(),
+        };
+        detail.validate()?;
+        Ok(detail)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        validate_control_code(&self.code, "host control error code")?;
+        validate_non_nul(
+            &self.message,
+            MAX_CONTROL_MESSAGE_BYTES,
+            "host control error message",
+        )
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl Serialize for HostControlErrorDetail {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("HostControlErrorDetail", 2)?;
+        record.serialize_field("code", &self.code)?;
+        record.serialize_field("message", &self.message)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for HostControlErrorDetail {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            code: String,
+            message: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.code, wire.message).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostControlError {
+    protocol_version: u32,
+    error: HostControlErrorDetail,
+}
+
+impl HostControlError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Result<Self, WorkerError> {
+        let error = Self {
+            protocol_version: PROTOCOL_VERSION,
+            error: HostControlErrorDetail::new(code, message)?,
+        };
+        error.validate()?;
+        Ok(error)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "host control error has an incompatible protocol version",
+            ));
+        }
+        self.error.validate()
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+    pub fn error(&self) -> &HostControlErrorDetail {
+        &self.error
+    }
+}
+
+impl Serialize for HostControlError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("HostControlError", 2)?;
+        record.serialize_field("protocol_version", &self.protocol_version)?;
+        record.serialize_field("error", &self.error)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for HostControlError {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            protocol_version: u32,
+            error: HostControlErrorDetail,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let error = Self {
+            protocol_version: wire.protocol_version,
+            error: wire.error,
+        };
+        error.validate().map_err(de::Error::custom)?;
+        Ok(error)
     }
 }
 
@@ -2256,6 +3209,19 @@ fn validate_non_nul(value: &str, max_bytes: usize, label: &str) -> Result<(), Wo
     if value.is_empty() || value.len() > max_bytes || value.as_bytes().contains(&0) {
         return Err(protocol_error(&format!(
             "{label} is empty, too long, or contains NUL"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_control_code(value: &str, label: &str) -> Result<(), WorkerError> {
+    validate_non_nul(value, MAX_CONTROL_CODE_BYTES, label)?;
+    let mut bytes = value.bytes();
+    if !bytes.next().is_some_and(|byte| byte.is_ascii_uppercase())
+        || !bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(protocol_error(&format!(
+            "{label} must be an uppercase ASCII identifier"
         )));
     }
     Ok(())

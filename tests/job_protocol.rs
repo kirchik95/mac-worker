@@ -1,10 +1,12 @@
 use mac_worker::{
     error::{ExitKind, WorkerError},
     job::{
-        CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus, JsonEvent,
-        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LocalJobRecord, LogChunk,
-        LogStream, ProcessIdentity, RequestFingerprint, RequestFingerprintMaterial, StatusResponse,
-        SubmitRequest, SubmitResponse,
+        CommandSpec, CommandSummary, HostControlError, JobId, JobMeta, JobState, JobStatus,
+        JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LocalJobRecord,
+        LogChunk, LogChunkRequest, LogChunkResponse, LogStream, PreacceptanceDisposition,
+        ProcessIdentity, RemoteUncertainty, RequestFingerprint, RequestFingerprintMaterial,
+        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest,
+        StatusResponse, SubmitRequest, SubmitResponse,
     },
     protocol::PROTOCOL_VERSION,
 };
@@ -67,6 +69,23 @@ fn lease_json() -> serde_json::Value {
         "created_at_millis": 100,
         "expires_at_millis": 30_100,
     })
+}
+
+fn submit_request() -> SubmitRequest {
+    SubmitRequest::new(material(
+        CommandSpec::shell("printf task-8-command-secret".into()).unwrap(),
+    ))
+}
+
+fn status_response(updated_at_millis: u64) -> StatusResponse {
+    let request = submit_request();
+    let meta = JobMeta::new(
+        request.material(),
+        request.request_fingerprint().clone(),
+        100,
+    )
+    .unwrap();
+    StatusResponse::new(meta, JobStatus::accepted(updated_at_millis).unwrap()).unwrap()
 }
 
 #[test]
@@ -209,11 +228,12 @@ fn serde_rejects_semantically_invalid_persistent_and_wire_dtos() {
             "meta": protocol_one_meta,
             "lease_token": LEASE_TOKEN,
             "last_status": null,
-            "cleanup_pending": false,
+            "remote_uncertainty": { "state": "none" },
         }))
         .is_err()
     );
     assert!(serde_json::from_value::<StatusResponse>(serde_json::json!({
+        "protocol_version": PROTOCOL_VERSION,
         "meta": protocol_one_meta,
         "status": { "state": "accepted", "updated_at_millis": 100, "supervisor_pid": null, "supervisor_start_identity": null, "child_pid": null, "child_start_identity": null, "exit_code": null, "final_stdout_bytes": null, "final_stderr_bytes": null, "error_code": null },
     })).is_err());
@@ -395,4 +415,209 @@ fn protocol_and_exit_kinds_keep_their_wire_contracts() {
         ExitKind::Unavailable
     );
     assert_eq!(WorkerError::CommandExit { code: 7 }.exit_code(), 7);
+}
+
+#[test]
+fn task8_query_dtos_round_trip_canonically_without_command_or_token_leaks() {
+    // Catches query envelopes omitting their compatibility version, resolver
+    // recovery state persisting raw command bytes, or Debug exposing the token.
+    let status_request = StatusRequest::new(JOB_ID.parse().unwrap());
+    let status_json = serde_json::to_string(&status_request).unwrap();
+    assert_eq!(
+        status_json,
+        format!(r#"{{"protocol_version":2,"job_id":"{JOB_ID}"}}"#)
+    );
+    assert_eq!(
+        serde_json::from_str::<StatusRequest>(&status_json).unwrap(),
+        status_request
+    );
+
+    let response = status_response(101);
+    let response_json = serde_json::to_string(&response).unwrap();
+    assert!(response_json.starts_with(r#"{"protocol_version":2,"meta":{"#));
+    assert_eq!(
+        serde_json::from_str::<StatusResponse>(&response_json).unwrap(),
+        response
+    );
+
+    let log_request = LogChunkRequest::new(JOB_ID.parse().unwrap(), LogStream::Stderr, 7, 65_537);
+    let log_request_json = serde_json::to_string(&log_request).unwrap();
+    assert_eq!(
+        log_request_json,
+        format!(
+            r#"{{"protocol_version":2,"job_id":"{JOB_ID}","stream":"stderr","offset":7,"limit":65537}}"#
+        )
+    );
+    assert_eq!(
+        serde_json::from_str::<LogChunkRequest>(&log_request_json).unwrap(),
+        log_request
+    );
+    let log_response =
+        LogChunkResponse::new(LogChunk::new(LogStream::Stderr, 7, b"\0\xff".to_vec()).unwrap())
+            .unwrap();
+    let log_response_json = serde_json::to_string(&log_response).unwrap();
+    assert_eq!(
+        serde_json::from_str::<LogChunkResponse>(&log_response_json).unwrap(),
+        log_response
+    );
+
+    let submit = submit_request();
+    let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let resolve_json = serde_json::to_string(&resolve).unwrap();
+    assert!(resolve_json.contains(r#""command_summary":{"mode":"shell"}"#));
+    assert!(!resolve_json.contains("task-8-command-secret"));
+    assert!(!resolve_json.contains(r#""command":"#));
+    let debug = format!("{resolve:?}");
+    assert!(!debug.contains(LEASE_TOKEN));
+    assert!(!debug.contains("task-8-command-secret"));
+    assert!(debug.contains("[REDACTED]"));
+    assert_eq!(
+        serde_json::from_str::<ResolveOrAbandonRequest>(&resolve_json).unwrap(),
+        resolve
+    );
+
+    let local = LocalJobRecord::new(
+        response.meta().clone(),
+        LEASE_TOKEN.parse().unwrap(),
+        Some(response.status().clone()),
+        RemoteUncertainty::None,
+    )
+    .unwrap();
+    assert_eq!(
+        ResolveOrAbandonRequest::from_local_record(&local).unwrap(),
+        resolve
+    );
+}
+
+#[test]
+fn task8_query_dtos_reject_missing_unknown_duplicate_trailing_and_invalid_values() {
+    // Catches permissive endpoint DTO parsing that could bind a query or
+    // recovery decision to an ambiguous identity or incompatible helper.
+    let valid_status = format!(r#"{{"protocol_version":2,"job_id":"{JOB_ID}"}}"#);
+    for invalid in [
+        format!(r#"{{"job_id":"{JOB_ID}"}}"#),
+        format!(r#"{{"protocol_version":1,"job_id":"{JOB_ID}"}}"#),
+        r#"{"protocol_version":2,"job_id":"BAD"}"#.to_string(),
+        format!(r#"{{"protocol_version":2,"job_id":"{JOB_ID}","extra":true}}"#),
+        format!(r#"{{"protocol_version":2,"protocol_version":2,"job_id":"{JOB_ID}"}}"#),
+        format!("{valid_status} true"),
+    ] {
+        assert!(
+            serde_json::from_str::<StatusRequest>(&invalid).is_err(),
+            "{invalid}"
+        );
+    }
+
+    for invalid in [
+        format!(
+            r#"{{"protocol_version":2,"job_id":"{JOB_ID}","stream":"stdout","offset":0,"limit":-1}}"#
+        ),
+        format!(
+            r#"{{"protocol_version":2,"job_id":"{JOB_ID}","stream":"stdout","offset":0,"limit":4294967296}}"#
+        ),
+        format!(
+            r#"{{"protocol_version":2,"job_id":"{JOB_ID}","stream":"stdin","offset":0,"limit":1}}"#
+        ),
+        format!(
+            r#"{{"protocol_version":2,"job_id":"{JOB_ID}","stream":"stdout","offset":0,"limit":1,"limit":2}}"#
+        ),
+    ] {
+        assert!(
+            serde_json::from_str::<LogChunkRequest>(&invalid).is_err(),
+            "{invalid}"
+        );
+    }
+
+    let response = status_response(100);
+    let mut backwards = serde_json::to_value(&response).unwrap();
+    backwards["status"]["updated_at_millis"] = serde_json::json!(99);
+    assert!(serde_json::from_value::<StatusResponse>(backwards).is_err());
+    let mut wrong_version = serde_json::to_value(&response).unwrap();
+    wrong_version["protocol_version"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<StatusResponse>(wrong_version).is_err());
+
+    let resolve = ResolveOrAbandonRequest::from_submit_request(&submit_request()).unwrap();
+    let mut invalid_resolve = serde_json::to_value(&resolve).unwrap();
+    invalid_resolve["manifest_digest"] = serde_json::json!("A".repeat(64));
+    assert!(serde_json::from_value::<ResolveOrAbandonRequest>(invalid_resolve.clone()).is_err());
+    invalid_resolve = serde_json::to_value(&resolve).unwrap();
+    invalid_resolve["timeout_millis"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<ResolveOrAbandonRequest>(invalid_resolve).is_err());
+    let mut raw_command = serde_json::to_value(&resolve).unwrap();
+    raw_command["command"] = serde_json::json!({"mode":"shell","shell":"secret"});
+    assert!(serde_json::from_value::<ResolveOrAbandonRequest>(raw_command).is_err());
+}
+
+#[test]
+fn resolution_outcomes_uncertainty_and_host_errors_are_strict_and_bounded() {
+    // Catches collapsing unknown-host and host-selected cleanup states, or
+    // accepting unbounded diagnostics from a remote helper.
+    let accepted = PreacceptanceDisposition::Accepted(status_response(101));
+    let abandoned = PreacceptanceDisposition::Abandoned;
+    let cleanup = PreacceptanceDisposition::cleanup_pending("CLEANUP_INCOMPLETE").unwrap();
+    let unknown = PreacceptanceDisposition::unknown_remote("UNKNOWN_REMOTE").unwrap();
+    for disposition in [accepted, abandoned, cleanup, unknown] {
+        let json = serde_json::to_string(&disposition).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PreacceptanceDisposition>(&json).unwrap(),
+            disposition
+        );
+    }
+    assert!(PreacceptanceDisposition::cleanup_pending("").is_err());
+    assert!(PreacceptanceDisposition::unknown_remote("X".repeat(129)).is_err());
+    assert!(PreacceptanceDisposition::unknown_remote("raw diagnostic text").is_err());
+
+    let accepted = ResolveOrAbandonResponse::accepted(status_response(101)).unwrap();
+    let abandoned = ResolveOrAbandonResponse::abandoned();
+    let cleanup = ResolveOrAbandonResponse::cleanup_pending("CLEANUP_INCOMPLETE").unwrap();
+    for response in [accepted, abandoned, cleanup] {
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ResolveOrAbandonResponse>(&json).unwrap(),
+            response
+        );
+    }
+    assert_eq!(
+        serde_json::to_string(&ResolveOrAbandonResponse::abandoned()).unwrap(),
+        r#"{"protocol_version":2,"outcome":"abandoned"}"#
+    );
+    assert!(ResolveOrAbandonResponse::cleanup_pending("").is_err());
+    assert!(
+        serde_json::from_str::<ResolveOrAbandonOutcome>(r#"{"outcome":"abandoned","code":null}"#)
+            .is_err()
+    );
+    assert!(
+        serde_json::from_str::<ResolveOrAbandonResponse>(
+            r#"{"protocol_version":2,"outcome":"abandoned","response":null}"#
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<PreacceptanceDisposition>(
+            r#"{"disposition":"unknown_remote","response":null,"code":"UNKNOWN_REMOTE"}"#
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_str::<RemoteUncertainty>(r#"{"state":"none","code":null}"#).is_err());
+
+    let error = HostControlError::new("JOB_NOT_FOUND", "job was not found").unwrap();
+    let error_json = serde_json::to_string(&error).unwrap();
+    assert_eq!(
+        error_json,
+        r#"{"protocol_version":2,"error":{"code":"JOB_NOT_FOUND","message":"job was not found"}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<HostControlError>(&error_json).unwrap(),
+        error
+    );
+    assert!(HostControlError::new("", "message").is_err());
+    assert!(HostControlError::new("job-not-found", "message").is_err());
+    assert!(HostControlError::new("X".repeat(129), "message").is_err());
+    assert!(HostControlError::new("CODE", "X".repeat(4097)).is_err());
+    assert!(
+        serde_json::from_str::<HostControlError>(
+            r#"{"protocol_version":2,"error":{"code":"A","code":"B","message":"m"}}"#
+        )
+        .is_err()
+    );
 }

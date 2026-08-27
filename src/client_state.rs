@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     error::WorkerError,
-    job::{ClientId, JobId, JobState, LocalJobRecord},
+    job::{ClientId, JobId, JobState, JobStatus, LocalJobRecord, RemoteUncertainty},
 };
 
 const DIRECTORY_FLAGS: libc::c_int =
@@ -353,42 +353,52 @@ impl ClientStateStore {
     pub fn update_job(&self, replacement: LocalJobRecord) -> Result<(), WorkerError> {
         replacement.validate()?;
         self.require_local_client(&replacement)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
-        let name = job_file_name(replacement.meta().job_id())?;
-        let (existing, identity) = read_job_with_identity(self.inner.jobs.as_raw_fd(), &name)?;
-        self.require_local_client(&existing)?;
-        require_same_immutable(&existing, &replacement)?;
-        require_forward_observation(&existing, &replacement)?;
+        let job_id = replacement.meta().job_id();
+        self.update_locked(job_id, move |existing| {
+            require_same_immutable(existing, &replacement)?;
+            if existing.remote_uncertainty() != replacement.remote_uncertainty() {
+                return Err(WorkerError::Protocol(
+                    "stale local job update cannot replace remote uncertainty; use the lock-internal uncertainty updater"
+                        .into(),
+                ));
+            }
+            require_forward_observation(existing.last_status(), replacement.last_status())?;
+            Ok(replacement)
+        })
+        .map(|_| ())
+    }
 
-        let bytes = canonical_record_bytes(&replacement)?;
-        let operation = OperationFile::stage(
-            self.inner.operations.as_raw_fd(),
-            &bytes,
-            Arc::clone(&self.inner.sync_counts),
-        )?;
-        if self.take_fault(ClientStateWritePoint::BeforePublish) {
-            return Err(injected_failure(ClientStateWritePoint::BeforePublish));
-        }
-        operation.replace_if_identity(
-            self.inner.jobs.as_raw_fd(),
-            &name,
-            identity,
-            &self.inner.write_fault,
-        )?;
-        if self.take_fault(ClientStateWritePoint::AfterPublish) {
-            return Err(injected_failure(ClientStateWritePoint::AfterPublish));
-        }
-        sync_counted(
-            self.inner.jobs.as_raw_fd(),
-            &self.inner.sync_counts,
-            SyncKind::Jobs,
-        )?;
-        operation.cleanup(
-            &self.inner.write_fault,
-            &[identity],
-            self.take_cleanup_pause(),
-        )?;
-        Ok(())
+    pub fn update_observation(
+        &self,
+        job_id: JobId,
+        status: JobStatus,
+    ) -> Result<LocalJobRecord, WorkerError> {
+        status.validate()?;
+        self.update_locked(job_id, move |existing| {
+            require_forward_observation(existing.last_status(), Some(&status))?;
+            LocalJobRecord::new(
+                existing.meta().clone(),
+                existing.lease_token(),
+                Some(status),
+                existing.remote_uncertainty().clone(),
+            )
+        })
+    }
+
+    pub fn set_remote_uncertainty(
+        &self,
+        job_id: JobId,
+        uncertainty: RemoteUncertainty,
+    ) -> Result<LocalJobRecord, WorkerError> {
+        uncertainty.validate()?;
+        self.update_locked(job_id, move |existing| {
+            LocalJobRecord::new(
+                existing.meta().clone(),
+                existing.lease_token(),
+                existing.last_status().cloned(),
+                uncertainty,
+            )
+        })
     }
 
     pub fn list_jobs(&self) -> Result<Vec<LocalJobRecord>, WorkerError> {
@@ -491,6 +501,53 @@ impl ClientStateStore {
             .expect("cleanup pause mutex poisoned")
             .take()
     }
+
+    fn update_locked<F>(&self, job_id: JobId, update: F) -> Result<LocalJobRecord, WorkerError>
+    where
+        F: FnOnce(&LocalJobRecord) -> Result<LocalJobRecord, WorkerError>,
+    {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let name = job_file_name(job_id)?;
+        let (existing, identity) = read_job_with_identity(self.inner.jobs.as_raw_fd(), &name)?;
+        if existing.meta().job_id() != job_id {
+            return Err(invalid_state("job filename and record identity differ"));
+        }
+        self.require_local_client(&existing)?;
+        let replacement = update(&existing)?;
+        replacement.validate()?;
+        self.require_local_client(&replacement)?;
+        require_same_immutable(&existing, &replacement)?;
+
+        let bytes = canonical_record_bytes(&replacement)?;
+        let operation = OperationFile::stage(
+            self.inner.operations.as_raw_fd(),
+            &bytes,
+            Arc::clone(&self.inner.sync_counts),
+        )?;
+        if self.take_fault(ClientStateWritePoint::BeforePublish) {
+            return Err(injected_failure(ClientStateWritePoint::BeforePublish));
+        }
+        operation.replace_if_identity(
+            self.inner.jobs.as_raw_fd(),
+            &name,
+            identity,
+            &self.inner.write_fault,
+        )?;
+        if self.take_fault(ClientStateWritePoint::AfterPublish) {
+            return Err(injected_failure(ClientStateWritePoint::AfterPublish));
+        }
+        sync_counted(
+            self.inner.jobs.as_raw_fd(),
+            &self.inner.sync_counts,
+            SyncKind::Jobs,
+        )?;
+        operation.cleanup(
+            &self.inner.write_fault,
+            &[identity],
+            self.take_cleanup_pause(),
+        )?;
+        Ok(replacement)
+    }
 }
 
 fn require_same_immutable(
@@ -507,41 +564,59 @@ fn require_same_immutable(
 }
 
 fn require_forward_observation(
-    existing: &LocalJobRecord,
-    replacement: &LocalJobRecord,
+    existing: Option<&JobStatus>,
+    replacement: Option<&JobStatus>,
 ) -> Result<(), WorkerError> {
-    match (existing.last_status(), replacement.last_status()) {
+    match (existing, replacement) {
         (None, _) => Ok(()),
         (Some(_), None) => Err(WorkerError::Protocol(
             "local job observation cannot be removed".into(),
         )),
-        (Some(previous), Some(next)) if previous.state() == next.state() => {
-            if next.updated_at_millis() < previous.updated_at_millis() {
-                Err(WorkerError::Protocol(
-                    "local job observation timestamp moved backwards".into(),
-                ))
-            } else if previous.state().is_terminal() && previous != next {
-                Err(WorkerError::Protocol(
-                    "terminal local job observation cannot be rewritten".into(),
-                ))
-            } else {
-                Ok(())
-            }
-        }
+        (Some(previous), Some(next)) if previous == next => Ok(()),
         (Some(previous), Some(next)) => {
             if next.updated_at_millis() < previous.updated_at_millis() {
                 return Err(WorkerError::Protocol(
                     "local job observation timestamp moved backwards".into(),
                 ));
             }
-            if observation_can_advance(previous.state(), next.state()) {
-                Ok(())
-            } else {
-                Err(WorkerError::Protocol(
-                    "local job observation moved backwards".into(),
-                ))
+            if previous.state() == next.state() {
+                return previous.transition(next.clone());
             }
+            if previous.state().is_terminal() {
+                return Err(WorkerError::Protocol(
+                    "terminal local job observation cannot be rewritten".into(),
+                ));
+            }
+            if !observation_can_advance(previous.state(), next.state()) {
+                return Err(WorkerError::Protocol(
+                    "local job observation moved backwards".into(),
+                ));
+            }
+            require_sticky_observed_identity(
+                previous.supervisor_identity(),
+                next.supervisor_identity(),
+                "supervisor",
+            )?;
+            require_sticky_observed_identity(
+                previous.child_identity(),
+                next.child_identity(),
+                "child",
+            )
         }
+    }
+}
+
+fn require_sticky_observed_identity<T: Copy + PartialEq>(
+    previous: Option<T>,
+    next: Option<T>,
+    label: &str,
+) -> Result<(), WorkerError> {
+    if previous.is_some_and(|identity| next != Some(identity)) {
+        Err(WorkerError::Protocol(format!(
+            "local {label} process identity is not sticky"
+        )))
+    } else {
+        Ok(())
     }
 }
 

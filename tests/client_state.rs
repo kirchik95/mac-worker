@@ -14,8 +14,8 @@ use std::{
 use mac_worker::{
     client_state::{ClientStateCreationRacePoint, ClientStateStore, ClientStateWritePoint},
     job::{
-        ClientId, CommandSpec, JobId, JobMeta, JobStatus, LeaseToken, LocalJobRecord,
-        RequestFingerprintMaterial,
+        ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseToken, LocalJobRecord,
+        ProcessIdentity, RemoteUncertainty, RequestFingerprintMaterial,
     },
 };
 
@@ -57,7 +57,12 @@ fn make_record(
     .unwrap();
     let fingerprint = material.fingerprint();
     let meta = JobMeta::new(&material, fingerprint, 1_000).unwrap();
-    LocalJobRecord::new(meta, lease_token, last_status, cleanup_pending).unwrap()
+    let uncertainty = if cleanup_pending {
+        RemoteUncertainty::cleanup_pending("CLEANUP_INCOMPLETE").unwrap()
+    } else {
+        RemoteUncertainty::None
+    };
+    LocalJobRecord::new(meta, lease_token, last_status, uncertainty).unwrap()
 }
 
 fn fresh_record(store: &ClientStateStore) -> LocalJobRecord {
@@ -250,7 +255,7 @@ fn updates_replace_only_mutable_observations_atomically() {
         original.lease_token(),
         DIGEST_A,
         Some(accepted.clone()),
-        true,
+        false,
     );
 
     store.update_job(observed.clone()).unwrap();
@@ -444,7 +449,7 @@ fn injected_update_rename_boundaries_preserve_one_complete_observation() {
         original.lease_token(),
         DIGEST_A,
         Some(JobStatus::accepted(2_000).unwrap()),
-        true,
+        false,
     );
 
     store.inject_write_failure_once(ClientStateWritePoint::BeforePublish);
@@ -453,13 +458,19 @@ fn injected_update_rename_boundaries_preserve_one_complete_observation() {
 
     store.inject_write_failure_once(ClientStateWritePoint::AfterPublish);
     assert!(store.update_job(accepted.clone()).is_err());
+    let reopened = ClientStateStore::open(&state).unwrap();
     assert_eq!(
-        ClientStateStore::open(&state)
-            .unwrap()
-            .load_job(accepted.meta().job_id())
-            .unwrap(),
+        reopened.load_job(accepted.meta().job_id()).unwrap(),
         accepted
     );
+    let before_retry = reopened.durability_sync_counts().jobs;
+    reopened
+        .update_observation(
+            accepted.meta().job_id(),
+            accepted.last_status().unwrap().clone(),
+        )
+        .unwrap();
+    assert!(reopened.durability_sync_counts().jobs > before_retry);
 }
 
 #[test]
@@ -1096,6 +1107,310 @@ fn copied_records_from_another_client_are_rejected_by_load_and_list() {
             .unwrap_err()
             .to_string()
             .contains("CLIENT_ID_MISMATCH")
+    );
+}
+
+#[test]
+fn remote_uncertainty_has_distinct_canonical_persistent_states() {
+    // Catches the old boolean schema collapsing an unreachable host into a
+    // host-confirmed abandonment whose cleanup still needs retrying.
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let record = fresh_record(&store);
+    store.create_job(record.clone()).unwrap();
+
+    let persisted = serde_json::to_value(store.load_job(record.meta().job_id()).unwrap()).unwrap();
+    assert_eq!(
+        persisted["remote_uncertainty"],
+        serde_json::json!({"state":"none"})
+    );
+    assert!(persisted.get("cleanup_pending").is_none());
+
+    let unknown = store
+        .set_remote_uncertainty(
+            record.meta().job_id(),
+            RemoteUncertainty::unknown_remote("UNKNOWN_REMOTE").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        unknown.remote_uncertainty(),
+        &RemoteUncertainty::UnknownRemote {
+            code: "UNKNOWN_REMOTE".into()
+        }
+    );
+    let cleanup = store
+        .set_remote_uncertainty(
+            record.meta().job_id(),
+            RemoteUncertainty::cleanup_pending("CLEANUP_INCOMPLETE").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        cleanup.remote_uncertainty(),
+        &RemoteUncertainty::CleanupPending {
+            code: "CLEANUP_INCOMPLETE".into()
+        }
+    );
+
+    let bytes = fs::read(
+        state
+            .join("jobs")
+            .join(format!("{}.json", record.meta().job_id())),
+    )
+    .unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains(
+        r#""remote_uncertainty":{"state":"cleanup_pending","code":"CLEANUP_INCOMPLETE"}"#
+    ));
+}
+
+#[test]
+fn lock_internal_mutations_preserve_the_other_fresh_mutable_field() {
+    // Catches read-unlocked/write-later helpers clobbering a newer uncertainty
+    // marker or observation from a stale LocalJobRecord clone.
+    let fixture = tempfile::tempdir().unwrap();
+    let store = ClientStateStore::open(&temp_root(&fixture).join("state")).unwrap();
+    let original = fresh_record(&store);
+    store.create_job(original.clone()).unwrap();
+
+    store
+        .set_remote_uncertainty(
+            original.meta().job_id(),
+            RemoteUncertainty::unknown_remote("UNKNOWN_REMOTE").unwrap(),
+        )
+        .unwrap();
+    let observed = store
+        .update_observation(
+            original.meta().job_id(),
+            JobStatus::accepted(2_000).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        observed.remote_uncertainty(),
+        &RemoteUncertainty::UnknownRemote {
+            code: "UNKNOWN_REMOTE".into()
+        }
+    );
+
+    let marked = store
+        .set_remote_uncertainty(
+            original.meta().job_id(),
+            RemoteUncertainty::cleanup_pending("CLEANUP_INCOMPLETE").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(marked.last_status(), observed.last_status());
+
+    let stale = make_record(
+        original.meta().job_id(),
+        store.client_id(),
+        original.lease_token(),
+        DIGEST_A,
+        Some(JobStatus::succeeded(3_000, 1, 2).unwrap()),
+        false,
+    );
+    assert!(store.update_job(stale).is_err());
+    assert_eq!(store.load_job(original.meta().job_id()).unwrap(), marked);
+}
+
+#[test]
+fn concurrent_lock_internal_mutations_preserve_both_results() {
+    // Catches each updater cloning the same pre-lock record and last-writer
+    // wins publication dropping the other updater's successful result.
+    let fixture = tempfile::tempdir().unwrap();
+    let store = Arc::new(ClientStateStore::open(&temp_root(&fixture).join("state")).unwrap());
+    let original = fresh_record(&store);
+    store.create_job(original.clone()).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let observation_store = Arc::clone(&store);
+    let observation_barrier = Arc::clone(&barrier);
+    let job_id = original.meta().job_id();
+    let observation = thread::spawn(move || {
+        observation_barrier.wait();
+        observation_store.update_observation(job_id, JobStatus::accepted(2_000).unwrap())
+    });
+    let uncertainty_store = Arc::clone(&store);
+    let uncertainty_barrier = Arc::clone(&barrier);
+    let uncertainty = thread::spawn(move || {
+        uncertainty_barrier.wait();
+        uncertainty_store.set_remote_uncertainty(
+            job_id,
+            RemoteUncertainty::unknown_remote("UNKNOWN_REMOTE").unwrap(),
+        )
+    });
+    observation.join().unwrap().unwrap();
+    uncertainty.join().unwrap().unwrap();
+
+    let final_record = store.load_job(job_id).unwrap();
+    assert_eq!(
+        final_record.last_status(),
+        Some(&JobStatus::accepted(2_000).unwrap())
+    );
+    assert_eq!(
+        final_record.remote_uncertainty(),
+        &RemoteUncertainty::UnknownRemote {
+            code: "UNKNOWN_REMOTE".into()
+        }
+    );
+}
+
+#[test]
+fn observations_use_status_transitions_for_same_state_enrichment() {
+    // Catches same-state Accepted updates replacing identities arbitrarily or
+    // terminal updates rewriting the command outcome under a newer timestamp.
+    let fixture = tempfile::tempdir().unwrap();
+    let store = ClientStateStore::open(&temp_root(&fixture).join("state")).unwrap();
+    let original = fresh_record(&store);
+    store.create_job(original.clone()).unwrap();
+    let accepted = JobStatus::accepted(2_000).unwrap();
+    store
+        .update_observation(original.meta().job_id(), accepted.clone())
+        .unwrap();
+    let supervised = accepted
+        .with_supervisor(ProcessIdentity::new(10, 100).unwrap(), 2_001)
+        .unwrap();
+    store
+        .update_observation(original.meta().job_id(), supervised.clone())
+        .unwrap();
+    let child_bound = supervised
+        .with_child(ProcessIdentity::new(11, 101).unwrap(), 2_002)
+        .unwrap();
+    store
+        .update_observation(original.meta().job_id(), child_bound.clone())
+        .unwrap();
+    assert_eq!(
+        store
+            .update_observation(original.meta().job_id(), child_bound.clone())
+            .unwrap()
+            .last_status(),
+        Some(&child_bound)
+    );
+
+    let replaced_identity = JobStatus::accepted(2_000)
+        .unwrap()
+        .with_supervisor(ProcessIdentity::new(20, 200).unwrap(), 2_003)
+        .unwrap();
+    assert!(
+        store
+            .update_observation(original.meta().job_id(), replaced_identity)
+            .is_err()
+    );
+}
+
+#[test]
+fn skipped_observations_require_sticky_identities_and_terminal_outcomes() {
+    // Catches polling skips dropping a previously learned process identity or
+    // allowing a terminal command outcome to be changed on a later refresh.
+    let fixture = tempfile::tempdir().unwrap();
+    let store = ClientStateStore::open(&temp_root(&fixture).join("state")).unwrap();
+    let original = fresh_record(&store);
+    store.create_job(original.clone()).unwrap();
+    let accepted = JobStatus::accepted(2_000)
+        .unwrap()
+        .with_supervisor(ProcessIdentity::new(10, 100).unwrap(), 2_001)
+        .unwrap();
+    store
+        .update_observation(original.meta().job_id(), accepted.clone())
+        .unwrap();
+
+    let skipped_terminal = JobStatus::new(
+        JobState::Succeeded,
+        3_000,
+        Some(10),
+        Some(100),
+        None,
+        None,
+        Some(0),
+        None,
+        Some(5),
+        Some(6),
+        None,
+        None,
+    )
+    .unwrap();
+    store
+        .update_observation(original.meta().job_id(), skipped_terminal.clone())
+        .unwrap();
+
+    let dropped_identity = JobStatus::succeeded(3_001, 5, 6).unwrap();
+    assert!(
+        store
+            .update_observation(original.meta().job_id(), dropped_identity)
+            .is_err()
+    );
+    let rewritten_outcome = JobStatus::new(
+        JobState::Failed,
+        3_002,
+        Some(10),
+        Some(100),
+        None,
+        None,
+        Some(7),
+        None,
+        Some(5),
+        Some(6),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        store
+            .update_observation(original.meta().job_id(), rewritten_outcome)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_job(original.meta().job_id())
+            .unwrap()
+            .last_status(),
+        Some(&skipped_terminal)
+    );
+}
+
+#[test]
+fn terminal_observation_allows_only_cleanup_error_enrichment() {
+    // Catches cleanup retry state being impossible to persist, or its update
+    // accidentally changing a completed command's immutable result.
+    let fixture = tempfile::tempdir().unwrap();
+    let store = ClientStateStore::open(&temp_root(&fixture).join("state")).unwrap();
+    let original = fresh_record(&store);
+    store.create_job(original.clone()).unwrap();
+    let terminal = JobStatus::succeeded(3_000, 5, 6).unwrap();
+    store
+        .update_observation(original.meta().job_id(), terminal.clone())
+        .unwrap();
+    let enriched = terminal
+        .with_cleanup_error("LEASE_RELEASE_FAILED".into(), 3_001)
+        .unwrap();
+    store
+        .update_observation(original.meta().job_id(), enriched.clone())
+        .unwrap();
+    assert_eq!(
+        store
+            .load_job(original.meta().job_id())
+            .unwrap()
+            .last_status(),
+        Some(&enriched)
+    );
+
+    let changed_lengths = JobStatus::new(
+        JobState::Succeeded,
+        3_002,
+        None,
+        None,
+        None,
+        None,
+        Some(0),
+        None,
+        Some(50),
+        Some(6),
+        None,
+        Some("LEASE_RELEASE_FAILED".into()),
+    )
+    .unwrap();
+    assert!(
+        store
+            .update_observation(original.meta().job_id(), changed_lengths)
+            .is_err()
     );
 }
 
