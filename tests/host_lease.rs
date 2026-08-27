@@ -209,8 +209,7 @@ fn replacing_a_retained_nested_namespace_never_redirects_host_mutation() {
 fn safe_unrelated_entries_are_preserved_but_non_utf8_entries_fail_closed() {
     let temp = tempdir().unwrap();
     let root = temp.path().join("host");
-    fs::create_dir(&root).unwrap();
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    HostStore::open(&root).unwrap();
     let unrelated = root.join("operator-note");
     fs::OpenOptions::new()
         .write(true)
@@ -245,16 +244,20 @@ fn permissive_preexisting_host_components_are_rejected_not_repaired() {
         0o755
     );
 
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-    let store = HostStore::open(&root).unwrap();
-    fs::set_permissions(root.join("leases"), fs::Permissions::from_mode(0o755)).unwrap();
+    let initialized_root = temp.path().join("initialized-host");
+    let store = HostStore::open(&initialized_root).unwrap();
+    fs::set_permissions(
+        initialized_root.join("leases"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
     assert!(
         LeaseService::new(&store)
             .acquire(&request(1), &healthy(), 1)
             .is_err()
     );
     assert_eq!(
-        fs::metadata(root.join("leases"))
+        fs::metadata(initialized_root.join("leases"))
             .unwrap()
             .permissions()
             .mode()

@@ -47,6 +47,10 @@ pub enum HostStoreWritePoint {
     AfterLeaseParentSync = 4,
     AfterLeasePublish = 5,
     AfterLeasePublishSync = 6,
+    AfterHostRootCreate = 7,
+    AfterHostNamespaces = 8,
+    AfterHostCapacityLock = 9,
+    AfterHostLayoutPublish = 10,
 }
 
 impl LayoutEntry {
@@ -351,9 +355,11 @@ impl HostStore {
                 "host data root must be absolute".into(),
             ));
         }
-        let mut rooted = match RootedDir::open(root) {
-            Ok(rooted) => rooted,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => RootedDir::create(root)?,
+        let (mut rooted, created_root) = match RootedDir::open(root) {
+            Ok(rooted) => (rooted, false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (RootedDir::create(root)?, true)
+            }
             Err(error) => return Err(error.into()),
         };
         let root_metadata = rooted.root_metadata()?;
@@ -365,17 +371,30 @@ impl HostStore {
             inode: root_metadata.st_ino,
         };
         let coordination = RootCoordinationGuard::acquire(&rooted, root_identity, None)?;
+        inject_open_fault(point, HostStoreWritePoint::AfterHostRootCreate)?;
         let initialized = rooted.entry_exists(HOST_LAYOUT_FILE)?;
-        let namespaces = open_host_namespaces(&rooted, root_device, !initialized)?;
+        if !created_root && !initialized {
+            return Err(WorkerError::Protocol(
+                "existing host data root has no canonical layout identity".into(),
+            ));
+        }
+        if created_root && initialized {
+            return Err(WorkerError::Protocol(
+                "new host data root unexpectedly contains a layout identity".into(),
+            ));
+        }
+        let namespaces = open_host_namespaces(&rooted, root_device, created_root)?;
+        inject_open_fault(point, HostStoreWritePoint::AfterHostNamespaces)?;
         let leases = namespaces
             .get("leases")
             .expect("owned leases namespace was inserted");
-        if !initialized {
+        if created_root {
             let existed = leases.entry_exists(CAPACITY_LOCK_FILE)?;
             drop(leases.open_private_lock(CAPACITY_LOCK_FILE)?);
             if !existed {
                 leases.sync_root()?;
             }
+            inject_open_fault(point, HostStoreWritePoint::AfterHostCapacityLock)?;
         }
         let layout = if initialized {
             let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
@@ -397,6 +416,7 @@ impl HostStore {
             let current_layout = build_host_layout(&rooted, &namespaces, layout_file_identity)?;
             let stored: HostLayoutIdentity = read_json_strict_at(&rooted, HOST_LAYOUT_FILE)?;
             validate_host_layout(&stored, &current_layout)?;
+            inject_open_fault(point, HostStoreWritePoint::AfterHostLayoutPublish)?;
             stored
         };
         let layout_file_identity = layout.layout_file.as_private();
@@ -983,6 +1003,18 @@ impl HostStore {
             Err(error) => Err(error),
         }
     }
+}
+
+fn inject_open_fault(
+    selected: Option<HostStoreWritePoint>,
+    boundary: HostStoreWritePoint,
+) -> Result<(), WorkerError> {
+    if selected == Some(boundary) {
+        return Err(WorkerError::Io(std::io::Error::other(
+            "injected host store initialization failure",
+        )));
+    }
+    Ok(())
 }
 
 fn open_host_namespaces(
@@ -1682,5 +1714,83 @@ mod review_regression_tests {
 
         assert!(HostStore::open(&root).is_err());
         assert_eq!(fs::read(&layout).unwrap(), bytes);
+    }
+
+    #[test]
+    fn deleted_layout_is_never_regenerated_for_an_existing_root() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let _first = HostStore::open(&root).unwrap();
+        fs::remove_file(root.join(HOST_LAYOUT_FILE)).unwrap();
+
+        assert!(HostStore::open(&root).is_err());
+        assert!(!root.join(HOST_LAYOUT_FILE).exists());
+    }
+
+    #[test]
+    fn replacing_an_active_root_with_an_empty_root_cannot_form_a_second_domain() {
+        use crate::protocol::MemoryPressure;
+        use crate::{
+            job::LeaseAcquireResponse,
+            lease::{AdmissionFacts, LeaseService},
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let first = HostStore::open(&root).unwrap();
+        let request = request(1);
+        assert!(matches!(
+            LeaseService::new(&first)
+                .acquire(
+                    &request,
+                    &AdmissionFacts {
+                        free_disk_bytes: 200 * 1024 * 1024 * 1024,
+                        total_disk_bytes: 500 * 1024 * 1024 * 1024,
+                        memory_pressure: MemoryPressure::Normal,
+                        swap_used_bytes: Some(0),
+                    },
+                    1,
+                )
+                .unwrap(),
+            LeaseAcquireResponse::Acquired { .. }
+        ));
+        fs::rename(&root, temp.path().join("detached-host")).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(HostStore::open(&root).is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn interrupted_first_layout_initialization_is_never_adopted_on_reopen() {
+        for point in [
+            HostStoreWritePoint::AfterHostRootCreate,
+            HostStoreWritePoint::AfterHostNamespaces,
+            HostStoreWritePoint::AfterHostCapacityLock,
+        ] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+
+            assert!(HostStore::open_with_write_fault(&root, point).is_err());
+            assert!(root.is_dir());
+            assert!(!root.join(HOST_LAYOUT_FILE).exists());
+            assert!(HostStore::open(&root).is_err());
+            assert!(!root.join(HOST_LAYOUT_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn interruption_after_complete_layout_publish_is_reopenable() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+
+        assert!(
+            HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterHostLayoutPublish,)
+                .is_err()
+        );
+        assert!(root.join(HOST_LAYOUT_FILE).is_file());
+        assert!(HostStore::open(&root).is_ok());
     }
 }
