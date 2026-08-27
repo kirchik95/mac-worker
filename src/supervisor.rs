@@ -2652,6 +2652,154 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    struct RawDescendantGate {
+        ready: Pipe,
+        go: Pipe,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl RawDescendantGate {
+        const READY: u8 = 0x52;
+        const GO: u8 = 0x47;
+
+        fn new() -> io::Result<Self> {
+            Ok(Self {
+                ready: Pipe::cloexec()?,
+                go: Pipe::cloexec()?,
+            })
+        }
+
+        /// Called only in the raw-fork child. Every operation is
+        /// async-signal-safe; returning false requires the caller to `_exit`
+        /// without creating descendants.
+        unsafe fn child_ready_then_wait_for_go(&self) -> bool {
+            unsafe {
+                libc::close(self.ready.read.as_raw_fd());
+                libc::close(self.go.write.as_raw_fd());
+                if !raw_write_byte(self.ready.write.as_raw_fd(), Self::READY) {
+                    return false;
+                }
+                libc::close(self.ready.write.as_raw_fd());
+                let mut byte = 0_u8;
+                let read = loop {
+                    let read = libc::read(self.go.read.as_raw_fd(), (&raw mut byte).cast(), 1);
+                    if read >= 0 || *libc::__error() != libc::EINTR {
+                        break read;
+                    }
+                };
+                libc::close(self.go.read.as_raw_fd());
+                read == 1 && byte == Self::GO
+            }
+        }
+
+        fn parent_bind_and_go<F>(
+            self,
+            cleanup: &mut RawProcessGroupGuard,
+            bind: F,
+        ) -> Result<(), WorkerError>
+        where
+            F: FnOnce(libc::pid_t) -> Result<ProcessIdentity, WorkerError>,
+        {
+            let Self { ready, go } = self;
+            let Pipe {
+                read: ready_read,
+                write: ready_write,
+            } = ready;
+            let Pipe {
+                read: go_read,
+                write: go_write,
+            } = go;
+            drop(ready_write);
+            drop(go_read);
+
+            let operation = (|| {
+                let ready = read_parent_gate_byte(ready_read.as_raw_fd())?;
+                if ready != Self::READY {
+                    return Err(protocol_code(
+                        "RAW_GATE_READY_INVALID",
+                        "raw group leader did not publish the READY byte",
+                    ));
+                }
+                let identity = bind(cleanup.leader())?;
+                cleanup.bind_identity(identity);
+                write_parent_gate_byte(go_write.as_raw_fd(), Self::GO)
+            })();
+
+            // Closing GO before cleanup makes every ordinary pre-GO failure a
+            // zero-descendant path. During unwinding these owned descriptors
+            // are likewise dropped before the armed guard in the caller.
+            drop(go_write);
+            drop(ready_read);
+            if let Err(error) = operation {
+                if let Err(cleanup_error) = cleanup.finish() {
+                    return Err(protocol_code(
+                        "RAW_GATE_CLEANUP_FAILED",
+                        &format!("{error}; cleanup: {cleanup_error}"),
+                    ));
+                }
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn raw_write_byte(fd: RawFd, byte: u8) -> bool {
+        unsafe {
+            loop {
+                let written = libc::write(fd, (&raw const byte).cast(), 1);
+                if written == 1 {
+                    return true;
+                }
+                if written >= 0 || *libc::__error() != libc::EINTR {
+                    return false;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_parent_gate_byte(fd: RawFd) -> Result<u8, WorkerError> {
+        let mut byte = 0_u8;
+        loop {
+            let read = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+            if read == 1 {
+                return Ok(byte);
+            }
+            if read == 0 {
+                return Err(protocol_code(
+                    "RAW_GATE_READY_CLOSED",
+                    "raw group leader closed READY before the handshake",
+                ));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(WorkerError::Io(error));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_parent_gate_byte(fd: RawFd, byte: u8) -> Result<(), WorkerError> {
+        loop {
+            let written = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+            if written == 1 {
+                return Ok(());
+            }
+            if written == 0 {
+                return Err(protocol_code(
+                    "RAW_GATE_GO_CLOSED",
+                    "raw group leader closed GO before release",
+                ));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(WorkerError::Io(error));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn wait_for_group_identity(pid: libc::pid_t) -> ProcessIdentity {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -2698,12 +2846,16 @@ mod tests {
     fn spawn_group_with_ignoring_descendant() -> (RawProcessGroupGuard, libc::pid_t) {
         let mut descriptors = [-1; 2];
         assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let gate = RawDescendantGate::new().unwrap();
         let leader = unsafe { libc::fork() };
         assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
         if leader == 0 {
             unsafe {
                 libc::close(descriptors[0]);
                 if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(70);
+                }
+                if !gate.child_ready_then_wait_for_go() {
                     libc::_exit(70);
                 }
                 let descendant = libc::fork();
@@ -2729,7 +2881,8 @@ mod tests {
             }
         }
         let mut cleanup = RawProcessGroupGuard::new(leader);
-        cleanup.bind_identity(wait_for_group_identity(leader));
+        gate.parent_bind_and_go(&mut cleanup, |pid| Ok(wait_for_group_identity(pid)))
+            .unwrap();
         assert_eq!(unsafe { libc::close(descriptors[1]) }, 0);
         let mut descendant = 0;
         let read = unsafe {
@@ -2750,6 +2903,7 @@ mod tests {
         let mut release = [-1; 2];
         assert_eq!(unsafe { libc::pipe(report.as_mut_ptr()) }, 0);
         assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        let gate = RawDescendantGate::new().unwrap();
         let leader = unsafe { libc::fork() };
         assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
         if leader == 0 {
@@ -2757,6 +2911,9 @@ mod tests {
                 libc::close(report[0]);
                 libc::close(release[1]);
                 if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(70);
+                }
+                if !gate.child_ready_then_wait_for_go() {
                     libc::_exit(70);
                 }
                 let descendant = libc::fork();
@@ -2783,7 +2940,8 @@ mod tests {
             }
         }
         let mut cleanup = RawProcessGroupGuard::new(leader);
-        cleanup.bind_identity(wait_for_group_identity(leader));
+        gate.parent_bind_and_go(&mut cleanup, |pid| Ok(wait_for_group_identity(pid)))
+            .unwrap();
         assert_eq!(unsafe { libc::close(report[1]) }, 0);
         assert_eq!(unsafe { libc::close(release[0]) }, 0);
         let mut descendant = 0;
@@ -2986,6 +3144,176 @@ mod tests {
             .expect_err("missing executable must remain an observable spawn error");
 
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy)]
+    enum InjectedBindMode {
+        Error,
+        Panic,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct BindGateEvidence {
+        outcome: String,
+        marker_read: isize,
+        wait_result: libc::pid_t,
+        wait_errno: Option<i32>,
+        group: ProcessGroupObservation,
+        elapsed: Duration,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn exercise_descendant_gate_bind_failure(mode: InjectedBindMode) -> BindGateEvidence {
+        let marker = Pipe::cloexec().unwrap();
+        let gate = RawDescendantGate::new().unwrap();
+        let started = Instant::now();
+        let leader = unsafe { libc::fork() };
+        assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
+        if leader == 0 {
+            unsafe {
+                libc::close(marker.read.as_raw_fd());
+                if libc::setpgid(0, 0) != 0 || !gate.child_ready_then_wait_for_go() {
+                    libc::_exit(0);
+                }
+                let descendant = libc::fork();
+                if descendant < 0 {
+                    libc::_exit(70);
+                }
+                if descendant == 0 {
+                    let created = 1_u8;
+                    libc::write(
+                        marker.write.as_raw_fd(),
+                        (&raw const created).cast(),
+                        std::mem::size_of_val(&created),
+                    );
+                    libc::_exit(0);
+                }
+                libc::close(marker.write.as_raw_fd());
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+
+        // Ownership is armed before any parent-side handshake or identity step.
+        let cleanup = RawProcessGroupGuard::new(leader);
+        drop(marker.write);
+        let outcome = match mode {
+            InjectedBindMode::Panic => {
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let mut cleanup = cleanup;
+                    gate.parent_bind_and_go(
+                        &mut cleanup,
+                        |_| -> Result<ProcessIdentity, WorkerError> {
+                            panic!("injected group-leader bind panic")
+                        },
+                    )
+                }));
+                assert!(panic.is_err(), "injected bind panic was not propagated");
+                "panic".to_owned()
+            }
+            InjectedBindMode::Error => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let mut cleanup = cleanup;
+                    gate.parent_bind_and_go(&mut cleanup, |_| {
+                        Err(protocol_code(
+                            "INJECTED_BIND_FAILURE",
+                            "group-leader identity bind failed",
+                        ))
+                    })
+                }));
+                let error = result
+                    .expect("ordinary bind failure unexpectedly panicked")
+                    .expect_err("injected bind failure unexpectedly sent GO");
+                error.to_string()
+            }
+        };
+
+        let mut marker_byte = 0_u8;
+        let marker_read = unsafe {
+            libc::read(
+                marker.read.as_raw_fd(),
+                (&raw mut marker_byte).cast(),
+                std::mem::size_of_val(&marker_byte),
+            )
+        };
+        let mut status = 0;
+        let wait_result = unsafe { libc::waitpid(leader, &raw mut status, libc::WNOHANG) };
+        let wait_errno = (wait_result == -1).then(|| {
+            io::Error::last_os_error()
+                .raw_os_error()
+                .expect("waitpid failure omitted errno")
+        });
+        let group = SystemProcessInspector.observe_group(leader as u32);
+        BindGateEvidence {
+            outcome,
+            marker_read,
+            wait_result,
+            wait_errno,
+            group,
+            elapsed: started.elapsed(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raw_descendant_gate_bind_failure_forks_nothing_and_reaps_leader() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::raw_descendant_gate_bind_failure_forks_nothing_and_reaps_leader",
+            || {
+                let evidence = exercise_descendant_gate_bind_failure(InjectedBindMode::Error);
+
+                assert!(
+                    evidence.outcome.contains("INJECTED_BIND_FAILURE"),
+                    "{}",
+                    evidence.outcome
+                );
+                assert_eq!(
+                    evidence.marker_read, 0,
+                    "a descendant crossed the closed GO gate"
+                );
+                assert_eq!(
+                    evidence.wait_result, -1,
+                    "failed-bind leader was not reaped"
+                );
+                assert_eq!(evidence.wait_errno, Some(libc::ECHILD));
+                assert_eq!(evidence.group, ProcessGroupObservation::Absent);
+                assert!(
+                    evidence.elapsed < Duration::from_secs(1),
+                    "failed bind cleanup was unbounded: {:?}",
+                    evidence.elapsed
+                );
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raw_descendant_gate_bind_panic_forks_nothing_and_reaps_leader() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::raw_descendant_gate_bind_panic_forks_nothing_and_reaps_leader",
+            || {
+                let evidence = exercise_descendant_gate_bind_failure(InjectedBindMode::Panic);
+
+                assert_eq!(evidence.outcome, "panic");
+                assert_eq!(
+                    evidence.marker_read, 0,
+                    "a descendant crossed the closed GO gate"
+                );
+                assert_eq!(
+                    evidence.wait_result, -1,
+                    "panicking-bind leader was not reaped"
+                );
+                assert_eq!(evidence.wait_errno, Some(libc::ECHILD));
+                assert_eq!(evidence.group, ProcessGroupObservation::Absent);
+                assert!(
+                    evidence.elapsed < Duration::from_secs(1),
+                    "panicking bind cleanup was unbounded: {:?}",
+                    evidence.elapsed
+                );
+            },
+        );
     }
 
     #[cfg(target_os = "macos")]
