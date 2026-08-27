@@ -34,6 +34,7 @@ const CONTROLLED_PATHS: &[&str] = &[
 ];
 const MAX_HOST_JSON_BYTES: u64 = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CHILD_TRANSITION_RETRY: Duration = Duration::from_millis(250);
 const SUPERVISOR_IDENTITY_RETRY: Duration = Duration::from_millis(250);
 const TERM_GRACE: Duration = Duration::from_secs(10);
 pub(crate) const SUPERVISOR_LOCK_FD: RawFd = 3;
@@ -1478,6 +1479,13 @@ enum ChildOutcome {
     TimedOut,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnedChildState {
+    MatchingGroup,
+    Waitable,
+    Transitioning,
+}
+
 fn wait_for_child(
     identity: ProcessIdentity,
     timeout_millis: u64,
@@ -1575,40 +1583,35 @@ fn terminate_exact_group(
     inspector: &dyn ProcessInspector,
 ) -> Result<ChildOutcome, WorkerError> {
     let pid = identity.pid();
-    if let Err(error) = require_matching_group(identity, inspector) {
-        return complete_newly_waitable_or(identity, inspector, error);
+    match wait_for_owned_child_state(identity, inspector, CHILD_TRANSITION_RETRY)? {
+        OwnedChildState::Waitable => return complete_waitable_child(identity, inspector),
+        OwnedChildState::MatchingGroup => {}
+        OwnedChildState::Transitioning => unreachable!("bounded ownership wait returns a state"),
     }
     if unsafe { libc::kill(-(pid as i32), libc::SIGTERM) } != 0 {
         let error = WorkerError::Io(io::Error::last_os_error());
-        return complete_newly_waitable_or(identity, inspector, error);
+        return reconcile_failed_group_signal(identity, inspector, error);
     }
     let deadline = Instant::now() + TERM_GRACE;
-    loop {
+    let final_state = loop {
         // An exact waitid(P_PID, ..., WNOWAIT) event retains this child as a
         // waitable zombie. Its PID cannot be reused before we reap it, so the
         // already-validated PID/start/PGID remains the authority for a final
         // group signal even though macOS proc_pidinfo no longer reports the
         // zombie as a live matching process.
-        if !child_is_waitable(pid as libc::pid_t)?
-            && let Err(error) = require_matching_group(identity, inspector)
-            && !child_is_waitable(pid as libc::pid_t)?
-        {
-            return Err(error);
-        }
+        let state = observe_owned_child_state(identity, inspector)?;
         if Instant::now() >= deadline {
-            break;
+            break match state {
+                OwnedChildState::Transitioning => {
+                    wait_for_owned_child_state(identity, inspector, CHILD_TRANSITION_RETRY)?
+                }
+                observed => observed,
+            };
         }
         std::thread::sleep(POLL_INTERVAL);
-    }
-    let mut waitable = child_is_waitable(pid as libc::pid_t)?;
-    if !waitable && let Err(error) = require_matching_group(identity, inspector) {
-        waitable = child_is_waitable(pid as libc::pid_t)?;
-        if !waitable {
-            return Err(error);
-        }
-    }
-    let should_kill = if waitable {
-        match inspector.observe_group_members(pid) {
+    };
+    let should_kill = match final_state {
+        OwnedChildState::Waitable => match inspector.observe_group_members(pid) {
             ProcessGroupMembership::LeaderOnly => false,
             ProcessGroupMembership::OtherMembers => true,
             ProcessGroupMembership::Ambiguous => {
@@ -1617,9 +1620,9 @@ fn terminate_exact_group(
                     "exact process-group membership could not be inspected",
                 ));
             }
-        }
-    } else {
-        true
+        },
+        OwnedChildState::MatchingGroup => true,
+        OwnedChildState::Transitioning => unreachable!("bounded ownership wait returns a state"),
     };
     if should_kill && unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
         let error = io::Error::last_os_error();
@@ -1632,15 +1635,15 @@ fn terminate_exact_group(
     Ok(ChildOutcome::TimedOut)
 }
 
-fn complete_newly_waitable_or(
+fn reconcile_failed_group_signal(
     identity: ProcessIdentity,
     inspector: &dyn ProcessInspector,
     original: WorkerError,
 ) -> Result<ChildOutcome, WorkerError> {
-    if child_is_waitable(identity.pid() as libc::pid_t)? {
-        complete_waitable_child(identity, inspector)
-    } else {
-        Err(original)
+    match wait_after_failed_group_signal(identity, inspector)? {
+        OwnedChildState::Waitable => complete_waitable_child(identity, inspector),
+        OwnedChildState::MatchingGroup => Err(original),
+        OwnedChildState::Transitioning => unreachable!("bounded ownership wait returns a state"),
     }
 }
 
@@ -1648,16 +1651,81 @@ fn failed_group_signal_has_only_waitable_leader(
     identity: ProcessIdentity,
     inspector: &dyn ProcessInspector,
 ) -> Result<bool, WorkerError> {
-    if !child_is_waitable(identity.pid() as libc::pid_t)? {
-        return Ok(false);
+    match wait_after_failed_group_signal(identity, inspector)? {
+        OwnedChildState::Waitable => match inspector.observe_group_members(identity.pid()) {
+            ProcessGroupMembership::LeaderOnly => Ok(true),
+            ProcessGroupMembership::OtherMembers => Ok(false),
+            ProcessGroupMembership::Ambiguous => Err(protocol_code(
+                "CHILD_TERMINATION_AMBIGUOUS",
+                "failed group signal could not be reconciled to the waitable leader anchor",
+            )),
+        },
+        OwnedChildState::MatchingGroup => Ok(false),
+        OwnedChildState::Transitioning => unreachable!("bounded ownership wait returns a state"),
     }
-    match inspector.observe_group_members(identity.pid()) {
-        ProcessGroupMembership::LeaderOnly => Ok(true),
-        ProcessGroupMembership::OtherMembers => Ok(false),
-        ProcessGroupMembership::Ambiguous => Err(protocol_code(
-            "CHILD_TERMINATION_AMBIGUOUS",
-            "failed group signal could not be reconciled to the waitable leader anchor",
-        )),
+}
+
+fn wait_after_failed_group_signal(
+    identity: ProcessIdentity,
+    inspector: &dyn ProcessInspector,
+) -> Result<OwnedChildState, WorkerError> {
+    let deadline = Instant::now()
+        .checked_add(CHILD_TRANSITION_RETRY)
+        .ok_or_else(|| protocol_code("CHILD_IDENTITY_AMBIGUOUS", "identity deadline overflow"))?;
+    loop {
+        let state = observe_owned_child_state(identity, inspector)?;
+        if state == OwnedChildState::Waitable {
+            return Ok(state);
+        }
+        if Instant::now() >= deadline {
+            return match state {
+                OwnedChildState::MatchingGroup => Ok(state),
+                OwnedChildState::Transitioning => Err(protocol_code(
+                    "CHILD_IDENTITY_AMBIGUOUS",
+                    "failed group signal left neither an exact live child group nor its waitable anchor",
+                )),
+                OwnedChildState::Waitable => unreachable!("waitable state returns immediately"),
+            };
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn observe_owned_child_state(
+    identity: ProcessIdentity,
+    inspector: &dyn ProcessInspector,
+) -> Result<OwnedChildState, WorkerError> {
+    if child_is_waitable(identity.pid() as libc::pid_t)? {
+        return Ok(OwnedChildState::Waitable);
+    }
+    Ok(match inspector.observe(identity) {
+        ProcessObservation::Matching { process_group } if process_group == identity.pid() => {
+            OwnedChildState::MatchingGroup
+        }
+        _ => OwnedChildState::Transitioning,
+    })
+}
+
+fn wait_for_owned_child_state(
+    identity: ProcessIdentity,
+    inspector: &dyn ProcessInspector,
+    retry_for: Duration,
+) -> Result<OwnedChildState, WorkerError> {
+    let deadline = Instant::now()
+        .checked_add(retry_for)
+        .ok_or_else(|| protocol_code("CHILD_IDENTITY_AMBIGUOUS", "identity deadline overflow"))?;
+    loop {
+        let state = observe_owned_child_state(identity, inspector)?;
+        if state != OwnedChildState::Transitioning {
+            return Ok(state);
+        }
+        if Instant::now() >= deadline {
+            return Err(protocol_code(
+                "CHILD_IDENTITY_AMBIGUOUS",
+                "neither an exact live child group nor its waitable anchor became observable",
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -1684,19 +1752,6 @@ fn wait_for_terminated_group_absence(
                 ));
             }
         }
-    }
-}
-
-fn require_matching_group(
-    identity: ProcessIdentity,
-    inspector: &dyn ProcessInspector,
-) -> Result<(), WorkerError> {
-    match inspector.observe(identity) {
-        ProcessObservation::Matching { process_group } if process_group == identity.pid() => Ok(()),
-        _ => Err(protocol_code(
-            "CHILD_IDENTITY_AMBIGUOUS",
-            "targeted child process group no longer matches",
-        )),
     }
 }
 
@@ -2178,7 +2233,8 @@ mod tests {
         process::Command,
         sync::{
             Mutex,
-            atomic::{AtomicBool, AtomicU32, Ordering},
+            atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+            mpsc,
         },
     };
 
@@ -2297,6 +2353,11 @@ mod tests {
         triggered: AtomicBool,
     }
 
+    struct PostTermTransitionInspector {
+        observations: AtomicUsize,
+        release: mpsc::Sender<()>,
+    }
+
     impl ProcessInspector for VanishingBeforeKillInspector {
         fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
             SystemProcessInspector.identity_for_pid(pid)
@@ -2331,6 +2392,124 @@ mod tests {
         }
     }
 
+    impl ProcessInspector for PostTermTransitionInspector {
+        fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+            SystemProcessInspector.identity_for_pid(pid)
+        }
+
+        fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+            if self.observations.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.release.send(()).unwrap();
+                return ProcessObservation::Absent;
+            }
+            SystemProcessInspector.observe(expected)
+        }
+
+        fn observe_group(&self, process_group: u32) -> ProcessGroupObservation {
+            SystemProcessInspector.observe_group(process_group)
+        }
+
+        fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership {
+            SystemProcessInspector.observe_group_members(leader)
+        }
+    }
+
+    struct RawProcessGroupGuard {
+        leader: libc::pid_t,
+        armed: bool,
+    }
+
+    impl RawProcessGroupGuard {
+        fn new(leader: libc::pid_t) -> Self {
+            Self {
+                leader,
+                armed: true,
+            }
+        }
+
+        fn leader(&self) -> libc::pid_t {
+            self.leader
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for RawProcessGroupGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            unsafe {
+                libc::kill(-self.leader, libc::SIGKILL);
+                libc::kill(self.leader, libc::SIGKILL);
+            }
+            let mut status = 0;
+            loop {
+                let result = unsafe { libc::waitpid(self.leader, &raw mut status, 0) };
+                if result == self.leader {
+                    break;
+                }
+                if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if unsafe { libc::kill(-self.leader, 0) } != 0
+                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+
+    struct RawChildGuard {
+        pid: libc::pid_t,
+        armed: bool,
+    }
+
+    impl RawChildGuard {
+        fn new(pid: libc::pid_t) -> Self {
+            Self { pid, armed: true }
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for RawChildGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let mut status = 0;
+            let observed = unsafe { libc::waitpid(self.pid, &raw mut status, libc::WNOHANG) };
+            if observed == 0 {
+                unsafe { libc::kill(self.pid, libc::SIGKILL) };
+                loop {
+                    let result = unsafe { libc::waitpid(self.pid, &raw mut status, 0) };
+                    if result == self.pid {
+                        break;
+                    }
+                    if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn wait_for_group_identity(pid: libc::pid_t) -> ProcessIdentity {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -2352,7 +2531,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn spawn_blocked_group_leader(exit_code: u8) -> (libc::pid_t, OwnedFd) {
+    fn spawn_blocked_group_leader(exit_code: u8) -> (RawProcessGroupGuard, OwnedFd) {
         let mut descriptors = [-1; 2];
         assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
         let pid = unsafe { libc::fork() };
@@ -2368,12 +2547,13 @@ mod tests {
                 libc::_exit(exit_code as i32);
             }
         }
+        let cleanup = RawProcessGroupGuard::new(pid);
         assert_eq!(unsafe { libc::close(descriptors[0]) }, 0);
-        (pid, unsafe { OwnedFd::from_raw_fd(descriptors[1]) })
+        (cleanup, unsafe { OwnedFd::from_raw_fd(descriptors[1]) })
     }
 
     #[cfg(target_os = "macos")]
-    fn spawn_group_with_ignoring_descendant() -> (libc::pid_t, libc::pid_t) {
+    fn spawn_group_with_ignoring_descendant() -> (RawProcessGroupGuard, libc::pid_t) {
         let mut descriptors = [-1; 2];
         assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
         let leader = unsafe { libc::fork() };
@@ -2406,6 +2586,7 @@ mod tests {
                 }
             }
         }
+        let cleanup = RawProcessGroupGuard::new(leader);
         assert_eq!(unsafe { libc::close(descriptors[1]) }, 0);
         let mut descendant = 0;
         let read = unsafe {
@@ -2417,103 +2598,393 @@ mod tests {
         };
         assert_eq!(read as usize, std::mem::size_of::<libc::pid_t>());
         assert_eq!(unsafe { libc::close(descriptors[0]) }, 0);
-        (leader, descendant)
+        (cleanup, descendant)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_term_ignoring_group_leader(exit_code: u8) -> (RawProcessGroupGuard, OwnedFd) {
+        let mut release = [-1; 2];
+        let mut ready = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+        let leader = unsafe { libc::fork() };
+        assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
+        if leader == 0 {
+            unsafe {
+                libc::close(release[1]);
+                libc::close(ready[0]);
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(70);
+                }
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                let ready_byte = 1_u8;
+                libc::write(
+                    ready[1],
+                    (&raw const ready_byte).cast(),
+                    std::mem::size_of_val(&ready_byte),
+                );
+                let mut release_byte = 0_u8;
+                libc::read(
+                    release[0],
+                    (&raw mut release_byte).cast(),
+                    std::mem::size_of_val(&release_byte),
+                );
+                libc::_exit(exit_code as i32);
+            }
+        }
+        let cleanup = RawProcessGroupGuard::new(leader);
+        assert_eq!(unsafe { libc::close(release[0]) }, 0);
+        assert_eq!(unsafe { libc::close(ready[1]) }, 0);
+        let mut ready_byte = 0_u8;
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    ready[0],
+                    (&raw mut ready_byte).cast(),
+                    std::mem::size_of_val(&ready_byte),
+                )
+            },
+            1
+        );
+        assert_eq!(ready_byte, 1);
+        assert_eq!(unsafe { libc::close(ready[0]) }, 0);
+        (cleanup, unsafe { OwnedFd::from_raw_fd(release[1]) })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_isolated_raw_fork_scenario<F>(test_name: &'static str, scenario: F)
+    where
+        F: FnOnce(),
+    {
+        const SCENARIO_ENV: &str = "MAC_WORKER_TEST_RAW_FORK_SCENARIO";
+        const SENTINEL_FD_ENV: &str = "MAC_WORKER_TEST_RAW_FORK_SENTINEL_FD";
+        const SENTINEL_DEVICE_ENV: &str = "MAC_WORKER_TEST_RAW_FORK_SENTINEL_DEVICE";
+        const SENTINEL_INODE_ENV: &str = "MAC_WORKER_TEST_RAW_FORK_SENTINEL_INODE";
+
+        if let Some(actual) = std::env::var_os(SCENARIO_ENV) {
+            assert_eq!(actual, test_name);
+            let sentinel_fd: RawFd = std::env::var(SENTINEL_FD_ENV).unwrap().parse().unwrap();
+            let expected_device: u64 = std::env::var(SENTINEL_DEVICE_ENV).unwrap().parse().unwrap();
+            let expected_inode: u64 = std::env::var(SENTINEL_INODE_ENV).unwrap().parse().unwrap();
+            let mut actual = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            if unsafe { libc::fstat(sentinel_fd, actual.as_mut_ptr()) } == 0 {
+                let actual = unsafe { actual.assume_init() };
+                assert_ne!(
+                    (actual.st_dev as u64, actual.st_ino),
+                    (expected_device, expected_inode),
+                    "raw-fork subprocess inherited the parent test descriptor"
+                );
+            } else {
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF),
+                    "raw-fork sentinel inspection was ambiguous"
+                );
+            }
+            scenario();
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let sentinel = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(temp.path().join("parent-test-sentinel"))
+            .unwrap();
+        set_cloexec(sentinel.as_raw_fd()).unwrap();
+        let sentinel_flags = unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(sentinel_flags, -1);
+        assert_ne!(sentinel_flags & libc::FD_CLOEXEC, 0);
+        let sentinel_stat = descriptor_stat(sentinel.as_raw_fd()).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env(SCENARIO_ENV, test_name)
+            .env(SENTINEL_FD_ENV, sentinel.as_raw_fd().to_string())
+            .env(SENTINEL_DEVICE_ENV, sentinel_stat.st_dev.to_string())
+            .env(SENTINEL_INODE_ENV, sentinel_stat.st_ino.to_string())
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raw_fork_scenarios_do_not_inherit_parent_test_descriptors() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::raw_fork_scenarios_do_not_inherit_parent_test_descriptors",
+            || {},
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raw_process_group_guard_reaps_during_a_panicking_scenario() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::raw_process_group_guard_reaps_during_a_panicking_scenario",
+            || {
+                let (cleanup, _descendant) = spawn_group_with_ignoring_descendant();
+                let leader = cleanup.leader();
+                let panic = std::panic::catch_unwind(move || {
+                    let _cleanup = cleanup;
+                    panic!("injected raw-fork scenario panic");
+                });
+                assert!(panic.is_err());
+                let deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    let mut status = 0;
+                    let result = unsafe { libc::waitpid(leader, &raw mut status, libc::WNOHANG) };
+                    if result == -1
+                        && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+                    {
+                        break;
+                    }
+                    assert_ne!(
+                        result, leader,
+                        "panic cleanup did not reap the group leader"
+                    );
+                    assert_eq!(result, 0, "unexpected panic-cleanup wait result");
+                    assert!(
+                        Instant::now() < deadline,
+                        "panic cleanup did not terminate the group leader"
+                    );
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    SystemProcessInspector.observe_group(leader as u32),
+                    ProcessGroupObservation::Absent
+                );
+            },
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn timeout_rechecks_waitable_anchor_when_leader_exits_before_term_identity_check() {
-        let (pid, release) = spawn_blocked_group_leader(7);
-        let identity = wait_for_group_identity(pid);
-        let inspector = ExitBeforeTermInspector {
-            release: Mutex::new(Some(release)),
-            triggered: AtomicBool::new(false),
-        };
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::timeout_rechecks_waitable_anchor_when_leader_exits_before_term_identity_check",
+            || {
+                let (mut cleanup, release) = spawn_blocked_group_leader(7);
+                let pid = cleanup.leader();
+                let identity = wait_for_group_identity(pid);
+                let inspector = ExitBeforeTermInspector {
+                    release: Mutex::new(Some(release)),
+                    triggered: AtomicBool::new(false),
+                };
 
-        let result = wait_for_child(identity, 0, &inspector);
-        if result.is_err() {
-            let _ = wait_blocking(pid);
-        }
+                let result = wait_for_child(identity, 0, &inspector);
+                if result.is_ok() {
+                    cleanup.disarm();
+                }
 
-        assert_eq!(result.unwrap(), ChildOutcome::Exited(7));
-        assert_eq!(
-            SystemProcessInspector.observe_group(identity.pid()),
-            ProcessGroupObservation::Absent
+                assert_eq!(result.unwrap(), ChildOutcome::Exited(7));
+                assert_eq!(
+                    SystemProcessInspector.observe_group(identity.pid()),
+                    ProcessGroupObservation::Absent
+                );
+            },
         );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn timeout_rechecks_waitable_anchor_when_descendants_vanish_before_kill() {
-        let (leader, descendant) = spawn_group_with_ignoring_descendant();
-        let identity = wait_for_group_identity(leader);
-        assert_eq!(
-            SystemProcessInspector.observe_group_members(identity.pid()),
-            ProcessGroupMembership::OtherMembers,
-            "descendant was not ready in the leader's process group"
-        );
-        let inspector = VanishingBeforeKillInspector {
-            descendant,
-            triggered: AtomicBool::new(false),
-        };
-        let started = Instant::now();
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::timeout_rechecks_waitable_anchor_when_descendants_vanish_before_kill",
+            || {
+                let (mut cleanup, descendant) = spawn_group_with_ignoring_descendant();
+                let leader = cleanup.leader();
+                let identity = wait_for_group_identity(leader);
+                assert_eq!(
+                    SystemProcessInspector.observe_group_members(identity.pid()),
+                    ProcessGroupMembership::OtherMembers,
+                    "descendant was not ready in the leader's process group"
+                );
+                let inspector = VanishingBeforeKillInspector {
+                    descendant,
+                    triggered: AtomicBool::new(false),
+                };
+                let started = Instant::now();
 
-        let result = wait_for_child(identity, 0, &inspector);
-        if result.is_err() {
-            let _ = wait_blocking(leader);
-        }
+                let result = wait_for_child(identity, 0, &inspector);
+                if result.is_ok() {
+                    cleanup.disarm();
+                }
 
-        assert_eq!(result.unwrap(), ChildOutcome::TimedOut);
-        assert!(
-            started.elapsed() >= TERM_GRACE,
-            "full TERM grace was skipped"
+                assert_eq!(result.unwrap(), ChildOutcome::TimedOut);
+                assert!(
+                    started.elapsed() >= TERM_GRACE,
+                    "full TERM grace was skipped"
+                );
+                assert_eq!(
+                    SystemProcessInspector.observe_group(identity.pid()),
+                    ProcessGroupObservation::Absent
+                );
+            },
         );
-        assert_eq!(
-            SystemProcessInspector.observe_group(identity.pid()),
-            ProcessGroupObservation::Absent
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn timeout_owns_the_real_exit_to_waitable_transition_after_successful_term() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::timeout_owns_the_real_exit_to_waitable_transition_after_successful_term",
+            || {
+                let (mut cleanup, release) = spawn_term_ignoring_group_leader(9);
+                let leader = cleanup.leader();
+                let identity = wait_for_group_identity(leader);
+                let (trigger, triggered) = mpsc::channel();
+                let releaser = std::thread::spawn(move || {
+                    triggered.recv_timeout(Duration::from_secs(2)).unwrap();
+                    std::thread::sleep(Duration::from_millis(50));
+                    let byte = 1_u8;
+                    assert_eq!(
+                        unsafe {
+                            libc::write(
+                                release.as_raw_fd(),
+                                (&raw const byte).cast(),
+                                std::mem::size_of_val(&byte),
+                            )
+                        },
+                        1
+                    );
+                });
+                let inspector = PostTermTransitionInspector {
+                    observations: AtomicUsize::new(0),
+                    release: trigger,
+                };
+                let started = Instant::now();
+
+                let result = wait_for_child(identity, 0, &inspector);
+                releaser.join().unwrap();
+                if result.is_ok() {
+                    cleanup.disarm();
+                }
+
+                assert_eq!(result.unwrap(), ChildOutcome::TimedOut);
+                assert!(
+                    started.elapsed() >= TERM_GRACE,
+                    "successful TERM did not retain ownership through the full grace"
+                );
+                assert_eq!(
+                    SystemProcessInspector.observe_group(identity.pid()),
+                    ProcessGroupObservation::Absent
+                );
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(leader, &raw mut status, libc::WNOHANG) },
+                    -1,
+                    "timeout leader was not reaped"
+                );
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_group_signal_waits_for_the_owned_child_to_become_waitable() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::failed_group_signal_waits_for_the_owned_child_to_become_waitable",
+            || {
+                let (mut cleanup, release) = spawn_term_ignoring_group_leader(9);
+                let leader = cleanup.leader();
+                let identity = wait_for_group_identity(leader);
+                let releaser = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let byte = 1_u8;
+                    assert_eq!(
+                        unsafe {
+                            libc::write(
+                                release.as_raw_fd(),
+                                (&raw const byte).cast(),
+                                std::mem::size_of_val(&byte),
+                            )
+                        },
+                        1
+                    );
+                });
+                let started = Instant::now();
+
+                let result = reconcile_failed_group_signal(
+                    identity,
+                    &SystemProcessInspector,
+                    WorkerError::Io(io::Error::from_raw_os_error(libc::ESRCH)),
+                );
+                releaser.join().unwrap();
+                if result.is_ok() {
+                    cleanup.disarm();
+                }
+
+                assert_eq!(result.unwrap(), ChildOutcome::Exited(9));
+                assert!(
+                    started.elapsed() >= Duration::from_millis(50),
+                    "failed-signal reconciliation used only an adjacent poll"
+                );
+                assert_eq!(
+                    SystemProcessInspector.observe_group(identity.pid()),
+                    ProcessGroupObservation::Absent
+                );
+            },
         );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn transient_launcher_inspection_never_waits_for_a_live_detached_candidate() {
-        let inspector = TransientLauncherInspector {
-            ambiguous: AtomicBool::new(true),
-        };
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
-        if pid == 0 {
-            loop {
-                unsafe { libc::pause() };
-            }
-        }
-        let started = Instant::now();
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::transient_launcher_inspection_never_waits_for_a_live_detached_candidate",
+            || {
+                let inspector = TransientLauncherInspector {
+                    ambiguous: AtomicBool::new(true),
+                };
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+                if pid == 0 {
+                    loop {
+                        unsafe { libc::pause() };
+                    }
+                }
+                let mut cleanup = RawChildGuard::new(pid);
+                let started = Instant::now();
 
-        let error = identify_launched_supervisor(pid, &inspector, Duration::from_millis(50))
-            .expect_err("transient identity inspection remains ambiguous");
+                let error =
+                    identify_launched_supervisor(pid, &inspector, Duration::from_millis(50))
+                        .expect_err("transient identity inspection remains ambiguous");
 
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "launcher blocked on the live detached candidate"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("SUPERVISOR_ACCEPTANCE_AMBIGUOUS"),
-            "{error}"
-        );
-        let mut wait_status = 0;
-        assert_eq!(
-            unsafe { libc::waitpid(pid, &raw mut wait_status, libc::WNOHANG) },
-            0,
-            "ambiguous candidate was reaped or exited"
-        );
-        inspector.ambiguous.store(false, Ordering::SeqCst);
-        let later = inspector.identity_for_pid(pid as u32).unwrap();
-        assert_eq!(later.pid(), pid as u32, "candidate is later discoverable");
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "launcher blocked on the live detached candidate"
+                );
+                assert!(
+                    error
+                        .to_string()
+                        .contains("SUPERVISOR_ACCEPTANCE_AMBIGUOUS"),
+                    "{error}"
+                );
+                let mut wait_status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(pid, &raw mut wait_status, libc::WNOHANG) },
+                    0,
+                    "ambiguous candidate was reaped or exited"
+                );
+                inspector.ambiguous.store(false, Ordering::SeqCst);
+                let later = inspector.identity_for_pid(pid as u32).unwrap();
+                assert_eq!(later.pid(), pid as u32, "candidate is later discoverable");
 
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-        assert_eq!(unsafe { libc::waitpid(pid, &raw mut wait_status, 0) }, pid);
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+                assert_eq!(unsafe { libc::waitpid(pid, &raw mut wait_status, 0) }, pid);
+                cleanup.disarm();
+            },
+        );
     }
 
     #[test]
