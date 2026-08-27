@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use clap::Parser;
 use mac_worker::cli::{Cli, Command as WorkerCommand};
+use mac_worker::protocol::PROTOCOL_VERSION;
 use predicates::prelude::*;
 use std::path::PathBuf;
 
@@ -124,7 +125,7 @@ fn hidden_host_probe_outputs_raw_compact_json_without_loading_config() {
         let stdout = std::str::from_utf8(&output.stdout).unwrap();
         assert_eq!(stdout.lines().count(), 1);
         let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
-        assert_eq!(value["protocol_version"], 1);
+        assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
         assert!(value.get("kind").is_none());
     }
 }

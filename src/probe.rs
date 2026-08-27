@@ -777,7 +777,7 @@ mod tests {
         let bytes = collect_json().unwrap();
         let response: ProbeResponse = serde_json::from_slice(&bytes).unwrap();
 
-        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.protocol_version, PROTOCOL_VERSION);
         assert!(!response.hostname.is_empty());
         assert!(!bytes.contains(&b'\n'));
     }

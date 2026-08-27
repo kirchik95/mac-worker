@@ -112,16 +112,37 @@ impl ProcessRunner for CandidateMutatingRunner {
     }
 }
 
-fn result(code: i32, stdout: &[u8], stderr: &[u8]) -> ProcessResult {
+fn result(code: i32, stdout: impl AsRef<[u8]>, stderr: impl AsRef<[u8]>) -> ProcessResult {
     ProcessResult {
         status: ExitStatus::from_raw(code << 8),
-        stdout: stdout.to_vec(),
-        stderr: stderr.to_vec(),
+        stdout: stdout.as_ref().to_vec(),
+        stderr: stderr.as_ref().to_vec(),
     }
 }
 
-fn valid_probe_json() -> &'static [u8] {
-    br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":["darwin-arm64"]}"#
+fn valid_probe_json() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "hostname": "mini-1.local",
+        "arch": "arm64",
+        "os_version": "26.2",
+        "free_disk_bytes": 536_870_912_u64,
+        "memory_pressure": "normal",
+        "swap_used_bytes": 134_217_728_u64,
+        "capabilities": ["darwin-arm64"],
+    }))
+    .unwrap()
+}
+
+fn expected_setup_json(expected: &[u8]) -> Vec<u8> {
+    String::from_utf8(expected.to_vec())
+        .unwrap()
+        .replacen(
+            "\"protocol_version\":1",
+            &format!("\"protocol_version\":{PROTOCOL_VERSION}"),
+            1,
+        )
+        .into_bytes()
 }
 
 fn worker() -> WorkerEntry {
@@ -1053,7 +1074,7 @@ fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv
     let installed = installer.install(&current_exe, &worker());
 
     assert!(installed.installed);
-    assert_eq!(installed.protocol_version, Some(1));
+    assert_eq!(installed.protocol_version, Some(PROTOCOL_VERSION));
     assert!(installed.warnings.is_empty());
     let requests = runner.requests();
     assert_eq!(requests.len(), 9);
@@ -1528,7 +1549,7 @@ fn hidden_host_probe_does_not_load_client_inventory() {
     let CommandOutput::Probe(probe) = output else {
         panic!("host probe must return raw probe data")
     };
-    assert_eq!(probe.protocol_version, 1);
+    assert_eq!(probe.protocol_version, PROTOCOL_VERSION);
     assert!(!probe.hostname.is_empty());
 }
 
@@ -1563,11 +1584,15 @@ fn setup_json_and_human_output_keep_per_host_results() {
 
     assert_eq!(
         output.render_human(),
-        "mini-1: installed (protocol 1)\nmini-2: failed [INSTALL_FAILED]: transfer failed"
+        format!(
+            "mini-1: installed (protocol {PROTOCOL_VERSION})\nmini-2: failed [INSTALL_FAILED]: transfer failed"
+        )
     );
     assert_eq!(
         output.render_json().unwrap(),
-        r#"{"kind":"setup","protocol_version":1,"workers":[{"name":"mini-1","ssh":"mac1","installed":true,"protocol_version":1,"error_code":null,"error_message":null,"warnings":[]},{"name":"mini-2","ssh":"mac2","installed":false,"protocol_version":null,"error_code":"INSTALL_FAILED","error_message":"transfer failed","warnings":[]}]}"#
+        format!(
+            r#"{{"kind":"setup","protocol_version":{PROTOCOL_VERSION},"workers":[{{"name":"mini-1","ssh":"mac1","installed":true,"protocol_version":{PROTOCOL_VERSION},"error_code":null,"error_message":null,"warnings":[]}},{{"name":"mini-2","ssh":"mac2","installed":false,"protocol_version":null,"error_code":"INSTALL_FAILED","error_message":"transfer failed","warnings":[]}}]}}"#
+        )
     );
 }
 
@@ -1594,7 +1619,9 @@ fn setup_human_output_surfaces_cleanup_warning_after_verified_success() {
 
     assert_eq!(
         output.render_human(),
-        "mini-1: installed (protocol 1)\n  warning [CLEANUP_FAILED]: lock release failed"
+        format!(
+            "mini-1: installed (protocol {PROTOCOL_VERSION})\n  warning [CLEANUP_FAILED]: lock release failed"
+        )
     );
 }
 
@@ -1764,7 +1791,7 @@ fn executable_setup_acquisition_io_retains_state_renders_report_and_exits_io() {
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"UNKNOWN_INSTALLATION_STATE\",\"error_message\":\"installation lock acquisition result was lost; scoped state was retained: I/O error: acquisition result read failed\",\"warnings\":[]}]}\n"
+        expected_setup_json(b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"UNKNOWN_INSTALLATION_STATE\",\"error_message\":\"installation lock acquisition result was lost; scoped state was retained: I/O error: acquisition result read failed\",\"warnings\":[]}]}\n")
     );
     assert_eq!(requests.len(), 2);
 }
@@ -1787,7 +1814,7 @@ fn executable_setup_digest_io_cleans_up_renders_report_and_exits_io() {
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"DIGEST_VERIFICATION_FAILED\",\"error_message\":\"failed to verify staged candidate digest: I/O error: digest result read failed\",\"warnings\":[]}]}\n"
+        expected_setup_json(b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"DIGEST_VERIFICATION_FAILED\",\"error_message\":\"failed to verify staged candidate digest: I/O error: digest result read failed\",\"warnings\":[]}]}\n")
     );
     assert_eq!(requests.len(), 5);
 }
@@ -1810,7 +1837,7 @@ fn executable_setup_prepare_io_cleans_up_renders_report_and_exits_io() {
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"INSTALL_FAILED\",\"error_message\":\"failed to launch /usr/bin/ssh: I/O error: prepare result read failed\",\"warnings\":[]}]}\n"
+        expected_setup_json(b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"INSTALL_FAILED\",\"error_message\":\"failed to launch /usr/bin/ssh: I/O error: prepare result read failed\",\"warnings\":[]}]}\n")
     );
     assert_eq!(requests.len(), 6);
 }
@@ -1835,7 +1862,7 @@ fn executable_setup_promotion_io_retains_ambiguous_state_and_exits_io() {
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"UNKNOWN_INSTALLATION_STATE\",\"error_message\":\"failed to launch /usr/bin/ssh: I/O error: promotion result read failed; the previous target is currently observable but promotion completion is unproven; installation lock and scoped state were retained\",\"warnings\":[]}]}\n"
+        expected_setup_json(b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"UNKNOWN_INSTALLATION_STATE\",\"error_message\":\"failed to launch /usr/bin/ssh: I/O error: promotion result read failed; the previous target is currently observable but promotion completion is unproven; installation lock and scoped state were retained\",\"warnings\":[]}]}\n")
     );
     assert_eq!(requests.len(), 7);
 }
@@ -1860,7 +1887,7 @@ fn executable_setup_reconciliation_io_retains_state_renders_report_and_exits_io(
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"UNKNOWN_INSTALLATION_STATE\",\"error_message\":\"promotion reported success but reconciliation could not prove completion: I/O error: reconciliation result read failed; installation lock and scoped state were retained\",\"warnings\":[]}]}\n"
+        expected_setup_json(b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"UNKNOWN_INSTALLATION_STATE\",\"error_message\":\"promotion reported success but reconciliation could not prove completion: I/O error: reconciliation result read failed; installation lock and scoped state were retained\",\"warnings\":[]}]}\n")
     );
     assert_eq!(requests.len(), 7);
 }
@@ -1887,7 +1914,7 @@ fn executable_setup_verification_io_rolls_back_renders_report_and_exits_io() {
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"VERIFICATION_FAILED\",\"error_message\":\"failed to launch SSH probe: I/O error: verification result read failed\",\"warnings\":[]}]}\n"
+        expected_setup_json(b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"VERIFICATION_FAILED\",\"error_message\":\"failed to launch SSH probe: I/O error: verification result read failed\",\"warnings\":[]}]}\n")
     );
     assert_eq!(requests.len(), 9);
 }
@@ -1929,7 +1956,7 @@ fn executable_setup_upload_io_renders_transfer_report_cleans_up_and_exits_io() {
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"TRANSFER_FAILED\",\"error_message\":\"failed to launch /usr/bin/ssh: I/O error: upload result read failed\",\"warnings\":[]}]}\n"
+        expected_setup_json(b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"TRANSFER_FAILED\",\"error_message\":\"failed to launch /usr/bin/ssh: I/O error: upload result read failed\",\"warnings\":[]}]}\n")
     );
     let requests = runner.requests();
     assert_eq!(requests.len(), 4);
@@ -1973,7 +2000,7 @@ fn executable_setup_upload_nonzero_renders_transfer_report_cleans_up_and_exits_u
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"TRANSFER_FAILED\",\"error_message\":\"/usr/bin/ssh failed with exit 1: transfer interrupted\",\"warnings\":[]}]}\n"
+        expected_setup_json(b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"TRANSFER_FAILED\",\"error_message\":\"/usr/bin/ssh failed with exit 1: transfer interrupted\",\"warnings\":[]}]}\n")
     );
     let requests = runner.requests();
     assert_eq!(requests.len(), 4);

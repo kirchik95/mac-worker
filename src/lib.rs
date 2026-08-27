@@ -19,6 +19,7 @@ pub mod doctor;
 pub mod error;
 pub mod inputs;
 pub mod install;
+pub mod job;
 pub mod manifest;
 pub mod output;
 pub mod paths;
@@ -166,13 +167,13 @@ pub fn run_with_io_in_context(
                 Ok(()) => exit,
                 Err(error) => {
                     write_error(stderr, &error);
-                    error.exit_kind() as u8
+                    error.exit_code()
                 }
             }
         }
         Err(error) => {
             write_error(stderr, &error);
-            error.exit_kind() as u8
+            error.exit_code()
         }
     }
 }

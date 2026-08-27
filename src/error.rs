@@ -6,6 +6,7 @@ pub enum ExitKind {
     Unavailable = 69,
     Infrastructure = 70,
     Io = 74,
+    Capacity = 75,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,12 @@ pub enum WorkerError {
     Project { code: &'static str, message: String },
     #[error("snapshot error [{code}]: {message}")]
     Snapshot { code: &'static str, message: String },
+    #[error("capacity error [{code}]: {message}")]
+    Capacity { code: &'static str, message: String },
+    #[error("transport error [{code}]: {message}")]
+    Transport { code: &'static str, message: String },
+    #[error("command exited with status {code}")]
+    CommandExit { code: u8 },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("process error: {0}")]
@@ -55,10 +62,20 @@ impl WorkerError {
             Self::Config(_) => ExitKind::Usage,
             Self::Project { .. } => ExitKind::Usage,
             Self::Unavailable(_) => ExitKind::Unavailable,
+            Self::Capacity { .. } => ExitKind::Capacity,
+            Self::Transport { .. } => ExitKind::Unavailable,
+            Self::CommandExit { .. } => ExitKind::Infrastructure,
             Self::Protocol(_) | Self::Process(_) | Self::Snapshot { .. } => {
                 ExitKind::Infrastructure
             }
             Self::Io(_) => ExitKind::Io,
+        }
+    }
+
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::CommandExit { code } => *code,
+            _ => self.exit_kind() as u8,
         }
     }
 }
@@ -94,6 +111,20 @@ mod tests {
                 ExitKind::Infrastructure,
             ),
             (
+                WorkerError::Capacity {
+                    code: "CAPACITY_BUSY",
+                    message: "one heavy job is already active".into(),
+                },
+                ExitKind::Capacity,
+            ),
+            (
+                WorkerError::Transport {
+                    code: "SSH_UNAVAILABLE",
+                    message: "host is offline".into(),
+                },
+                ExitKind::Unavailable,
+            ),
+            (
                 WorkerError::Io(std::io::Error::other("disk failed")),
                 ExitKind::Io,
             ),
@@ -102,6 +133,12 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.exit_kind(), expected);
         }
+    }
+
+    #[test]
+    fn command_exit_preserves_the_child_status_exactly() {
+        assert_eq!(WorkerError::CommandExit { code: 7 }.exit_code(), 7);
+        assert_eq!(WorkerError::CommandExit { code: 143 }.exit_code(), 143);
     }
 
     #[test]

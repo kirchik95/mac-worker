@@ -1,4 +1,4 @@
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ProbeResponse {
@@ -174,7 +174,7 @@ mod tests {
         let response = ProbeResponse::fixture();
         let value = serde_json::to_value(response).unwrap();
 
-        assert_eq!(value["protocol_version"], 1);
+        assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(value["arch"], "arm64");
     }
 
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(value["name"], "mini-1");
         assert_eq!(value["ssh"], "mac1");
         assert_eq!(value["status"], "ready");
-        assert_eq!(value["probe"]["protocol_version"], 1);
+        assert_eq!(value["probe"]["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(value["missing_capabilities"], serde_json::json!([]));
         assert!(value["error_code"].is_null());
         assert!(value["error_message"].is_null());
@@ -240,10 +240,13 @@ mod tests {
         let workers_json = serde_json::to_value(workers).unwrap();
         let setup_json = serde_json::to_value(setup).unwrap();
 
-        assert_eq!(workers_json["protocol_version"], 1);
+        assert_eq!(workers_json["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(workers_json["workers"][0]["status"], "unavailable");
-        assert_eq!(setup_json["protocol_version"], 1);
+        assert_eq!(setup_json["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(setup_json["workers"][0]["installed"], true);
-        assert_eq!(setup_json["workers"][0]["protocol_version"], 1);
+        assert_eq!(
+            setup_json["workers"][0]["protocol_version"],
+            PROTOCOL_VERSION
+        );
     }
 }

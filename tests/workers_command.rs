@@ -69,7 +69,13 @@ fn exit_status(code: i32) -> ExitStatus {
 }
 
 fn valid_probe_json() -> Vec<u8> {
-    br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":["darwin-arm64","git"]}"#.to_vec()
+    structured_probe_json(
+        PROTOCOL_VERSION,
+        "mini-1.local",
+        "arm64",
+        "26.2",
+        vec!["darwin-arm64".into(), "git".into()],
+    )
 }
 
 fn structured_probe_json(
@@ -371,11 +377,7 @@ fn invalid_structured_probe_fields_are_rejected_before_other_classification() {
 
 #[test]
 fn protocol_mismatch_is_reported_as_unavailable() {
-    let response = valid_probe_json()
-        .into_iter()
-        .enumerate()
-        .map(|(index, byte)| if index == 20 { b'2' } else { byte })
-        .collect();
+    let response = br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":[]}"#.to_vec();
     let runner = RecordingRunner::returning_json(response);
     let transport = SshTransport::new(runner);
 
@@ -386,7 +388,7 @@ fn protocol_mismatch_is_reported_as_unavailable() {
     assert!(health.error_message.is_some());
     assert_eq!(
         health.probe.as_ref().map(|probe| probe.protocol_version),
-        Some(2)
+        Some(1)
     );
 }
 
@@ -406,11 +408,7 @@ fn absent_declared_capabilities_exclude_the_worker() {
 
 #[test]
 fn inventory_keeps_ready_and_failed_workers_in_config_order() {
-    let protocol_mismatch = valid_probe_json()
-        .into_iter()
-        .enumerate()
-        .map(|(index, byte)| if index == 20 { b'2' } else { byte })
-        .collect();
+    let protocol_mismatch = structured_probe_json(1, "mini-1.local", "arm64", "26.2", Vec::new());
     let runner = RecordingRunner::returning_results(vec![
         Ok(ProcessResult {
             status: exit_status(0),
@@ -446,7 +444,7 @@ fn inventory_keeps_ready_and_failed_workers_in_config_order() {
 
     let report = service.inspect(&config);
 
-    assert_eq!(report.protocol_version, 1);
+    assert_eq!(report.protocol_version, PROTOCOL_VERSION);
     assert_eq!(
         report
             .workers
@@ -489,12 +487,24 @@ fn inspect_with_requirements_adds_project_capabilities_without_changing_inventor
     let runner = RecordingRunner::returning_results(vec![
         Ok(ProcessResult {
             status: exit_status(0),
-            stdout: br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":["darwin-arm64","node"]}"#.to_vec(),
+            stdout: structured_probe_json(
+                PROTOCOL_VERSION,
+                "mini-1.local",
+                "arm64",
+                "26.2",
+                vec!["darwin-arm64".into(), "node".into()],
+            ),
             stderr: Vec::new(),
         }),
         Ok(ProcessResult {
             status: exit_status(0),
-            stdout: br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":["darwin-arm64","node"]}"#.to_vec(),
+            stdout: structured_probe_json(
+                PROTOCOL_VERSION,
+                "mini-1.local",
+                "arm64",
+                "26.2",
+                vec!["darwin-arm64".into(), "node".into()],
+            ),
             stderr: Vec::new(),
         }),
     ]);
@@ -533,9 +543,13 @@ fn inspect_with_requirements_adds_project_capabilities_without_changing_inventor
 fn inspect_with_requirements_uses_inventory_first_stable_union_for_multiple_missing_values() {
     // Catches project-first probing, duplicate requirements, or mutating the
     // configured inventory while constructing the required-capability union.
-    let runner = RecordingRunner::returning_json(
-        br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":["node"]}"#.to_vec(),
-    );
+    let runner = RecordingRunner::returning_json(structured_probe_json(
+        PROTOCOL_VERSION,
+        "mini-1.local",
+        "arm64",
+        "26.2",
+        vec!["node".into()],
+    ));
     let config = Config {
         version: 1,
         workers: vec![worker(

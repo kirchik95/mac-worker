@@ -248,7 +248,7 @@ fn exit_status(code: i32) -> ExitStatus {
 
 fn ready_probe(capabilities: &[&str]) -> Result<ProcessResult, WorkerError> {
     let response = serde_json::json!({
-        "protocol_version": 1,
+        "protocol_version": PROTOCOL_VERSION,
         "hostname": "mini.local",
         "arch": "arm64",
         "os_version": "26.2",
@@ -602,31 +602,34 @@ fn doctor_output_human_renders_complete_ready_and_blocked_reports_without_ssh() 
 
     assert_eq!(
         ready,
-        concat!(
-            "doctor: ready\n",
-            "project: demo\n",
-            "  project id: 0123456789ab\n",
-            "  worktree id: fedcba987654\n",
-            "  source: branch main at abcdef012345\n",
-            "  dirty: yes\n",
-            "  working directory: crates/app\n",
-            "requirements: node, docker\n",
-            "snapshot:\n",
-            "  digest: 9999999999999999999999999999999999999999999999999999999999999999\n",
-            "  file count: 3\n",
-            "  total bytes: 42\n",
-            "  tracked deletions: 1\n",
-            "  included untracked: 1\n",
-            "  warnings: 1\n",
-            "workers:\n",
-            "  mini-1: eligible (mini-1.local; arm64; macOS 26.2; protocol 1)\n",
-            "    capabilities: node, docker\n",
-            "    free disk bytes: 536870912\n",
-            "    memory pressure: normal\n",
-            "    swap used bytes: 134217728\n",
-            "issues:\n",
-            "  warning [SENSITIVE_PATH_ALLOWED]: allowed sensitive input\n",
-            "    path: .env",
+        format!(
+            concat!(
+                "doctor: ready\n",
+                "project: demo\n",
+                "  project id: 0123456789ab\n",
+                "  worktree id: fedcba987654\n",
+                "  source: branch main at abcdef012345\n",
+                "  dirty: yes\n",
+                "  working directory: crates/app\n",
+                "requirements: node, docker\n",
+                "snapshot:\n",
+                "  digest: 9999999999999999999999999999999999999999999999999999999999999999\n",
+                "  file count: 3\n",
+                "  total bytes: 42\n",
+                "  tracked deletions: 1\n",
+                "  included untracked: 1\n",
+                "  warnings: 1\n",
+                "workers:\n",
+                "  mini-1: eligible (mini-1.local; arm64; macOS 26.2; protocol {})\n",
+                "    capabilities: node, docker\n",
+                "    free disk bytes: 536870912\n",
+                "    memory pressure: normal\n",
+                "    swap used bytes: 134217728\n",
+                "issues:\n",
+                "  warning [SENSITIVE_PATH_ALLOWED]: allowed sensitive input\n",
+                "    path: .env",
+            ),
+            PROTOCOL_VERSION,
         )
     );
     assert_eq!(
