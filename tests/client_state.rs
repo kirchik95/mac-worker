@@ -3,7 +3,7 @@ use std::{
     fs,
     os::unix::{
         ffi::OsStringExt,
-        fs::{PermissionsExt, symlink},
+        fs::{FileTypeExt, PermissionsExt, symlink},
     },
     path::{Path, PathBuf},
     sync::{Arc, Barrier},
@@ -11,7 +11,7 @@ use std::{
 };
 
 use mac_worker::{
-    client_state::{ClientStateStore, ClientStateWritePoint},
+    client_state::{ClientStateCreationRacePoint, ClientStateStore, ClientStateWritePoint},
     job::{
         ClientId, CommandSpec, JobId, JobMeta, JobStatus, LeaseToken, LocalJobRecord,
         RequestFingerprintMaterial,
@@ -479,7 +479,7 @@ fn swapped_staged_payload_is_never_published_as_client_or_job_state() {
             .to_string()
             .contains("11111111111111111111111111111111")
     );
-    assert!(!identity_state.join("client-id").exists());
+    assert!(identity_state.join("client-id").exists());
     assert!(operation_tree_contains(
         &identity_state.join(".mac-worker-state"),
         b"11111111111111111111111111111111\n"
@@ -491,11 +491,12 @@ fn swapped_staged_payload_is_never_published_as_client_or_job_state() {
     store.inject_write_failure_once(ClientStateWritePoint::SwapOperationPayloadBeforePublish);
     assert!(store.create_job(record.clone()).is_err());
     assert!(
-        !job_state
+        job_state
             .join("jobs")
             .join(format!("{}.json", record.meta().job_id()))
             .exists()
     );
+    assert!(store.load_job(record.meta().job_id()).is_err());
     assert!(operation_tree_contains(
         &job_state.join(".mac-worker-state"),
         b"11111111111111111111111111111111\n"
@@ -524,6 +525,71 @@ fn substituted_operation_directory_is_preserved_during_cleanup() {
         sentinel_count, 1,
         "replacement operation directory was deleted"
     );
+}
+
+#[test]
+fn post_validation_operation_directory_substitution_is_never_removed() {
+    // Catches validating an acquired operation directory and then rmdir'ing a
+    // same-name replacement at the final pathname.
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let record = fresh_record(&store);
+    store.inject_write_failure_once(
+        ClientStateWritePoint::SwapOperationDirectoryAfterValidationBeforeRemoval,
+    );
+
+    assert!(store.create_job(record.clone()).is_err());
+    assert_eq!(store.load_job(record.meta().job_id()).unwrap(), record);
+    assert!(tree_contains_named_entry(
+        &state.join(".mac-worker-state"),
+        "post-validation-directory-sentinel"
+    ));
+}
+
+#[test]
+fn post_validation_payload_substitution_is_never_unlinked() {
+    // Catches opening/stat'ing an owned payload and then unlinking a replacement
+    // through the same mutable child name.
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let record = fresh_record(&store);
+    store.inject_write_failure_once(
+        ClientStateWritePoint::SwapOperationChildAfterValidationBeforeRemoval,
+    );
+
+    assert!(store.create_job(record.clone()).is_err());
+    assert_eq!(store.load_job(record.meta().job_id()).unwrap(), record);
+    assert!(operation_tree_contains(
+        &state.join(".mac-worker-state"),
+        b"post-validation-child-substitution\n"
+    ));
+}
+
+#[test]
+fn post_validation_published_rollback_substitution_is_preserved() {
+    // Catches validating a quarantined bad publication and then unlinking a
+    // replacement planted at the quarantine name.
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let record = fresh_record(&store);
+    store.inject_write_failure_once(
+        ClientStateWritePoint::SwapPublishedRollbackAfterValidationBeforeRemoval,
+    );
+
+    assert!(store.create_job(record.clone()).is_err());
+    assert!(
+        !state
+            .join("jobs")
+            .join(format!("{}.json", record.meta().job_id()))
+            .exists()
+    );
+    assert!(operation_tree_contains(
+        &state,
+        b"post-validation-published-substitution\n"
+    ));
 }
 
 #[test]
@@ -562,6 +628,69 @@ fn live_job_swap_between_validation_and_replace_is_rolled_back() {
 }
 
 #[test]
+fn every_unreadable_exchange_displacement_is_restored_and_fsynced() {
+    // Catches `?` exits after atomic exchange that leave staged JSON live when
+    // the displaced entry cannot be opened as an owner-only regular file.
+    for point in [
+        ClientStateWritePoint::SwapLiveJobWithSymlinkBeforeReplace,
+        ClientStateWritePoint::SwapLiveJobWithDirectoryBeforeReplace,
+        ClientStateWritePoint::SwapLiveJobWithFifoBeforeReplace,
+        ClientStateWritePoint::SwapLiveJobWithPermissiveFileBeforeReplace,
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let state = temp_root(&fixture).join("state");
+        let store = ClientStateStore::open(&state).unwrap();
+        let original = fresh_record(&store);
+        store.create_job(original.clone()).unwrap();
+        let replacement = make_record(
+            original.meta().job_id(),
+            store.client_id(),
+            original.lease_token(),
+            DIGEST_A,
+            Some(JobStatus::accepted(2_000).unwrap()),
+            false,
+        );
+        let jobs_syncs = store.durability_sync_counts().jobs;
+        store.inject_write_failure_once(point);
+
+        assert!(store.update_job(replacement).is_err(), "{point:?}");
+        assert!(
+            store.durability_sync_counts().jobs > jobs_syncs,
+            "{point:?}"
+        );
+        let final_path = state
+            .join("jobs")
+            .join(format!("{}.json", original.meta().job_id()));
+        let metadata = fs::symlink_metadata(&final_path).unwrap();
+        match point {
+            ClientStateWritePoint::SwapLiveJobWithSymlinkBeforeReplace => {
+                assert!(metadata.file_type().is_symlink());
+                assert_eq!(
+                    fs::read_link(&final_path).unwrap(),
+                    PathBuf::from("swap-target")
+                );
+            }
+            ClientStateWritePoint::SwapLiveJobWithDirectoryBeforeReplace => {
+                assert!(metadata.is_dir());
+                assert!(final_path.join("sentinel").is_file());
+            }
+            ClientStateWritePoint::SwapLiveJobWithFifoBeforeReplace => {
+                assert!(metadata.file_type().is_fifo());
+            }
+            ClientStateWritePoint::SwapLiveJobWithPermissiveFileBeforeReplace => {
+                assert!(metadata.is_file());
+                assert_eq!(mode(&final_path), 0o644);
+                assert_eq!(
+                    fs::read(final_path).unwrap(),
+                    b"permissive-live-substitution\n"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 fn successful_creation_recovery_and_idempotency_cross_durability_barriers() {
     // Catches returning success while newly created parent entries, an
     // observed client identity, or an idempotent job entry remain unsynced.
@@ -582,6 +711,30 @@ fn successful_creation_recovery_and_idempotency_cross_durability_barriers() {
 
     let reopened = ClientStateStore::open(&state).unwrap();
     assert!(reopened.durability_sync_counts().root >= 1);
+}
+
+#[test]
+fn concurrent_creation_losers_fsync_every_parent_they_observe() {
+    // Catches ENOENT followed by EEXIST being treated like an already-existing
+    // entry even though the winning creator may crash before its own fsync.
+    for point in [
+        ClientStateCreationRacePoint::RootComponent,
+        ClientStateCreationRacePoint::OwnedDirectory,
+        ClientStateCreationRacePoint::LockFile,
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let state = temp_root(&fixture).join("nested/state");
+        let store = ClientStateStore::open_with_creation_race(&state, point).unwrap();
+        let counts = store.durability_sync_counts();
+        assert!(
+            counts.concurrent_loser_parents >= 1,
+            "{point:?}: {counts:?}"
+        );
+        assert!(
+            counts.parent_directories + counts.root >= 1,
+            "{point:?}: {counts:?}"
+        );
+    }
 }
 
 #[test]
@@ -664,15 +817,36 @@ fn copied_records_from_another_client_are_rejected_by_load_and_list() {
 }
 
 fn operation_tree_contains(root: &Path, expected: &[u8]) -> bool {
-    fs::read_dir(root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .any(|entry| {
-            fs::read_dir(entry.path())
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .any(|child| fs::read(child.path()).is_ok_and(|bytes| bytes == expected))
-        })
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(entry.path());
+            } else if fs::read(entry.path()).is_ok_and(|bytes| bytes == expected) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn tree_contains_named_entry(root: &Path, expected_name: &str) -> bool {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if entry.file_name() == expected_name {
+                return true;
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
+    false
 }

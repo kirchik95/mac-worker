@@ -41,6 +41,21 @@ pub enum ClientStateWritePoint {
     SwapOperationPayloadBeforePublish = 3,
     SwapOperationDirectoryBeforeCleanup = 4,
     SwapLiveJobBeforeReplace = 5,
+    SwapOperationDirectoryAfterValidationBeforeRemoval = 6,
+    SwapOperationChildAfterValidationBeforeRemoval = 7,
+    SwapPublishedRollbackAfterValidationBeforeRemoval = 8,
+    SwapLiveJobWithSymlinkBeforeReplace = 9,
+    SwapLiveJobWithDirectoryBeforeReplace = 10,
+    SwapLiveJobWithFifoBeforeReplace = 11,
+    SwapLiveJobWithPermissiveFileBeforeReplace = 12,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientStateCreationRacePoint {
+    RootComponent = 1,
+    OwnedDirectory = 2,
+    LockFile = 3,
 }
 
 #[doc(hidden)]
@@ -49,6 +64,7 @@ pub struct ClientStateSyncCounts {
     pub parent_directories: u64,
     pub root: u64,
     pub jobs: u64,
+    pub concurrent_loser_parents: u64,
 }
 
 #[derive(Clone)]
@@ -71,11 +87,12 @@ struct SyncCounters {
     root: std::sync::atomic::AtomicU64,
     jobs: std::sync::atomic::AtomicU64,
     operations: std::sync::atomic::AtomicU64,
+    concurrent_loser_parents: std::sync::atomic::AtomicU64,
 }
 
 impl ClientStateStore {
     pub fn open(state_root: &Path) -> Result<Self, WorkerError> {
-        Self::open_inner(state_root, None)
+        Self::open_inner(state_root, None, None)
     }
 
     #[doc(hidden)]
@@ -83,30 +100,42 @@ impl ClientStateStore {
         state_root: &Path,
         point: ClientStateWritePoint,
     ) -> Result<Self, WorkerError> {
-        Self::open_inner(state_root, Some(point))
+        Self::open_inner(state_root, Some(point), None)
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_creation_race(
+        state_root: &Path,
+        point: ClientStateCreationRacePoint,
+    ) -> Result<Self, WorkerError> {
+        Self::open_inner(state_root, None, Some(point))
     }
 
     fn open_inner(
         state_root: &Path,
         initial_fault: Option<ClientStateWritePoint>,
+        initial_creation_race: Option<ClientStateCreationRacePoint>,
     ) -> Result<Self, WorkerError> {
         let write_fault = Arc::new(AtomicU8::new(initial_fault.map_or(0, |point| point as u8)));
         let sync_counts = Arc::new(SyncCounters::default());
-        let root = open_or_create_root(state_root, &sync_counts)?;
+        let creation_race = AtomicU8::new(initial_creation_race.map_or(0, |point| point as u8));
+        let root = open_or_create_root(state_root, &sync_counts, &creation_race)?;
         require_owned_directory(root.as_raw_fd())?;
         let jobs = open_or_create_owned_directory(
             root.as_raw_fd(),
             JOBS_NAME,
             &sync_counts,
             SyncKind::Root,
+            &creation_race,
         )?;
         let operations = open_or_create_owned_directory(
             root.as_raw_fd(),
             OPERATIONS_NAME,
             &sync_counts,
             SyncKind::Root,
+            &creation_race,
         )?;
-        ensure_lock_file(root.as_raw_fd(), &sync_counts)?;
+        ensure_lock_file(root.as_raw_fd(), &sync_counts, &creation_race)?;
         validate_root_entries(root.as_raw_fd())?;
         validate_operation_entries(operations.as_raw_fd())?;
         let client_id = load_or_create_client_id(
@@ -276,6 +305,11 @@ impl ClientStateStore {
                 .load(Ordering::SeqCst),
             root: self.inner.sync_counts.root.load(Ordering::SeqCst),
             jobs: self.inner.sync_counts.jobs.load(Ordering::SeqCst),
+            concurrent_loser_parents: self
+                .inner
+                .sync_counts
+                .concurrent_loser_parents
+                .load(Ordering::SeqCst),
         }
     }
 
@@ -521,6 +555,11 @@ impl OperationFile {
         ) {
             self.inject_payload_swap()?;
         }
+        if fault.load(Ordering::SeqCst)
+            == ClientStateWritePoint::SwapPublishedRollbackAfterValidationBeforeRemoval as u8
+        {
+            self.inject_retained_payload_corruption()?;
+        }
         link_no_replace(
             self.directory.as_raw_fd(),
             PAYLOAD_NAME,
@@ -530,7 +569,15 @@ impl OperationFile {
         let published = open_regular_at(destination_parent, destination)?;
         let (published_bytes, published_identity) = read_open_regular(published)?;
         if published_identity != self.payload_identity || published_bytes != self.expected_bytes {
-            remove_entry_if_identity(destination_parent, destination, published_identity)?;
+            if published_identity == self.payload_identity {
+                remove_entry_if_identity(
+                    destination_parent,
+                    destination,
+                    self.payload_identity,
+                    fault,
+                    &self.sync_counts,
+                )?;
+            }
             return Err(invalid_state(
                 "staged payload identity or bytes changed before publication",
             ));
@@ -545,8 +592,8 @@ impl OperationFile {
         expected: FileIdentity,
         fault: &AtomicU8,
     ) -> Result<(), WorkerError> {
-        if take_fault(fault, ClientStateWritePoint::SwapLiveJobBeforeReplace) {
-            inject_live_job_swap(destination_parent, destination)?;
+        if let Some(point) = take_live_job_swap_fault(fault) {
+            inject_live_job_swap(destination_parent, destination, point)?;
         }
         exchange_entries(
             self.directory.as_raw_fd(),
@@ -555,37 +602,89 @@ impl OperationFile {
             destination,
         )?;
 
-        let displaced = open_regular_at(self.directory.as_raw_fd(), PAYLOAD_NAME)?;
-        let (_, displaced_identity) = read_open_regular(displaced)?;
-        let published = open_regular_at(destination_parent, destination)?;
-        let (published_bytes, published_identity) = read_open_regular(published)?;
-        if displaced_identity == expected
-            && published_identity == self.payload_identity
-            && published_bytes == self.expected_bytes
-        {
+        let displaced_stat = stat_at(self.directory.as_raw_fd(), PAYLOAD_NAME).ok();
+        if displaced_stat.is_some_and(|stat| {
+            self.exchange_state_is_valid(destination_parent, destination, expected, stat)
+        }) {
             return Ok(());
         }
 
+        self.rollback_exchange(
+            destination_parent,
+            destination,
+            displaced_stat.map(PathIdentity::from_stat),
+        )?;
+        Err(invalid_state(
+            "job state changed during conditional atomic replacement",
+        ))
+    }
+
+    fn exchange_state_is_valid(
+        &self,
+        destination_parent: RawFd,
+        destination: &CStr,
+        expected: FileIdentity,
+        displaced_stat: libc::stat,
+    ) -> bool {
+        if !is_owned_regular_stat(&displaced_stat, MAX_STATE_FILE_BYTES)
+            || FileIdentity::from_stat(displaced_stat) != expected
+        {
+            return false;
+        }
+        let displaced = match open_regular_at(self.directory.as_raw_fd(), PAYLOAD_NAME) {
+            Ok(displaced) => displaced,
+            Err(_) => return false,
+        };
+        let displaced_open =
+            match require_owned_regular(displaced.as_raw_fd(), MAX_STATE_FILE_BYTES) {
+                Ok(stat) => stat,
+                Err(_) => return false,
+            };
+        if FileIdentity::from_stat(displaced_open) != expected {
+            return false;
+        }
+        let published = match open_regular_at(destination_parent, destination) {
+            Ok(published) => published,
+            Err(_) => return false,
+        };
+        match read_open_regular(published) {
+            Ok((bytes, identity)) => {
+                identity == self.payload_identity && bytes == self.expected_bytes
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn rollback_exchange(
+        &self,
+        destination_parent: RawFd,
+        destination: &CStr,
+        displaced: Option<PathIdentity>,
+    ) -> Result<(), WorkerError> {
         exchange_entries(
             self.directory.as_raw_fd(),
             PAYLOAD_NAME,
             destination_parent,
             destination,
-        )?;
-        let restored = open_regular_at(destination_parent, destination)?;
-        let restored_identity = FileIdentity::from_stat(require_owned_regular(
-            restored.as_raw_fd(),
-            MAX_STATE_FILE_BYTES,
-        )?);
-        if restored_identity != displaced_identity {
+        )
+        .map_err(|_| invalid_state("conditional replacement rollback failed"))?;
+        sync_counted(destination_parent, &self.sync_counts, SyncKind::Jobs)
+            .map_err(|_| invalid_state("conditional replacement rollback fsync failed"))?;
+        sync_counted(
+            self.directory.as_raw_fd(),
+            &self.sync_counts,
+            SyncKind::Operations,
+        )
+        .map_err(|_| invalid_state("conditional replacement rollback fsync failed"))?;
+        let restored = stat_at(destination_parent, destination)
+            .map(PathIdentity::from_stat)
+            .map_err(|_| invalid_state("conditional replacement rollback verification failed"))?;
+        if displaced != Some(restored) {
             return Err(invalid_state(
                 "job replacement rollback did not restore the displaced entry",
             ));
         }
-        self.cleanup_entries_in_place(&[])?;
-        Err(invalid_state(
-            "job state changed during conditional atomic replacement",
-        ))
+        Ok(())
     }
 
     fn cleanup(self, fault: &AtomicU8, extra_owned: &[FileIdentity]) -> Result<(), WorkerError> {
@@ -596,36 +695,89 @@ impl OperationFile {
             self.inject_directory_swap()?;
         }
 
-        let acquired_name = random_component();
-        rename_no_replace(self.operations, &self.name, self.operations, &acquired_name)?;
-        let acquired = open_directory_at(self.operations, &acquired_name)?;
+        let (namespace_name, namespace) =
+            create_private_directory(self.operations, &self.sync_counts, SyncKind::Operations)?;
+        let acquired_name = c"operation";
+        rename_no_replace(
+            self.operations,
+            &self.name,
+            namespace.as_raw_fd(),
+            acquired_name,
+        )?;
+        let acquired = open_directory_at(namespace.as_raw_fd(), acquired_name)?;
         let acquired_identity = FileIdentity::from_stat(stat_fd(acquired.as_raw_fd())?);
         if acquired_identity != self.directory_identity {
-            restore_quarantine(self.operations, &acquired_name, self.operations, &self.name)?;
+            restore_quarantine(
+                namespace.as_raw_fd(),
+                acquired_name,
+                self.operations,
+                &self.name,
+            )?;
+            remove_empty_directory_if_identity(self.operations, &namespace_name, &namespace)?;
             return Err(invalid_state(
                 "operation directory changed before identity-bound cleanup",
             ));
         }
 
-        self.cleanup_owned_payload_links(acquired.as_raw_fd(), extra_owned)?;
+        if take_fault(
+            fault,
+            ClientStateWritePoint::SwapOperationDirectoryAfterValidationBeforeRemoval,
+        ) {
+            inject_directory_swap_at(
+                namespace.as_raw_fd(),
+                acquired_name,
+                c"post-validation-directory-sentinel",
+            )?;
+        }
+
+        let (retired_name, retired) = create_private_directory(
+            namespace.as_raw_fd(),
+            &self.sync_counts,
+            SyncKind::Operations,
+        )?;
+        self.cleanup_owned_payload_links(
+            acquired.as_raw_fd(),
+            retired.as_raw_fd(),
+            extra_owned,
+            fault,
+        )?;
         if !directory_entries(acquired.as_raw_fd())?.is_empty() {
             return Err(invalid_state(
                 "operation directory contains substituted entries",
             ));
         }
-        unlink_at(self.operations, &acquired_name, libc::AT_REMOVEDIR)?;
+        rename_no_replace(
+            namespace.as_raw_fd(),
+            acquired_name,
+            retired.as_raw_fd(),
+            acquired_name,
+        )?;
+        let final_object = open_directory_at(retired.as_raw_fd(), acquired_name)?;
+        if FileIdentity::from_stat(stat_fd(final_object.as_raw_fd())?) != self.directory_identity {
+            restore_quarantine(
+                retired.as_raw_fd(),
+                acquired_name,
+                namespace.as_raw_fd(),
+                acquired_name,
+            )?;
+            return Err(invalid_state(
+                "operation directory changed before private retirement",
+            ));
+        }
+        unlink_at(retired.as_raw_fd(), acquired_name, libc::AT_REMOVEDIR)?;
+        sync_counted(retired.as_raw_fd(), &self.sync_counts, SyncKind::Operations)?;
+        remove_empty_directory_if_identity(namespace.as_raw_fd(), &retired_name, &retired)?;
+        remove_empty_directory_if_identity(self.operations, &namespace_name, &namespace)?;
         sync_counted(self.operations, &self.sync_counts, SyncKind::Operations)?;
         Ok(())
-    }
-
-    fn cleanup_entries_in_place(&self, extra_owned: &[FileIdentity]) -> Result<(), WorkerError> {
-        self.cleanup_owned_payload_links(self.directory.as_raw_fd(), extra_owned)
     }
 
     fn cleanup_owned_payload_links(
         &self,
         directory: RawFd,
+        retirement: RawFd,
         extra_owned: &[FileIdentity],
+        fault: &AtomicU8,
     ) -> Result<(), WorkerError> {
         let mut removed = false;
         for entry in directory_entries(directory)? {
@@ -639,7 +791,29 @@ impl OperationFile {
                 MAX_STATE_FILE_BYTES,
             )?);
             if identity == self.payload_identity || extra_owned.contains(&identity) {
-                unlink_at(directory, &entry, 0)?;
+                if take_fault(
+                    fault,
+                    ClientStateWritePoint::SwapOperationChildAfterValidationBeforeRemoval,
+                ) {
+                    let preserved = random_component();
+                    rename_no_replace(directory, &entry, directory, &preserved)?;
+                    write_new_file(directory, &entry, b"post-validation-child-substitution\n")?;
+                    sync_directory(directory)?;
+                }
+                let retired_name = random_component();
+                rename_no_replace(directory, &entry, retirement, &retired_name)?;
+                let retired_entry = open_regular_at(retirement, &retired_name)?;
+                let retired_identity = FileIdentity::from_stat(require_owned_regular(
+                    retired_entry.as_raw_fd(),
+                    MAX_STATE_FILE_BYTES,
+                )?);
+                if retired_identity != identity {
+                    restore_quarantine(retirement, &retired_name, directory, &entry)?;
+                    return Err(invalid_state(
+                        "operation child changed before private retirement",
+                    ));
+                }
+                unlink_at(retirement, &retired_name, 0)?;
                 removed = true;
             }
         }
@@ -668,6 +842,24 @@ impl OperationFile {
         )
     }
 
+    fn inject_retained_payload_corruption(&self) -> Result<(), WorkerError> {
+        cvt(unsafe { libc::ftruncate(self.payload.as_raw_fd(), 0) })?;
+        let bytes = b"rollback-trigger\n";
+        let written = unsafe {
+            libc::pwrite(
+                self.payload.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                0,
+            )
+        };
+        if written != bytes.len() as libc::ssize_t {
+            return Err(WorkerError::Io(io::Error::last_os_error()));
+        }
+        cvt(unsafe { libc::fsync(self.payload.as_raw_fd()) })?;
+        Ok(())
+    }
+
     fn inject_directory_swap(&self) -> Result<(), WorkerError> {
         let original_name = random_component();
         rename_no_replace(self.operations, &self.name, self.operations, &original_name)?;
@@ -688,8 +880,8 @@ struct StateLock(OwnedFd);
 
 impl StateLock {
     fn acquire(root: RawFd, sync_counts: &SyncCounters) -> Result<Self, WorkerError> {
-        let (descriptor, created) = open_lock_file_with_creation(root)?;
-        if created {
+        let (descriptor, outcome) = open_lock_file_with_creation(root, None)?;
+        if outcome != CreationOutcome::Existing {
             sync_counted(root, sync_counts, SyncKind::Root)?;
         }
         cvt(unsafe { libc::flock(descriptor.as_raw_fd(), libc::LOCK_EX) })?;
@@ -707,6 +899,25 @@ impl Drop for StateLock {
 struct FileIdentity {
     device: libc::dev_t,
     inode: libc::ino_t,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PathIdentity {
+    file: FileIdentity,
+    kind: libc::mode_t,
+    permissions: libc::mode_t,
+    owner: libc::uid_t,
+}
+
+impl PathIdentity {
+    fn from_stat(stat: libc::stat) -> Self {
+        Self {
+            file: FileIdentity::from_stat(stat),
+            kind: file_type(stat.st_mode),
+            permissions: stat.st_mode & 0o777,
+            owner: stat.st_uid,
+        }
+    }
 }
 
 impl FileIdentity {
@@ -729,6 +940,7 @@ enum SyncKind {
 fn open_or_create_root(
     path: &Path,
     sync_counts: &Arc<SyncCounters>,
+    creation_race: &AtomicU8,
 ) -> Result<OwnedFd, WorkerError> {
     if path.as_os_str().is_empty() {
         return Err(invalid_state("state root path is empty"));
@@ -752,15 +964,26 @@ fn open_or_create_root(
         let next = match open_directory_at(current.as_raw_fd(), &name) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if take_creation_race(creation_race, ClientStateCreationRacePoint::RootComponent) {
+                    mkdir_at(current.as_raw_fd(), &name, 0o700)?;
+                }
                 let mut created = false;
+                let mut concurrent_existing = false;
                 match mkdir_at(current.as_raw_fd(), &name, 0o700) {
                     Ok(()) => created = true,
-                    Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                        concurrent_existing = true;
+                    }
                     Err(error) => return Err(WorkerError::Io(error)),
                 }
                 let directory = open_directory_at(current.as_raw_fd(), &name)?;
-                if created {
+                if created || concurrent_existing {
                     sync_counted(current.as_raw_fd(), sync_counts, SyncKind::ParentDirectory)?;
+                }
+                if concurrent_existing {
+                    sync_counts
+                        .concurrent_loser_parents
+                        .fetch_add(1, Ordering::SeqCst);
                 }
                 directory
             }
@@ -779,19 +1002,31 @@ fn open_or_create_owned_directory(
     name: &CStr,
     sync_counts: &Arc<SyncCounters>,
     sync_kind: SyncKind,
+    creation_race: &AtomicU8,
 ) -> Result<OwnedFd, WorkerError> {
     let directory = match open_directory_at(parent, name) {
         Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if take_creation_race(creation_race, ClientStateCreationRacePoint::OwnedDirectory) {
+                mkdir_at(parent, name, 0o700)?;
+            }
             let mut created = false;
+            let mut concurrent_existing = false;
             match mkdir_at(parent, name, 0o700) {
                 Ok(()) => created = true,
-                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                    concurrent_existing = true;
+                }
                 Err(error) => return Err(WorkerError::Io(error)),
             }
             let directory = open_directory_at(parent, name)?;
-            if created {
+            if created || concurrent_existing {
                 sync_counted(parent, sync_counts, sync_kind)?;
+            }
+            if concurrent_existing {
+                sync_counts
+                    .concurrent_loser_parents
+                    .fetch_add(1, Ordering::SeqCst);
             }
             directory
         }
@@ -801,16 +1036,35 @@ fn open_or_create_owned_directory(
     Ok(directory)
 }
 
-fn ensure_lock_file(root: RawFd, sync_counts: &Arc<SyncCounters>) -> Result<(), WorkerError> {
-    let (descriptor, created) = open_lock_file_with_creation(root)?;
+fn ensure_lock_file(
+    root: RawFd,
+    sync_counts: &Arc<SyncCounters>,
+    creation_race: &AtomicU8,
+) -> Result<(), WorkerError> {
+    let (descriptor, outcome) = open_lock_file_with_creation(root, Some(creation_race))?;
     drop(descriptor);
-    if created {
+    if outcome != CreationOutcome::Existing {
         sync_counted(root, sync_counts, SyncKind::Root)?;
+    }
+    if outcome == CreationOutcome::ConcurrentExisting {
+        sync_counts
+            .concurrent_loser_parents
+            .fetch_add(1, Ordering::SeqCst);
     }
     Ok(())
 }
 
-fn open_lock_file_with_creation(root: RawFd) -> Result<(OwnedFd, bool), WorkerError> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreationOutcome {
+    Existing,
+    Created,
+    ConcurrentExisting,
+}
+
+fn open_lock_file_with_creation(
+    root: RawFd,
+    creation_race: Option<&AtomicU8>,
+) -> Result<(OwnedFd, CreationOutcome), WorkerError> {
     let open_existing = || {
         cvt_fd(unsafe {
             libc::openat(
@@ -820,29 +1074,54 @@ fn open_lock_file_with_creation(root: RawFd) -> Result<(OwnedFd, bool), WorkerEr
             )
         })
     };
-    let (descriptor, created) = match open_existing() {
-        Ok(descriptor) => (descriptor, false),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => match cvt_fd(unsafe {
-            libc::openat(
-                root,
-                LOCK_NAME.as_ptr(),
-                libc::O_RDWR
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW
-                    | libc::O_NONBLOCK,
-                0o600,
-            )
-        }) {
-            Ok(descriptor) => (descriptor, true),
-            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => (open_existing()?, false),
-            Err(error) => return Err(WorkerError::Io(error)),
-        },
+    let (descriptor, outcome) = match open_existing() {
+        Ok(descriptor) => (descriptor, CreationOutcome::Existing),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if creation_race.is_some_and(|race| {
+                take_creation_race(race, ClientStateCreationRacePoint::LockFile)
+            }) {
+                drop(create_lock_file(root)?);
+            }
+            match cvt_fd(unsafe {
+                libc::openat(
+                    root,
+                    LOCK_NAME.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW
+                        | libc::O_NONBLOCK,
+                    0o600,
+                )
+            }) {
+                Ok(descriptor) => (descriptor, CreationOutcome::Created),
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                    (open_existing()?, CreationOutcome::ConcurrentExisting)
+                }
+                Err(error) => return Err(WorkerError::Io(error)),
+            }
+        }
         Err(error) => return Err(WorkerError::Io(error)),
     };
     require_owned_regular(descriptor.as_raw_fd(), 0)?;
-    Ok((descriptor, created))
+    Ok((descriptor, outcome))
+}
+
+fn create_lock_file(root: RawFd) -> io::Result<OwnedFd> {
+    cvt_fd(unsafe {
+        libc::openat(
+            root,
+            LOCK_NAME.as_ptr(),
+            libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK,
+            0o600,
+        )
+    })
 }
 
 fn validate_root_entries(root: RawFd) -> Result<(), WorkerError> {
@@ -912,18 +1191,20 @@ fn require_owned_directory(descriptor: RawFd) -> Result<(), WorkerError> {
 
 fn require_owned_regular(descriptor: RawFd, max_size: usize) -> Result<libc::stat, WorkerError> {
     let stat = stat_fd(descriptor)?;
-    if file_type(stat.st_mode) != libc::S_IFREG
-        || stat.st_uid != effective_user_id()
-        || stat.st_mode & 0o777 != 0o600
-    {
+    if !is_owned_regular_stat(&stat, max_size) {
         return Err(invalid_state(
             "state file is not an owner-only regular file",
         ));
     }
-    if stat.st_size < 0 || stat.st_size as usize > max_size {
-        return Err(invalid_state("state file exceeds its size limit"));
-    }
     Ok(stat)
+}
+
+fn is_owned_regular_stat(stat: &libc::stat, max_size: usize) -> bool {
+    file_type(stat.st_mode) == libc::S_IFREG
+        && stat.st_uid == effective_user_id()
+        && stat.st_mode & 0o777 == 0o600
+        && stat.st_size >= 0
+        && stat.st_size as usize <= max_size
 }
 
 fn read_regular_optional(
@@ -1154,21 +1435,127 @@ fn remove_entry_if_identity(
     parent: RawFd,
     name: &CStr,
     expected: FileIdentity,
+    fault: &AtomicU8,
+    sync_counts: &Arc<SyncCounters>,
 ) -> Result<(), WorkerError> {
-    let quarantine = random_component();
-    rename_no_replace(parent, name, parent, &quarantine)?;
-    let acquired = open_regular_at(parent, &quarantine)?;
+    let (namespace_name, namespace) =
+        create_private_directory(parent, sync_counts, SyncKind::Jobs)?;
+    let acquired_name = c"published";
+    rename_no_replace(parent, name, namespace.as_raw_fd(), acquired_name)?;
+    let acquired = open_regular_at(namespace.as_raw_fd(), acquired_name)?;
     let identity = FileIdentity::from_stat(require_owned_regular(
         acquired.as_raw_fd(),
         MAX_STATE_FILE_BYTES,
     )?);
     if identity != expected {
-        restore_quarantine(parent, &quarantine, parent, name)?;
+        restore_quarantine(namespace.as_raw_fd(), acquired_name, parent, name)?;
+        remove_empty_directory_if_identity(parent, &namespace_name, &namespace)?;
         return Err(invalid_state(
             "published entry changed before identity-bound rollback",
         ));
     }
-    unlink_at(parent, &quarantine, 0)?;
+
+    if take_fault(
+        fault,
+        ClientStateWritePoint::SwapPublishedRollbackAfterValidationBeforeRemoval,
+    ) {
+        let preserved = random_component();
+        rename_no_replace(
+            namespace.as_raw_fd(),
+            acquired_name,
+            namespace.as_raw_fd(),
+            &preserved,
+        )?;
+        write_new_file(
+            namespace.as_raw_fd(),
+            acquired_name,
+            b"post-validation-published-substitution\n",
+        )?;
+        sync_directory(namespace.as_raw_fd())?;
+    }
+
+    let (retired_name, retired) =
+        create_private_directory(namespace.as_raw_fd(), sync_counts, SyncKind::Operations)?;
+    rename_no_replace(
+        namespace.as_raw_fd(),
+        acquired_name,
+        retired.as_raw_fd(),
+        acquired_name,
+    )?;
+    let final_entry = open_regular_at(retired.as_raw_fd(), acquired_name)?;
+    let final_identity = FileIdentity::from_stat(require_owned_regular(
+        final_entry.as_raw_fd(),
+        MAX_STATE_FILE_BYTES,
+    )?);
+    if final_identity != expected {
+        restore_quarantine(
+            retired.as_raw_fd(),
+            acquired_name,
+            namespace.as_raw_fd(),
+            acquired_name,
+        )?;
+        return Err(invalid_state(
+            "published entry changed before private retirement",
+        ));
+    }
+    unlink_at(retired.as_raw_fd(), acquired_name, 0)?;
+    sync_directory(retired.as_raw_fd())?;
+    remove_empty_directory_if_identity(namespace.as_raw_fd(), &retired_name, &retired)?;
+    remove_empty_directory_if_identity(parent, &namespace_name, &namespace)?;
+    sync_directory(parent)
+}
+
+fn create_private_directory(
+    parent: RawFd,
+    sync_counts: &Arc<SyncCounters>,
+    kind: SyncKind,
+) -> Result<(CString, OwnedFd), WorkerError> {
+    for _ in 0..16 {
+        let name = random_component();
+        match mkdir_at(parent, &name, 0o700) {
+            Ok(()) => {
+                sync_counted(parent, sync_counts, kind)?;
+                let directory = open_directory_at(parent, &name)?;
+                require_owned_directory(directory.as_raw_fd())?;
+                return Ok((name, directory));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+    }
+    Err(WorkerError::Io(io::Error::from_raw_os_error(libc::EEXIST)))
+}
+
+fn remove_empty_directory_if_identity(
+    parent: RawFd,
+    name: &CStr,
+    directory: &OwnedFd,
+) -> Result<(), WorkerError> {
+    if !directory_entries(directory.as_raw_fd())?.is_empty() {
+        return Err(invalid_state("private retirement directory is not empty"));
+    }
+    let opened = FileIdentity::from_stat(stat_fd(directory.as_raw_fd())?);
+    let current = FileIdentity::from_stat(stat_at(parent, name)?);
+    if opened != current {
+        return Err(invalid_state(
+            "private retirement directory identity changed",
+        ));
+    }
+    unlink_at(parent, name, libc::AT_REMOVEDIR)?;
+    Ok(())
+}
+
+fn inject_directory_swap_at(
+    parent: RawFd,
+    name: &CStr,
+    sentinel_name: &CStr,
+) -> Result<(), WorkerError> {
+    let preserved = random_component();
+    rename_no_replace(parent, name, parent, &preserved)?;
+    mkdir_at(parent, name, 0o700)?;
+    let replacement = open_directory_at(parent, name)?;
+    write_new_file(replacement.as_raw_fd(), sentinel_name, b"sentinel\n")?;
+    sync_directory(replacement.as_raw_fd())?;
     sync_directory(parent)
 }
 
@@ -1182,14 +1569,71 @@ fn restore_quarantine(
         .map_err(WorkerError::Io)
 }
 
-fn inject_live_job_swap(parent: RawFd, name: &CStr) -> Result<(), WorkerError> {
+fn take_live_job_swap_fault(fault: &AtomicU8) -> Option<ClientStateWritePoint> {
+    let point = match fault.load(Ordering::SeqCst) {
+        value if value == ClientStateWritePoint::SwapLiveJobBeforeReplace as u8 => {
+            ClientStateWritePoint::SwapLiveJobBeforeReplace
+        }
+        value if value == ClientStateWritePoint::SwapLiveJobWithSymlinkBeforeReplace as u8 => {
+            ClientStateWritePoint::SwapLiveJobWithSymlinkBeforeReplace
+        }
+        value if value == ClientStateWritePoint::SwapLiveJobWithDirectoryBeforeReplace as u8 => {
+            ClientStateWritePoint::SwapLiveJobWithDirectoryBeforeReplace
+        }
+        value if value == ClientStateWritePoint::SwapLiveJobWithFifoBeforeReplace as u8 => {
+            ClientStateWritePoint::SwapLiveJobWithFifoBeforeReplace
+        }
+        value
+            if value == ClientStateWritePoint::SwapLiveJobWithPermissiveFileBeforeReplace as u8 =>
+        {
+            ClientStateWritePoint::SwapLiveJobWithPermissiveFileBeforeReplace
+        }
+        _ => return None,
+    };
+    take_fault(fault, point).then_some(point)
+}
+
+fn inject_live_job_swap(
+    parent: RawFd,
+    name: &CStr,
+    point: ClientStateWritePoint,
+) -> Result<(), WorkerError> {
     let original = random_component();
     rename_no_replace(parent, name, parent, &original)?;
-    let replacement = create_regular_at(parent, name)?;
-    let mut replacement = File::from(replacement);
-    replacement.write_all(b"injected-live-replacement\n")?;
-    replacement.sync_all()?;
+    match point {
+        ClientStateWritePoint::SwapLiveJobBeforeReplace => {
+            write_new_file(parent, name, b"injected-live-replacement\n")?;
+        }
+        ClientStateWritePoint::SwapLiveJobWithSymlinkBeforeReplace => {
+            cvt(unsafe { libc::symlinkat(c"swap-target".as_ptr(), parent, name.as_ptr()) })?;
+        }
+        ClientStateWritePoint::SwapLiveJobWithDirectoryBeforeReplace => {
+            mkdir_at(parent, name, 0o700)?;
+            let directory = open_directory_at(parent, name)?;
+            write_new_file(directory.as_raw_fd(), c"sentinel", b"sentinel\n")?;
+            sync_directory(directory.as_raw_fd())?;
+        }
+        ClientStateWritePoint::SwapLiveJobWithFifoBeforeReplace => {
+            cvt(unsafe { libc::mkfifoat(parent, name.as_ptr(), 0o600) })?;
+        }
+        ClientStateWritePoint::SwapLiveJobWithPermissiveFileBeforeReplace => {
+            let replacement = create_regular_at(parent, name)?;
+            cvt(unsafe { libc::fchmod(replacement.as_raw_fd(), 0o644) })?;
+            let mut replacement = File::from(replacement);
+            replacement.write_all(b"permissive-live-substitution\n")?;
+            replacement.sync_all()?;
+        }
+        _ => return Err(invalid_state("invalid live job swap injection")),
+    }
     sync_directory(parent)
+}
+
+fn write_new_file(parent: RawFd, name: &CStr, bytes: &[u8]) -> Result<(), WorkerError> {
+    let descriptor = create_regular_at(parent, name)?;
+    let mut file = File::from(descriptor);
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn random_component() -> CString {
@@ -1199,6 +1643,19 @@ fn random_component() -> CString {
 fn stat_fd(descriptor: RawFd) -> Result<libc::stat, WorkerError> {
     let mut stat = MaybeUninit::<libc::stat>::zeroed();
     cvt(unsafe { libc::fstat(descriptor, stat.as_mut_ptr()) }).map_err(WorkerError::Io)?;
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn stat_at(parent: RawFd, name: &CStr) -> io::Result<libc::stat> {
+    let mut stat = MaybeUninit::<libc::stat>::zeroed();
+    cvt(unsafe {
+        libc::fstatat(
+            parent,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })?;
     Ok(unsafe { stat.assume_init() })
 }
 
@@ -1223,6 +1680,12 @@ fn sync_counted(
 }
 
 fn take_fault(fault: &AtomicU8, point: ClientStateWritePoint) -> bool {
+    fault
+        .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+fn take_creation_race(fault: &AtomicU8, point: ClientStateCreationRacePoint) -> bool {
     fault
         .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
@@ -1271,6 +1734,27 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
             "after operation directory substitution"
         }
         ClientStateWritePoint::SwapLiveJobBeforeReplace => "after live job substitution",
+        ClientStateWritePoint::SwapOperationDirectoryAfterValidationBeforeRemoval => {
+            "after validated operation directory substitution"
+        }
+        ClientStateWritePoint::SwapOperationChildAfterValidationBeforeRemoval => {
+            "after validated operation child substitution"
+        }
+        ClientStateWritePoint::SwapPublishedRollbackAfterValidationBeforeRemoval => {
+            "after validated published rollback substitution"
+        }
+        ClientStateWritePoint::SwapLiveJobWithSymlinkBeforeReplace => {
+            "after symlink live job substitution"
+        }
+        ClientStateWritePoint::SwapLiveJobWithDirectoryBeforeReplace => {
+            "after directory live job substitution"
+        }
+        ClientStateWritePoint::SwapLiveJobWithFifoBeforeReplace => {
+            "after fifo live job substitution"
+        }
+        ClientStateWritePoint::SwapLiveJobWithPermissiveFileBeforeReplace => {
+            "after permissive live job substitution"
+        }
     };
     WorkerError::Io(io::Error::other(format!(
         "injected local state failure {label}"
