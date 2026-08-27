@@ -1,27 +1,38 @@
 mod support;
 
 use std::{
+    collections::BTreeSet,
     ffi::OsStr,
     fs, io,
     os::unix::{
         ffi::OsStrExt,
         fs::{PermissionsExt, symlink},
+        process::ExitStatusExt,
     },
     path::{Path, PathBuf},
-    sync::Mutex,
+    process::ExitStatus,
+    sync::{Arc, Barrier, Mutex},
+    time::Instant,
 };
 
 use mac_worker::{
     error::WorkerError,
-    inputs::{InputOrigin, InputSelection, InputSelector},
+    inputs::{
+        InputOrigin, InputSelection, InputSelector, RelativePath, SelectedInput, SelectedInputKind,
+    },
     manifest::{ManifestEntry, ManifestEntryKind, SnapshotManifest},
-    process::SystemProcessRunner,
+    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project::{ProjectContext, ProjectInspector},
     project_config::SnapshotSettings,
     snapshot::{Snapshot, SnapshotBuilder, SnapshotHook},
 };
+use proptest::{prelude::*, test_runner::Config as ProptestConfig};
 
 use support::{GitRepo, create_directory};
+
+const MANIFEST_PROPERTY_CASES: u32 = 256;
+const MAX_MANIFEST_PATH_BYTES: usize = 1_024;
+const MUTATION_CAPTURE_COUNT: usize = 1_000;
 
 fn settings(include_untracked: &[&str], include_empty_dirs: &[&str]) -> SnapshotSettings {
     SnapshotSettings {
@@ -114,6 +125,87 @@ fn base_manifest() -> SnapshotManifest {
             },
         ],
         tracked_deletions: vec!["z-deleted".into(), "a-deleted".into()],
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: MANIFEST_PROPERTY_CASES,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn shuffled_manifest_entries_have_identical_canonical_bytes_and_digest(
+        payloads in prop::array::uniform8(any::<u8>()),
+        entry_order in prop::array::uniform8(any::<u16>()),
+        deletion_order in prop::array::uniform4(any::<u16>()),
+    ) {
+        // Catches canonicalization depending on caller insertion order. The
+        // exact wire-format fixture below independently protects field order.
+        let entries = payloads
+            .into_iter()
+            .enumerate()
+            .map(|(index, payload)| ManifestEntry {
+                path: format!("generated/{index:02}-β {payload:03}"),
+                kind: ManifestEntryKind::File,
+                mode: if payload & 1 == 0 { 0o644 } else { 0o755 },
+                size: u64::from(payload),
+                sha256: format!("{payload:02x}").repeat(32),
+                symlink_target: None,
+            })
+            .collect::<Vec<_>>();
+        let tracked_deletions = (0..4)
+            .map(|index| format!("deleted/{index:02}-line\\nname"))
+            .collect::<Vec<_>>();
+        prop_assert!(entries.iter().all(|entry| entry.path.len() <= MAX_MANIFEST_PATH_BYTES));
+        prop_assert!(tracked_deletions.iter().all(|path| path.len() <= MAX_MANIFEST_PATH_BYTES));
+
+        let manifest = SnapshotManifest {
+            version: 1,
+            project_id: "property-project".into(),
+            worktree_id: "property-worktree".into(),
+            head: Some("0123456789abcdef".into()),
+            branch: Some("property".into()),
+            dirty: true,
+            relative_working_dir: "nested".into(),
+            entries,
+            tracked_deletions,
+        };
+        let mut shuffled = manifest.clone();
+        let mut keyed_entries = shuffled
+            .entries
+            .drain(..)
+            .enumerate()
+            .collect::<Vec<_>>();
+        keyed_entries.sort_by_key(|(index, _)| (entry_order[*index], *index));
+        shuffled.entries = keyed_entries.into_iter().map(|(_, entry)| entry).collect();
+        if shuffled.entries == manifest.entries {
+            shuffled.entries.rotate_left(1);
+        }
+        let mut keyed_deletions = shuffled
+            .tracked_deletions
+            .drain(..)
+            .enumerate()
+            .collect::<Vec<_>>();
+        keyed_deletions.sort_by_key(|(index, _)| (deletion_order[*index], *index));
+        shuffled.tracked_deletions = keyed_deletions
+            .into_iter()
+            .map(|(_, deletion)| deletion)
+            .collect();
+        if shuffled.tracked_deletions == manifest.tracked_deletions {
+            shuffled.tracked_deletions.rotate_left(1);
+        }
+
+        prop_assert_ne!(&shuffled.entries, &manifest.entries);
+        prop_assert_ne!(&shuffled.tracked_deletions, &manifest.tracked_deletions);
+        let canonical = manifest.canonical_bytes().unwrap();
+        prop_assert!(
+            canonical.starts_with(br#"{"version":1,"project_id":"property-project""#),
+            "canonical manifest prefix changed"
+        );
+        prop_assert_eq!(shuffled.canonical_bytes().unwrap(), canonical);
+        prop_assert_eq!(shuffled.digest().unwrap(), manifest.digest().unwrap());
     }
 }
 
@@ -739,6 +831,168 @@ fn every_enumerated_source_mutation_is_rejected_without_publication() {
     }
 }
 
+struct SinglePathSelectionRunner {
+    path: String,
+}
+
+impl ProcessRunner for SinglePathSelectionRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        assert_eq!(request.program, OsStr::new("/usr/bin/git"));
+        let (status, stdout) = if request.args.iter().any(|argument| argument == "--stage") {
+            (
+                ExitStatus::from_raw(0),
+                format!(
+                    "100644 0123456789012345678901234567890123456789 0\t{}\0",
+                    self.path
+                )
+                .into_bytes(),
+            )
+        } else if request
+            .args
+            .iter()
+            .any(|argument| argument == "--get-regexp")
+        {
+            (ExitStatus::from_raw(1 << 8), Vec::new())
+        } else if request.args.iter().any(|argument| argument == "check-attr") {
+            (
+                ExitStatus::from_raw(0),
+                [self.path.as_bytes(), b"\0filter\0unspecified\0"].concat(),
+            )
+        } else {
+            (ExitStatus::from_raw(0), Vec::new())
+        };
+        Ok(ProcessResult {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        })
+    }
+}
+
+fn assert_snapshot_capture_roots_empty(cache: &Path) {
+    for root in [
+        cache.join("snapshots/staging"),
+        cache.join("snapshots/ready"),
+    ] {
+        if !root.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&root).unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(
+                entry.file_name(),
+                ".mac-worker-rooted-fs",
+                "unexpected capture residue under {}",
+                root.display()
+            );
+            assert!(entry.file_type().unwrap().is_dir());
+            assert!(
+                fs::read_dir(entry.path()).unwrap().next().is_none(),
+                "private capture cleanup residue remained under {}",
+                root.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn one_thousand_deterministic_source_mutations_publish_zero_snapshots() {
+    // Catches accepting even one hybrid capture at the binding 1,000-edit
+    // go/no-go threshold while proving every owned partial is removed.
+    let source = tempfile::tempdir().unwrap();
+    create_directory(source.path().join("matrix"));
+    let root = fs::canonicalize(source.path()).unwrap();
+    let context = ProjectContext {
+        root: root.clone(),
+        relative_cwd: PathBuf::new(),
+        git_dir: root.join(".git"),
+        common_dir: root.join(".git"),
+        head: Some("0123456789012345678901234567890123456789".into()),
+        branch: Some("matrix".into()),
+        project_id: "matrix-project".into(),
+        worktree_id: "matrix-worktree".into(),
+        dirty: true,
+    };
+    let settings = settings(&[], &[]);
+    let cache = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let mut successful_publications = 0;
+    let mut mutated_paths = BTreeSet::new();
+
+    for index in 0..MUTATION_CAPTURE_COUNT {
+        let relative = format!("matrix/capture-{index:04}.bin");
+        assert!(mutated_paths.insert(relative.clone()));
+        let source_path = root.join(&relative);
+        fs::write(&source_path, format!("before-{index:04}\n")).unwrap();
+        let path = RelativePath::parse(relative.as_bytes()).unwrap();
+        let initial = InputSelection {
+            entries: vec![SelectedInput {
+                path: path.clone(),
+                origin: InputOrigin::Tracked,
+                kind: SelectedInputKind::FilesystemEntry,
+            }],
+            tracked_deletions: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let runner = SinglePathSelectionRunner {
+            path: relative.clone(),
+        };
+        let hook_path = source_path.clone();
+        let hook = RecordingHook::new(move |_tree: &Path| {
+            fs::write(&hook_path, format!("after--{index:04}\n"))
+        });
+
+        match SnapshotBuilder::with_hook(&runner, cache.path(), &hook)
+            .capture(&context, &settings, initial)
+        {
+            Ok(snapshot) => {
+                successful_publications += 1;
+                snapshot.cleanup().unwrap();
+                break;
+            }
+            Err(error) => assert!(
+                matches!(
+                    error,
+                    WorkerError::Snapshot {
+                        code: "SNAPSHOT_CHANGED",
+                        ..
+                    }
+                ),
+                "capture {index} returned {error}"
+            ),
+        }
+
+        let capture_id = hook.capture_id();
+        assert!(
+            !cache
+                .path()
+                .join("snapshots/staging")
+                .join(format!(".partial-{capture_id}"))
+                .exists(),
+            "capture {index} retained its partial tree"
+        );
+        assert!(
+            !cache
+                .path()
+                .join("snapshots/ready")
+                .join(capture_id)
+                .exists(),
+            "capture {index} reached ready publication"
+        );
+        assert_snapshot_capture_roots_empty(cache.path());
+        fs::remove_file(source_path).unwrap();
+    }
+
+    let elapsed = started.elapsed();
+    eprintln!(
+        "mutation matrix: {MUTATION_CAPTURE_COUNT} captures in {:.3}s",
+        elapsed.as_secs_f64()
+    );
+    assert_eq!(successful_publications, 0);
+    assert_eq!(mutated_paths.len(), MUTATION_CAPTURE_COUNT);
+    assert_snapshot_capture_roots_empty(cache.path());
+}
+
 #[test]
 fn initially_non_utf8_symlink_target_is_unsupported_path_encoding() {
     // Catches treating an unsupported input present before materialization as
@@ -776,6 +1030,7 @@ fn capture_preserves_binary_and_unusual_names_without_git_or_inline_manifest() {
     let unusual = "fixtures/привет\nданные.bin";
     let binary = b"\0\xffbinary\n\0";
     repo.write(unusual, binary);
+    repo.write("fixtures/zero.bin", b"");
     repo.write("bin/tool", b"#!/bin/sh\nexit 0\n");
     fs::set_permissions(
         repo.root().join("bin/tool"),
@@ -783,6 +1038,11 @@ fn capture_preserves_binary_and_unusual_names_without_git_or_inline_manifest() {
     )
     .unwrap();
     symlink("../bin/tool\n", repo.root().join("tool-link")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_target = outside.path().join("must-not-dereference.txt");
+    let outside_bytes = b"outside symlink target bytes must not be captured\n";
+    fs::write(&outside_target, outside_bytes).unwrap();
+    symlink(&outside_target, repo.root().join("absolute-link")).unwrap();
     repo.commit_all("track unusual snapshot inputs");
     let cache = tempfile::tempdir().unwrap();
 
@@ -790,8 +1050,30 @@ fn capture_preserves_binary_and_unusual_names_without_git_or_inline_manifest() {
 
     assert_eq!(fs::read(snapshot.root.join(unusual)).unwrap(), binary);
     assert_eq!(
+        fs::read(snapshot.root.join("fixtures/zero.bin")).unwrap(),
+        b""
+    );
+    assert_eq!(entry(&snapshot, "fixtures/zero.bin").size, 0);
+    assert_eq!(
+        entry(&snapshot, "fixtures/zero.bin").sha256,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
         fs::read_link(snapshot.root.join("tool-link")).unwrap(),
         PathBuf::from("../bin/tool\n")
+    );
+    assert_eq!(
+        fs::read_link(snapshot.root.join("absolute-link")).unwrap(),
+        outside_target
+    );
+    assert_eq!(fs::read(&outside_target).unwrap(), outside_bytes);
+    assert!(
+        !snapshot
+            .manifest
+            .canonical_bytes()
+            .unwrap()
+            .windows(outside_bytes.len())
+            .any(|window| window == outside_bytes)
     );
     assert!(!contains_component_named(&snapshot.root, ".git"));
     assert!(!snapshot.root.join("manifest.json").exists());
@@ -804,13 +1086,142 @@ fn capture_preserves_binary_and_unusual_names_without_git_or_inline_manifest() {
         snapshot.manifest.canonical_bytes().unwrap()
     );
     assert_eq!(snapshot.digest, snapshot.manifest.digest().unwrap());
-    assert_eq!(snapshot.file_count, 3);
+    assert_eq!(snapshot.file_count, 5);
     assert_eq!(
         snapshot.total_bytes,
-        binary.len() as u64 + b"#!/bin/sh\nexit 0\n".len() as u64 + b"../bin/tool\n".len() as u64
+        binary.len() as u64
+            + b"#!/bin/sh\nexit 0\n".len() as u64
+            + b"../bin/tool\n".len() as u64
+            + outside_target.as_os_str().as_bytes().len() as u64
     );
 
     snapshot.cleanup().unwrap();
+}
+
+#[test]
+fn capture_preserves_a_255_byte_utf8_filename_when_supported() {
+    // Catches character-count truncation or lossy normalization at the common
+    // 255-byte component boundary. Only ENAMETOOLONG permits this one skip.
+    let repo = GitRepo::init();
+    let name = format!("{}a", "é".repeat(127));
+    assert_eq!(name.len(), 255);
+    let bytes = b"maximum UTF-8 filename bytes\n";
+    match fs::write(repo.root().join(&name), bytes) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+            eprintln!("255-byte UTF-8 filename unsupported: ENAMETOOLONG");
+            return;
+        }
+        Err(error) => panic!("255-byte UTF-8 filename creation failed: {error}"),
+    }
+    repo.commit_all("track maximum UTF-8 filename");
+    let cache = tempfile::tempdir().unwrap();
+
+    let snapshot = capture(&repo, cache.path(), &settings(&[], &[]));
+
+    assert_eq!(fs::read(snapshot.root.join(&name)).unwrap(), bytes);
+    assert_eq!(entry(&snapshot, &name).path.len(), 255);
+    snapshot.cleanup().unwrap();
+    assert_snapshot_capture_roots_empty(cache.path());
+}
+
+struct BarrierHook {
+    barrier: Arc<Barrier>,
+}
+
+impl SnapshotHook for BarrierHook {
+    fn after_materialization(&self, _tree: &Path) -> io::Result<()> {
+        self.barrier.wait();
+        Ok(())
+    }
+}
+
+#[test]
+fn simultaneous_linked_worktree_captures_have_isolated_exact_cleanup() {
+    // Catches shared cache publication or cleanup crossing from one linked
+    // worktree's capture into another live immutable snapshot.
+    let repo = GitRepo::init();
+    repo.write("tracked.bin", b"\0linked-worktree-bytes\xff\n");
+    repo.write(
+        "nested/readable.txt",
+        b"still readable after sibling cleanup\n",
+    );
+    repo.commit_all("track concurrent capture fixture");
+    let linked_parent = tempfile::tempdir().unwrap();
+    let linked_root = linked_parent.path().join("linked");
+    assert!(
+        repo.git(&[
+            "worktree",
+            "add",
+            "--detach",
+            linked_root.to_str().unwrap(),
+            "HEAD",
+        ])
+        .status
+        .success()
+    );
+    let primary_context = inspect(&repo);
+    let linked_context = ProjectInspector::new(&SystemProcessRunner)
+        .inspect(&linked_root)
+        .unwrap();
+    let settings = settings(&[], &[]);
+    let primary_initial = select(&primary_context, &settings);
+    let linked_initial = select(&linked_context, &settings);
+    let cache = tempfile::tempdir().unwrap();
+    let hook = BarrierHook {
+        barrier: Arc::new(Barrier::new(2)),
+    };
+
+    let (primary, linked) = std::thread::scope(|scope| {
+        let primary_handle = scope.spawn(|| {
+            SnapshotBuilder::with_hook(&SystemProcessRunner, cache.path(), &hook)
+                .capture(&primary_context, &settings, primary_initial)
+                .unwrap()
+        });
+        let linked_handle = scope.spawn(|| {
+            SnapshotBuilder::with_hook(&SystemProcessRunner, cache.path(), &hook)
+                .capture(&linked_context, &settings, linked_initial)
+                .unwrap()
+        });
+        (
+            primary_handle.join().unwrap(),
+            linked_handle.join().unwrap(),
+        )
+    });
+
+    assert_ne!(primary.capture_id, linked.capture_id);
+    assert_eq!(
+        primary.manifest.project_id, linked.manifest.project_id,
+        "linked worktrees must retain shared project identity"
+    );
+    assert_ne!(primary.manifest.worktree_id, linked.manifest.worktree_id);
+    let primary_container = primary.root.parent().unwrap().to_path_buf();
+    let linked_manifest_bytes = fs::read(&linked.manifest_path).unwrap();
+    let linked_binary_bytes = fs::read(linked.root.join("tracked.bin")).unwrap();
+    let linked_readable_bytes = fs::read(linked.root.join("nested/readable.txt")).unwrap();
+
+    primary.cleanup().unwrap();
+
+    assert!(!primary_container.exists());
+    assert_eq!(
+        fs::read(&linked.manifest_path).unwrap(),
+        linked_manifest_bytes
+    );
+    assert_eq!(
+        fs::read(linked.root.join("tracked.bin")).unwrap(),
+        linked_binary_bytes
+    );
+    assert_eq!(
+        fs::read(linked.root.join("nested/readable.txt")).unwrap(),
+        linked_readable_bytes
+    );
+    assert_eq!(
+        linked.manifest.canonical_bytes().unwrap(),
+        linked_manifest_bytes
+    );
+
+    linked.cleanup().unwrap();
+    assert_snapshot_capture_roots_empty(cache.path());
 }
 
 fn contains_component_named(root: &Path, wanted: &str) -> bool {

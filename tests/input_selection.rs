@@ -17,8 +17,116 @@ use mac_worker::{
     project::{ProjectContext, ProjectInspector},
     project_config::SnapshotSettings,
 };
+use proptest::{prelude::*, test_runner::Config as ProptestConfig};
 
 use support::{GitRepo, create_directory};
+
+const PROPERTY_CASES: u32 = 256;
+const MAX_GENERATED_PATH_BYTES: usize = 1_024;
+
+fn generated_component() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop_oneof![
+            Just('a'),
+            Just('Z'),
+            Just('0'),
+            Just('-'),
+            Just('_'),
+            Just(' '),
+            Just('\t'),
+            Just('\n'),
+            Just('é'),
+            Just('界'),
+            Just('🙂'),
+        ],
+        1..=24,
+    )
+    .prop_map(|characters| {
+        let mut component = String::from("c");
+        component.extend(characters);
+        component
+    })
+}
+
+fn valid_relative_path() -> impl Strategy<Value = String> {
+    prop::collection::vec(generated_component(), 0..=8).prop_map(|mut generated| {
+        let mut components = vec![
+            "space name".to_owned(),
+            "tab\tname".to_owned(),
+            "line\nname".to_owned(),
+            "é界🙂".to_owned(),
+        ];
+        components.append(&mut generated);
+        components.join("/")
+    })
+}
+
+fn plain_component() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop_oneof![
+            Just('a'),
+            Just('b'),
+            Just('Z'),
+            Just('0'),
+            Just('-'),
+            Just('_')
+        ],
+        1..=32,
+    )
+    .prop_map(|characters| characters.into_iter().collect())
+}
+
+fn invalid_relative_path() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        plain_component().prop_map(|component| format!("/{component}").into_bytes()),
+        plain_component().prop_map(|component| format!("../{component}").into_bytes()),
+        (plain_component(), plain_component())
+            .prop_map(|(left, right)| format!("{left}/../{right}").into_bytes()),
+        (plain_component(), plain_component())
+            .prop_map(|(left, right)| format!("{left}/./{right}").into_bytes()),
+        plain_component().prop_map(|component| format!(".git/{component}").into_bytes()),
+        (plain_component(), plain_component())
+            .prop_map(|(left, right)| format!("{left}/.git/{right}").into_bytes()),
+        (plain_component(), plain_component())
+            .prop_map(|(left, right)| format!("{left}//{right}").into_bytes()),
+        (plain_component(), plain_component())
+            .prop_map(|(left, right)| format!("{left}\\{right}").into_bytes()),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: PROPERTY_CASES,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn relative_path_parse_display_and_reparse_are_stable(raw in valid_relative_path()) {
+        // Catches lossy UTF-8 handling, whitespace splitting, diagnostic
+        // control-byte leakage, and serialization that cannot be reparsed.
+        prop_assert!(raw.len() <= MAX_GENERATED_PATH_BYTES);
+        let parsed = RelativePath::parse(raw.as_bytes()).expect("generated path is valid");
+        prop_assert_eq!(parsed.as_str().as_bytes(), raw.as_bytes());
+
+        let expected_display = raw.replace('\t', "\\t").replace('\n', "\\n");
+        prop_assert_eq!(parsed.to_string(), expected_display);
+
+        let reparsed = RelativePath::parse(parsed.as_str().as_bytes())
+            .expect("serialized valid path remains valid");
+        prop_assert_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn absolute_traversal_and_reserved_paths_are_rejected(raw in invalid_relative_path()) {
+        // Catches weakening any absolute, traversal, separator, or .git
+        // rejection branch while keeping generated failures bounded.
+        prop_assert!(raw.len() <= MAX_GENERATED_PATH_BYTES);
+        let error = RelativePath::parse(&raw).expect_err("generated path is invalid");
+        prop_assert_eq!(error.code, "INVALID_PATH");
+        prop_assert_eq!(error.total_path_count, 0);
+    }
+}
 
 fn settings(
     include_untracked: &[&str],

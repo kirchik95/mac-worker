@@ -21,9 +21,12 @@ use mac_worker::{
     config::{Config, WorkerEntry},
     doctor::{DoctorRequest, DoctorService},
     error::{ExitKind, WorkerError},
+    inputs::InputSelector,
     output::CommandOutput,
     paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    project::ProjectInspector,
+    project_config::SnapshotSettings,
     protocol::{
         DoctorIssue, DoctorProject, DoctorReport, HealthStatus, IssueSeverity, MemoryPressure,
         PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
@@ -402,6 +405,30 @@ fn assert_isolated_snapshot_state(runtime: &IsolatedRuntime, infrastructure_expe
         !runtime.fallback_cache.exists(),
         "doctor selected the runtime home's fallback cache instead of isolated XDG cache"
     );
+}
+
+fn regular_files_below(root: &Path, files: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => panic!("could not inspect {}: {error}", root.display()),
+    };
+    for entry in entries {
+        let entry = entry.unwrap();
+        let metadata = fs::symlink_metadata(entry.path()).unwrap();
+        if metadata.file_type().is_dir() {
+            regular_files_below(&entry.path(), files);
+        } else if metadata.file_type().is_file() {
+            files.push(entry.path());
+        }
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 #[test]
@@ -840,6 +867,163 @@ fn explicitly_allowed_sensitive_path_is_only_a_content_free_warning() {
     assert!(!serialized.contains("DOCTOR_PLANTED_SECRET"));
     assert!(!serialized.contains("never-report-this"));
     assert_no_doctor_snapshot(&state.path().join("cache"));
+}
+
+#[test]
+fn blocked_sensitive_path_matrix_leaks_no_secret_bytes_or_snapshot_tree() {
+    // Catches any sensitive-path policy gap or diagnostic path that copies
+    // tracked credential contents into typed, human, JSON, error, or cache
+    // surfaces. Relative paths may be named; their bytes never may be.
+    let repo = GitRepo::init();
+    let secrets = [
+        (".env", "ENV_SECRET_MATRIX_71f5920d"),
+        (".npmrc", "NPM_SECRET_MATRIX_28ca864e"),
+        (".pypirc", "PYPI_SECRET_MATRIX_43bd709a"),
+        (".ssh/id_ed25519", "SSH_SECRET_MATRIX_9ed1435c"),
+        (".aws/credentials", "AWS_SECRET_MATRIX_56ac208f"),
+    ];
+    assert_eq!(
+        secrets
+            .iter()
+            .map(|(_, bytes)| *bytes)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        secrets.len()
+    );
+    for (path, secret) in secrets {
+        repo.write(path, format!("{secret}\n").as_bytes());
+    }
+    repo.commit_all("track blocked sensitive matrix");
+
+    let context = ProjectInspector::new(&SystemProcessRunner)
+        .inspect(repo.root())
+        .unwrap();
+    let selection_error = InputSelector::new(&SystemProcessRunner)
+        .select(
+            &context,
+            &SnapshotSettings {
+                include_untracked: Vec::new(),
+                include_empty_dirs: Vec::new(),
+                allow_sensitive: Vec::new(),
+            },
+        )
+        .expect_err("tracked sensitive paths must block selection");
+    assert_eq!(selection_error.code, "SENSITIVE_PATH");
+
+    let state = tempfile::tempdir().unwrap();
+    let service_state = state.path().join("service");
+    let service_config = config(vec![worker("mini-1", "mac1", &[])]);
+    let service_runner = DoctorRunner::new(vec![ready_probe(&[])]);
+    let report = inspect(&repo, &service_state, &service_config, &service_runner).unwrap();
+    let expected_paths = [
+        ".aws/credentials",
+        ".env",
+        ".npmrc",
+        ".pypirc",
+        ".ssh/id_ed25519",
+    ];
+    assert!(!report.ready);
+    assert!(report.snapshot.is_none());
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(report.issues[0].code, "SENSITIVE_PATH");
+    assert_eq!(report.issues[0].paths, expected_paths);
+
+    let output = CommandOutput::Doctor(report.clone());
+    let typed = format!("{report:?}");
+    let human = output.render_human();
+    let json = output.render_json().unwrap();
+    let selection_display = selection_error.to_string();
+    let selection_debug = format!("{selection_error:?}");
+    let issue_errors = report
+        .issues
+        .iter()
+        .map(|issue| format!("[{}] {}", issue.code, issue.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let config_path = write_inventory(state.path());
+    let runtime = isolated_runtime(state.path(), repo.root());
+    let mut executable_surfaces = Vec::new();
+    for json_mode in [false, true] {
+        let runner = DoctorRunner::new(vec![ready_probe(&[])]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = run_with_io_in_context(
+            doctor_cli(
+                config_path.clone(),
+                Some(repo.root()),
+                Vec::new(),
+                json_mode,
+            ),
+            &runner,
+            &runtime.context,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(exit, ExitKind::Usage as u8);
+        assert!(stderr.is_empty());
+        executable_surfaces.push((stdout, stderr));
+    }
+
+    for path in expected_paths {
+        assert!(
+            human.contains(path),
+            "human output omitted blocked path {path}"
+        );
+        assert!(
+            json.contains(path),
+            "JSON output omitted blocked path {path}"
+        );
+    }
+    let text_surfaces = [
+        ("typed debug", typed.as_bytes()),
+        ("human", human.as_bytes()),
+        ("JSON", json.as_bytes()),
+        ("selection display", selection_display.as_bytes()),
+        ("selection debug", selection_debug.as_bytes()),
+        ("issue error strings", issue_errors.as_bytes()),
+    ];
+    for (path, secret) in secrets {
+        for (label, surface) in text_surfaces {
+            assert!(
+                !contains_bytes(surface, secret.as_bytes()),
+                "{label} leaked secret bytes from {path}"
+            );
+        }
+        for (stdout, stderr) in &executable_surfaces {
+            assert!(
+                !contains_bytes(stdout, secret.as_bytes()),
+                "executable stdout leaked secret bytes from {path}"
+            );
+            assert!(
+                !contains_bytes(stderr, secret.as_bytes()),
+                "executable stderr leaked secret bytes from {path}"
+            );
+        }
+    }
+
+    assert!(
+        !service_state.join("cache").exists(),
+        "blocked service doctor created a snapshot cache"
+    );
+    assert_isolated_snapshot_state(&runtime, false);
+    let mut state_files = Vec::new();
+    regular_files_below(state.path(), &mut state_files);
+    assert!(
+        state_files
+            .iter()
+            .all(|path| path.file_name() != Some(OsStr::new("manifest.json")))
+    );
+    for file in state_files {
+        let bytes = fs::read(&file).unwrap();
+        for (path, secret) in secrets {
+            assert!(
+                !contains_bytes(&bytes, secret.as_bytes()),
+                "local state file {} leaked secret bytes from {path}",
+                file.display()
+            );
+        }
+    }
 }
 
 #[test]

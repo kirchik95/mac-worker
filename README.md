@@ -2,7 +2,7 @@
 
 `mac-worker` is a personal remote-execution tool for dispatching heavy local-development commands from a MacBook to a small pool of trusted Mac mini workers.
 
-## Phase-one quick start
+## Setup and inventory
 
 First provision each host according to the [macOS worker setup guide](docs/setup-macos-worker.md). In particular, the worker alias must support non-interactive SSH with the existing macOS account selected for worker jobs before running setup. A separate worker-only account is optional hardening, not a prerequisite.
 
@@ -16,4 +16,20 @@ cp config.example.toml ~/.config/mac-worker/config.toml
 ./target/release/worker --json workers | jq .
 ```
 
-At this checkpoint, `worker run`, snapshots, queues, logs, and artifacts are not yet implemented.
+## Validate a project locally
+
+Build the release binary, then run Doctor from either human-readable or JSON-oriented tooling:
+
+```bash
+cargo build --release
+./target/release/worker doctor --project /path/to/worktree
+./target/release/worker --json doctor --project /path/to/worktree | jq .
+./target/release/worker doctor --project /path/to/worktree \
+  --include 'fixtures/generated/**'
+```
+
+Doctor inspects the Git worktree, probes configured workers read-only, creates a unique local snapshot, verifies the selected source a second time, and deletes that exact snapshot before a successful return. It does not upload project data or start a user command. A cleanup failure is an I/O failure, never a ready result.
+
+`UNTRACKED_INPUT` means local inputs are not covered by an explicit policy. Commit them, ignore or remove them when appropriate, or include only the exact file or narrow project-owned subtree needed by the command. Do not use a catch-all include. `SENSITIVE_PATH` means a conventional credential path is selected: remove it from the project input and use a documented example file or separately provisioned worker configuration. If the name is intentionally non-secret, review it and add only that exact relative path to `snapshot.allow_sensitive` in `.worker.toml`; Doctor will emit a content-free warning.
+
+Remote upload and `worker run`, queues, remote logs, and artifacts are the next phases; Doctor does not provide those execution features.
