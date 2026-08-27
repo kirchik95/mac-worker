@@ -1,4 +1,7 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     config::Config,
@@ -35,31 +38,88 @@ pub struct DoctorService<'a> {
     pub paths: &'a PathLayout,
 }
 
-impl DoctorService<'_> {
-    pub fn inspect(&self, request: DoctorRequest) -> Result<DoctorReport, WorkerError> {
-        let context = ProjectInspector::new(self.runner).inspect(&request.project)?;
-        let settings = ProjectSettings::load(&context.root, &request.cli_includes)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalProjectState {
+    context: ProjectContext,
+    settings: ProjectSettings,
+    requirements: Vec<String>,
+}
+
+impl LocalProjectState {
+    fn load(
+        runner: &dyn ProcessRunner,
+        project: &Path,
+        cli_includes: &[String],
+    ) -> Result<Self, WorkerError> {
+        let context = ProjectInspector::new(runner).inspect(project)?;
+        let settings = ProjectSettings::load(&context.root, cli_includes)?;
         let detected = RequirementDetector::detect(&context.root)?;
         let requirements = merge_project_requirements(&settings.requires, detected);
+        Ok(Self {
+            context,
+            settings,
+            requirements,
+        })
+    }
+}
+
+impl DoctorService<'_> {
+    pub fn inspect(&self, request: DoctorRequest) -> Result<DoctorReport, WorkerError> {
+        let before_probes =
+            LocalProjectState::load(self.runner, &request.project, &request.cli_includes)?;
 
         let mut workers = WorkersService::new(SshTransport::new(self.runner))
-            .inspect_with_requirements(self.config, &requirements)
+            .inspect_with_requirements(self.config, &before_probes.requirements)
             .workers;
+        let after_probes =
+            LocalProjectState::load(self.runner, &request.project, &request.cli_includes)?;
         let eligible_worker_count = workers.iter().filter(|worker| is_eligible(worker)).count();
         let mut issues = worker_issues(&mut workers, eligible_worker_count);
+        if before_probes != after_probes {
+            issues.push(local_state_changed_issue());
+            sort_issues(&mut issues);
+            return Ok(doctor_report(
+                &before_probes,
+                None,
+                workers,
+                issues,
+                eligible_worker_count,
+            ));
+        }
 
-        let snapshot = match InputSelector::new(self.runner).select(&context, &settings.snapshot) {
+        let snapshot = match InputSelector::new(self.runner)
+            .select(&after_probes.context, &after_probes.settings.snapshot)
+        {
             Ok(selection) => {
                 issues.extend(selection.warnings.iter().map(selection_warning_issue));
                 match SnapshotBuilder::new(self.runner, &self.paths.cache).capture(
-                    &context,
-                    &settings.snapshot,
+                    &after_probes.context,
+                    &after_probes.settings.snapshot,
                     selection,
                 ) {
                     Ok(snapshot) => {
-                        let summary = snapshot.summary();
-                        snapshot.cleanup()?;
-                        Some(summary)
+                        let after_capture = match LocalProjectState::load(
+                            self.runner,
+                            &request.project,
+                            &request.cli_includes,
+                        ) {
+                            Ok(state) => state,
+                            Err(error) => {
+                                return match snapshot.cleanup() {
+                                    Ok(()) => Err(error),
+                                    Err(cleanup_error) => Err(cleanup_error),
+                                };
+                            }
+                        };
+                        if after_probes == after_capture {
+                            let summary = snapshot.summary();
+                            snapshot.cleanup()?;
+                            Some(summary)
+                        } else {
+                            snapshot.cleanup()?;
+                            issues.push(local_state_changed_issue());
+                            None
+                        }
                     }
                     Err(WorkerError::Snapshot { code, message }) => {
                         issues.push(issue(IssueSeverity::Blocker, code, &message, Vec::new()));
@@ -75,22 +135,46 @@ impl DoctorService<'_> {
         };
 
         sort_issues(&mut issues);
-        let ready = snapshot.is_some()
-            && eligible_worker_count > 0
-            && !issues
-                .iter()
-                .any(|issue| issue.severity == IssueSeverity::Blocker);
-
-        Ok(DoctorReport {
-            version: DOCTOR_REPORT_VERSION,
-            ready,
-            project: doctor_project(&context),
-            requirements,
+        Ok(doctor_report(
+            &after_probes,
             snapshot,
             workers,
             issues,
-        })
+            eligible_worker_count,
+        ))
     }
+}
+
+fn doctor_report(
+    state: &LocalProjectState,
+    snapshot: Option<crate::snapshot::SnapshotSummary>,
+    workers: Vec<WorkerHealth>,
+    issues: Vec<DoctorIssue>,
+    eligible_worker_count: usize,
+) -> DoctorReport {
+    let ready = snapshot.is_some()
+        && eligible_worker_count > 0
+        && !issues
+            .iter()
+            .any(|issue| issue.severity == IssueSeverity::Blocker);
+    DoctorReport {
+        version: DOCTOR_REPORT_VERSION,
+        ready,
+        project: doctor_project(&state.context),
+        requirements: state.requirements.clone(),
+        snapshot,
+        workers,
+        issues,
+    }
+}
+
+fn local_state_changed_issue() -> DoctorIssue {
+    issue(
+        IssueSeverity::Blocker,
+        "SNAPSHOT_CHANGED",
+        "project policy, requirements, or Git metadata changed during doctor inspection",
+        Vec::new(),
+    )
 }
 
 fn merge_project_requirements(configured: &[String], mut detected: Vec<String>) -> Vec<String> {
@@ -277,8 +361,9 @@ mod tests {
         ffi::OsStr,
         fs,
         os::unix::process::ExitStatusExt,
-        path::Path,
+        path::{Path, PathBuf},
         process::{Command, ExitStatus, Output},
+        sync::atomic::{AtomicUsize, Ordering},
     };
 
     use crate::{
@@ -294,26 +379,53 @@ mod tests {
 
     struct ReadyDoctorRunner;
 
+    struct AfterCapturePolicyRunner {
+        root: PathBuf,
+        project_inspections: AtomicUsize,
+    }
+
     impl ProcessRunner for ReadyDoctorRunner {
         fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
             if request.program == OsStr::new("/usr/bin/ssh") {
-                let response = serde_json::json!({
-                    "protocol_version": 1,
-                    "hostname": "mini.local",
-                    "arch": "arm64",
-                    "os_version": "26.2",
-                    "free_disk_bytes": 536_870_912_u64,
-                    "memory_pressure": "normal",
-                    "swap_used_bytes": 134_217_728_u64,
-                    "capabilities": [],
-                });
-                return Ok(ProcessResult {
-                    status: ExitStatus::from_raw(0),
-                    stdout: serde_json::to_vec(&response).unwrap(),
-                    stderr: Vec::new(),
-                });
+                return Ok(ready_probe_result());
             }
             SystemProcessRunner.run(request)
+        }
+    }
+
+    impl ProcessRunner for AfterCapturePolicyRunner {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.program == OsStr::new("/usr/bin/ssh") {
+                return Ok(ready_probe_result());
+            }
+            if request.program == OsStr::new("/usr/bin/git")
+                && request
+                    .args
+                    .iter()
+                    .any(|argument| argument == "--show-toplevel")
+                && self.project_inspections.fetch_add(1, Ordering::SeqCst) == 2
+            {
+                fs::write(self.root.join(".worker.toml"), b"version = 1\n")?;
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+
+    fn ready_probe_result() -> ProcessResult {
+        let response = serde_json::json!({
+            "protocol_version": 1,
+            "hostname": "mini.local",
+            "arch": "arm64",
+            "os_version": "26.2",
+            "free_disk_bytes": 536_870_912_u64,
+            "memory_pressure": "normal",
+            "swap_used_bytes": 134_217_728_u64,
+            "capabilities": [],
+        });
+        ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout: serde_json::to_vec(&response).unwrap(),
+            stderr: Vec::new(),
         }
     }
 
@@ -508,6 +620,97 @@ mod tests {
         // The injected kernel-boundary failure intentionally leaves the empty
         // privately acquired capture as evidence. The fixture removes exactly
         // that private namespace only after validating the service contract.
+        fs::remove_dir_all(&ready_entries[0]).unwrap();
+    }
+
+    #[test]
+    fn post_capture_state_change_cleanup_failure_keeps_io_precedence() {
+        // Catches replacing an exact-owned cleanup failure with the typed
+        // SNAPSHOT_CHANGED report produced by the post-capture state check.
+        let repository = tempfile::tempdir().unwrap();
+        fs::create_dir(repository.path().join("home")).unwrap();
+        assert!(
+            git(repository.path(), &["init", "--initial-branch=main"])
+                .status
+                .success()
+        );
+        assert!(
+            git(
+                repository.path(),
+                &["config", "user.name", "Doctor Cleanup Test"]
+            )
+            .status
+            .success()
+        );
+        assert!(
+            git(
+                repository.path(),
+                &["config", "user.email", "doctor-cleanup@example.test"]
+            )
+            .status
+            .success()
+        );
+        fs::write(
+            repository.path().join(".worker.toml"),
+            b"version = 1\n[snapshot]\nallow_sensitive = [\".env\"]\n",
+        )
+        .unwrap();
+        fs::write(repository.path().join(".env"), b"fixture secret\n").unwrap();
+        fs::write(repository.path().join("README.md"), b"tracked\n").unwrap();
+        assert!(git(repository.path(), &["add", "--all"]).status.success());
+        assert!(
+            git(repository.path(), &["commit", "-m", "cleanup fixture"])
+                .status
+                .success()
+        );
+        fs::write(repository.path().join("README.md"), b"already dirty\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let paths = PathLayout {
+            config: state.path().join("config.toml"),
+            state: state.path().join("state"),
+            cache: state.path().join("cache"),
+            data: state.path().join("data"),
+        };
+        let config = ready_config();
+        let runner = AfterCapturePolicyRunner {
+            root: repository.path().to_path_buf(),
+            project_inspections: AtomicUsize::new(0),
+        };
+        let _fault = crate::rooted_fs::fail_next_cleanup_before_final_root_removal(libc::EIO);
+
+        let error = DoctorService {
+            runner: &runner,
+            config: &config,
+            paths: &paths,
+        }
+        .inspect(DoctorRequest {
+            project: repository.path().to_path_buf(),
+            cli_includes: Vec::new(),
+        })
+        .expect_err("cleanup failure must override a post-capture state change report");
+
+        match error {
+            WorkerError::Io(error) => assert_eq!(error.raw_os_error(), Some(libc::EIO)),
+            other => panic!("cleanup failure had wrong classification: {other}"),
+        }
+        let ready = paths.cache.join("snapshots/ready");
+        let ready_entries = fs::read_dir(&ready)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(ready_entries.len(), 1);
+        assert_eq!(
+            ready_entries[0].file_name().unwrap(),
+            ".mac-worker-rooted-fs"
+        );
+        let retained = fs::read_dir(&ready_entries[0])
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].is_dir());
+        assert_eq!(fs::read_dir(&retained[0]).unwrap().count(), 0);
+
         fs::remove_dir_all(&ready_entries[0]).unwrap();
     }
 }

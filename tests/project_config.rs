@@ -1,7 +1,17 @@
 #[allow(dead_code)]
 mod support;
 
-use std::{fs, os::unix::fs::symlink, time::Duration};
+use std::{
+    ffi::CString,
+    fs,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{PermissionsExt, symlink},
+    },
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
 use mac_worker::{
     error::{ExitKind, WorkerError},
@@ -31,16 +41,145 @@ fn absent_project_settings_file_uses_v1_defaults() {
 }
 
 #[test]
-fn project_settings_preserve_local_io_errors_when_config_cannot_be_read_as_a_file() {
-    // This catches collapsing a local filesystem fault into invalid user
-    // configuration, which would change the process exit contract.
+fn project_settings_reject_non_regular_config_as_usage() {
+    // This catches treating an unsafe final component as a generic local I/O
+    // failure instead of failing closed as invalid project policy.
     let repo = GitRepo::init();
     fs::create_dir(repo.root().join(".worker.toml")).unwrap();
 
     let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
 
+    assert!(matches!(error, WorkerError::Config(_)), "{error}");
+    assert_eq!(error.exit_kind(), ExitKind::Usage);
+}
+
+#[test]
+fn project_settings_preserve_regular_file_open_failures_as_io() {
+    // This catches the no-follow hardening flattening a genuine regular-file
+    // access failure into a usage-class policy error.
+    // SAFETY: geteuid has no arguments and no memory-safety contract.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let repo = GitRepo::init();
+    let config = repo.root().join(".worker.toml");
+    fs::write(&config, b"version = 1\n").unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
+
     assert!(matches!(error, WorkerError::Io(_)), "{error}");
     assert_eq!(error.exit_kind(), ExitKind::Io);
+}
+
+#[test]
+fn project_settings_reject_fifo_config_without_waiting_for_a_writer() {
+    // This catches opening a special file without O_NONBLOCK and hanging the
+    // command before its file type can be rejected.
+    let repo = GitRepo::init();
+    let config = repo.root().join(".worker.toml");
+    let config_name = CString::new(config.as_os_str().as_bytes()).unwrap();
+    // SAFETY: the CString is NUL-terminated and live for this call.
+    assert_eq!(unsafe { libc::mkfifo(config_name.as_ptr(), 0o600) }, 0);
+    let root = repo.root().to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let _ = sender.send(ProjectSettings::load(&root, &[]));
+    });
+    let result = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("project settings load blocked on a FIFO");
+    handle.join().unwrap();
+    let error = result.unwrap_err();
+
+    assert!(matches!(error, WorkerError::Config(_)), "{error}");
+    assert_eq!(error.exit_kind(), ExitKind::Usage);
+}
+
+#[test]
+fn project_settings_reject_final_symlinks_without_reading_external_policy() {
+    // This catches a final symlink authorizing sensitive project input from a
+    // policy file that would not be present in the captured worktree.
+    let repo = GitRepo::init();
+    let external = tempdir().unwrap();
+    let secret = "EXTERNAL_POLICY_SECRET_7f1e2f90";
+    let project_secret = "PROJECT_ENV_SECRET_a74f083e";
+    let external_policy = external.path().join("outside-policy.toml");
+    fs::write(
+        &external_policy,
+        format!("version = 1\n# {secret}\n[snapshot]\nallow_sensitive = [\".env\"]\n"),
+    )
+    .unwrap();
+    symlink(&external_policy, repo.root().join(".worker.toml")).unwrap();
+    repo.write(".env", format!("TOKEN={project_secret}\n").as_bytes());
+
+    let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+
+    assert!(matches!(error, WorkerError::Config(_)), "{display}");
+    assert_eq!(error.exit_kind(), ExitKind::Usage);
+    for forbidden in [
+        secret,
+        project_secret,
+        external_policy.to_string_lossy().as_ref(),
+        repo.root().to_string_lossy().as_ref(),
+        "allow_sensitive",
+    ] {
+        assert!(!display.contains(forbidden), "display leaked {forbidden:?}");
+        assert!(!debug.contains(forbidden), "debug leaked {forbidden:?}");
+    }
+}
+
+#[test]
+fn project_settings_reject_dangling_final_symlinks_as_usage() {
+    // This catches treating a dangling policy symlink as an absent optional
+    // config and silently falling back to permissive-independent defaults.
+    let repo = GitRepo::init();
+    let missing_target = repo.root().join("outside-missing-policy.toml");
+    symlink(&missing_target, repo.root().join(".worker.toml")).unwrap();
+
+    let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
+    let diagnostics = format!("{error}\n{error:?}");
+
+    assert!(matches!(error, WorkerError::Config(_)), "{diagnostics}");
+    assert_eq!(error.exit_kind(), ExitKind::Usage);
+    assert!(!diagnostics.contains(&missing_target.to_string_lossy().into_owned()));
+    assert!(!diagnostics.contains(&repo.root().to_string_lossy().into_owned()));
+}
+
+#[test]
+fn malformed_project_config_diagnostics_do_not_echo_source_or_secrets() {
+    // This catches TOML parser snippets and semantic validation values reaching
+    // Display/Debug/CLI error surfaces.
+    let cases = [
+        (
+            "requires = [\"node\"\n# MALFORMED_CONFIG_SECRET_8af36e72\n",
+            "MALFORMED_CONFIG_SECRET_8af36e72",
+        ),
+        (
+            "requires = [\"SEMANTIC_CONFIG_SECRET_2e09d4b1\"]\n",
+            "SEMANTIC_CONFIG_SECRET_2e09d4b1",
+        ),
+    ];
+
+    for (contents, secret) in cases {
+        let repo = GitRepo::init();
+        repo.write(".worker.toml", contents.as_bytes());
+
+        let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
+        let diagnostics = format!("{error}\n{error:?}");
+
+        assert!(matches!(error, WorkerError::Config(_)), "{diagnostics}");
+        assert_eq!(error.exit_kind(), ExitKind::Usage);
+        assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
+        assert!(
+            !diagnostics.contains(contents),
+            "diagnostics echoed TOML source"
+        );
+        assert!(!diagnostics.contains(&repo.root().to_string_lossy().into_owned()));
+    }
 }
 
 #[test]

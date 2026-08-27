@@ -6,12 +6,12 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::{self, Write},
-    os::unix::process::ExitStatusExt,
+    os::unix::{fs::symlink, process::ExitStatusExt},
     path::{Path, PathBuf},
-    process::ExitStatus,
+    process::{Command as ProcessCommand, ExitStatus},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -41,11 +41,29 @@ use support::GitRepo;
 struct DoctorRunner {
     ssh_results: Arc<Mutex<VecDeque<Result<ProcessResult, WorkerError>>>>,
     mutation: Option<Arc<SnapshotMutation>>,
+    probe_mutation: Option<Arc<ProbeWindowMutation>>,
+    after_capture_mutation: Option<Arc<AfterCaptureMutation>>,
 }
 
 struct SnapshotMutation {
     root: PathBuf,
     stage_queries: AtomicUsize,
+}
+
+struct ProbeWindowMutation {
+    root: PathBuf,
+    kind: ProbeWindowMutationKind,
+    applied: AtomicBool,
+}
+
+enum ProbeWindowMutationKind {
+    RevokeSensitivePolicy,
+    CommitNodeRequirement,
+}
+
+struct AfterCaptureMutation {
+    root: PathBuf,
+    project_inspections: AtomicUsize,
 }
 
 struct BrokenWriter;
@@ -71,6 +89,8 @@ impl DoctorRunner {
         Self {
             ssh_results: Arc::new(Mutex::new(ssh_results.into())),
             mutation: None,
+            probe_mutation: None,
+            after_capture_mutation: None,
         }
     }
 
@@ -84,6 +104,55 @@ impl DoctorRunner {
                 root: root.to_path_buf(),
                 stage_queries: AtomicUsize::new(0),
             })),
+            probe_mutation: None,
+            after_capture_mutation: None,
+        }
+    }
+
+    fn mutating_probe_policy(
+        root: &Path,
+        ssh_results: Vec<Result<ProcessResult, WorkerError>>,
+    ) -> Self {
+        Self {
+            ssh_results: Arc::new(Mutex::new(ssh_results.into())),
+            mutation: None,
+            probe_mutation: Some(Arc::new(ProbeWindowMutation {
+                root: root.to_path_buf(),
+                kind: ProbeWindowMutationKind::RevokeSensitivePolicy,
+                applied: AtomicBool::new(false),
+            })),
+            after_capture_mutation: None,
+        }
+    }
+
+    fn mutating_probe_requirement_and_head(
+        root: &Path,
+        ssh_results: Vec<Result<ProcessResult, WorkerError>>,
+    ) -> Self {
+        Self {
+            ssh_results: Arc::new(Mutex::new(ssh_results.into())),
+            mutation: None,
+            probe_mutation: Some(Arc::new(ProbeWindowMutation {
+                root: root.to_path_buf(),
+                kind: ProbeWindowMutationKind::CommitNodeRequirement,
+                applied: AtomicBool::new(false),
+            })),
+            after_capture_mutation: None,
+        }
+    }
+
+    fn mutating_policy_after_capture(
+        root: &Path,
+        ssh_results: Vec<Result<ProcessResult, WorkerError>>,
+    ) -> Self {
+        Self {
+            ssh_results: Arc::new(Mutex::new(ssh_results.into())),
+            mutation: None,
+            probe_mutation: None,
+            after_capture_mutation: Some(Arc::new(AfterCaptureMutation {
+                root: root.to_path_buf(),
+                project_inspections: AtomicUsize::new(0),
+            })),
         }
     }
 }
@@ -91,12 +160,41 @@ impl DoctorRunner {
 impl ProcessRunner for DoctorRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
         if request.program == OsStr::new("/usr/bin/ssh") {
-            return self
+            let result = self
                 .ssh_results
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("one SSH result per configured worker");
+            if let Some(mutation) = &self.probe_mutation
+                && !mutation.applied.swap(true, Ordering::SeqCst)
+            {
+                match mutation.kind {
+                    ProbeWindowMutationKind::RevokeSensitivePolicy => {
+                        fs::write(mutation.root.join(".worker.toml"), b"version = 1\n")?
+                    }
+                    ProbeWindowMutationKind::CommitNodeRequirement => {
+                        fs::write(mutation.root.join("package.json"), b"{}\n")?;
+                        run_fixture_git(&mutation.root, &["add", "package.json"])?;
+                        run_fixture_git(
+                            &mutation.root,
+                            &["commit", "-m", "probe-window requirement mutation"],
+                        )?;
+                    }
+                }
+            }
+            return result;
+        }
+
+        if request.program == OsStr::new("/usr/bin/git")
+            && request
+                .args
+                .iter()
+                .any(|argument| argument == "--show-toplevel")
+            && let Some(mutation) = &self.after_capture_mutation
+            && mutation.project_inspections.fetch_add(1, Ordering::SeqCst) == 2
+        {
+            fs::write(mutation.root.join(".worker.toml"), b"version = 1\n")?;
         }
 
         if request.program == OsStr::new("/usr/bin/git")
@@ -112,6 +210,35 @@ impl ProcessRunner for DoctorRunner {
         }
 
         SystemProcessRunner.run(request)
+    }
+}
+
+fn run_fixture_git(root: &Path, arguments: &[&str]) -> io::Result<()> {
+    let mut command = ProcessCommand::new("/usr/bin/git");
+    command
+        .current_dir(root)
+        .env("HOME", root.join("home"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        command.env_remove(name);
+    }
+    let output = command.args(arguments).output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("fixture Git mutation failed"))
     }
 }
 
@@ -655,6 +782,60 @@ fn executable_doctor_project_blocker_goes_to_stdout_and_exits_usage() {
     assert_eq!(value["kind"], "doctor");
     assert_eq!(value["ready"], false);
     assert_eq!(value["issues"][0]["code"], "UNTRACKED_INPUT");
+    assert_isolated_snapshot_state(&runtime, false);
+}
+
+#[test]
+fn executable_doctor_rejects_external_project_policy_without_leaking_diagnostics() {
+    // This catches a symlinked policy authorizing tracked .env bytes and
+    // catches its target, contents, or project root reaching CLI stderr.
+    let repo = GitRepo::init();
+    let external = tempfile::tempdir().unwrap();
+    let external_secret = "CLI_EXTERNAL_POLICY_SECRET_3617a4e2";
+    let project_secret = "CLI_PROJECT_ENV_SECRET_e2999421";
+    let external_policy = external.path().join("outside-policy.toml");
+    fs::write(
+        &external_policy,
+        format!("version = 1\n# {external_secret}\n[snapshot]\nallow_sensitive = [\".env\"]\n"),
+    )
+    .unwrap();
+    symlink(&external_policy, repo.root().join(".worker.toml")).unwrap();
+    repo.write(".env", format!("TOKEN={project_secret}\n").as_bytes());
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("external policy CLI fixture");
+    let state = tempfile::tempdir().unwrap();
+    let config_path = write_inventory(state.path());
+    let runtime = isolated_runtime(state.path(), repo.root());
+    let runner = DoctorRunner::new(Vec::new());
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_with_io_in_context(
+        doctor_cli(config_path, Some(repo.root()), Vec::new(), true),
+        &runner,
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, ExitKind::Usage as u8);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&stderr),
+        "configuration error: project configuration must be a regular file\n"
+    );
+    for forbidden in [
+        external_secret,
+        project_secret,
+        external_policy.to_string_lossy().as_ref(),
+        repo.root().to_string_lossy().as_ref(),
+        "allow_sensitive",
+    ] {
+        assert!(
+            !contains_bytes(&stderr, forbidden.as_bytes()),
+            "CLI diagnostics leaked {forbidden:?}"
+        );
+    }
     assert_isolated_snapshot_state(&runtime, false);
 }
 
@@ -1317,6 +1498,154 @@ fn offline_worker_is_a_sorted_warning_when_another_worker_is_eligible() {
         ]
     );
     assert_no_doctor_snapshot(&state.path().join("cache"));
+}
+
+#[test]
+fn policy_change_during_worker_probe_blocks_before_capture_without_leaking_allowed_secret() {
+    // This catches probing under one authorization policy and capturing under
+    // stale settings after that policy has revoked a sensitive path.
+    let repo = GitRepo::init();
+    let secret = "PROBE_WINDOW_POLICY_SECRET_f2e57941";
+    repo.write(
+        ".worker.toml",
+        b"version = 1\n[snapshot]\nallow_sensitive = [\".env\"]\n",
+    );
+    repo.write(".env", format!("TOKEN={secret}\n").as_bytes());
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("probe-window policy fixture");
+    repo.write("README.md", b"already dirty before probe\n");
+    let state = tempfile::tempdir().unwrap();
+    let poisoned_cache = state.path().join("cache");
+    let poison = b"capture must never open this cache\n";
+    fs::write(&poisoned_cache, poison).unwrap();
+    let config = config(vec![worker("mini-1", "mac1", &[])]);
+    let runner = DoctorRunner::mutating_probe_policy(repo.root(), vec![ready_probe(&[])]);
+
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+    assert!(!report.ready);
+    assert!(report.snapshot.is_none());
+    assert_eq!(report.workers[0].status, HealthStatus::Ready);
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .map(|issue| (issue.severity, issue.code.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(IssueSeverity::Blocker, "SNAPSHOT_CHANGED")]
+    );
+    let output = CommandOutput::Doctor(report.clone());
+    assert_eq!(output.aggregate_exit_kind(), Some(ExitKind::Infrastructure));
+    let surfaces = [
+        format!("{report:?}"),
+        output.render_human(),
+        output.render_json().unwrap(),
+    ];
+    for forbidden in [secret, repo.root().to_string_lossy().as_ref()] {
+        assert!(
+            surfaces.iter().all(|surface| !surface.contains(forbidden)),
+            "probe-window report leaked {forbidden:?}"
+        );
+    }
+    assert_eq!(fs::read(&poisoned_cache).unwrap(), poison);
+    assert!(!poisoned_cache.join("snapshots").exists());
+}
+
+#[test]
+fn requirement_and_head_change_during_worker_probe_blocks_before_capture() {
+    // This catches accepting worker eligibility measured for an old HEAD and
+    // requirement set, even when the later project state is otherwise clean.
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("probe-window Git context fixture");
+    let original_head = String::from_utf8(repo.git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let state = tempfile::tempdir().unwrap();
+    let poisoned_cache = state.path().join("cache");
+    let poison = b"capture must never open this cache\n";
+    fs::write(&poisoned_cache, poison).unwrap();
+    let config = config(vec![worker("mini-1", "mac1", &[])]);
+    let runner =
+        DoctorRunner::mutating_probe_requirement_and_head(repo.root(), vec![ready_probe(&[])]);
+
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+    let changed_head = String::from_utf8(repo.git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    assert_ne!(changed_head, original_head);
+    assert!(!report.ready);
+    assert!(report.snapshot.is_none());
+    assert_eq!(report.project.head.as_deref(), Some(original_head.as_str()));
+    assert!(report.requirements.is_empty());
+    assert_eq!(report.workers[0].status, HealthStatus::Ready);
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .map(|issue| (issue.severity, issue.code.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(IssueSeverity::Blocker, "SNAPSHOT_CHANGED")]
+    );
+    assert_eq!(fs::read(&poisoned_cache).unwrap(), poison);
+    assert!(!poisoned_cache.join("snapshots").exists());
+}
+
+#[test]
+fn policy_change_after_capture_discards_summary_and_cleans_secret_bytes() {
+    // This catches returning a ready summary when policy changes after the
+    // snapshot's own byte verification but before Doctor returns.
+    let repo = GitRepo::init();
+    let secret = "POST_CAPTURE_POLICY_SECRET_6d67d751";
+    repo.write(
+        ".worker.toml",
+        b"version = 1\n[snapshot]\nallow_sensitive = [\".env\"]\n",
+    );
+    repo.write(".env", format!("TOKEN={secret}\n").as_bytes());
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("post-capture policy fixture");
+    repo.write("README.md", b"already dirty before capture\n");
+    let state = tempfile::tempdir().unwrap();
+    let config = config(vec![worker("mini-1", "mac1", &[])]);
+    let runner = DoctorRunner::mutating_policy_after_capture(repo.root(), vec![ready_probe(&[])]);
+
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+    assert!(!report.ready);
+    assert!(report.snapshot.is_none());
+    assert_eq!(report.workers[0].status, HealthStatus::Ready);
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .map(|issue| (issue.severity, issue.code.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (IssueSeverity::Blocker, "SNAPSHOT_CHANGED"),
+            (IssueSeverity::Warning, "SENSITIVE_PATH_ALLOWED"),
+        ]
+    );
+    let output = CommandOutput::Doctor(report.clone());
+    for surface in [
+        format!("{report:?}"),
+        output.render_human(),
+        output.render_json().unwrap(),
+    ] {
+        assert!(!surface.contains(secret), "report leaked captured secret");
+    }
+    assert_no_doctor_snapshot(&state.path().join("cache"));
+    let mut cache_files = Vec::new();
+    regular_files_below(&state.path().join("cache"), &mut cache_files);
+    for file in cache_files {
+        assert!(
+            !contains_bytes(&fs::read(&file).unwrap(), secret.as_bytes()),
+            "cleaned cache file {} retained secret bytes",
+            file.display()
+        );
+    }
 }
 
 #[test]

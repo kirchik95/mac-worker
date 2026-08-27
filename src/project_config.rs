@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
-    fs,
+    fs::{self, OpenOptions},
+    io::{self, Read},
+    os::unix::fs::OpenOptionsExt,
     path::{Component, Path},
     time::Duration,
 };
@@ -12,6 +14,8 @@ use crate::error::WorkerError;
 
 const PROJECT_CONFIG: &str = ".worker.toml";
 const DEFAULT_TIMEOUT: &str = "30m";
+const PROJECT_CONFIG_OPEN_FLAGS: libc::c_int =
+    libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectSettings {
@@ -79,21 +83,10 @@ struct RawArtifactSettings {
 
 impl ProjectSettings {
     pub fn load(root: &Path, cli_includes: &[String]) -> Result<Self, WorkerError> {
-        let config_path = root.join(PROJECT_CONFIG);
-        let raw = match fs::read_to_string(&config_path) {
-            Ok(contents) => toml::from_str(&contents).map_err(|error| {
-                WorkerError::Config(format!(
-                    "invalid project configuration {}: {error}",
-                    config_path.display()
-                ))
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => RawProjectSettings {
-                version: default_version(),
-                resource_class: default_resource_class(),
-                timeout: default_timeout(),
-                ..RawProjectSettings::default()
-            },
-            Err(error) => return Err(WorkerError::Io(error)),
+        let raw = match read_project_config(root)? {
+            Some(contents) => toml::from_str(&contents)
+                .map_err(|_| WorkerError::Config("invalid project configuration".into()))?,
+            None => default_project_settings(),
         };
 
         Self::validate(raw, cli_includes)
@@ -101,28 +94,20 @@ impl ProjectSettings {
 
     fn validate(raw: RawProjectSettings, cli_includes: &[String]) -> Result<Self, WorkerError> {
         if raw.version != 1 {
-            return Err(WorkerError::Config(format!(
-                "unsupported project configuration version {}",
-                raw.version
-            )));
+            return Err(WorkerError::Config(
+                "unsupported project configuration version".into(),
+            ));
         }
         validate_requirements(&raw.requires)?;
 
         let resource_class = match raw.resource_class.as_str() {
             "heavy" => ResourceClass::Heavy,
             _ => {
-                return Err(WorkerError::Config(format!(
-                    "unsupported resource class {:?}",
-                    raw.resource_class
-                )));
+                return Err(WorkerError::Config("unsupported resource class".into()));
             }
         };
-        let timeout = humantime::parse_duration(&raw.timeout).map_err(|error| {
-            WorkerError::Config(format!(
-                "invalid project timeout {:?}: {error}",
-                raw.timeout
-            ))
-        })?;
+        let timeout = humantime::parse_duration(&raw.timeout)
+            .map_err(|_| WorkerError::Config("invalid project timeout".into()))?;
 
         validate_patterns(
             &raw.snapshot.include_untracked,
@@ -156,6 +141,65 @@ impl ProjectSettings {
     }
 }
 
+fn read_project_config(root: &Path) -> Result<Option<String>, WorkerError> {
+    let path = root.join(PROJECT_CONFIG);
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(PROJECT_CONFIG_OPEN_FLAGS)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => return classify_project_config_open_error(&path, error),
+    };
+    let metadata = file.metadata().map_err(WorkerError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(unsafe_project_config());
+    }
+
+    let mut contents = String::new();
+    match file.read_to_string(&mut contents) {
+        Ok(_) => Ok(Some(contents)),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            Err(WorkerError::Config("invalid project configuration".into()))
+        }
+        Err(error) => Err(WorkerError::Io(error)),
+    }
+}
+
+fn classify_project_config_open_error(
+    path: &Path,
+    error: io::Error,
+) -> Result<Option<String>, WorkerError> {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return Err(unsafe_project_config());
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => Err(unsafe_project_config()),
+        Ok(_) => Err(WorkerError::Io(error)),
+        Err(metadata_error)
+            if error.kind() == io::ErrorKind::NotFound
+                && metadata_error.kind() == io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(_) => Err(WorkerError::Io(error)),
+    }
+}
+
+fn unsafe_project_config() -> WorkerError {
+    WorkerError::Config("project configuration must be a regular file".into())
+}
+
+fn default_project_settings() -> RawProjectSettings {
+    RawProjectSettings {
+        version: default_version(),
+        resource_class: default_resource_class(),
+        timeout: default_timeout(),
+        ..RawProjectSettings::default()
+    }
+}
+
 fn default_version() -> u32 {
     1
 }
@@ -172,14 +216,10 @@ fn validate_requirements(requires: &[String]) -> Result<(), WorkerError> {
     let mut seen = HashSet::new();
     for requirement in requires {
         if !valid_capability(requirement) {
-            return Err(WorkerError::Config(format!(
-                "invalid required capability {requirement:?}"
-            )));
+            return Err(WorkerError::Config("invalid required capability".into()));
         }
         if !seen.insert(requirement) {
-            return Err(WorkerError::Config(format!(
-                "duplicate required capability {requirement:?}"
-            )));
+            return Err(WorkerError::Config("duplicate required capability".into()));
         }
     }
     Ok(())
@@ -197,12 +237,10 @@ fn validate_patterns(patterns: &[String], field: &str) -> Result<(), WorkerError
         validate_relative_path(pattern, field)?;
         if first_component(pattern).is_some_and(contains_glob_metacharacter) {
             return Err(WorkerError::Config(format!(
-                "{field} pattern {pattern:?} must begin with a literal path component"
+                "{field} pattern must begin with a literal path component"
             )));
         }
-        Glob::new(pattern).map_err(|error| {
-            WorkerError::Config(format!("invalid {field} pattern {pattern:?}: {error}"))
-        })?;
+        Glob::new(pattern).map_err(|_| WorkerError::Config(format!("invalid {field} pattern")))?;
     }
     Ok(())
 }
@@ -212,7 +250,7 @@ fn validate_exact_paths(paths: &[String], field: &str) -> Result<(), WorkerError
         validate_relative_path(path, field)?;
         if contains_glob_metacharacter(path) {
             return Err(WorkerError::Config(format!(
-                "{field} path {path:?} must not contain glob metacharacters"
+                "{field} path must not contain glob metacharacters"
             )));
         }
     }
@@ -225,14 +263,14 @@ fn validate_relative_path(value: &str, field: &str) -> Result<(), WorkerError> {
         || value.split('/').any(|part| part == "." || part == "..")
     {
         return Err(WorkerError::Config(format!(
-            "{field} path {value:?} must be a precise relative path"
+            "{field} path must be a precise relative path"
         )));
     }
 
     for component in Path::new(value).components() {
         if !matches!(component, Component::Normal(_)) {
             return Err(WorkerError::Config(format!(
-                "{field} path {value:?} contains a forbidden path component"
+                "{field} path contains a forbidden path component"
             )));
         }
     }
