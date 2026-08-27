@@ -13,7 +13,7 @@ use crate::{
     lease::{LeaseService, SlotState},
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
-    protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse},
+    protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
 };
 
 const CONTROLLED_HOST_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -204,6 +204,7 @@ impl ProbeCollector {
 
         Ok(ProbeResponse {
             protocol_version: PROTOCOL_VERSION,
+            supervision_version: SUPERVISION_VERSION,
             hostname,
             arch,
             os_version,
@@ -475,7 +476,7 @@ mod tests {
         error::{ProcessError, ProcessStream, WorkerError},
         lease::SlotState,
         process::ProcessPolicy,
-        protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse},
+        protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     };
 
     fn host_test_policy(stdout_limit: usize, deadline: Duration) -> ProcessPolicy {
@@ -697,6 +698,7 @@ mod tests {
             response,
             ProbeResponse {
                 protocol_version: PROTOCOL_VERSION,
+                supervision_version: SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),

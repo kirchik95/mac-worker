@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     fs::File,
-    os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -17,8 +20,8 @@ use crate::{
     error::WorkerError,
     inputs::RelativePath,
     job::{
-        ClientId, JobId, JobStatus, LeaseAcquireRequest, LeaseRecord, LeaseToken,
-        RequestFingerprint,
+        ClientId, JobId, JobMeta, JobStatus, LeaseAcquireRequest, LeaseRecord, LeaseToken,
+        RequestFingerprint, SubmitRequest,
     },
     rooted_fs::{PrivateEntryIdentity, RootedDir},
 };
@@ -33,6 +36,9 @@ const ADMISSION_LOCK_FILE: &str = "admission.lock";
 const TRANSFER_DIRECTORY: &str = "transfer";
 const TRANSFER_LOCK_FILE: &str = "transfer.lock";
 const TRANSFER_IDENTITY_SUFFIX: &str = ".transfer-lock.json";
+const SUPERVISOR_DIRECTORY: &str = "supervisor";
+const SUPERVISOR_LOCK_FILE: &str = "supervisor.lock";
+const SUPERVISOR_IDENTITY_SUFFIX: &str = ".supervisor-lock.json";
 const OWNED_DIRECTORIES: &[&str] = &[
     "incoming",
     "verified",
@@ -73,6 +79,26 @@ pub enum HostStoreWritePoint {
     AfterSnapshotReceiptFileSync = 25,
     AfterSnapshotReceiptPublish = 26,
     AfterSnapshotReceiptParentSync = 27,
+    AfterJobPublish = 28,
+    AfterJobHomeSync = 29,
+    AfterJobTmpSync = 30,
+    AfterJobStdoutWrite = 31,
+    AfterJobStdoutFileSync = 32,
+    AfterJobStderrWrite = 33,
+    AfterJobStderrFileSync = 34,
+    AfterJobMetaWrite = 35,
+    AfterJobMetaFileSync = 36,
+    AfterJobStatusWrite = 37,
+    AfterJobStatusFileSync = 38,
+    AfterJobExecutionWrite = 39,
+    AfterJobExecutionFileSync = 40,
+    AfterJobStagingDirectorySync = 41,
+    AfterJobRename = 42,
+    AfterJobIndexFileSync = 43,
+    AfterJobIndexRename = 44,
+    AfterJobIndexParentSync = 45,
+    AfterJobCleanupProof = 46,
+    AfterJobLeaseRetirement = 47,
 }
 
 impl LayoutEntry {
@@ -193,6 +219,16 @@ struct TransferLockIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SupervisorLockIdentity {
+    version: u32,
+    job_id: JobId,
+    directory: LayoutEntry,
+    lock: LayoutEntry,
+    identity_file: LayoutEntry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobDisposition {
     Accepted {
@@ -227,9 +263,13 @@ impl JobDisposition {
                 validate_digest(project_id, "accepted project ID")?;
                 validate_digest(worktree_id, "accepted worktree ID")?;
                 status.validate()?;
-                if status.state() != crate::job::JobState::Accepted {
-                    return Err(WorkerError::Protocol(
-                        "accepted disposition requires accepted status".into(),
+                if status.state() != crate::job::JobState::Accepted
+                    || status.supervisor_identity().is_some()
+                    || status.child_identity().is_some()
+                {
+                    return Err(protocol_code(
+                        "JOB_ID_CONFLICT",
+                        "accepted disposition requires the initial accepted status",
                     ));
                 }
                 Ok(())
@@ -275,10 +315,24 @@ pub struct TransferGuard {
     identity: TransferLockIdentity,
 }
 
+pub struct SupervisorGuard {
+    file: File,
+    namespace: RootedDir,
+    file_name: String,
+    file_identity: PrivateEntryIdentity,
+    anchor_namespace: RootedDir,
+    identity_file: File,
+    identity_file_name: String,
+    identity_file_identity: PrivateEntryIdentity,
+    identity: SupervisorLockIdentity,
+}
+
 // Every host mutation follows this fixed order: the parent-anchored stable
 // installation lock, then the per-job admission lock, then (as applicable)
-// the transfer lock or heavy-slot capacity lock. Capacity-only integrity
-// operations start at the installation anchor as well.
+// the transfer lock, supervisor lock, or heavy-slot capacity lock. A detached
+// supervisor drops admission before long-running work and drops its supervisor
+// capability before cleanup reacquires admission -> capacity. Capacity-only
+// integrity operations start at the installation anchor as well.
 struct InstallationGuard {
     file: File,
     parent: RootedDir,
@@ -364,10 +418,70 @@ impl TransferGuard {
     }
 }
 
+impl SupervisorGuard {
+    pub(crate) fn validate(&self) -> Result<(), WorkerError> {
+        self.anchor_namespace.verify_bound()?;
+        self.anchor_namespace.validate_private_regular_binding(
+            &self.identity_file_name,
+            &self.identity_file,
+            self.identity_file_identity,
+        )?;
+        let stored: SupervisorLockIdentity =
+            read_json_strict_at(&self.anchor_namespace, &self.identity_file_name)?;
+        if stored != self.identity {
+            return Err(WorkerError::Protocol(
+                "canonical supervisor lock identity changed".into(),
+            ));
+        }
+        let current_namespace = self.anchor_namespace.open_child_directory(
+            &relative(&format!("{}/{SUPERVISOR_DIRECTORY}", self.identity.job_id))?,
+            false,
+        )?;
+        let current = build_supervisor_lock_identity(
+            &current_namespace,
+            self.identity.job_id,
+            current_namespace.private_entry_identity(SUPERVISOR_LOCK_FILE)?,
+            self.identity_file_identity,
+            &self.identity_file_name,
+        )?;
+        if current != self.identity {
+            return Err(WorkerError::Protocol(
+                "canonical supervisor lock identity changed".into(),
+            ));
+        }
+        self.namespace.verify_bound()?;
+        self.namespace.validate_private_regular_binding(
+            &self.file_name,
+            &self.file,
+            self.file_identity,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn raw_lock_fd(&self) -> Result<std::os::fd::RawFd, WorkerError> {
+        self.validate()?;
+        require_cloexec(self.file.as_raw_fd())?;
+        Ok(self.file.as_raw_fd())
+    }
+
+    pub(crate) fn job_id(&self) -> JobId {
+        self.identity.job_id
+    }
+}
+
 impl fmt::Debug for TransferGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TransferGuard")
+            .field("job_id", &self.identity.job_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for SupervisorGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SupervisorGuard")
             .field("job_id", &self.identity.job_id)
             .finish_non_exhaustive()
     }
@@ -458,6 +572,14 @@ pub struct WorkspaceReceipt {
     manifest_digest: String,
 }
 
+pub struct PublishedJob {
+    root: RootedDir,
+    guard: AdmissionGuard,
+    job_id: JobId,
+    project_id: String,
+    worktree_id: String,
+}
+
 pub struct CleanupReceipt {
     root_identity: HostRootIdentity,
     job_id: JobId,
@@ -485,6 +607,15 @@ impl fmt::Debug for WorkspaceReceipt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WorkspaceReceipt")
+            .field("job_id", &self.job_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for PublishedJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublishedJob")
             .field("job_id", &self.job_id)
             .finish_non_exhaustive()
     }
@@ -1067,6 +1198,287 @@ impl HostStore {
         Ok(guard)
     }
 
+    pub(crate) fn supervisor_lock_after(
+        &self,
+        admission: &AdmissionGuard,
+        job: JobId,
+        blocking: bool,
+    ) -> Result<Option<SupervisorGuard>, WorkerError> {
+        admission.validate_for(job)?;
+        let identity_name = format!("{job}{SUPERVISOR_IDENTITY_SUFFIX}");
+        let jobs = self.open_directory("locks/jobs", false)?;
+        let job_locks = admission.namespace.reopen()?;
+        let identity_exists = jobs.entry_exists(&identity_name)?;
+        let (identity, identity_file_identity, identity_file) = if identity_exists {
+            let stored: SupervisorLockIdentity = read_json_strict_at(&jobs, &identity_name)?;
+            let identity_file_identity = jobs.private_entry_identity(&identity_name)?;
+            let identity_file = jobs.open_private_regular_handle(&identity_name)?;
+            jobs.validate_private_regular_binding(
+                &identity_name,
+                &identity_file,
+                stored.identity_file.as_private(),
+            )?;
+            if stored.version != HOST_LAYOUT_VERSION
+                || stored.job_id != job
+                || stored.identity_file
+                    != LayoutEntry::new(identity_name.clone(), identity_file_identity)
+            {
+                return Err(WorkerError::Protocol(
+                    "canonical supervisor lock identity changed".into(),
+                ));
+            }
+            (stored, identity_file_identity, identity_file)
+        } else {
+            if job_locks.entry_exists(SUPERVISOR_DIRECTORY)? {
+                return Err(WorkerError::Protocol(
+                    "canonical supervisor lock identity is absent".into(),
+                ));
+            }
+            for bytes in job_locks.list_names()? {
+                let name = std::str::from_utf8(&bytes).map_err(|_| {
+                    WorkerError::Protocol("job lock namespace contains a non-UTF-8 entry".into())
+                })?;
+                if let Some(suffix) = name.strip_prefix(".supervisor-init-") {
+                    if !is_lower_hex(suffix, 32) {
+                        return Err(WorkerError::Protocol(
+                            "unsafe supervisor initialization residue".into(),
+                        ));
+                    }
+                    admission.validate_for(job)?;
+                    job_locks.remove_owned_child(name)?;
+                }
+            }
+            let operation_name = format!(
+                ".supervisor-init-{}",
+                hex_16(*uuid::Uuid::new_v4().as_bytes())
+            );
+            let mut operation = job_locks.create_new_child_directory(&operation_name)?;
+            drop(operation.open_private_lock(SUPERVISOR_LOCK_FILE)?);
+            operation.sync_root()?;
+            let lock_identity = operation.private_entry_identity(SUPERVISOR_LOCK_FILE)?;
+            let identity_file_identity = jobs.write_private_atomic_no_replace_with_identity(
+                &identity_name,
+                |identity_file| {
+                    let identity = build_supervisor_lock_identity(
+                        &operation,
+                        job,
+                        lock_identity,
+                        identity_file,
+                        &identity_name,
+                    )
+                    .map_err(worker_error_as_io)?;
+                    serde_json::to_vec(&identity).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })
+                },
+            )?;
+            let identity: SupervisorLockIdentity = read_json_strict_at(&jobs, &identity_name)?;
+            let identity_file = jobs.open_private_regular_handle(&identity_name)?;
+            jobs.validate_private_regular_binding(
+                &identity_name,
+                &identity_file,
+                identity.identity_file.as_private(),
+            )?;
+            let staged = build_supervisor_lock_identity(
+                &operation,
+                job,
+                operation.private_entry_identity(SUPERVISOR_LOCK_FILE)?,
+                identity_file_identity,
+                &identity_name,
+            )?;
+            if staged != identity {
+                return Err(WorkerError::Protocol(
+                    "canonical supervisor lock identity changed".into(),
+                ));
+            }
+            operation.sync_root()?;
+            admission.validate_for(job)?;
+            operation.publish_owned_into(&job_locks, SUPERVISOR_DIRECTORY)?;
+            job_locks.sync_root()?;
+            (identity, identity_file_identity, identity_file)
+        };
+
+        if !job_locks.entry_exists(SUPERVISOR_DIRECTORY)? {
+            let mut matching_operation = None;
+            for bytes in job_locks.list_names()? {
+                let name = std::str::from_utf8(&bytes).map_err(|_| {
+                    WorkerError::Protocol("job lock namespace contains a non-UTF-8 entry".into())
+                })?;
+                let Some(suffix) = name.strip_prefix(".supervisor-init-") else {
+                    continue;
+                };
+                if !is_lower_hex(suffix, 32) {
+                    return Err(WorkerError::Protocol(
+                        "unsafe supervisor initialization residue".into(),
+                    ));
+                }
+                let operation = job_locks.open_child_directory(&relative(name)?, false)?;
+                if operation.identity()? == identity.directory.as_private() {
+                    if matching_operation.is_some() {
+                        return Err(WorkerError::Protocol(
+                            "ambiguous supervisor initialization residue".into(),
+                        ));
+                    }
+                    matching_operation = Some(operation);
+                } else {
+                    admission.validate_for(job)?;
+                    job_locks.remove_owned_child(name)?;
+                }
+            }
+            let mut operation = matching_operation.ok_or_else(|| {
+                WorkerError::Protocol("canonical supervisor lock directory is absent".into())
+            })?;
+            let staged = build_supervisor_lock_identity(
+                &operation,
+                job,
+                operation.private_entry_identity(SUPERVISOR_LOCK_FILE)?,
+                identity_file_identity,
+                &identity_name,
+            )?;
+            if staged != identity {
+                return Err(WorkerError::Protocol(
+                    "canonical supervisor lock identity changed".into(),
+                ));
+            }
+            admission.validate_for(job)?;
+            operation.publish_owned_into(&job_locks, SUPERVISOR_DIRECTORY)?;
+            job_locks.sync_root()?;
+        }
+        let namespace = job_locks.open_child_directory(&relative(SUPERVISOR_DIRECTORY)?, false)?;
+        let current = build_supervisor_lock_identity(
+            &namespace,
+            job,
+            namespace.private_entry_identity(SUPERVISOR_LOCK_FILE)?,
+            identity_file_identity,
+            &identity_name,
+        )?;
+        if current != identity {
+            return Err(WorkerError::Protocol(
+                "canonical supervisor lock identity changed".into(),
+            ));
+        }
+        let file = namespace.open_existing_private_lock(SUPERVISOR_LOCK_FILE)?;
+        namespace.validate_private_regular_binding(
+            SUPERVISOR_LOCK_FILE,
+            &file,
+            identity.lock.as_private(),
+        )?;
+        admission.validate_for(job)?;
+        let operation = libc::LOCK_EX | if blocking { 0 } else { libc::LOCK_NB };
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if !blocking && error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            return Err(WorkerError::Io(error));
+        }
+        admission.validate_for(job)?;
+        let guard = SupervisorGuard {
+            file,
+            namespace,
+            file_name: SUPERVISOR_LOCK_FILE.into(),
+            file_identity: identity.lock.as_private(),
+            anchor_namespace: jobs,
+            identity_file,
+            identity_file_name: identity_name,
+            identity_file_identity,
+            identity,
+        };
+        guard.validate()?;
+        Ok(Some(guard))
+    }
+
+    pub(crate) fn supervisor_guard_from_inherited(
+        &self,
+        job: JobId,
+        descriptor: std::os::fd::RawFd,
+    ) -> Result<SupervisorGuard, WorkerError> {
+        if descriptor < 0 {
+            return Err(WorkerError::Protocol(
+                "inherited supervisor descriptor is invalid".into(),
+            ));
+        }
+        let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        if descriptor_flags < 0 {
+            return Err(WorkerError::Protocol(
+                "inherited supervisor descriptor is absent".into(),
+            ));
+        }
+        if unsafe {
+            libc::fcntl(
+                descriptor,
+                libc::F_SETFD,
+                descriptor_flags | libc::FD_CLOEXEC,
+            )
+        } < 0
+        {
+            return Err(WorkerError::Io(std::io::Error::last_os_error()));
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let identity_name = format!("{job}{SUPERVISOR_IDENTITY_SUFFIX}");
+        let jobs = self.open_directory("locks/jobs", false)?;
+        let identity: SupervisorLockIdentity = read_json_strict_at(&jobs, &identity_name)?;
+        let identity_file_identity = jobs.private_entry_identity(&identity_name)?;
+        let identity_file = jobs.open_private_regular_handle(&identity_name)?;
+        jobs.validate_private_regular_binding(
+            &identity_name,
+            &identity_file,
+            identity.identity_file.as_private(),
+        )?;
+        if identity.version != HOST_LAYOUT_VERSION
+            || identity.job_id != job
+            || identity.identity_file
+                != LayoutEntry::new(identity_name.clone(), identity_file_identity)
+        {
+            return Err(WorkerError::Protocol(
+                "canonical supervisor lock identity changed".into(),
+            ));
+        }
+        let namespace =
+            jobs.open_child_directory(&relative(&format!("{job}/{SUPERVISOR_DIRECTORY}"))?, false)?;
+        let current = build_supervisor_lock_identity(
+            &namespace,
+            job,
+            namespace.private_entry_identity(SUPERVISOR_LOCK_FILE)?,
+            identity_file_identity,
+            &identity_name,
+        )?;
+        if current != identity {
+            return Err(WorkerError::Protocol(
+                "canonical supervisor lock identity changed".into(),
+            ));
+        }
+        namespace.validate_private_regular_binding(
+            SUPERVISOR_LOCK_FILE,
+            &file,
+            identity.lock.as_private(),
+        )?;
+        let contender = namespace.open_existing_private_lock(SUPERVISOR_LOCK_FILE)?;
+        if unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_UN) };
+            return Err(WorkerError::Protocol(
+                "inherited supervisor descriptor does not retain the elected lock".into(),
+            ));
+        }
+        let contention_error = std::io::Error::last_os_error();
+        if contention_error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(WorkerError::Io(contention_error));
+        }
+        let guard = SupervisorGuard {
+            file,
+            namespace,
+            file_name: SUPERVISOR_LOCK_FILE.into(),
+            file_identity: identity.lock.as_private(),
+            anchor_namespace: jobs,
+            identity_file,
+            identity_file_name: identity_name,
+            identity_file_identity,
+            identity,
+        };
+        guard.validate()?;
+        Ok(guard)
+    }
+
     pub fn incoming_job(&self, job: JobId, token: LeaseToken) -> Result<PathBuf, WorkerError> {
         self.validate_layout()?;
         Ok(self
@@ -1137,6 +1549,19 @@ impl HostStore {
         validate_digest(project, "project ID")?;
         validate_digest(worktree, "worktree ID")?;
         let guard = self.admission_lock(job)?;
+        self.begin_job_after(guard, project, worktree, job)
+    }
+
+    pub(crate) fn begin_job_after(
+        &self,
+        guard: AdmissionGuard,
+        project: &str,
+        worktree: &str,
+        job: JobId,
+    ) -> Result<StagedJob, WorkerError> {
+        guard.validate_for(job)?;
+        validate_digest(project, "project ID")?;
+        validate_digest(worktree, "worktree ID")?;
         let nonce = *uuid::Uuid::new_v4().as_bytes();
         let leases = self.open_directory("leases", false)?;
         let root = leases.create_new_child_directory(&format!(".job-{job}-{}", hex_16(nonce)))?;
@@ -1152,6 +1577,59 @@ impl HostStore {
             receipt_nonce: nonce,
             guard,
         })
+    }
+
+    pub(crate) fn reopen_published_after(
+        &self,
+        guard: AdmissionGuard,
+        project: &str,
+        worktree: &str,
+        job: JobId,
+    ) -> Result<PublishedJob, WorkerError> {
+        guard.validate_for(job)?;
+        validate_digest(project, "project ID")?;
+        validate_digest(worktree, "worktree ID")?;
+        let final_parent = self.open_directory(&format!("jobs/{project}/{worktree}"), false)?;
+        let root = final_parent.open_child_directory(&relative(&job.to_string())?, false)?;
+        let published = PublishedJob {
+            root,
+            guard,
+            job_id: job,
+            project_id: project.into(),
+            worktree_id: worktree.into(),
+        };
+        published.validate()?;
+        let leases = self.open_directory("leases", false)?;
+        leases.sync_root()?;
+        final_parent.sync_root()?;
+        consume_write_fault_io(self, HostStoreWritePoint::AfterJobPublish)?;
+        published.validate()?;
+        Ok(published)
+    }
+
+    pub(crate) fn repair_indexed_publication_after(
+        &self,
+        admission: &AdmissionGuard,
+        project: &str,
+        worktree: &str,
+        job: JobId,
+    ) -> Result<(), WorkerError> {
+        admission.validate_for(job)?;
+        validate_digest(project, "project ID")?;
+        validate_digest(worktree, "worktree ID")?;
+        let leases = self.open_directory("leases", false)?;
+        let final_parent = self.open_directory(&format!("jobs/{project}/{worktree}"), false)?;
+        let final_job = final_parent.open_child_directory(&relative(&job.to_string())?, false)?;
+        let index = self.open_directory("job-index", false)?;
+        final_job.verify_bound()?;
+        admission.validate_for(job)?;
+        leases.sync_root()?;
+        final_parent.sync_root()?;
+        consume_write_fault_io(self, HostStoreWritePoint::AfterJobPublish)?;
+        index.sync_root()?;
+        consume_write_fault_io(self, HostStoreWritePoint::AfterJobIndexParentSync)?;
+        final_job.verify_bound()?;
+        admission.validate_for(job)
     }
 
     pub fn record_accepted(
@@ -1174,6 +1652,39 @@ impl HostStore {
         };
         guard.validate()?;
         self.write_new_disposition(&disposition)
+    }
+
+    pub(crate) fn record_accepted_after(
+        &self,
+        published: &PublishedJob,
+        request: &SubmitRequest,
+        status: &JobStatus,
+        now: u64,
+    ) -> Result<(), WorkerError> {
+        request.validate()?;
+        status.validate()?;
+        published.validate()?;
+        if status.state() != crate::job::JobState::Accepted
+            || published.job_id != request.material().job_id()
+            || published.project_id != request.material().project_id()
+            || published.worktree_id != request.material().worktree_id()
+        {
+            return Err(protocol_code(
+                "JOB_ID_CONFLICT",
+                "accepted publication identity does not match the request",
+            ));
+        }
+        let disposition = JobDisposition::Accepted {
+            job_id: request.material().job_id(),
+            client_id: request.material().client_id(),
+            project_id: request.material().project_id().into(),
+            worktree_id: request.material().worktree_id().into(),
+            request_fingerprint: request.request_fingerprint().clone(),
+            status: status.clone(),
+            recorded_at_millis: now,
+        };
+        self.write_new_disposition(&disposition)?;
+        published.validate()
     }
 
     pub fn record_abandoned(
@@ -1285,7 +1796,43 @@ impl HostStore {
                 "job ID already has a permanent disposition",
             ));
         }
-        atomic_write_at(&index, &name, disposition)
+        if matches!(disposition, JobDisposition::Accepted { .. }) {
+            let bytes = serde_json::to_vec(disposition).map_err(|error| {
+                WorkerError::Protocol(format!("failed to serialize host JSON: {error}"))
+            })?;
+            if bytes.len() as u64 > MAX_HOST_FILE_BYTES {
+                return Err(WorkerError::Protocol("host JSON exceeds 1 MiB".into()));
+            }
+            let staging = format!(".accept-{job}.json");
+            if index.entry_exists(&staging)? {
+                let staged: JobDisposition = read_json_strict_at(&index, &staging)?;
+                if !same_recoverable_accepted_staging(&staged, disposition) {
+                    return Err(protocol_code(
+                        "JOB_ID_CONFLICT",
+                        "accepted-index staging evidence conflicts with the request",
+                    ));
+                }
+                index.remove_owned_regular(&staging)?;
+            }
+            index
+                .write_private_atomic_no_replace_with_commit_hooks(
+                    &name,
+                    &staging,
+                    &bytes,
+                    || consume_write_fault_io(self, HostStoreWritePoint::AfterJobIndexFileSync),
+                    || consume_write_fault_io(self, HostStoreWritePoint::AfterJobIndexRename),
+                    || consume_write_fault_io(self, HostStoreWritePoint::AfterJobIndexParentSync),
+                )
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        protocol_code("JOB_ID_CONFLICT", "host record already exists")
+                    } else {
+                        WorkerError::Io(error)
+                    }
+                })
+        } else {
+            atomic_write_at(&index, &name, disposition)
+        }
     }
 
     #[allow(dead_code)] // Task 7 lifecycle consumes this internal proof writer.
@@ -1333,7 +1880,10 @@ impl HostStore {
         );
         let terminal = match self.open_directory(&final_relative, false) {
             Ok(job_dir) => match read_json_optional_at::<JobStatus>(&job_dir, "status.json")? {
-                Some(status) if status.state().is_terminal() => Some(job_dir),
+                Some(status) if status.state().is_terminal() => {
+                    validate_terminal_job_basis(self, &job_dir, lease, false)?;
+                    Some(job_dir)
+                }
                 _ => None,
             },
             Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1390,6 +1940,11 @@ impl HostStore {
             },
             "cleanup marker",
         )?;
+        if self.consume_fault(HostStoreWritePoint::AfterJobCleanupProof) {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected cleanup-proof crash boundary",
+            )));
+        }
         Ok(CleanupReceipt {
             root_identity: self.root_identity()?,
             job_id: lease.job_id(),
@@ -1539,13 +2094,28 @@ impl HostStore {
     }
 
     fn remove_job_mutable_scopes(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
-        if let Some(incoming) =
-            self.open_optional_directory(&format!("incoming/{}", lease.job_id()))?
-        {
+        let incoming_root = self.open_directory("incoming", false)?;
+        let incoming_job_name = lease.job_id().to_string();
+        if incoming_root.entry_exists(&incoming_job_name)? {
+            let incoming =
+                incoming_root.open_child_directory(&relative(&incoming_job_name)?, false)?;
             let token = lease.lease_token().to_string();
             if incoming.entry_exists(&token)? {
                 incoming.remove_owned_child(&token)?;
             }
+            let remaining = incoming.list_names()?;
+            let only_private_namespace = remaining.len() == 1
+                && remaining[0].as_slice() == b".mac-worker-rooted-fs"
+                && incoming
+                    .open_child_directory(&relative(".mac-worker-rooted-fs")?, false)?
+                    .list_names()?
+                    .is_empty();
+            if !remaining.is_empty() && !only_private_namespace {
+                return Err(WorkerError::Protocol(
+                    "incoming job scope contains non-lease evidence".into(),
+                ));
+            }
+            incoming_root.remove_owned_child(&incoming_job_name)?;
         }
         if let Some(job) = self.open_optional_directory(&format!(
             "jobs/{}/{}/{}",
@@ -1588,10 +2158,8 @@ impl HostStore {
     }
 
     fn verify_job_mutable_scopes_absent(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
-        if let Some(incoming) =
-            self.open_optional_directory(&format!("incoming/{}", lease.job_id()))?
-            && incoming.entry_exists(&lease.lease_token().to_string())?
-        {
+        let incoming = self.open_directory("incoming", false)?;
+        if incoming.entry_exists(&lease.job_id().to_string())? {
             return Err(WorkerError::Protocol(
                 "incoming job scope remains after cleanup".into(),
             ));
@@ -1781,6 +2349,14 @@ fn worker_error_as_io(error: WorkerError) -> std::io::Error {
     }
 }
 
+fn consume_write_fault_io(store: &HostStore, point: HostStoreWritePoint) -> std::io::Result<()> {
+    if store.consume_fault(point) {
+        Err(std::io::Error::other("injected host-store write failure"))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_host_layout(
     stored: &HostLayoutIdentity,
     current: &HostLayoutIdentity,
@@ -1806,6 +2382,28 @@ fn build_transfer_lock_identity(
         directory: LayoutEntry::new(format!("{job}/{TRANSFER_DIRECTORY}"), directory.identity()?),
         lock: LayoutEntry::new(
             format!("{job}/{TRANSFER_DIRECTORY}/{TRANSFER_LOCK_FILE}"),
+            lock,
+        ),
+        identity_file: LayoutEntry::new(identity_file_name.into(), identity_file),
+    })
+}
+
+fn build_supervisor_lock_identity(
+    directory: &RootedDir,
+    job: JobId,
+    lock: PrivateEntryIdentity,
+    identity_file: PrivateEntryIdentity,
+    identity_file_name: &str,
+) -> Result<SupervisorLockIdentity, WorkerError> {
+    Ok(SupervisorLockIdentity {
+        version: HOST_LAYOUT_VERSION,
+        job_id: job,
+        directory: LayoutEntry::new(
+            format!("{job}/{SUPERVISOR_DIRECTORY}"),
+            directory.identity()?,
+        ),
+        lock: LayoutEntry::new(
+            format!("{job}/{SUPERVISOR_DIRECTORY}/{SUPERVISOR_LOCK_FILE}"),
             lock,
         ),
         identity_file: LayoutEntry::new(identity_file_name.into(), identity_file),
@@ -1880,6 +2478,37 @@ fn same_disposition_identity(left: &JobDisposition, right: &JobDisposition) -> b
         }
         _ => false,
     }
+}
+
+fn same_recoverable_accepted_staging(staged: &JobDisposition, requested: &JobDisposition) -> bool {
+    matches!(
+        (staged, requested),
+        (
+            JobDisposition::Accepted {
+                job_id: staged_job,
+                client_id: staged_client,
+                project_id: staged_project,
+                worktree_id: staged_worktree,
+                request_fingerprint: staged_fingerprint,
+                status: staged_status,
+                ..
+            },
+            JobDisposition::Accepted {
+                job_id: requested_job,
+                client_id: requested_client,
+                project_id: requested_project,
+                worktree_id: requested_worktree,
+                request_fingerprint: requested_fingerprint,
+                status: requested_status,
+                ..
+            }
+        ) if staged_job == requested_job
+            && staged_client == requested_client
+            && staged_project == requested_project
+            && staged_worktree == requested_worktree
+            && staged_fingerprint == requested_fingerprint
+            && staged_status == requested_status
+    )
 }
 
 fn disposition_job_id(disposition: &JobDisposition) -> JobId {
@@ -2033,7 +2662,19 @@ impl StagedJob {
         })
     }
 
-    pub(crate) fn publish_complete(mut self, receipt: WorkspaceReceipt) -> Result<(), WorkerError> {
+    pub(crate) fn publish_complete(
+        self,
+        receipt: WorkspaceReceipt,
+    ) -> Result<PublishedJob, WorkerError> {
+        self.publish_complete_with_commit_hooks(receipt, || Ok(()), || Ok(()))
+    }
+
+    pub(crate) fn publish_complete_with_commit_hooks(
+        mut self,
+        receipt: WorkspaceReceipt,
+        after_rename: impl FnOnce() -> std::io::Result<()>,
+        after_parent_sync: impl FnOnce() -> std::io::Result<()>,
+    ) -> Result<PublishedJob, WorkerError> {
         if receipt.job_id != self.job_id
             || receipt.nonce != self.receipt_nonce
             || receipt.project_id != self.project_id
@@ -2051,10 +2692,38 @@ impl StagedJob {
             ));
         }
         self.guard.validate()?;
-        self.root
-            .publish_owned_into(&self.final_parent, &self.final_name)?;
-        self.final_parent.sync_root()?;
+        self.root.publish_owned_into_with_commit_hooks(
+            &self.final_parent,
+            &self.final_name,
+            after_rename,
+            after_parent_sync,
+        )?;
+        let published = PublishedJob {
+            root: self.root,
+            guard: self.guard,
+            job_id: self.job_id,
+            project_id: self.project_id,
+            worktree_id: self.worktree_id,
+        };
+        published.validate()?;
+        Ok(published)
+    }
+}
+
+impl PublishedJob {
+    pub(crate) fn validate(&self) -> Result<(), WorkerError> {
+        self.guard.validate_for(self.job_id)?;
+        self.root.verify_bound()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    pub(crate) fn admission_guard(&self) -> &AdmissionGuard {
+        &self.guard
     }
 }
 
@@ -2105,12 +2774,7 @@ impl CleanupReceipt {
                     ),
                     false,
                 )?;
-                let status: JobStatus = read_json_strict_at(&job_dir, "status.json")?;
-                if !status.state().is_terminal() {
-                    return Err(WorkerError::Protocol(
-                        "terminal cleanup proof is not terminal".into(),
-                    ));
-                }
+                validate_terminal_job_basis(store, &job_dir, lease, true)?;
             }
             CleanupProof::Abandoned => {
                 let disposition = store
@@ -2134,6 +2798,123 @@ impl CleanupReceipt {
         }
         Ok(())
     }
+}
+
+fn validate_terminal_job_basis(
+    store: &HostStore,
+    job: &RootedDir,
+    lease: &LeaseRecord,
+    require_mutable_absent: bool,
+) -> Result<(), WorkerError> {
+    let disposition = store.disposition(lease.job_id())?;
+    match disposition {
+        Some(JobDisposition::Accepted {
+            job_id,
+            client_id,
+            project_id,
+            worktree_id,
+            request_fingerprint,
+            ..
+        }) if job_id == lease.job_id()
+            && client_id == lease.client_id()
+            && project_id == lease.project_id()
+            && worktree_id == lease.worktree_id()
+            && request_fingerprint == *lease.request_fingerprint() => {}
+        _ => {
+            return Err(WorkerError::Protocol(
+                "terminal cleanup requires the exact Accepted disposition".into(),
+            ));
+        }
+    }
+    let meta: JobMeta = read_json_strict_at(job, "meta.json")?;
+    if meta.job_id() != lease.job_id()
+        || meta.client_id() != lease.client_id()
+        || meta.request_fingerprint() != lease.request_fingerprint()
+        || meta.worker_name() != lease.worker_name()
+        || meta.project_id() != lease.project_id()
+        || meta.worktree_id() != lease.worktree_id()
+        || meta.manifest_digest() != lease.manifest_digest()
+        || meta.timeout_millis() != lease.timeout_millis()
+        || meta.resource_class() != lease.resource_class()
+        || meta.command_summary() != lease.command_summary()
+    {
+        return Err(WorkerError::Protocol(
+            "terminal cleanup metadata does not match the live lease".into(),
+        ));
+    }
+    let status: JobStatus = read_json_strict_at(job, "status.json")?;
+    if !status.state().is_terminal() {
+        return Err(WorkerError::Protocol(
+            "terminal cleanup proof is not terminal".into(),
+        ));
+    }
+    if job.entry_exists("execution.json")? {
+        return Err(WorkerError::Protocol(
+            "terminal cleanup requires erased execution payload".into(),
+        ));
+    }
+    let expected_log_lengths = [
+        status
+            .final_stdout_bytes()
+            .expect("validated terminal status has a stdout length"),
+        status
+            .final_stderr_bytes()
+            .expect("validated terminal status has a stderr length"),
+    ];
+    for (log, expected_length) in ["stdout.log", "stderr.log"]
+        .into_iter()
+        .zip(expected_log_lengths)
+    {
+        let file = job.open_private_append(log)?;
+        let actual_length = job.validate_private_append_binding(log, &file)?;
+        if actual_length != expected_length {
+            return Err(WorkerError::Protocol(
+                "terminal cleanup log length does not match status".into(),
+            ));
+        }
+    }
+    let names = job
+        .list_names()?
+        .into_iter()
+        .map(|name| {
+            String::from_utf8(name).map_err(|_| {
+                WorkerError::Protocol("terminal job contains a non-UTF-8 entry".into())
+            })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let retained = [
+        ".mac-worker-rooted-fs",
+        "meta.json",
+        "status.json",
+        "stdout.log",
+        "stderr.log",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect::<BTreeSet<_>>();
+    let allowed = retained
+        .iter()
+        .cloned()
+        .chain(["workspace", "home", "tmp"].into_iter().map(String::from))
+        .collect::<BTreeSet<_>>();
+    if (require_mutable_absent && names != retained)
+        || (!require_mutable_absent && !names.is_subset(&allowed))
+    {
+        return Err(WorkerError::Protocol(
+            "terminal job cleanup scope is incomplete or unsafe".into(),
+        ));
+    }
+    for mutable in ["workspace", "home", "tmp"] {
+        if job.entry_exists(mutable)? {
+            if require_mutable_absent {
+                return Err(WorkerError::Protocol(
+                    "terminal job mutable scope remains".into(),
+                ));
+            }
+            job.open_child_directory(&relative(mutable)?, false)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_digest(value: &str, label: &str) -> Result<(), WorkerError> {
@@ -2162,7 +2943,7 @@ fn hex_16(bytes: [u8; 16]) -> String {
 mod review_regression_tests {
     use super::*;
     use crate::job::{ClientId, CommandSpec, LeaseToken, RequestFingerprintMaterial};
-    use std::{fs, sync::mpsc, thread, time::Duration};
+    use std::{fs, os::unix::fs::PermissionsExt, sync::mpsc, thread, time::Duration};
     use tempfile::tempdir;
 
     fn installation_entries(parent: &Path) -> Vec<PathBuf> {
@@ -2831,5 +3612,134 @@ mod review_regression_tests {
             .is_err()
         );
         assert!(HostStore::open(&complete_root).is_ok());
+    }
+
+    #[test]
+    fn task7_publication_retains_final_descriptor_and_matching_admission() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let acquire = request(70);
+        let submit = crate::job::SubmitRequest::new(acquire.material().clone());
+        let material = submit.material();
+        let admission = store.admission_lock(material.job_id()).unwrap();
+        let mut staged = store
+            .begin_job_after(
+                admission,
+                material.project_id(),
+                material.worktree_id(),
+                material.job_id(),
+            )
+            .unwrap();
+        let payload = RelativePath::parse(b"payload").unwrap();
+        staged
+            .create_workspace_tree()
+            .unwrap()
+            .create_empty_directory(&payload)
+            .unwrap();
+        let receipt = staged
+            .complete_snapshot_materialization(
+                &BTreeSet::from([payload]),
+                material.project_id(),
+                material.worktree_id(),
+                material.manifest_digest(),
+            )
+            .unwrap();
+
+        let published = staged.publish_complete(receipt).unwrap();
+        assert_eq!(published.job_id(), material.job_id());
+        published.validate().unwrap();
+        store
+            .record_accepted_after(&published, &submit, &JobStatus::accepted(71).unwrap(), 71)
+            .unwrap();
+        assert!(store.job_index(material.job_id()).unwrap().is_file());
+        published.validate().unwrap();
+    }
+
+    #[test]
+    fn task7_supervisor_lock_is_nonblocking_and_survives_admission_release() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let job = request(71).material().job_id();
+        let admission = store.admission_lock(job).unwrap();
+        let supervisor = store
+            .supervisor_lock_after(&admission, job, false)
+            .unwrap()
+            .unwrap();
+        drop(admission);
+        supervisor.validate().unwrap();
+
+        let contender_store = store.clone();
+        let (sender, receiver) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            let admission = contender_store.admission_lock(job).unwrap();
+            let won = contender_store
+                .supervisor_lock_after(&admission, job, false)
+                .unwrap()
+                .is_some();
+            sender.send(won).unwrap();
+        });
+        assert!(!receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        contender.join().unwrap();
+
+        drop(supervisor);
+        let admission = store.admission_lock(job).unwrap();
+        assert!(
+            store
+                .supervisor_lock_after(&admission, job, false)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn task7_supervisor_lock_rejects_directory_file_and_identity_replacements() {
+        for (seed, mutation) in [(72, "directory"), (73, "lock"), (74, "identity")] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let store = HostStore::open(&root).unwrap();
+            let job = request(seed).material().job_id();
+            let admission = store.admission_lock(job).unwrap();
+            let supervisor = store
+                .supervisor_lock_after(&admission, job, false)
+                .unwrap()
+                .unwrap();
+            drop(supervisor);
+            drop(admission);
+
+            let job_locks = root.join("locks/jobs");
+            let supervisor_dir = job_locks.join(job.to_string()).join(SUPERVISOR_DIRECTORY);
+            let lock = supervisor_dir.join(SUPERVISOR_LOCK_FILE);
+            let identity = job_locks.join(format!("{job}{SUPERVISOR_IDENTITY_SUFFIX}"));
+            match mutation {
+                "directory" => {
+                    fs::rename(&supervisor_dir, supervisor_dir.with_extension("retained")).unwrap();
+                    fs::create_dir(&supervisor_dir).unwrap();
+                    fs::set_permissions(&supervisor_dir, fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    fs::write(&lock, b"").unwrap();
+                    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                "lock" => {
+                    fs::rename(&lock, lock.with_extension("retained")).unwrap();
+                    fs::write(&lock, b"").unwrap();
+                    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                "identity" => {
+                    let bytes = fs::read(&identity).unwrap();
+                    fs::rename(&identity, identity.with_extension("retained")).unwrap();
+                    fs::write(&identity, bytes).unwrap();
+                    fs::set_permissions(&identity, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let admission = store.admission_lock(job).unwrap();
+            assert!(
+                store.supervisor_lock_after(&admission, job, false).is_err(),
+                "{mutation} replacement formed a second supervisor lock domain"
+            );
+        }
     }
 }

@@ -39,6 +39,10 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum HostCommand {
     Probe,
+    Submit,
+    Supervise {
+        job_id: HiddenComponent,
+    },
     #[command(name = "lease-acquire")]
     LeaseAcquire,
     #[command(name = "snapshot-verify")]

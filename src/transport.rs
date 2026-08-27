@@ -5,8 +5,8 @@ use crate::{
     error::{ProcessError, ProcessStream, WorkerError},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::{
-        HealthStatus, PROTOCOL_VERSION, ProbeResponse, SetupFailureKind, WorkerHealth,
-        WorkersReport, missing_capabilities,
+        HealthStatus, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION, SetupFailureKind,
+        WorkerHealth, WorkersReport, missing_capabilities,
     },
 };
 
@@ -237,6 +237,21 @@ impl<R: ProcessRunner> SshTransport<R> {
                 None,
             );
         }
+        if probe.supervision_version != SUPERVISION_VERSION {
+            return (
+                unavailable(
+                    worker,
+                    "PROTOCOL_MISMATCH",
+                    format!(
+                        "worker supervision version {} does not match required version {SUPERVISION_VERSION}",
+                        probe.supervision_version
+                    ),
+                    Some(probe),
+                    Vec::new(),
+                ),
+                None,
+            );
+        }
 
         let missing = missing_capabilities(required_capabilities, &probe);
         if !missing.is_empty() {
@@ -320,14 +335,52 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
         swap_used_bytes: Option<u64>,
         capabilities: Vec<String>,
     }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProtocolTwoWithoutSupervision {
+        protocol_version: u32,
+        hostname: String,
+        arch: String,
+        os_version: String,
+        free_disk_bytes: u64,
+        total_disk_bytes: u64,
+        memory_pressure: crate::protocol::MemoryPressure,
+        swap_used_bytes: Option<u64>,
+        slot_state: crate::lease::SlotState,
+        active_lease: Option<crate::lease::LeaseSummary>,
+        capabilities: Vec<String>,
+    }
 
     let version: VersionOnly = serde_json::from_str(response)?;
     if version.protocol_version == PROTOCOL_VERSION {
-        serde_json::from_str(response)
+        match serde_json::from_str(response) {
+            Ok(probe) => Ok(probe),
+            Err(full_error) => {
+                let legacy: ProtocolTwoWithoutSupervision = match serde_json::from_str(response) {
+                    Ok(legacy) => legacy,
+                    Err(_) => return Err(full_error),
+                };
+                Ok(ProbeResponse {
+                    protocol_version: legacy.protocol_version,
+                    supervision_version: 0,
+                    hostname: legacy.hostname,
+                    arch: legacy.arch,
+                    os_version: legacy.os_version,
+                    free_disk_bytes: legacy.free_disk_bytes,
+                    total_disk_bytes: legacy.total_disk_bytes,
+                    memory_pressure: legacy.memory_pressure,
+                    swap_used_bytes: legacy.swap_used_bytes,
+                    slot_state: legacy.slot_state,
+                    active_lease: legacy.active_lease,
+                    capabilities: legacy.capabilities,
+                })
+            }
+        }
     } else {
         let legacy: LegacyProbe = serde_json::from_str(response)?;
         Ok(ProbeResponse {
             protocol_version: legacy.protocol_version,
+            supervision_version: 0,
             hostname: legacy.hostname,
             arch: legacy.arch,
             os_version: legacy.os_version,

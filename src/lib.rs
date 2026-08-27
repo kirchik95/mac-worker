@@ -11,7 +11,8 @@ use doctor::{DoctorRequest, DoctorService};
 use error::WorkerError;
 use host_store::HostStore;
 use install::Installer;
-use job::LeaseAcquireRequest;
+use job::{LeaseAcquireRequest, SubmitRequest};
+use job_service::JobService;
 use lease::{AdmissionFacts, LeaseService};
 use output::CommandOutput;
 use paths::PathLayout;
@@ -20,6 +21,10 @@ use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport};
 use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnapshotResponse};
 use serde::Deserialize;
+use supervisor::{
+    SUPERVISOR_LOCK_FD, Supervisor, SystemProcessInspector, SystemSupervisorLauncher,
+    validate_detached_supervisor_context,
+};
 use transfer::{
     HostTransferService, RsyncServerExecutor, SystemRsyncServerExecutor, TransferIdentity,
 };
@@ -35,6 +40,7 @@ pub mod host_store;
 pub mod inputs;
 pub mod install;
 pub mod job;
+pub mod job_service;
 pub mod lease;
 pub mod manifest;
 pub mod output;
@@ -49,6 +55,7 @@ pub mod remote_snapshot;
 pub mod requirements;
 pub mod rooted_fs;
 pub mod snapshot;
+pub mod supervisor;
 pub mod transfer;
 pub mod transport;
 
@@ -166,6 +173,16 @@ fn execute_with_context(
             "host snapshot-verify requires the stdio execution boundary".into(),
         )),
         Command::Host {
+            command: HostCommand::Submit,
+        } => Err(WorkerError::Protocol(
+            "host submit requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::Supervise { .. },
+        } => Err(WorkerError::Protocol(
+            "host supervise requires the inherited supervisor boundary".into(),
+        )),
+        Command::Host {
             command: HostCommand::RsyncReceive { .. },
         } => Err(WorkerError::Protocol(
             "host rsync-receive requires the binary stdio execution boundary".into(),
@@ -239,6 +256,20 @@ pub fn run_with_rsync_executor_in_context(
     if matches!(
         &cli.command,
         Command::Host {
+            command: HostCommand::Submit
+        }
+    ) {
+        return run_host_submit(cli.config, runtime, stdin, stdout);
+    }
+    if let Command::Host {
+        command: HostCommand::Supervise { job_id },
+    } = &cli.command
+    {
+        return run_host_supervise(cli.config, runtime, job_id.expose());
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
             command: HostCommand::LeaseAcquire
         }
     ) {
@@ -298,6 +329,83 @@ pub fn run_with_rsync_executor_in_context(
             write_error(stderr, &error);
             error.exit_code()
         }
+    }
+}
+
+fn run_host_submit(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    const LIMIT: usize = 1024 * 1024;
+    let result = (|| -> Result<job::SubmitResponse, WorkerError> {
+        let mut bytes = Vec::new();
+        stdin.take((LIMIT + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > LIMIT {
+            return Err(WorkerError::Protocol(
+                "submit request exceeded 1 MiB".into(),
+            ));
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let request = SubmitRequest::deserialize(&mut deserializer)
+            .map_err(|_| WorkerError::Protocol("invalid submit request".into()))?;
+        deserializer
+            .end()
+            .map_err(|_| WorkerError::Protocol("submit request contained trailing data".into()))?;
+        if serde_json::to_vec(&request)
+            .map_err(|_| WorkerError::Protocol("submit request serialization failed".into()))?
+            != bytes
+        {
+            return Err(WorkerError::Protocol(
+                "submit request was not canonical JSON".into(),
+            ));
+        }
+        let paths = discover_paths(config_override, runtime)?;
+        let store = HostStore::open(&paths.host_state_root())?;
+        let launcher = SystemSupervisorLauncher::new()?;
+        JobService::new(&store, &launcher).submit(request)
+    })();
+
+    let exit = match &result {
+        Ok(_) => 0,
+        Err(error) => error.exit_code(),
+    };
+    let write_result = match result {
+        Ok(response) => serde_json::to_writer(&mut *stdout, &response),
+        Err(error) => {
+            let (code, message) = public_host_error(&error);
+            serde_json::to_writer(
+                &mut *stdout,
+                &serde_json::json!({"error": {"code": code, "message": message}}),
+            )
+        }
+    };
+    if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
+        return crate::error::ExitKind::Io as u8;
+    }
+    exit
+}
+
+fn run_host_supervise(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    raw_job_id: &str,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        validate_detached_supervisor_context()?;
+        let job_id = raw_job_id
+            .parse()
+            .map_err(|_| WorkerError::Protocol("invalid supervisor job identity".into()))?;
+        let paths = discover_paths(config_override, runtime)?;
+        let store = HostStore::open(&paths.host_state_root())?;
+        let guard = store.supervisor_guard_from_inherited(job_id, SUPERVISOR_LOCK_FD)?;
+        let inspector = SystemProcessInspector;
+        Supervisor::new(&store, &inspector).run_with_guard(job_id, guard)
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => error.exit_code(),
     }
 }
 

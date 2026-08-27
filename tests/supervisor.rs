@@ -1,0 +1,2045 @@
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Write as _,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use mac_worker::{
+    host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
+    job::{
+        CommandSpec, JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
+        ProcessIdentity, RequestFingerprintMaterial, SubmitRequest,
+    },
+    job_service::{JobService, LaunchCandidate, SupervisorLauncher},
+    lease::{AdmissionFacts, LeaseService},
+    protocol::{MemoryPressure, PROTOCOL_VERSION},
+    remote_snapshot::RemoteSnapshotService,
+    supervisor::{ProcessInspector, Supervisor, SupervisorFaultPoint, SystemProcessInspector},
+};
+use sha2::{Digest, Sha256};
+
+const JOB_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
+const CLIENT_ID: &str = "102f0f4a6b5c7d8e9f00112233445566";
+const LEASE_TOKEN: &str = "202f0f4a6b5c7d8e9f00112233445566";
+const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const MANIFEST_DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+fn material(command: CommandSpec) -> RequestFingerprintMaterial {
+    RequestFingerprintMaterial::new(
+        JOB_ID.parse().unwrap(),
+        CLIENT_ID.parse().unwrap(),
+        LEASE_TOKEN.parse().unwrap(),
+        "mini-1".into(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        MANIFEST_DIGEST.into(),
+        "packages/app".into(),
+        30_000,
+        "heavy".into(),
+        command,
+    )
+    .unwrap()
+}
+
+fn healthy() -> AdmissionFacts {
+    AdmissionFacts {
+        free_disk_bytes: 100 * 1024 * 1024 * 1024,
+        total_disk_bytes: 250 * 1024 * 1024 * 1024,
+        memory_pressure: MemoryPressure::Normal,
+        swap_used_bytes: Some(0),
+    }
+}
+
+fn valid_manifest_bytes() -> Vec<u8> {
+    format!(
+        concat!(
+            r#"{{"version":1,"project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
+            r#""head":null,"branch":null,"dirty":false,"relative_working_dir":"","#,
+            r#""entries":[{{"path":"payload.txt","kind":"file","mode":420,"size":7,"#,
+            r#""sha256":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5","#,
+            r#""symlink_target":null}}],"tracked_deletions":[]}}"#,
+        ),
+        PROJECT_ID = PROJECT_ID,
+        WORKTREE_ID = WORKTREE_ID,
+    )
+    .into_bytes()
+}
+
+fn prepared_host(root: &Path) -> (HostStore, LeaseRecord, SubmitRequest) {
+    prepared_host_with_command(
+        root,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    )
+}
+
+fn prepared_host_with_command(
+    root: &Path,
+    command: CommandSpec,
+) -> (HostStore, LeaseRecord, SubmitRequest) {
+    prepared_host_with_command_and_timeout(root, command, 30_000)
+}
+
+fn prepared_host_with_command_and_timeout(
+    root: &Path,
+    command: CommandSpec,
+    timeout_millis: u64,
+) -> (HostStore, LeaseRecord, SubmitRequest) {
+    let store = HostStore::open(root).unwrap();
+    let manifest = valid_manifest_bytes();
+    let digest = format!("{:x}", Sha256::digest(&manifest));
+    let request = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            JOB_ID.parse().unwrap(),
+            CLIENT_ID.parse().unwrap(),
+            LEASE_TOKEN.parse().unwrap(),
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            digest.clone(),
+            String::new(),
+            timeout_millis,
+            "heavy".into(),
+            command,
+        )
+        .unwrap(),
+    );
+    let lease = match LeaseService::new(&store)
+        .acquire(&request, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    fs::create_dir_all(incoming.join("tree")).unwrap();
+    for private in [
+        incoming.parent().unwrap().parent().unwrap(),
+        incoming.parent().unwrap(),
+        incoming.as_path(),
+    ] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(incoming.join("manifest.json"), manifest).unwrap();
+    fs::write(incoming.join("tree/payload.txt"), b"payload").unwrap();
+    fs::set_permissions(
+        incoming.join("manifest.json"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(
+        incoming.join("tree/payload.txt"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
+    RemoteSnapshotService::new(&store)
+        .verify_and_promote_at(&lease, &digest, 2)
+        .unwrap();
+    (store, lease, SubmitRequest::new(request.material().clone()))
+}
+
+fn prepared_host_with_nested_cwd(
+    root: &Path,
+    command: CommandSpec,
+) -> (HostStore, LeaseRecord, SubmitRequest) {
+    let store = HostStore::open(root).unwrap();
+    let manifest = format!(
+        concat!(
+            r#"{{"version":1,"project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
+            r#""head":null,"branch":null,"dirty":false,"relative_working_dir":"nested","#,
+            r#""entries":[{{"path":"nested","kind":"directory","mode":493,"size":0,"#,
+            r#""sha256":"4b66bf93b3932a9539880b2421e35019af9daf84363a0246280ffcac173b2678","#,
+            r#""symlink_target":null}},{{"path":"nested/payload.txt","kind":"file","mode":420,"size":7,"#,
+            r#""sha256":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5","#,
+            r#""symlink_target":null}}],"tracked_deletions":[]}}"#,
+        ),
+        PROJECT_ID = PROJECT_ID,
+        WORKTREE_ID = WORKTREE_ID,
+    )
+    .into_bytes();
+    let digest = format!("{:x}", Sha256::digest(&manifest));
+    let request = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            JOB_ID.parse().unwrap(),
+            CLIENT_ID.parse().unwrap(),
+            LEASE_TOKEN.parse().unwrap(),
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            digest.clone(),
+            "nested".into(),
+            30_000,
+            "heavy".into(),
+            command,
+        )
+        .unwrap(),
+    );
+    let lease = match LeaseService::new(&store)
+        .acquire(&request, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    fs::create_dir_all(incoming.join("tree/nested")).unwrap();
+    for private in [
+        incoming.parent().unwrap().parent().unwrap(),
+        incoming.parent().unwrap(),
+        incoming.as_path(),
+    ] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(incoming.join("manifest.json"), manifest).unwrap();
+    fs::write(incoming.join("tree/nested/payload.txt"), b"payload").unwrap();
+    fs::set_permissions(
+        incoming.join("manifest.json"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(
+        incoming.join("tree/nested/payload.txt"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(
+        incoming.join("tree/nested"),
+        fs::Permissions::from_mode(0o555),
+    )
+    .unwrap();
+    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
+    RemoteSnapshotService::new(&store)
+        .verify_and_promote_at(&lease, &digest, 2)
+        .unwrap();
+    (store, lease, SubmitRequest::new(request.material().clone()))
+}
+
+struct InlineSupervisorLauncher {
+    store: HostStore,
+}
+
+struct FaultingInlineSupervisorLauncher {
+    store: HostStore,
+    point: SupervisorFaultPoint,
+}
+
+struct TamperingInlineSupervisorLauncher {
+    store: HostStore,
+    job_path: PathBuf,
+}
+
+impl SupervisorLauncher for InlineSupervisorLauncher {
+    fn launch(
+        &self,
+        job_id: mac_worker::job::JobId,
+        guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+        let inspector = SystemProcessInspector;
+        let identity = inspector.identity_for_pid(std::process::id())?;
+        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Ok(LaunchCandidate::new(identity))
+    }
+}
+
+impl SupervisorLauncher for FaultingInlineSupervisorLauncher {
+    fn launch(
+        &self,
+        job_id: mac_worker::job::JobId,
+        guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+        let inspector = SystemProcessInspector;
+        let identity = inspector.identity_for_pid(std::process::id())?;
+        Supervisor::new_with_fault(&self.store, &inspector, self.point)
+            .run_with_guard(job_id, guard)?;
+        Ok(LaunchCandidate::new(identity))
+    }
+}
+
+impl SupervisorLauncher for TamperingInlineSupervisorLauncher {
+    fn launch(
+        &self,
+        job_id: mac_worker::job::JobId,
+        guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+        let payload_path = self.job_path.join("execution.json");
+        let mut bytes = fs::read(&payload_path)?;
+        let original = b"/bin/true";
+        let replacement = b"/bin/echo";
+        let offset = bytes
+            .windows(original.len())
+            .position(|window| window == original)
+            .ok_or_else(|| {
+                mac_worker::error::WorkerError::Protocol(
+                    "test execution payload did not contain its command".into(),
+                )
+            })?;
+        bytes[offset..offset + original.len()].copy_from_slice(replacement);
+        let temporary = self.job_path.join(".test-tampered-execution");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &payload_path)?;
+        File::open(&self.job_path)?.sync_all()?;
+
+        let inspector = SystemProcessInspector;
+        let identity = inspector.identity_for_pid(std::process::id())?;
+        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Ok(LaunchCandidate::new(identity))
+    }
+}
+
+struct RecordingLauncher {
+    launches: Arc<AtomicUsize>,
+    job_path: PathBuf,
+    identity: ProcessIdentity,
+}
+
+struct PrelaunchTerminalLauncher {
+    job_path: PathBuf,
+    supervisor: ProcessIdentity,
+    child: ProcessIdentity,
+}
+
+struct FailingLauncher {
+    launches: Arc<AtomicUsize>,
+}
+
+impl SupervisorLauncher for FailingLauncher {
+    fn launch(
+        &self,
+        _job_id: mac_worker::job::JobId,
+        _guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        Err(mac_worker::error::WorkerError::Protocol(
+            "injected launcher failure".into(),
+        ))
+    }
+}
+
+impl SupervisorLauncher for PrelaunchTerminalLauncher {
+    fn launch(
+        &self,
+        _job_id: mac_worker::job::JobId,
+        guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+        let status: JobStatus =
+            serde_json::from_slice(&fs::read(self.job_path.join("status.json"))?)
+                .map_err(|error| mac_worker::error::WorkerError::Protocol(error.to_string()))?;
+        let terminal = status
+            .with_supervisor(self.supervisor, 4)?
+            .with_child(self.child, 5)?
+            .into_infrastructure_terminal(JobState::Lost, 6, 0, 0, "EXEC_FAILED".into())?;
+        let replacement = self.job_path.join(".test-prelaunch-status");
+        let mut replacement_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&replacement)?;
+        replacement_file.write_all(&serde_json::to_vec(&terminal).unwrap())?;
+        replacement_file.sync_all()?;
+        fs::rename(&replacement, self.job_path.join("status.json"))?;
+        File::open(&self.job_path)?.sync_all()?;
+        drop(guard);
+        Ok(LaunchCandidate::new(self.supervisor))
+    }
+}
+
+impl SupervisorLauncher for RecordingLauncher {
+    fn launch(
+        &self,
+        _job_id: mac_worker::job::JobId,
+        guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        let bytes = fs::read(self.job_path.join("status.json"))?;
+        let status: JobStatus = serde_json::from_slice(&bytes)
+            .map_err(|error| mac_worker::error::WorkerError::Protocol(error.to_string()))?;
+        let status = status.with_supervisor(self.identity, 4)?;
+        let replacement = self.job_path.join(".test-launcher-status");
+        let mut replacement_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&replacement)?;
+        replacement_file.write_all(&serde_json::to_vec(&status).unwrap())?;
+        replacement_file.sync_all()?;
+        fs::rename(&replacement, self.job_path.join("status.json"))?;
+        File::open(&self.job_path)?.sync_all()?;
+        drop(guard);
+        Ok(LaunchCandidate::new(self.identity))
+    }
+}
+
+#[test]
+fn status_enrichment_and_terminal_outcomes_preserve_sticky_process_identities() {
+    let supervisor = ProcessIdentity::new(101, 1_000_001).unwrap();
+    let child = ProcessIdentity::new(202, 2_000_002).unwrap();
+
+    let accepted = JobStatus::accepted(10).unwrap();
+    let supervised = accepted.with_supervisor(supervisor, 11).unwrap();
+    let ready = supervised.with_child(child, 12).unwrap();
+    let running = ready.into_running(13).unwrap();
+    let succeeded = running.clone().into_succeeded(14, 7, 9).unwrap();
+    let signalled = running.into_failed_signal(15, 15, 11, 13).unwrap();
+
+    assert_eq!(succeeded.state(), JobState::Succeeded);
+    assert_eq!(succeeded.supervisor_identity(), Some(supervisor));
+    assert_eq!(succeeded.child_identity(), Some(child));
+    assert_eq!(succeeded.exit_code(), Some(0));
+    assert_eq!(succeeded.terminating_signal(), None);
+    assert_eq!(signalled.supervisor_identity(), Some(supervisor));
+    assert_eq!(signalled.child_identity(), Some(child));
+    assert_eq!(signalled.exit_code(), None);
+    assert_eq!(signalled.terminating_signal(), Some(15));
+
+    assert!(supervised.with_supervisor(supervisor, 12).is_err());
+    assert!(ready.with_child(child, 13).is_err());
+}
+
+#[test]
+fn status_rejects_inconsistent_signal_identity_and_cleanup_shapes() {
+    let supervisor = ProcessIdentity::new(101, 1_000_001).unwrap();
+    let child = ProcessIdentity::new(202, 2_000_002).unwrap();
+    let running = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(supervisor, 11)
+        .unwrap()
+        .with_child(child, 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap();
+    let failed = running.into_failed_exit(14, 7, 3, 4).unwrap();
+    let cleanup_failed = failed
+        .clone()
+        .with_cleanup_error("CLEANUP_IO".into(), 15)
+        .unwrap();
+
+    assert_eq!(cleanup_failed.state(), JobState::Failed);
+    assert_eq!(cleanup_failed.exit_code(), Some(7));
+    assert_eq!(cleanup_failed.cleanup_error_code(), Some("CLEANUP_IO"));
+    assert!(
+        cleanup_failed
+            .with_cleanup_error("SECOND".into(), 16)
+            .is_err()
+    );
+
+    let value = serde_json::to_value(&failed).unwrap();
+    let mut both_outcomes = value.clone();
+    both_outcomes["terminating_signal"] = serde_json::json!(15);
+    assert!(serde_json::from_value::<JobStatus>(both_outcomes).is_err());
+
+    let mut child_without_supervisor = value;
+    child_without_supervisor["supervisor_pid"] = serde_json::Value::Null;
+    child_without_supervisor["supervisor_start_identity"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<JobStatus>(child_without_supervisor).is_err());
+
+    let mut partial_nonterminal_lengths =
+        serde_json::to_value(JobStatus::accepted(10).unwrap()).unwrap();
+    partial_nonterminal_lengths["final_stdout_bytes"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<JobStatus>(partial_nonterminal_lengths).is_err());
+
+    assert!(
+        JobStatus::accepted(10)
+            .unwrap()
+            .transition(JobStatus::running(11, 101, 1_000_001, 202, 2_000_002).unwrap())
+            .is_err(),
+        "running must not bypass the two durable Accepted identity enrichments"
+    );
+}
+
+#[test]
+fn status_wire_is_canonical_strict_and_rejects_duplicate_fields() {
+    let status = JobStatus::accepted(10).unwrap();
+    assert_eq!(
+        serde_json::to_string(&status).unwrap(),
+        r#"{"state":"accepted","updated_at_millis":10,"supervisor_pid":null,"supervisor_start_identity":null,"child_pid":null,"child_start_identity":null,"exit_code":null,"terminating_signal":null,"final_stdout_bytes":null,"final_stderr_bytes":null,"error_code":null,"cleanup_error_code":null}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<JobStatus>(&serde_json::to_string(&status).unwrap()).unwrap(),
+        status
+    );
+    assert!(
+        serde_json::from_str::<JobStatus>(
+            r#"{"state":"accepted","state":"accepted","updated_at_millis":10,"supervisor_pid":null,"supervisor_start_identity":null,"child_pid":null,"child_start_identity":null,"exit_code":null,"terminating_signal":null,"final_stdout_bytes":null,"final_stderr_bytes":null,"error_code":null,"cleanup_error_code":null}"#,
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<JobStatus>(
+            r#"{"state":"accepted","updated_at_millis":10,"supervisor_pid":null,"supervisor_start_identity":null,"child_pid":null,"child_start_identity":null,"exit_code":null,"terminating_signal":null,"final_stdout_bytes":null,"final_stderr_bytes":null,"error_code":null,"cleanup_error_code":null,"extra":true}"#,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn every_command_bearing_debug_is_content_free() {
+    let marker = "payload-should-never-appear";
+    let command = CommandSpec::shell(marker.into()).unwrap();
+    let material = material(command.clone());
+    let request = SubmitRequest::new(material.clone());
+
+    for rendered in [
+        format!("{command:?}"),
+        format!("{material:?}"),
+        format!("{request:?}"),
+    ] {
+        assert!(!rendered.contains(marker), "{rendered}");
+        assert!(!rendered.contains(LEASE_TOKEN), "{rendered}");
+    }
+    assert_eq!(PROTOCOL_VERSION, 2);
+}
+
+#[test]
+fn supervisor_recomputes_the_fingerprint_from_exact_command_and_cwd_before_fork() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host_with_command(
+        &temp.path().join("tampered-command"),
+        CommandSpec::argv(vec!["/bin/true".into()]).unwrap(),
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = TamperingInlineSupervisorLauncher {
+        store: store.clone(),
+        job_path: job.clone(),
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 3)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status.state(), JobState::Lost);
+    assert!(status.supervisor_identity().is_some());
+    assert!(status.child_identity().is_none());
+    assert_eq!(status.error_code(), Some("EXECUTION_PAYLOAD_INVALID"));
+    assert!(!job.join("execution.json").exists());
+    assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
+fn submit_publishes_complete_job_before_index_and_is_idempotent_after_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let job_path = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let identity = ProcessIdentity::new(41_001, 4_100_001).unwrap();
+    let launcher = RecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: job_path.clone(),
+        identity,
+    };
+    let service = JobService::new(&store, &launcher);
+
+    let first = service.submit_at(request.clone(), 3).unwrap();
+    assert_eq!(first.status().supervisor_identity(), Some(identity));
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    let names = fs::read_dir(&job_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        [
+            "execution.json",
+            "home",
+            "meta.json",
+            "status.json",
+            "stderr.log",
+            "stdout.log",
+            "tmp",
+            "workspace",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    );
+    assert!(store.job_index(lease.job_id()).unwrap().is_file());
+    for log in ["stdout.log", "stderr.log"] {
+        let metadata = fs::metadata(job_path.join(log)).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.len(), 0);
+    }
+
+    let second = service.submit_at(request, 5).unwrap();
+    assert_eq!(second.status().supervisor_identity(), Some(identity));
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn fast_prelaunch_terminal_with_child_identity_is_not_acknowledged_as_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let supervisor = ProcessIdentity::new(41_101, 4_110_001).unwrap();
+    let launcher = PrelaunchTerminalLauncher {
+        job_path: store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap(),
+        supervisor,
+        child: ProcessIdentity::new(41_102, 4_110_002).unwrap(),
+    };
+
+    let service = JobService::new(&store, &launcher);
+    let error = service.submit_at(request.clone(), 3).unwrap_err();
+
+    assert!(
+        error.to_string().contains("SUPERVISOR_PRELAUNCH_FAILED"),
+        "{error}"
+    );
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+
+    let retry_error = service.submit_at(request, 4).unwrap_err();
+    assert!(
+        retry_error
+            .to_string()
+            .contains("SUPERVISOR_PRELAUNCH_FAILED"),
+        "{retry_error}"
+    );
+}
+
+#[test]
+fn submit_conflicts_on_changed_request_and_honours_an_abandonment_tombstone() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host(&temp.path().join("conflict-host"));
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launcher = RecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap(),
+        identity: ProcessIdentity::new(41_002, 4_100_002).unwrap(),
+    };
+    let changed = SubmitRequest::new(
+        RequestFingerprintMaterial::new(
+            request.material().job_id(),
+            request.material().client_id(),
+            request.material().lease_token(),
+            request.material().worker_name().into(),
+            request.material().project_id().into(),
+            request.material().worktree_id().into(),
+            request.material().manifest_digest().into(),
+            request.material().relative_working_dir().into(),
+            request.material().timeout_millis(),
+            request.material().resource_class().into(),
+            CommandSpec::argv(vec!["/usr/bin/false".into()]).unwrap(),
+        )
+        .unwrap(),
+    );
+    let error = JobService::new(&store, &launcher)
+        .submit_at(changed, 3)
+        .unwrap_err();
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+
+    let abandoned_root = temp.path().join("abandoned-host");
+    let (abandoned_store, abandoned_lease, abandoned_request) = prepared_host(&abandoned_root);
+    abandoned_store
+        .record_abandoned(
+            &LeaseAcquireRequest::new(abandoned_request.material().clone()),
+            3,
+        )
+        .unwrap();
+    let abandoned_launcher = RecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: abandoned_store
+            .job(
+                abandoned_lease.project_id(),
+                abandoned_lease.worktree_id(),
+                abandoned_lease.job_id(),
+            )
+            .unwrap(),
+        identity: ProcessIdentity::new(41_003, 4_100_003).unwrap(),
+    };
+    let error = JobService::new(&abandoned_store, &abandoned_launcher)
+        .submit_at(abandoned_request, 4)
+        .unwrap_err();
+    assert!(error.to_string().contains("JOB_ABANDONED"));
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn submit_repairs_a_complete_final_job_after_crash_before_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, request) = prepared_host(&root);
+    drop(store);
+    let launches = Arc::new(AtomicUsize::new(0));
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobPublish).unwrap();
+    let job_path = faulted
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = RecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: job_path.clone(),
+        identity: ProcessIdentity::new(41_004, 4_100_004).unwrap(),
+    };
+    let error = JobService::new(&faulted, &launcher)
+        .submit_at(request.clone(), 3)
+        .unwrap_err();
+    assert!(error.to_string().contains("injected"));
+    assert!(job_path.is_dir());
+    assert!(!faulted.job_index(lease.job_id()).unwrap().exists());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let launcher = RecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path,
+        identity: ProcessIdentity::new(41_004, 4_100_004).unwrap(),
+    };
+    let repaired = JobService::new(&reopened, &launcher)
+        .submit_at(request, 4)
+        .unwrap();
+    assert_eq!(
+        repaired.status().supervisor_identity(),
+        Some(ProcessIdentity::new(41_004, 4_100_004).unwrap())
+    );
+    assert!(reopened.job_index(lease.job_id()).unwrap().is_file());
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn fresh_reopen_repairs_every_durable_job_and_index_publication_boundary_once() {
+    let boundaries = [
+        ("home-sync", HostStoreWritePoint::AfterJobHomeSync),
+        ("tmp-sync", HostStoreWritePoint::AfterJobTmpSync),
+        ("stdout-write", HostStoreWritePoint::AfterJobStdoutWrite),
+        (
+            "stdout-file-sync",
+            HostStoreWritePoint::AfterJobStdoutFileSync,
+        ),
+        ("stderr-write", HostStoreWritePoint::AfterJobStderrWrite),
+        (
+            "stderr-file-sync",
+            HostStoreWritePoint::AfterJobStderrFileSync,
+        ),
+        ("meta-write", HostStoreWritePoint::AfterJobMetaWrite),
+        ("meta-file-sync", HostStoreWritePoint::AfterJobMetaFileSync),
+        ("status-write", HostStoreWritePoint::AfterJobStatusWrite),
+        (
+            "status-file-sync",
+            HostStoreWritePoint::AfterJobStatusFileSync,
+        ),
+        (
+            "execution-write",
+            HostStoreWritePoint::AfterJobExecutionWrite,
+        ),
+        (
+            "execution-file-sync",
+            HostStoreWritePoint::AfterJobExecutionFileSync,
+        ),
+        (
+            "staging-directory-sync",
+            HostStoreWritePoint::AfterJobStagingDirectorySync,
+        ),
+        ("job-rename", HostStoreWritePoint::AfterJobRename),
+        ("job-parent-sync", HostStoreWritePoint::AfterJobPublish),
+        (
+            "index-file-sync",
+            HostStoreWritePoint::AfterJobIndexFileSync,
+        ),
+        ("index-rename", HostStoreWritePoint::AfterJobIndexRename),
+        (
+            "index-parent-sync",
+            HostStoreWritePoint::AfterJobIndexParentSync,
+        ),
+    ];
+
+    for (label, point) in boundaries {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(label);
+        let marker = temp.path().join("executions");
+        let command = CommandSpec::argv(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf x >> \"$1\"".into(),
+            "publication-crash".into(),
+            marker.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let (store, lease, request) = prepared_host_with_command(&root, command);
+        drop(store);
+
+        let faulted = HostStore::open_with_write_fault(&root, point).unwrap();
+        let first_launcher = InlineSupervisorLauncher {
+            store: faulted.clone(),
+        };
+        assert!(
+            JobService::new(&faulted, &first_launcher)
+                .submit_at(request.clone(), 10)
+                .is_err(),
+            "{label} did not stop at its injected boundary"
+        );
+        assert!(!marker.exists(), "{label} executed before recovery");
+        drop(first_launcher);
+        drop(faulted);
+
+        let reopened = HostStore::open(&root).unwrap();
+        let retry_launcher = InlineSupervisorLauncher {
+            store: reopened.clone(),
+        };
+        let response = JobService::new(&reopened, &retry_launcher)
+            .submit_at(request, 11)
+            .unwrap_or_else(|error| panic!("{label} was not repairable: {error}"));
+        assert_eq!(response.status().state(), JobState::Succeeded, "{label}");
+        assert_eq!(fs::read(&marker).unwrap(), b"x", "{label}");
+        assert!(
+            reopened.job_index(lease.job_id()).unwrap().is_file(),
+            "{label} did not leave one indexed job"
+        );
+        assert_eq!(
+            LeaseService::new(&reopened).load().unwrap(),
+            None,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn rename_crash_recovery_durably_syncs_job_and_index_parents_before_launch() {
+    let cases = [
+        (
+            "job-rename-repair",
+            HostStoreWritePoint::AfterJobRename,
+            HostStoreWritePoint::AfterJobPublish,
+        ),
+        (
+            "index-rename-repair",
+            HostStoreWritePoint::AfterJobIndexRename,
+            HostStoreWritePoint::AfterJobIndexParentSync,
+        ),
+    ];
+
+    for (label, initial_fault, repair_fault) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(label);
+        let marker = temp.path().join(format!("{label}-executions"));
+        let command = CommandSpec::argv(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf x >> \"$1\"".into(),
+            "publication-repair".into(),
+            marker.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let (store, _lease, request) = prepared_host_with_command(&root, command);
+        drop(store);
+
+        let faulted = HostStore::open_with_write_fault(&root, initial_fault).unwrap();
+        let launcher = InlineSupervisorLauncher {
+            store: faulted.clone(),
+        };
+        assert!(
+            JobService::new(&faulted, &launcher)
+                .submit_at(request.clone(), 10)
+                .is_err(),
+            "{label} did not stop after rename"
+        );
+        assert!(!marker.exists(), "{label} executed at the rename boundary");
+        drop(launcher);
+        drop(faulted);
+
+        let repair = HostStore::open_with_write_fault(&root, repair_fault).unwrap();
+        let launcher = InlineSupervisorLauncher {
+            store: repair.clone(),
+        };
+        assert!(
+            JobService::new(&repair, &launcher)
+                .submit_at(request.clone(), 11)
+                .is_err(),
+            "{label} skipped the durable parent-sync repair boundary"
+        );
+        assert!(
+            !marker.exists(),
+            "{label} launched before repair was durable"
+        );
+        drop(launcher);
+        drop(repair);
+
+        let reopened = HostStore::open(&root).unwrap();
+        let launcher = InlineSupervisorLauncher {
+            store: reopened.clone(),
+        };
+        let response = JobService::new(&reopened, &launcher)
+            .submit_at(request, 12)
+            .unwrap_or_else(|error| panic!("{label} was not repairable: {error}"));
+        assert_eq!(response.status().state(), JobState::Succeeded, "{label}");
+        assert_eq!(fs::read(&marker).unwrap(), b"x", "{label}");
+    }
+}
+
+#[test]
+fn conflicting_index_staging_is_preserved_and_never_adopted() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("index-staging-conflict");
+    let marker = temp.path().join("must-not-run");
+    let command = CommandSpec::argv(vec![
+        "/usr/bin/touch".into(),
+        marker.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let (store, lease, request) = prepared_host_with_command(&root, command);
+    drop(store);
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobIndexFileSync)
+            .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: faulted.clone(),
+    };
+    assert!(
+        JobService::new(&faulted, &launcher)
+            .submit_at(request.clone(), 10)
+            .is_err()
+    );
+    drop(launcher);
+    drop(faulted);
+
+    let staging = root
+        .join("job-index")
+        .join(format!(".accept-{}.json", lease.job_id()));
+    let bytes = fs::read(&staging).unwrap();
+    let bytes = String::from_utf8(bytes)
+        .unwrap()
+        .replace(
+            "\"supervisor_pid\":null,\"supervisor_start_identity\":null",
+            "\"supervisor_pid\":9001,\"supervisor_start_identity\":9002",
+        )
+        .into_bytes();
+    fs::write(&staging, bytes).unwrap();
+
+    let reopened = HostStore::open(&root).unwrap();
+    let retry = InlineSupervisorLauncher {
+        store: reopened.clone(),
+    };
+    let error = JobService::new(&reopened, &retry)
+        .submit_at(request, 11)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
+    assert!(staging.is_file());
+    assert!(!reopened.job_index(lease.job_id()).unwrap().exists());
+    assert!(!marker.exists());
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), Some(lease));
+}
+
+#[test]
+fn fresh_reopen_supervision_crash_matrix_never_executes_twice() {
+    #[derive(Clone, Copy)]
+    enum Boundary {
+        Spawn,
+        Supervisor(SupervisorFaultPoint),
+        Store(HostStoreWritePoint),
+    }
+
+    let boundaries = [
+        ("supervisor-spawn", Boundary::Spawn, true),
+        (
+            "supervisor-identity",
+            Boundary::Supervisor(SupervisorFaultPoint::AfterSupervisorIdentity),
+            false,
+        ),
+        (
+            "payload-read",
+            Boundary::Supervisor(SupervisorFaultPoint::AfterPayloadRead),
+            false,
+        ),
+        (
+            "child-ready",
+            Boundary::Supervisor(SupervisorFaultPoint::AfterChildReady),
+            false,
+        ),
+        (
+            "child-identity",
+            Boundary::Supervisor(SupervisorFaultPoint::AfterChildIdentity),
+            false,
+        ),
+        (
+            "payload-erase",
+            Boundary::Supervisor(SupervisorFaultPoint::AfterPayloadErase),
+            false,
+        ),
+        (
+            "go",
+            Boundary::Supervisor(SupervisorFaultPoint::AfterGo),
+            true,
+        ),
+        (
+            "exec-ack",
+            Boundary::Supervisor(SupervisorFaultPoint::AfterExecAck),
+            true,
+        ),
+        (
+            "running-status",
+            Boundary::Supervisor(SupervisorFaultPoint::BeforeRunningStatus),
+            true,
+        ),
+        (
+            "running-durable",
+            Boundary::Supervisor(SupervisorFaultPoint::AfterRunningStatus),
+            true,
+        ),
+        (
+            "log-sync",
+            Boundary::Supervisor(SupervisorFaultPoint::AfterLogSync),
+            true,
+        ),
+        (
+            "terminal-status",
+            Boundary::Supervisor(SupervisorFaultPoint::AfterTerminalStatus),
+            true,
+        ),
+        (
+            "cleanup-proof",
+            Boundary::Store(HostStoreWritePoint::AfterJobCleanupProof),
+            true,
+        ),
+        (
+            "lease-retirement",
+            Boundary::Store(HostStoreWritePoint::AfterJobLeaseRetirement),
+            true,
+        ),
+    ];
+
+    for (label, boundary, expects_execution) in boundaries {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(label);
+        let marker = temp.path().join("executions");
+        let command = CommandSpec::argv(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf x >> \"$1\"".into(),
+            "supervisor-crash".into(),
+            marker.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let (prepared, lease, request) = prepared_host_with_command(&root, command);
+        drop(prepared);
+        let store = match boundary {
+            Boundary::Store(point) => HostStore::open_with_write_fault(&root, point).unwrap(),
+            Boundary::Spawn | Boundary::Supervisor(_) => HostStore::open(&root).unwrap(),
+        };
+        let first_result = match boundary {
+            Boundary::Spawn => {
+                let launcher = FailingLauncher {
+                    launches: Arc::new(AtomicUsize::new(0)),
+                };
+                JobService::new(&store, &launcher).submit_at(request.clone(), 10)
+            }
+            Boundary::Supervisor(point) => {
+                let launcher = FaultingInlineSupervisorLauncher {
+                    store: store.clone(),
+                    point,
+                };
+                JobService::new(&store, &launcher).submit_at(request.clone(), 10)
+            }
+            Boundary::Store(_) => {
+                let launcher = InlineSupervisorLauncher {
+                    store: store.clone(),
+                };
+                JobService::new(&store, &launcher).submit_at(request.clone(), 10)
+            }
+        };
+        if label != "lease-retirement" {
+            assert!(first_result.is_err(), "{label} unexpectedly acknowledged");
+        }
+        drop(store);
+
+        let reopened = HostStore::open(&root).unwrap();
+        let retry = InlineSupervisorLauncher {
+            store: reopened.clone(),
+        };
+        let _ = JobService::new(&reopened, &retry).submit_at(request, 11);
+        let bytes = fs::read(&marker).unwrap_or_default();
+        assert_eq!(
+            bytes,
+            if expects_execution {
+                b"x".as_slice()
+            } else {
+                b"".as_slice()
+            },
+            "{label} execution cardinality changed after fresh reopen"
+        );
+        assert!(
+            reopened.job_index(lease.job_id()).unwrap().is_file(),
+            "{label} lost the accepted index"
+        );
+    }
+}
+
+#[test]
+fn unindexed_final_with_corrupt_workspace_is_preserved_and_never_repaired_or_launched() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, request) = prepared_host(&root);
+    drop(store);
+    let launches = Arc::new(AtomicUsize::new(0));
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobPublish).unwrap();
+    let job = faulted
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let first_launcher = RecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: job.clone(),
+        identity: ProcessIdentity::new(41_104, 4_110_004).unwrap(),
+    };
+    assert!(
+        JobService::new(&faulted, &first_launcher)
+            .submit_at(request.clone(), 3)
+            .is_err()
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    fs::write(job.join("workspace/tree/payload.txt"), b"corrupt").unwrap();
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let retry_launcher = RecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: job.clone(),
+        identity: ProcessIdentity::new(41_105, 4_110_005).unwrap(),
+    };
+    let error = JobService::new(&reopened, &retry_launcher)
+        .submit_at(request, 4)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert!(!reopened.job_index(lease.job_id()).unwrap().exists());
+    assert_eq!(
+        fs::read(job.join("workspace/tree/payload.txt")).unwrap(),
+        b"corrupt"
+    );
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), Some(lease));
+}
+
+#[test]
+fn indexed_prelaunch_retry_rejects_incomplete_final_without_a_second_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launcher = FailingLauncher {
+        launches: Arc::clone(&launches),
+    };
+    let service = JobService::new(&store, &launcher);
+    let first_error = service.submit_at(request.clone(), 3).unwrap_err();
+    assert!(
+        first_error
+            .to_string()
+            .contains("injected launcher failure")
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    fs::remove_file(job.join("execution.json")).unwrap();
+
+    let retry_error = service.submit_at(request, 4).unwrap_err();
+
+    assert!(retry_error.to_string().contains("JOB_ID_CONFLICT"));
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+}
+
+#[test]
+fn accepted_index_cannot_claim_a_lifecycle_identity_and_trigger_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let marker = temp.path().join("must-not-run");
+    let command = CommandSpec::argv(vec![
+        "/usr/bin/touch".into(),
+        marker.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let (store, lease, request) = prepared_host_with_command(&root, command);
+    let failing = FailingLauncher {
+        launches: Arc::new(AtomicUsize::new(0)),
+    };
+    assert!(
+        JobService::new(&store, &failing)
+            .submit_at(request.clone(), 3)
+            .is_err()
+    );
+
+    let index = store.job_index(lease.job_id()).unwrap();
+    let bytes = String::from_utf8(fs::read(&index).unwrap())
+        .unwrap()
+        .replace(
+            "\"supervisor_pid\":null,\"supervisor_start_identity\":null",
+            "\"supervisor_pid\":9001,\"supervisor_start_identity\":9002",
+        );
+    fs::write(&index, bytes).unwrap();
+
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 4)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
+    assert!(!marker.exists());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+}
+
+#[test]
+fn unsafe_preexisting_final_evidence_is_preserved_and_never_indexed_or_launched() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let job_path = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    fs::create_dir_all(&job_path).unwrap();
+    for private in [
+        job_path.parent().unwrap().parent().unwrap(),
+        job_path.parent().unwrap(),
+        job_path.as_path(),
+    ] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(job_path.join("foreign-evidence"), b"retain-me").unwrap();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launcher = RecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: job_path.clone(),
+        identity: ProcessIdentity::new(41_005, 4_100_005).unwrap(),
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 3)
+        .unwrap_err();
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
+    assert_eq!(
+        fs::read(job_path.join("foreign-evidence")).unwrap(),
+        b"retain-me"
+    );
+    assert!(!store.job_index(lease.job_id()).unwrap().exists());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn sixty_four_concurrent_identical_submits_publish_and_launch_exactly_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let job_path = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launcher = RecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: job_path.clone(),
+        identity: ProcessIdentity::new(41_006, 4_100_006).unwrap(),
+    };
+    let service = JobService::new(&store, &launcher);
+    let barrier = Arc::new(Barrier::new(64));
+
+    std::thread::scope(|scope| {
+        let handles = (0..64)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let request = request.clone();
+                let service = &service;
+                scope.spawn(move || {
+                    barrier.wait();
+                    service.submit_at(request, 3).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let response = handle.join().unwrap();
+            assert_eq!(
+                response.status().supervisor_identity(),
+                Some(ProcessIdentity::new(41_006, 4_100_006).unwrap())
+            );
+        }
+    });
+
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert!(job_path.is_dir());
+    assert!(store.job_index(lease.job_id()).unwrap().is_file());
+}
+
+#[test]
+fn real_gated_argv_execution_is_literal_terminal_and_releases_only_its_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("must-not-exist");
+    let literal = format!(
+        "spaces 'quotes' \"double\" $(touch {}) `touch {}` ; semicolon ünicode\nnewline",
+        marker.display(),
+        marker.display()
+    );
+    let command =
+        CommandSpec::argv(vec!["/usr/bin/printf".into(), "%s".into(), literal.clone()]).unwrap();
+    let (store, lease, request) = prepared_host_with_command(&temp.path().join("host"), command);
+    let job_path = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert!(response.status().supervisor_identity().is_some());
+    assert!(response.status().child_identity().is_some());
+    assert_eq!(response.status().exit_code(), Some(0));
+    assert_eq!(
+        fs::read(job_path.join("stdout.log")).unwrap(),
+        literal.as_bytes()
+    );
+    assert_eq!(fs::read(job_path.join("stderr.log")).unwrap(), b"");
+    assert!(!marker.exists(), "argv bytes were interpreted by a shell");
+    assert!(!job_path.join("execution.json").exists());
+    for removed in ["workspace", "home", "tmp"] {
+        assert!(!job_path.join(removed).exists());
+    }
+    assert!(
+        !store
+            .incoming_job(lease.job_id(), lease.lease_token())
+            .unwrap()
+            .parent()
+            .unwrap()
+            .exists(),
+        "job-owned incoming namespace was not cleaned"
+    );
+    assert!(LeaseService::new(&store).load().unwrap().is_none());
+}
+
+#[test]
+fn real_execution_records_exit_signal_timeout_and_binary_split_logs() {
+    let temp = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            "exit-seven",
+            CommandSpec::argv(vec!["/bin/sh".into(), "-c".into(), "exit 7".into()]).unwrap(),
+            30_000,
+            JobState::Failed,
+            Some(7),
+            None,
+        ),
+        (
+            "signal-term",
+            CommandSpec::argv(vec!["/bin/sh".into(), "-c".into(), "kill -TERM $$".into()]).unwrap(),
+            30_000,
+            JobState::Failed,
+            None,
+            Some(15),
+        ),
+        (
+            "timeout",
+            CommandSpec::argv(vec!["/bin/sleep".into(), "60".into()]).unwrap(),
+            25,
+            JobState::TimedOut,
+            None,
+            None,
+        ),
+    ];
+
+    for (name, command, timeout, state, exit, signal) in cases {
+        let (store, lease, request) =
+            prepared_host_with_command_and_timeout(&temp.path().join(name), command, timeout);
+        let launcher = InlineSupervisorLauncher {
+            store: store.clone(),
+        };
+        let response = JobService::new(&store, &launcher)
+            .submit_at(request, 10)
+            .unwrap();
+        assert_eq!(response.status().state(), state, "{name}");
+        assert_eq!(response.status().exit_code(), exit, "{name}");
+        assert_eq!(response.status().terminating_signal(), signal, "{name}");
+        assert!(
+            LeaseService::new(&store).load().unwrap().is_none(),
+            "{name}"
+        );
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        assert!(!job.join("execution.json").exists(), "{name}");
+    }
+
+    let command = CommandSpec::argv(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf 'out\\000bytes'; printf 'err\\000bytes' >&2".into(),
+    ])
+    .unwrap();
+    let (store, lease, request) =
+        prepared_host_with_command(&temp.path().join("binary-logs"), command);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"out\0bytes");
+    assert_eq!(fs::read(job.join("stderr.log")).unwrap(), b"err\0bytes");
+    assert_eq!(response.status().final_stdout_bytes(), Some(9));
+    assert_eq!(response.status().final_stderr_bytes(), Some(9));
+}
+
+#[test]
+fn timeout_keeps_a_waitable_leader_anchor_then_kills_and_proves_the_group_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = CommandSpec::argv(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "trap 'exit 0' TERM; /bin/sh -c 'trap \"\" TERM; while :; do sleep 1; done' & echo $!; wait"
+            .into(),
+    ])
+    .unwrap();
+    let (store, lease, request) =
+        prepared_host_with_command_and_timeout(&temp.path().join("surviving-group"), command, 100);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let started = Instant::now();
+    let result = JobService::new(&store, &launcher).submit_at(request, 10);
+    let elapsed = started.elapsed();
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    let process_group = status.child_identity().unwrap().pid() as i32;
+    let group_alive = unsafe { libc::kill(-process_group, 0) } == 0;
+    if result.is_err() && group_alive {
+        unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    }
+
+    let response = result.unwrap_or_else(|error| {
+        panic!(
+            "{error}; leader={:?}; group={:?}",
+            SystemProcessInspector.observe(status.child_identity().unwrap()),
+            SystemProcessInspector.observe_group(status.child_identity().unwrap().pid())
+        )
+    });
+    assert_eq!(response.status().state(), JobState::TimedOut);
+    assert_eq!(status.state(), JobState::TimedOut);
+    assert!(!group_alive, "timed-out process group remains observable");
+    assert!(
+        elapsed >= Duration::from_secs(10),
+        "ten-second TERM grace was skipped: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "targeted timeout cleanup exceeded its bounded proof window: {elapsed:?}"
+    );
+    assert!(LeaseService::new(&store).load().unwrap().is_none());
+}
+
+#[test]
+fn successful_leader_cannot_leave_a_background_process_group_after_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = CommandSpec::argv(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "/bin/sh -c 'trap \"\" HUP TERM; while :; do sleep 1; done' & echo $!; exit 0".into(),
+    ])
+    .unwrap();
+    let (store, lease, request) = prepared_host_with_command_and_timeout(
+        &temp.path().join("background-group"),
+        command,
+        30_000,
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let started = Instant::now();
+    let result = JobService::new(&store, &launcher).submit_at(request, 10);
+    let elapsed = started.elapsed();
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    let process_group = status.child_identity().unwrap().pid() as i32;
+    let group_alive = unsafe { libc::kill(-process_group, 0) } == 0;
+    if group_alive {
+        unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    }
+
+    let response = result.unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert!(
+        !group_alive,
+        "successful command left its process group alive"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(10),
+        "background group skipped its TERM grace: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "background group cleanup exceeded its bounded proof window: {elapsed:?}"
+    );
+    assert!(LeaseService::new(&store).load().unwrap().is_none());
+}
+
+#[test]
+fn mutable_cleanup_failure_preserves_command_outcome_and_retains_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = CommandSpec::argv(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "rmdir \"$HOME\" && : > \"$HOME\"".into(),
+    ])
+    .unwrap();
+    let (store, lease, request) =
+        prepared_host_with_command(&temp.path().join("cleanup-failure"), command);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap_err();
+
+    assert!(!error.to_string().contains(job.to_string_lossy().as_ref()));
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status.state(), JobState::Succeeded);
+    assert_eq!(status.exit_code(), Some(0));
+    assert_eq!(status.cleanup_error_code(), Some("MUTABLE_CLEANUP_FAILED"));
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert!(job.join("home").is_file());
+    assert!(job.join("workspace").is_dir());
+}
+
+#[test]
+fn unexpected_incoming_evidence_is_preserved_and_blocks_cleanup_and_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host(&temp.path().join("incoming-evidence"));
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let incoming_job = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let foreign = incoming_job.join("foreign-evidence");
+    fs::create_dir(&foreign).unwrap();
+    fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap_err();
+
+    assert!(
+        !error
+            .to_string()
+            .contains(foreign.to_string_lossy().as_ref())
+    );
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status.state(), JobState::Succeeded);
+    assert_eq!(status.exit_code(), Some(0));
+    assert_eq!(status.cleanup_error_code(), Some("MUTABLE_CLEANUP_FAILED"));
+    assert!(foreign.is_dir());
+    assert!(job.join("workspace").is_dir());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+}
+
+#[test]
+fn lease_release_failure_preserves_terminal_outcome_and_live_lease_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let host_root = temp.path().join("release-failure");
+    let lease_file = host_root.join("leases/heavy/lease.json");
+    let command = CommandSpec::argv(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf x > \"$1\"".into(),
+        "lease-corruptor".into(),
+        lease_file.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let (store, lease, request) = prepared_host_with_command(&host_root, command);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap_err();
+
+    assert!(
+        !error
+            .to_string()
+            .contains(lease_file.to_string_lossy().as_ref())
+    );
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status.state(), JobState::Succeeded);
+    assert_eq!(status.exit_code(), Some(0));
+    assert_eq!(status.cleanup_error_code(), Some("LEASE_RELEASE_FAILED"));
+    assert_eq!(fs::read(&lease_file).unwrap(), b"x");
+    assert!(host_root.join("leases/heavy").is_dir());
+    for removed in ["workspace", "home", "tmp"] {
+        assert!(!job.join(removed).exists());
+    }
+}
+
+#[test]
+fn terminal_status_write_conflict_retains_lease_and_mutable_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let host_root = temp.path().join("status-failure");
+    let status_file = host_root
+        .join("jobs")
+        .join(PROJECT_ID)
+        .join(WORKTREE_ID)
+        .join(JOB_ID)
+        .join("status.json");
+    let marker = temp.path().join("command-ran");
+    let command = CommandSpec::argv(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "sleep 0.05; : > \"$2\"; printf x > \"$1\"".into(),
+        "status-conflict".into(),
+        status_file.to_string_lossy().into_owned(),
+        marker.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let (store, lease, request) = prepared_host_with_command(&host_root, command);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap_err();
+
+    assert!(
+        !error
+            .to_string()
+            .contains(status_file.to_string_lossy().as_ref())
+    );
+    assert!(marker.is_file());
+    assert_eq!(fs::read(&status_file).unwrap(), b"x");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert!(job.join("workspace").is_dir());
+    assert!(!job.join("execution.json").exists());
+}
+
+#[test]
+fn payload_erase_failure_closes_the_gate_before_any_user_byte_and_retains_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("must-not-run");
+    let command = CommandSpec::argv(vec![
+        "/usr/bin/touch".into(),
+        marker.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let (store, lease, request) =
+        prepared_host_with_command(&temp.path().join("payload-erase-failure"), command);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = FaultingInlineSupervisorLauncher {
+        store: store.clone(),
+        point: SupervisorFaultPoint::BeforePayloadErase,
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("injected"), "{error}");
+    assert!(
+        !marker.exists(),
+        "gated user command executed before erasure"
+    );
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status.state(), JobState::Lost);
+    assert_eq!(status.error_code(), Some("PAYLOAD_ERASURE_FAILED"));
+    assert!(status.child_identity().is_some());
+    assert!(job.join("execution.json").is_file());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert!(job.join("workspace").is_dir());
+}
+
+#[test]
+fn pre_go_child_status_failure_erases_payload_but_abort_ambiguity_retains_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("must-not-run");
+    let command = CommandSpec::argv(vec![
+        "/usr/bin/touch".into(),
+        marker.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let (store, lease, request) =
+        prepared_host_with_command(&temp.path().join("child-status-abort-ambiguity"), command);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = FaultingInlineSupervisorLauncher {
+        store: store.clone(),
+        point: SupervisorFaultPoint::BeforeChildStatusAbortProof,
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("abort proof"), "{error}");
+    assert!(!marker.exists(), "pre-GO command unexpectedly executed");
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status.state(), JobState::Lost);
+    assert_eq!(status.error_code(), Some("CHILD_STATUS_WRITE_FAILED"));
+    assert!(status.child_identity().is_none());
+    assert!(!job.join("execution.json").exists());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert!(job.join("workspace").is_dir());
+}
+
+#[test]
+fn running_status_failure_reaps_the_post_go_child_and_retains_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("ran-exactly-once");
+    let command = CommandSpec::argv(vec![
+        "/usr/bin/touch".into(),
+        marker.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let (store, lease, request) =
+        prepared_host_with_command(&temp.path().join("running-status-failure"), command);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = FaultingInlineSupervisorLauncher {
+        store: store.clone(),
+        point: SupervisorFaultPoint::BeforeRunningStatus,
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("injected"), "{error}");
+    assert!(marker.is_file(), "post-GO user command did not run");
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status.state(), JobState::Lost);
+    assert_eq!(status.error_code(), Some("RUNNING_STATUS_WRITE_FAILED"));
+    let child = status.child_identity().unwrap();
+    let mut wait_status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(child.pid() as i32, &raw mut wait_status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    assert!(!job.join("execution.json").exists());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert!(job.join("workspace").is_dir());
+}
+
+#[test]
+fn log_path_replacement_after_go_retains_running_status_and_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let host_root = temp.path().join("log-failure");
+    let stdout_path = host_root
+        .join("jobs")
+        .join(PROJECT_ID)
+        .join(WORKTREE_ID)
+        .join(JOB_ID)
+        .join("stdout.log");
+    let command = CommandSpec::argv(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "sleep 0.05; rm -f \"$1\"; : > \"$1\"".into(),
+        "log-replacement".into(),
+        stdout_path.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let (store, lease, request) = prepared_host_with_command(&host_root, command);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap_err();
+
+    assert!(
+        !error
+            .to_string()
+            .contains(stdout_path.to_string_lossy().as_ref())
+    );
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status.state(), JobState::Running);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert!(job.join("workspace").is_dir());
+    assert!(!job.join("execution.json").exists());
+}
+
+#[test]
+fn child_receives_only_the_exact_controlled_environment_and_workspace_cwd() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host_with_command(
+        &temp.path().join("env-host"),
+        CommandSpec::argv(vec!["/usr/bin/env".into()]).unwrap(),
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+    let actual = String::from_utf8(fs::read(job.join("stdout.log")).unwrap())
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = [
+        "LC_ALL=C".to_owned(),
+        "LANG=C".to_owned(),
+        "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
+        format!("HOME={}", job.join("home").display()),
+        format!("TMPDIR={}", job.join("tmp").display()),
+        format!("MAC_WORKER_JOB_ID={}", lease.job_id()),
+        format!("MAC_WORKER_CLIENT_ID={}", lease.client_id()),
+        format!("MAC_WORKER_PROJECT_ID={}", lease.project_id()),
+        format!("MAC_WORKER_WORKTREE_ID={}", lease.worktree_id()),
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual, expected);
+
+    let (cwd_store, cwd_lease, cwd_request) = prepared_host_with_command(
+        &temp.path().join("cwd-host"),
+        CommandSpec::argv(vec!["/bin/pwd".into()]).unwrap(),
+    );
+    let cwd_job = cwd_store
+        .job(
+            cwd_lease.project_id(),
+            cwd_lease.worktree_id(),
+            cwd_lease.job_id(),
+        )
+        .unwrap();
+    let cwd_launcher = InlineSupervisorLauncher {
+        store: cwd_store.clone(),
+    };
+    JobService::new(&cwd_store, &cwd_launcher)
+        .submit_at(cwd_request, 10)
+        .unwrap();
+    let physical_job = if let Ok(suffix) = cwd_job.strip_prefix("/var") {
+        Path::new("/private/var").join(suffix)
+    } else {
+        cwd_job.clone()
+    };
+    assert_eq!(
+        fs::read(cwd_job.join("stdout.log")).unwrap(),
+        format!("{}\n", physical_job.join("workspace/tree").display()).as_bytes()
+    );
+}
+
+#[test]
+fn nested_manifest_cwd_and_bare_executable_use_descriptor_root_and_fixed_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host_with_nested_cwd(
+        &temp.path().join("nested-cwd"),
+        CommandSpec::argv(vec!["pwd".into()]).unwrap(),
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+
+    let physical_job = if let Ok(suffix) = job.strip_prefix("/var") {
+        Path::new("/private/var").join(suffix)
+    } else {
+        job.clone()
+    };
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert_eq!(
+        fs::read(job.join("stdout.log")).unwrap(),
+        format!("{}\n", physical_job.join("workspace/tree/nested").display()).as_bytes()
+    );
+}
+
+#[test]
+fn shell_mode_uses_zsh_and_prelaunch_resolution_failure_is_terminal_and_erased() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host_with_command(
+        &temp.path().join("shell-host"),
+        CommandSpec::shell("printf '%s' $ZSH_VERSION".into()).unwrap(),
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert!(!fs::read(job.join("stdout.log")).unwrap().is_empty());
+
+    let (failed_store, failed_lease, failed_request) = prepared_host_with_command(
+        &temp.path().join("missing-host"),
+        CommandSpec::argv(vec!["/definitely/not/a/program".into()]).unwrap(),
+    );
+    let failed_job = failed_store
+        .job(
+            failed_lease.project_id(),
+            failed_lease.worktree_id(),
+            failed_lease.job_id(),
+        )
+        .unwrap();
+    let failed_launcher = InlineSupervisorLauncher {
+        store: failed_store.clone(),
+    };
+    let error = JobService::new(&failed_store, &failed_launcher)
+        .submit_at(failed_request, 10)
+        .unwrap_err();
+    assert!(error.to_string().contains("EXECUTABLE_NOT_FOUND"));
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(failed_job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status.state(), JobState::Lost);
+    assert_eq!(status.error_code(), Some("EXECUTABLE_NOT_FOUND"));
+    assert!(!failed_job.join("execution.json").exists());
+    assert!(LeaseService::new(&failed_store).load().unwrap().is_none());
+}
+
+#[test]
+fn hidden_submit_detaches_the_same_worker_and_inherited_lock_runs_supervisor() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let data = temp.path().join("data");
+    fs::create_dir_all(&home).unwrap();
+    let host_root = data.join("mac-worker/host");
+    let (store, lease, request) = prepared_host(&host_root);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    drop(store);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_worker"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &data)
+        .args(["host", "submit"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&request).unwrap())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: mac_worker::job::SubmitResponse = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(response.status().supervisor_identity().is_some());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let terminal = loop {
+        let status: JobStatus =
+            serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+        if status.state().is_terminal() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached supervisor did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(terminal.state(), JobState::Succeeded);
+    assert!(!job.join("execution.json").exists());
+    loop {
+        if LeaseService::new(&HostStore::open(&host_root).unwrap())
+            .load()
+            .unwrap()
+            .is_none()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached cleanup did not release lease"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_worker"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &data)
+        .args(["host", "supervise", &lease.job_id().to_string()])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+}

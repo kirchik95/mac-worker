@@ -3,8 +3,8 @@ use mac_worker::{
     job::{
         CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus, JsonEvent,
         LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LocalJobRecord, LogChunk,
-        LogStream, RequestFingerprint, RequestFingerprintMaterial, StatusResponse, SubmitRequest,
-        SubmitResponse,
+        LogStream, ProcessIdentity, RequestFingerprint, RequestFingerprintMaterial, StatusResponse,
+        SubmitRequest, SubmitResponse,
     },
     protocol::PROTOCOL_VERSION,
 };
@@ -310,19 +310,25 @@ fn material_rejects_noncanonical_identifiers_and_duplicate_json_fields() {
 #[test]
 fn status_requires_process_identities_for_running_terminal_lengths_and_monotonic_time() {
     let accepted = JobStatus::accepted(100).unwrap();
-    let running = JobStatus::running(101, 10, 11, 20, 21).unwrap();
-    accepted.transition(running.clone()).unwrap();
+    let supervised = accepted
+        .with_supervisor(ProcessIdentity::new(10, 11).unwrap(), 100)
+        .unwrap();
+    let ready = supervised
+        .with_child(ProcessIdentity::new(20, 21).unwrap(), 101)
+        .unwrap();
+    let running = ready.into_running(101).unwrap();
+    assert!(
+        accepted
+            .transition(JobStatus::running(101, 10, 11, 20, 21).unwrap())
+            .is_err()
+    );
     assert!(JobStatus::running(101, 10, 0, 20, 21).is_err());
     assert!(
         running
-            .transition(JobStatus::succeeded(102, 9, 10).unwrap())
+            .transition(running.clone().into_succeeded(102, 9, 10).unwrap())
             .is_ok()
     );
-    assert!(
-        running
-            .transition(JobStatus::succeeded(99, 9, 10).unwrap())
-            .is_err()
-    );
+    assert!(running.clone().into_succeeded(99, 9, 10).is_err());
     assert!(
         JobStatus::succeeded(102, 9, 10)
             .unwrap()

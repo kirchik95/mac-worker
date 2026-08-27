@@ -1,9 +1,11 @@
 pub const PROTOCOL_VERSION: u32 = 2;
+pub const SUPERVISION_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProbeResponse {
     pub protocol_version: u32,
+    pub supervision_version: u32,
     pub hostname: String,
     pub arch: String,
     pub os_version: String,
@@ -147,14 +149,15 @@ pub fn missing_capabilities(required: &[String], probe: &ProbeResponse) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::{
-        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SetupHostResult,
-        SetupReport, WorkerHealth, WorkersReport, missing_capabilities,
+        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+        SetupHostResult, SetupReport, WorkerHealth, WorkersReport, missing_capabilities,
     };
 
     impl ProbeResponse {
         fn fixture() -> Self {
             Self {
                 protocol_version: PROTOCOL_VERSION,
+                supervision_version: SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
@@ -182,6 +185,7 @@ mod tests {
         let value = serde_json::to_value(response).unwrap();
 
         assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(value["supervision_version"], SUPERVISION_VERSION);
         assert_eq!(value["arch"], "arm64");
     }
 

@@ -41,6 +41,7 @@ const MAX_RSYNC_STATS_BYTES: usize = 64 * 1024;
 pub enum HostOperation {
     LeaseAcquire,
     SnapshotVerify,
+    Submit,
 }
 
 impl HostOperation {
@@ -48,6 +49,7 @@ impl HostOperation {
         match self {
             Self::LeaseAcquire => "~/.local/bin/worker host lease-acquire",
             Self::SnapshotVerify => "~/.local/bin/worker host snapshot-verify",
+            Self::Submit => "~/.local/bin/worker host submit",
         }
     }
 }

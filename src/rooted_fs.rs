@@ -28,10 +28,139 @@ pub enum EntryKind {
     Symlink,
 }
 
+#[cfg(test)]
+mod task7_status_file_tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
+    use tempfile::tempdir;
+
+    #[test]
+    fn conditional_private_replacement_requires_exact_old_binding_and_bytes() {
+        let temp = tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let root = RootedDir::create(&root_path).unwrap();
+        root.write_private_atomic_no_replace("status.json", b"old")
+            .unwrap();
+
+        root.replace_private_regular_exact("status.json", b"old", b"new")
+            .unwrap();
+        assert_eq!(fs::read(root_path.join("status.json")).unwrap(), b"new");
+        assert!(
+            root.replace_private_regular_exact("status.json", b"old", b"bad")
+                .is_err()
+        );
+        assert_eq!(fs::read(root_path.join("status.json")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn append_handle_is_owner_only_single_link_and_name_bound() {
+        let temp = tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let root = RootedDir::create(&root_path).unwrap();
+        root.write_private_atomic_no_replace("stdout.log", b"first")
+            .unwrap();
+        let mut append = root.open_private_append("stdout.log").unwrap();
+        append.write_all(b"second").unwrap();
+        append.sync_all().unwrap();
+        root.validate_private_append_binding("stdout.log", &append)
+            .unwrap();
+        assert_eq!(
+            fs::read(root_path.join("stdout.log")).unwrap(),
+            b"firstsecond"
+        );
+
+        symlink(root_path.join("stdout.log"), root_path.join("link.log")).unwrap();
+        assert!(root.open_private_append("link.log").is_err());
+        fs::hard_link(root_path.join("stdout.log"), root_path.join("hard.log")).unwrap();
+        assert!(root.open_private_append("hard.log").is_err());
+    }
+
+    #[test]
+    fn conditional_status_replacement_rejects_symlink_hardlink_and_root_substitution() {
+        let symlink_temp = tempdir().unwrap();
+        let symlink_root_path = symlink_temp.path().join("root");
+        let symlink_root = RootedDir::create(&symlink_root_path).unwrap();
+        symlink_root
+            .write_private_atomic_no_replace("status.json", b"old")
+            .unwrap();
+        fs::rename(
+            symlink_root_path.join("status.json"),
+            symlink_root_path.join("retained.json"),
+        )
+        .unwrap();
+        symlink(
+            symlink_root_path.join("retained.json"),
+            symlink_root_path.join("status.json"),
+        )
+        .unwrap();
+        assert!(
+            symlink_root
+                .replace_private_regular_exact("status.json", b"old", b"new")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(symlink_root_path.join("retained.json")).unwrap(),
+            b"old"
+        );
+
+        let hardlink_temp = tempdir().unwrap();
+        let hardlink_root_path = hardlink_temp.path().join("root");
+        let hardlink_root = RootedDir::create(&hardlink_root_path).unwrap();
+        hardlink_root
+            .write_private_atomic_no_replace("status.json", b"old")
+            .unwrap();
+        fs::hard_link(
+            hardlink_root_path.join("status.json"),
+            hardlink_root_path.join("alias.json"),
+        )
+        .unwrap();
+        assert!(
+            hardlink_root
+                .replace_private_regular_exact("status.json", b"old", b"new")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(hardlink_root_path.join("status.json")).unwrap(),
+            b"old"
+        );
+
+        let replaced_temp = tempdir().unwrap();
+        let replaced_root_path = replaced_temp.path().join("root");
+        let replaced_root = RootedDir::create(&replaced_root_path).unwrap();
+        replaced_root
+            .write_private_atomic_no_replace("status.json", b"old")
+            .unwrap();
+        let detached = replaced_temp.path().join("detached");
+        fs::rename(&replaced_root_path, &detached).unwrap();
+        fs::create_dir(&replaced_root_path).unwrap();
+        fs::set_permissions(&replaced_root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(replaced_root_path.join("status.json"), b"replacement").unwrap();
+        fs::set_permissions(
+            replaced_root_path.join("status.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(
+            replaced_root
+                .replace_private_regular_exact("status.json", b"old", b"new")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(replaced_root_path.join("status.json")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(fs::read(detached.join("status.json")).unwrap(), b"old");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotProjection {
     TransportOrOwner,
     OwnerOnly,
+    Workspace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -952,6 +1081,139 @@ impl RootedDir {
         Ok(File::from(descriptor))
     }
 
+    pub(crate) fn open_private_append(&self, name: &str) -> io::Result<File> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let before = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular(&before)?;
+        self.require_bound_regular_device(&before)?;
+        let flags =
+            libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        let descriptor =
+            owned_fd(unsafe { libc::openat(self.root.as_raw_fd(), name.as_ptr(), flags) })?;
+        let opened = stat_fd(descriptor.as_raw_fd())?;
+        require_private_regular(&opened)?;
+        self.require_bound_regular_device(&opened)?;
+        let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular(&rebound)?;
+        self.require_bound_regular_device(&rebound)?;
+        if !same_file(&before, &opened) || !same_file(&before, &rebound) {
+            return Err(os_error(libc::ESTALE));
+        }
+        self.verify_root_name()?;
+        Ok(File::from(descriptor))
+    }
+
+    pub(crate) fn validate_private_append_binding(
+        &self,
+        name: &str,
+        file: &File,
+    ) -> io::Result<u64> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let opened = stat_fd(file.as_raw_fd())?;
+        let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular(&opened)?;
+        require_private_regular(&rebound)?;
+        self.require_bound_regular_device(&opened)?;
+        self.require_bound_regular_device(&rebound)?;
+        if !same_file(&opened, &rebound) || opened.st_size < 0 {
+            return Err(os_error(libc::ESTALE));
+        }
+        self.verify_root_name()?;
+        Ok(opened.st_size as u64)
+    }
+
+    fn require_bound_regular_device(&self, metadata: &libc::stat) -> io::Result<()> {
+        if self
+            .security_device
+            .is_some_and(|device| metadata.st_dev as u64 != device)
+        {
+            return Err(os_error(libc::EXDEV));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replace_private_regular_exact(
+        &self,
+        name: &str,
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        let target = CString::new(name).map_err(interior_nul_error)?;
+        let before = stat_at(self.root.as_raw_fd(), &target)?;
+        require_private_regular(&before)?;
+        if before.st_size < 0 || before.st_size as usize != expected.len() {
+            return Err(os_error(libc::ESTALE));
+        }
+        let opened = open_regular_at(self.root.as_raw_fd(), &target)?;
+        let opened_stat = stat_fd(opened.as_raw_fd())?;
+        require_private_regular(&opened_stat)?;
+        if !same_file(&before, &opened_stat) {
+            return Err(os_error(libc::ESTALE));
+        }
+        let mut old_bytes = Vec::with_capacity(expected.len());
+        File::from(duplicate_fd(opened.as_raw_fd())?)
+            .take(expected.len() as u64 + 1)
+            .read_to_end(&mut old_bytes)?;
+        let rebound = stat_at(self.root.as_raw_fd(), &target)?;
+        let after_read = stat_fd(opened.as_raw_fd())?;
+        if old_bytes != expected
+            || !snapshot_metadata_stable(&before, &after_read)
+            || !snapshot_metadata_stable(&before, &rebound)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+
+        let temporary = random_private_name("replace");
+        let replacement_fd = create_regular_at(self.root.as_raw_fd(), &temporary)?;
+        let mut replacement_file = File::from(replacement_fd);
+        if let Err(error) = replacement_file
+            .write_all(replacement)
+            .and_then(|()| replacement_file.sync_all())
+        {
+            let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
+            return Err(error);
+        }
+        let replacement_identity = FileIdentity::from_stat(&stat_fd(replacement_file.as_raw_fd())?);
+        self.verify_root_name()?;
+        let rebound = stat_at(self.root.as_raw_fd(), &target)?;
+        if !snapshot_metadata_stable(&before, &rebound) {
+            let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
+            return Err(os_error(libc::ESTALE));
+        }
+        if let Err(error) = exchange_entries(
+            self.root.as_raw_fd(),
+            &temporary,
+            self.root.as_raw_fd(),
+            &target,
+        ) {
+            let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
+            return Err(error);
+        }
+        let published = stat_at(self.root.as_raw_fd(), &target)?;
+        let displaced = stat_at(self.root.as_raw_fd(), &temporary)?;
+        let replacement_opened = stat_fd(replacement_file.as_raw_fd())?;
+        if FileIdentity::from_stat(&published) != replacement_identity
+            || FileIdentity::from_stat(&replacement_opened) != replacement_identity
+            || !same_file(&published, &replacement_opened)
+            || !same_file(&displaced, &before)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        self.verify_root_name()?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
+        self.remove_owned_regular(temporary.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "replacement name is not UTF-8")
+        })?)?;
+        let final_binding = stat_at(self.root.as_raw_fd(), &target)?;
+        if !same_file(&final_binding, &replacement_opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
     pub(crate) fn write_private_atomic_no_replace(
         &self,
         name: &str,
@@ -1271,6 +1533,24 @@ impl RootedDir {
             destination_name,
             || {},
             after_rename,
+            || Ok(()),
+            || {},
+        )
+    }
+
+    pub(crate) fn publish_owned_into_with_commit_hooks(
+        &mut self,
+        destination_parent: &RootedDir,
+        destination_name: &str,
+        after_rename: impl FnOnce() -> io::Result<()>,
+        after_parent_sync: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.publish_owned_into_with_hooks(
+            destination_parent,
+            destination_name,
+            || {},
+            after_rename,
+            after_parent_sync,
             || {},
         )
     }
@@ -1286,6 +1566,7 @@ impl RootedDir {
             destination_name,
             after_final_validation,
             || Ok(()),
+            || Ok(()),
             || {},
         )
     }
@@ -1296,6 +1577,7 @@ impl RootedDir {
         destination_name: &str,
         after_final_validation: impl FnOnce(),
         after_rename: impl FnOnce() -> io::Result<()>,
+        after_parent_sync: impl FnOnce() -> io::Result<()>,
         before_recovery: impl FnOnce(),
     ) -> io::Result<()> {
         self.verify_root_name()?;
@@ -1390,6 +1672,7 @@ impl RootedDir {
         }
         cvt(unsafe { libc::fsync(self.parent.as_raw_fd()) })?;
         cvt(unsafe { libc::fsync(destination_parent.root.as_raw_fd()) })?;
+        after_parent_sync()?;
         self.parent = rebound_parent;
         self.root_name = destination_name;
         self.lineage = rebound_lineage;
@@ -2534,6 +2817,7 @@ fn require_snapshot_directory(
     let valid_mode = match projection {
         SnapshotProjection::TransportOrOwner => matches!(mode, 0o555 | 0o500),
         SnapshotProjection::OwnerOnly => mode == 0o500,
+        SnapshotProjection::Workspace => mode == 0o700,
     };
     if file_type(metadata.st_mode) != libc::S_IFDIR || !valid_mode {
         return Err(snapshot_policy_error());
@@ -2553,6 +2837,7 @@ fn require_snapshot_regular(
             matches!(mode, 0o444 | 0o555 | 0o400 | 0o500)
         }
         SnapshotProjection::OwnerOnly => matches!(mode, 0o400 | 0o500),
+        SnapshotProjection::Workspace => matches!(mode, 0o600 | 0o700),
     };
     if file_type(metadata.st_mode) != libc::S_IFREG
         || metadata.st_nlink != 1
@@ -5394,6 +5679,7 @@ mod tests {
                     fs::rename(host_path.join("jobs/project"), &detached).unwrap();
                     fs::create_dir_all(host_path.join("jobs/project/worktree")).unwrap();
                 },
+                || Ok(()),
                 || Ok(()),
                 || {
                     fs::rename(&target, &evidence).unwrap();

@@ -179,6 +179,15 @@ impl<'a> LeaseService<'a> {
         capacity.validate()?;
         live_dir.publish_owned_into(&leases, &retired)?;
         leases.sync_root()?;
+        if self
+            .store
+            .consume_fault(HostStoreWritePoint::AfterJobLeaseRetirement)
+        {
+            // The live lease rename and parent fsync are already durable. A
+            // crash here can only leave the retired operation directory; it
+            // cannot make the heavy slot live again.
+            return Ok(());
+        }
         leases.remove_owned_child(&retired)?;
         leases.sync_root()?;
         Ok(())
@@ -363,7 +372,7 @@ mod lifecycle_tests {
     use super::*;
     use crate::{
         inputs::RelativePath,
-        job::{ClientId, CommandSpec, JobStatus, LeaseToken, RequestFingerprintMaterial},
+        job::{ClientId, CommandSpec, JobMeta, JobStatus, LeaseToken, RequestFingerprintMaterial},
     };
     use tempfile::tempdir;
 
@@ -401,7 +410,7 @@ mod lifecycle_tests {
         }
     }
 
-    fn publish_job(store: &HostStore, lease: &LeaseRecord) {
+    fn publish_job(store: &HostStore, lease: &LeaseRecord, request: &LeaseAcquireRequest) {
         let mut staged = store
             .begin_job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap();
@@ -419,7 +428,26 @@ mod lifecycle_tests {
                 lease.manifest_digest(),
             )
             .unwrap();
+        let meta =
+            JobMeta::new(request.material(), request.request_fingerprint().clone(), 2).unwrap();
+        let meta_file = staged
+            .rooted_dir()
+            .write_new_private_file("meta.json", &serde_json::to_vec(&meta).unwrap())
+            .unwrap();
+        meta_file.sync_all().unwrap();
+        for name in ["stdout.log", "stderr.log"] {
+            staged
+                .rooted_dir()
+                .write_new_private_file(name, &[])
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+        staged.rooted_dir().sync_root().unwrap();
         staged.publish_complete(receipt).unwrap();
+        store
+            .record_accepted(request, &JobStatus::accepted(2).unwrap(), 2)
+            .unwrap();
     }
 
     fn private_dir(path: &Path) {
@@ -441,7 +469,7 @@ mod lifecycle_tests {
         let acquire_request = request(1);
         let lease = acquire(&service, &acquire_request);
         assert!(store.cleanup_job_owned(&lease).is_err());
-        publish_job(&store, &lease);
+        publish_job(&store, &lease, &acquire_request);
         store
             .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
             .unwrap();
@@ -462,6 +490,9 @@ mod lifecycle_tests {
         }
         private_file(&job.join("execution.json"), b"mutable");
 
+        assert!(store.cleanup_job_owned(&lease).is_err());
+        assert_eq!(service.load().unwrap(), Some(lease.clone()));
+        fs::remove_file(job.join("execution.json")).unwrap();
         let receipt = store.cleanup_job_owned(&lease).unwrap();
         assert!(!incoming.exists());
         assert!(!job.join("workspace").exists());
@@ -492,8 +523,9 @@ mod lifecycle_tests {
         private_file(&outside.join("sentinel"), b"keep");
         let store = HostStore::open(&root).unwrap();
         let service = LeaseService::new(&store);
-        let lease = acquire(&service, &request(1));
-        publish_job(&store, &lease);
+        let acquire_request = request(1);
+        let lease = acquire(&service, &acquire_request);
+        publish_job(&store, &lease, &acquire_request);
         store
             .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
             .unwrap();
@@ -512,6 +544,58 @@ mod lifecycle_tests {
         let receipt = store.cleanup_job_owned(&lease).unwrap();
         private_dir(&job.join("workspace"));
         assert!(service.release_after_cleanup(&lease, &receipt).is_err());
+        assert_eq!(service.load().unwrap(), Some(lease));
+    }
+
+    #[test]
+    fn terminal_cleanup_rejects_conflicting_metadata_before_mutating_workspace() {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let service = LeaseService::new(&store);
+        let acquire_request = request(1);
+        let lease = acquire(&service, &acquire_request);
+        publish_job(&store, &lease, &acquire_request);
+        store
+            .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
+            .unwrap();
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        let conflicting_request = request(2);
+        let conflicting_meta = JobMeta::new(
+            conflicting_request.material(),
+            conflicting_request.request_fingerprint().clone(),
+            2,
+        )
+        .unwrap();
+        fs::write(
+            job.join("meta.json"),
+            serde_json::to_vec(&conflicting_meta).unwrap(),
+        )
+        .unwrap();
+
+        assert!(store.cleanup_job_owned(&lease).is_err());
+        assert!(job.join("workspace").is_dir());
+        assert_eq!(service.load().unwrap(), Some(lease));
+    }
+
+    #[test]
+    fn terminal_cleanup_rejects_log_lengths_that_do_not_match_status() {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let service = LeaseService::new(&store);
+        let acquire_request = request(1);
+        let lease = acquire(&service, &acquire_request);
+        publish_job(&store, &lease, &acquire_request);
+        store
+            .record_terminal_status(&lease, &JobStatus::succeeded(100, 9, 8).unwrap())
+            .unwrap();
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+
+        assert!(store.cleanup_job_owned(&lease).is_err());
+        assert!(job.join("workspace").is_dir());
         assert_eq!(service.load().unwrap(), Some(lease));
     }
 

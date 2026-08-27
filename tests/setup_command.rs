@@ -123,6 +123,7 @@ fn result(code: i32, stdout: impl AsRef<[u8]>, stderr: impl AsRef<[u8]>) -> Proc
 fn valid_probe_json() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
+        "supervision_version": mac_worker::protocol::SUPERVISION_VERSION,
         "hostname": "mini-1.local",
         "arch": "arm64",
         "os_version": "26.2",

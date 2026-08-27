@@ -250,6 +250,7 @@ fn exit_status(code: i32) -> ExitStatus {
 fn ready_probe(capabilities: &[&str]) -> Result<ProcessResult, WorkerError> {
     let response = serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
+        "supervision_version": mac_worker::protocol::SUPERVISION_VERSION,
         "hostname": "mini.local",
         "arch": "arm64",
         "os_version": "26.2",
@@ -300,6 +301,8 @@ fn structured_probe(
         "capabilities": capabilities,
     });
     if protocol_version == PROTOCOL_VERSION {
+        response["supervision_version"] =
+            serde_json::json!(mac_worker::protocol::SUPERVISION_VERSION);
         response["total_disk_bytes"] = serde_json::json!(1_073_741_824_u64);
         response["slot_state"] = serde_json::json!("idle");
         response["active_lease"] = serde_json::Value::Null;
@@ -424,6 +427,7 @@ fn ready_output_report() -> DoctorReport {
             status: HealthStatus::Ready,
             probe: Some(ProbeResponse {
                 protocol_version: PROTOCOL_VERSION,
+                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
@@ -469,6 +473,7 @@ fn blocked_output_report(code: &str) -> DoctorReport {
             status: HealthStatus::Unavailable,
             probe: Some(ProbeResponse {
                 protocol_version: PROTOCOL_VERSION,
+                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
                 hostname: "mini-2.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),

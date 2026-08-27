@@ -169,10 +169,24 @@ impl<'de> Deserialize<'de> for RequestFingerprint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CommandSpec {
     Argv { argv: Vec<String> },
     Shell { shell: String },
+}
+
+impl fmt::Debug for CommandSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Argv { argv } => formatter
+                .debug_struct("CommandSpec::Argv")
+                .field("argument_count", &argv.len())
+                .finish_non_exhaustive(),
+            Self::Shell { .. } => formatter
+                .debug_struct("CommandSpec::Shell")
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl CommandSpec {
@@ -389,7 +403,7 @@ impl JobState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RequestFingerprintMaterial {
     protocol_version: u32,
     job_id: JobId,
@@ -403,6 +417,24 @@ pub struct RequestFingerprintMaterial {
     timeout_millis: u64,
     resource_class: String,
     command: CommandSpec,
+}
+
+impl fmt::Debug for RequestFingerprintMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestFingerprintMaterial")
+            .field("protocol_version", &self.protocol_version)
+            .field("job_id", &self.job_id)
+            .field("client_id", &self.client_id)
+            .field("worker_name", &self.worker_name)
+            .field("project_id", &self.project_id)
+            .field("worktree_id", &self.worktree_id)
+            .field("manifest_digest", &self.manifest_digest)
+            .field("timeout_millis", &self.timeout_millis)
+            .field("resource_class", &self.resource_class)
+            .field("command", &self.command)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RequestFingerprintMaterial {
@@ -559,6 +591,37 @@ impl<'de> Deserialize<'de> for RequestFingerprintMaterial {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIdentity {
+    pid: u32,
+    start_time_micros: u64,
+}
+
+impl ProcessIdentity {
+    pub fn new(pid: u32, start_time_micros: u64) -> Result<Self, WorkerError> {
+        if pid == 0 || start_time_micros == 0 {
+            return Err(protocol_error("process identity is invalid"));
+        }
+        Ok(Self {
+            pid,
+            start_time_micros,
+        })
+    }
+
+    pub fn pid(self) -> u32 {
+        self.pid
+    }
+
+    pub fn start_time_micros(self) -> u64 {
+        self.start_time_micros
+    }
+
+    fn validate(self) -> Result<(), WorkerError> {
+        Self::new(self.pid, self.start_time_micros).map(|_| ())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobStatus {
     state: JobState,
@@ -568,15 +631,17 @@ pub struct JobStatus {
     child_pid: Option<u32>,
     child_start_identity: Option<u64>,
     exit_code: Option<u8>,
+    terminating_signal: Option<u32>,
     final_stdout_bytes: Option<u64>,
     final_stderr_bytes: Option<u64>,
     error_code: Option<String>,
+    cleanup_error_code: Option<String>,
 }
 
 impl Serialize for JobStatus {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("JobStatus", 10)?;
+        let mut record = serializer.serialize_struct("JobStatus", 12)?;
         record.serialize_field("state", &self.state)?;
         record.serialize_field("updated_at_millis", &self.updated_at_millis)?;
         record.serialize_field("supervisor_pid", &self.supervisor_pid)?;
@@ -584,9 +649,11 @@ impl Serialize for JobStatus {
         record.serialize_field("child_pid", &self.child_pid)?;
         record.serialize_field("child_start_identity", &self.child_start_identity)?;
         record.serialize_field("exit_code", &self.exit_code)?;
+        record.serialize_field("terminating_signal", &self.terminating_signal)?;
         record.serialize_field("final_stdout_bytes", &self.final_stdout_bytes)?;
         record.serialize_field("final_stderr_bytes", &self.final_stderr_bytes)?;
         record.serialize_field("error_code", &self.error_code)?;
+        record.serialize_field("cleanup_error_code", &self.cleanup_error_code)?;
         record.end()
     }
 }
@@ -596,6 +663,8 @@ impl JobStatus {
         Self::new(
             JobState::Accepted,
             updated_at_millis,
+            None,
+            None,
             None,
             None,
             None,
@@ -625,6 +694,8 @@ impl JobStatus {
             None,
             None,
             None,
+            None,
+            None,
         )
     }
 
@@ -641,8 +712,10 @@ impl JobStatus {
             None,
             None,
             Some(0),
+            None,
             Some(stdout),
             Some(stderr),
+            None,
             None,
         )
     }
@@ -661,8 +734,10 @@ impl JobStatus {
             None,
             None,
             Some(code),
+            None,
             Some(stdout),
             Some(stderr),
+            None,
             None,
         )
     }
@@ -676,9 +751,11 @@ impl JobStatus {
         child_pid: Option<u32>,
         child_start_identity: Option<u64>,
         exit_code: Option<u8>,
+        terminating_signal: Option<u32>,
         final_stdout_bytes: Option<u64>,
         final_stderr_bytes: Option<u64>,
         error_code: Option<String>,
+        cleanup_error_code: Option<String>,
     ) -> Result<Self, WorkerError> {
         let status = Self {
             state,
@@ -688,9 +765,11 @@ impl JobStatus {
             child_pid,
             child_start_identity,
             exit_code,
+            terminating_signal,
             final_stdout_bytes,
             final_stderr_bytes,
             error_code,
+            cleanup_error_code,
         };
         status.validate()?;
         Ok(status)
@@ -703,6 +782,11 @@ impl JobStatus {
             "supervisor",
         )?;
         validate_identity_pair(self.child_pid, self.child_start_identity, "child")?;
+        if self.child_pid.is_some() && self.supervisor_pid.is_none() {
+            return Err(protocol_error(
+                "child identity requires a supervisor identity",
+            ));
+        }
         if self.state == JobState::Running
             && (self.supervisor_pid.is_none() || self.child_pid.is_none())
         {
@@ -710,29 +794,47 @@ impl JobStatus {
                 "running status requires supervisor and child identities",
             ));
         }
-        let has_lengths = self.final_stdout_bytes.is_some() && self.final_stderr_bytes.is_some();
+        if self.final_stdout_bytes.is_some() != self.final_stderr_bytes.is_some() {
+            return Err(protocol_error("final log lengths must be present together"));
+        }
+        let has_lengths = self.final_stdout_bytes.is_some();
         if self.state.is_terminal() != has_lengths {
             return Err(protocol_error(
                 "terminal status must bind both final log lengths",
             ));
         }
         match self.state {
-            JobState::Succeeded if self.exit_code != Some(0) => {
+            JobState::Succeeded
+                if self.exit_code != Some(0) || self.terminating_signal.is_some() =>
+            {
                 return Err(protocol_error("succeeded status requires exit code zero"));
             }
-            JobState::Failed if !self.exit_code.is_some_and(|code| code != 0) => {
-                return Err(protocol_error("failed status requires a nonzero exit code"));
+            JobState::Failed
+                if !matches!(
+                    (self.exit_code, self.terminating_signal),
+                    (Some(1..=u8::MAX), None) | (None, Some(1..=u32::MAX))
+                ) =>
+            {
+                return Err(protocol_error(
+                    "failed status requires exactly one nonzero command outcome",
+                ));
             }
             JobState::Succeeded | JobState::Failed => {}
-            _ if self.exit_code.is_some() => {
+            _ if self.exit_code.is_some() || self.terminating_signal.is_some() => {
                 return Err(protocol_error(
-                    "only command outcomes may include an exit code",
+                    "only command outcomes may include an exit code or signal",
                 ));
             }
             _ => {}
         }
         if let Some(error_code) = &self.error_code {
             validate_non_nul(error_code, 128, "status error code")?;
+        }
+        if let Some(cleanup_error_code) = &self.cleanup_error_code {
+            if !self.state.is_terminal() {
+                return Err(protocol_error("cleanup error requires a terminal status"));
+            }
+            validate_non_nul(cleanup_error_code, 128, "cleanup error code")?;
         }
         Ok(())
     }
@@ -743,10 +845,271 @@ impl JobStatus {
         if next.updated_at_millis < self.updated_at_millis {
             return Err(protocol_error("job status timestamp moved backwards"));
         }
+        require_sticky_identity(
+            self.supervisor_identity(),
+            next.supervisor_identity(),
+            "supervisor",
+        )?;
+        require_sticky_identity(self.child_identity(), next.child_identity(), "child")?;
+        if self.state == JobState::Accepted && next.state == JobState::Accepted {
+            let supervisor_added = self.supervisor_pid.is_none() && next.supervisor_pid.is_some();
+            let child_added = self.child_pid.is_none() && next.child_pid.is_some();
+            let exactly_one_added = supervisor_added ^ child_added;
+            if !exactly_one_added
+                || self.exit_code != next.exit_code
+                || self.terminating_signal != next.terminating_signal
+                || self.error_code != next.error_code
+                || self.cleanup_error_code != next.cleanup_error_code
+            {
+                return Err(protocol_error(
+                    "accepted identity enrichment must add exactly one process identity",
+                ));
+            }
+            return Ok(());
+        }
+        if self.supervisor_identity() != next.supervisor_identity()
+            || self.child_identity() != next.child_identity()
+        {
+            return Err(protocol_error(
+                "process identities may change only during accepted enrichment",
+            ));
+        }
+        if self.state.is_terminal() && self.state == next.state {
+            if self.cleanup_error_code.is_none()
+                && next.cleanup_error_code.is_some()
+                && self.exit_code == next.exit_code
+                && self.terminating_signal == next.terminating_signal
+                && self.final_stdout_bytes == next.final_stdout_bytes
+                && self.final_stderr_bytes == next.final_stderr_bytes
+                && self.error_code == next.error_code
+            {
+                return Ok(());
+            }
+            return Err(protocol_error(
+                "terminal status permits only one cleanup-error enrichment",
+            ));
+        }
         if !self.state.can_transition_to(next.state) {
             return Err(protocol_error("job state transition is not allowed"));
         }
         Ok(())
+    }
+
+    pub fn with_supervisor(
+        &self,
+        identity: ProcessIdentity,
+        updated_at_millis: u64,
+    ) -> Result<Self, WorkerError> {
+        identity.validate()?;
+        if self.state != JobState::Accepted || self.supervisor_pid.is_some() {
+            return Err(protocol_error(
+                "supervisor identity may enrich accepted status once",
+            ));
+        }
+        let next = Self::new(
+            self.state,
+            updated_at_millis,
+            Some(identity.pid()),
+            Some(identity.start_time_micros()),
+            self.child_pid,
+            self.child_start_identity,
+            self.exit_code,
+            self.terminating_signal,
+            self.final_stdout_bytes,
+            self.final_stderr_bytes,
+            self.error_code.clone(),
+            self.cleanup_error_code.clone(),
+        )?;
+        self.transition(next.clone())?;
+        Ok(next)
+    }
+
+    pub fn with_child(
+        &self,
+        identity: ProcessIdentity,
+        updated_at_millis: u64,
+    ) -> Result<Self, WorkerError> {
+        identity.validate()?;
+        if self.state != JobState::Accepted
+            || self.supervisor_pid.is_none()
+            || self.child_pid.is_some()
+        {
+            return Err(protocol_error(
+                "child identity may enrich supervised accepted status once",
+            ));
+        }
+        let next = Self::new(
+            self.state,
+            updated_at_millis,
+            self.supervisor_pid,
+            self.supervisor_start_identity,
+            Some(identity.pid()),
+            Some(identity.start_time_micros()),
+            self.exit_code,
+            self.terminating_signal,
+            self.final_stdout_bytes,
+            self.final_stderr_bytes,
+            self.error_code.clone(),
+            self.cleanup_error_code.clone(),
+        )?;
+        self.transition(next.clone())?;
+        Ok(next)
+    }
+
+    pub fn into_running(&self, updated_at_millis: u64) -> Result<Self, WorkerError> {
+        let next = Self::new(
+            JobState::Running,
+            updated_at_millis,
+            self.supervisor_pid,
+            self.supervisor_start_identity,
+            self.child_pid,
+            self.child_start_identity,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        self.transition(next.clone())?;
+        Ok(next)
+    }
+
+    pub fn into_succeeded(
+        &self,
+        updated_at_millis: u64,
+        stdout: u64,
+        stderr: u64,
+    ) -> Result<Self, WorkerError> {
+        self.transition_to_terminal(
+            JobState::Succeeded,
+            updated_at_millis,
+            Some(0),
+            None,
+            stdout,
+            stderr,
+            None,
+        )
+    }
+
+    pub fn into_failed_exit(
+        &self,
+        updated_at_millis: u64,
+        exit_code: u8,
+        stdout: u64,
+        stderr: u64,
+    ) -> Result<Self, WorkerError> {
+        self.transition_to_terminal(
+            JobState::Failed,
+            updated_at_millis,
+            Some(exit_code),
+            None,
+            stdout,
+            stderr,
+            None,
+        )
+    }
+
+    pub fn into_failed_signal(
+        &self,
+        updated_at_millis: u64,
+        signal: u32,
+        stdout: u64,
+        stderr: u64,
+    ) -> Result<Self, WorkerError> {
+        self.transition_to_terminal(
+            JobState::Failed,
+            updated_at_millis,
+            None,
+            Some(signal),
+            stdout,
+            stderr,
+            None,
+        )
+    }
+
+    pub fn into_infrastructure_terminal(
+        &self,
+        state: JobState,
+        updated_at_millis: u64,
+        stdout: u64,
+        stderr: u64,
+        error_code: String,
+    ) -> Result<Self, WorkerError> {
+        if !matches!(
+            state,
+            JobState::Cancelled | JobState::TimedOut | JobState::Lost
+        ) {
+            return Err(protocol_error(
+                "infrastructure terminal constructor requires a non-command terminal state",
+            ));
+        }
+        self.transition_to_terminal(
+            state,
+            updated_at_millis,
+            None,
+            None,
+            stdout,
+            stderr,
+            Some(error_code),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transition_to_terminal(
+        &self,
+        state: JobState,
+        updated_at_millis: u64,
+        exit_code: Option<u8>,
+        terminating_signal: Option<u32>,
+        stdout: u64,
+        stderr: u64,
+        error_code: Option<String>,
+    ) -> Result<Self, WorkerError> {
+        let next = Self::new(
+            state,
+            updated_at_millis,
+            self.supervisor_pid,
+            self.supervisor_start_identity,
+            self.child_pid,
+            self.child_start_identity,
+            exit_code,
+            terminating_signal,
+            Some(stdout),
+            Some(stderr),
+            error_code,
+            None,
+        )?;
+        self.transition(next.clone())?;
+        Ok(next)
+    }
+
+    pub fn with_cleanup_error(
+        &self,
+        cleanup_error_code: String,
+        updated_at_millis: u64,
+    ) -> Result<Self, WorkerError> {
+        if !self.state.is_terminal() || self.cleanup_error_code.is_some() {
+            return Err(protocol_error(
+                "cleanup error may enrich a terminal status once",
+            ));
+        }
+        let next = Self::new(
+            self.state,
+            updated_at_millis,
+            self.supervisor_pid,
+            self.supervisor_start_identity,
+            self.child_pid,
+            self.child_start_identity,
+            self.exit_code,
+            self.terminating_signal,
+            self.final_stdout_bytes,
+            self.final_stderr_bytes,
+            self.error_code.clone(),
+            Some(cleanup_error_code),
+        )?;
+        self.transition(next.clone())?;
+        Ok(next)
     }
 
     pub fn state(&self) -> JobState {
@@ -764,6 +1127,27 @@ impl JobStatus {
     pub fn exit_code(&self) -> Option<u8> {
         self.exit_code
     }
+    pub fn terminating_signal(&self) -> Option<u32> {
+        self.terminating_signal
+    }
+    pub fn supervisor_identity(&self) -> Option<ProcessIdentity> {
+        match (self.supervisor_pid, self.supervisor_start_identity) {
+            (Some(pid), Some(start)) => ProcessIdentity::new(pid, start).ok(),
+            _ => None,
+        }
+    }
+    pub fn child_identity(&self) -> Option<ProcessIdentity> {
+        match (self.child_pid, self.child_start_identity) {
+            (Some(pid), Some(start)) => ProcessIdentity::new(pid, start).ok(),
+            _ => None,
+        }
+    }
+    pub fn error_code(&self) -> Option<&str> {
+        self.error_code.as_deref()
+    }
+    pub fn cleanup_error_code(&self) -> Option<&str> {
+        self.cleanup_error_code.as_deref()
+    }
 }
 
 impl<'de> Deserialize<'de> for JobStatus {
@@ -778,9 +1162,11 @@ impl<'de> Deserialize<'de> for JobStatus {
             child_pid: Option<u32>,
             child_start_identity: Option<u64>,
             exit_code: Option<u8>,
+            terminating_signal: Option<u32>,
             final_stdout_bytes: Option<u64>,
             final_stderr_bytes: Option<u64>,
             error_code: Option<String>,
+            cleanup_error_code: Option<String>,
         }
         let wire = Wire::deserialize(deserializer)?;
         Self::new(
@@ -791,9 +1177,11 @@ impl<'de> Deserialize<'de> for JobStatus {
             wire.child_pid,
             wire.child_start_identity,
             wire.exit_code,
+            wire.terminating_signal,
             wire.final_stdout_bytes,
             wire.final_stderr_bytes,
             wire.error_code,
+            wire.cleanup_error_code,
         )
         .map_err(de::Error::custom)
     }
@@ -908,6 +1296,27 @@ impl JobMeta {
     }
     pub fn created_at_millis(&self) -> u64 {
         self.created_at_millis
+    }
+    pub fn worker_name(&self) -> &str {
+        &self.worker_name
+    }
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub fn worktree_id(&self) -> &str {
+        &self.worktree_id
+    }
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+    pub fn relative_working_dir(&self) -> &str {
+        &self.relative_working_dir
+    }
+    pub fn timeout_millis(&self) -> u64 {
+        self.timeout_millis
+    }
+    pub fn resource_class(&self) -> &str {
+        &self.resource_class
     }
 }
 
@@ -1201,10 +1610,21 @@ impl<'de> Deserialize<'de> for LeaseRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LeaseAcquireRequest {
     material: RequestFingerprintMaterial,
     request_fingerprint: RequestFingerprint,
+}
+
+impl fmt::Debug for LeaseAcquireRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeaseAcquireRequest")
+            .field("job_id", &self.material.job_id())
+            .field("client_id", &self.material.client_id())
+            .field("request_fingerprint", &self.request_fingerprint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Serialize for LeaseAcquireRequest {
@@ -1312,10 +1732,21 @@ impl<'de> Deserialize<'de> for LeaseAcquireResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SubmitRequest {
     material: RequestFingerprintMaterial,
     request_fingerprint: RequestFingerprint,
+}
+
+impl fmt::Debug for SubmitRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubmitRequest")
+            .field("job_id", &self.material.job_id())
+            .field("client_id", &self.material.client_id())
+            .field("request_fingerprint", &self.request_fingerprint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Serialize for SubmitRequest {
@@ -1385,6 +1816,12 @@ pub enum SubmitResponse {
 impl SubmitResponse {
     pub fn validate(&self) -> Result<(), WorkerError> {
         response_status_validate(self)
+    }
+
+    pub fn status(&self) -> &JobStatus {
+        match self {
+            Self::Accepted { status, .. } | Self::Existing { status } => status,
+        }
     }
 }
 
@@ -1797,6 +2234,19 @@ fn validate_identity_pair(
     {
         return Err(protocol_error(&format!(
             "{label} process identity is incomplete"
+        )));
+    }
+    Ok(())
+}
+
+fn require_sticky_identity(
+    previous: Option<ProcessIdentity>,
+    next: Option<ProcessIdentity>,
+    label: &str,
+) -> Result<(), WorkerError> {
+    if previous.is_some_and(|previous| next != Some(previous)) {
+        return Err(protocol_error(&format!(
+            "{label} process identity is not sticky"
         )));
     }
     Ok(())

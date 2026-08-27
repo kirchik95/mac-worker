@@ -299,6 +299,27 @@ impl<'a> RemoteSnapshotService<'a> {
         Ok(snapshot)
     }
 
+    pub(crate) fn load_verified_for_accepted_after(
+        &self,
+        admission: &AdmissionGuard,
+        lease: &LeaseRecord,
+        request_fingerprint: &RequestFingerprint,
+    ) -> Result<VerifiedRemoteSnapshot, WorkerError> {
+        admission.validate_for(lease.job_id())?;
+        let live = require_exact_live(self.store, admission, lease)?;
+        if live.request_fingerprint() != request_fingerprint {
+            return Err(lease_identity_mismatch());
+        }
+        require_matching_accepted_disposition(self.store, &live)?;
+        let receipt = self
+            .read_receipt_optional(live.job_id())?
+            .ok_or_else(manifest_mismatch)?;
+        validate_receipt_identity(&receipt, &live, request_fingerprint)?;
+        let snapshot = self.open_and_validate_cache(&live, receipt.verified_at_millis(), true)?;
+        admission.validate_for(lease.job_id())?;
+        Ok(snapshot)
+    }
+
     pub fn materialize_workspace(
         &self,
         snapshot: &VerifiedRemoteSnapshot,
@@ -366,6 +387,36 @@ impl<'a> RemoteSnapshotService<'a> {
             snapshot.worktree_id(),
             snapshot.digest(),
         )
+    }
+
+    pub(crate) fn validate_materialized_workspace(
+        &self,
+        snapshot: &VerifiedRemoteSnapshot,
+        workspace: &RootedDir,
+    ) -> Result<(), WorkerError> {
+        let canonical = self
+            .open_cache(&snapshot.lease, snapshot.digest())?
+            .ok_or_else(manifest_mismatch)?;
+        if canonical.identity()? != snapshot.cache_root.identity()? {
+            return Err(unsafe_remote_snapshot());
+        }
+        validate_bundle(
+            &snapshot.cache_root,
+            &snapshot.lease,
+            snapshot.digest(),
+            BundlePolicy::Cache,
+        )?;
+        let tree = workspace
+            .inspect_snapshot_tree(TREE_DIRECTORY, SnapshotProjection::Workspace)
+            .map_err(unsafe_snapshot_io)?;
+        validate_exact_tree(&snapshot.manifest, &tree, BundlePolicy::Workspace)?;
+        validate_bundle(
+            &snapshot.cache_root,
+            &snapshot.lease,
+            snapshot.digest(),
+            BundlePolicy::Cache,
+        )
+        .map(|_| ())
     }
 
     fn open_and_validate_cache(
@@ -496,6 +547,7 @@ enum BundlePolicy {
     Incoming,
     Prepared,
     Cache,
+    Workspace,
 }
 
 impl BundlePolicy {
@@ -503,6 +555,7 @@ impl BundlePolicy {
         match self {
             Self::Incoming => SnapshotProjection::TransportOrOwner,
             Self::Prepared | Self::Cache => SnapshotProjection::OwnerOnly,
+            Self::Workspace => SnapshotProjection::Workspace,
         }
     }
 }
@@ -527,7 +580,7 @@ fn validate_bundle_with_hook(
     let root_mode = (root_metadata.st_mode & 0o7777) as u32;
     let valid_root_mode = match policy {
         BundlePolicy::Incoming => matches!(root_mode, 0o700 | 0o500),
-        BundlePolicy::Prepared => root_mode == 0o700,
+        BundlePolicy::Prepared | BundlePolicy::Workspace => root_mode == 0o700,
         BundlePolicy::Cache => root_mode == 0o500,
     };
     if !valid_root_mode {
@@ -550,6 +603,7 @@ fn validate_bundle_with_hook(
     let expected_manifest_mode = match policy {
         BundlePolicy::Incoming => matches!(manifest_file.mode, 0o444 | 0o400),
         BundlePolicy::Prepared | BundlePolicy::Cache => manifest_file.mode == 0o400,
+        BundlePolicy::Workspace => manifest_file.mode == 0o600,
     };
     if !expected_manifest_mode {
         return Err(unsafe_remote_snapshot());
@@ -784,6 +838,8 @@ fn physical_mode_matches(entry: &ManifestEntry, actual: u32, policy: BundlePolic
             (0o755, BundlePolicy::Incoming) => matches!(actual, 0o555 | 0o500),
             (0o644, BundlePolicy::Prepared | BundlePolicy::Cache) => actual == 0o400,
             (0o755, BundlePolicy::Prepared | BundlePolicy::Cache) => actual == 0o500,
+            (0o644, BundlePolicy::Workspace) => actual == 0o600,
+            (0o755, BundlePolicy::Workspace) => actual == 0o700,
             _ => false,
         },
         ManifestEntryKind::Directory => physical_directory_mode_matches(actual, policy),
@@ -806,6 +862,7 @@ fn physical_directory_mode_matches(actual: u32, policy: BundlePolicy) -> bool {
     match policy {
         BundlePolicy::Incoming => matches!(actual, 0o555 | 0o500),
         BundlePolicy::Prepared | BundlePolicy::Cache => actual == 0o500,
+        BundlePolicy::Workspace => actual == 0o700,
     }
 }
 
@@ -901,6 +958,33 @@ fn require_verifiable_disposition(
         JobDisposition::Abandoned { .. } => Err(protocol_code(
             "JOB_ABANDONED",
             "job ID was permanently abandoned",
+        )),
+    }
+}
+
+fn require_matching_accepted_disposition(
+    store: &HostStore,
+    live: &LeaseRecord,
+) -> Result<(), WorkerError> {
+    match store.disposition(live.job_id())? {
+        Some(JobDisposition::Accepted {
+            job_id,
+            client_id,
+            project_id,
+            worktree_id,
+            request_fingerprint,
+            ..
+        }) if job_id == live.job_id()
+            && client_id == live.client_id()
+            && project_id == live.project_id()
+            && worktree_id == live.worktree_id()
+            && request_fingerprint == *live.request_fingerprint() =>
+        {
+            Ok(())
+        }
+        _ => Err(protocol_code(
+            "JOB_ID_CONFLICT",
+            "accepted disposition does not match the live lease",
         )),
     }
 }

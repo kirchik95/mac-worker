@@ -97,6 +97,7 @@ fn structured_probe_json(
         "capabilities": capabilities,
     });
     if protocol_version == PROTOCOL_VERSION {
+        value["supervision_version"] = serde_json::json!(mac_worker::protocol::SUPERVISION_VERSION);
         value["total_disk_bytes"] = serde_json::json!(1_073_741_824_u64);
         value["slot_state"] = serde_json::json!("idle");
         value["active_lease"] = serde_json::Value::Null;
@@ -412,6 +413,28 @@ fn protocol_two_missing_occupancy_is_invalid_not_a_version_mismatch() {
 }
 
 #[test]
+fn protocol_two_without_supervision_capability_is_an_explicit_version_mismatch() {
+    let response = br#"{"protocol_version":2,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"total_disk_bytes":1073741824,"memory_pressure":"normal","swap_used_bytes":0,"slot_state":"idle","active_lease":null,"capabilities":[]}"#.to_vec();
+    let health = SshTransport::new(RecordingRunner::returning_json(response)).probe(&worker(
+        "mini-1",
+        "mac1",
+        &[],
+    ));
+
+    assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
+    assert!(
+        health
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("supervision"))
+    );
+    assert_eq!(
+        health.probe.as_ref().map(|probe| probe.supervision_version),
+        Some(0)
+    );
+}
+
+#[test]
 fn absent_declared_capabilities_exclude_the_worker() {
     let runner = RecordingRunner::returning_json(valid_probe_json());
     let transport = SshTransport::new(runner);
@@ -652,6 +675,7 @@ fn human_workers_output_includes_all_parsed_health_facts() {
             status: HealthStatus::Ready,
             probe: Some(ProbeResponse {
                 protocol_version: PROTOCOL_VERSION,
+                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
@@ -703,6 +727,7 @@ fn human_unavailable_worker_keeps_error_missing_capabilities_and_unknown_swap_vi
             status: HealthStatus::Unavailable,
             probe: Some(ProbeResponse {
                 protocol_version: PROTOCOL_VERSION,
+                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
