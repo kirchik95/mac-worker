@@ -10,7 +10,7 @@ use std::{
     path::{Component, Path},
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Condvar, LazyLock, Mutex, Weak,
         atomic::{AtomicU8, Ordering},
     },
 };
@@ -48,6 +48,11 @@ pub enum ClientStateWritePoint {
     SwapLiveJobWithDirectoryBeforeReplace = 10,
     SwapLiveJobWithFifoBeforeReplace = 11,
     SwapLiveJobWithPermissiveFileBeforeReplace = 12,
+    CrashCleanupAfterRetirementCreated = 13,
+    CrashCleanupAfterOperationMoved = 14,
+    CrashCleanupBeforeNestedCleanup = 15,
+    CrashRollbackAfterEntryMoved = 16,
+    CrashRollbackBeforeNestedCleanup = 17,
 }
 
 #[doc(hidden)]
@@ -79,6 +84,99 @@ struct ClientStateInner {
     client_id: ClientId,
     write_fault: Arc<AtomicU8>,
     sync_counts: Arc<SyncCounters>,
+    cleanup_pause: Mutex<Option<Arc<CleanupPauseState>>>,
+}
+
+struct CleanupPauseState {
+    state: Mutex<CleanupPauseFlags>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct CleanupPauseFlags {
+    paused: bool,
+    resumed: bool,
+}
+
+#[doc(hidden)]
+pub struct ClientStateCleanupPause {
+    inner: Arc<CleanupPauseState>,
+}
+
+impl ClientStateCleanupPause {
+    pub fn wait_until_paused(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("cleanup pause mutex poisoned");
+        while !state.paused {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .expect("cleanup pause mutex poisoned");
+        }
+    }
+
+    pub fn resume(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("cleanup pause mutex poisoned");
+        state.resumed = true;
+        self.inner.changed.notify_all();
+    }
+}
+
+impl Drop for ClientStateCleanupPause {
+    fn drop(&mut self) {
+        self.resume();
+    }
+}
+
+fn pause_cleanup(pause: Arc<CleanupPauseState>) {
+    let mut state = pause.state.lock().expect("cleanup pause mutex poisoned");
+    state.paused = true;
+    pause.changed.notify_all();
+    while !state.resumed {
+        state = pause
+            .changed
+            .wait(state)
+            .expect("cleanup pause mutex poisoned");
+    }
+}
+
+struct LockAttemptState {
+    root: FileIdentity,
+    attempted: Mutex<bool>,
+    changed: Condvar,
+}
+
+static LOCK_ATTEMPT_PROBES: LazyLock<Mutex<Vec<Weak<LockAttemptState>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[doc(hidden)]
+pub struct ClientStateLockAttemptProbe {
+    inner: Arc<LockAttemptState>,
+}
+
+impl ClientStateLockAttemptProbe {
+    pub fn wait_until_attempted(&self) {
+        let mut attempted = self
+            .inner
+            .attempted
+            .lock()
+            .expect("lock-attempt probe mutex poisoned");
+        while !*attempted {
+            attempted = self
+                .inner
+                .changed
+                .wait(attempted)
+                .expect("lock-attempt probe mutex poisoned");
+        }
+    }
 }
 
 #[derive(Default)]
@@ -136,6 +234,8 @@ impl ClientStateStore {
             &creation_race,
         )?;
         ensure_lock_file(root.as_raw_fd(), &sync_counts, &creation_race)?;
+        let _lock = StateLock::acquire(root.as_raw_fd(), &sync_counts)?;
+        require_same_device(root.as_raw_fd(), jobs.as_raw_fd(), operations.as_raw_fd())?;
         validate_root_entries(root.as_raw_fd())?;
         validate_operation_entries(operations.as_raw_fd())?;
         let client_id = load_or_create_client_id(
@@ -153,6 +253,7 @@ impl ClientStateStore {
                 client_id,
                 write_fault,
                 sync_counts,
+                cleanup_pause: Mutex::new(None),
             }),
         })
     }
@@ -194,7 +295,7 @@ impl ClientStateStore {
         ) {
             Ok(()) => {}
             Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
-                operation.cleanup(&self.inner.write_fault, &[])?;
+                operation.cleanup(&self.inner.write_fault, &[], self.take_cleanup_pause())?;
                 let existing = read_job(self.inner.jobs.as_raw_fd(), &name)?;
                 self.require_local_client(&existing)?;
                 sync_counted(
@@ -215,7 +316,7 @@ impl ClientStateStore {
             &self.inner.sync_counts,
             SyncKind::Jobs,
         )?;
-        operation.cleanup(&self.inner.write_fault, &[])?;
+        operation.cleanup(&self.inner.write_fault, &[], self.take_cleanup_pause())?;
         Ok(())
     }
 
@@ -262,7 +363,11 @@ impl ClientStateStore {
             &self.inner.sync_counts,
             SyncKind::Jobs,
         )?;
-        operation.cleanup(&self.inner.write_fault, &[identity])?;
+        operation.cleanup(
+            &self.inner.write_fault,
+            &[identity],
+            self.take_cleanup_pause(),
+        )?;
         Ok(())
     }
 
@@ -293,6 +398,36 @@ impl ClientStateStore {
     #[doc(hidden)]
     pub fn inject_write_failure_once(&self, point: ClientStateWritePoint) {
         self.inner.write_fault.store(point as u8, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn pause_cleanup_after_move_once(&self) -> ClientStateCleanupPause {
+        let state = Arc::new(CleanupPauseState {
+            state: Mutex::new(CleanupPauseFlags::default()),
+            changed: Condvar::new(),
+        });
+        *self
+            .inner
+            .cleanup_pause
+            .lock()
+            .expect("cleanup pause mutex poisoned") = Some(Arc::clone(&state));
+        ClientStateCleanupPause { inner: state }
+    }
+
+    #[doc(hidden)]
+    pub fn observe_next_lock_attempt(&self) -> ClientStateLockAttemptProbe {
+        let state = Arc::new(LockAttemptState {
+            root: FileIdentity::from_stat(
+                stat_fd(self.inner.root.as_raw_fd()).expect("anchored state root must be open"),
+            ),
+            attempted: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        LOCK_ATTEMPT_PROBES
+            .lock()
+            .expect("lock-attempt probes mutex poisoned")
+            .push(Arc::downgrade(&state));
+        ClientStateLockAttemptProbe { inner: state }
     }
 
     #[doc(hidden)]
@@ -327,6 +462,14 @@ impl ClientStateStore {
             .write_fault
             .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
+    }
+
+    fn take_cleanup_pause(&self) -> Option<Arc<CleanupPauseState>> {
+        self.inner
+            .cleanup_pause
+            .lock()
+            .expect("cleanup pause mutex poisoned")
+            .take()
     }
 }
 
@@ -418,11 +561,11 @@ fn load_or_create_client_id(
             match operation.publish_no_replace(root, CLIENT_ID_NAME, fault) {
                 Ok(()) => {
                     sync_counted(root, sync_counts, SyncKind::Root)?;
-                    operation.cleanup(fault, &[])?;
+                    operation.cleanup(fault, &[], None)?;
                     Ok(candidate)
                 }
                 Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
-                    operation.cleanup(fault, &[])?;
+                    operation.cleanup(fault, &[], None)?;
                     let (winner, _) = read_regular(root, CLIENT_ID_NAME)?;
                     let winner = parse_client_id(&winner)?;
                     sync_counted(root, sync_counts, SyncKind::Root)?;
@@ -555,11 +698,6 @@ impl OperationFile {
         ) {
             self.inject_payload_swap()?;
         }
-        if fault.load(Ordering::SeqCst)
-            == ClientStateWritePoint::SwapPublishedRollbackAfterValidationBeforeRemoval as u8
-        {
-            self.inject_retained_payload_corruption()?;
-        }
         link_no_replace(
             self.directory.as_raw_fd(),
             PAYLOAD_NAME,
@@ -568,7 +706,10 @@ impl OperationFile {
         )?;
         let published = open_regular_at(destination_parent, destination)?;
         let (published_bytes, published_identity) = read_open_regular(published)?;
-        if published_identity != self.payload_identity || published_bytes != self.expected_bytes {
+        if published_identity != self.payload_identity
+            || published_bytes != self.expected_bytes
+            || rollback_fault_is_armed(fault)
+        {
             if published_identity == self.payload_identity {
                 remove_entry_if_identity(
                     destination_parent,
@@ -576,6 +717,7 @@ impl OperationFile {
                     self.payload_identity,
                     fault,
                     &self.sync_counts,
+                    self.operations,
                 )?;
             }
             return Err(invalid_state(
@@ -687,7 +829,12 @@ impl OperationFile {
         Ok(())
     }
 
-    fn cleanup(self, fault: &AtomicU8, extra_owned: &[FileIdentity]) -> Result<(), WorkerError> {
+    fn cleanup(
+        self,
+        fault: &AtomicU8,
+        extra_owned: &[FileIdentity],
+        pause: Option<Arc<CleanupPauseState>>,
+    ) -> Result<(), WorkerError> {
         if take_fault(
             fault,
             ClientStateWritePoint::SwapOperationDirectoryBeforeCleanup,
@@ -695,8 +842,20 @@ impl OperationFile {
             self.inject_directory_swap()?;
         }
 
-        let (namespace_name, namespace) =
-            create_private_directory(self.operations, &self.sync_counts, SyncKind::Operations)?;
+        let (namespace_name, namespace) = create_private_directory(
+            self.operations,
+            "cleanup",
+            &self.sync_counts,
+            SyncKind::Operations,
+        )?;
+        if take_fault(
+            fault,
+            ClientStateWritePoint::CrashCleanupAfterRetirementCreated,
+        ) {
+            return Err(injected_failure(
+                ClientStateWritePoint::CrashCleanupAfterRetirementCreated,
+            ));
+        }
         let acquired_name = c"operation";
         rename_no_replace(
             self.operations,
@@ -704,6 +863,23 @@ impl OperationFile {
             namespace.as_raw_fd(),
             acquired_name,
         )?;
+        sync_counted(
+            namespace.as_raw_fd(),
+            &self.sync_counts,
+            SyncKind::Operations,
+        )?;
+        sync_counted(self.operations, &self.sync_counts, SyncKind::Operations)?;
+        if take_fault(
+            fault,
+            ClientStateWritePoint::CrashCleanupAfterOperationMoved,
+        ) {
+            return Err(injected_failure(
+                ClientStateWritePoint::CrashCleanupAfterOperationMoved,
+            ));
+        }
+        if let Some(pause) = pause {
+            pause_cleanup(pause);
+        }
         let acquired = open_directory_at(namespace.as_raw_fd(), acquired_name)?;
         let acquired_identity = FileIdentity::from_stat(stat_fd(acquired.as_raw_fd())?);
         if acquired_identity != self.directory_identity {
@@ -730,11 +906,23 @@ impl OperationFile {
             )?;
         }
 
-        let (retired_name, retired) = create_private_directory(
+        let retired_name = c"retired";
+        mkdir_at(namespace.as_raw_fd(), retired_name, 0o700)?;
+        sync_counted(
             namespace.as_raw_fd(),
             &self.sync_counts,
             SyncKind::Operations,
         )?;
+        let retired = open_directory_at(namespace.as_raw_fd(), retired_name)?;
+        require_owned_directory(retired.as_raw_fd())?;
+        if take_fault(
+            fault,
+            ClientStateWritePoint::CrashCleanupBeforeNestedCleanup,
+        ) {
+            return Err(injected_failure(
+                ClientStateWritePoint::CrashCleanupBeforeNestedCleanup,
+            ));
+        }
         self.cleanup_owned_payload_links(
             acquired.as_raw_fd(),
             retired.as_raw_fd(),
@@ -766,7 +954,7 @@ impl OperationFile {
         }
         unlink_at(retired.as_raw_fd(), acquired_name, libc::AT_REMOVEDIR)?;
         sync_counted(retired.as_raw_fd(), &self.sync_counts, SyncKind::Operations)?;
-        remove_empty_directory_if_identity(namespace.as_raw_fd(), &retired_name, &retired)?;
+        remove_empty_directory_if_identity(namespace.as_raw_fd(), retired_name, &retired)?;
         remove_empty_directory_if_identity(self.operations, &namespace_name, &namespace)?;
         sync_counted(self.operations, &self.sync_counts, SyncKind::Operations)?;
         Ok(())
@@ -800,7 +988,7 @@ impl OperationFile {
                     write_new_file(directory, &entry, b"post-validation-child-substitution\n")?;
                     sync_directory(directory)?;
                 }
-                let retired_name = random_component();
+                let retired_name = entry.clone();
                 rename_no_replace(directory, &entry, retirement, &retired_name)?;
                 let retired_entry = open_regular_at(retirement, &retired_name)?;
                 let retired_identity = FileIdentity::from_stat(require_owned_regular(
@@ -842,24 +1030,6 @@ impl OperationFile {
         )
     }
 
-    fn inject_retained_payload_corruption(&self) -> Result<(), WorkerError> {
-        cvt(unsafe { libc::ftruncate(self.payload.as_raw_fd(), 0) })?;
-        let bytes = b"rollback-trigger\n";
-        let written = unsafe {
-            libc::pwrite(
-                self.payload.as_raw_fd(),
-                bytes.as_ptr().cast(),
-                bytes.len(),
-                0,
-            )
-        };
-        if written != bytes.len() as libc::ssize_t {
-            return Err(WorkerError::Io(io::Error::last_os_error()));
-        }
-        cvt(unsafe { libc::fsync(self.payload.as_raw_fd()) })?;
-        Ok(())
-    }
-
     fn inject_directory_swap(&self) -> Result<(), WorkerError> {
         let original_name = random_component();
         rename_no_replace(self.operations, &self.name, self.operations, &original_name)?;
@@ -884,9 +1054,31 @@ impl StateLock {
         if outcome != CreationOutcome::Existing {
             sync_counted(root, sync_counts, SyncKind::Root)?;
         }
+        notify_lock_attempt(root)?;
         cvt(unsafe { libc::flock(descriptor.as_raw_fd(), libc::LOCK_EX) })?;
         Ok(Self(descriptor))
     }
+}
+
+fn notify_lock_attempt(root: RawFd) -> Result<(), WorkerError> {
+    let root = FileIdentity::from_stat(stat_fd(root)?);
+    let mut probes = LOCK_ATTEMPT_PROBES
+        .lock()
+        .expect("lock-attempt probes mutex poisoned");
+    probes.retain(|probe| {
+        let Some(probe) = probe.upgrade() else {
+            return false;
+        };
+        if probe.root == root {
+            *probe
+                .attempted
+                .lock()
+                .expect("lock-attempt probe mutex poisoned") = true;
+            probe.changed.notify_all();
+        }
+        true
+    });
+    Ok(())
 }
 
 impl Drop for StateLock {
@@ -1141,40 +1333,127 @@ fn validate_operation_entries(operations: RawFd) -> Result<(), WorkerError> {
     for entry in directory_entries(operations)? {
         let text = std::str::from_utf8(entry.to_bytes())
             .map_err(|_| invalid_state("operation state contains a non-UTF-8 entry"))?;
-        if text.len() != 32
-            || !text
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
+        let directory = open_owned_directory_entry(operations, &entry)?;
+        if is_lower_hex_id(text) {
+            validate_active_operation(directory.as_raw_fd())?;
+        } else if has_operation_namespace_id(text, "cleanup-") {
+            validate_cleanup_namespace(directory.as_raw_fd())?;
+        } else if has_operation_namespace_id(text, "rollback-") {
+            validate_rollback_namespace(directory.as_raw_fd())?;
+        } else {
             return Err(invalid_state(
                 "operation state contains an unexpected entry",
             ));
         }
-        let directory = match open_directory_at(operations, &entry) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(WorkerError::Io(error)),
-        };
-        require_owned_directory(directory.as_raw_fd())?;
-        let children = match directory_entries(directory.as_raw_fd()) {
-            Ok(children) => children,
-            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for child in children {
-            if child.as_c_str() != PAYLOAD_NAME {
+    }
+    Ok(())
+}
+
+fn is_lower_hex_id(text: &str) -> bool {
+    text.len() == 32
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn has_operation_namespace_id(text: &str, prefix: &str) -> bool {
+    text.strip_prefix(prefix).is_some_and(is_lower_hex_id)
+}
+
+fn open_owned_directory_entry(parent: RawFd, name: &CStr) -> Result<OwnedFd, WorkerError> {
+    let before = stat_at(parent, name)?;
+    let directory = open_directory_at(parent, name)?;
+    let opened = stat_fd(directory.as_raw_fd())?;
+    if file_type(before.st_mode) != libc::S_IFDIR
+        || FileIdentity::from_stat(before) != FileIdentity::from_stat(opened)
+    {
+        return Err(invalid_state("operation directory identity changed"));
+    }
+    require_owned_directory(directory.as_raw_fd())?;
+    Ok(directory)
+}
+
+fn validate_active_operation(directory: RawFd) -> Result<(), WorkerError> {
+    for entry in directory_entries(directory)? {
+        if entry.as_c_str() != PAYLOAD_NAME {
+            return Err(invalid_state(
+                "active operation contains an unexpected entry",
+            ));
+        }
+        validate_operation_regular(directory, &entry)?;
+    }
+    Ok(())
+}
+
+fn validate_cleanup_namespace(directory: RawFd) -> Result<(), WorkerError> {
+    for entry in directory_entries(directory)? {
+        match entry.to_bytes() {
+            b"operation" => {
+                let operation = open_owned_directory_entry(directory, &entry)?;
+                validate_active_operation(operation.as_raw_fd())?;
+            }
+            b"retired" => {
+                let retired = open_owned_directory_entry(directory, &entry)?;
+                validate_cleanup_retired(retired.as_raw_fd())?;
+            }
+            _ => {
                 return Err(invalid_state(
-                    "operation directory contains an unexpected entry",
+                    "cleanup namespace contains an unexpected entry",
                 ));
             }
-            let descriptor = match open_regular_at(directory.as_raw_fd(), &child) {
-                Ok(descriptor) => descriptor,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(WorkerError::Io(error)),
-            };
-            require_owned_regular(descriptor.as_raw_fd(), MAX_STATE_FILE_BYTES)?;
         }
     }
+    Ok(())
+}
+
+fn validate_cleanup_retired(directory: RawFd) -> Result<(), WorkerError> {
+    for entry in directory_entries(directory)? {
+        match entry.to_bytes() {
+            b"payload" => validate_operation_regular(directory, &entry)?,
+            b"operation" => {
+                let operation = open_owned_directory_entry(directory, &entry)?;
+                if !directory_entries(operation.as_raw_fd())?.is_empty() {
+                    return Err(invalid_state("retired operation directory is not empty"));
+                }
+            }
+            _ => {
+                return Err(invalid_state(
+                    "cleanup retirement contains an unexpected entry",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_rollback_namespace(directory: RawFd) -> Result<(), WorkerError> {
+    for entry in directory_entries(directory)? {
+        match entry.to_bytes() {
+            b"published" => validate_operation_regular(directory, &entry)?,
+            b"retired" => {
+                let retired = open_owned_directory_entry(directory, &entry)?;
+                for child in directory_entries(retired.as_raw_fd())? {
+                    if child.to_bytes() != b"published" {
+                        return Err(invalid_state(
+                            "rollback retirement contains an unexpected entry",
+                        ));
+                    }
+                    validate_operation_regular(retired.as_raw_fd(), &child)?;
+                }
+            }
+            _ => {
+                return Err(invalid_state(
+                    "rollback namespace contains an unexpected entry",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_operation_regular(parent: RawFd, name: &CStr) -> Result<(), WorkerError> {
+    let descriptor = open_regular_at(parent, name)?;
+    require_owned_regular(descriptor.as_raw_fd(), MAX_STATE_FILE_BYTES)?;
     Ok(())
 }
 
@@ -1185,6 +1464,16 @@ fn require_owned_directory(descriptor: RawFd) -> Result<(), WorkerError> {
         || stat.st_mode & 0o777 != 0o700
     {
         return Err(invalid_state("state directory is not owner-only"));
+    }
+    Ok(())
+}
+
+fn require_same_device(root: RawFd, jobs: RawFd, operations: RawFd) -> Result<(), WorkerError> {
+    let device = stat_fd(root)?.st_dev;
+    if stat_fd(jobs)?.st_dev != device || stat_fd(operations)?.st_dev != device {
+        return Err(invalid_state(
+            "local state directories must share one filesystem",
+        ));
     }
     Ok(())
 }
@@ -1437,11 +1726,24 @@ fn remove_entry_if_identity(
     expected: FileIdentity,
     fault: &AtomicU8,
     sync_counts: &Arc<SyncCounters>,
+    operations: RawFd,
 ) -> Result<(), WorkerError> {
+    if stat_fd(parent)?.st_dev != stat_fd(operations)?.st_dev {
+        return Err(invalid_state(
+            "rollback destination and operation state are on different filesystems",
+        ));
+    }
     let (namespace_name, namespace) =
-        create_private_directory(parent, sync_counts, SyncKind::Jobs)?;
+        create_private_directory(operations, "rollback", sync_counts, SyncKind::Operations)?;
     let acquired_name = c"published";
     rename_no_replace(parent, name, namespace.as_raw_fd(), acquired_name)?;
+    sync_directory(parent)?;
+    sync_counted(namespace.as_raw_fd(), sync_counts, SyncKind::Operations)?;
+    if take_fault(fault, ClientStateWritePoint::CrashRollbackAfterEntryMoved) {
+        return Err(injected_failure(
+            ClientStateWritePoint::CrashRollbackAfterEntryMoved,
+        ));
+    }
     let acquired = open_regular_at(namespace.as_raw_fd(), acquired_name)?;
     let identity = FileIdentity::from_stat(require_owned_regular(
         acquired.as_raw_fd(),
@@ -1449,7 +1751,8 @@ fn remove_entry_if_identity(
     )?);
     if identity != expected {
         restore_quarantine(namespace.as_raw_fd(), acquired_name, parent, name)?;
-        remove_empty_directory_if_identity(parent, &namespace_name, &namespace)?;
+        sync_directory(parent)?;
+        remove_empty_directory_if_identity(operations, &namespace_name, &namespace)?;
         return Err(invalid_state(
             "published entry changed before identity-bound rollback",
         ));
@@ -1474,8 +1777,19 @@ fn remove_entry_if_identity(
         sync_directory(namespace.as_raw_fd())?;
     }
 
-    let (retired_name, retired) =
-        create_private_directory(namespace.as_raw_fd(), sync_counts, SyncKind::Operations)?;
+    let retired_name = c"retired";
+    mkdir_at(namespace.as_raw_fd(), retired_name, 0o700)?;
+    sync_counted(namespace.as_raw_fd(), sync_counts, SyncKind::Operations)?;
+    let retired = open_directory_at(namespace.as_raw_fd(), retired_name)?;
+    require_owned_directory(retired.as_raw_fd())?;
+    if take_fault(
+        fault,
+        ClientStateWritePoint::CrashRollbackBeforeNestedCleanup,
+    ) {
+        return Err(injected_failure(
+            ClientStateWritePoint::CrashRollbackBeforeNestedCleanup,
+        ));
+    }
     rename_no_replace(
         namespace.as_raw_fd(),
         acquired_name,
@@ -1500,18 +1814,21 @@ fn remove_entry_if_identity(
     }
     unlink_at(retired.as_raw_fd(), acquired_name, 0)?;
     sync_directory(retired.as_raw_fd())?;
-    remove_empty_directory_if_identity(namespace.as_raw_fd(), &retired_name, &retired)?;
-    remove_empty_directory_if_identity(parent, &namespace_name, &namespace)?;
+    remove_empty_directory_if_identity(namespace.as_raw_fd(), retired_name, &retired)?;
+    remove_empty_directory_if_identity(operations, &namespace_name, &namespace)?;
+    sync_counted(operations, sync_counts, SyncKind::Operations)?;
     sync_directory(parent)
 }
 
 fn create_private_directory(
     parent: RawFd,
+    kind_name: &str,
     sync_counts: &Arc<SyncCounters>,
     kind: SyncKind,
 ) -> Result<(CString, OwnedFd), WorkerError> {
     for _ in 0..16 {
-        let name = random_component();
+        let name = CString::new(format!("{kind_name}-{}", Uuid::new_v4().simple()))
+            .expect("operation namespace name contains no NUL");
         match mkdir_at(parent, &name, 0o700) {
             Ok(()) => {
                 sync_counted(parent, sync_counts, kind)?;
@@ -1685,6 +2002,16 @@ fn take_fault(fault: &AtomicU8, point: ClientStateWritePoint) -> bool {
         .is_ok()
 }
 
+fn rollback_fault_is_armed(fault: &AtomicU8) -> bool {
+    matches!(
+        fault.load(Ordering::SeqCst),
+        value if value
+            == ClientStateWritePoint::SwapPublishedRollbackAfterValidationBeforeRemoval as u8
+            || value == ClientStateWritePoint::CrashRollbackAfterEntryMoved as u8
+            || value == ClientStateWritePoint::CrashRollbackBeforeNestedCleanup as u8
+    )
+}
+
 fn take_creation_race(fault: &AtomicU8, point: ClientStateCreationRacePoint) -> bool {
     fault
         .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
@@ -1754,6 +2081,15 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         }
         ClientStateWritePoint::SwapLiveJobWithPermissiveFileBeforeReplace => {
             "after permissive live job substitution"
+        }
+        ClientStateWritePoint::CrashCleanupAfterRetirementCreated => {
+            "after cleanup retirement creation"
+        }
+        ClientStateWritePoint::CrashCleanupAfterOperationMoved => "after operation retirement move",
+        ClientStateWritePoint::CrashCleanupBeforeNestedCleanup => "before nested operation cleanup",
+        ClientStateWritePoint::CrashRollbackAfterEntryMoved => "after published rollback move",
+        ClientStateWritePoint::CrashRollbackBeforeNestedCleanup => {
+            "before nested published rollback cleanup"
         }
     };
     WorkerError::Io(io::Error::other(format!(

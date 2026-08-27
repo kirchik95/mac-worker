@@ -6,7 +6,7 @@ use std::{
         fs::{FileTypeExt, PermissionsExt, symlink},
     },
     path::{Path, PathBuf},
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, mpsc},
     thread,
 };
 
@@ -735,6 +735,168 @@ fn concurrent_creation_losers_fsync_every_parent_they_observe() {
             "{point:?}: {counts:?}"
         );
     }
+}
+
+#[test]
+fn recognized_cleanup_crash_residue_does_not_poison_reopen_or_job_listing() {
+    for point in [
+        ClientStateWritePoint::CrashCleanupAfterRetirementCreated,
+        ClientStateWritePoint::CrashCleanupAfterOperationMoved,
+        ClientStateWritePoint::CrashCleanupBeforeNestedCleanup,
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let state = temp_root(&fixture).join("state");
+        let store = ClientStateStore::open(&state).unwrap();
+        let client_id = store.client_id();
+        let baseline = make_record(
+            "00000000000000000000000000000001".parse().unwrap(),
+            client_id,
+            LeaseToken::generate(),
+            DIGEST_A,
+            None,
+            false,
+        );
+        store.create_job(baseline.clone()).unwrap();
+        let record = fresh_record(&store);
+        store.inject_write_failure_once(point);
+
+        assert!(store.create_job(record.clone()).is_err(), "{point:?}");
+        let reopened = ClientStateStore::open(&state).unwrap();
+        assert_eq!(reopened.client_id(), client_id, "{point:?}");
+        assert_eq!(
+            reopened.list_jobs().unwrap(),
+            vec![baseline, record.clone()],
+            "{point:?}"
+        );
+        assert_eq!(reopened.load_job(record.meta().job_id()).unwrap(), record);
+    }
+}
+
+#[test]
+fn rollback_crash_residue_stays_out_of_root_and_jobs() {
+    for point in [
+        ClientStateWritePoint::CrashRollbackAfterEntryMoved,
+        ClientStateWritePoint::CrashRollbackBeforeNestedCleanup,
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let state = temp_root(&fixture).join("state");
+        let store = ClientStateStore::open(&state).unwrap();
+        let client_id = store.client_id();
+        let baseline = fresh_record(&store);
+        store.create_job(baseline.clone()).unwrap();
+        let interrupted = fresh_record(&store);
+        store.inject_write_failure_once(point);
+
+        assert!(store.create_job(interrupted.clone()).is_err(), "{point:?}");
+        assert!(
+            !state
+                .join("jobs")
+                .join(format!("{}.json", interrupted.meta().job_id()))
+                .exists()
+        );
+        let reopened = ClientStateStore::open(&state).unwrap();
+        assert_eq!(reopened.client_id(), client_id);
+        assert_eq!(reopened.list_jobs().unwrap(), vec![baseline.clone()]);
+        assert_eq!(
+            reopened.load_job(baseline.meta().job_id()).unwrap(),
+            baseline
+        );
+    }
+}
+
+#[test]
+fn client_identity_rollback_crash_residue_is_reopenable() {
+    for point in [
+        ClientStateWritePoint::CrashRollbackAfterEntryMoved,
+        ClientStateWritePoint::CrashRollbackBeforeNestedCleanup,
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let state = temp_root(&fixture).join("state");
+        assert!(ClientStateStore::open_with_write_fault(&state, point).is_err());
+        assert!(!state.join("client-id").exists(), "{point:?}");
+        let reopened = ClientStateStore::open(&state).unwrap();
+        assert!(reopened.list_jobs().unwrap().is_empty());
+        assert_eq!(
+            reopened.client_id(),
+            ClientStateStore::open(&state).unwrap().client_id()
+        );
+    }
+}
+
+#[test]
+fn operation_residue_schema_rejects_symlink_permissive_and_malformed_entries() {
+    for kind in ["symlink", "permissive", "malformed", "non-utf8"] {
+        let fixture = tempfile::tempdir().unwrap();
+        let state = temp_root(&fixture).join("state");
+        ClientStateStore::open(&state).unwrap();
+        let operations = state.join(".mac-worker-state");
+        let recognized = operations.join(format!("cleanup-{}", JobId::generate()));
+        match kind {
+            "symlink" => symlink("outside", &recognized).unwrap(),
+            "permissive" => {
+                fs::create_dir(&recognized).unwrap();
+                fs::set_permissions(&recognized, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            "malformed" => {
+                fs::create_dir(&recognized).unwrap();
+                fs::set_permissions(&recognized, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(recognized.join("unexpected"), b"unexpected\n").unwrap();
+                fs::set_permissions(
+                    recognized.join("unexpected"),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            "non-utf8" => {
+                let invalid = operations.join(OsString::from_vec(vec![0xff, 0xfe]));
+                if fs::create_dir(&invalid).is_err() {
+                    continue;
+                }
+                fs::set_permissions(&invalid, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(ClientStateStore::open(&state).is_err(), "{kind}");
+    }
+}
+
+#[test]
+fn concurrent_open_waits_for_cooperating_cleanup_lock() {
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let record = fresh_record(&store);
+    let cleanup_pause = store.pause_cleanup_after_move_once();
+    let writer_store = store.clone();
+    let writer_record = record.clone();
+    let writer = thread::spawn(move || writer_store.create_job(writer_record));
+    cleanup_pause.wait_until_paused();
+
+    let lock_probe = store.observe_next_lock_attempt();
+    let (result_sender, result_receiver) = mpsc::channel();
+    let open_state = state.clone();
+    let opener = thread::spawn(move || {
+        result_sender
+            .send(ClientStateStore::open(&open_state))
+            .unwrap();
+    });
+    lock_probe.wait_until_attempted();
+    assert!(matches!(
+        result_receiver.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    cleanup_pause.resume();
+    writer.join().unwrap().unwrap();
+    opener.join().unwrap();
+    let reopened = result_receiver.recv().unwrap().unwrap();
+    assert_eq!(reopened.list_jobs().unwrap(), vec![record]);
+    assert!(
+        fs::read_dir(state.join(".mac-worker-state"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
