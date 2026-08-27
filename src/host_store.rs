@@ -32,7 +32,7 @@ const CAPACITY_LOCK_FILE: &str = "capacity.lock";
 const ADMISSION_LOCK_FILE: &str = "admission.lock";
 const TRANSFER_DIRECTORY: &str = "transfer";
 const TRANSFER_LOCK_FILE: &str = "transfer.lock";
-const TRANSFER_IDENTITY_FILE: &str = "identity.json";
+const TRANSFER_IDENTITY_SUFFIX: &str = ".transfer-lock.json";
 const OWNED_DIRECTORIES: &[&str] = &[
     "incoming",
     "verified",
@@ -198,6 +198,8 @@ pub enum JobDisposition {
     Abandoned {
         job_id: JobId,
         client_id: ClientId,
+        project_id: String,
+        worktree_id: String,
         request_fingerprint: RequestFingerprint,
         lease_token_sha256: String,
         recorded_at_millis: u64,
@@ -224,8 +226,15 @@ impl JobDisposition {
                 Ok(())
             }
             Self::Abandoned {
-                lease_token_sha256, ..
-            } => validate_digest(lease_token_sha256, "lease token hash"),
+                project_id,
+                worktree_id,
+                lease_token_sha256,
+                ..
+            } => {
+                validate_digest(project_id, "abandoned project ID")?;
+                validate_digest(worktree_id, "abandoned worktree ID")?;
+                validate_digest(lease_token_sha256, "lease token hash")
+            }
         }
     }
 }
@@ -250,14 +259,11 @@ pub struct TransferGuard {
     namespace: RootedDir,
     file_name: String,
     file_identity: PrivateEntryIdentity,
+    anchor_namespace: RootedDir,
     identity_file: File,
     identity_file_name: String,
     identity_file_identity: PrivateEntryIdentity,
     identity: TransferLockIdentity,
-}
-
-pub(crate) struct TransferExecLock<'a> {
-    file: &'a File,
 }
 
 // Every host mutation follows this fixed order: the parent-anchored stable
@@ -291,54 +297,51 @@ impl AdmissionGuard {
 
 impl TransferGuard {
     pub(crate) fn validate(&self) -> Result<(), WorkerError> {
+        self.anchor_namespace.verify_bound()?;
+        self.anchor_namespace.validate_private_regular_binding(
+            &self.identity_file_name,
+            &self.identity_file,
+            self.identity_file_identity,
+        )?;
+        let stored: TransferLockIdentity =
+            read_json_strict_at(&self.anchor_namespace, &self.identity_file_name)?;
+        if stored != self.identity {
+            return Err(WorkerError::Protocol(
+                "canonical transfer lock identity changed".into(),
+            ));
+        }
+        let current_namespace = self.anchor_namespace.open_child_directory(
+            &relative(&format!("{}/{TRANSFER_DIRECTORY}", self.identity.job_id))?,
+            false,
+        )?;
+        let current = build_transfer_lock_identity(
+            &current_namespace,
+            self.identity.job_id,
+            current_namespace.private_entry_identity(TRANSFER_LOCK_FILE)?,
+            self.identity_file_identity,
+            &self.identity_file_name,
+        )?;
+        if current != self.identity {
+            return Err(WorkerError::Protocol(
+                "canonical transfer lock identity changed".into(),
+            ));
+        }
         self.namespace.verify_bound()?;
         self.namespace.validate_private_regular_binding(
             &self.file_name,
             &self.file,
             self.file_identity,
         )?;
-        self.namespace.validate_private_regular_binding(
-            &self.identity_file_name,
-            &self.identity_file,
-            self.identity_file_identity,
-        )?;
-        let stored: TransferLockIdentity =
-            read_json_strict_at(&self.namespace, &self.identity_file_name)?;
-        if stored != self.identity {
-            return Err(WorkerError::Protocol(
-                "canonical transfer lock identity changed".into(),
-            ));
-        }
         Ok(())
     }
 
-    pub(crate) fn inherit_for_exec(&self) -> Result<TransferExecLock<'_>, WorkerError> {
+    pub(crate) fn raw_lock_fd_for_exec(&self) -> Result<std::os::fd::RawFd, WorkerError> {
         self.validate()?;
         self.namespace.verify_descriptors_cloexec()?;
+        self.anchor_namespace.verify_descriptors_cloexec()?;
         require_cloexec(self.identity_file.as_raw_fd())?;
         require_cloexec(self.file.as_raw_fd())?;
-        let flags = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETFD) };
-        if flags == -1 {
-            return Err(WorkerError::Io(std::io::Error::last_os_error()));
-        }
-        if unsafe {
-            libc::fcntl(
-                self.file.as_raw_fd(),
-                libc::F_SETFD,
-                flags & !libc::FD_CLOEXEC,
-            )
-        } == -1
-        {
-            return Err(WorkerError::Io(std::io::Error::last_os_error()));
-        }
-        Ok(TransferExecLock { file: &self.file })
-    }
-}
-
-impl TransferExecLock<'_> {
-    #[cfg(test)]
-    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
-        self.file.as_raw_fd()
+        Ok(self.file.as_raw_fd())
     }
 }
 
@@ -348,21 +351,6 @@ impl fmt::Debug for TransferGuard {
             .debug_struct("TransferGuard")
             .field("job_id", &self.identity.job_id)
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for TransferExecLock<'_> {
-    fn drop(&mut self) {
-        let flags = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETFD) };
-        if flags != -1 {
-            let _ = unsafe {
-                libc::fcntl(
-                    self.file.as_raw_fd(),
-                    libc::F_SETFD,
-                    flags | libc::FD_CLOEXEC,
-                )
-            };
-        }
     }
 }
 
@@ -853,25 +841,51 @@ impl HostStore {
                 "transfer lock requires the matching job admission guard".into(),
             ));
         }
+        let transfer_identity_name = format!("{job}{TRANSFER_IDENTITY_SUFFIX}");
+        let identity_exists = self
+            .open_directory("locks/jobs", false)?
+            .entry_exists(&transfer_identity_name)?;
         let job_locks = admission.namespace.reopen()?;
-        for name in job_locks.list_names()? {
-            let name = std::str::from_utf8(&name).map_err(|_| {
-                WorkerError::Protocol("job lock namespace contains a non-UTF-8 entry".into())
-            })?;
-            if let Some(suffix) = name.strip_prefix(".transfer-init-") {
-                if !is_lower_hex(suffix, 32) {
-                    return Err(WorkerError::Protocol(
-                        "unsafe transfer initialization residue".into(),
-                    ));
-                }
-                admission.validate()?;
-                job_locks.remove_owned_child(name)?;
+        let jobs = self.open_directory("locks/jobs", false)?;
+        let (identity, identity_file_identity, identity_file) = if identity_exists {
+            let stored: TransferLockIdentity = read_json_strict_at(&jobs, &transfer_identity_name)?;
+            let identity_file_identity = jobs.private_entry_identity(&transfer_identity_name)?;
+            let identity_file = jobs.open_private_regular_handle(&transfer_identity_name)?;
+            jobs.validate_private_regular_binding(
+                &transfer_identity_name,
+                &identity_file,
+                stored.identity_file.as_private(),
+            )?;
+            if stored.version != HOST_LAYOUT_VERSION
+                || stored.job_id != job
+                || stored.identity_file
+                    != LayoutEntry::new(transfer_identity_name.clone(), identity_file_identity)
+            {
+                return Err(WorkerError::Protocol(
+                    "canonical transfer lock identity changed".into(),
+                ));
             }
-        }
-
-        let transfer = if job_locks.entry_exists(TRANSFER_DIRECTORY)? {
-            job_locks.open_child_directory(&relative(TRANSFER_DIRECTORY)?, false)?
+            (stored, identity_file_identity, identity_file)
         } else {
+            if job_locks.entry_exists(TRANSFER_DIRECTORY)? {
+                return Err(WorkerError::Protocol(
+                    "canonical transfer lock identity is absent".into(),
+                ));
+            }
+            for name in job_locks.list_names()? {
+                let name = std::str::from_utf8(&name).map_err(|_| {
+                    WorkerError::Protocol("job lock namespace contains a non-UTF-8 entry".into())
+                })?;
+                if let Some(suffix) = name.strip_prefix(".transfer-init-") {
+                    if !is_lower_hex(suffix, 32) {
+                        return Err(WorkerError::Protocol(
+                            "unsafe transfer initialization residue".into(),
+                        ));
+                    }
+                    admission.validate()?;
+                    job_locks.remove_owned_child(name)?;
+                }
+            }
             let operation_name = format!(
                 ".transfer-init-{}",
                 hex_16(*uuid::Uuid::new_v4().as_bytes())
@@ -886,17 +900,42 @@ impl HostStore {
                 return Err(injected_transfer_initialization());
             }
             let lock_identity = operation.private_entry_identity(TRANSFER_LOCK_FILE)?;
-            operation.write_private_atomic_no_replace_with_identity(
-                TRANSFER_IDENTITY_FILE,
+            let identity_file_identity = jobs.write_private_atomic_no_replace_with_identity(
+                &transfer_identity_name,
                 |identity_file| {
-                    let identity =
-                        build_transfer_lock_identity(&operation, job, lock_identity, identity_file)
-                            .map_err(worker_error_as_io)?;
+                    let identity = build_transfer_lock_identity(
+                        &operation,
+                        job,
+                        lock_identity,
+                        identity_file,
+                        &transfer_identity_name,
+                    )
+                    .map_err(worker_error_as_io)?;
                     serde_json::to_vec(&identity).map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, error)
                     })
                 },
             )?;
+            let identity: TransferLockIdentity =
+                read_json_strict_at(&jobs, &transfer_identity_name)?;
+            let identity_file = jobs.open_private_regular_handle(&transfer_identity_name)?;
+            jobs.validate_private_regular_binding(
+                &transfer_identity_name,
+                &identity_file,
+                identity.identity_file.as_private(),
+            )?;
+            let staged = build_transfer_lock_identity(
+                &operation,
+                job,
+                operation.private_entry_identity(TRANSFER_LOCK_FILE)?,
+                identity_file_identity,
+                &transfer_identity_name,
+            )?;
+            if staged != identity {
+                return Err(WorkerError::Protocol(
+                    "canonical transfer lock identity changed".into(),
+                ));
+            }
             if self.consume_fault(HostStoreWritePoint::AfterTransferIdentityPublish) {
                 return Err(injected_transfer_initialization());
             }
@@ -907,28 +946,78 @@ impl HostStore {
                 return Err(injected_transfer_initialization());
             }
             job_locks.sync_root()?;
-            operation
+            (identity, identity_file_identity, identity_file)
         };
 
-        let identity_file_identity = transfer.private_entry_identity(TRANSFER_IDENTITY_FILE)?;
+        if !job_locks.entry_exists(TRANSFER_DIRECTORY)? {
+            let mut matching_operation = None;
+            for bytes in job_locks.list_names()? {
+                let name = std::str::from_utf8(&bytes).map_err(|_| {
+                    WorkerError::Protocol("job lock namespace contains a non-UTF-8 entry".into())
+                })?;
+                let Some(suffix) = name.strip_prefix(".transfer-init-") else {
+                    continue;
+                };
+                if !is_lower_hex(suffix, 32) {
+                    return Err(WorkerError::Protocol(
+                        "unsafe transfer initialization residue".into(),
+                    ));
+                }
+                let operation = job_locks.open_child_directory(&relative(name)?, false)?;
+                if operation.identity()? == identity.directory.as_private() {
+                    if matching_operation.is_some() {
+                        return Err(WorkerError::Protocol(
+                            "ambiguous transfer initialization residue".into(),
+                        ));
+                    }
+                    matching_operation = Some(operation);
+                } else {
+                    admission.validate()?;
+                    job_locks.remove_owned_child(name)?;
+                }
+            }
+            let mut operation = matching_operation.ok_or_else(|| {
+                WorkerError::Protocol("canonical transfer lock directory is absent".into())
+            })?;
+            let staged = build_transfer_lock_identity(
+                &operation,
+                job,
+                operation.private_entry_identity(TRANSFER_LOCK_FILE)?,
+                identity_file_identity,
+                &transfer_identity_name,
+            )?;
+            if staged != identity {
+                return Err(WorkerError::Protocol(
+                    "canonical transfer lock identity changed".into(),
+                ));
+            }
+            operation.validate_private_regular_binding(
+                TRANSFER_LOCK_FILE,
+                &operation.open_existing_private_lock(TRANSFER_LOCK_FILE)?,
+                identity.lock.as_private(),
+            )?;
+            admission.validate()?;
+            operation.publish_owned_into(&job_locks, TRANSFER_DIRECTORY)?;
+            job_locks.sync_root()?;
+        }
+        let transfer = job_locks.open_child_directory(&relative(TRANSFER_DIRECTORY)?, false)?;
         let current = build_transfer_lock_identity(
             &transfer,
             job,
             transfer.private_entry_identity(TRANSFER_LOCK_FILE)?,
             identity_file_identity,
+            &transfer_identity_name,
         )?;
-        let stored: TransferLockIdentity = read_json_strict_at(&transfer, TRANSFER_IDENTITY_FILE)?;
-        if stored != current {
+        if identity != current {
             return Err(WorkerError::Protocol(
                 "canonical transfer lock identity changed".into(),
             ));
         }
-        let identity_file = transfer.open_private_regular_handle(TRANSFER_IDENTITY_FILE)?;
         let file = transfer.open_existing_private_lock(TRANSFER_LOCK_FILE)?;
         transfer.validate_private_regular_binding(
             TRANSFER_LOCK_FILE,
             &file,
-            stored.lock.as_private(),
+            identity.lock.as_private(),
         )?;
         admission.validate()?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
@@ -940,11 +1029,12 @@ impl HostStore {
             file,
             namespace: transfer,
             file_name: TRANSFER_LOCK_FILE.into(),
-            file_identity: stored.lock.as_private(),
+            file_identity: identity.lock.as_private(),
+            anchor_namespace: jobs,
             identity_file,
-            identity_file_name: TRANSFER_IDENTITY_FILE.into(),
+            identity_file_name: transfer_identity_name,
             identity_file_identity,
-            identity: stored,
+            identity,
         };
         guard.validate()?;
         Ok(guard)
@@ -1085,6 +1175,8 @@ impl HostStore {
         let disposition = JobDisposition::Abandoned {
             job_id: request.material().job_id(),
             client_id: request.material().client_id(),
+            project_id: request.material().project_id().into(),
+            worktree_id: request.material().worktree_id().into(),
             request_fingerprint: request.request_fingerprint().clone(),
             lease_token_sha256: token_hash,
             recorded_at_millis: now,
@@ -1228,11 +1320,15 @@ impl HostStore {
                     Some(JobDisposition::Abandoned {
                         job_id,
                         client_id,
+                        project_id,
+                        worktree_id,
                         request_fingerprint,
                         lease_token_sha256,
                         ..
                     }) if job_id == lease.job_id()
                         && client_id == lease.client_id()
+                        && project_id == lease.project_id()
+                        && worktree_id == lease.worktree_id()
                         && request_fingerprint == *lease.request_fingerprint()
                         && lease_token_sha256 == expected_hash =>
                     {
@@ -1672,6 +1768,7 @@ fn build_transfer_lock_identity(
     job: JobId,
     lock: PrivateEntryIdentity,
     identity_file: PrivateEntryIdentity,
+    identity_file_name: &str,
 ) -> Result<TransferLockIdentity, WorkerError> {
     Ok(TransferLockIdentity {
         version: HOST_LAYOUT_VERSION,
@@ -1681,10 +1778,7 @@ fn build_transfer_lock_identity(
             format!("{job}/{TRANSFER_DIRECTORY}/{TRANSFER_LOCK_FILE}"),
             lock,
         ),
-        identity_file: LayoutEntry::new(
-            format!("{job}/{TRANSFER_DIRECTORY}/{TRANSFER_IDENTITY_FILE}"),
-            identity_file,
-        ),
+        identity_file: LayoutEntry::new(identity_file_name.into(), identity_file),
     })
 }
 
@@ -1731,6 +1825,8 @@ fn same_disposition_identity(left: &JobDisposition, right: &JobDisposition) -> b
             JobDisposition::Abandoned {
                 job_id: left_job,
                 client_id: left_client,
+                project_id: left_project,
+                worktree_id: left_worktree,
                 request_fingerprint: left_fingerprint,
                 lease_token_sha256: left_hash,
                 ..
@@ -1738,6 +1834,8 @@ fn same_disposition_identity(left: &JobDisposition, right: &JobDisposition) -> b
             JobDisposition::Abandoned {
                 job_id: right_job,
                 client_id: right_client,
+                project_id: right_project,
+                worktree_id: right_worktree,
                 request_fingerprint: right_fingerprint,
                 lease_token_sha256: right_hash,
                 ..
@@ -1745,6 +1843,8 @@ fn same_disposition_identity(left: &JobDisposition, right: &JobDisposition) -> b
         ) => {
             left_job == right_job
                 && left_client == right_client
+                && left_project == right_project
+                && left_worktree == right_worktree
                 && left_fingerprint == right_fingerprint
                 && left_hash == right_hash
         }
@@ -1952,8 +2052,9 @@ impl CleanupReceipt {
                     "{:x}",
                     Sha256::digest(lease.lease_token().to_string().as_bytes())
                 );
-                if !matches!(disposition, JobDisposition::Abandoned { job_id, client_id, request_fingerprint, lease_token_sha256, .. }
+                if !matches!(disposition, JobDisposition::Abandoned { job_id, client_id, project_id, worktree_id, request_fingerprint, lease_token_sha256, .. }
                     if job_id == lease.job_id() && client_id == lease.client_id()
+                        && project_id == lease.project_id() && worktree_id == lease.worktree_id()
                         && request_fingerprint == *lease.request_fingerprint()
                         && lease_token_sha256 == expected_hash)
                 {

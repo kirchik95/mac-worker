@@ -413,12 +413,8 @@ impl RootedDir {
         Ok(())
     }
 
-    pub(crate) fn set_as_current_directory(&self) -> io::Result<()> {
-        self.verify_root_name()?;
-        if unsafe { libc::fchdir(self.root.as_raw_fd()) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+    pub(crate) fn raw_directory_fd(&self) -> RawFd {
+        self.root.as_raw_fd()
     }
 
     pub(crate) fn root_metadata(&self) -> io::Result<libc::stat> {

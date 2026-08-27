@@ -3,7 +3,7 @@ use std::{
     fmt, fs,
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        process::CommandExt,
+        process::{CommandExt, ExitStatusExt},
     },
     process::{Command, Stdio},
     time::Duration,
@@ -16,7 +16,7 @@ use crate::{
     config::WorkerEntry,
     error::{ProcessError, ProcessStream, WorkerError},
     host_store::{HostStore, JobDisposition},
-    job::{ClientId, JobId, LeaseAcquireRequest, LeaseToken, RequestFingerprint},
+    job::{ClientId, JobId, LeaseAcquireRequest, LeaseRecord, LeaseToken, RequestFingerprint},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     rooted_fs::RootedDir,
     snapshot::Snapshot,
@@ -173,18 +173,72 @@ pub struct SystemRsyncServerExecutor;
 
 impl RsyncServerExecutor for SystemRsyncServerExecutor {
     fn execute(&self, invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
-        invocation.destination.verify_descriptors_cloexec()?;
-        invocation.destination.set_as_current_directory()?;
         let mut command = Command::new(RSYNC_PROGRAM);
         command
             .args(invocation.server_args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        let _inherited_lock = invocation.transfer_guard.inherit_for_exec()?;
-        let error = command.exec();
-        Err(WorkerError::Io(error))
+        execute_server_child(&mut command, invocation)
     }
+}
+
+fn execute_server_child(
+    command: &mut Command,
+    invocation: RsyncServerInvocation<'_>,
+) -> Result<(), WorkerError> {
+    invocation.destination.verify_descriptors_cloexec()?;
+    let destination_fd = invocation.destination.raw_directory_fd();
+    let transfer_fd = invocation.transfer_guard.raw_lock_fd_for_exec()?;
+    let fd_ceiling = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    if fd_ceiling < 0 || fd_ceiling > i64::from(i32::MAX) {
+        return Err(WorkerError::Io(std::io::Error::last_os_error()));
+    }
+    let fd_ceiling = fd_ceiling as i32;
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(destination_fd) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for descriptor in 3..fd_ceiling {
+                if descriptor != transfer_fd {
+                    let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                    if flags == -1 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::EBADF) {
+                            return Err(error);
+                        }
+                    } else if flags & libc::FD_CLOEXEC == 0
+                        && libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+            }
+            let flags = libc::fcntl(transfer_fd, libc::F_GETFD);
+            if flags == -1
+                || libc::fcntl(transfer_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let status = command.spawn()?.wait()?;
+    if status.success() {
+        return Ok(());
+    }
+    let code = status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .or_else(|| {
+            status
+                .signal()
+                .and_then(|signal| u8::try_from(signal).ok())
+                .and_then(|signal| 128_u8.checked_add(signal))
+        })
+        .ok_or_else(|| WorkerError::Protocol("rsync server child status was invalid".into()))?;
+    Err(WorkerError::CommandExit { code })
 }
 
 pub struct HostTransferService<'a> {
@@ -207,15 +261,15 @@ impl<'a> HostTransferService<'a> {
         self.store.validate_layout()?;
         let admission = self.store.admission_lock(identity.job_id)?;
         admission.validate()?;
-        require_receivable_disposition(self.store, identity)?;
-        require_live_identity(self.store, identity)?;
+        let live = require_live_identity(self.store, identity)?;
+        require_receivable_disposition(self.store, &live)?;
         let transfer = self
             .store
             .transfer_lock_after(&admission, identity.job_id)?;
         admission.validate()?;
         transfer.validate()?;
-        require_receivable_disposition(self.store, identity)?;
-        require_live_identity(self.store, identity)?;
+        let live = require_live_identity(self.store, identity)?;
+        require_receivable_disposition(self.store, &live)?;
         let destination = self.store.open_directory(
             &format!("incoming/{}/{}", identity.job_id, identity.lease_token),
             true,
@@ -242,15 +296,15 @@ impl<'a> HostTransferService<'a> {
         self.store.validate_layout()?;
         let admission = self.store.admission_lock(identity.job_id)?;
         admission.validate()?;
-        require_abandonable_disposition(self.store, &identity)?;
-        require_live_identity(self.store, &identity)?;
+        let live = require_live_identity(self.store, &identity)?;
+        require_abandonable_disposition(self.store, &live)?;
         let transfer = self
             .store
             .transfer_lock_after(&admission, identity.job_id)?;
         admission.validate()?;
         transfer.validate()?;
-        let existing = require_abandonable_disposition(self.store, &identity)?;
-        require_live_identity(self.store, &identity)?;
+        let live = require_live_identity(self.store, &identity)?;
+        let existing = require_abandonable_disposition(self.store, &live)?;
         if !existing {
             self.store
                 .record_abandoned_after(&admission, request, now)?;
@@ -463,7 +517,7 @@ fn validated_server_args(supplied: &[OsString]) -> Result<Vec<OsString>, WorkerE
 fn require_live_identity(
     store: &HostStore,
     identity: &TransferIdentity,
-) -> Result<(), WorkerError> {
+) -> Result<LeaseRecord, WorkerError> {
     let live = crate::lease::LeaseService::new(store)
         .load()?
         .ok_or_else(|| {
@@ -482,61 +536,108 @@ fn require_live_identity(
             "live lease identity was rejected",
         ));
     }
-    Ok(())
+    Ok(live)
 }
 
 fn require_receivable_disposition(
     store: &HostStore,
-    identity: &TransferIdentity,
+    live: &LeaseRecord,
 ) -> Result<(), WorkerError> {
-    match store.disposition(identity.job_id)? {
+    match store.disposition(live.job_id())? {
         None => Ok(()),
-        Some(JobDisposition::Abandoned { .. }) => Err(host_transfer_error(
-            "JOB_ABANDONED",
-            "job ID was permanently abandoned",
-        )),
-        Some(JobDisposition::Accepted { .. }) => Err(host_transfer_error(
-            "JOB_ACCEPTED",
-            "job ID was already accepted",
-        )),
+        Some(disposition @ JobDisposition::Abandoned { .. }) => {
+            if disposition_matches_live_lease(&disposition, live) {
+                Err(host_transfer_error(
+                    "JOB_ABANDONED",
+                    "job ID was permanently abandoned",
+                ))
+            } else {
+                Err(job_id_conflict())
+            }
+        }
+        Some(disposition @ JobDisposition::Accepted { .. }) => {
+            if disposition_matches_live_lease(&disposition, live) {
+                Err(host_transfer_error(
+                    "JOB_ACCEPTED",
+                    "job ID was already accepted",
+                ))
+            } else {
+                Err(job_id_conflict())
+            }
+        }
     }
 }
 
 fn require_abandonable_disposition(
     store: &HostStore,
-    identity: &TransferIdentity,
+    live: &LeaseRecord,
 ) -> Result<bool, WorkerError> {
-    match store.disposition(identity.job_id)? {
+    match store.disposition(live.job_id())? {
         None => Ok(false),
-        Some(JobDisposition::Abandoned {
+        Some(disposition @ JobDisposition::Abandoned { .. }) => {
+            if disposition_matches_live_lease(&disposition, live) {
+                Ok(true)
+            } else {
+                Err(job_id_conflict())
+            }
+        }
+        Some(disposition @ JobDisposition::Accepted { .. }) => {
+            if disposition_matches_live_lease(&disposition, live) {
+                Err(host_transfer_error(
+                    "JOB_ACCEPTED",
+                    "job ID was already accepted",
+                ))
+            } else {
+                Err(job_id_conflict())
+            }
+        }
+    }
+}
+
+fn disposition_matches_live_lease(disposition: &JobDisposition, live: &LeaseRecord) -> bool {
+    match disposition {
+        JobDisposition::Accepted {
             job_id,
             client_id,
+            project_id,
+            worktree_id,
+            request_fingerprint,
+            ..
+        } => {
+            *job_id == live.job_id()
+                && *client_id == live.client_id()
+                && project_id == live.project_id()
+                && worktree_id == live.worktree_id()
+                && request_fingerprint == live.request_fingerprint()
+        }
+        JobDisposition::Abandoned {
+            job_id,
+            client_id,
+            project_id,
+            worktree_id,
             request_fingerprint,
             lease_token_sha256,
             ..
-        }) => {
+        } => {
             let expected_hash = format!(
                 "{:x}",
-                Sha256::digest(identity.lease_token.to_string().as_bytes())
+                Sha256::digest(live.lease_token().to_string().as_bytes())
             );
-            if job_id == identity.job_id
-                && client_id == identity.client_id
-                && request_fingerprint == identity.request_fingerprint
-                && lease_token_sha256 == expected_hash
-            {
-                Ok(true)
-            } else {
-                Err(host_transfer_error(
-                    "JOB_ID_CONFLICT",
-                    "job ID conflicts with durable host state",
-                ))
-            }
+            *job_id == live.job_id()
+                && *client_id == live.client_id()
+                && project_id == live.project_id()
+                && worktree_id == live.worktree_id()
+                && request_fingerprint == live.request_fingerprint()
+                && lease_token_sha256 == &expected_hash
         }
-        Some(JobDisposition::Accepted { .. }) => Err(host_transfer_error(
-            "JOB_ACCEPTED",
-            "job ID was already accepted",
-        )),
     }
+}
+
+fn job_id_conflict() -> WorkerError {
+    host_transfer_error(
+        "JOB_ID_CONFLICT",
+        "job ID conflicts with durable host state",
+    )
 }
 
 fn validate_worker(worker: &WorkerEntry) -> Result<(), WorkerError> {
@@ -711,10 +812,14 @@ fn host_transfer_error(code: &'static str, message: &'static str) -> WorkerError
 #[cfg(test)]
 mod exec_inheritance_tests {
     use std::{
-        io::{BufRead, BufReader, Read},
-        os::fd::RawFd,
-        process::{Child, Stdio},
-        sync::{Mutex, mpsc},
+        ffi::CString,
+        fs::{File, OpenOptions},
+        io::{Read, Write},
+        os::fd::{AsRawFd, RawFd},
+        os::unix::ffi::OsStrExt,
+        path::{Path, PathBuf},
+        process::Stdio,
+        sync::mpsc,
         thread,
         time::Duration,
     };
@@ -729,6 +834,9 @@ mod exec_inheritance_tests {
     };
 
     const CHILD_FD_ENV: &str = "MAC_WORKER_TEST_TRANSFER_LOCK_FD";
+    const SENTINEL_FD_ENV: &str = "MAC_WORKER_TEST_SENTINEL_FD";
+    const READY_FIFO_ENV: &str = "MAC_WORKER_TEST_READY_FIFO";
+    const RELEASE_FIFO_ENV: &str = "MAC_WORKER_TEST_RELEASE_FIFO";
 
     fn request() -> LeaseAcquireRequest {
         LeaseAcquireRequest::new(
@@ -758,65 +866,135 @@ mod exec_inheritance_tests {
         }
     }
 
-    struct ExecChildExecutor {
-        child: Mutex<Option<Child>>,
+    fn stock_server_args() -> Vec<OsString> {
+        [
+            "--server",
+            "--delete-before",
+            "-l",
+            "-p",
+            "-D",
+            "-r",
+            "-t",
+            "--dirs",
+            ".",
+            "incoming",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
     }
 
-    impl RsyncServerExecutor for ExecChildExecutor {
-        fn execute(&self, invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
-            let inherited = invocation.transfer_guard.inherit_for_exec()?;
-            let descriptor = inherited.raw_fd();
-            let mut child = Command::new(std::env::current_exe()?)
-                .arg("--exact")
-                .arg("transfer::exec_inheritance_tests::exec_child_probe")
-                .arg("--nocapture")
-                .env(CHILD_FD_ENV, descriptor.to_string())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()?;
-            drop(inherited);
+    struct ProductionExecProbe {
+        ready_fifo: PathBuf,
+        release_fifo: PathBuf,
+        sentinel_fd: RawFd,
+    }
 
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| WorkerError::Protocol("child stdout was absent".into()))?;
-            let (ready_tx, ready_rx) = mpsc::channel();
-            thread::spawn(move || {
-                let ready = BufReader::new(stdout)
-                    .lines()
-                    .map_while(Result::ok)
-                    .any(|line| line == "TRANSFER_LOCK_READY");
-                let _ = ready_tx.send(ready);
-            });
-            if ready_rx.recv_timeout(Duration::from_secs(5)) != Ok(true) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(WorkerError::Protocol(
-                    "exec child did not retain the transfer descriptor".into(),
-                ));
-            }
-            *self.child.lock().unwrap() = Some(child);
-            Ok(())
+    impl RsyncServerExecutor for ProductionExecProbe {
+        fn execute(&self, invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
+            let transfer_fd = invocation.transfer_guard.raw_lock_fd_for_exec()?;
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .arg("--exact")
+                .arg("transfer::exec_inheritance_tests::production_exec_child_probe")
+                .arg("--nocapture")
+                .env(CHILD_FD_ENV, transfer_fd.to_string())
+                .env(SENTINEL_FD_ENV, self.sentinel_fd.to_string())
+                .env(READY_FIFO_ENV, &self.ready_fifo)
+                .env(RELEASE_FIFO_ENV, &self.release_fifo)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            execute_server_child(&mut command, invocation)
+        }
+    }
+
+    struct FailedExec;
+
+    impl RsyncServerExecutor for FailedExec {
+        fn execute(&self, invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
+            let mut command = Command::new("/definitely/missing/mac-worker-rsync");
+            execute_server_child(&mut command, invocation)
+        }
+    }
+
+    struct Exit23;
+
+    impl RsyncServerExecutor for Exit23 {
+        fn execute(&self, invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "exit 23"]);
+            execute_server_child(&mut command, invocation)
+        }
+    }
+
+    struct SignalTerm;
+
+    impl RsyncServerExecutor for SignalTerm {
+        fn execute(&self, invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "kill -TERM $$"]);
+            execute_server_child(&mut command, invocation)
         }
     }
 
     #[test]
-    fn exec_child_probe() {
-        let Ok(value) = std::env::var(CHILD_FD_ENV) else {
+    fn production_exec_child_probe() {
+        let Ok(ready_fifo) = std::env::var(READY_FIFO_ENV) else {
             return;
         };
-        let descriptor: RawFd = value.parse().unwrap();
-        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-        assert_ne!(flags, -1, "transfer lock descriptor did not survive exec");
-        assert_eq!(flags & libc::FD_CLOEXEC, 0);
-        println!("TRANSFER_LOCK_READY");
-        let mut bytes = Vec::new();
-        std::io::stdin().read_to_end(&mut bytes).unwrap();
+        let release_fifo = std::env::var(RELEASE_FIFO_ENV).unwrap();
+        let transfer_fd: RawFd = std::env::var(CHILD_FD_ENV).unwrap().parse().unwrap();
+        let sentinel_fd: RawFd = std::env::var(SENTINEL_FD_ENV).unwrap().parse().unwrap();
+        let transfer_flags = unsafe { libc::fcntl(transfer_fd, libc::F_GETFD) };
+        assert_ne!(transfer_flags, -1, "transfer fd must survive exec");
+        assert_eq!(transfer_flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(
+            unsafe { libc::fcntl(sentinel_fd, libc::F_GETFD) },
+            -1,
+            "unrelated inheritable fd survived exec"
+        );
+        OpenOptions::new()
+            .write(true)
+            .open(ready_fifo)
+            .unwrap()
+            .write_all(b"R")
+            .unwrap();
+        let mut release = [0_u8; 1];
+        OpenOptions::new()
+            .read(true)
+            .open(release_fifo)
+            .unwrap()
+            .read_exact(&mut release)
+            .unwrap();
+        assert_eq!(release, *b"X");
+    }
+
+    fn create_fifo(path: &Path) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    fn inheritable_sentinel(path: &Path) -> File {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        file
     }
 
     #[test]
-    fn exec_child_holds_transfer_lock_until_killed_and_reaped() {
+    fn production_exec_inherits_only_stdio_and_transfer_lock_and_fences_resolver() {
         let fixture = tempdir().unwrap();
         let root = fixture.path().join("host");
         let store = HostStore::open(&root).unwrap();
@@ -825,27 +1003,46 @@ mod exec_inheritance_tests {
             .acquire(&request, &healthy(), 1)
             .unwrap();
         let identity = TransferIdentity::from_acquire_request(&request).unwrap();
-        let executor = ExecChildExecutor {
-            child: Mutex::new(None),
-        };
-        HostTransferService::new(&store)
-            .receive(
-                &identity,
-                &[
-                    "--server".into(),
-                    "--delete-before".into(),
-                    "-l".into(),
-                    "-p".into(),
-                    "-D".into(),
-                    "-r".into(),
-                    "-t".into(),
-                    "--dirs".into(),
-                    ".".into(),
-                    "incoming".into(),
-                ],
-                &executor,
+        let sentinel = inheritable_sentinel(&fixture.path().join("sentinel"));
+        let ready_fifo = fixture.path().join("ready.fifo");
+        let release_fifo = fixture.path().join("release.fifo");
+        create_fifo(&ready_fifo);
+        create_fifo(&release_fifo);
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let ready_reader = ready_fifo.clone();
+        let acceptor = thread::spawn(move || {
+            let result = (|| -> std::io::Result<u8> {
+                let mut ready = [0_u8; 1];
+                OpenOptions::new()
+                    .read(true)
+                    .open(ready_reader)?
+                    .read_exact(&mut ready)?;
+                Ok(ready[0])
+            })();
+            accepted_tx.send(result).unwrap();
+        });
+        let receiver_store = store.clone();
+        let receiver_identity = identity.clone();
+        let receiver_ready = ready_fifo;
+        let receiver_release = release_fifo.clone();
+        let sentinel_fd = sentinel.as_raw_fd();
+        let receiver = thread::spawn(move || {
+            HostTransferService::new(&receiver_store).receive(
+                &receiver_identity,
+                &stock_server_args(),
+                &ProductionExecProbe {
+                    ready_fifo: receiver_ready,
+                    release_fifo: receiver_release,
+                    sentinel_fd,
+                },
             )
+        });
+        let ready = accepted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
             .unwrap();
+        acceptor.join().unwrap();
+        assert_eq!(ready, b'R');
 
         let resolver_store = HostStore::open(&root).unwrap();
         let resolver_request = request.clone();
@@ -860,10 +1057,13 @@ mod exec_inheritance_tests {
                 .recv_timeout(Duration::from_millis(100))
                 .is_err()
         );
-
-        let mut child = executor.child.lock().unwrap().take().unwrap();
-        child.kill().unwrap();
-        child.wait().unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&release_fifo)
+            .unwrap()
+            .write_all(b"X")
+            .unwrap();
+        receiver.join().unwrap().unwrap();
         assert_eq!(
             resolved_rx
                 .recv_timeout(Duration::from_secs(5))
@@ -872,5 +1072,53 @@ mod exec_inheritance_tests {
             AbandonTransferResult::Abandoned
         );
         resolver.join().unwrap();
+    }
+
+    #[test]
+    fn failed_exec_does_not_change_parent_current_directory() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request();
+        LeaseService::new(&store)
+            .acquire(&request, &healthy(), 1)
+            .unwrap();
+        let identity = TransferIdentity::from_acquire_request(&request).unwrap();
+        let before = std::env::current_dir().unwrap();
+        let error = HostTransferService::new(&store)
+            .receive(&identity, &stock_server_args(), &FailedExec)
+            .unwrap_err();
+        assert_eq!(std::env::current_dir().unwrap(), before);
+        assert!(!error.to_string().contains("/definitely/missing"));
+    }
+
+    #[test]
+    fn production_exec_propagates_child_exit_status() {
+        let fixture = tempdir().unwrap();
+        let store = HostStore::open(&fixture.path().join("host")).unwrap();
+        let request = request();
+        LeaseService::new(&store)
+            .acquire(&request, &healthy(), 1)
+            .unwrap();
+        let identity = TransferIdentity::from_acquire_request(&request).unwrap();
+        let error = HostTransferService::new(&store)
+            .receive(&identity, &stock_server_args(), &Exit23)
+            .unwrap_err();
+        assert!(matches!(error, WorkerError::CommandExit { code: 23 }));
+    }
+
+    #[test]
+    fn production_exec_maps_child_signal_to_shell_status() {
+        let fixture = tempdir().unwrap();
+        let store = HostStore::open(&fixture.path().join("host")).unwrap();
+        let request = request();
+        LeaseService::new(&store)
+            .acquire(&request, &healthy(), 1)
+            .unwrap();
+        let identity = TransferIdentity::from_acquire_request(&request).unwrap();
+        let error = HostTransferService::new(&store)
+            .receive(&identity, &stock_server_args(), &SignalTerm)
+            .unwrap_err();
+        assert!(matches!(error, WorkerError::CommandExit { code: 143 }));
     }
 }

@@ -8,6 +8,7 @@ use std::{
     io::Cursor,
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
+        fs::MetadataExt,
         process::ExitStatusExt,
     },
     path::Path,
@@ -29,8 +30,8 @@ use mac_worker::{
     host_store::{HostStore, HostStoreWritePoint},
     inputs::RelativePath,
     job::{
-        ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseAcquireResponse, LeaseToken,
-        RequestFingerprint, RequestFingerprintMaterial,
+        ClientId, CommandSpec, JobId, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
+        LeaseToken, RequestFingerprint, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
     paths::PathLayout,
@@ -46,7 +47,10 @@ use mac_worker::{
         TransferIdentity, TransferReceipt, transfer_failure_disposition,
     },
 };
+use sha2::Digest;
 use support::GitRepo;
+
+static HOST_FD_STRESS_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(serde::Serialize)]
 struct LiteralRequest<'a> {
@@ -151,6 +155,13 @@ fn acquire_request(seed: u128) -> LeaseAcquireRequest {
     )
 }
 
+fn replace_disposition_value(store: &HostStore, job: JobId, old: &str, new: &str) {
+    let path = store.job_index(job).unwrap();
+    let bytes = fs::read_to_string(&path).unwrap();
+    assert!(bytes.contains(old));
+    fs::write(path, bytes.replacen(old, new, 1)).unwrap();
+}
+
 fn healthy() -> AdmissionFacts {
     AdmissionFacts {
         free_disk_bytes: 100 * 1024 * 1024 * 1024,
@@ -186,6 +197,40 @@ fn stock_server_args() -> Vec<OsString> {
     .into_iter()
     .map(OsString::from)
     .collect()
+}
+
+fn write_self_consistent_internal_transfer_identity(
+    transfer_dir: &Path,
+    external_identity_path: &Path,
+) {
+    let identity_path = transfer_dir.join("identity.json");
+    let mut bytes = fs::read_to_string(external_identity_path).unwrap();
+    fs::write(&identity_path, &bytes).unwrap();
+    let identity: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+    for (entry, metadata) in [
+        ("directory", fs::metadata(transfer_dir).unwrap()),
+        (
+            "lock",
+            fs::metadata(transfer_dir.join("transfer.lock")).unwrap(),
+        ),
+        ("identity_file", fs::metadata(&identity_path).unwrap()),
+    ] {
+        let old_inode = identity[entry]["inode"].as_u64().unwrap();
+        bytes = bytes.replacen(
+            &format!("\"inode\":{old_inode}"),
+            &format!("\"inode\":{}", metadata.ino()),
+            1,
+        );
+    }
+    bytes = bytes.replacen(
+        identity["identity_file"]["path"].as_str().unwrap(),
+        &format!(
+            "{}/transfer/identity.json",
+            identity["job_id"].as_str().unwrap()
+        ),
+        1,
+    );
+    fs::write(identity_path, bytes).unwrap();
 }
 
 fn snapshot(cache: &Path) -> (GitRepo, Snapshot) {
@@ -999,10 +1044,123 @@ fn tombstone_first_refuses_before_opening_or_recreating_the_sink() {
 }
 
 #[test]
+fn exact_accepted_disposition_fences_receiver_and_abandon_as_accepted() {
+    let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let (store, request, identity) = leased_store(&fixture.path().join("host"), 41);
+    store
+        .record_accepted(&request, &JobStatus::accepted(2).unwrap(), 2)
+        .unwrap();
+    let receiver_error = HostTransferService::new(&store)
+        .receive(
+            &identity,
+            &stock_server_args(),
+            &CountingExecutor::default(),
+        )
+        .unwrap_err();
+    let abandon_error = HostTransferService::new(&store)
+        .abandon(&request, 3)
+        .unwrap_err();
+    assert!(receiver_error.to_string().contains("JOB_ACCEPTED"));
+    assert!(abandon_error.to_string().contains("JOB_ACCEPTED"));
+}
+
+#[test]
+fn accepted_disposition_immutable_mismatches_are_job_id_conflicts() {
+    let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
+    // Break caught: an unrelated accepted record is misclassified as an
+    // idempotent acceptance fence instead of a global job-ID conflict.
+    for (field, replacement) in [
+        (
+            "client",
+            ClientId::new(uuid::Uuid::from_u128(999)).to_string(),
+        ),
+        ("fingerprint", "d".repeat(64)),
+        ("project", "e".repeat(64)),
+        ("worktree", "f".repeat(64)),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let (store, request, identity) = leased_store(&fixture.path().join("host"), 42);
+        store
+            .record_accepted(&request, &JobStatus::accepted(2).unwrap(), 2)
+            .unwrap();
+        let old = match field {
+            "client" => request.material().client_id().to_string(),
+            "fingerprint" => request.request_fingerprint().to_string(),
+            "project" => request.material().project_id().into(),
+            "worktree" => request.material().worktree_id().into(),
+            _ => unreachable!(),
+        };
+        replace_disposition_value(&store, identity.job_id(), &old, &replacement);
+
+        let receiver_error = HostTransferService::new(&store)
+            .receive(
+                &identity,
+                &stock_server_args(),
+                &CountingExecutor::default(),
+            )
+            .unwrap_err();
+        let abandon_error = HostTransferService::new(&store)
+            .abandon(&request, 3)
+            .unwrap_err();
+        assert!(
+            receiver_error.to_string().contains("JOB_ID_CONFLICT"),
+            "{field}: {receiver_error}"
+        );
+        assert!(
+            abandon_error.to_string().contains("JOB_ID_CONFLICT"),
+            "{field}: {abandon_error}"
+        );
+    }
+}
+
+#[test]
+fn abandoned_disposition_requires_the_full_exact_request_identity() {
+    let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
+    for field in ["client", "fingerprint", "project", "worktree", "token_hash"] {
+        let fixture = tempfile::tempdir().unwrap();
+        let (store, request, identity) = leased_store(&fixture.path().join("host"), 43);
+        store.record_abandoned(&request, 2).unwrap();
+        let token_hash = format!(
+            "{:x}",
+            sha2::Sha256::digest(request.material().lease_token().to_string().as_bytes())
+        );
+        let (old, replacement) = match field {
+            "client" => (
+                request.material().client_id().to_string(),
+                ClientId::new(uuid::Uuid::from_u128(999)).to_string(),
+            ),
+            "fingerprint" => (request.request_fingerprint().to_string(), "d".repeat(64)),
+            "project" => (request.material().project_id().into(), "e".repeat(64)),
+            "worktree" => (request.material().worktree_id().into(), "f".repeat(64)),
+            "token_hash" => (token_hash, "0".repeat(64)),
+            _ => unreachable!(),
+        };
+        replace_disposition_value(&store, identity.job_id(), &old, &replacement);
+        let receiver_error = HostTransferService::new(&store)
+            .receive(
+                &identity,
+                &stock_server_args(),
+                &CountingExecutor::default(),
+            )
+            .unwrap_err();
+        let abandon_error = HostTransferService::new(&store)
+            .abandon(&request, 3)
+            .unwrap_err();
+        for error in [receiver_error, abandon_error] {
+            let rendered = error.to_string();
+            assert!(rendered.contains("JOB_ID_CONFLICT"), "{field}: {rendered}");
+            assert!(!rendered.contains(&request.material().lease_token().to_string()));
+        }
+    }
+}
+
+#[test]
 fn independent_and_cloned_stores_share_one_64_way_transfer_lock_domain() {
     // Break caught: flock self-coalescing or replacement creates concurrent
     // receiver domains. Each entrant stays blocked until explicitly released.
     const CONTENDERS: usize = 64;
+    let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
     let (store, _request, identity) = leased_store(&root, 50);
@@ -1088,9 +1246,194 @@ fn replacing_an_initialized_transfer_lock_cannot_create_a_second_domain() {
         .receive(&identity, &stock_server_args(), &second)
         .unwrap_err();
     assert_eq!(second.0.load(Ordering::SeqCst), 0);
-    assert!(error.to_string().contains("transfer lock identity"));
+    assert!(
+        error.to_string().contains("transfer lock identity"),
+        "{error}"
+    );
     release.send(()).unwrap();
     active.join().unwrap().unwrap();
+}
+
+#[test]
+fn self_consistent_internal_lock_and_identity_replacement_fails_closed() {
+    // Break caught: replacing both files consistently lets a fresh store lock
+    // a new inode while the active receiver still owns the original flock.
+    let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, _request, identity) = leased_store(&root, 61);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let executor = Arc::new(GateExecutor {
+        entered: entered_tx,
+        calls: AtomicUsize::new(0),
+    });
+    let active_store = store.clone();
+    let active_identity = identity.clone();
+    let active_executor = Arc::clone(&executor);
+    let active = std::thread::spawn(move || {
+        HostTransferService::new(&active_store).receive(
+            &active_identity,
+            &stock_server_args(),
+            active_executor.as_ref(),
+        )
+    });
+    let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let transfer_dir = root
+        .join("locks/jobs")
+        .join(identity.job_id().to_string())
+        .join("transfer");
+    fs::rename(
+        transfer_dir.join("transfer.lock"),
+        transfer_dir.join("detached.lock"),
+    )
+    .unwrap();
+    fs::write(transfer_dir.join("transfer.lock"), b"").unwrap();
+    let mut permissions = fs::metadata(transfer_dir.join("transfer.lock"))
+        .unwrap()
+        .permissions();
+    use std::os::unix::fs::PermissionsExt as _;
+    permissions.set_mode(0o600);
+    fs::set_permissions(transfer_dir.join("transfer.lock"), permissions).unwrap();
+    write_self_consistent_internal_transfer_identity(
+        &transfer_dir,
+        &root
+            .join("locks/jobs")
+            .join(format!("{}.transfer-lock.json", identity.job_id())),
+    );
+
+    let second = CountingExecutor::default();
+    let result = HostTransferService::new(&HostStore::open(&root).unwrap()).receive(
+        &identity,
+        &stock_server_args(),
+        &second,
+    );
+    release.send(()).unwrap();
+    active.join().unwrap().unwrap();
+
+    let error = result.expect_err("coordinated internal replacement must fail closed");
+    assert_eq!(second.0.load(Ordering::SeqCst), 0);
+    assert!(
+        error.to_string().contains("transfer lock identity"),
+        "{error}"
+    );
+}
+
+#[test]
+fn self_consistent_whole_transfer_directory_replacement_fences_resolver() {
+    // Break caught: a resolver locks a replacement directory and publishes an
+    // abandonment while the active receiver still owns the detached lock.
+    let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, request, identity) = leased_store(&root, 62);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let executor = Arc::new(GateExecutor {
+        entered: entered_tx,
+        calls: AtomicUsize::new(0),
+    });
+    let active_store = store.clone();
+    let active_identity = identity.clone();
+    let active_executor = Arc::clone(&executor);
+    let active = std::thread::spawn(move || {
+        HostTransferService::new(&active_store).receive(
+            &active_identity,
+            &stock_server_args(),
+            active_executor.as_ref(),
+        )
+    });
+    let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let job_locks = root.join("locks/jobs").join(identity.job_id().to_string());
+    let transfer_dir = job_locks.join("transfer");
+    let detached = job_locks.join("detached-transfer");
+    fs::rename(&transfer_dir, &detached).unwrap();
+    fs::create_dir(&transfer_dir).unwrap();
+    let mut directory_permissions = fs::metadata(&transfer_dir).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt as _;
+    directory_permissions.set_mode(0o700);
+    fs::set_permissions(&transfer_dir, directory_permissions).unwrap();
+    let lock_name = "transfer.lock";
+    fs::copy(detached.join(lock_name), transfer_dir.join(lock_name)).unwrap();
+    let mut permissions = fs::metadata(transfer_dir.join(lock_name))
+        .unwrap()
+        .permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(transfer_dir.join(lock_name), permissions).unwrap();
+    write_self_consistent_internal_transfer_identity(
+        &transfer_dir,
+        &root
+            .join("locks/jobs")
+            .join(format!("{}.transfer-lock.json", identity.job_id())),
+    );
+
+    let result = HostTransferService::new(&HostStore::open(&root).unwrap()).abandon(&request, 2);
+    release.send(()).unwrap();
+    active.join().unwrap().unwrap();
+
+    let error = result.expect_err("whole transfer replacement must fence resolution");
+    assert!(
+        error.to_string().contains("transfer lock identity"),
+        "{error}"
+    );
+    assert!(!store.job_index(identity.job_id()).unwrap().exists());
+}
+
+#[test]
+fn missing_replaced_and_unsafe_external_transfer_identities_fail_closed() {
+    let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
+    for attack in ["missing", "replaced", "symlink", "permissive"] {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("host");
+        let (store, request, identity) = leased_store(&root, 63);
+        HostTransferService::new(&store)
+            .receive(
+                &identity,
+                &stock_server_args(),
+                &CountingExecutor::default(),
+            )
+            .unwrap();
+        let external = root
+            .join("locks/jobs")
+            .join(format!("{}.transfer-lock.json", identity.job_id()));
+        match attack {
+            "missing" => fs::remove_file(&external).unwrap(),
+            "replaced" => {
+                let bytes = fs::read(&external).unwrap();
+                fs::rename(&external, external.with_extension("detached")).unwrap();
+                fs::write(&external, bytes).unwrap();
+                let mut permissions = fs::metadata(&external).unwrap().permissions();
+                use std::os::unix::fs::PermissionsExt as _;
+                permissions.set_mode(0o600);
+                fs::set_permissions(&external, permissions).unwrap();
+            }
+            "symlink" => {
+                let detached = external.with_extension("detached");
+                fs::rename(&external, &detached).unwrap();
+                std::os::unix::fs::symlink(&detached, &external).unwrap();
+            }
+            "permissive" => {
+                let mut permissions = fs::metadata(&external).unwrap().permissions();
+                use std::os::unix::fs::PermissionsExt as _;
+                permissions.set_mode(0o644);
+                fs::set_permissions(&external, permissions).unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let second = CountingExecutor::default();
+        let error = HostTransferService::new(&HostStore::open(&root).unwrap())
+            .receive(&identity, &stock_server_args(), &second)
+            .unwrap_err();
+        assert_eq!(second.0.load(Ordering::SeqCst), 0, "{attack}");
+        assert!(
+            !error
+                .to_string()
+                .contains(&request.material().lease_token().to_string()),
+            "{attack}: {error}"
+        );
+        assert!(!store.job_index(identity.job_id()).unwrap().exists());
+    }
 }
 
 #[test]
@@ -1288,6 +1631,63 @@ fn every_transfer_lock_initialization_crash_is_recoverable_or_fully_published() 
             .unwrap();
         assert_eq!(retry.0.load(Ordering::SeqCst), 1);
     }
+}
+
+#[test]
+fn tampered_external_marker_never_publishes_its_staged_transfer_directory() {
+    let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
+    // Break caught: recovery mutates the canonical namespace before comparing
+    // every externally anchored identity field against the staged directory.
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let store =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterTransferIdentityPublish)
+            .unwrap();
+    let request = acquire_request(119);
+    LeaseService::new(&store)
+        .acquire(&request, &healthy(), 1)
+        .unwrap();
+    let identity = TransferIdentity::from_acquire_request(&request).unwrap();
+    assert!(
+        HostTransferService::new(&store)
+            .receive(
+                &identity,
+                &stock_server_args(),
+                &CountingExecutor::default(),
+            )
+            .is_err()
+    );
+    drop(store);
+
+    let marker = root
+        .join("locks/jobs")
+        .join(format!("{}.transfer-lock.json", identity.job_id()));
+    let bytes = fs::read_to_string(&marker).unwrap();
+    fs::write(
+        &marker,
+        bytes.replacen(
+            &format!("{}/transfer/transfer.lock", identity.job_id()),
+            &format!("{}/transfer/planted.lock", identity.job_id()),
+            1,
+        ),
+    )
+    .unwrap();
+
+    let error = HostTransferService::new(&HostStore::open(&root).unwrap())
+        .receive(
+            &identity,
+            &stock_server_args(),
+            &CountingExecutor::default(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("transfer lock identity"));
+    assert!(
+        !root
+            .join("locks/jobs")
+            .join(identity.job_id().to_string())
+            .join("transfer")
+            .exists()
+    );
 }
 
 struct NoProcess;
