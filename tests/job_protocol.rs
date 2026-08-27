@@ -621,3 +621,42 @@ fn resolution_outcomes_uncertainty_and_host_errors_are_strict_and_bounded() {
         .is_err()
     );
 }
+
+#[test]
+fn host_control_error_messages_reject_control_characters_but_allow_unicode_and_spaces() {
+    let message = "worker ещё выполняет задачу — retry later";
+    let error = HostControlError::new("JOB_STILL_RUNNING", message).unwrap();
+    let json = serde_json::to_string(&error).unwrap();
+    assert_eq!(
+        serde_json::from_str::<HostControlError>(&json).unwrap(),
+        error
+    );
+    assert_eq!(error.error().message(), message);
+
+    for (name, message) in [
+        ("line feed", "unsafe\nmessage"),
+        ("carriage return", "unsafe\rmessage"),
+        ("tab", "unsafe\tmessage"),
+        ("escape", "unsafe\u{001b}message"),
+        ("delete", "unsafe\u{007f}message"),
+        ("next line", "unsafe\u{0085}message"),
+        ("C1 application program command", "unsafe\u{009f}message"),
+    ] {
+        assert!(
+            HostControlError::new("HOST_REQUEST_FAILED", message).is_err(),
+            "checked construction accepted {name}"
+        );
+
+        let wire = serde_json::json!({
+            "protocol_version": 2,
+            "error": {
+                "code": "HOST_REQUEST_FAILED",
+                "message": message,
+            },
+        });
+        assert!(
+            serde_json::from_value::<HostControlError>(wire).is_err(),
+            "deserialization accepted {name}"
+        );
+    }
+}

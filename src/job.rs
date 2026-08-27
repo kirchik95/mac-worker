@@ -2880,11 +2880,7 @@ impl HostControlErrorDetail {
 
     pub fn validate(&self) -> Result<(), WorkerError> {
         validate_control_code(&self.code, "host control error code")?;
-        validate_non_nul(
-            &self.message,
-            MAX_CONTROL_MESSAGE_BYTES,
-            "host control error message",
-        )
+        validate_control_message(&self.message, "host control error message")
     }
 
     pub fn code(&self) -> &str {
@@ -3227,6 +3223,16 @@ fn validate_control_code(value: &str, label: &str) -> Result<(), WorkerError> {
     Ok(())
 }
 
+fn validate_control_message(value: &str, label: &str) -> Result<(), WorkerError> {
+    validate_non_nul(value, MAX_CONTROL_MESSAGE_BYTES, label)?;
+    if value.chars().any(char::is_control) {
+        return Err(protocol_error(&format!(
+            "{label} contains a control character"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_argument(value: &str) -> Result<(), WorkerError> {
     if value.len() > MAX_ARG_BYTES || value.as_bytes().contains(&0) {
         return Err(protocol_error("argv argument is too long or contains NUL"));
@@ -3253,4 +3259,36 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
 
 fn protocol_error(message: &str) -> WorkerError {
     WorkerError::Protocol(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_control_error_serialization_revalidates_message_content() {
+        for message in [
+            "unsafe\nmessage",
+            "unsafe\rmessage",
+            "unsafe\tmessage",
+            "unsafe\u{001b}message",
+            "unsafe\u{007f}message",
+            "unsafe\u{0085}message",
+            "unsafe\u{009f}message",
+        ] {
+            let invalid_detail = HostControlErrorDetail {
+                code: "HOST_REQUEST_FAILED".into(),
+                message: message.into(),
+            };
+            assert!(
+                serde_json::to_string(&invalid_detail).is_err(),
+                "{message:?}"
+            );
+            let invalid = HostControlError {
+                protocol_version: PROTOCOL_VERSION,
+                error: invalid_detail,
+            };
+            assert!(serde_json::to_string(&invalid).is_err(), "{message:?}");
+        }
+    }
 }
