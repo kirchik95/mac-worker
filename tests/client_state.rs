@@ -160,6 +160,25 @@ fn create_load_and_list_round_trip_canonical_sanitized_job_json() {
 }
 
 #[test]
+fn repeated_listing_and_listing_after_create_reopen_the_directory_stream() {
+    // Catches iterating through a dup of the anchored jobs descriptor: dup
+    // shares the directory offset, so later status calls would see no jobs.
+    let fixture = tempfile::tempdir().unwrap();
+    let store = ClientStateStore::open(&temp_root(&fixture).join("state")).unwrap();
+    let first = fresh_record(&store);
+    store.create_job(first.clone()).unwrap();
+
+    assert_eq!(store.list_jobs().unwrap(), vec![first.clone()]);
+    assert_eq!(store.list_jobs().unwrap(), vec![first.clone()]);
+
+    let second = fresh_record(&store);
+    store.create_job(second.clone()).unwrap();
+    let mut expected = vec![first, second];
+    expected.sort_by_key(|record| record.meta().job_id().to_string());
+    assert_eq!(store.list_jobs().unwrap(), expected);
+}
+
+#[test]
 fn sixty_four_identical_creators_are_idempotent_and_never_clobber() {
     // Catches check-then-create races and treating a retry of the exact same
     // durable identity as a conflict.
@@ -443,6 +462,129 @@ fn injected_update_rename_boundaries_preserve_one_complete_observation() {
 }
 
 #[test]
+fn swapped_staged_payload_is_never_published_as_client_or_job_state() {
+    // Catches dropping the staged payload descriptor and later trusting only
+    // the mutable `payload` pathname for publication.
+    let fixture = tempfile::tempdir().unwrap();
+    let physical = temp_root(&fixture);
+    let identity_state = physical.join("identity-state");
+    let error = ClientStateStore::open_with_write_fault(
+        &identity_state,
+        ClientStateWritePoint::SwapOperationPayloadBeforePublish,
+    )
+    .err()
+    .expect("swapped client identity payload must fail closed");
+    assert!(
+        !error
+            .to_string()
+            .contains("11111111111111111111111111111111")
+    );
+    assert!(!identity_state.join("client-id").exists());
+    assert!(operation_tree_contains(
+        &identity_state.join(".mac-worker-state"),
+        b"11111111111111111111111111111111\n"
+    ));
+
+    let job_state = physical.join("job-state");
+    let store = ClientStateStore::open(&job_state).unwrap();
+    let record = fresh_record(&store);
+    store.inject_write_failure_once(ClientStateWritePoint::SwapOperationPayloadBeforePublish);
+    assert!(store.create_job(record.clone()).is_err());
+    assert!(
+        !job_state
+            .join("jobs")
+            .join(format!("{}.json", record.meta().job_id()))
+            .exists()
+    );
+    assert!(operation_tree_contains(
+        &job_state.join(".mac-worker-state"),
+        b"11111111111111111111111111111111\n"
+    ));
+}
+
+#[test]
+fn substituted_operation_directory_is_preserved_during_cleanup() {
+    // Catches cleanup checking an operation directory and then unlinking a
+    // same-name replacement planted after the check.
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let record = fresh_record(&store);
+    store.inject_write_failure_once(ClientStateWritePoint::SwapOperationDirectoryBeforeCleanup);
+
+    assert!(store.create_job(record.clone()).is_err());
+    assert_eq!(store.load_job(record.meta().job_id()).unwrap(), record);
+    let operation_root = state.join(".mac-worker-state");
+    let sentinel_count = fs::read_dir(operation_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("substitution-sentinel").is_file())
+        .count();
+    assert_eq!(
+        sentinel_count, 1,
+        "replacement operation directory was deleted"
+    );
+}
+
+#[test]
+fn live_job_swap_between_validation_and_replace_is_rolled_back() {
+    // Catches an inode check followed by unconditional renameat, which would
+    // silently overwrite a same-name replacement in the TOCTOU window.
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let original = fresh_record(&store);
+    store.create_job(original.clone()).unwrap();
+    let replacement = make_record(
+        original.meta().job_id(),
+        store.client_id(),
+        original.lease_token(),
+        DIGEST_A,
+        Some(JobStatus::accepted(2_000).unwrap()),
+        false,
+    );
+    store.inject_write_failure_once(ClientStateWritePoint::SwapLiveJobBeforeReplace);
+
+    assert!(store.update_job(replacement.clone()).is_err());
+    let final_path = state
+        .join("jobs")
+        .join(format!("{}.json", original.meta().job_id()));
+    assert_eq!(
+        fs::read(final_path).unwrap(),
+        b"injected-live-replacement\n"
+    );
+    let mut original_bytes = serde_json::to_vec(&original).unwrap();
+    original_bytes.push(b'\n');
+    assert!(fs::read_dir(state.join("jobs")).unwrap().any(|entry| {
+        let path = entry.unwrap().path();
+        path.is_file() && fs::read(path).is_ok_and(|bytes| bytes == original_bytes)
+    }));
+}
+
+#[test]
+fn successful_creation_recovery_and_idempotency_cross_durability_barriers() {
+    // Catches returning success while newly created parent entries, an
+    // observed client identity, or an idempotent job entry remain unsynced.
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("nested/state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let opened = store.durability_sync_counts();
+    assert!(opened.parent_directories >= 2, "{opened:?}");
+    assert!(opened.root >= 4, "{opened:?}");
+
+    let record = fresh_record(&store);
+    let before_create = store.durability_sync_counts().jobs;
+    store.create_job(record.clone()).unwrap();
+    let after_create = store.durability_sync_counts().jobs;
+    assert!(after_create > before_create);
+    store.create_job(record).unwrap();
+    assert!(store.durability_sync_counts().jobs > after_create);
+
+    let reopened = ClientStateStore::open(&state).unwrap();
+    assert!(reopened.durability_sync_counts().root >= 1);
+}
+
+#[test]
 fn permissive_state_directories_and_files_are_rejected_not_repaired() {
     // Catches silently inheriting group/world-readable recovery credentials or
     // chmodding a pre-existing object that the store did not create.
@@ -468,4 +610,69 @@ fn permissive_state_directories_and_files_are_rejected_not_repaired() {
     fs::set_permissions(state.join("client-id"), fs::Permissions::from_mode(0o644)).unwrap();
     assert!(ClientStateStore::open(&state).is_err());
     assert_eq!(mode(state.join("client-id")), 0o644);
+}
+
+#[test]
+fn copied_records_from_another_client_are_rejected_by_load_and_list() {
+    // Catches treating a valid canonical record copied from a different local
+    // client as this MacBook's recovery credential.
+    let fixture = tempfile::tempdir().unwrap();
+    let physical = temp_root(&fixture);
+    let source_state = physical.join("source-state");
+    let source = ClientStateStore::open(&source_state).unwrap();
+    let record = fresh_record(&source);
+    source.create_job(record.clone()).unwrap();
+
+    let target_state = physical.join("target-state");
+    let target = ClientStateStore::open(&target_state).unwrap();
+    let filename = format!("{}.json", record.meta().job_id());
+    fs::copy(
+        source_state.join("jobs").join(&filename),
+        target_state.join("jobs").join(&filename),
+    )
+    .unwrap();
+    fs::set_permissions(
+        target_state.join("jobs").join(&filename),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    assert!(target.load_job(record.meta().job_id()).is_err());
+    assert!(target.list_jobs().is_err());
+    let local_candidate = make_record(
+        record.meta().job_id(),
+        target.client_id(),
+        record.lease_token(),
+        DIGEST_A,
+        None,
+        false,
+    );
+    assert!(
+        target
+            .create_job(local_candidate.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("CLIENT_ID_MISMATCH")
+    );
+    assert!(
+        target
+            .update_job(local_candidate)
+            .unwrap_err()
+            .to_string()
+            .contains("CLIENT_ID_MISMATCH")
+    );
+}
+
+fn operation_tree_contains(root: &Path, expected: &[u8]) -> bool {
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            fs::read_dir(entry.path())
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|child| fs::read(child.path()).is_ok_and(|bytes| bytes == expected))
+        })
 }

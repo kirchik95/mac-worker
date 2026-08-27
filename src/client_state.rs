@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     mem::MaybeUninit,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::ffi::OsStrExt,
     },
     path::{Component, Path},
@@ -38,6 +38,17 @@ const PAYLOAD_NAME: &CStr = c"payload";
 pub enum ClientStateWritePoint {
     BeforePublish = 1,
     AfterPublish = 2,
+    SwapOperationPayloadBeforePublish = 3,
+    SwapOperationDirectoryBeforeCleanup = 4,
+    SwapLiveJobBeforeReplace = 5,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientStateSyncCounts {
+    pub parent_directories: u64,
+    pub root: u64,
+    pub jobs: u64,
 }
 
 #[derive(Clone)]
@@ -50,19 +61,60 @@ struct ClientStateInner {
     jobs: OwnedFd,
     operations: OwnedFd,
     client_id: ClientId,
-    write_fault: AtomicU8,
+    write_fault: Arc<AtomicU8>,
+    sync_counts: Arc<SyncCounters>,
+}
+
+#[derive(Default)]
+struct SyncCounters {
+    parent_directories: std::sync::atomic::AtomicU64,
+    root: std::sync::atomic::AtomicU64,
+    jobs: std::sync::atomic::AtomicU64,
+    operations: std::sync::atomic::AtomicU64,
 }
 
 impl ClientStateStore {
     pub fn open(state_root: &Path) -> Result<Self, WorkerError> {
-        let root = open_or_create_root(state_root)?;
+        Self::open_inner(state_root, None)
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_write_fault(
+        state_root: &Path,
+        point: ClientStateWritePoint,
+    ) -> Result<Self, WorkerError> {
+        Self::open_inner(state_root, Some(point))
+    }
+
+    fn open_inner(
+        state_root: &Path,
+        initial_fault: Option<ClientStateWritePoint>,
+    ) -> Result<Self, WorkerError> {
+        let write_fault = Arc::new(AtomicU8::new(initial_fault.map_or(0, |point| point as u8)));
+        let sync_counts = Arc::new(SyncCounters::default());
+        let root = open_or_create_root(state_root, &sync_counts)?;
         require_owned_directory(root.as_raw_fd())?;
-        let jobs = open_or_create_owned_directory(root.as_raw_fd(), JOBS_NAME)?;
-        let operations = open_or_create_owned_directory(root.as_raw_fd(), OPERATIONS_NAME)?;
-        ensure_lock_file(root.as_raw_fd())?;
+        let jobs = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            JOBS_NAME,
+            &sync_counts,
+            SyncKind::Root,
+        )?;
+        let operations = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            OPERATIONS_NAME,
+            &sync_counts,
+            SyncKind::Root,
+        )?;
+        ensure_lock_file(root.as_raw_fd(), &sync_counts)?;
         validate_root_entries(root.as_raw_fd())?;
         validate_operation_entries(operations.as_raw_fd())?;
-        let client_id = load_or_create_client_id(root.as_raw_fd(), operations.as_raw_fd())?;
+        let client_id = load_or_create_client_id(
+            root.as_raw_fd(),
+            operations.as_raw_fd(),
+            &write_fault,
+            &sync_counts,
+        )?;
 
         Ok(Self {
             inner: Arc::new(ClientStateInner {
@@ -70,7 +122,8 @@ impl ClientStateStore {
                 jobs,
                 operations,
                 client_id,
-                write_fault: AtomicU8::new(0),
+                write_fault,
+                sync_counts,
             }),
         })
     }
@@ -82,39 +135,58 @@ impl ClientStateStore {
     pub fn create_job(&self, record: LocalJobRecord) -> Result<(), WorkerError> {
         record.validate()?;
         self.require_local_client(&record)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd())?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let name = job_file_name(record.meta().job_id())?;
 
         if let Some(existing) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? {
+            self.require_local_client(&existing)?;
+            sync_counted(
+                self.inner.jobs.as_raw_fd(),
+                &self.inner.sync_counts,
+                SyncKind::Jobs,
+            )?;
             return require_same_immutable(&existing, &record);
         }
 
         let bytes = canonical_record_bytes(&record)?;
-        let operation = OperationFile::stage(self.inner.operations.as_raw_fd(), &bytes)?;
+        let operation = OperationFile::stage(
+            self.inner.operations.as_raw_fd(),
+            &bytes,
+            Arc::clone(&self.inner.sync_counts),
+        )?;
         if self.take_fault(ClientStateWritePoint::BeforePublish) {
             return Err(injected_failure(ClientStateWritePoint::BeforePublish));
         }
 
-        match link_no_replace(
-            operation.directory.as_raw_fd(),
-            PAYLOAD_NAME,
+        match operation.publish_no_replace(
             self.inner.jobs.as_raw_fd(),
             &name,
+            &self.inner.write_fault,
         ) {
             Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
-                operation.cleanup()?;
+            Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
+                operation.cleanup(&self.inner.write_fault, &[])?;
                 let existing = read_job(self.inner.jobs.as_raw_fd(), &name)?;
+                self.require_local_client(&existing)?;
+                sync_counted(
+                    self.inner.jobs.as_raw_fd(),
+                    &self.inner.sync_counts,
+                    SyncKind::Jobs,
+                )?;
                 return require_same_immutable(&existing, &record);
             }
-            Err(error) => return Err(WorkerError::Io(error)),
+            Err(error) => return Err(error),
         }
 
         if self.take_fault(ClientStateWritePoint::AfterPublish) {
             return Err(injected_failure(ClientStateWritePoint::AfterPublish));
         }
-        sync_directory(self.inner.jobs.as_raw_fd())?;
-        operation.cleanup()?;
+        sync_counted(
+            self.inner.jobs.as_raw_fd(),
+            &self.inner.sync_counts,
+            SyncKind::Jobs,
+        )?;
+        operation.cleanup(&self.inner.write_fault, &[])?;
         Ok(())
     }
 
@@ -124,40 +196,49 @@ impl ClientStateStore {
         if record.meta().job_id() != job_id {
             return Err(invalid_state("job filename and record identity differ"));
         }
+        self.require_local_client(&record)?;
         Ok(record)
     }
 
     pub fn update_job(&self, replacement: LocalJobRecord) -> Result<(), WorkerError> {
         replacement.validate()?;
         self.require_local_client(&replacement)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd())?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let name = job_file_name(replacement.meta().job_id())?;
         let (existing, identity) = read_job_with_identity(self.inner.jobs.as_raw_fd(), &name)?;
+        self.require_local_client(&existing)?;
         require_same_immutable(&existing, &replacement)?;
         require_forward_observation(&existing, &replacement)?;
 
         let bytes = canonical_record_bytes(&replacement)?;
-        let operation = OperationFile::stage(self.inner.operations.as_raw_fd(), &bytes)?;
+        let operation = OperationFile::stage(
+            self.inner.operations.as_raw_fd(),
+            &bytes,
+            Arc::clone(&self.inner.sync_counts),
+        )?;
         if self.take_fault(ClientStateWritePoint::BeforePublish) {
             return Err(injected_failure(ClientStateWritePoint::BeforePublish));
         }
-        require_same_path_identity(self.inner.jobs.as_raw_fd(), &name, identity)?;
-        rename_replace(
-            operation.directory.as_raw_fd(),
-            PAYLOAD_NAME,
+        operation.replace_if_identity(
             self.inner.jobs.as_raw_fd(),
             &name,
+            identity,
+            &self.inner.write_fault,
         )?;
         if self.take_fault(ClientStateWritePoint::AfterPublish) {
             return Err(injected_failure(ClientStateWritePoint::AfterPublish));
         }
-        sync_directory(self.inner.jobs.as_raw_fd())?;
-        operation.cleanup()?;
+        sync_counted(
+            self.inner.jobs.as_raw_fd(),
+            &self.inner.sync_counts,
+            SyncKind::Jobs,
+        )?;
+        operation.cleanup(&self.inner.write_fault, &[identity])?;
         Ok(())
     }
 
     pub fn list_jobs(&self) -> Result<Vec<LocalJobRecord>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd())?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let mut entries = directory_entries(self.inner.jobs.as_raw_fd())?;
         entries.sort();
         entries
@@ -174,6 +255,7 @@ impl ClientStateStore {
                 if record.meta().job_id() != job_id {
                     return Err(invalid_state("job filename and record identity differ"));
                 }
+                self.require_local_client(&record)?;
                 Ok(record)
             })
             .collect()
@@ -182,6 +264,19 @@ impl ClientStateStore {
     #[doc(hidden)]
     pub fn inject_write_failure_once(&self, point: ClientStateWritePoint) {
         self.inner.write_fault.store(point as u8, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn durability_sync_counts(&self) -> ClientStateSyncCounts {
+        ClientStateSyncCounts {
+            parent_directories: self
+                .inner
+                .sync_counts
+                .parent_directories
+                .load(Ordering::SeqCst),
+            root: self.inner.sync_counts.root.load(Ordering::SeqCst),
+            jobs: self.inner.sync_counts.jobs.load(Ordering::SeqCst),
+        }
     }
 
     fn require_local_client(&self, record: &LocalJobRecord) -> Result<(), WorkerError> {
@@ -270,30 +365,36 @@ fn observation_can_advance(previous: JobState, next: JobState) -> bool {
     }
 }
 
-fn load_or_create_client_id(root: RawFd, operations: RawFd) -> Result<ClientId, WorkerError> {
+fn load_or_create_client_id(
+    root: RawFd,
+    operations: RawFd,
+    fault: &AtomicU8,
+    sync_counts: &Arc<SyncCounters>,
+) -> Result<ClientId, WorkerError> {
     match read_regular_optional(root, CLIENT_ID_NAME)? {
-        Some((bytes, _)) => parse_client_id(&bytes),
+        Some((bytes, _)) => {
+            let client_id = parse_client_id(&bytes)?;
+            sync_counted(root, sync_counts, SyncKind::Root)?;
+            Ok(client_id)
+        }
         None => {
             let candidate = ClientId::generate();
             let bytes = format!("{candidate}\n").into_bytes();
-            let operation = OperationFile::stage(operations, &bytes)?;
-            match link_no_replace(
-                operation.directory.as_raw_fd(),
-                PAYLOAD_NAME,
-                root,
-                CLIENT_ID_NAME,
-            ) {
+            let operation = OperationFile::stage(operations, &bytes, Arc::clone(sync_counts))?;
+            match operation.publish_no_replace(root, CLIENT_ID_NAME, fault) {
                 Ok(()) => {
-                    sync_directory(root)?;
-                    operation.cleanup()?;
+                    sync_counted(root, sync_counts, SyncKind::Root)?;
+                    operation.cleanup(fault, &[])?;
                     Ok(candidate)
                 }
-                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
-                    operation.cleanup()?;
+                Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
+                    operation.cleanup(fault, &[])?;
                     let (winner, _) = read_regular(root, CLIENT_ID_NAME)?;
-                    parse_client_id(&winner)
+                    let winner = parse_client_id(&winner)?;
+                    sync_counted(root, sync_counts, SyncKind::Root)?;
+                    Ok(winner)
                 }
-                Err(error) => Err(WorkerError::Io(error)),
+                Err(error) => Err(error),
             }
         }
     }
@@ -356,13 +457,23 @@ struct OperationFile {
     operations: RawFd,
     name: CString,
     directory: OwnedFd,
+    directory_identity: FileIdentity,
+    payload: OwnedFd,
+    payload_identity: FileIdentity,
+    expected_bytes: Vec<u8>,
+    sync_counts: Arc<SyncCounters>,
 }
 
 impl OperationFile {
-    fn stage(operations: RawFd, bytes: &[u8]) -> Result<Self, WorkerError> {
+    fn stage(
+        operations: RawFd,
+        bytes: &[u8],
+        sync_counts: Arc<SyncCounters>,
+    ) -> Result<Self, WorkerError> {
         let name = CString::new(Uuid::new_v4().simple().to_string())
             .map_err(|_| invalid_state("operation identity is invalid"))?;
         mkdir_at(operations, &name, 0o700)?;
+        sync_counted(operations, &sync_counts, SyncKind::Operations)?;
         let directory = match open_directory_at(operations, &name) {
             Ok(directory) => directory,
             Err(error) => {
@@ -371,36 +482,216 @@ impl OperationFile {
             }
         };
         require_owned_directory(directory.as_raw_fd())?;
+        let directory_identity = FileIdentity::from_stat(stat_fd(directory.as_raw_fd())?);
         let descriptor = create_regular_at(directory.as_raw_fd(), PAYLOAD_NAME)?;
         let mut file = File::from(descriptor);
         file.write_all(bytes)?;
         file.sync_all()?;
-        drop(file);
-        sync_directory(directory.as_raw_fd())?;
+        let payload = OwnedFd::from(file);
+        let payload_identity = FileIdentity::from_stat(require_owned_regular(
+            payload.as_raw_fd(),
+            MAX_STATE_FILE_BYTES,
+        )?);
+        sync_counted(directory.as_raw_fd(), &sync_counts, SyncKind::Operations)?;
         Ok(Self {
             operations,
             name,
             directory,
+            directory_identity,
+            payload,
+            payload_identity,
+            expected_bytes: bytes.to_vec(),
+            sync_counts,
         })
     }
 
-    fn cleanup(self) -> Result<(), WorkerError> {
-        match unlink_at(self.directory.as_raw_fd(), PAYLOAD_NAME, 0) {
-            Ok(()) => sync_directory(self.directory.as_raw_fd())?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(WorkerError::Io(error)),
+    fn publish_no_replace(
+        &self,
+        destination_parent: RawFd,
+        destination: &CStr,
+        fault: &AtomicU8,
+    ) -> Result<(), WorkerError> {
+        let retained_identity = FileIdentity::from_stat(stat_fd(self.payload.as_raw_fd())?);
+        if retained_identity != self.payload_identity {
+            return Err(invalid_state("retained staged payload identity changed"));
         }
-        unlink_at(self.operations, &self.name, libc::AT_REMOVEDIR)?;
-        sync_directory(self.operations)?;
+        if take_fault(
+            fault,
+            ClientStateWritePoint::SwapOperationPayloadBeforePublish,
+        ) {
+            self.inject_payload_swap()?;
+        }
+        link_no_replace(
+            self.directory.as_raw_fd(),
+            PAYLOAD_NAME,
+            destination_parent,
+            destination,
+        )?;
+        let published = open_regular_at(destination_parent, destination)?;
+        let (published_bytes, published_identity) = read_open_regular(published)?;
+        if published_identity != self.payload_identity || published_bytes != self.expected_bytes {
+            remove_entry_if_identity(destination_parent, destination, published_identity)?;
+            return Err(invalid_state(
+                "staged payload identity or bytes changed before publication",
+            ));
+        }
         Ok(())
+    }
+
+    fn replace_if_identity(
+        &self,
+        destination_parent: RawFd,
+        destination: &CStr,
+        expected: FileIdentity,
+        fault: &AtomicU8,
+    ) -> Result<(), WorkerError> {
+        if take_fault(fault, ClientStateWritePoint::SwapLiveJobBeforeReplace) {
+            inject_live_job_swap(destination_parent, destination)?;
+        }
+        exchange_entries(
+            self.directory.as_raw_fd(),
+            PAYLOAD_NAME,
+            destination_parent,
+            destination,
+        )?;
+
+        let displaced = open_regular_at(self.directory.as_raw_fd(), PAYLOAD_NAME)?;
+        let (_, displaced_identity) = read_open_regular(displaced)?;
+        let published = open_regular_at(destination_parent, destination)?;
+        let (published_bytes, published_identity) = read_open_regular(published)?;
+        if displaced_identity == expected
+            && published_identity == self.payload_identity
+            && published_bytes == self.expected_bytes
+        {
+            return Ok(());
+        }
+
+        exchange_entries(
+            self.directory.as_raw_fd(),
+            PAYLOAD_NAME,
+            destination_parent,
+            destination,
+        )?;
+        let restored = open_regular_at(destination_parent, destination)?;
+        let restored_identity = FileIdentity::from_stat(require_owned_regular(
+            restored.as_raw_fd(),
+            MAX_STATE_FILE_BYTES,
+        )?);
+        if restored_identity != displaced_identity {
+            return Err(invalid_state(
+                "job replacement rollback did not restore the displaced entry",
+            ));
+        }
+        self.cleanup_entries_in_place(&[])?;
+        Err(invalid_state(
+            "job state changed during conditional atomic replacement",
+        ))
+    }
+
+    fn cleanup(self, fault: &AtomicU8, extra_owned: &[FileIdentity]) -> Result<(), WorkerError> {
+        if take_fault(
+            fault,
+            ClientStateWritePoint::SwapOperationDirectoryBeforeCleanup,
+        ) {
+            self.inject_directory_swap()?;
+        }
+
+        let acquired_name = random_component();
+        rename_no_replace(self.operations, &self.name, self.operations, &acquired_name)?;
+        let acquired = open_directory_at(self.operations, &acquired_name)?;
+        let acquired_identity = FileIdentity::from_stat(stat_fd(acquired.as_raw_fd())?);
+        if acquired_identity != self.directory_identity {
+            restore_quarantine(self.operations, &acquired_name, self.operations, &self.name)?;
+            return Err(invalid_state(
+                "operation directory changed before identity-bound cleanup",
+            ));
+        }
+
+        self.cleanup_owned_payload_links(acquired.as_raw_fd(), extra_owned)?;
+        if !directory_entries(acquired.as_raw_fd())?.is_empty() {
+            return Err(invalid_state(
+                "operation directory contains substituted entries",
+            ));
+        }
+        unlink_at(self.operations, &acquired_name, libc::AT_REMOVEDIR)?;
+        sync_counted(self.operations, &self.sync_counts, SyncKind::Operations)?;
+        Ok(())
+    }
+
+    fn cleanup_entries_in_place(&self, extra_owned: &[FileIdentity]) -> Result<(), WorkerError> {
+        self.cleanup_owned_payload_links(self.directory.as_raw_fd(), extra_owned)
+    }
+
+    fn cleanup_owned_payload_links(
+        &self,
+        directory: RawFd,
+        extra_owned: &[FileIdentity],
+    ) -> Result<(), WorkerError> {
+        let mut removed = false;
+        for entry in directory_entries(directory)? {
+            let descriptor = match open_regular_at(directory, &entry) {
+                Ok(descriptor) => descriptor,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(WorkerError::Io(error)),
+            };
+            let identity = FileIdentity::from_stat(require_owned_regular(
+                descriptor.as_raw_fd(),
+                MAX_STATE_FILE_BYTES,
+            )?);
+            if identity == self.payload_identity || extra_owned.contains(&identity) {
+                unlink_at(directory, &entry, 0)?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_counted(directory, &self.sync_counts, SyncKind::Operations)?;
+        }
+        Ok(())
+    }
+
+    fn inject_payload_swap(&self) -> Result<(), WorkerError> {
+        let original_name = c"payload-original";
+        rename_no_replace(
+            self.directory.as_raw_fd(),
+            PAYLOAD_NAME,
+            self.directory.as_raw_fd(),
+            original_name,
+        )?;
+        let replacement = create_regular_at(self.directory.as_raw_fd(), PAYLOAD_NAME)?;
+        let mut replacement = File::from(replacement);
+        replacement.write_all(b"11111111111111111111111111111111\n")?;
+        replacement.sync_all()?;
+        sync_counted(
+            self.directory.as_raw_fd(),
+            &self.sync_counts,
+            SyncKind::Operations,
+        )
+    }
+
+    fn inject_directory_swap(&self) -> Result<(), WorkerError> {
+        let original_name = random_component();
+        rename_no_replace(self.operations, &self.name, self.operations, &original_name)?;
+        mkdir_at(self.operations, &self.name, 0o700)?;
+        let replacement = open_directory_at(self.operations, &self.name)?;
+        let sentinel = create_regular_at(replacement.as_raw_fd(), c"substitution-sentinel")?;
+        File::from(sentinel).sync_all()?;
+        sync_counted(
+            replacement.as_raw_fd(),
+            &self.sync_counts,
+            SyncKind::Operations,
+        )?;
+        sync_counted(self.operations, &self.sync_counts, SyncKind::Operations)
     }
 }
 
 struct StateLock(OwnedFd);
 
 impl StateLock {
-    fn acquire(root: RawFd) -> Result<Self, WorkerError> {
-        let descriptor = open_lock_file(root)?;
+    fn acquire(root: RawFd, sync_counts: &SyncCounters) -> Result<Self, WorkerError> {
+        let (descriptor, created) = open_lock_file_with_creation(root)?;
+        if created {
+            sync_counted(root, sync_counts, SyncKind::Root)?;
+        }
         cvt(unsafe { libc::flock(descriptor.as_raw_fd(), libc::LOCK_EX) })?;
         Ok(Self(descriptor))
     }
@@ -412,13 +703,33 @@ impl Drop for StateLock {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     device: libc::dev_t,
     inode: libc::ino_t,
 }
 
-fn open_or_create_root(path: &Path) -> Result<OwnedFd, WorkerError> {
+impl FileIdentity {
+    fn from_stat(stat: libc::stat) -> Self {
+        Self {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SyncKind {
+    ParentDirectory,
+    Root,
+    Jobs,
+    Operations,
+}
+
+fn open_or_create_root(
+    path: &Path,
+    sync_counts: &Arc<SyncCounters>,
+) -> Result<OwnedFd, WorkerError> {
     if path.as_os_str().is_empty() {
         return Err(invalid_state("state root path is empty"));
     }
@@ -441,12 +752,17 @@ fn open_or_create_root(path: &Path) -> Result<OwnedFd, WorkerError> {
         let next = match open_directory_at(current.as_raw_fd(), &name) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut created = false;
                 match mkdir_at(current.as_raw_fd(), &name, 0o700) {
-                    Ok(()) => {}
+                    Ok(()) => created = true,
                     Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
                     Err(error) => return Err(WorkerError::Io(error)),
                 }
-                open_directory_at(current.as_raw_fd(), &name)?
+                let directory = open_directory_at(current.as_raw_fd(), &name)?;
+                if created {
+                    sync_counted(current.as_raw_fd(), sync_counts, SyncKind::ParentDirectory)?;
+                }
+                directory
             }
             Err(error) => return Err(WorkerError::Io(error)),
         };
@@ -458,16 +774,26 @@ fn open_or_create_root(path: &Path) -> Result<OwnedFd, WorkerError> {
     Ok(current)
 }
 
-fn open_or_create_owned_directory(parent: RawFd, name: &CStr) -> Result<OwnedFd, WorkerError> {
+fn open_or_create_owned_directory(
+    parent: RawFd,
+    name: &CStr,
+    sync_counts: &Arc<SyncCounters>,
+    sync_kind: SyncKind,
+) -> Result<OwnedFd, WorkerError> {
     let directory = match open_directory_at(parent, name) {
         Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut created = false;
             match mkdir_at(parent, name, 0o700) {
-                Ok(()) => {}
+                Ok(()) => created = true,
                 Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
                 Err(error) => return Err(WorkerError::Io(error)),
             }
-            open_directory_at(parent, name)?
+            let directory = open_directory_at(parent, name)?;
+            if created {
+                sync_counted(parent, sync_counts, sync_kind)?;
+            }
+            directory
         }
         Err(error) => return Err(WorkerError::Io(error)),
     };
@@ -475,12 +801,16 @@ fn open_or_create_owned_directory(parent: RawFd, name: &CStr) -> Result<OwnedFd,
     Ok(directory)
 }
 
-fn ensure_lock_file(root: RawFd) -> Result<(), WorkerError> {
-    drop(open_lock_file(root)?);
+fn ensure_lock_file(root: RawFd, sync_counts: &Arc<SyncCounters>) -> Result<(), WorkerError> {
+    let (descriptor, created) = open_lock_file_with_creation(root)?;
+    drop(descriptor);
+    if created {
+        sync_counted(root, sync_counts, SyncKind::Root)?;
+    }
     Ok(())
 }
 
-fn open_lock_file(root: RawFd) -> Result<OwnedFd, WorkerError> {
+fn open_lock_file_with_creation(root: RawFd) -> Result<(OwnedFd, bool), WorkerError> {
     let open_existing = || {
         cvt_fd(unsafe {
             libc::openat(
@@ -490,8 +820,8 @@ fn open_lock_file(root: RawFd) -> Result<OwnedFd, WorkerError> {
             )
         })
     };
-    let descriptor = match open_existing() {
-        Ok(descriptor) => descriptor,
+    let (descriptor, created) = match open_existing() {
+        Ok(descriptor) => (descriptor, false),
         Err(error) if error.kind() == io::ErrorKind::NotFound => match cvt_fd(unsafe {
             libc::openat(
                 root,
@@ -505,14 +835,14 @@ fn open_lock_file(root: RawFd) -> Result<OwnedFd, WorkerError> {
                 0o600,
             )
         }) {
-            Ok(descriptor) => descriptor,
-            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => open_existing()?,
+            Ok(descriptor) => (descriptor, true),
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => (open_existing()?, false),
             Err(error) => return Err(WorkerError::Io(error)),
         },
         Err(error) => return Err(WorkerError::Io(error)),
     };
     require_owned_regular(descriptor.as_raw_fd(), 0)?;
-    Ok(descriptor)
+    Ok((descriptor, created))
 }
 
 fn validate_root_entries(root: RawFd) -> Result<(), WorkerError> {
@@ -637,28 +967,15 @@ fn read_open_regular(descriptor: OwnedFd) -> Result<(Vec<u8>, FileIdentity), Wor
     Ok((bytes, identity))
 }
 
-fn require_same_path_identity(
-    directory: RawFd,
-    name: &CStr,
-    expected: FileIdentity,
-) -> Result<(), WorkerError> {
-    let stat = stat_at(directory, name)?;
-    if file_type(stat.st_mode) != libc::S_IFREG
-        || stat.st_dev != expected.device
-        || stat.st_ino != expected.inode
-    {
-        return Err(invalid_state("job state changed before atomic replacement"));
-    }
-    Ok(())
-}
-
 fn directory_entries(directory: RawFd) -> Result<Vec<CString>, WorkerError> {
-    let duplicate = cvt_fd(unsafe { libc::fcntl(directory, libc::F_DUPFD_CLOEXEC, 0) })?;
-    let stream = unsafe { libc::fdopendir(duplicate.as_raw_fd()) };
+    let independent = open_directory_at(directory, c".")?;
+    let independent = independent.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(independent) };
     if stream.is_null() {
-        return Err(WorkerError::Io(io::Error::last_os_error()));
+        let error = io::Error::last_os_error();
+        let _ = unsafe { libc::close(independent) };
+        return Err(WorkerError::Io(error));
     }
-    std::mem::forget(duplicate);
     let mut entries = Vec::new();
     loop {
         clear_errno();
@@ -733,21 +1050,150 @@ fn link_no_replace(
     })
 }
 
-fn rename_replace(
+#[cfg(target_vendor = "apple")]
+fn rename_no_replace(
+    source_parent: RawFd,
+    source: &CStr,
+    destination_parent: RawFd,
+    destination: &CStr,
+) -> io::Result<()> {
+    cvt(unsafe {
+        libc::renameatx_np(
+            source_parent,
+            source.as_ptr(),
+            destination_parent,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_no_replace(
+    source_parent: RawFd,
+    source: &CStr,
+    destination_parent: RawFd,
+    destination: &CStr,
+) -> io::Result<()> {
+    cvt(unsafe {
+        libc::renameat2(
+            source_parent,
+            source.as_ptr(),
+            destination_parent,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    })
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn rename_no_replace(
+    _source_parent: RawFd,
+    _source: &CStr,
+    _destination_parent: RawFd,
+    _destination: &CStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable",
+    ))
+}
+
+#[cfg(target_vendor = "apple")]
+fn exchange_entries(
+    left_parent: RawFd,
+    left: &CStr,
+    right_parent: RawFd,
+    right: &CStr,
+) -> Result<(), WorkerError> {
+    cvt(unsafe {
+        libc::renameatx_np(
+            left_parent,
+            left.as_ptr(),
+            right_parent,
+            right.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    })
+    .map_err(WorkerError::Io)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn exchange_entries(
+    left_parent: RawFd,
+    left: &CStr,
+    right_parent: RawFd,
+    right: &CStr,
+) -> Result<(), WorkerError> {
+    cvt(unsafe {
+        libc::renameat2(
+            left_parent,
+            left.as_ptr(),
+            right_parent,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    })
+    .map_err(WorkerError::Io)
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn exchange_entries(
+    _left_parent: RawFd,
+    _left: &CStr,
+    _right_parent: RawFd,
+    _right: &CStr,
+) -> Result<(), WorkerError> {
+    Err(WorkerError::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic entry exchange is unavailable",
+    )))
+}
+
+fn remove_entry_if_identity(
+    parent: RawFd,
+    name: &CStr,
+    expected: FileIdentity,
+) -> Result<(), WorkerError> {
+    let quarantine = random_component();
+    rename_no_replace(parent, name, parent, &quarantine)?;
+    let acquired = open_regular_at(parent, &quarantine)?;
+    let identity = FileIdentity::from_stat(require_owned_regular(
+        acquired.as_raw_fd(),
+        MAX_STATE_FILE_BYTES,
+    )?);
+    if identity != expected {
+        restore_quarantine(parent, &quarantine, parent, name)?;
+        return Err(invalid_state(
+            "published entry changed before identity-bound rollback",
+        ));
+    }
+    unlink_at(parent, &quarantine, 0)?;
+    sync_directory(parent)
+}
+
+fn restore_quarantine(
     source_parent: RawFd,
     source: &CStr,
     destination_parent: RawFd,
     destination: &CStr,
 ) -> Result<(), WorkerError> {
-    cvt(unsafe {
-        libc::renameat(
-            source_parent,
-            source.as_ptr(),
-            destination_parent,
-            destination.as_ptr(),
-        )
-    })
-    .map_err(WorkerError::Io)
+    rename_no_replace(source_parent, source, destination_parent, destination)
+        .map_err(WorkerError::Io)
+}
+
+fn inject_live_job_swap(parent: RawFd, name: &CStr) -> Result<(), WorkerError> {
+    let original = random_component();
+    rename_no_replace(parent, name, parent, &original)?;
+    let replacement = create_regular_at(parent, name)?;
+    let mut replacement = File::from(replacement);
+    replacement.write_all(b"injected-live-replacement\n")?;
+    replacement.sync_all()?;
+    sync_directory(parent)
+}
+
+fn random_component() -> CString {
+    CString::new(Uuid::new_v4().simple().to_string()).expect("simple UUID contains no NUL")
 }
 
 fn stat_fd(descriptor: RawFd) -> Result<libc::stat, WorkerError> {
@@ -756,22 +1202,30 @@ fn stat_fd(descriptor: RawFd) -> Result<libc::stat, WorkerError> {
     Ok(unsafe { stat.assume_init() })
 }
 
-fn stat_at(parent: RawFd, name: &CStr) -> Result<libc::stat, WorkerError> {
-    let mut stat = MaybeUninit::<libc::stat>::zeroed();
-    cvt(unsafe {
-        libc::fstatat(
-            parent,
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    })
-    .map_err(WorkerError::Io)?;
-    Ok(unsafe { stat.assume_init() })
-}
-
 fn sync_directory(descriptor: RawFd) -> Result<(), WorkerError> {
     cvt(unsafe { libc::fsync(descriptor) }).map_err(WorkerError::Io)
+}
+
+fn sync_counted(
+    descriptor: RawFd,
+    counts: &SyncCounters,
+    kind: SyncKind,
+) -> Result<(), WorkerError> {
+    sync_directory(descriptor)?;
+    let counter = match kind {
+        SyncKind::ParentDirectory => &counts.parent_directories,
+        SyncKind::Root => &counts.root,
+        SyncKind::Jobs => &counts.jobs,
+        SyncKind::Operations => &counts.operations,
+    };
+    counter.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+fn take_fault(fault: &AtomicU8, point: ClientStateWritePoint) -> bool {
+    fault
+        .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
 }
 
 fn file_type(mode: libc::mode_t) -> libc::mode_t {
@@ -810,6 +1264,13 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
     let label = match point {
         ClientStateWritePoint::BeforePublish => "before publication",
         ClientStateWritePoint::AfterPublish => "after publication",
+        ClientStateWritePoint::SwapOperationPayloadBeforePublish => {
+            "after staged payload substitution"
+        }
+        ClientStateWritePoint::SwapOperationDirectoryBeforeCleanup => {
+            "after operation directory substitution"
+        }
+        ClientStateWritePoint::SwapLiveJobBeforeReplace => "after live job substitution",
     };
     WorkerError::Io(io::Error::other(format!(
         "injected local state failure {label}"
