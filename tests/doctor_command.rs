@@ -108,10 +108,22 @@ fn ready_probe(capabilities: &[&str]) -> Result<ProcessResult, WorkerError> {
 }
 
 fn offline_probe() -> Result<ProcessResult, WorkerError> {
+    offline_probe_with_stderr(b"offline")
+}
+
+fn offline_probe_with_stderr(stderr: &[u8]) -> Result<ProcessResult, WorkerError> {
     Ok(ProcessResult {
         status: exit_status(255),
         stdout: Vec::new(),
-        stderr: b"offline".to_vec(),
+        stderr: stderr.to_vec(),
+    })
+}
+
+fn invalid_probe() -> Result<ProcessResult, WorkerError> {
+    Ok(ProcessResult {
+        status: exit_status(0),
+        stdout: b"not JSON".to_vec(),
+        stderr: Vec::new(),
     })
 }
 
@@ -187,12 +199,14 @@ fn clean_project_snapshot_and_eligible_worker_are_ready_and_cleanup_the_capture(
     let repo = GitRepo::init();
     repo.write(
         ".worker.toml",
-        b"version = 1\nrequires = [\"swift\", \"darwin-arm64\"]\n",
+        b"version = 1\nrequires = [\"swift\", \"darwin-arm64\", \"node\"]\n",
     );
     repo.write("README.md", b"tracked\n");
     repo.write("Dockerfile", b"FROM scratch\n");
     repo.write("Package.swift", b"// package\n");
     repo.write("package.json", b"{}\n");
+    repo.write("playwright.config.ts", b"export default {};\n");
+    repo.write("go.mod", b"module example.test/fixture\n");
     repo.commit_all("ready doctor fixture");
     let state = tempfile::tempdir().unwrap();
     let config = config(vec![worker("mini-1", "mac1", &["darwin-arm64", "git"])]);
@@ -200,8 +214,10 @@ fn clean_project_snapshot_and_eligible_worker_are_ready_and_cleanup_the_capture(
         "darwin-arm64",
         "git",
         "swift",
-        "docker",
         "node",
+        "browser",
+        "docker",
+        "go",
     ])]);
 
     let report = inspect(&repo, state.path(), &config, &runner).unwrap();
@@ -210,7 +226,7 @@ fn clean_project_snapshot_and_eligible_worker_are_ready_and_cleanup_the_capture(
     assert!(report.ready);
     assert_eq!(
         report.requirements,
-        ["swift", "darwin-arm64", "docker", "node"]
+        ["swift", "darwin-arm64", "node", "browser", "docker", "go"]
     );
     assert_eq!(report.workers[0].status, HealthStatus::Ready);
     assert!(report.workers[0].missing_capabilities.is_empty());
@@ -218,7 +234,7 @@ fn clean_project_snapshot_and_eligible_worker_are_ready_and_cleanup_the_capture(
         report
             .snapshot
             .as_ref()
-            .is_some_and(|snapshot| { snapshot.file_count == 5 && !snapshot.digest.is_empty() })
+            .is_some_and(|snapshot| { snapshot.file_count == 7 && !snapshot.digest.is_empty() })
     );
     assert!(report.issues.is_empty());
     assert_eq!(
@@ -249,6 +265,8 @@ fn uncovered_untracked_input_is_a_bounded_typed_blocker_but_keeps_worker_health(
         repo.write(&format!("untracked/{index:03}.txt"), b"local\n");
     }
     let state = tempfile::tempdir().unwrap();
+    let poisoned_cache = state.path().join("cache");
+    fs::write(&poisoned_cache, b"capture must never touch this file\n").unwrap();
     let config = config(vec![worker("mini-1", "mac1", &[])]);
     let runner = DoctorRunner::new(vec![ready_probe(&[])]);
 
@@ -264,7 +282,8 @@ fn uncovered_untracked_input_is_a_bounded_typed_blocker_but_keeps_worker_health(
     assert_eq!(report.issues[0].paths[0], "local\\ninput.txt");
     assert!(!report.issues[0].message.contains("untracked contents"));
     assert!(!report.issues[0].message.contains('\n'));
-    assert_no_doctor_snapshot(&state.path().join("cache"));
+    assert!(poisoned_cache.is_file());
+    assert!(!poisoned_cache.join("snapshots").exists());
 }
 
 #[test]
@@ -339,6 +358,8 @@ fn unsupported_submodule_lfs_and_custom_filters_block_before_capture() {
             _ => unreachable!(),
         };
         let state = tempfile::tempdir().unwrap();
+        let poisoned_cache = state.path().join("cache");
+        fs::write(&poisoned_cache, b"capture must never touch this file\n").unwrap();
         let config = config(vec![worker("mini-1", "mac1", &[])]);
         let runner = DoctorRunner::new(vec![ready_probe(&[])]);
 
@@ -355,8 +376,87 @@ fn unsupported_submodule_lfs_and_custom_filters_block_before_capture() {
             report.issues
         );
         assert_eq!(report.workers[0].status, HealthStatus::Ready);
-        assert_no_doctor_snapshot(&state.path().join("cache"));
+        assert!(poisoned_cache.is_file(), "{feature}");
+        assert!(
+            !poisoned_cache.join("snapshots").exists(),
+            "{feature}: snapshot hierarchy was created"
+        );
     }
+}
+
+#[test]
+fn doctor_replaces_untrusted_ssh_diagnostics_everywhere_in_the_typed_report() {
+    // Catches raw SSH stderr surviving in WorkerHealth even if the duplicate
+    // issue message is genericized. The JSON and typed report share this data.
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("SSH diagnostic redaction fixture");
+    let state = tempfile::tempdir().unwrap();
+    let secret_token = "ssh-token-DOCTOR-should-never-report";
+    let environment_value = "DEPLOY_PASSWORD=planted-environment-secret";
+    let absolute_path = state
+        .path()
+        .join("private/credentials.txt")
+        .to_string_lossy()
+        .into_owned();
+    let stderr = format!(
+        "authentication failed: {secret_token}\n{environment_value}\r\nlocal={absolute_path}\tCONTROL_MARKER\u{1b}"
+    );
+    let config = config(vec![
+        worker("offline", "mac1", &[]),
+        worker("ready", "mac2", &[]),
+    ]);
+    let runner = DoctorRunner::new(vec![
+        offline_probe_with_stderr(stderr.as_bytes()),
+        ready_probe(&[]),
+    ]);
+
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+    let typed = format!("{report:?}");
+    let json = serde_json::to_string(&report).unwrap();
+    let safe_message = "worker offline could not be reached by the SSH probe";
+
+    assert!(report.ready);
+    assert_eq!(
+        report.workers[0].error_code.as_deref(),
+        Some("SSH_UNAVAILABLE")
+    );
+    assert_eq!(
+        report.workers[0].error_message.as_deref(),
+        Some(safe_message)
+    );
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| issue.code == "SSH_UNAVAILABLE")
+        .unwrap();
+    assert_eq!(issue.message, safe_message);
+    for forbidden in [
+        secret_token,
+        environment_value,
+        absolute_path.as_str(),
+        "CONTROL_MARKER",
+    ] {
+        assert!(
+            !typed.contains(forbidden),
+            "typed report leaked {forbidden:?}"
+        );
+        assert!(
+            !json.contains(forbidden),
+            "JSON report leaked {forbidden:?}"
+        );
+    }
+    for escaped_control in ["\\n", "\\r", "\\t", "\\u001b", "\\u{1b}"] {
+        assert!(
+            !typed.contains(escaped_control),
+            "typed report leaked control data {escaped_control:?}"
+        );
+        assert!(
+            !json.contains(escaped_control),
+            "JSON report leaked control data {escaped_control:?}"
+        );
+    }
+    assert_no_doctor_snapshot(&state.path().join("cache"));
 }
 
 #[test]
@@ -453,5 +553,58 @@ fn snapshot_change_is_a_typed_blocker_with_no_published_snapshot() {
     assert!(report.issues.iter().any(|issue| {
         issue.code == "SNAPSHOT_CHANGED" && issue.severity == IssueSeverity::Blocker
     }));
+    assert_no_doctor_snapshot(&state.path().join("cache"));
+}
+
+#[test]
+fn issues_sort_by_severity_then_code_then_first_path() {
+    // Catches warning codes outranking blockers or equal-code issues retaining
+    // producer order instead of sorting by their first escaped path.
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        b"version = 1\n[snapshot]\nallow_sensitive = [\".npmrc\", \".env\"]\n",
+    );
+    repo.write(".env", b"first planted secret\n");
+    repo.write(".npmrc", b"second planted secret\n");
+    repo.write("tracked.txt", b"initial bytes\n");
+    repo.commit_all("issue ordering fixture");
+    let state = tempfile::tempdir().unwrap();
+    let config = config(vec![
+        worker("invalid", "mac1", &[]),
+        worker("ready", "mac2", &[]),
+    ]);
+    let runner =
+        DoctorRunner::mutating_snapshot(repo.root(), vec![invalid_probe(), ready_probe(&[])]);
+
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+    assert!(!report.ready);
+    assert!(report.snapshot.is_none());
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .map(|issue| (
+                issue.severity,
+                issue.code.as_str(),
+                issue.paths.first().map(String::as_str),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (IssueSeverity::Blocker, "SNAPSHOT_CHANGED", None),
+            (IssueSeverity::Warning, "INVALID_RESPONSE", None),
+            (
+                IssueSeverity::Warning,
+                "SENSITIVE_PATH_ALLOWED",
+                Some(".env"),
+            ),
+            (
+                IssueSeverity::Warning,
+                "SENSITIVE_PATH_ALLOWED",
+                Some(".npmrc"),
+            ),
+        ]
+    );
     assert_no_doctor_snapshot(&state.path().join("cache"));
 }

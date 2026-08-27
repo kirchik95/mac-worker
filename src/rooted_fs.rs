@@ -164,6 +164,11 @@ impl Drop for CleanupFaultOverride {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn fail_next_cleanup_before_final_root_removal(errno: libc::c_int) -> impl Drop {
+    CleanupFaultOverride::set(CleanupFault::BeforeFinalRootRemoval(errno))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntryMetadata {
     pub kind: EntryKind,

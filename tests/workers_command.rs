@@ -150,7 +150,12 @@ fn nonzero_ssh_exit_is_reported_as_unavailable() {
 
     assert_eq!(health.status, HealthStatus::Unavailable);
     assert_eq!(health.error_code.as_deref(), Some("SSH_UNAVAILABLE"));
-    assert!(health.error_message.is_some());
+    assert!(
+        health
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("connection refused"))
+    );
     assert!(health.probe.is_none());
 }
 
@@ -382,6 +387,47 @@ fn inspect_with_requirements_adds_project_capabilities_without_changing_inventor
     assert_eq!(inventory_report.workers[0].status, HealthStatus::Ready);
     assert!(inventory_report.workers[0].missing_capabilities.is_empty());
     assert_eq!(config.workers[0].capabilities, ["darwin-arm64"]);
+}
+
+#[test]
+fn inspect_with_requirements_uses_inventory_first_stable_union_for_multiple_missing_values() {
+    // Catches project-first probing, duplicate requirements, or mutating the
+    // configured inventory while constructing the required-capability union.
+    let runner = RecordingRunner::returning_json(
+        br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":["node"]}"#.to_vec(),
+    );
+    let config = Config {
+        version: 1,
+        workers: vec![worker(
+            "mini-1",
+            "mac1",
+            &["darwin-arm64", "docker", "darwin-arm64", "ruby"],
+        )],
+    };
+    let original_inventory = config.workers[0].capabilities.clone();
+    let service = WorkersService::new(SshTransport::new(runner));
+
+    let report = service.inspect_with_requirements(
+        &config,
+        &[
+            "node".into(),
+            "docker".into(),
+            "swift".into(),
+            "node".into(),
+            "go".into(),
+        ],
+    );
+
+    assert_eq!(report.workers[0].status, HealthStatus::Unavailable);
+    assert_eq!(
+        report.workers[0].missing_capabilities,
+        ["darwin-arm64", "docker", "ruby", "swift", "go"]
+    );
+    assert_eq!(
+        report.workers[0].error_message.as_deref(),
+        Some("worker is missing required capabilities: darwin-arm64, docker, ruby, swift, go")
+    );
+    assert_eq!(config.workers[0].capabilities, original_inventory);
 }
 
 #[test]

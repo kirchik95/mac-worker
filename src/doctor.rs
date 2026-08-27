@@ -235,7 +235,7 @@ fn sort_issues(issues: &mut [DoctorIssue]) {
 }
 
 fn sanitize_bounded(value: &str, limit: usize) -> String {
-    let mut sanitized = String::new();
+    let mut tokens = Vec::new();
     let mut used = 0;
     let mut truncated = false;
 
@@ -252,12 +252,262 @@ fn sanitize_bounded(value: &str, limit: usize) -> String {
             truncated = true;
             break;
         }
-        sanitized.push_str(&escaped);
+        tokens.push(escaped);
         used += escaped_length;
     }
 
     if truncated {
-        sanitized.push('…');
+        if limit == 0 {
+            return String::new();
+        }
+        while used + 1 > limit {
+            let removed = tokens
+                .pop()
+                .expect("a full output limit always contains at least one token");
+            used -= removed.chars().count();
+        }
+        tokens.push("…".to_owned());
     }
-    sanitized
+    tokens.concat()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::OsStr,
+        fs,
+        os::unix::process::ExitStatusExt,
+        path::Path,
+        process::{Command, ExitStatus, Output},
+    };
+
+    use crate::{
+        config::{Config, WorkerEntry},
+        error::WorkerError,
+        paths::PathLayout,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    };
+
+    use super::{
+        DoctorRequest, DoctorService, IssueSeverity, issue, sanitize_bounded, sort_issues,
+    };
+
+    struct ReadyDoctorRunner;
+
+    impl ProcessRunner for ReadyDoctorRunner {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.program == OsStr::new("/usr/bin/ssh") {
+                let response = serde_json::json!({
+                    "protocol_version": 1,
+                    "hostname": "mini.local",
+                    "arch": "arm64",
+                    "os_version": "26.2",
+                    "free_disk_bytes": 536_870_912_u64,
+                    "memory_pressure": "normal",
+                    "swap_used_bytes": 134_217_728_u64,
+                    "capabilities": [],
+                });
+                return Ok(ProcessResult {
+                    status: ExitStatus::from_raw(0),
+                    stdout: serde_json::to_vec(&response).unwrap(),
+                    stderr: Vec::new(),
+                });
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+
+    fn git(root: &Path, arguments: &[&str]) -> Output {
+        let mut command = Command::new("/usr/bin/git");
+        command
+            .current_dir(root)
+            .env("HOME", root.join("home"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            command.env_remove(name);
+        }
+        command
+            .args(arguments)
+            .output()
+            .expect("run isolated Git fixture command")
+    }
+
+    fn ready_config() -> Config {
+        Config {
+            version: 1,
+            workers: vec![WorkerEntry {
+                name: "mini-1".into(),
+                ssh: "mac1".into(),
+                slots: 1,
+                capabilities: Vec::new(),
+                remote_binary: "~/.local/bin/worker".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn bounded_sanitization_reserves_the_marker_and_keeps_escape_tokens_atomic() {
+        // Catches appending a truncation marker after already filling the
+        // limit, and catches truncation splitting an escaped control token.
+        let cases = [
+            ("abcde", 5, "abcde"),
+            ("abcdef", 5, "abcd…"),
+            ("abc\nz", 5, "abc…"),
+            ("\n", 2, "\\n"),
+            ("\nX", 2, "…"),
+            ("\n", 1, "…"),
+            ("x", 0, ""),
+        ];
+
+        for (value, limit, expected) in cases {
+            let actual = sanitize_bounded(value, limit);
+            assert_eq!(actual, expected, "value={value:?}, limit={limit}");
+            assert!(
+                actual.chars().count() <= limit,
+                "value={value:?}, limit={limit}, actual={actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_sorting_uses_the_first_path_after_severity_and_code() {
+        // Catches dropping the final ordering key when upstream producers
+        // happen to already emit equal-code issues in lexical path order.
+        let mut issues = vec![
+            issue(
+                IssueSeverity::Warning,
+                "SAME_CODE",
+                "later path",
+                vec!["z/path".into()],
+            ),
+            issue(
+                IssueSeverity::Warning,
+                "SAME_CODE",
+                "earlier path",
+                vec!["a/path".into()],
+            ),
+            issue(
+                IssueSeverity::Warning,
+                "ALPHA_CODE",
+                "earlier code",
+                Vec::new(),
+            ),
+            issue(IssueSeverity::Blocker, "ZZZ_CODE", "blocker", Vec::new()),
+        ];
+
+        sort_issues(&mut issues);
+
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| (
+                    issue.severity,
+                    issue.code.as_str(),
+                    issue.paths.first().map(String::as_str),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (IssueSeverity::Blocker, "ZZZ_CODE", None),
+                (IssueSeverity::Warning, "ALPHA_CODE", None),
+                (IssueSeverity::Warning, "SAME_CODE", Some("a/path")),
+                (IssueSeverity::Warning, "SAME_CODE", Some("z/path")),
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_cleanup_failure_is_an_io_error_and_retains_only_private_empty_residue() {
+        // Catches swallowing a post-summary exact-owned cleanup error and
+        // returning a ready report. The injected final-remove failure happens
+        // after the capture is privately acquired and emptied.
+        let repository = tempfile::tempdir().unwrap();
+        fs::create_dir(repository.path().join("home")).unwrap();
+        assert!(
+            git(repository.path(), &["init", "--initial-branch=main"])
+                .status
+                .success()
+        );
+        assert!(
+            git(
+                repository.path(),
+                &["config", "user.name", "Doctor Cleanup Test"]
+            )
+            .status
+            .success()
+        );
+        assert!(
+            git(
+                repository.path(),
+                &["config", "user.email", "doctor-cleanup@example.test"]
+            )
+            .status
+            .success()
+        );
+        fs::write(repository.path().join("README.md"), b"tracked\n").unwrap();
+        assert!(git(repository.path(), &["add", "--all"]).status.success());
+        assert!(
+            git(repository.path(), &["commit", "-m", "cleanup fixture"])
+                .status
+                .success()
+        );
+        let state = tempfile::tempdir().unwrap();
+        let paths = PathLayout {
+            config: state.path().join("config.toml"),
+            state: state.path().join("state"),
+            cache: state.path().join("cache"),
+            data: state.path().join("data"),
+        };
+        let config = ready_config();
+        let _fault = crate::rooted_fs::fail_next_cleanup_before_final_root_removal(libc::EIO);
+
+        let error = DoctorService {
+            runner: &ReadyDoctorRunner,
+            config: &config,
+            paths: &paths,
+        }
+        .inspect(DoctorRequest {
+            project: repository.path().to_path_buf(),
+            cli_includes: Vec::new(),
+        })
+        .expect_err("cleanup failure must take precedence over a ready report");
+
+        match error {
+            WorkerError::Io(error) => assert_eq!(error.raw_os_error(), Some(libc::EIO)),
+            other => panic!("cleanup failure had wrong classification: {other}"),
+        }
+        let ready = paths.cache.join("snapshots/ready");
+        let ready_entries = fs::read_dir(&ready)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(ready_entries.len(), 1);
+        assert_eq!(
+            ready_entries[0].file_name().unwrap(),
+            ".mac-worker-rooted-fs"
+        );
+        let retained = fs::read_dir(&ready_entries[0])
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].is_dir());
+        assert_eq!(fs::read_dir(&retained[0]).unwrap().count(), 0);
+
+        // The injected kernel-boundary failure intentionally leaves the empty
+        // privately acquired capture as evidence. The fixture removes exactly
+        // that private namespace only after validating the service contract.
+        fs::remove_dir_all(&ready_entries[0]).unwrap();
+    }
 }
