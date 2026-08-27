@@ -72,6 +72,26 @@ fn valid_probe_json() -> Vec<u8> {
     br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":["darwin-arm64","git"]}"#.to_vec()
 }
 
+fn structured_probe_json(
+    protocol_version: u32,
+    hostname: &str,
+    arch: &str,
+    os_version: &str,
+    capabilities: Vec<String>,
+) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "protocol_version": protocol_version,
+        "hostname": hostname,
+        "arch": arch,
+        "os_version": os_version,
+        "free_disk_bytes": 536_870_912_u64,
+        "memory_pressure": "normal",
+        "swap_used_bytes": 134_217_728_u64,
+        "capabilities": capabilities,
+    }))
+    .unwrap()
+}
+
 fn worker(name: &str, ssh: &str, capabilities: &[&str]) -> WorkerEntry {
     WorkerEntry {
         name: name.into(),
@@ -227,6 +247,126 @@ fn output_larger_than_one_mib_is_reported_as_an_invalid_response() {
     assert_eq!(health.status, HealthStatus::Unavailable);
     assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
     assert!(health.error_message.is_some());
+}
+
+#[test]
+fn invalid_structured_probe_fields_are_rejected_before_other_classification() {
+    // Catches parsed remote strings surviving into protocol-mismatch or
+    // missing-capability reports before their shape and bounds are checked.
+    let oversized_hostname = format!("{}-hostname-oversize-secret", "h".repeat(280));
+    let oversized_arch = format!("{}-arch-oversize-secret", "a".repeat(80));
+    let oversized_os_version = "7".repeat(160);
+    let oversized_capability = format!("{}-capability-oversize-secret", "c".repeat(100));
+    let mut excessive_capabilities = (0..128)
+        .map(|index| format!("capability-{index}"))
+        .collect::<Vec<_>>();
+    excessive_capabilities[0] = "capability-collection-secret".into();
+    let cases = vec![
+        (
+            "hostname environment/newline",
+            structured_probe_json(
+                2,
+                "mini.local\nHOSTNAME_SECRET=value",
+                "arm64",
+                "26.2",
+                vec!["darwin-arm64".into()],
+            ),
+            "HOSTNAME_SECRET=value".to_owned(),
+        ),
+        (
+            "hostname bound",
+            structured_probe_json(1, &oversized_hostname, "arm64", "26.2", Vec::new()),
+            oversized_hostname,
+        ),
+        (
+            "architecture terminal control",
+            structured_probe_json(
+                1,
+                "mini.local",
+                "arm64\u{1b}]0;ARCH_SECRET\u{7}",
+                "26.2",
+                Vec::new(),
+            ),
+            "ARCH_SECRET".to_owned(),
+        ),
+        (
+            "architecture bound",
+            structured_probe_json(1, "mini.local", &oversized_arch, "26.2", Vec::new()),
+            oversized_arch,
+        ),
+        (
+            "OS version environment/newline",
+            structured_probe_json(
+                1,
+                "mini.local",
+                "arm64",
+                "26.2\r\nOS_VERSION_SECRET=value",
+                Vec::new(),
+            ),
+            "OS_VERSION_SECRET=value".to_owned(),
+        ),
+        (
+            "OS version bound",
+            structured_probe_json(1, "mini.local", "arm64", &oversized_os_version, Vec::new()),
+            oversized_os_version,
+        ),
+        (
+            "capability environment/newline",
+            structured_probe_json(
+                1,
+                "mini.local",
+                "arm64",
+                "26.2",
+                vec!["docker\nCAPABILITY_SECRET=value".into()],
+            ),
+            "CAPABILITY_SECRET=value".to_owned(),
+        ),
+        (
+            "capability bound",
+            structured_probe_json(
+                1,
+                "mini.local",
+                "arm64",
+                "26.2",
+                vec![oversized_capability.clone()],
+            ),
+            oversized_capability,
+        ),
+        (
+            "capability collection bound",
+            structured_probe_json(1, "mini.local", "arm64", "26.2", excessive_capabilities),
+            "capability-collection-secret".to_owned(),
+        ),
+    ];
+
+    for (label, response, forbidden) in cases {
+        let runner = RecordingRunner::returning_json(response);
+        let transport = SshTransport::new(runner);
+
+        let health = transport.probe(&worker("mini-1", "mac1", &["required-safe"]));
+
+        assert_eq!(health.status, HealthStatus::Unavailable, "{label}");
+        assert_eq!(
+            health.error_code.as_deref(),
+            Some("INVALID_RESPONSE"),
+            "{label}"
+        );
+        assert_eq!(
+            health.error_message.as_deref(),
+            Some("SSH probe response contained invalid structured fields"),
+            "{label}"
+        );
+        assert!(health.probe.is_none(), "{label}");
+        assert!(health.missing_capabilities.is_empty(), "{label}");
+        let serialized = serde_json::to_string(&health).unwrap();
+        let human = CommandOutput::Workers(WorkersReport {
+            protocol_version: PROTOCOL_VERSION,
+            workers: vec![health],
+        })
+        .render_human();
+        assert!(!serialized.contains(&forbidden), "{label}: {serialized}");
+        assert!(!human.contains(&forbidden), "{label}: {human}");
+    }
 }
 
 #[test]

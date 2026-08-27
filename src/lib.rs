@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, io::Write, path::PathBuf};
+use std::{collections::BTreeMap, ffi::OsString, io::Write, path::PathBuf};
 
 use cli::{Cli, Command, HostCommand};
 use config::{Config, WorkerEntry};
@@ -31,10 +31,68 @@ pub mod rooted_fs;
 pub mod snapshot;
 pub mod transport;
 
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct RuntimeContext {
+    environment: BTreeMap<OsString, OsString>,
+    home: PathBuf,
+    current_dir: RuntimeCurrentDir,
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeCurrentDir {
+    Process,
+    Fixed(PathBuf),
+}
+
+impl RuntimeContext {
+    fn capture() -> Self {
+        let environment = std::env::vars_os().collect::<BTreeMap<_, _>>();
+        let home = environment
+            .get(&OsString::from("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        Self {
+            environment,
+            home,
+            current_dir: RuntimeCurrentDir::Process,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn isolated(
+        environment: BTreeMap<OsString, OsString>,
+        home: PathBuf,
+        current_dir: PathBuf,
+    ) -> Self {
+        Self {
+            environment,
+            home,
+            current_dir: RuntimeCurrentDir::Fixed(current_dir),
+        }
+    }
+
+    fn current_dir(&self) -> Result<PathBuf, WorkerError> {
+        match &self.current_dir {
+            RuntimeCurrentDir::Process => std::env::current_dir().map_err(WorkerError::Io),
+            RuntimeCurrentDir::Fixed(current_dir) => Ok(current_dir.clone()),
+        }
+    }
+}
+
 pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutput, WorkerError> {
+    let runtime = RuntimeContext::capture();
+    execute_with_context(cli, runner, &runtime)
+}
+
+fn execute_with_context(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    runtime: &RuntimeContext,
+) -> Result<CommandOutput, WorkerError> {
     match cli.command {
         Command::Setup { hosts } => {
-            let config = load_config(cli.config)?;
+            let config = load_config(cli.config, runtime)?;
             let selected = select_workers(&config, &hosts)?;
             let current_exe = std::env::current_exe()?;
             let workers = selected
@@ -47,11 +105,11 @@ pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutpu
             }))
         }
         Command::Doctor { project, includes } => {
-            let paths = discover_paths(cli.config)?;
+            let paths = discover_paths(cli.config, runtime)?;
             let config = Config::load(&paths.config)?;
             let project = match project {
                 Some(project) => project,
-                None => std::env::current_dir()?,
+                None => runtime.current_dir()?,
             };
             let service = DoctorService {
                 runner,
@@ -64,7 +122,7 @@ pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutpu
             })?))
         }
         Command::Workers => {
-            let config = load_config(cli.config)?;
+            let config = load_config(cli.config, runtime)?;
             let service = WorkersService::new(SshTransport::new(runner));
             Ok(CommandOutput::Workers(service.inspect(&config)))
         }
@@ -80,6 +138,18 @@ pub fn run_with_io(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    let runtime = RuntimeContext::capture();
+    run_with_io_in_context(cli, runner, &runtime, stdout, stderr)
+}
+
+#[doc(hidden)]
+pub fn run_with_io_in_context(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    runtime: &RuntimeContext,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
     let json = cli.json;
     let raw_probe = matches!(
         &cli.command,
@@ -88,7 +158,7 @@ pub fn run_with_io(
         }
     );
 
-    match execute_with(cli, runner) {
+    match execute_with_context(cli, runner, runtime) {
         Ok(output) => {
             let exit = output.aggregate_exit_kind().map_or(0, |kind| kind as u8);
             match output.write_to(stdout, json, raw_probe) {
@@ -110,18 +180,19 @@ fn write_error(stderr: &mut dyn Write, error: &WorkerError) {
     let _ = writeln!(stderr, "{error}");
 }
 
-fn load_config(config_override: Option<PathBuf>) -> Result<Config, WorkerError> {
-    let paths = discover_paths(config_override)?;
+fn load_config(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+) -> Result<Config, WorkerError> {
+    let paths = discover_paths(config_override, runtime)?;
     Config::load(&paths.config)
 }
 
-fn discover_paths(config_override: Option<PathBuf>) -> Result<PathLayout, WorkerError> {
-    let env = std::env::vars_os().collect::<BTreeMap<_, _>>();
-    let home = env
-        .get(&std::ffi::OsString::from("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    PathLayout::discover(config_override, &env, &home)
+fn discover_paths(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+) -> Result<PathLayout, WorkerError> {
+    PathLayout::discover(config_override, &runtime.environment, &runtime.home)
 }
 
 fn select_workers(config: &Config, hosts: &[String]) -> Result<Vec<WorkerEntry>, WorkerError> {

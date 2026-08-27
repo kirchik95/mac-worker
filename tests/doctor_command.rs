@@ -2,8 +2,8 @@
 mod support;
 
 use std::{
-    collections::VecDeque,
-    ffi::OsStr,
+    collections::{BTreeMap, VecDeque},
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Write},
     os::unix::process::ExitStatusExt,
@@ -16,6 +16,7 @@ use std::{
 };
 
 use mac_worker::{
+    RuntimeContext,
     cli::{Cli, Command},
     config::{Config, WorkerEntry},
     doctor::{DoctorRequest, DoctorService},
@@ -27,7 +28,7 @@ use mac_worker::{
         DoctorIssue, DoctorProject, DoctorReport, HealthStatus, IssueSeverity, MemoryPressure,
         PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
     },
-    run_with_io,
+    run_with_io_in_context,
     snapshot::SnapshotSummary,
 };
 
@@ -45,6 +46,12 @@ struct SnapshotMutation {
 }
 
 struct BrokenWriter;
+
+struct IsolatedRuntime {
+    context: RuntimeContext,
+    cache: PathBuf,
+    fallback_cache: PathBuf,
+}
 
 impl Write for BrokenWriter {
     fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
@@ -115,6 +122,30 @@ fn ready_probe(capabilities: &[&str]) -> Result<ProcessResult, WorkerError> {
         "hostname": "mini.local",
         "arch": "arm64",
         "os_version": "26.2",
+        "free_disk_bytes": 536_870_912_u64,
+        "memory_pressure": "normal",
+        "swap_used_bytes": 134_217_728_u64,
+        "capabilities": capabilities,
+    });
+    Ok(ProcessResult {
+        status: exit_status(0),
+        stdout: serde_json::to_vec(&response).unwrap(),
+        stderr: Vec::new(),
+    })
+}
+
+fn structured_probe(
+    protocol_version: u32,
+    hostname: &str,
+    arch: &str,
+    os_version: &str,
+    capabilities: Vec<String>,
+) -> Result<ProcessResult, WorkerError> {
+    let response = serde_json::json!({
+        "protocol_version": protocol_version,
+        "hostname": hostname,
+        "arch": arch,
+        "os_version": os_version,
         "free_disk_bytes": 536_870_912_u64,
         "memory_pressure": "normal",
         "swap_used_bytes": 134_217_728_u64,
@@ -321,15 +352,56 @@ fn write_inventory(root: &Path) -> PathBuf {
     path
 }
 
-fn doctor_cli(config: PathBuf, project: &Path, includes: Vec<String>, json: bool) -> Cli {
+fn doctor_cli(config: PathBuf, project: Option<&Path>, includes: Vec<String>, json: bool) -> Cli {
     Cli {
         config: Some(config),
         json,
         command: Command::Doctor {
-            project: Some(project.to_path_buf()),
+            project: project.map(Path::to_path_buf),
             includes,
         },
     }
+}
+
+fn isolated_runtime(root: &Path, current_dir: &Path) -> IsolatedRuntime {
+    let home = root.join("runtime-home");
+    let config_home = root.join("xdg-config");
+    let state_home = root.join("xdg-state");
+    let cache_home = root.join("xdg-cache");
+    let data_home = root.join("xdg-data");
+    fs::create_dir(&home).unwrap();
+    let environment = BTreeMap::from([
+        (
+            OsString::from("XDG_CONFIG_HOME"),
+            config_home.into_os_string(),
+        ),
+        (
+            OsString::from("XDG_STATE_HOME"),
+            state_home.into_os_string(),
+        ),
+        (
+            OsString::from("XDG_CACHE_HOME"),
+            cache_home.clone().into_os_string(),
+        ),
+        (OsString::from("XDG_DATA_HOME"), data_home.into_os_string()),
+    ]);
+
+    IsolatedRuntime {
+        context: RuntimeContext::isolated(environment, home.clone(), current_dir.to_path_buf()),
+        cache: cache_home.join("mac-worker"),
+        fallback_cache: home.join(".cache/mac-worker"),
+    }
+}
+
+fn assert_isolated_snapshot_state(runtime: &IsolatedRuntime, infrastructure_expected: bool) {
+    assert_eq!(runtime.cache.exists(), infrastructure_expected);
+    if infrastructure_expected {
+        assert_no_doctor_snapshot(&runtime.cache);
+    }
+    assert!(
+        !runtime.fallback_cache.exists(),
+        "doctor selected the runtime home's fallback cache instead of isolated XDG cache"
+    );
 }
 
 #[test]
@@ -441,6 +513,43 @@ fn doctor_output_human_renders_complete_ready_and_blocked_reports_without_ssh() 
 }
 
 #[test]
+fn doctor_output_human_renders_every_bounded_issue_path() {
+    let mut report = blocked_output_report("UNTRACKED_INPUT");
+    report.issues = vec![DoctorIssue {
+        severity: IssueSeverity::Blocker,
+        code: "UNTRACKED_INPUT".into(),
+        message: "untracked inputs need an explicit policy".into(),
+        paths: vec![
+            "first/input.txt".into(),
+            "second/input.txt".into(),
+            "third/input.txt".into(),
+        ],
+    }];
+
+    let human = CommandOutput::Doctor(report).render_human();
+
+    for path in [
+        "path: first/input.txt",
+        "path: second/input.txt",
+        "path: third/input.txt",
+    ] {
+        assert!(human.contains(path), "missing issue {path:?} in {human:?}");
+    }
+}
+
+#[test]
+fn doctor_output_human_labels_an_unborn_branch_without_inventing_a_head() {
+    let mut report = ready_output_report();
+    report.project.branch = Some("main".into());
+    report.project.head = None;
+
+    let human = CommandOutput::Doctor(report).render_human();
+
+    assert!(human.contains("source: branch main at unborn HEAD"));
+    assert!(!human.contains("source: detached HEAD"));
+}
+
+#[test]
 fn doctor_aggregate_exit_uses_ready_usage_and_snapshot_integrity_categories() {
     assert_eq!(
         CommandOutput::Doctor(ready_output_report()).aggregate_exit_kind(),
@@ -464,18 +573,20 @@ fn executable_doctor_ready_report_goes_to_stdout_and_exits_zero() {
     repo.write("fixtures/generated/data.txt", b"included untracked\n");
     let state = tempfile::tempdir().unwrap();
     let config_path = write_inventory(state.path());
+    let runtime = isolated_runtime(state.path(), repo.root());
     let runner = DoctorRunner::new(vec![ready_probe(&[])]);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
 
-    let exit = run_with_io(
+    let exit = run_with_io_in_context(
         doctor_cli(
             config_path,
-            repo.root(),
+            Some(repo.root()),
             vec!["fixtures/generated/**".into()],
             true,
         ),
         &runner,
+        &runtime.context,
         &mut stdout,
         &mut stderr,
     );
@@ -487,6 +598,7 @@ fn executable_doctor_ready_report_goes_to_stdout_and_exits_zero() {
     assert_eq!(value["kind"], "doctor");
     assert_eq!(value["ready"], true);
     assert_eq!(value["snapshot"]["included_untracked_count"], 1);
+    assert_isolated_snapshot_state(&runtime, true);
 }
 
 #[test]
@@ -497,13 +609,15 @@ fn executable_doctor_project_blocker_goes_to_stdout_and_exits_usage() {
     repo.write("local-input.txt", b"uncovered untracked input\n");
     let state = tempfile::tempdir().unwrap();
     let config_path = write_inventory(state.path());
+    let runtime = isolated_runtime(state.path(), repo.root());
     let runner = DoctorRunner::new(vec![ready_probe(&[])]);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
 
-    let exit = run_with_io(
-        doctor_cli(config_path, repo.root(), Vec::new(), true),
+    let exit = run_with_io_in_context(
+        doctor_cli(config_path, Some(repo.root()), Vec::new(), true),
         &runner,
+        &runtime.context,
         &mut stdout,
         &mut stderr,
     );
@@ -514,6 +628,7 @@ fn executable_doctor_project_blocker_goes_to_stdout_and_exits_usage() {
     assert_eq!(value["kind"], "doctor");
     assert_eq!(value["ready"], false);
     assert_eq!(value["issues"][0]["code"], "UNTRACKED_INPUT");
+    assert_isolated_snapshot_state(&runtime, false);
 }
 
 #[test]
@@ -523,13 +638,15 @@ fn executable_doctor_snapshot_change_goes_to_stdout_and_exits_infrastructure() {
     repo.commit_all("mutating executable doctor fixture");
     let state = tempfile::tempdir().unwrap();
     let config_path = write_inventory(state.path());
+    let runtime = isolated_runtime(state.path(), repo.root());
     let runner = DoctorRunner::mutating_snapshot(repo.root(), vec![ready_probe(&[])]);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
 
-    let exit = run_with_io(
-        doctor_cli(config_path, repo.root(), Vec::new(), true),
+    let exit = run_with_io_in_context(
+        doctor_cli(config_path, Some(repo.root()), Vec::new(), true),
         &runner,
+        &runtime.context,
         &mut stdout,
         &mut stderr,
     );
@@ -540,6 +657,7 @@ fn executable_doctor_snapshot_change_goes_to_stdout_and_exits_infrastructure() {
     assert_eq!(value["kind"], "doctor");
     assert_eq!(value["ready"], false);
     assert_eq!(value["issues"][0]["code"], "SNAPSHOT_CHANGED");
+    assert_isolated_snapshot_state(&runtime, true);
 }
 
 #[test]
@@ -550,18 +668,55 @@ fn executable_doctor_broken_stdout_is_an_io_error_on_stderr_and_exit_74() {
     repo.write("local-input.txt", b"uncovered untracked input\n");
     let state = tempfile::tempdir().unwrap();
     let config_path = write_inventory(state.path());
+    let runtime = isolated_runtime(state.path(), repo.root());
     let runner = DoctorRunner::new(vec![ready_probe(&[])]);
     let mut stderr = Vec::new();
 
-    let exit = run_with_io(
-        doctor_cli(config_path, repo.root(), Vec::new(), true),
+    let exit = run_with_io_in_context(
+        doctor_cli(config_path, Some(repo.root()), Vec::new(), true),
         &runner,
+        &runtime.context,
         &mut BrokenWriter,
         &mut stderr,
     );
 
     assert_eq!(exit, 74);
     assert!(String::from_utf8(stderr).unwrap().contains("I/O error"));
+    assert_isolated_snapshot_state(&runtime, false);
+}
+
+#[test]
+fn executable_doctor_resolves_an_omitted_project_from_the_injected_current_dir() {
+    // Catches parse-time cwd capture or dispatch falling back to the process
+    // cwd instead of the isolated runtime context.
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("omitted project executable doctor fixture");
+    let state = tempfile::tempdir().unwrap();
+    let config_path = write_inventory(state.path());
+    let runtime = isolated_runtime(state.path(), repo.root());
+    let runner = DoctorRunner::new(vec![ready_probe(&[])]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_with_io_in_context(
+        doctor_cli(config_path, None, Vec::new(), true),
+        &runner,
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 0);
+    assert!(stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["kind"], "doctor");
+    assert_eq!(value["ready"], true);
+    assert_eq!(
+        value["project"]["display_name"],
+        repo.root().file_name().unwrap().to_string_lossy().as_ref()
+    );
+    assert_isolated_snapshot_state(&runtime, true);
 }
 
 #[test]
@@ -827,6 +982,80 @@ fn doctor_replaces_untrusted_ssh_diagnostics_everywhere_in_the_typed_report() {
             !json.contains(escaped_control),
             "JSON report leaked control data {escaped_control:?}"
         );
+    }
+    assert_no_doctor_snapshot(&state.path().join("cache"));
+}
+
+#[test]
+fn doctor_rejects_invalid_probe_fields_without_retaining_or_rendering_them() {
+    // Catches structured SSH probe data reaching the typed report before
+    // protocol and required-capability classification validates it.
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("invalid structured probe fixture");
+    let state = tempfile::tempdir().unwrap();
+    let oversized_hostname = format!("{}-hostname-doctor-secret", "h".repeat(280));
+    let oversized_capability = format!("{}-capability-doctor-secret", "c".repeat(100));
+    let forbidden = [
+        oversized_hostname.clone(),
+        "ARCH_DOCTOR_SECRET".into(),
+        "OS_DOCTOR_SECRET=value".into(),
+        oversized_capability.clone(),
+    ];
+    let config = config(vec![
+        worker("invalid-hostname", "mac1", &["required-safe"]),
+        worker("invalid-arch", "mac2", &["required-safe"]),
+        worker("invalid-os", "mac3", &["required-safe"]),
+        worker("invalid-capability", "mac4", &["required-safe"]),
+    ]);
+    let runner = DoctorRunner::new(vec![
+        structured_probe(2, &oversized_hostname, "arm64", "26.2", Vec::new()),
+        structured_probe(
+            1,
+            "mini.local",
+            "arm64\u{1b}]0;ARCH_DOCTOR_SECRET\u{7}",
+            "26.2",
+            Vec::new(),
+        ),
+        structured_probe(
+            1,
+            "mini.local",
+            "arm64",
+            "26.2\nOS_DOCTOR_SECRET=value",
+            Vec::new(),
+        ),
+        structured_probe(1, "mini.local", "arm64", "26.2", vec![oversized_capability]),
+    ]);
+
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+    let typed = format!("{report:?}");
+    let output = CommandOutput::Doctor(report.clone());
+    let json = output.render_json().unwrap();
+    let human = output.render_human();
+
+    assert!(!report.ready);
+    assert!(report.snapshot.is_some());
+    let expected_messages = [
+        "worker invalid-hostname returned an invalid probe response",
+        "worker invalid-arch returned an invalid probe response",
+        "worker invalid-os returned an invalid probe response",
+        "worker invalid-capability returned an invalid probe response",
+    ];
+    for (worker, expected_message) in report.workers.iter().zip(expected_messages) {
+        assert_eq!(worker.status, HealthStatus::Unavailable);
+        assert_eq!(worker.error_code.as_deref(), Some("INVALID_RESPONSE"));
+        assert_eq!(worker.error_message.as_deref(), Some(expected_message));
+        assert!(worker.probe.is_none());
+        assert!(worker.missing_capabilities.is_empty());
+    }
+    assert!(report.issues.iter().any(|issue| {
+        issue.severity == IssueSeverity::Blocker && issue.code == "NO_ELIGIBLE_WORKER"
+    }));
+    assert_eq!(output.aggregate_exit_kind(), Some(ExitKind::Usage));
+    for value in forbidden {
+        assert!(!typed.contains(&value), "typed report leaked {value:?}");
+        assert!(!json.contains(&value), "doctor JSON leaked {value:?}");
+        assert!(!human.contains(&value), "human output leaked {value:?}");
     }
     assert_no_doctor_snapshot(&state.path().join("cache"));
 }

@@ -13,6 +13,11 @@ use crate::{
 const SSH_PROGRAM: &str = "/usr/bin/ssh";
 const REMOTE_PROBE_COMMAND: &str = "~/.local/bin/worker host probe";
 const MAX_PROBE_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_HOSTNAME_BYTES: usize = 253;
+const MAX_ARCH_BYTES: usize = 32;
+const MAX_OS_VERSION_BYTES: usize = 64;
+const MAX_CAPABILITY_BYTES: usize = 64;
+const MAX_CAPABILITY_COUNT: usize = 64;
 
 pub struct SshTransport<R> {
     runner: R,
@@ -204,6 +209,18 @@ impl<R: ProcessRunner> SshTransport<R> {
                 );
             }
         };
+        if !valid_probe_response(&probe) {
+            return (
+                unavailable(
+                    worker,
+                    "INVALID_RESPONSE",
+                    "SSH probe response contained invalid structured fields".into(),
+                    None,
+                    Vec::new(),
+                ),
+                None,
+            );
+        }
 
         if probe.protocol_version != PROTOCOL_VERSION {
             return (
@@ -256,6 +273,53 @@ impl<R: ProcessRunner> SshTransport<R> {
             None,
         )
     }
+}
+
+fn valid_probe_response(probe: &ProbeResponse) -> bool {
+    valid_hostname(&probe.hostname)
+        && valid_arch(&probe.arch)
+        && valid_os_version(&probe.os_version)
+        && probe.capabilities.len() <= MAX_CAPABILITY_COUNT
+        && probe
+            .capabilities
+            .iter()
+            .all(|capability| valid_capability(capability))
+        && probe.capabilities.iter().collect::<HashSet<_>>().len() == probe.capabilities.len()
+}
+
+fn valid_hostname(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_HOSTNAME_BYTES
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn valid_arch(value: &str) -> bool {
+    valid_lowercase_identifier(value, MAX_ARCH_BYTES)
+}
+
+fn valid_os_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_OS_VERSION_BYTES
+        && value.split('.').all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn valid_capability(value: &str) -> bool {
+    valid_lowercase_identifier(value, MAX_CAPABILITY_BYTES)
+}
+
+fn valid_lowercase_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
 fn stable_required_capabilities(worker: &WorkerEntry, requirements: &[String]) -> Vec<String> {
