@@ -387,6 +387,36 @@ impl RootedDir {
         make_directory_read_only(self.root.as_raw_fd())
     }
 
+    pub(crate) fn publish_owned_to(&mut self, destination: &Path) -> io::Result<()> {
+        let (destination_parent_path, destination_name) = split_root_path(destination)?;
+        let destination_parent = open_directory_path(destination_parent_path)?;
+        self.verify_root_name()?;
+        if stat_fd(destination_parent.as_raw_fd())?.st_dev
+            != self.root_identity.device as libc::dev_t
+        {
+            return Err(os_error(libc::EXDEV));
+        }
+        rename_no_replace(
+            self.parent.as_raw_fd(),
+            &self.root_name,
+            destination_parent.as_raw_fd(),
+            &destination_name,
+        )?;
+
+        // All fallible work happens before the rename. Once the kernel moves
+        // the exact opened root, rebinding its cleanup parent/name is
+        // infallible and preserves ownership across the publication boundary.
+        self.parent = destination_parent;
+        self.root_name = destination_name;
+        Ok(())
+    }
+
+    pub(crate) fn sync_parent(&self) -> io::Result<()> {
+        // SAFETY: the retained parent descriptor is live for this call and
+        // fsync does not retain it.
+        cvt(unsafe { libc::fsync(self.parent.as_raw_fd()) })
+    }
+
     pub fn remove_owned_tree(&self) -> io::Result<()> {
         self.remove_owned_tree_with_hook(|| {})
     }

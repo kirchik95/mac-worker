@@ -33,6 +33,11 @@ const ROOTED_FS_NAMESPACE: &str = ".mac-worker-rooted-fs";
 #[doc(hidden)]
 pub trait SnapshotHook: Send + Sync {
     fn after_materialization(&self, tree: &Path) -> io::Result<()>;
+
+    #[doc(hidden)]
+    fn after_publication(&self, _capture: &Path) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct NoopSnapshotHook;
@@ -139,7 +144,7 @@ impl<'a> SnapshotBuilder<'a> {
         ensure_directory_chain(&staging)?;
         ensure_directory_chain(&ready)?;
 
-        let (capture_id, partial_path, partial, partial_identity) =
+        let (capture_id, partial_path, mut partial, partial_identity) =
             create_unique_partial(&staging)?;
         let tree_path = partial_path.join("tree");
         let tree = match RootedDir::create(&tree_path) {
@@ -181,7 +186,7 @@ impl<'a> SnapshotBuilder<'a> {
         }
 
         let ready_capture = ready.join(capture_id.to_string());
-        if let Err(error) = rename_no_replace(&partial_path, &ready_capture) {
+        if let Err(error) = partial.publish_owned_to(&ready_capture) {
             let primary = if matches!(error.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) {
                 snapshot_error(
                     "SNAPSHOT_PUBLICATION_CONFLICT",
@@ -192,13 +197,11 @@ impl<'a> SnapshotBuilder<'a> {
             };
             return fail_with_owned_cleanup(&partial, primary);
         }
-
-        let owned_capture = match RootedDir::open(&ready_capture) {
-            Ok(root) => root,
-            Err(error) => return Err(WorkerError::Io(error)),
-        };
-        if let Err(error) = sync_directory(&ready) {
-            return fail_with_owned_cleanup(&owned_capture, WorkerError::Io(error));
+        if let Err(error) = self.hook.after_publication(&ready_capture) {
+            return fail_with_owned_cleanup(&partial, WorkerError::Io(error));
+        }
+        if let Err(error) = partial.sync_parent() {
+            return fail_with_owned_cleanup(&partial, WorkerError::Io(error));
         }
 
         Ok(Snapshot {
@@ -215,7 +218,7 @@ impl<'a> SnapshotBuilder<'a> {
                 .filter(|entry| entry.origin != InputOrigin::Tracked)
                 .count(),
             warning_count: initial.warnings.len(),
-            owned_capture,
+            owned_capture: partial,
         })
     }
 
@@ -257,7 +260,8 @@ impl<'a> SnapshotBuilder<'a> {
         }
 
         for (selected, first) in initial.entries.iter().zip(&entries) {
-            let second = fingerprint_selected(&source, selected).map_err(map_source_error)?;
+            let second =
+                fingerprint_selected(&source, selected).map_err(map_verification_source_error)?;
             if &second != first {
                 return Err(snapshot_error(
                     "SNAPSHOT_CHANGED",
@@ -657,60 +661,6 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-#[cfg(target_vendor = "apple")]
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes()).map_err(path_nul_error)?;
-    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(path_nul_error)?;
-    // SAFETY: both NUL-terminated path buffers remain live for this call.
-    let result = unsafe {
-        libc::renameatx_np(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    cvt(result)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes()).map_err(path_nul_error)?;
-    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(path_nul_error)?;
-    // SAFETY: both NUL-terminated path buffers remain live for this call.
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    cvt(result)
-}
-
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-fn rename_no_replace(_source: &Path, _destination: &Path) -> io::Result<()> {
-    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
-}
-
-fn path_nul_error(_: std::ffi::NulError) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "filesystem path contains a NUL byte",
-    )
-}
-
-fn cvt(result: libc::c_int) -> io::Result<()> {
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 fn effective_user_id() -> u32 {
     // SAFETY: geteuid has no arguments and no memory-safety contract.
     unsafe { libc::geteuid() }
@@ -733,6 +683,16 @@ fn map_source_error(error: io::Error) -> WorkerError {
         );
     }
     WorkerError::Io(error)
+}
+
+fn map_verification_source_error(error: io::Error) -> WorkerError {
+    if error.kind() == io::ErrorKind::InvalidData {
+        return snapshot_error(
+            "SNAPSHOT_CHANGED",
+            "a selected symlink target changed to an unsupported encoding during capture",
+        );
+    }
+    map_source_error(error)
 }
 
 fn manifest_error(error: serde_json::Error) -> WorkerError {

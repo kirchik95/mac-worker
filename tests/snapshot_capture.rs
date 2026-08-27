@@ -1,8 +1,12 @@
 mod support;
 
 use std::{
+    ffi::OsStr,
     fs, io,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{PermissionsExt, symlink},
+    },
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -14,7 +18,7 @@ use mac_worker::{
     process::SystemProcessRunner,
     project::{ProjectContext, ProjectInspector},
     project_config::SnapshotSettings,
-    snapshot::{SnapshotBuilder, SnapshotHook},
+    snapshot::{Snapshot, SnapshotBuilder, SnapshotHook},
 };
 
 use support::{GitRepo, create_directory};
@@ -45,16 +49,37 @@ fn select(context: &ProjectContext, settings: &SnapshotSettings) -> InputSelecti
         .expect("select fixture inputs")
 }
 
-fn capture(
-    repo: &GitRepo,
+fn capture(repo: &GitRepo, cache_root: &Path, settings: &SnapshotSettings) -> Snapshot {
+    let context = inspect(repo);
+    capture_context(&context, cache_root, settings)
+}
+
+fn capture_context(
+    context: &ProjectContext,
     cache_root: &Path,
     settings: &SnapshotSettings,
-) -> mac_worker::snapshot::Snapshot {
-    let context = inspect(repo);
-    let initial = select(&context, settings);
+) -> Snapshot {
+    let initial = select(context, settings);
     SnapshotBuilder::new(&SystemProcessRunner, cache_root)
-        .capture(&context, settings, initial)
+        .capture(context, settings, initial)
         .expect("capture verified snapshot")
+}
+
+fn entry<'a>(snapshot: &'a Snapshot, path: &str) -> &'a ManifestEntry {
+    snapshot
+        .manifest
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .unwrap_or_else(|| panic!("snapshot manifest omitted {path}"))
+}
+
+fn manifest_entry_mut<'a>(manifest: &'a mut SnapshotManifest, path: &str) -> &'a mut ManifestEntry {
+    manifest
+        .entries
+        .iter_mut()
+        .find(|entry| entry.path == path)
+        .unwrap_or_else(|| panic!("snapshot manifest omitted {path}"))
 }
 
 fn mode(path: impl AsRef<Path>) -> u32 {
@@ -201,6 +226,360 @@ fn unchanged_captures_have_identical_manifests_despite_unique_capture_ids() {
     second.cleanup().unwrap();
 }
 
+#[test]
+fn real_capture_hashes_same_length_file_bytes_and_entry_domains_exactly() {
+    // Catches constant, size-only, text-decoded, or non-domain-separated entry
+    // hashes. Both file captures stay dirty against the same HEAD so only the
+    // four payload bytes differ in their manifests.
+    let repo = GitRepo::init();
+    repo.write("payload.bin", b"0000");
+    repo.write("target.txt", b"link target contents\n");
+    symlink("target.txt", repo.root().join("tracked-link")).unwrap();
+    repo.commit_all("track hash fixtures");
+    create_directory(repo.root().join("declared/empty"));
+    repo.write("payload.bin", b"ABCD");
+    let cache = tempfile::tempdir().unwrap();
+    let settings = settings(&[], &["declared/empty"]);
+
+    let first = capture(&repo, cache.path(), &settings);
+    assert!(first.manifest.dirty);
+    assert_eq!(
+        entry(&first, "payload.bin"),
+        &ManifestEntry {
+            path: "payload.bin".into(),
+            kind: ManifestEntryKind::File,
+            mode: 0o644,
+            size: 4,
+            sha256: "e12e115acf4552b2568b55e93cbd39394c4ef81c82447fafc997882a02d23677".into(),
+            symlink_target: None,
+        }
+    );
+    assert_eq!(
+        entry(&first, "tracked-link"),
+        &ManifestEntry {
+            path: "tracked-link".into(),
+            kind: ManifestEntryKind::Symlink,
+            mode: 0o777,
+            size: 10,
+            sha256: "dfd50ff65ada073aad22ed9e89ed05ec4bbb5542dc759e8605b997de20ce2d8c".into(),
+            symlink_target: Some("target.txt".into()),
+        }
+    );
+    assert_eq!(
+        entry(&first, "declared/empty"),
+        &ManifestEntry {
+            path: "declared/empty".into(),
+            kind: ManifestEntryKind::Directory,
+            mode: 0o755,
+            size: 0,
+            sha256: "4b66bf93b3932a9539880b2421e35019af9daf84363a0246280ffcac173b2678".into(),
+            symlink_target: None,
+        }
+    );
+
+    repo.write("payload.bin", b"WXYZ");
+    let second = capture(&repo, cache.path(), &settings);
+    assert!(second.manifest.dirty);
+    assert_eq!(entry(&second, "payload.bin").size, 4);
+    assert_eq!(
+        entry(&second, "payload.bin").sha256,
+        "21e32f5321cad49ab4cf78ba5ed231e0f36d0c78d34108fda1be939f33fba149"
+    );
+    assert_ne!(
+        entry(&first, "payload.bin").sha256,
+        entry(&second, "payload.bin").sha256
+    );
+    let mut normalized_second = second.manifest.clone();
+    manifest_entry_mut(&mut normalized_second, "payload.bin").sha256 =
+        entry(&first, "payload.bin").sha256.clone();
+    assert_eq!(first.manifest, normalized_second);
+    assert_ne!(first.digest, second.digest);
+
+    first.cleanup().unwrap();
+    second.cleanup().unwrap();
+}
+
+#[test]
+fn real_capture_digest_tracks_executable_mode() {
+    let repo = GitRepo::init();
+    repo.write("tool", b"committed\n");
+    fs::set_permissions(repo.root().join("tool"), fs::Permissions::from_mode(0o644)).unwrap();
+    repo.commit_all("track mode fixture");
+    repo.write("tool", b"captured bytes\n");
+    let cache = tempfile::tempdir().unwrap();
+
+    let regular = capture(&repo, cache.path(), &settings(&[], &[]));
+    fs::set_permissions(repo.root().join("tool"), fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = capture(&repo, cache.path(), &settings(&[], &[]));
+
+    assert!(regular.manifest.dirty);
+    assert!(executable.manifest.dirty);
+    assert_eq!(entry(&regular, "tool").mode, 0o644);
+    assert_eq!(entry(&executable, "tool").mode, 0o755);
+    assert_eq!(
+        entry(&regular, "tool").sha256,
+        entry(&executable, "tool").sha256
+    );
+    let mut normalized_executable = executable.manifest.clone();
+    manifest_entry_mut(&mut normalized_executable, "tool").mode = entry(&regular, "tool").mode;
+    assert_eq!(regular.manifest, normalized_executable);
+    assert_ne!(regular.digest, executable.digest);
+
+    regular.cleanup().unwrap();
+    executable.cleanup().unwrap();
+}
+
+#[test]
+fn real_capture_digest_tracks_symlink_target() {
+    let repo = GitRepo::init();
+    symlink("base!", repo.root().join("tracked-link")).unwrap();
+    repo.commit_all("track symlink fixture");
+    fs::remove_file(repo.root().join("tracked-link")).unwrap();
+    symlink("alpha", repo.root().join("tracked-link")).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let alpha = capture(&repo, cache.path(), &settings(&[], &[]));
+    fs::remove_file(repo.root().join("tracked-link")).unwrap();
+    symlink("omega", repo.root().join("tracked-link")).unwrap();
+    let omega = capture(&repo, cache.path(), &settings(&[], &[]));
+
+    assert!(alpha.manifest.dirty);
+    assert!(omega.manifest.dirty);
+    assert_eq!(entry(&alpha, "tracked-link").size, 5);
+    assert_eq!(entry(&omega, "tracked-link").size, 5);
+    assert_eq!(
+        entry(&alpha, "tracked-link").symlink_target.as_deref(),
+        Some("alpha")
+    );
+    assert_eq!(
+        entry(&omega, "tracked-link").symlink_target.as_deref(),
+        Some("omega")
+    );
+    assert_ne!(
+        entry(&alpha, "tracked-link").sha256,
+        entry(&omega, "tracked-link").sha256
+    );
+    let mut normalized_omega = omega.manifest.clone();
+    let normalized_link = manifest_entry_mut(&mut normalized_omega, "tracked-link");
+    normalized_link.sha256 = entry(&alpha, "tracked-link").sha256.clone();
+    normalized_link.symlink_target = entry(&alpha, "tracked-link").symlink_target.clone();
+    assert_eq!(alpha.manifest, normalized_omega);
+    assert_ne!(alpha.digest, omega.digest);
+
+    alpha.cleanup().unwrap();
+    omega.cleanup().unwrap();
+}
+
+#[test]
+fn real_capture_digest_tracks_declared_empty_directory_set() {
+    let repo = GitRepo::init();
+    repo.write("tracked.txt", b"stable\n");
+    repo.commit_all("track empty-directory fixture");
+    create_directory(repo.root().join("declared/empty"));
+    let cache = tempfile::tempdir().unwrap();
+
+    let omitted = capture(&repo, cache.path(), &settings(&[], &[]));
+    let declared = capture(&repo, cache.path(), &settings(&[], &["declared/empty"]));
+
+    assert!(
+        omitted
+            .manifest
+            .entries
+            .iter()
+            .all(|entry| entry.path != "declared/empty")
+    );
+    assert_eq!(
+        entry(&declared, "declared/empty").kind,
+        ManifestEntryKind::Directory
+    );
+    let mut normalized_declared = declared.manifest.clone();
+    normalized_declared
+        .entries
+        .retain(|entry| entry.path != "declared/empty");
+    assert_eq!(omitted.manifest, normalized_declared);
+    assert_ne!(omitted.digest, declared.digest);
+
+    omitted.cleanup().unwrap();
+    declared.cleanup().unwrap();
+}
+
+#[test]
+fn real_capture_digest_tracks_deletion_set() {
+    let repo = GitRepo::init();
+    repo.write("stable.txt", b"stable\n");
+    repo.write("delete-me.txt", b"remove this\n");
+    repo.commit_all("track deletion fixture");
+    fs::remove_file(repo.root().join("delete-me.txt")).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let deleted_from_worktree = capture(&repo, cache.path(), &settings(&[], &[]));
+    assert_eq!(
+        deleted_from_worktree.manifest.tracked_deletions,
+        ["delete-me.txt"]
+    );
+    assert!(
+        repo.git(&["rm", "--cached", "--ignore-unmatch", "delete-me.txt"])
+            .status
+            .success()
+    );
+    let deleted_from_index = capture(&repo, cache.path(), &settings(&[], &[]));
+
+    assert!(deleted_from_index.manifest.tracked_deletions.is_empty());
+    assert_eq!(
+        deleted_from_worktree.manifest.entries,
+        deleted_from_index.manifest.entries
+    );
+    let mut normalized_worktree = deleted_from_worktree.manifest.clone();
+    normalized_worktree.tracked_deletions.clear();
+    assert_eq!(normalized_worktree, deleted_from_index.manifest);
+    assert_ne!(deleted_from_worktree.digest, deleted_from_index.digest);
+
+    deleted_from_worktree.cleanup().unwrap();
+    deleted_from_index.cleanup().unwrap();
+}
+
+#[test]
+fn real_capture_digest_tracks_relative_working_directory() {
+    let repo = GitRepo::init();
+    repo.write("nested/tracked.txt", b"stable\n");
+    repo.commit_all("track relative working directory fixture");
+    let cache = tempfile::tempdir().unwrap();
+    let root_context = inspect(&repo);
+    let nested_context = ProjectInspector::new(&SystemProcessRunner)
+        .inspect(&repo.root().join("nested"))
+        .unwrap();
+    let settings = settings(&[], &[]);
+
+    let root = capture_context(&root_context, cache.path(), &settings);
+    let nested = capture_context(&nested_context, cache.path(), &settings);
+
+    assert_eq!(root.manifest.relative_working_dir, "");
+    assert_eq!(nested.manifest.relative_working_dir, "nested");
+    assert_eq!(root.manifest.entries, nested.manifest.entries);
+    let mut normalized_nested = nested.manifest.clone();
+    normalized_nested.relative_working_dir = root.manifest.relative_working_dir.clone();
+    assert_eq!(root.manifest, normalized_nested);
+    assert_ne!(root.digest, nested.digest);
+
+    root.cleanup().unwrap();
+    nested.cleanup().unwrap();
+}
+
+#[test]
+fn real_capture_digest_tracks_head() {
+    let repo = GitRepo::init();
+    repo.write("tracked.txt", b"stable\n");
+    repo.commit_all("track HEAD fixture");
+    let cache = tempfile::tempdir().unwrap();
+    let before = capture(&repo, cache.path(), &settings(&[], &[]));
+
+    assert!(
+        repo.git(&["commit", "--allow-empty", "-m", "advance HEAD"])
+            .status
+            .success()
+    );
+    let after = capture(&repo, cache.path(), &settings(&[], &[]));
+
+    assert_ne!(before.manifest.head, after.manifest.head);
+    assert_eq!(before.manifest.entries, after.manifest.entries);
+    assert_eq!(before.manifest.project_id, after.manifest.project_id);
+    assert_eq!(before.manifest.worktree_id, after.manifest.worktree_id);
+    let mut normalized_after = after.manifest.clone();
+    normalized_after.head = before.manifest.head.clone();
+    assert_eq!(before.manifest, normalized_after);
+    assert_ne!(before.digest, after.digest);
+
+    before.cleanup().unwrap();
+    after.cleanup().unwrap();
+}
+
+#[test]
+fn real_capture_digest_tracks_project_identity() {
+    let repo = GitRepo::init();
+    repo.write("tracked.txt", b"stable\n");
+    repo.commit_all("track project identity fixture");
+    assert!(
+        repo.git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.test/project-a.git",
+        ])
+        .status
+        .success()
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let first = capture(&repo, cache.path(), &settings(&[], &[]));
+
+    assert!(
+        repo.git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.test/project-b.git",
+        ])
+        .status
+        .success()
+    );
+    let second = capture(&repo, cache.path(), &settings(&[], &[]));
+
+    assert_ne!(first.manifest.project_id, second.manifest.project_id);
+    assert_eq!(first.manifest.worktree_id, second.manifest.worktree_id);
+    assert_eq!(first.manifest.head, second.manifest.head);
+    assert_eq!(first.manifest.entries, second.manifest.entries);
+    let mut normalized_second = second.manifest.clone();
+    normalized_second.project_id = first.manifest.project_id.clone();
+    assert_eq!(first.manifest, normalized_second);
+    assert_ne!(first.digest, second.digest);
+
+    first.cleanup().unwrap();
+    second.cleanup().unwrap();
+}
+
+#[test]
+fn real_capture_digest_tracks_worktree_identity() {
+    let repo = GitRepo::init();
+    repo.write("tracked.txt", b"stable\n");
+    repo.commit_all("track worktree identity fixture");
+    assert!(repo.git(&["checkout", "--detach", "HEAD"]).status.success());
+    let linked_parent = tempfile::tempdir().unwrap();
+    let linked_root = linked_parent.path().join("linked");
+    assert!(
+        repo.git(&[
+            "worktree",
+            "add",
+            "--detach",
+            linked_root.to_str().unwrap(),
+            "HEAD",
+        ])
+        .status
+        .success()
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let primary_context = inspect(&repo);
+    let linked_context = ProjectInspector::new(&SystemProcessRunner)
+        .inspect(&linked_root)
+        .unwrap();
+    let settings = settings(&[], &[]);
+
+    let primary = capture_context(&primary_context, cache.path(), &settings);
+    let linked = capture_context(&linked_context, cache.path(), &settings);
+
+    assert_eq!(primary.manifest.project_id, linked.manifest.project_id);
+    assert_ne!(primary.manifest.worktree_id, linked.manifest.worktree_id);
+    assert_eq!(primary.manifest.head, linked.manifest.head);
+    assert_eq!(primary.manifest.branch, None);
+    assert_eq!(linked.manifest.branch, None);
+    assert_eq!(primary.manifest.entries, linked.manifest.entries);
+    let mut normalized_linked = linked.manifest.clone();
+    normalized_linked.worktree_id = primary.manifest.worktree_id.clone();
+    assert_eq!(primary.manifest, normalized_linked);
+    assert_ne!(primary.digest, linked.digest);
+
+    primary.cleanup().unwrap();
+    linked.cleanup().unwrap();
+}
+
 struct RecordingHook<F> {
     capture_id: Mutex<Option<String>>,
     action: F,
@@ -259,6 +638,14 @@ fn mutate_file_type(root: &Path) -> io::Result<()> {
 fn mutate_symlink_target(root: &Path) -> io::Result<()> {
     fs::remove_file(root.join("tracked-link"))?;
     symlink("different-target", root.join("tracked-link"))
+}
+
+fn mutate_symlink_target_to_non_utf8(root: &Path) -> io::Result<()> {
+    fs::remove_file(root.join("tracked-link"))?;
+    symlink(
+        OsStr::from_bytes(b"non-utf8-\xff-target"),
+        root.join("tracked-link"),
+    )
 }
 
 fn mutate_tracked_deletion(root: &Path) -> io::Result<()> {
@@ -332,11 +719,15 @@ fn assert_snapshot_changed(label: &str, mutation: Mutation) {
 fn every_enumerated_source_mutation_is_rejected_without_publication() {
     // Each case catches a distinct way a second-pass check could compare only
     // file content while missing selection or metadata drift.
-    let cases: [(&str, Mutation); 8] = [
+    let cases: [(&str, Mutation); 9] = [
         ("file bytes", mutate_file_bytes),
         ("file mode", mutate_file_mode),
         ("entry type", mutate_file_type),
         ("symlink target", mutate_symlink_target),
+        (
+            "symlink target becomes non-UTF-8",
+            mutate_symlink_target_to_non_utf8,
+        ),
         ("tracked deletion", mutate_tracked_deletion),
         ("new uncovered untracked", mutate_new_uncovered_untracked),
         ("removed selected path", mutate_removed_path),
@@ -346,6 +737,35 @@ fn every_enumerated_source_mutation_is_rejected_without_publication() {
     for (label, mutation) in cases {
         assert_snapshot_changed(label, mutation);
     }
+}
+
+#[test]
+fn initially_non_utf8_symlink_target_is_unsupported_path_encoding() {
+    // Catches treating an unsupported input present before materialization as
+    // a concurrent source mutation instead of its stable encoding failure.
+    let repo = GitRepo::init();
+    symlink(
+        OsStr::from_bytes(b"non-utf8-\xff-target"),
+        repo.root().join("tracked-link"),
+    )
+    .unwrap();
+    repo.commit_all("track unsupported symlink target");
+    let cache = tempfile::tempdir().unwrap();
+    let context = inspect(&repo);
+    let settings = settings(&[], &[]);
+    let initial = select(&context, &settings);
+
+    let error = SnapshotBuilder::new(&SystemProcessRunner, cache.path())
+        .capture(&context, &settings, initial)
+        .expect_err("initial non-UTF-8 target must be rejected");
+
+    assert!(matches!(
+        error,
+        WorkerError::Snapshot {
+            code: "UNSUPPORTED_PATH_ENCODING",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -510,6 +930,56 @@ fn staging_root_is_new_owner_only_and_contains_no_caller_payload() {
         .unwrap();
 
     snapshot.cleanup().unwrap();
+}
+
+#[derive(Default)]
+struct PostPublicationFailureHook {
+    published: Mutex<Option<PathBuf>>,
+}
+
+impl SnapshotHook for PostPublicationFailureHook {
+    fn after_materialization(&self, _tree: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn after_publication(&self, capture: &Path) -> io::Result<()> {
+        *self.published.lock().unwrap() = Some(capture.to_path_buf());
+        Err(io::Error::from_raw_os_error(libc::EMFILE))
+    }
+}
+
+#[test]
+fn post_rename_failure_removes_only_the_rebound_owned_capture() {
+    // Catches returning an error after publication without retaining an
+    // identity-bound cleanup handle for the directory at its new name.
+    let repo = GitRepo::init();
+    repo.write("tracked.txt", b"published bytes\n");
+    repo.commit_all("track publication failure fixture");
+    let cache = tempfile::tempdir().unwrap();
+    let sibling = capture(&repo, cache.path(), &settings(&[], &[]));
+    let sibling_container = sibling.root.parent().unwrap().to_path_buf();
+    let context = inspect(&repo);
+    let settings = settings(&[], &[]);
+    let initial = select(&context, &settings);
+    let hook = PostPublicationFailureHook::default();
+
+    let error = SnapshotBuilder::with_hook(&SystemProcessRunner, cache.path(), &hook)
+        .capture(&context, &settings, initial)
+        .expect_err("post-publication failure must not return a snapshot");
+
+    match error {
+        WorkerError::Io(error) => assert_eq!(error.raw_os_error(), Some(libc::EMFILE)),
+        other => panic!("post-publication failure had wrong classification: {other}"),
+    }
+    let failed_capture = hook.published.lock().unwrap().clone().unwrap();
+    assert!(!failed_capture.exists());
+    assert!(sibling_container.exists());
+    assert_eq!(
+        fs::read(sibling.root.join("tracked.txt")).unwrap(),
+        b"published bytes\n"
+    );
+
+    sibling.cleanup().unwrap();
 }
 
 #[test]
