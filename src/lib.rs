@@ -13,6 +13,7 @@ use transport::{SshTransport, WorkersService};
 
 pub mod cli;
 pub mod config;
+pub mod doctor;
 pub mod error;
 pub mod inputs;
 pub mod install;

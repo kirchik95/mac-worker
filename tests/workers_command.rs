@@ -338,6 +338,53 @@ fn inventory_keeps_ready_and_failed_workers_in_config_order() {
 }
 
 #[test]
+fn inspect_with_requirements_adds_project_capabilities_without_changing_inventory_inspection() {
+    // Catches project requirements being ignored, copied into the inventory,
+    // or applied before the worker's declared capability order.
+    let runner = RecordingRunner::returning_results(vec![
+        Ok(ProcessResult {
+            status: exit_status(0),
+            stdout: br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":["darwin-arm64","node"]}"#.to_vec(),
+            stderr: Vec::new(),
+        }),
+        Ok(ProcessResult {
+            status: exit_status(0),
+            stdout: br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":["darwin-arm64","node"]}"#.to_vec(),
+            stderr: Vec::new(),
+        }),
+    ]);
+    let config = Config {
+        version: 1,
+        workers: vec![worker("mini-1", "mac1", &["darwin-arm64"])],
+    };
+    let service = WorkersService::new(SshTransport::new(runner));
+
+    let project_report = service.inspect_with_requirements(
+        &config,
+        &[
+            "node".into(),
+            "darwin-arm64".into(),
+            "node".into(),
+            "docker".into(),
+        ],
+    );
+    let inventory_report = service.inspect(&config);
+
+    assert_eq!(project_report.workers[0].status, HealthStatus::Unavailable);
+    assert_eq!(
+        project_report.workers[0].missing_capabilities,
+        vec!["docker"]
+    );
+    assert_eq!(
+        project_report.workers[0].error_message.as_deref(),
+        Some("worker is missing required capabilities: docker")
+    );
+    assert_eq!(inventory_report.workers[0].status, HealthStatus::Ready);
+    assert!(inventory_report.workers[0].missing_capabilities.is_empty());
+    assert_eq!(config.workers[0].capabilities, ["darwin-arm64"]);
+}
+
+#[test]
 fn system_runner_passes_arguments_without_shell_interpretation() {
     let literal = "$(printf injected); $HOME *";
     let request = ProcessRequest {

@@ -45,6 +45,43 @@ pub struct WorkersReport {
     pub workers: Vec<WorkerHealth>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DoctorReport {
+    pub version: u32,
+    pub ready: bool,
+    pub project: DoctorProject,
+    pub requirements: Vec<String>,
+    pub snapshot: Option<crate::snapshot::SnapshotSummary>,
+    pub workers: Vec<WorkerHealth>,
+    pub issues: Vec<DoctorIssue>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct DoctorProject {
+    pub display_name: String,
+    pub project_id: String,
+    pub worktree_id: String,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub dirty: bool,
+    pub relative_working_dir: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct DoctorIssue {
+    pub severity: IssueSeverity,
+    pub code: String,
+    pub message: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueSeverity {
+    Blocker,
+    Warning,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SetupHostResult {
     pub name: String,

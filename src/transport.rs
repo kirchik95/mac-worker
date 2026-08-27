@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use crate::{
     config::{Config, WorkerEntry},
@@ -37,6 +37,24 @@ impl<R: ProcessRunner> WorkersService<R> {
                 .collect(),
         }
     }
+
+    pub fn inspect_with_requirements(
+        &self,
+        config: &Config,
+        requirements: &[String],
+    ) -> WorkersReport {
+        WorkersReport {
+            protocol_version: PROTOCOL_VERSION,
+            workers: config
+                .workers
+                .iter()
+                .map(|worker| {
+                    let required = stable_required_capabilities(worker, requirements);
+                    self.transport.probe_with_failure_kind(worker, &required).0
+                })
+                .collect(),
+        }
+    }
 }
 
 impl<R: ProcessRunner> SshTransport<R> {
@@ -45,19 +63,37 @@ impl<R: ProcessRunner> SshTransport<R> {
     }
 
     pub fn probe(&self, worker: &WorkerEntry) -> WorkerHealth {
-        self.probe_with_failure_kind(worker).0
+        self.probe_with_failure_kind(worker, &worker.capabilities).0
     }
 
     pub(crate) fn probe_with_failure_kind(
         &self,
         worker: &WorkerEntry,
+        required_capabilities: &[String],
     ) -> (WorkerHealth, Option<SetupFailureKind>) {
-        self.probe_with_command_and_failure_kind(worker, REMOTE_PROBE_COMMAND.into())
+        self.probe_with_required_command_and_failure_kind(
+            worker,
+            required_capabilities,
+            REMOTE_PROBE_COMMAND.into(),
+        )
     }
 
     pub(crate) fn probe_with_command_and_failure_kind(
         &self,
         worker: &WorkerEntry,
+        remote_command: String,
+    ) -> (WorkerHealth, Option<SetupFailureKind>) {
+        self.probe_with_required_command_and_failure_kind(
+            worker,
+            &worker.capabilities,
+            remote_command,
+        )
+    }
+
+    fn probe_with_required_command_and_failure_kind(
+        &self,
+        worker: &WorkerEntry,
+        required_capabilities: &[String],
         remote_command: String,
     ) -> (WorkerHealth, Option<SetupFailureKind>) {
         let result = match self.runner.run(&ssh_request(
@@ -185,14 +221,19 @@ impl<R: ProcessRunner> SshTransport<R> {
             );
         }
 
-        let missing = missing_capabilities(&worker.capabilities, &probe);
+        let missing = missing_capabilities(required_capabilities, &probe);
         if !missing.is_empty() {
+            let capability_kind = if required_capabilities == worker.capabilities.as_slice() {
+                "declared"
+            } else {
+                "required"
+            };
             return (
                 unavailable(
                     worker,
                     "MISSING_CAPABILITIES",
                     format!(
-                        "worker is missing declared capabilities: {}",
+                        "worker is missing {capability_kind} capabilities: {}",
                         missing.join(", ")
                     ),
                     Some(probe),
@@ -215,6 +256,17 @@ impl<R: ProcessRunner> SshTransport<R> {
             None,
         )
     }
+}
+
+fn stable_required_capabilities(worker: &WorkerEntry, requirements: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    worker
+        .capabilities
+        .iter()
+        .chain(requirements)
+        .filter(|capability| seen.insert(capability.as_str()))
+        .cloned()
+        .collect()
 }
 
 pub(crate) fn ssh_request(
