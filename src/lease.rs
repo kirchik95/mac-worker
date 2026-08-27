@@ -126,6 +126,15 @@ impl<'a> LeaseService<'a> {
         self.load_locked()
     }
 
+    pub(crate) fn load_after(
+        &self,
+        admission: &crate::host_store::AdmissionGuard,
+        job: JobId,
+    ) -> Result<Option<LeaseRecord>, WorkerError> {
+        admission.validate_for(job)?;
+        self.load_locked()
+    }
+
     pub fn occupancy(&self) -> Result<LeaseOccupancy, WorkerError> {
         occupancy_from_lease(self.load()?)
     }
@@ -393,16 +402,22 @@ mod lifecycle_tests {
     }
 
     fn publish_job(store: &HostStore, lease: &LeaseRecord) {
-        let staged = store
+        let mut staged = store
             .begin_job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap();
         let payload = RelativePath::parse(b"payload").unwrap();
         staged
-            .rooted_dir()
+            .create_workspace_tree()
+            .unwrap()
             .create_empty_directory(&payload)
             .unwrap();
         let receipt = staged
-            .complete_materialization(&BTreeSet::from([payload]))
+            .complete_snapshot_materialization(
+                &BTreeSet::from([payload]),
+                lease.project_id(),
+                lease.worktree_id(),
+                lease.manifest_digest(),
+            )
             .unwrap();
         staged.publish_complete(receipt).unwrap();
     }
@@ -485,6 +500,7 @@ mod lifecycle_tests {
         let job = store
             .job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap();
+        fs::remove_dir_all(job.join("workspace")).unwrap();
         symlink(&outside, job.join("workspace")).unwrap();
 
         assert!(store.cleanup_job_owned(&lease).is_err());

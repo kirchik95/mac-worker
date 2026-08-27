@@ -41,6 +41,8 @@ pub enum HostCommand {
     Probe,
     #[command(name = "lease-acquire")]
     LeaseAcquire,
+    #[command(name = "snapshot-verify")]
+    SnapshotVerify,
     #[command(name = "rsync-receive", trailing_var_arg = true)]
     RsyncReceive {
         job_id: HiddenComponent,

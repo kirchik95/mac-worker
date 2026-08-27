@@ -11,6 +11,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::inputs::RelativePath;
 
 const DIRECTORY_OPEN_FLAGS: libc::c_int =
@@ -24,6 +26,47 @@ const PRIVATE_NAMESPACE_NAME: &CStr = c".mac-worker-rooted-fs";
 pub enum EntryKind {
     RegularFile,
     Symlink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotProjection {
+    TransportOrOwner,
+    OwnerOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotFsKind {
+    RegularFile,
+    Directory,
+    Symlink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotFileRead {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) mode: u32,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotTreeEntry {
+    pub(crate) path: RelativePath,
+    pub(crate) kind: SnapshotFsKind,
+    pub(crate) mode: u32,
+    pub(crate) size: u64,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) sha256: Option<String>,
+    pub(crate) symlink_target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotTreeInspection {
+    pub(crate) root_mode: u32,
+    pub(crate) root_device: u64,
+    pub(crate) root_inode: u64,
+    pub(crate) entries: Vec<SnapshotTreeEntry>,
 }
 
 #[cfg(test)]
@@ -685,6 +728,15 @@ impl RootedDir {
     }
 
     pub(crate) fn read_private_regular(&self, name: &str, maximum: u64) -> io::Result<Vec<u8>> {
+        self.read_private_regular_with_hook(name, maximum, || {})
+    }
+
+    fn read_private_regular_with_hook(
+        &self,
+        name: &str,
+        maximum: u64,
+        after_open: impl FnOnce(),
+    ) -> io::Result<Vec<u8>> {
         self.verify_root_name()?;
         let name = CString::new(name).map_err(interior_nul_error)?;
         let path_stat = stat_at(self.root.as_raw_fd(), &name)?;
@@ -701,8 +753,10 @@ impl RootedDir {
                 "host file exceeds limit",
             ));
         }
+        after_open();
         let mut bytes = Vec::new();
-        File::from(descriptor)
+        let mut file = File::from(descriptor);
+        Read::by_ref(&mut file)
             .take(maximum.saturating_add(1))
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > maximum {
@@ -711,7 +765,177 @@ impl RootedDir {
                 "host file exceeds limit",
             ));
         }
+        let after = stat_fd(file.as_raw_fd())?;
+        let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular(&after)?;
+        require_private_regular(&rebound)?;
+        if bytes.len() as u64 != path_stat.st_size as u64
+            || !snapshot_metadata_stable(&path_stat, &after)
+            || !snapshot_metadata_stable(&path_stat, &rebound)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        self.verify_root_name()?;
         Ok(bytes)
+    }
+
+    pub(crate) fn validate_snapshot_root(&self, expected_mode: u32) -> io::Result<()> {
+        self.verify_root_name()?;
+        let metadata = stat_fd(self.root.as_raw_fd())?;
+        require_snapshot_entry(&metadata, metadata.st_dev as u64)?;
+        if file_type(metadata.st_mode) != libc::S_IFDIR
+            || (metadata.st_mode & 0o777) as u32 != expected_mode
+        {
+            return Err(snapshot_policy_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_snapshot_regular(
+        &self,
+        name: &str,
+        maximum: u64,
+        projection: SnapshotProjection,
+    ) -> io::Result<SnapshotFileRead> {
+        self.verify_root_name()?;
+        let root = stat_fd(self.root.as_raw_fd())?;
+        let expected_device = root.st_dev as u64;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let before = stat_at(self.root.as_raw_fd(), &name)?;
+        require_snapshot_regular(&before, expected_device, projection)?;
+        let descriptor = open_regular_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(descriptor.as_raw_fd())?;
+        require_snapshot_regular(&opened, expected_device, projection)?;
+        if !snapshot_metadata_stable(&before, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        if opened.st_size < 0 || opened.st_size as u64 > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot regular file exceeds its byte limit",
+            ));
+        }
+        let mut bytes = Vec::new();
+        let mut file = File::from(descriptor);
+        Read::by_ref(&mut file)
+            .take(maximum.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot regular file exceeds its byte limit",
+            ));
+        }
+        let after = stat_fd(file.as_raw_fd())?;
+        let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+        if bytes.len() as u64 != before.st_size as u64
+            || !snapshot_metadata_stable(&before, &after)
+            || !snapshot_metadata_stable(&before, &rebound)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        self.verify_root_name()?;
+        Ok(SnapshotFileRead {
+            bytes,
+            mode: (before.st_mode & 0o7777) as u32,
+            device: before.st_dev as u64,
+            inode: before.st_ino,
+        })
+    }
+
+    pub(crate) fn inspect_snapshot_tree(
+        &self,
+        name: &str,
+        projection: SnapshotProjection,
+    ) -> io::Result<SnapshotTreeInspection> {
+        self.verify_root_name()?;
+        let bundle = stat_fd(self.root.as_raw_fd())?;
+        let expected_device = bundle.st_dev as u64;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let before = stat_at(self.root.as_raw_fd(), &name)?;
+        require_snapshot_directory(&before, expected_device, projection)?;
+        let directory = open_directory_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(directory.as_raw_fd())?;
+        require_snapshot_directory(&opened, expected_device, projection)?;
+        if !snapshot_metadata_stable(&before, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        let mut identities = BTreeSet::from([(before.st_dev as u64, before.st_ino)]);
+        let mut entries = Vec::new();
+        inspect_snapshot_directory(
+            directory.as_raw_fd(),
+            "",
+            expected_device,
+            projection,
+            &mut identities,
+            &mut entries,
+        )?;
+        let after = stat_fd(directory.as_raw_fd())?;
+        let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+        if !snapshot_metadata_stable(&before, &after)
+            || !snapshot_metadata_stable(&before, &rebound)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        self.verify_root_name()?;
+        entries.sort_by(|left, right| {
+            left.path
+                .as_str()
+                .as_bytes()
+                .cmp(right.path.as_str().as_bytes())
+        });
+        Ok(SnapshotTreeInspection {
+            root_mode: (before.st_mode & 0o777) as u32,
+            root_device: before.st_dev as u64,
+            root_inode: before.st_ino,
+            entries,
+        })
+    }
+
+    pub(crate) fn prepare_snapshot_for_publication_with_hook(
+        &self,
+        mut after_first_conversion: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        let metadata = stat_fd(self.root.as_raw_fd())?;
+        require_snapshot_entry(&metadata, metadata.st_dev as u64)?;
+        if file_type(metadata.st_mode) != libc::S_IFDIR
+            || !matches!((metadata.st_mode & 0o777) as u32, 0o700 | 0o500)
+        {
+            return Err(snapshot_policy_error());
+        }
+        let mut first_conversion = true;
+        make_snapshot_directory_owner_only(
+            self.root.as_raw_fd(),
+            metadata.st_dev as u64,
+            &mut || {
+                if first_conversion {
+                    first_conversion = false;
+                    after_first_conversion()?;
+                }
+                Ok(())
+            },
+        )?;
+        // Darwin requires the moved directory itself to remain owner-writable
+        // for renamex_np. Every child is already immutable here; the retained
+        // descriptor seals this root immediately after the no-replace rename.
+        chmod_fd(self.root.as_raw_fd(), 0o700)?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
+        self.verify_root_name()
+    }
+
+    pub(crate) fn seal_snapshot_root(&self) -> io::Result<()> {
+        self.verify_root_name()?;
+        let metadata = stat_fd(self.root.as_raw_fd())?;
+        require_snapshot_entry(&metadata, metadata.st_dev as u64)?;
+        if file_type(metadata.st_mode) != libc::S_IFDIR
+            || !matches!((metadata.st_mode & 0o7777) as u32, 0o700 | 0o500)
+        {
+            return Err(snapshot_policy_error());
+        }
+        chmod_fd(self.root.as_raw_fd(), 0o500)?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
+        self.verify_root_name()
     }
 
     pub(crate) fn open_private_regular_handle(&self, name: &str) -> io::Result<File> {
@@ -734,6 +958,25 @@ impl RootedDir {
         bytes: &[u8],
     ) -> io::Result<()> {
         self.write_private_atomic_no_replace_with_hook(name, bytes, || {})
+    }
+
+    pub(crate) fn write_private_atomic_no_replace_with_commit_hooks(
+        &self,
+        name: &str,
+        staging_name: &str,
+        bytes: &[u8],
+        after_file_sync: impl FnOnce() -> io::Result<()>,
+        after_publish: impl FnOnce() -> io::Result<()>,
+        after_parent_sync: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.write_private_atomic_no_replace_with_all_hooks(
+            (name, Some(staging_name)),
+            bytes,
+            after_file_sync,
+            after_publish,
+            after_parent_sync,
+            (|| {}, || {}),
+        )
     }
 
     pub(crate) fn write_private_atomic_no_replace_with_identity(
@@ -811,6 +1054,27 @@ impl RootedDir {
         after_final_validation: impl FnOnce(),
         before_recovery: impl FnOnce(),
     ) -> io::Result<()> {
+        self.write_private_atomic_no_replace_with_all_hooks(
+            (name, None),
+            bytes,
+            || Ok(()),
+            || Ok(()),
+            || Ok(()),
+            (after_final_validation, before_recovery),
+        )
+    }
+
+    fn write_private_atomic_no_replace_with_all_hooks(
+        &self,
+        names: (&str, Option<&str>),
+        bytes: &[u8],
+        after_file_sync: impl FnOnce() -> io::Result<()>,
+        after_publish: impl FnOnce() -> io::Result<()>,
+        after_parent_sync: impl FnOnce() -> io::Result<()>,
+        race_hooks: (impl FnOnce(), impl FnOnce()),
+    ) -> io::Result<()> {
+        let (after_final_validation, before_recovery) = race_hooks;
+        let (name, staging_name) = names;
         self.verify_root_name()?;
         let namespace = PrivateNamespace::select(
             self.parent.as_raw_fd(),
@@ -821,11 +1085,21 @@ impl RootedDir {
             }],
         )?;
         let target = CString::new(name).map_err(interior_nul_error)?;
-        let temporary = random_private_name("write");
+        let retain_staging_on_hook_error = staging_name.is_some();
+        let temporary = match staging_name {
+            Some(staging_name) => CString::new(staging_name).map_err(interior_nul_error)?,
+            None => random_private_name("write"),
+        };
         let descriptor = create_regular_at(self.root.as_raw_fd(), &temporary)?;
         let mut file = File::from(descriptor);
         file.write_all(bytes)?;
         file.sync_all()?;
+        if let Err(error) = after_file_sync() {
+            if !retain_staging_on_hook_error {
+                let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
+            }
+            return Err(error);
+        }
         let file_identity = FileIdentity::from_stat(&stat_fd(file.as_raw_fd())?);
         self.verify_root_name()?;
         after_final_validation();
@@ -852,7 +1126,9 @@ impl RootedDir {
                 Err(recovery_error) => Err(recovery_error),
             };
         }
-        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+        after_publish()?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
+        after_parent_sync()
     }
 
     pub(crate) fn write_new_private_file(&self, name: &str, bytes: &[u8]) -> io::Result<File> {
@@ -984,6 +1260,21 @@ impl RootedDir {
         self.publish_owned_into_with_hook(destination_parent, destination_name, || {})
     }
 
+    pub(crate) fn publish_owned_into_with_post_rename(
+        &mut self,
+        destination_parent: &RootedDir,
+        destination_name: &str,
+        after_rename: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.publish_owned_into_with_hooks(
+            destination_parent,
+            destination_name,
+            || {},
+            after_rename,
+            || {},
+        )
+    }
+
     fn publish_owned_into_with_hook(
         &mut self,
         destination_parent: &RootedDir,
@@ -994,6 +1285,7 @@ impl RootedDir {
             destination_parent,
             destination_name,
             after_final_validation,
+            || Ok(()),
             || {},
         )
     }
@@ -1003,6 +1295,7 @@ impl RootedDir {
         destination_parent: &RootedDir,
         destination_name: &str,
         after_final_validation: impl FnOnce(),
+        after_rename: impl FnOnce() -> io::Result<()>,
         before_recovery: impl FnOnce(),
     ) -> io::Result<()> {
         self.verify_root_name()?;
@@ -1043,6 +1336,7 @@ impl RootedDir {
             destination_parent.root.as_raw_fd(),
             &destination_name,
         )?;
+        after_rename()?;
         let published = stat_at(destination_parent.root.as_raw_fd(), &destination_name);
         let validation = published.and_then(|published| {
             let opened = stat_fd(self.root.as_raw_fd())?;
@@ -1152,6 +1446,7 @@ impl RootedDir {
         Ok(())
     }
 
+    #[allow(dead_code)] // Existing staged-publication integrity boundary.
     pub(crate) fn validate_and_sync_declared_tree(
         &self,
         declared: &BTreeSet<RelativePath>,
@@ -1169,6 +1464,22 @@ impl RootedDir {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "staged tree does not match its declaration",
+            ));
+        }
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
+    pub(crate) fn validate_and_sync_snapshot_workspace(
+        &self,
+        declared: &BTreeSet<RelativePath>,
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        let mut actual = BTreeSet::new();
+        collect_and_sync_tree(self.root.as_raw_fd(), "", &mut actual)?;
+        if &actual != declared {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workspace tree does not match its verified snapshot",
             ));
         }
         cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
@@ -1265,6 +1576,86 @@ impl RootedDir {
             &destination_name,
             destination_mode,
         )
+    }
+
+    pub(crate) fn copy_snapshot_regular_to_writable(
+        &self,
+        path: &RelativePath,
+        destination: &RootedDir,
+        executable: bool,
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        destination.verify_root_name()?;
+        let source_root = stat_fd(self.root.as_raw_fd())?;
+        let source_device = source_root.st_dev as u64;
+        require_snapshot_directory(&source_root, source_device, SnapshotProjection::OwnerOnly)?;
+        let (source_parent, source_name, source_lineage) =
+            self.open_private_parent(path, false, self.security_device)?;
+        let before = stat_at(source_parent.as_raw_fd(), &source_name)?;
+        require_snapshot_regular(&before, source_device, SnapshotProjection::OwnerOnly)?;
+        let source = open_regular_at(source_parent.as_raw_fd(), &source_name)?;
+        let opened = stat_fd(source.as_raw_fd())?;
+        require_snapshot_regular(&opened, source_device, SnapshotProjection::OwnerOnly)?;
+        if !snapshot_metadata_stable(&before, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        let namespace = PrivateNamespace::select(
+            destination.parent.as_raw_fd(),
+            destination.root_identity.device as libc::dev_t,
+            &[
+                DirectoryIdentity {
+                    descriptor: self.root.as_raw_fd(),
+                    identity: self.root_identity,
+                },
+                DirectoryIdentity {
+                    descriptor: destination.root.as_raw_fd(),
+                    identity: destination.root_identity,
+                },
+            ],
+        )?;
+        let (destination_parent, destination_name) = destination.open_parent(path, true)?;
+        let destination_device = stat_fd(destination_parent.as_raw_fd())?.st_dev as u64;
+        if destination_device != destination.root_identity.device {
+            return Err(os_error(libc::EXDEV));
+        }
+        copy_regular_in_namespace(
+            duplicate_fd(source.as_raw_fd())?,
+            &namespace,
+            &destination_parent,
+            &destination_name,
+            if executable { 0o700 } else { 0o600 },
+        )?;
+
+        let after = stat_fd(source.as_raw_fd())?;
+        let rebound = stat_at(source_parent.as_raw_fd(), &source_name)?;
+        if !snapshot_metadata_stable(&before, &after)
+            || !snapshot_metadata_stable(&before, &rebound)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        verify_lineage(&source_lineage)?;
+        self.verify_root_name()?;
+
+        let destination_path_stat = stat_at(destination_parent.as_raw_fd(), &destination_name)?;
+        let destination_file = open_regular_at(destination_parent.as_raw_fd(), &destination_name)?;
+        let destination_opened = stat_fd(destination_file.as_raw_fd())?;
+        let expected_mode = if executable { 0o700 } else { 0o600 };
+        if file_type(destination_path_stat.st_mode) != libc::S_IFREG
+            || file_type(destination_opened.st_mode) != libc::S_IFREG
+            || destination_path_stat.st_uid != unsafe { libc::geteuid() }
+            || destination_opened.st_uid != unsafe { libc::geteuid() }
+            || destination_path_stat.st_dev as u64 != destination_device
+            || destination_opened.st_dev as u64 != destination_device
+            || destination_path_stat.st_nlink != 1
+            || destination_opened.st_nlink != 1
+            || (destination_path_stat.st_mode & 0o7777) as u32 != expected_mode
+            || (destination_opened.st_mode & 0o7777) as u32 != expected_mode
+            || !same_file(&destination_path_stat, &destination_opened)
+            || same_file(&opened, &destination_opened)
+        {
+            return Err(snapshot_policy_error());
+        }
+        destination.verify_root_name()
     }
 
     pub fn create_empty_directory(&self, path: &RelativePath) -> io::Result<()> {
@@ -1908,6 +2299,7 @@ fn stat_fd(descriptor: RawFd) -> io::Result<libc::stat> {
 fn require_private_regular(metadata: &libc::stat) -> io::Result<()> {
     if file_type(metadata.st_mode) != libc::S_IFREG
         || metadata.st_uid != unsafe { libc::geteuid() }
+        || metadata.st_nlink != 1
         || metadata.st_mode & 0o077 != 0
     {
         return Err(io::Error::new(
@@ -1982,6 +2374,325 @@ fn collect_and_sync_tree(
         }
     }
     Ok(())
+}
+
+fn inspect_snapshot_directory(
+    directory: RawFd,
+    prefix: &str,
+    expected_device: u64,
+    projection: SnapshotProjection,
+    identities: &mut BTreeSet<(u64, u64)>,
+    entries: &mut Vec<SnapshotTreeEntry>,
+) -> io::Result<()> {
+    for name in directory_entries(directory)? {
+        let name_text = std::str::from_utf8(name.to_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot entry name is not valid UTF-8",
+            )
+        })?;
+        let path = if prefix.is_empty() {
+            name_text.to_owned()
+        } else {
+            format!("{prefix}/{name_text}")
+        };
+        let relative = RelativePath::parse(path.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "snapshot entry path is unsafe")
+        })?;
+        let before = stat_at(directory, &name)?;
+        require_snapshot_entry(&before, expected_device)?;
+        if !identities.insert((before.st_dev as u64, before.st_ino)) {
+            return Err(snapshot_policy_error());
+        }
+        match file_type(before.st_mode) {
+            libc::S_IFDIR => {
+                require_snapshot_directory(&before, expected_device, projection)?;
+                let child = open_directory_at(directory, &name)?;
+                let opened = stat_fd(child.as_raw_fd())?;
+                require_snapshot_directory(&opened, expected_device, projection)?;
+                if !snapshot_metadata_stable(&before, &opened) {
+                    return Err(os_error(libc::ESTALE));
+                }
+                entries.push(SnapshotTreeEntry {
+                    path: relative,
+                    kind: SnapshotFsKind::Directory,
+                    mode: (before.st_mode & 0o7777) as u32,
+                    size: 0,
+                    device: before.st_dev as u64,
+                    inode: before.st_ino,
+                    sha256: None,
+                    symlink_target: None,
+                });
+                inspect_snapshot_directory(
+                    child.as_raw_fd(),
+                    &path,
+                    expected_device,
+                    projection,
+                    identities,
+                    entries,
+                )?;
+                let after = stat_fd(child.as_raw_fd())?;
+                let rebound = stat_at(directory, &name)?;
+                if !snapshot_metadata_stable(&before, &after)
+                    || !snapshot_metadata_stable(&before, &rebound)
+                {
+                    return Err(os_error(libc::ESTALE));
+                }
+            }
+            libc::S_IFREG => {
+                require_snapshot_regular(&before, expected_device, projection)?;
+                let descriptor = open_regular_at(directory, &name)?;
+                let opened = stat_fd(descriptor.as_raw_fd())?;
+                require_snapshot_regular(&opened, expected_device, projection)?;
+                if !snapshot_metadata_stable(&before, &opened) {
+                    return Err(os_error(libc::ESTALE));
+                }
+                let mut file = File::from(descriptor);
+                let mut hasher = Sha256::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                let mut bytes_read = 0_u64;
+                loop {
+                    let count = file.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    bytes_read = bytes_read
+                        .checked_add(count as u64)
+                        .ok_or_else(snapshot_policy_error)?;
+                    hasher.update(&buffer[..count]);
+                }
+                let after = stat_fd(file.as_raw_fd())?;
+                let rebound = stat_at(directory, &name)?;
+                if before.st_size < 0
+                    || bytes_read != before.st_size as u64
+                    || !snapshot_metadata_stable(&before, &after)
+                    || !snapshot_metadata_stable(&before, &rebound)
+                {
+                    return Err(os_error(libc::ESTALE));
+                }
+                entries.push(SnapshotTreeEntry {
+                    path: relative,
+                    kind: SnapshotFsKind::RegularFile,
+                    mode: (before.st_mode & 0o7777) as u32,
+                    size: bytes_read,
+                    device: before.st_dev as u64,
+                    inode: before.st_ino,
+                    sha256: Some(format!("{:x}", hasher.finalize())),
+                    symlink_target: None,
+                });
+            }
+            libc::S_IFLNK => {
+                require_snapshot_symlink(&before, expected_device)?;
+                let target = read_link_at(directory, &name, before.st_size)?;
+                let after = stat_at(directory, &name)?;
+                if !snapshot_metadata_stable(&before, &after)
+                    || before.st_size < 0
+                    || target.len() as u64 != before.st_size as u64
+                {
+                    return Err(os_error(libc::ESTALE));
+                }
+                let target = String::from_utf8(target).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snapshot symlink target is not valid UTF-8",
+                    )
+                })?;
+                let mut hasher = Sha256::new();
+                hasher.update(b"symlink\0");
+                hasher.update(target.as_bytes());
+                entries.push(SnapshotTreeEntry {
+                    path: relative,
+                    kind: SnapshotFsKind::Symlink,
+                    mode: (before.st_mode & 0o7777) as u32,
+                    size: target.len() as u64,
+                    device: before.st_dev as u64,
+                    inode: before.st_ino,
+                    sha256: Some(format!("{:x}", hasher.finalize())),
+                    symlink_target: Some(target),
+                });
+            }
+            _ => return Err(invalid_type_error()),
+        }
+    }
+    Ok(())
+}
+
+fn require_snapshot_entry(metadata: &libc::stat, expected_device: u64) -> io::Result<()> {
+    if metadata.st_uid != unsafe { libc::geteuid() } || metadata.st_dev as u64 != expected_device {
+        return Err(snapshot_policy_error());
+    }
+    Ok(())
+}
+
+fn require_snapshot_directory(
+    metadata: &libc::stat,
+    expected_device: u64,
+    projection: SnapshotProjection,
+) -> io::Result<()> {
+    require_snapshot_entry(metadata, expected_device)?;
+    let mode = (metadata.st_mode & 0o7777) as u32;
+    let valid_mode = match projection {
+        SnapshotProjection::TransportOrOwner => matches!(mode, 0o555 | 0o500),
+        SnapshotProjection::OwnerOnly => mode == 0o500,
+    };
+    if file_type(metadata.st_mode) != libc::S_IFDIR || !valid_mode {
+        return Err(snapshot_policy_error());
+    }
+    Ok(())
+}
+
+fn require_snapshot_regular(
+    metadata: &libc::stat,
+    expected_device: u64,
+    projection: SnapshotProjection,
+) -> io::Result<()> {
+    require_snapshot_entry(metadata, expected_device)?;
+    let mode = (metadata.st_mode & 0o7777) as u32;
+    let valid_mode = match projection {
+        SnapshotProjection::TransportOrOwner => {
+            matches!(mode, 0o444 | 0o555 | 0o400 | 0o500)
+        }
+        SnapshotProjection::OwnerOnly => matches!(mode, 0o400 | 0o500),
+    };
+    if file_type(metadata.st_mode) != libc::S_IFREG
+        || metadata.st_nlink != 1
+        || metadata.st_size < 0
+        || !valid_mode
+    {
+        return Err(snapshot_policy_error());
+    }
+    Ok(())
+}
+
+fn require_snapshot_symlink(metadata: &libc::stat, expected_device: u64) -> io::Result<()> {
+    require_snapshot_entry(metadata, expected_device)?;
+    if file_type(metadata.st_mode) != libc::S_IFLNK
+        || metadata.st_nlink != 1
+        || metadata.st_size < 0
+        || !snapshot_symlink_mode_valid((metadata.st_mode & 0o7777) as u32)
+    {
+        return Err(snapshot_policy_error());
+    }
+    Ok(())
+}
+
+fn snapshot_symlink_mode_valid(mode: u32) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        // Darwin applies the process umask when creating symlinks and offers
+        // no descriptor-relative, no-follow chmod primitive. Both modes are
+        // emitted by the local builder/rsync path and are metadata-only.
+        matches!(mode, 0o755 | 0o777)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        mode == 0o777
+    }
+}
+
+fn snapshot_metadata_stable(left: &libc::stat, right: &libc::stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode == right.st_mode
+        && left.st_nlink == right.st_nlink
+        && left.st_uid == right.st_uid
+        && left.st_gid == right.st_gid
+        && left.st_size == right.st_size
+        && left.st_mtime == right.st_mtime
+        && left.st_mtime_nsec == right.st_mtime_nsec
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
+}
+
+fn make_snapshot_directory_owner_only(
+    directory: RawFd,
+    expected_device: u64,
+    after_conversion: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    for name in directory_entries(directory)? {
+        let before = stat_at(directory, &name)?;
+        require_snapshot_entry(&before, expected_device)?;
+        match file_type(before.st_mode) {
+            libc::S_IFDIR => {
+                require_snapshot_directory(
+                    &before,
+                    expected_device,
+                    SnapshotProjection::TransportOrOwner,
+                )?;
+                let child = open_directory_at(directory, &name)?;
+                let opened = stat_fd(child.as_raw_fd())?;
+                require_snapshot_directory(
+                    &opened,
+                    expected_device,
+                    SnapshotProjection::TransportOrOwner,
+                )?;
+                if !snapshot_metadata_stable(&before, &opened) {
+                    return Err(os_error(libc::ESTALE));
+                }
+                make_snapshot_directory_owner_only(
+                    child.as_raw_fd(),
+                    expected_device,
+                    after_conversion,
+                )?;
+                chmod_fd(child.as_raw_fd(), 0o500)?;
+                cvt(unsafe { libc::fsync(child.as_raw_fd()) })?;
+                let after = stat_fd(child.as_raw_fd())?;
+                let rebound = stat_at(directory, &name)?;
+                require_snapshot_directory(&after, expected_device, SnapshotProjection::OwnerOnly)?;
+                require_snapshot_directory(
+                    &rebound,
+                    expected_device,
+                    SnapshotProjection::OwnerOnly,
+                )?;
+                if !same_file(&before, &after) || !same_file(&before, &rebound) {
+                    return Err(os_error(libc::ESTALE));
+                }
+                after_conversion()?;
+            }
+            libc::S_IFREG => {
+                require_snapshot_regular(
+                    &before,
+                    expected_device,
+                    SnapshotProjection::TransportOrOwner,
+                )?;
+                let descriptor = open_regular_at(directory, &name)?;
+                let opened = stat_fd(descriptor.as_raw_fd())?;
+                require_snapshot_regular(
+                    &opened,
+                    expected_device,
+                    SnapshotProjection::TransportOrOwner,
+                )?;
+                if !snapshot_metadata_stable(&before, &opened) {
+                    return Err(os_error(libc::ESTALE));
+                }
+                let mode = if opened.st_mode & 0o111 != 0 {
+                    0o500
+                } else {
+                    0o400
+                };
+                chmod_fd(descriptor.as_raw_fd(), mode)?;
+                cvt(unsafe { libc::fsync(descriptor.as_raw_fd()) })?;
+                let after = stat_fd(descriptor.as_raw_fd())?;
+                let rebound = stat_at(directory, &name)?;
+                require_snapshot_regular(&after, expected_device, SnapshotProjection::OwnerOnly)?;
+                require_snapshot_regular(&rebound, expected_device, SnapshotProjection::OwnerOnly)?;
+                if !same_file(&before, &after) || !same_file(&before, &rebound) {
+                    return Err(os_error(libc::ESTALE));
+                }
+                after_conversion()?;
+            }
+            libc::S_IFLNK => require_snapshot_symlink(&before, expected_device)?,
+            _ => return Err(invalid_type_error()),
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_policy_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "snapshot entry violates the read-only descriptor policy",
+    )
 }
 
 fn read_link_at(parent: RawFd, name: &CStr, reported_size: libc::off_t) -> io::Result<Vec<u8>> {
@@ -4612,6 +5323,40 @@ mod tests {
     }
 
     #[test]
+    fn bounded_private_read_rejects_a_final_name_swap_after_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("private");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+        root.write_private_atomic_no_replace("receipt.json", b"owned")
+            .unwrap();
+
+        let error = root
+            .read_private_regular_with_hook("receipt.json", 1024, || {
+                fs::rename(
+                    root_path.join("receipt.json"),
+                    root_path.join("detached.json"),
+                )
+                .unwrap();
+                fs::write(root_path.join("receipt.json"), b"planted").unwrap();
+                fs::set_permissions(
+                    root_path.join("receipt.json"),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            })
+            .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(fs::read(root_path.join("detached.json")).unwrap(), b"owned");
+        assert_eq!(
+            fs::read(root_path.join("receipt.json")).unwrap(),
+            b"planted"
+        );
+    }
+
+    #[test]
     fn directory_publication_recovery_preserves_a_substitution_at_rollback() {
         let fixture = tempfile::tempdir().unwrap();
         let host_path = fixture.path().join("host");
@@ -4649,6 +5394,7 @@ mod tests {
                     fs::rename(host_path.join("jobs/project"), &detached).unwrap();
                     fs::create_dir_all(host_path.join("jobs/project/worktree")).unwrap();
                 },
+                || Ok(()),
                 || {
                     fs::rename(&target, &evidence).unwrap();
                     fs::create_dir(&target).unwrap();

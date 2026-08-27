@@ -18,6 +18,7 @@ use paths::PathLayout;
 use probe::ProbeCollector;
 use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport};
+use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnapshotResponse};
 use serde::Deserialize;
 use transfer::{
     HostTransferService, RsyncServerExecutor, SystemRsyncServerExecutor, TransferIdentity,
@@ -44,6 +45,7 @@ pub mod project;
 pub mod project_config;
 pub mod project_state;
 pub mod protocol;
+pub mod remote_snapshot;
 pub mod requirements;
 pub mod rooted_fs;
 pub mod snapshot;
@@ -159,6 +161,11 @@ fn execute_with_context(
             "host lease-acquire requires the stdio execution boundary".into(),
         )),
         Command::Host {
+            command: HostCommand::SnapshotVerify,
+        } => Err(WorkerError::Protocol(
+            "host snapshot-verify requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
             command: HostCommand::RsyncReceive { .. },
         } => Err(WorkerError::Protocol(
             "host rsync-receive requires the binary stdio execution boundary".into(),
@@ -236,6 +243,14 @@ pub fn run_with_rsync_executor_in_context(
         }
     ) {
         return run_host_lease_acquire(cli.config, runtime, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::SnapshotVerify
+        }
+    ) {
+        return run_host_snapshot_verify(cli.config, runtime, stdin, stdout);
     }
     if let Command::Host {
         command:
@@ -417,15 +432,79 @@ fn run_host_lease_acquire(
     exit
 }
 
+fn run_host_snapshot_verify(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    const LIMIT: usize = 1024 * 1024;
+    let result = (|| -> Result<VerifiedSnapshotResponse, WorkerError> {
+        let mut bytes = Vec::new();
+        stdin.take((LIMIT + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > LIMIT {
+            return Err(WorkerError::Protocol(
+                "snapshot-verify request exceeded 1 MiB".into(),
+            ));
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let request = SnapshotVerifyRequest::deserialize(&mut deserializer)
+            .map_err(|_| WorkerError::Protocol("invalid snapshot-verify request".into()))?;
+        deserializer.end().map_err(|_| {
+            WorkerError::Protocol("snapshot-verify request contained trailing data".into())
+        })?;
+        let paths = discover_paths(config_override, runtime)?;
+        let store = HostStore::open(&paths.host_state_root())?;
+        RemoteSnapshotService::new(&store).verify_request(&request)
+    })();
+
+    let exit = match &result {
+        Ok(_) => 0,
+        Err(error) => error.exit_code(),
+    };
+    let write_result = match result {
+        Ok(response) => serde_json::to_writer(&mut *stdout, &response),
+        Err(error) => {
+            let (code, message) = public_host_error(&error);
+            serde_json::to_writer(
+                &mut *stdout,
+                &serde_json::json!({"error": {"code": code, "message": message}}),
+            )
+        }
+    };
+    if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
+        return crate::error::ExitKind::Io as u8;
+    }
+    exit
+}
+
 fn public_host_error(error: &WorkerError) -> (&'static str, &'static str) {
     match error {
         WorkerError::Capacity { code, .. } => (code, "worker admission rejected"),
         WorkerError::Protocol(message) if message.starts_with("JOB_ABANDONED:") => {
             ("JOB_ABANDONED", "job ID was abandoned")
         }
+        WorkerError::Protocol(message) if message.starts_with("JOB_ACCEPTED:") => {
+            ("JOB_ACCEPTED", "job ID was already accepted")
+        }
         WorkerError::Protocol(message) if message.starts_with("JOB_ID_CONFLICT:") => (
             "JOB_ID_CONFLICT",
             "job ID conflicts with durable host state",
+        ),
+        WorkerError::Protocol(message) if message.starts_with("LEASE_IDENTITY_MISMATCH:") => (
+            "LEASE_IDENTITY_MISMATCH",
+            "live lease identity was rejected",
+        ),
+        WorkerError::Snapshot {
+            code: "MANIFEST_MISMATCH",
+            ..
+        } => ("MANIFEST_MISMATCH", "snapshot did not match its manifest"),
+        WorkerError::Snapshot {
+            code: "UNSAFE_REMOTE_SNAPSHOT",
+            ..
+        } => (
+            "UNSAFE_REMOTE_SNAPSHOT",
+            "snapshot filesystem state was rejected",
         ),
         WorkerError::Io(_) => ("HOST_IO", "host state operation failed"),
         _ => ("INVALID_REQUEST", "host request was invalid"),
