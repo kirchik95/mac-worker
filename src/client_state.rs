@@ -13,6 +13,7 @@ use std::{
         Arc, Condvar, LazyLock, Mutex, Weak,
         atomic::{AtomicU8, Ordering},
     },
+    time::Duration,
 };
 
 use uuid::Uuid;
@@ -110,12 +111,17 @@ impl ClientStateCleanupPause {
             .state
             .lock()
             .expect("cleanup pause mutex poisoned");
-        while !state.paused {
-            state = self
+        if !state.paused {
+            let (next, timeout) = self
                 .inner
                 .changed
-                .wait(state)
+                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.paused)
                 .expect("cleanup pause mutex poisoned");
+            state = next;
+            assert!(
+                !timeout.timed_out() || state.paused,
+                "cleanup did not pause"
+            );
         }
     }
 
@@ -140,42 +146,56 @@ fn pause_cleanup(pause: Arc<CleanupPauseState>) {
     let mut state = pause.state.lock().expect("cleanup pause mutex poisoned");
     state.paused = true;
     pause.changed.notify_all();
-    while !state.resumed {
-        state = pause
+    if !state.resumed {
+        let (next, timeout) = pause
             .changed
-            .wait(state)
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.resumed)
             .expect("cleanup pause mutex poisoned");
+        state = next;
+        assert!(
+            !timeout.timed_out() || state.resumed,
+            "cleanup pause was not resumed"
+        );
     }
 }
 
-struct LockAttemptState {
+struct LockContentionState {
     root: FileIdentity,
-    attempted: Mutex<bool>,
+    confirmed: Mutex<bool>,
     changed: Condvar,
 }
 
-static LOCK_ATTEMPT_PROBES: LazyLock<Mutex<Vec<Weak<LockAttemptState>>>> =
+static LOCK_CONTENTION_PROBES: LazyLock<Mutex<Vec<Weak<LockContentionState>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
 #[doc(hidden)]
-pub struct ClientStateLockAttemptProbe {
-    inner: Arc<LockAttemptState>,
+pub struct ClientStateLockContentionProbe {
+    inner: Arc<LockContentionState>,
 }
 
-impl ClientStateLockAttemptProbe {
-    pub fn wait_until_attempted(&self) {
-        let mut attempted = self
+impl ClientStateLockContentionProbe {
+    pub fn wait_until_confirmed(&self) {
+        assert!(
+            self.confirmed_within(Duration::from_secs(5)),
+            "authoritative local state lock contention was not confirmed"
+        );
+    }
+
+    pub fn confirmed_within(&self, timeout: Duration) -> bool {
+        let mut confirmed = self
             .inner
-            .attempted
+            .confirmed
             .lock()
-            .expect("lock-attempt probe mutex poisoned");
-        while !*attempted {
-            attempted = self
+            .expect("lock-contention probe mutex poisoned");
+        if !*confirmed {
+            let (next, _) = self
                 .inner
                 .changed
-                .wait(attempted)
-                .expect("lock-attempt probe mutex poisoned");
+                .wait_timeout_while(confirmed, timeout, |confirmed| !*confirmed)
+                .expect("lock-contention probe mutex poisoned");
+            confirmed = next;
         }
+        *confirmed
     }
 }
 
@@ -233,8 +253,8 @@ impl ClientStateStore {
             SyncKind::Root,
             &creation_race,
         )?;
-        ensure_lock_file(root.as_raw_fd(), &sync_counts, &creation_race)?;
-        let _lock = StateLock::acquire(root.as_raw_fd(), &sync_counts)?;
+        let _lock =
+            StateLock::acquire_with_creation_race(root.as_raw_fd(), &sync_counts, &creation_race)?;
         require_same_device(root.as_raw_fd(), jobs.as_raw_fd(), operations.as_raw_fd())?;
         validate_root_entries(root.as_raw_fd())?;
         validate_operation_entries(operations.as_raw_fd())?;
@@ -415,19 +435,19 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
-    pub fn observe_next_lock_attempt(&self) -> ClientStateLockAttemptProbe {
-        let state = Arc::new(LockAttemptState {
+    pub fn observe_next_lock_contention(&self) -> ClientStateLockContentionProbe {
+        let state = Arc::new(LockContentionState {
             root: FileIdentity::from_stat(
                 stat_fd(self.inner.root.as_raw_fd()).expect("anchored state root must be open"),
             ),
-            attempted: Mutex::new(false),
+            confirmed: Mutex::new(false),
             changed: Condvar::new(),
         });
-        LOCK_ATTEMPT_PROBES
+        LOCK_CONTENTION_PROBES
             .lock()
-            .expect("lock-attempt probes mutex poisoned")
+            .expect("lock-contention probes mutex poisoned")
             .push(Arc::downgrade(&state));
-        ClientStateLockAttemptProbe { inner: state }
+        ClientStateLockContentionProbe { inner: state }
     }
 
     #[doc(hidden)]
@@ -1046,34 +1066,84 @@ impl OperationFile {
     }
 }
 
-struct StateLock(OwnedFd);
+struct StateLock {
+    authoritative: OwnedFd,
+    marker: OwnedFd,
+}
 
 impl StateLock {
     fn acquire(root: RawFd, sync_counts: &SyncCounters) -> Result<Self, WorkerError> {
-        let (descriptor, outcome) = open_lock_file_with_creation(root, None)?;
+        Self::acquire_inner(root, sync_counts, None)
+    }
+
+    fn acquire_with_creation_race(
+        root: RawFd,
+        sync_counts: &SyncCounters,
+        creation_race: &AtomicU8,
+    ) -> Result<Self, WorkerError> {
+        Self::acquire_inner(root, sync_counts, Some(creation_race))
+    }
+
+    fn acquire_inner(
+        root: RawFd,
+        sync_counts: &SyncCounters,
+        creation_race: Option<&AtomicU8>,
+    ) -> Result<Self, WorkerError> {
+        let authoritative = open_directory_at(root, c".")?;
+        let anchored_identity = FileIdentity::from_stat(stat_fd(root)?);
+        let lock_identity = FileIdentity::from_stat(stat_fd(authoritative.as_raw_fd())?);
+        if anchored_identity != lock_identity {
+            return Err(invalid_state(
+                "authoritative local state lock identity changed",
+            ));
+        }
+        require_owned_directory(authoritative.as_raw_fd())?;
+        match cvt(unsafe { libc::flock(authoritative.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) })
+        {
+            Ok(()) => {}
+            Err(error) if lock_would_block(&error) => {
+                notify_lock_contention(root)?;
+                cvt(unsafe { libc::flock(authoritative.as_raw_fd(), libc::LOCK_EX) })?;
+            }
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+
+        let (marker, outcome) = open_lock_file_with_creation(root, creation_race)?;
         if outcome != CreationOutcome::Existing {
             sync_counted(root, sync_counts, SyncKind::Root)?;
         }
-        notify_lock_attempt(root)?;
-        cvt(unsafe { libc::flock(descriptor.as_raw_fd(), libc::LOCK_EX) })?;
-        Ok(Self(descriptor))
+        if outcome == CreationOutcome::ConcurrentExisting {
+            sync_counts
+                .concurrent_loser_parents
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        cvt(unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX) })?;
+        Ok(Self {
+            authoritative,
+            marker,
+        })
     }
 }
 
-fn notify_lock_attempt(root: RawFd) -> Result<(), WorkerError> {
+fn lock_would_block(error: &io::Error) -> bool {
+    let code = error.raw_os_error();
+    code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN)
+}
+
+fn notify_lock_contention(root: RawFd) -> Result<(), WorkerError> {
     let root = FileIdentity::from_stat(stat_fd(root)?);
-    let mut probes = LOCK_ATTEMPT_PROBES
+    let mut probes = LOCK_CONTENTION_PROBES
         .lock()
-        .expect("lock-attempt probes mutex poisoned");
+        .expect("lock-contention probes mutex poisoned");
     probes.retain(|probe| {
         let Some(probe) = probe.upgrade() else {
             return false;
         };
         if probe.root == root {
             *probe
-                .attempted
+                .confirmed
                 .lock()
-                .expect("lock-attempt probe mutex poisoned") = true;
+                .expect("lock-contention probe mutex poisoned") = true;
             probe.changed.notify_all();
         }
         true
@@ -1083,7 +1153,8 @@ fn notify_lock_attempt(root: RawFd) -> Result<(), WorkerError> {
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        let _ = unsafe { libc::flock(self.marker.as_raw_fd(), libc::LOCK_UN) };
+        let _ = unsafe { libc::flock(self.authoritative.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -1226,24 +1297,6 @@ fn open_or_create_owned_directory(
     };
     require_owned_directory(directory.as_raw_fd())?;
     Ok(directory)
-}
-
-fn ensure_lock_file(
-    root: RawFd,
-    sync_counts: &Arc<SyncCounters>,
-    creation_race: &AtomicU8,
-) -> Result<(), WorkerError> {
-    let (descriptor, outcome) = open_lock_file_with_creation(root, Some(creation_race))?;
-    drop(descriptor);
-    if outcome != CreationOutcome::Existing {
-        sync_counted(root, sync_counts, SyncKind::Root)?;
-    }
-    if outcome == CreationOutcome::ConcurrentExisting {
-        sync_counts
-            .concurrent_loser_parents
-            .fetch_add(1, Ordering::SeqCst);
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

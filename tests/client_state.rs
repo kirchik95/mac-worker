@@ -3,11 +3,12 @@ use std::{
     fs,
     os::unix::{
         ffi::OsStringExt,
-        fs::{FileTypeExt, PermissionsExt, symlink},
+        fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
     },
     path::{Path, PathBuf},
     sync::{Arc, Barrier, mpsc},
     thread,
+    time::Duration,
 };
 
 use mac_worker::{
@@ -869,10 +870,15 @@ fn concurrent_open_waits_for_cooperating_cleanup_lock() {
     let cleanup_pause = store.pause_cleanup_after_move_once();
     let writer_store = store.clone();
     let writer_record = record.clone();
-    let writer = thread::spawn(move || writer_store.create_job(writer_record));
+    let (writer_sender, writer_receiver) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        writer_sender
+            .send(writer_store.create_job(writer_record))
+            .unwrap();
+    });
     cleanup_pause.wait_until_paused();
 
-    let lock_probe = store.observe_next_lock_attempt();
+    let lock_probe = store.observe_next_lock_contention();
     let (result_sender, result_receiver) = mpsc::channel();
     let open_state = state.clone();
     let opener = thread::spawn(move || {
@@ -880,16 +886,23 @@ fn concurrent_open_waits_for_cooperating_cleanup_lock() {
             .send(ClientStateStore::open(&open_state))
             .unwrap();
     });
-    lock_probe.wait_until_attempted();
+    lock_probe.wait_until_confirmed();
     assert!(matches!(
-        result_receiver.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
+        result_receiver.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
     ));
 
     cleanup_pause.resume();
-    writer.join().unwrap().unwrap();
+    writer_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let reopened = result_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    writer.join().unwrap();
     opener.join().unwrap();
-    let reopened = result_receiver.recv().unwrap().unwrap();
     assert_eq!(reopened.list_jobs().unwrap(), vec![record]);
     assert!(
         fs::read_dir(state.join(".mac-worker-state"))
@@ -897,6 +910,114 @@ fn concurrent_open_waits_for_cooperating_cleanup_lock() {
             .next()
             .is_none()
     );
+}
+
+#[test]
+fn replacing_jobs_lock_does_not_split_the_authoritative_lock_domain() {
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let record = fresh_record(&store);
+    let cleanup_pause = store.pause_cleanup_after_move_once();
+    let writer_store = store.clone();
+    let writer_record = record.clone();
+    let (writer_sender, writer_receiver) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        writer_sender
+            .send(writer_store.create_job(writer_record))
+            .unwrap();
+    });
+    cleanup_pause.wait_until_paused();
+
+    let lock_path = state.join("jobs.lock");
+    let old_inode = fs::metadata(&lock_path).unwrap().ino();
+    fs::rename(&lock_path, fixture.path().join("displaced-jobs-lock")).unwrap();
+    fs::write(&lock_path, b"").unwrap();
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let new_inode = fs::metadata(&lock_path).unwrap().ino();
+    assert_ne!(old_inode, new_inode);
+
+    let contention = store.observe_next_lock_contention();
+    let (open_sender, open_receiver) = mpsc::channel();
+    let open_state = state.clone();
+    let opener = thread::spawn(move || {
+        open_sender
+            .send(ClientStateStore::open(&open_state))
+            .unwrap();
+    });
+    contention.wait_until_confirmed();
+    assert!(matches!(
+        open_receiver.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    cleanup_pause.resume();
+    writer_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let reopened = open_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    writer.join().unwrap();
+    opener.join().unwrap();
+    assert_eq!(reopened.list_jobs().unwrap(), vec![record]);
+}
+
+#[test]
+fn cloned_stores_use_independent_lock_descriptions_and_serialize() {
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let record = fresh_record(&store);
+    let cleanup_pause = store.pause_cleanup_after_move_once();
+    let writer_store = store.clone();
+    let writer_record = record.clone();
+    let (writer_sender, writer_receiver) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        writer_sender
+            .send(writer_store.create_job(writer_record))
+            .unwrap();
+    });
+    cleanup_pause.wait_until_paused();
+
+    let contention = store.observe_next_lock_contention();
+    let reader_store = store.clone();
+    let (reader_sender, reader_receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        reader_sender.send(reader_store.list_jobs()).unwrap();
+    });
+    contention.wait_until_confirmed();
+    assert!(matches!(
+        reader_receiver.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    cleanup_pause.resume();
+    writer_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reader_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        vec![record]
+    );
+    writer.join().unwrap();
+    reader.join().unwrap();
+}
+
+#[test]
+fn uncontended_lock_acquisition_does_not_report_contention() {
+    let fixture = tempfile::tempdir().unwrap();
+    let store = ClientStateStore::open(&temp_root(&fixture).join("state")).unwrap();
+    let contention = store.observe_next_lock_contention();
+
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert!(!contention.confirmed_within(Duration::from_millis(50)));
 }
 
 #[test]
