@@ -422,6 +422,12 @@ impl RootedDir {
         cvt(unsafe { libc::fsync(self.parent.as_raw_fd()) })
     }
 
+    pub(crate) fn sync_root(&self) -> io::Result<()> {
+        // SAFETY: the retained root descriptor is live for this call and
+        // fsync does not retain it.
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
     pub fn remove_owned_tree(&self) -> io::Result<()> {
         self.remove_owned_tree_with_hook(|| {})
     }

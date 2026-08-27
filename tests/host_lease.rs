@@ -1,0 +1,627 @@
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    fs,
+    io::Cursor,
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{OpenOptionsExt, PermissionsExt, symlink},
+    },
+    sync::{Arc, Barrier},
+    thread,
+};
+
+use clap::Parser;
+use mac_worker::{
+    RuntimeContext,
+    cli::Cli,
+    error::WorkerError,
+    host_store::{HostStore, HostStoreWritePoint},
+    job::{
+        ClientId, CommandSpec, JobId, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
+        LeaseToken, RequestFingerprintMaterial,
+    },
+    lease::{AdmissionFacts, LeaseService, SlotState},
+    process::{ProcessRequest, ProcessResult, ProcessRunner},
+    protocol::MemoryPressure,
+    run_with_stdio_in_context,
+};
+use tempfile::tempdir;
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+struct NoProcess;
+
+impl ProcessRunner for NoProcess {
+    fn run(&self, _request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        panic!("host lease input validation must not invoke a subprocess")
+    }
+}
+
+fn request(seed: u128) -> LeaseAcquireRequest {
+    let job = JobId::new(uuid::Uuid::from_u128(seed));
+    let client = ClientId::new(uuid::Uuid::from_u128(seed + 10_000));
+    let token = LeaseToken::new(uuid::Uuid::from_u128(seed + 20_000));
+    let material = RequestFingerprintMaterial::new(
+        job,
+        client,
+        token,
+        "mini-1".into(),
+        "a".repeat(64),
+        "b".repeat(64),
+        "c".repeat(64),
+        String::new(),
+        60_000,
+        "heavy".into(),
+        CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+    )
+    .unwrap();
+    LeaseAcquireRequest::new(material)
+}
+
+fn healthy() -> AdmissionFacts {
+    AdmissionFacts {
+        free_disk_bytes: 100 * GIB,
+        total_disk_bytes: 250 * GIB,
+        memory_pressure: MemoryPressure::Normal,
+        swap_used_bytes: Some(0),
+    }
+}
+
+#[test]
+fn host_layout_is_private_and_identifier_paths_are_canonical() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("data/mac-worker");
+    fs::create_dir(temp.path().join("data")).unwrap();
+    fs::write(temp.path().join("data/sentinel"), b"keep").unwrap();
+
+    let store = HostStore::open(&root).unwrap();
+    let req = request(1);
+    let material = req.material();
+
+    assert_eq!(
+        store.job_index(material.job_id()).unwrap(),
+        root.join(format!("job-index/{}.json", material.job_id()))
+    );
+    assert_eq!(
+        store
+            .incoming_job(material.job_id(), material.lease_token())
+            .unwrap(),
+        root.join(format!(
+            "incoming/{}/{}",
+            material.job_id(),
+            material.lease_token()
+        ))
+    );
+    assert_eq!(
+        store.verified_receipt(material.job_id()).unwrap(),
+        root.join(format!("verified/{}.json", material.job_id()))
+    );
+    assert_eq!(
+        store
+            .job(
+                material.project_id(),
+                material.worktree_id(),
+                material.job_id(),
+            )
+            .unwrap(),
+        root.join("jobs")
+            .join(material.project_id())
+            .join(material.worktree_id())
+            .join(material.job_id().to_string())
+    );
+    assert_eq!(
+        store
+            .snapshot(
+                material.project_id(),
+                material.worktree_id(),
+                material.manifest_digest(),
+            )
+            .unwrap(),
+        root.join("snapshots")
+            .join(material.project_id())
+            .join(material.worktree_id())
+            .join(material.manifest_digest())
+    );
+    assert!(
+        store
+            .snapshot(
+                "../escape",
+                material.worktree_id(),
+                material.manifest_digest()
+            )
+            .is_err()
+    );
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(root.join("job-index"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::read(temp.path().join("data/sentinel")).unwrap(),
+        b"keep"
+    );
+
+    let staged = store
+        .begin_job(
+            material.project_id(),
+            material.worktree_id(),
+            material.job_id(),
+        )
+        .unwrap();
+    let debug = format!("{staged:?}");
+    assert!(!debug.contains(root.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn symlinked_root_or_owned_component_is_rejected() {
+    let temp = tempdir().unwrap();
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let linked_root = temp.path().join("linked");
+    symlink(&outside, &linked_root).unwrap();
+    assert!(HostStore::open(&linked_root).is_err());
+
+    let nested = outside.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let linked_parent = temp.path().join("linked-parent");
+    symlink(&outside, &linked_parent).unwrap();
+    assert!(HostStore::open(&linked_parent.join("nested")).is_err());
+
+    let root = temp.path().join("real");
+    fs::create_dir(&root).unwrap();
+    symlink(&outside, root.join("leases")).unwrap();
+    assert!(HostStore::open(&root).is_err());
+}
+
+#[test]
+fn safe_unrelated_entries_are_preserved_but_non_utf8_entries_fail_closed() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let unrelated = root.join("operator-note");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&unrelated)
+        .unwrap();
+    HostStore::open(&root).unwrap();
+    assert!(unrelated.exists());
+
+    let invalid = root.join(OsString::from_vec(b"invalid-\xff".to_vec()));
+    let created = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(invalid);
+    if created.is_ok() {
+        assert!(HostStore::open(&root).is_err());
+    }
+    assert!(unrelated.exists());
+}
+
+#[test]
+fn permissive_preexisting_host_components_are_rejected_not_repaired() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(HostStore::open(&root).is_err());
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let store = HostStore::open(&root).unwrap();
+    fs::set_permissions(root.join("leases"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        LeaseService::new(&store)
+            .acquire(&request(1), &healthy(), 1)
+            .is_err()
+    );
+    assert_eq!(
+        fs::metadata(root.join("leases"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn sixty_four_distinct_contenders_produce_one_live_lease() {
+    let temp = tempdir().unwrap();
+    let store = Arc::new(HostStore::open(&temp.path().join("host")).unwrap());
+    let barrier = Arc::new(Barrier::new(64));
+    let handles = (1..=64)
+        .map(|seed| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let request = request(seed);
+                barrier.wait();
+                let result = LeaseService::new(&store).acquire(&request, &healthy(), 1_000);
+                (request.material().job_id(), result)
+            })
+        })
+        .collect::<Vec<_>>();
+    let outcomes = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    let winners = outcomes
+        .iter()
+        .filter(|(_, result)| matches!(result, Ok(LeaseAcquireResponse::Acquired { .. })))
+        .collect::<Vec<_>>();
+
+    assert_eq!(winners.len(), 1);
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap().unwrap().job_id(),
+        winners[0].0
+    );
+    assert!(outcomes.iter().all(|(_, result)| match result {
+        Ok(LeaseAcquireResponse::Acquired { .. }) => true,
+        Err(WorkerError::Capacity { code, .. }) => code == &"CAPACITY_BUSY",
+        _ => false,
+    }));
+}
+
+#[test]
+fn exact_retry_is_idempotent_but_changed_identity_is_busy() {
+    let temp = tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let service = LeaseService::new(&store);
+    let first = request(1);
+
+    let acquired = service.acquire(&first, &healthy(), 10).unwrap();
+    let retried = service.acquire(&first, &healthy(), 20).unwrap();
+    assert_eq!(acquired, retried);
+
+    let changed = request(2);
+    let changed_token = changed.material().lease_token().to_string();
+    let error = service.acquire(&changed, &healthy(), 30).unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            ..
+        }
+    ));
+    assert!(!error.to_string().contains(&changed_token));
+}
+
+#[test]
+fn exact_retry_compares_live_fields_to_independently_recomputed_request() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let req = request(1);
+    LeaseService::new(&store)
+        .acquire(&req, &healthy(), 10)
+        .unwrap();
+    let path = root.join("leases/heavy/lease.json");
+    let original = fs::read_to_string(&path).unwrap();
+    let altered = original.replacen(
+        &format!("\"project_id\":\"{}\"", "a".repeat(64)),
+        &format!("\"project_id\":\"{}\"", "d".repeat(64)),
+        1,
+    );
+    assert_ne!(altered, original);
+    fs::write(path, altered).unwrap();
+
+    assert!(
+        LeaseService::new(&store)
+            .acquire(&req, &healthy(), 20)
+            .is_err()
+    );
+}
+
+#[test]
+fn admission_uses_disk_total_memory_pressure_and_swap_thresholds() {
+    for (facts, code) in [
+        (
+            AdmissionFacts {
+                free_disk_bytes: 49 * GIB,
+                ..healthy()
+            },
+            "INSUFFICIENT_DISK",
+        ),
+        (
+            AdmissionFacts {
+                free_disk_bytes: 59 * GIB,
+                total_disk_bytes: 300 * GIB,
+                ..healthy()
+            },
+            "INSUFFICIENT_DISK",
+        ),
+        (
+            AdmissionFacts {
+                memory_pressure: MemoryPressure::Critical,
+                ..healthy()
+            },
+            "MEMORY_PRESSURE",
+        ),
+        (
+            AdmissionFacts {
+                swap_used_bytes: Some(2 * GIB + 1),
+                ..healthy()
+            },
+            "SWAP_LIMIT",
+        ),
+    ] {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let error = LeaseService::new(&store)
+            .acquire(&request(1), &facts, 1)
+            .unwrap_err();
+        assert!(matches!(error, WorkerError::Capacity { code: actual, .. } if actual == code));
+        assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    }
+}
+
+#[test]
+fn accepted_and_abandoned_dispositions_fence_job_ids_without_leases() {
+    let temp = tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let accepted = request(1);
+    let status = JobStatus::accepted(100).unwrap();
+    store.record_accepted(&accepted, &status, 100).unwrap();
+    store.record_accepted(&accepted, &status, 101).unwrap();
+
+    assert_eq!(
+        LeaseService::new(&store)
+            .acquire(&accepted, &healthy(), 200)
+            .unwrap(),
+        LeaseAcquireResponse::ExistingAccepted {
+            status: status.clone()
+        }
+    );
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+
+    let abandoned = request(2);
+    store.record_abandoned(&abandoned, 300).unwrap();
+    store.record_abandoned(&abandoned, 301).unwrap();
+    let error = LeaseService::new(&store)
+        .acquire(&abandoned, &healthy(), 400)
+        .unwrap_err();
+    assert!(matches!(error, WorkerError::Protocol(message) if message.contains("JOB_ABANDONED")));
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
+fn matching_terminal_cleanup_releases_but_mismatch_and_expiry_do_not() {
+    let temp = tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let service = LeaseService::new(&store);
+    let req = request(1);
+    let lease = match service.acquire(&req, &healthy(), 1).unwrap() {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        _ => unreachable!(),
+    };
+    assert!(lease.expires_at_millis() < 1_000_000);
+    assert_eq!(service.load().unwrap(), Some(lease.clone()));
+
+    let wrong_request = request(2);
+    let wrong_lease = mac_worker::job::LeaseRecord::new(
+        wrong_request.material(),
+        wrong_request.request_fingerprint().clone(),
+        1,
+        60_001,
+    )
+    .unwrap();
+    assert!(store.record_cleanup_complete(&lease).is_err());
+    store
+        .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
+        .unwrap();
+    let proof = store.record_cleanup_complete(&lease).unwrap();
+    assert!(service.release_after_cleanup(&wrong_lease, &proof).is_err());
+    assert_eq!(service.load().unwrap(), Some(lease.clone()));
+
+    service.release_after_cleanup(&lease, &proof).unwrap();
+    assert_eq!(service.load().unwrap(), None);
+}
+
+#[test]
+fn matching_abandonment_and_cleanup_receipt_release_the_exact_lease() {
+    let temp = tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let service = LeaseService::new(&store);
+    let req = request(1);
+    let lease = match service.acquire(&req, &healthy(), 1).unwrap() {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        _ => unreachable!(),
+    };
+    store.record_abandoned(&req, 2).unwrap();
+    let receipt = store.record_cleanup_complete(&lease).unwrap();
+
+    service.release_after_cleanup(&lease, &receipt).unwrap();
+
+    assert_eq!(service.load().unwrap(), None);
+}
+
+#[test]
+fn read_only_absent_probe_is_idle_and_does_not_create_root() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("absent");
+
+    let occupancy = LeaseService::load_if_present(&root).unwrap();
+
+    assert_eq!(occupancy.slot_state, SlotState::Idle);
+    assert!(occupancy.active_lease.is_none());
+    assert!(!root.exists());
+}
+
+#[test]
+fn every_lease_crash_boundary_leaves_absent_or_complete_live_state() {
+    for point in [
+        HostStoreWritePoint::AfterLeaseWrite,
+        HostStoreWritePoint::AfterLeaseFileSync,
+        HostStoreWritePoint::AfterLeaseDirectorySync,
+        HostStoreWritePoint::AfterLeaseParentSync,
+        HostStoreWritePoint::AfterLeasePublish,
+        HostStoreWritePoint::AfterLeasePublishSync,
+    ] {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open_with_write_fault(&root, point).unwrap();
+        assert!(
+            LeaseService::new(&store)
+                .acquire(&request(1), &healthy(), 1)
+                .is_err()
+        );
+        drop(store);
+
+        let recovered = HostStore::open(&root).unwrap();
+        let live = LeaseService::new(&recovered).load().unwrap();
+        if matches!(
+            point,
+            HostStoreWritePoint::AfterLeasePublish | HostStoreWritePoint::AfterLeasePublishSync
+        ) {
+            assert!(
+                live.is_some(),
+                "published state must be complete at {point:?}"
+            );
+            assert_eq!(
+                fs::metadata(root.join("leases/heavy/lease.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        } else {
+            assert_eq!(live, None, "staging residue must be idle at {point:?}");
+        }
+    }
+}
+
+#[test]
+fn corrupt_or_unsafe_live_lease_fails_closed_and_is_never_released() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let lease = match LeaseService::new(&store)
+        .acquire(&request(1), &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        _ => unreachable!(),
+    };
+    store
+        .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
+        .unwrap();
+    let proof = store.record_cleanup_complete(&lease).unwrap();
+    fs::write(root.join("leases/heavy/lease.json"), b"{}\n").unwrap();
+
+    assert!(LeaseService::new(&store).load().is_err());
+    assert!(
+        LeaseService::new(&store)
+            .release_after_cleanup(&lease, &proof)
+            .is_err()
+    );
+    assert!(root.join("leases/heavy").exists());
+}
+
+#[test]
+fn noncanonical_live_lease_json_fails_closed() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    LeaseService::new(&store)
+        .acquire(&request(1), &healthy(), 1)
+        .unwrap();
+    let path = root.join("leases/heavy/lease.json");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.push(b'\n');
+    fs::write(&path, bytes).unwrap();
+
+    assert!(LeaseService::new(&store).load().is_err());
+    assert!(root.join("leases/heavy").exists());
+}
+
+#[test]
+fn abandoned_disposition_hashes_the_token_and_public_occupancy_omits_it() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let req = request(7);
+    let raw_token = req.material().lease_token().to_string();
+    store.record_abandoned(&req, 1).unwrap();
+    let disposition =
+        fs::read_to_string(store.job_index(req.material().job_id()).unwrap()).unwrap();
+    assert!(!disposition.contains(&raw_token));
+    assert!(disposition.contains("lease_token_sha256"));
+
+    let other_root = temp.path().join("other-host");
+    let other = HostStore::open(&other_root).unwrap();
+    LeaseService::new(&other)
+        .acquire(&req, &healthy(), 1)
+        .unwrap();
+    let private_lease = fs::read_to_string(other_root.join("leases/heavy/lease.json")).unwrap();
+    assert!(!private_lease.contains("cargo"));
+    assert!(!private_lease.contains("test"));
+    let public = serde_json::to_string(&LeaseService::new(&other).occupancy().unwrap()).unwrap();
+    assert!(!public.contains(&raw_token));
+    assert!(!public.contains(&req.material().client_id().to_string()));
+    assert!(!public.contains(other_root.to_string_lossy().as_ref()));
+    assert!(!format!("{req:?}").contains(&raw_token));
+    assert!(!format!("{req:?}").contains(&req.material().lease_token().as_uuid().to_string()));
+}
+
+#[test]
+fn hidden_acquire_is_bounded_strict_json_with_one_compact_response() {
+    let temp = tempdir().unwrap();
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::from([(
+            OsString::from("XDG_DATA_HOME"),
+            temp.path().join("data").into_os_string(),
+        )]),
+        temp.path().join("home"),
+        temp.path().to_path_buf(),
+    );
+
+    let mut valid_with_trailing = serde_json::to_vec(&request(1)).unwrap();
+    valid_with_trailing.extend_from_slice(b" trailing");
+    for input in [
+        b"{} trailing".to_vec(),
+        valid_with_trailing,
+        vec![b' '; 1024 * 1024 + 1],
+    ] {
+        let cli = Cli::try_parse_from(["worker", "host", "lease-acquire"]).unwrap();
+        let mut stdin = Cursor::new(input);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = run_with_stdio_in_context(
+            cli,
+            &NoProcess,
+            &runtime,
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_ne!(exit, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let response: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert!(response.get("error").is_some());
+        assert!(!String::from_utf8_lossy(&stdout).contains("lease_token"));
+    }
+}
+
+#[test]
+fn raw_lease_status_and_release_are_not_cli_operations() {
+    assert!(Cli::try_parse_from(["worker", "host", "lease-status"]).is_err());
+    assert!(Cli::try_parse_from(["worker", "host", "lease-release"]).is_err());
+}

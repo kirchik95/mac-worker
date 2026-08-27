@@ -168,11 +168,20 @@ fn doctor_project(context: &ProjectContext) -> DoctorProject {
 fn worker_issues(workers: &mut [WorkerHealth], eligible_worker_count: usize) -> Vec<DoctorIssue> {
     let mut issues = Vec::new();
     for worker in workers.iter_mut().filter(|worker| !is_eligible(worker)) {
-        let code = worker
-            .error_code
-            .as_deref()
-            .unwrap_or("WORKER_UNAVAILABLE")
-            .to_owned();
+        let code = if worker.status == HealthStatus::Ready
+            && worker
+                .probe
+                .as_ref()
+                .is_some_and(|probe| probe.slot_state == crate::lease::SlotState::Busy)
+        {
+            "CAPACITY_BUSY".to_owned()
+        } else {
+            worker
+                .error_code
+                .as_deref()
+                .unwrap_or("WORKER_UNAVAILABLE")
+                .to_owned()
+        };
         let message = safe_worker_message(worker, &code);
         worker.error_message = Some(message.clone());
         if eligible_worker_count > 0 {
@@ -193,6 +202,10 @@ fn worker_issues(workers: &mut [WorkerHealth], eligible_worker_count: usize) -> 
 fn is_eligible(worker: &WorkerHealth) -> bool {
     worker.status == HealthStatus::Ready
         && worker.probe.is_some()
+        && worker
+            .probe
+            .as_ref()
+            .is_some_and(|probe| probe.slot_state == crate::lease::SlotState::Idle)
         && worker.missing_capabilities.is_empty()
 }
 
@@ -211,6 +224,7 @@ fn safe_worker_message(worker: &WorkerHealth, code: &str) -> String {
         "SSH_UNAVAILABLE" => format!("worker {name} could not be reached by the SSH probe"),
         "INVALID_RESPONSE" => format!("worker {name} returned an invalid probe response"),
         "PROTOCOL_MISMATCH" => format!("worker {name} uses an incompatible protocol version"),
+        "CAPACITY_BUSY" => format!("worker {name} is healthy but its heavy slot is busy"),
         _ => format!("worker {name} is not eligible"),
     };
     sanitize_bounded(&message, MAX_ISSUE_MESSAGE_CHARACTERS)

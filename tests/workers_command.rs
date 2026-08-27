@@ -10,6 +10,7 @@ use std::{
 use mac_worker::{
     config::{Config, WorkerEntry},
     error::{ProcessError, ProcessStream, WorkerError},
+    lease::{LeaseSummary, SlotState},
     output::CommandOutput,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::{
@@ -85,7 +86,7 @@ fn structured_probe_json(
     os_version: &str,
     capabilities: Vec<String>,
 ) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
+    let mut value = serde_json::json!({
         "protocol_version": protocol_version,
         "hostname": hostname,
         "arch": arch,
@@ -94,8 +95,13 @@ fn structured_probe_json(
         "memory_pressure": "normal",
         "swap_used_bytes": 134_217_728_u64,
         "capabilities": capabilities,
-    }))
-    .unwrap()
+    });
+    if protocol_version == PROTOCOL_VERSION {
+        value["total_disk_bytes"] = serde_json::json!(1_073_741_824_u64);
+        value["slot_state"] = serde_json::json!("idle");
+        value["active_lease"] = serde_json::Value::Null;
+    }
+    serde_json::to_vec(&value).unwrap()
 }
 
 fn worker(name: &str, ssh: &str, capabilities: &[&str]) -> WorkerEntry {
@@ -393,6 +399,19 @@ fn protocol_mismatch_is_reported_as_unavailable() {
 }
 
 #[test]
+fn protocol_two_missing_occupancy_is_invalid_not_a_version_mismatch() {
+    let response = br#"{"protocol_version":2,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":0,"capabilities":[]}"#.to_vec();
+    let health = SshTransport::new(RecordingRunner::returning_json(response)).probe(&worker(
+        "mini-1",
+        "mac1",
+        &[],
+    ));
+
+    assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
+    assert!(health.probe.is_none());
+}
+
+#[test]
 fn absent_declared_capabilities_exclude_the_worker() {
     let runner = RecordingRunner::returning_json(valid_probe_json());
     let transport = SshTransport::new(runner);
@@ -637,8 +656,16 @@ fn human_workers_output_includes_all_parsed_health_facts() {
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
                 free_disk_bytes: 536_870_912,
+                total_disk_bytes: 1_073_741_824,
                 memory_pressure: MemoryPressure::Warn,
                 swap_used_bytes: Some(134_217_728),
+                slot_state: SlotState::Busy,
+                active_lease: Some(LeaseSummary {
+                    job_id: "00000000000000000000000000000001".parse().unwrap(),
+                    project_id: "a".repeat(64),
+                    worktree_id: "b".repeat(64),
+                    created_at_millis: 10,
+                }),
                 capabilities: vec!["darwin-arm64".into(), "git".into()],
             }),
             missing_capabilities: Vec::new(),
@@ -650,6 +677,8 @@ fn human_workers_output_includes_all_parsed_health_facts() {
     let rendered = output.render_human();
 
     for fragment in [
+        "slot: busy",
+        "active job: 00000000000000000000000000000001",
         "capabilities: darwin-arm64, git",
         "free disk bytes: 536870912",
         "memory pressure: warn",
@@ -678,8 +707,11 @@ fn human_unavailable_worker_keeps_error_missing_capabilities_and_unknown_swap_vi
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
                 free_disk_bytes: 536_870_912,
+                total_disk_bytes: 1_073_741_824,
                 memory_pressure: MemoryPressure::Unknown,
                 swap_used_bytes: None,
+                slot_state: SlotState::Idle,
+                active_lease: None,
                 capabilities: vec!["darwin-arm64".into()],
             }),
             missing_capabilities: vec!["docker".into(), "swift".into()],

@@ -22,6 +22,7 @@ use mac_worker::{
     doctor::{DoctorRequest, DoctorService},
     error::{ExitKind, WorkerError},
     inputs::InputSelector,
+    lease::SlotState,
     output::CommandOutput,
     paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
@@ -253,8 +254,11 @@ fn ready_probe(capabilities: &[&str]) -> Result<ProcessResult, WorkerError> {
         "arch": "arm64",
         "os_version": "26.2",
         "free_disk_bytes": 536_870_912_u64,
+        "total_disk_bytes": 1_073_741_824_u64,
         "memory_pressure": "normal",
         "swap_used_bytes": 134_217_728_u64,
+        "slot_state": "idle",
+        "active_lease": null,
         "capabilities": capabilities,
     });
     Ok(ProcessResult {
@@ -264,6 +268,20 @@ fn ready_probe(capabilities: &[&str]) -> Result<ProcessResult, WorkerError> {
     })
 }
 
+fn busy_probe(capabilities: &[&str]) -> Result<ProcessResult, WorkerError> {
+    let mut result = ready_probe(capabilities)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    value["slot_state"] = serde_json::json!("busy");
+    value["active_lease"] = serde_json::json!({
+        "job_id": "00000000000000000000000000000001",
+        "project_id": "a".repeat(64),
+        "worktree_id": "b".repeat(64),
+        "created_at_millis": 10,
+    });
+    result.stdout = serde_json::to_vec(&value).unwrap();
+    Ok(result)
+}
+
 fn structured_probe(
     protocol_version: u32,
     hostname: &str,
@@ -271,7 +289,7 @@ fn structured_probe(
     os_version: &str,
     capabilities: Vec<String>,
 ) -> Result<ProcessResult, WorkerError> {
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "protocol_version": protocol_version,
         "hostname": hostname,
         "arch": arch,
@@ -281,6 +299,11 @@ fn structured_probe(
         "swap_used_bytes": 134_217_728_u64,
         "capabilities": capabilities,
     });
+    if protocol_version == PROTOCOL_VERSION {
+        response["total_disk_bytes"] = serde_json::json!(1_073_741_824_u64);
+        response["slot_state"] = serde_json::json!("idle");
+        response["active_lease"] = serde_json::Value::Null;
+    }
     Ok(ProcessResult {
         status: exit_status(0),
         stdout: serde_json::to_vec(&response).unwrap(),
@@ -405,8 +428,11 @@ fn ready_output_report() -> DoctorReport {
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
                 free_disk_bytes: 536_870_912,
+                total_disk_bytes: 1_073_741_824,
                 memory_pressure: MemoryPressure::Normal,
                 swap_used_bytes: Some(134_217_728),
+                slot_state: SlotState::Idle,
+                active_lease: None,
                 capabilities: vec!["node".into(), "docker".into()],
             }),
             missing_capabilities: Vec::new(),
@@ -447,8 +473,11 @@ fn blocked_output_report(code: &str) -> DoctorReport {
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
                 free_disk_bytes: 268_435_456,
+                total_disk_bytes: 1_073_741_824,
                 memory_pressure: MemoryPressure::Warn,
                 swap_used_bytes: None,
+                slot_state: SlotState::Idle,
+                active_lease: None,
                 capabilities: vec!["node".into()],
             }),
             missing_capabilities: vec!["docker".into()],
@@ -621,8 +650,10 @@ fn doctor_output_human_renders_complete_ready_and_blocked_reports_without_ssh() 
                 "  warnings: 1\n",
                 "workers:\n",
                 "  mini-1: eligible (mini-1.local; arm64; macOS 26.2; protocol {})\n",
+                "    slot: idle\n",
                 "    capabilities: node, docker\n",
                 "    free disk bytes: 536870912\n",
+                "    total disk bytes: 1073741824\n",
                 "    memory pressure: normal\n",
                 "    swap used bytes: 134217728\n",
                 "issues:\n",
@@ -647,8 +678,10 @@ fn doctor_output_human_renders_complete_ready_and_blocked_reports_without_ssh() 
             "workers:\n",
             "  mini-2: ineligible [MISSING_CAPABILITIES]: worker mini-2 is missing required capabilities: docker\n",
             "    missing capabilities: docker\n",
+            "    slot: idle\n",
             "    capabilities: node\n",
             "    free disk bytes: 268435456\n",
+            "    total disk bytes: 1073741824\n",
             "    memory pressure: warn\n",
             "    swap used bytes: unavailable\n",
             "issues:\n",
@@ -986,6 +1019,34 @@ fn clean_project_snapshot_and_eligible_worker_are_ready_and_cleanup_the_capture(
             .contains(&repo.root().to_string_lossy().into_owned())
     );
     assert_no_doctor_snapshot(&state.path().join("cache"));
+}
+
+#[test]
+fn busy_worker_is_healthy_but_not_immediately_eligible() {
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("busy worker fixture");
+    let state = tempfile::tempdir().unwrap();
+    let config = config(vec![worker("mini-1", "mac1", &["darwin-arm64"])]);
+    let runner = DoctorRunner::new(vec![busy_probe(&["darwin-arm64"])]);
+
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+    assert!(!report.ready);
+    assert_eq!(report.workers[0].status, HealthStatus::Ready);
+    assert_eq!(
+        report.workers[0].probe.as_ref().unwrap().slot_state,
+        SlotState::Busy
+    );
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "NO_ELIGIBLE_WORKER")
+    );
+    let human = CommandOutput::Doctor(report).render_human();
+    assert!(human.contains("mini-1: busy"));
+    assert!(human.contains("slot: busy"));
 }
 
 #[test]

@@ -1,14 +1,18 @@
 pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeResponse {
     pub protocol_version: u32,
     pub hostname: String,
     pub arch: String,
     pub os_version: String,
     pub free_disk_bytes: u64,
+    pub total_disk_bytes: u64,
     pub memory_pressure: MemoryPressure,
     pub swap_used_bytes: Option<u64>,
+    pub slot_state: crate::lease::SlotState,
+    pub active_lease: Option<crate::lease::LeaseSummary>,
     pub capabilities: Vec<String>,
 }
 
@@ -155,8 +159,11 @@ mod tests {
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
                 free_disk_bytes: 512 * 1024 * 1024,
+                total_disk_bytes: 1024 * 1024 * 1024,
                 memory_pressure: MemoryPressure::Normal,
                 swap_used_bytes: Some(128 * 1024 * 1024),
+                slot_state: crate::lease::SlotState::Idle,
+                active_lease: None,
                 capabilities: vec!["darwin-arm64".into(), "git".into()],
             }
         }

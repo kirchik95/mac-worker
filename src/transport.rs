@@ -194,7 +194,7 @@ impl<R: ProcessRunner> SshTransport<R> {
                 );
             }
         };
-        let probe: ProbeResponse = match serde_json::from_str(response) {
+        let probe: ProbeResponse = match decode_probe_response(response) {
             Ok(probe) => probe,
             Err(error) => {
                 return (
@@ -276,7 +276,9 @@ impl<R: ProcessRunner> SshTransport<R> {
 }
 
 fn valid_probe_response(probe: &ProbeResponse) -> bool {
-    valid_hostname(&probe.hostname)
+    (probe.protocol_version != PROTOCOL_VERSION
+        || (probe.total_disk_bytes > 0 && probe.free_disk_bytes <= probe.total_disk_bytes))
+        && valid_hostname(&probe.hostname)
         && valid_arch(&probe.arch)
         && valid_os_version(&probe.os_version)
         && probe.capabilities.len() <= MAX_CAPABILITY_COUNT
@@ -285,6 +287,59 @@ fn valid_probe_response(probe: &ProbeResponse) -> bool {
             .iter()
             .all(|capability| valid_capability(capability))
         && probe.capabilities.iter().collect::<HashSet<_>>().len() == probe.capabilities.len()
+        && match (probe.slot_state, probe.active_lease.as_ref()) {
+            (crate::lease::SlotState::Idle, None) => true,
+            (crate::lease::SlotState::Busy, Some(summary)) => {
+                summary.project_id.len() == 64
+                    && summary.project_id.bytes().all(is_lower_hex)
+                    && summary.worktree_id.len() == 64
+                    && summary.worktree_id.bytes().all(is_lower_hex)
+            }
+            _ => false,
+        }
+}
+
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
+fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    struct VersionOnly {
+        protocol_version: u32,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyProbe {
+        protocol_version: u32,
+        hostname: String,
+        arch: String,
+        os_version: String,
+        free_disk_bytes: u64,
+        memory_pressure: crate::protocol::MemoryPressure,
+        swap_used_bytes: Option<u64>,
+        capabilities: Vec<String>,
+    }
+
+    let version: VersionOnly = serde_json::from_str(response)?;
+    if version.protocol_version == PROTOCOL_VERSION {
+        serde_json::from_str(response)
+    } else {
+        let legacy: LegacyProbe = serde_json::from_str(response)?;
+        Ok(ProbeResponse {
+            protocol_version: legacy.protocol_version,
+            hostname: legacy.hostname,
+            arch: legacy.arch,
+            os_version: legacy.os_version,
+            free_disk_bytes: legacy.free_disk_bytes,
+            total_disk_bytes: 0,
+            memory_pressure: legacy.memory_pressure,
+            swap_used_bytes: legacy.swap_used_bytes,
+            slot_state: crate::lease::SlotState::Idle,
+            active_lease: None,
+            capabilities: legacy.capabilities,
+        })
+    }
 }
 
 fn valid_hostname(value: &str) -> bool {

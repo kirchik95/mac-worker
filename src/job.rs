@@ -71,7 +71,58 @@ macro_rules! canonical_uuid_id {
 
 canonical_uuid_id!(JobId);
 canonical_uuid_id!(ClientId);
-canonical_uuid_id!(LeaseToken);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LeaseToken(Uuid);
+
+impl LeaseToken {
+    pub fn new(value: Uuid) -> Self {
+        Self(value)
+    }
+    pub fn generate() -> Self {
+        Self(Uuid::new_v4())
+    }
+    pub fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Debug for LeaseToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LeaseToken([REDACTED])")
+    }
+}
+
+impl fmt::Display for LeaseToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:x}", self.0.simple())
+    }
+}
+
+impl FromStr for LeaseToken {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if !is_lower_hex(value, 32) {
+            return Err("identifier must be a lowercase simple UUID".into());
+        }
+        Uuid::parse_str(value)
+            .map(Self)
+            .map_err(|_| "identifier must be a lowercase simple UUID".into())
+    }
+}
+
+impl Serialize for LeaseToken {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for LeaseToken {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestFingerprint(String);
@@ -1080,6 +1131,33 @@ impl LeaseRecord {
     }
     pub fn request_fingerprint(&self) -> &RequestFingerprint {
         &self.request_fingerprint
+    }
+    pub fn worker_name(&self) -> &str {
+        &self.worker_name
+    }
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub fn worktree_id(&self) -> &str {
+        &self.worktree_id
+    }
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+    pub fn timeout_millis(&self) -> u64 {
+        self.timeout_millis
+    }
+    pub fn resource_class(&self) -> &str {
+        &self.resource_class
+    }
+    pub fn command_summary(&self) -> &CommandSummary {
+        &self.command_summary
+    }
+    pub fn created_at_millis(&self) -> u64 {
+        self.created_at_millis
+    }
+    pub fn expires_at_millis(&self) -> u64 {
+        self.expires_at_millis
     }
 }
 

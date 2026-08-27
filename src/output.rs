@@ -229,6 +229,14 @@ fn extend_indented(lines: &mut Vec<String>, rendered: &str) {
 }
 
 fn render_doctor_worker_health(worker: &crate::protocol::WorkerHealth) -> String {
+    if worker.status == crate::protocol::HealthStatus::Ready
+        && worker
+            .probe
+            .as_ref()
+            .is_some_and(|probe| probe.slot_state == crate::lease::SlotState::Busy)
+    {
+        return render_worker_health_with_labels(worker, "busy", "ineligible");
+    }
     render_worker_health_with_labels(worker, "eligible", "ineligible")
 }
 
@@ -263,6 +271,24 @@ fn render_worker_health_with_labels(
         ));
     }
     if let Some(probe) = &worker.probe {
+        lines.push(format!(
+            "  slot: {}",
+            match probe.slot_state {
+                crate::lease::SlotState::Idle => "idle",
+                crate::lease::SlotState::Busy => "busy",
+            }
+        ));
+        if let Some(lease) = &probe.active_lease {
+            lines.push(format!("  active job: {}", lease.job_id));
+            lines.push(format!(
+                "  active project: {}",
+                short_identifier(&lease.project_id)
+            ));
+            lines.push(format!(
+                "  active worktree: {}",
+                short_identifier(&lease.worktree_id)
+            ));
+        }
         let capabilities = if probe.capabilities.is_empty() {
             "none".into()
         } else {
@@ -270,6 +296,7 @@ fn render_worker_health_with_labels(
         };
         lines.push(format!("  capabilities: {capabilities}"));
         lines.push(format!("  free disk bytes: {}", probe.free_disk_bytes));
+        lines.push(format!("  total disk bytes: {}", probe.total_disk_bytes));
         lines.push(format!(
             "  memory pressure: {}",
             memory_pressure_name(&probe.memory_pressure)

@@ -4,11 +4,13 @@ use std::{
 };
 
 use clap::{Parser, error::ErrorKind};
-use mac_worker::{cli::Cli, process::SystemProcessRunner, run_with_io};
+use mac_worker::{cli::Cli, process::SystemProcessRunner, run_with_stdio};
 
 fn main() -> ExitCode {
     let stdout = io::stdout();
     let stderr = io::stderr();
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
     let mut stdout = stdout.lock();
     let mut stderr = stderr.lock();
 
@@ -40,9 +42,10 @@ fn main() -> ExitCode {
         }
     };
 
-    ExitCode::from(run_with_io(
+    ExitCode::from(run_with_stdio(
         cli,
         &SystemProcessRunner,
+        &mut stdin,
         &mut stdout,
         &mut stderr,
     ))

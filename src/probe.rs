@@ -10,6 +10,7 @@ use std::ffi::{c_char, c_int, c_void};
 
 use crate::{
     error::WorkerError,
+    lease::{LeaseService, SlotState},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse},
 };
@@ -138,17 +139,33 @@ pub struct ProbeCollector;
 
 impl ProbeCollector {
     pub fn collect() -> Result<ProbeResponse, WorkerError> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let env = std::env::vars_os().collect();
+        let paths = crate::paths::PathLayout::discover(None, &env, &home)?;
+        Self::collect_at(&paths.data)
+    }
+
+    pub fn collect_at(data_root: &Path) -> Result<ProbeResponse, WorkerError> {
         let search_paths = CONTROLLED_HOST_PATHS
             .iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        Self::collect_with(
+        let mut response = Self::collect_with(
             &SystemCommandExecutor::default(),
             &SystemMemoryPressureQuery,
             &search_paths,
             std::env::consts::OS,
             std::env::consts::ARCH,
-        )
+        )?;
+        let (free, total) = filesystem_capacity(data_root)?;
+        response.free_disk_bytes = free;
+        response.total_disk_bytes = total;
+        let occupancy = LeaseService::load_if_present(data_root)?;
+        response.slot_state = occupancy.slot_state;
+        response.active_lease = occupancy.active_lease;
+        Ok(response)
     }
 
     fn collect_with(
@@ -172,7 +189,7 @@ impl ProbeCollector {
             &["-k", "/"],
             "free disk space",
         )?;
-        let free_disk_bytes = parse_free_disk_bytes(&disk)?;
+        let (free_disk_bytes, total_disk_bytes) = parse_disk_bytes(&disk)?;
         let memory_pressure = collect_memory_pressure(memory_pressure_query);
         let swap_used_bytes = collect_swap_used_bytes(executor);
         let capabilities = collect_capabilities(executor, search_paths, os, &arch);
@@ -183,8 +200,11 @@ impl ProbeCollector {
             arch,
             os_version,
             free_disk_bytes,
+            total_disk_bytes,
             memory_pressure,
             swap_used_bytes,
+            slot_state: SlotState::Idle,
+            active_lease: None,
             capabilities,
         })
     }
@@ -245,21 +265,58 @@ fn normalize_arch(arch: &str) -> Result<String, WorkerError> {
     })
 }
 
-fn parse_free_disk_bytes(output: &str) -> Result<u64, WorkerError> {
-    let available_kib = output
+fn parse_disk_bytes(output: &str) -> Result<(u64, u64), WorkerError> {
+    let line = output
         .lines()
         .rev()
         .find(|line| !line.trim().is_empty())
-        .and_then(|line| line.split_whitespace().nth(3))
+        .ok_or_else(|| WorkerError::Protocol("failed to parse disk space".into()))?;
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let total_kib = fields
+        .get(1)
+        .ok_or_else(|| WorkerError::Protocol("failed to parse total disk space".into()))?
+        .parse::<u64>()
+        .map_err(|error| {
+            WorkerError::Protocol(format!("failed to parse total disk space: {error}"))
+        })?;
+    let available_kib = fields
+        .get(3)
         .ok_or_else(|| WorkerError::Protocol("failed to parse free disk space".into()))?
         .parse::<u64>()
         .map_err(|error| {
             WorkerError::Protocol(format!("failed to parse free disk space: {error}"))
         })?;
-
-    available_kib
+    let total = total_kib
         .checked_mul(1024)
-        .ok_or_else(|| WorkerError::Protocol("free disk space overflowed u64".into()))
+        .ok_or_else(|| WorkerError::Protocol("total disk space overflowed u64".into()))?;
+    let free = available_kib
+        .checked_mul(1024)
+        .ok_or_else(|| WorkerError::Protocol("free disk space overflowed u64".into()))?;
+    Ok((free, total))
+}
+
+fn filesystem_capacity(path: &Path) -> Result<(u64, u64), WorkerError> {
+    let existing = path
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| WorkerError::Protocol("host data root has no existing ancestor".into()))?;
+    let c_path = std::ffi::CString::new(existing.as_os_str().as_encoded_bytes())
+        .map_err(|_| WorkerError::Protocol("host data path contains NUL".into()))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(WorkerError::Io(std::io::Error::last_os_error()));
+    }
+    let stats = unsafe { stats.assume_init() };
+    let block_size = stats.f_frsize;
+    let free_blocks: u64 = stats.f_bavail.into();
+    let total_blocks: u64 = stats.f_blocks.into();
+    let free = free_blocks
+        .checked_mul(block_size)
+        .ok_or_else(|| WorkerError::Protocol("free disk capacity overflowed".into()))?;
+    let total = total_blocks
+        .checked_mul(block_size)
+        .ok_or_else(|| WorkerError::Protocol("total disk capacity overflowed".into()))?;
+    Ok((free, total))
 }
 
 fn collect_memory_pressure(query: &impl MemoryPressureQuery) -> MemoryPressure {
@@ -408,6 +465,7 @@ mod tests {
     };
     use crate::{
         error::{ProcessError, ProcessStream, WorkerError},
+        lease::SlotState,
         process::ProcessPolicy,
         protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse},
     };
@@ -635,8 +693,11 @@ mod tests {
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
                 free_disk_bytes: 333 * 1024,
+                total_disk_bytes: 1000 * 1024,
                 memory_pressure: MemoryPressure::Warn,
                 swap_used_bytes: Some(1_610_612_736),
+                slot_state: SlotState::Idle,
+                active_lease: None,
                 capabilities: vec!["darwin-arm64".into(), "git".into(), "python".into()],
             }
         );

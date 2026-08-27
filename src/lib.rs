@@ -1,15 +1,24 @@
-use std::{collections::BTreeMap, ffi::OsString, io::Write, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    io::{Cursor, Read, Write},
+    path::PathBuf,
+};
 
 use cli::{Cli, Command, HostCommand};
 use config::{Config, WorkerEntry};
 use doctor::{DoctorRequest, DoctorService};
 use error::WorkerError;
+use host_store::HostStore;
 use install::Installer;
+use job::LeaseAcquireRequest;
+use lease::{AdmissionFacts, LeaseService};
 use output::CommandOutput;
 use paths::PathLayout;
 use probe::ProbeCollector;
 use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport};
+use serde::Deserialize;
 use transport::{SshTransport, WorkersService};
 
 pub mod agent;
@@ -18,9 +27,11 @@ pub mod client_state;
 pub mod config;
 pub mod doctor;
 pub mod error;
+pub mod host_store;
 pub mod inputs;
 pub mod install;
 pub mod job;
+pub mod lease;
 pub mod manifest;
 pub mod output;
 pub mod paths;
@@ -132,7 +143,17 @@ fn execute_with_context(
         }
         Command::Host {
             command: HostCommand::Probe,
-        } => Ok(CommandOutput::Probe(ProbeCollector::collect()?)),
+        } => {
+            let paths = discover_paths(cli.config, runtime)?;
+            Ok(CommandOutput::Probe(ProbeCollector::collect_at(
+                &paths.data,
+            )?))
+        }
+        Command::Host {
+            command: HostCommand::LeaseAcquire,
+        } => Err(WorkerError::Protocol(
+            "host lease-acquire requires the stdio execution boundary".into(),
+        )),
     }
 }
 
@@ -146,6 +167,17 @@ pub fn run_with_io(
     run_with_io_in_context(cli, runner, &runtime, stdout, stderr)
 }
 
+pub fn run_with_stdio(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let runtime = RuntimeContext::capture();
+    run_with_stdio_in_context(cli, runner, &runtime, stdin, stdout, stderr)
+}
+
 #[doc(hidden)]
 pub fn run_with_io_in_context(
     cli: Cli,
@@ -154,6 +186,27 @@ pub fn run_with_io_in_context(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    let mut stdin = Cursor::new(Vec::<u8>::new());
+    run_with_stdio_in_context(cli, runner, runtime, &mut stdin, stdout, stderr)
+}
+
+#[doc(hidden)]
+pub fn run_with_stdio_in_context(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::LeaseAcquire
+        }
+    ) {
+        return run_host_lease_acquire(cli.config, runtime, stdin, stdout);
+    }
     let json = cli.json;
     let raw_probe = matches!(
         &cli.command,
@@ -177,6 +230,81 @@ pub fn run_with_io_in_context(
             write_error(stderr, &error);
             error.exit_code()
         }
+    }
+}
+
+fn run_host_lease_acquire(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    const LIMIT: usize = 1024 * 1024;
+    let result = (|| -> Result<job::LeaseAcquireResponse, WorkerError> {
+        let mut bytes = Vec::new();
+        stdin.take((LIMIT + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > LIMIT {
+            return Err(WorkerError::Protocol(
+                "lease-acquire request exceeded 1 MiB".into(),
+            ));
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let request = LeaseAcquireRequest::deserialize(&mut deserializer).map_err(|error| {
+            WorkerError::Protocol(format!("invalid lease-acquire request: {error}"))
+        })?;
+        deserializer.end().map_err(|_| {
+            WorkerError::Protocol("lease-acquire request contained trailing data".into())
+        })?;
+        let paths = discover_paths(config_override, runtime)?;
+        let probe = ProbeCollector::collect_at(&paths.data)?;
+        let facts = AdmissionFacts {
+            free_disk_bytes: probe.free_disk_bytes,
+            total_disk_bytes: probe.total_disk_bytes,
+            memory_pressure: probe.memory_pressure,
+            swap_used_bytes: probe.swap_used_bytes,
+        };
+        let store = HostStore::open(&paths.data)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| WorkerError::Protocol("system clock predates Unix epoch".into()))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| WorkerError::Protocol("system clock overflow".into()))?;
+        LeaseService::new(&store).acquire(&request, &facts, now)
+    })();
+
+    let exit = match &result {
+        Ok(_) => 0,
+        Err(error) => error.exit_code(),
+    };
+    let write_result = match result {
+        Ok(response) => serde_json::to_writer(&mut *stdout, &response),
+        Err(error) => {
+            let (code, message) = public_host_error(&error);
+            serde_json::to_writer(
+                &mut *stdout,
+                &serde_json::json!({"error": {"code": code, "message": message}}),
+            )
+        }
+    };
+    if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
+        return crate::error::ExitKind::Io as u8;
+    }
+    exit
+}
+
+fn public_host_error(error: &WorkerError) -> (&'static str, &'static str) {
+    match error {
+        WorkerError::Capacity { code, .. } => (code, "worker admission rejected"),
+        WorkerError::Protocol(message) if message.starts_with("JOB_ABANDONED:") => {
+            ("JOB_ABANDONED", "job ID was abandoned")
+        }
+        WorkerError::Protocol(message) if message.starts_with("JOB_ID_CONFLICT:") => (
+            "JOB_ID_CONFLICT",
+            "job ID conflicts with durable host state",
+        ),
+        WorkerError::Io(_) => ("HOST_IO", "host state operation failed"),
+        _ => ("INVALID_REQUEST", "host request was invalid"),
     }
 }
 

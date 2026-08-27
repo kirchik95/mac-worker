@@ -39,6 +39,8 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum HostCommand {
     Probe,
+    #[command(name = "lease-acquire")]
+    LeaseAcquire,
 }
 
 fn non_empty_pattern(value: &str) -> Result<String, String> {

@@ -127,8 +127,11 @@ fn valid_probe_json() -> Vec<u8> {
         "arch": "arm64",
         "os_version": "26.2",
         "free_disk_bytes": 536_870_912_u64,
+        "total_disk_bytes": 1_073_741_824_u64,
         "memory_pressure": "normal",
         "swap_used_bytes": 134_217_728_u64,
+        "slot_state": "idle",
+        "active_lease": null,
         "capabilities": ["darwin-arm64"],
     }))
     .unwrap()
