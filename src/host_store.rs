@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::File,
     os::fd::AsRawFd,
@@ -53,7 +53,15 @@ pub struct HostStore {
 struct HostStoreInner {
     display_root: PathBuf,
     root: RootedDir,
+    namespaces: BTreeMap<&'static str, RootedDir>,
+    root_identity: HostRootIdentity,
     fault: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostRootIdentity {
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,6 +113,14 @@ impl JobDisposition {
 
 pub struct AdmissionGuard {
     file: File,
+    namespace: RootedDir,
+}
+
+impl AdmissionGuard {
+    pub(crate) fn validate(&self) -> Result<(), WorkerError> {
+        self.namespace.verify_bound()?;
+        Ok(())
+    }
 }
 
 impl Drop for AdmissionGuard {
@@ -127,7 +143,7 @@ pub struct WorkspaceReceipt {
 }
 
 pub struct CleanupReceipt {
-    store: HostStore,
+    root_identity: HostRootIdentity,
     job_id: JobId,
     client_id: ClientId,
     lease_token: LeaseToken,
@@ -196,19 +212,32 @@ impl HostStore {
                 "host data root must be absolute".into(),
             ));
         }
-        let rooted = match RootedDir::open(root) {
+        let mut rooted = match RootedDir::open(root) {
             Ok(rooted) => rooted,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => RootedDir::create(root)?,
             Err(error) => return Err(error.into()),
         };
-        require_private_directory_metadata(&rooted.root_metadata()?)?;
+        let root_metadata = rooted.root_metadata()?;
+        require_private_directory_metadata(&root_metadata)?;
+        let root_device = root_metadata.st_dev as u64;
+        rooted.bind_host_device(root_device)?;
+        let root_identity = HostRootIdentity {
+            device: root_device,
+            inode: root_metadata.st_ino,
+        };
+        let mut namespaces = BTreeMap::new();
         for name in OWNED_DIRECTORIES {
-            let child = rooted.open_child_directory(&relative(name)?, true)?;
+            let child =
+                rooted.open_child_directory_on_device(&relative(name)?, true, root_device)?;
             require_private_directory_metadata(&child.root_metadata()?)?;
+            namespaces.insert(*name, child);
         }
-        let locks = rooted.open_child_directory(&relative("locks")?, false)?;
-        let jobs = locks.open_child_directory(&relative("jobs")?, true)?;
+        let locks = namespaces
+            .get("locks")
+            .expect("owned locks namespace was inserted");
+        let jobs = locks.open_child_directory_on_device(&relative("jobs")?, true, root_device)?;
         require_private_directory_metadata(&jobs.root_metadata()?)?;
+        namespaces.insert("locks/jobs", jobs);
         for bytes in rooted.list_names()? {
             let name = std::str::from_utf8(&bytes).map_err(|_| {
                 WorkerError::Protocol("host data root contains a non-UTF-8 entry".into())
@@ -221,6 +250,8 @@ impl HostStore {
             inner: Arc::new(HostStoreInner {
                 display_root: root.to_path_buf(),
                 root: rooted,
+                namespaces,
+                root_identity,
                 fault: AtomicU8::new(point.map_or(0, |point| point as u8)),
             }),
         };
@@ -235,7 +266,12 @@ impl HostStore {
         if result != 0 {
             return Err(WorkerError::Io(std::io::Error::last_os_error()));
         }
-        Ok(AdmissionGuard { file })
+        let guard = AdmissionGuard {
+            file,
+            namespace: directory,
+        };
+        guard.validate()?;
+        Ok(guard)
     }
 
     pub(crate) fn capacity_lock(&self) -> Result<AdmissionGuard, WorkerError> {
@@ -245,7 +281,12 @@ impl HostStore {
         if result != 0 {
             return Err(WorkerError::Io(std::io::Error::last_os_error()));
         }
-        Ok(AdmissionGuard { file })
+        let guard = AdmissionGuard {
+            file,
+            namespace: leases,
+        };
+        guard.validate()?;
+        Ok(guard)
     }
 
     pub fn incoming_job(&self, job: JobId, token: LeaseToken) -> Result<PathBuf, WorkerError> {
@@ -338,7 +379,7 @@ impl HostStore {
     ) -> Result<(), WorkerError> {
         request.validate()?;
         status.validate()?;
-        let _guard = self.admission_lock(request.material().job_id())?;
+        let guard = self.admission_lock(request.material().job_id())?;
         let disposition = JobDisposition::Accepted {
             job_id: request.material().job_id(),
             client_id: request.material().client_id(),
@@ -348,6 +389,7 @@ impl HostStore {
             status: status.clone(),
             recorded_at_millis: now,
         };
+        guard.validate()?;
         self.write_new_disposition(&disposition)
     }
 
@@ -357,7 +399,7 @@ impl HostStore {
         now: u64,
     ) -> Result<(), WorkerError> {
         request.validate()?;
-        let _guard = self.admission_lock(request.material().job_id())?;
+        let guard = self.admission_lock(request.material().job_id())?;
         let token_hash = format!(
             "{:x}",
             Sha256::digest(request.material().lease_token().to_string().as_bytes())
@@ -369,6 +411,7 @@ impl HostStore {
             lease_token_sha256: token_hash,
             recorded_at_millis: now,
         };
+        guard.validate()?;
         self.write_new_disposition(&disposition)
     }
 
@@ -430,6 +473,8 @@ impl HostStore {
                 "terminal status proof is required".into(),
             ));
         }
+        let admission = self.admission_lock(lease.job_id())?;
+        let capacity = self.capacity_lock()?;
         let job_dir = self.open_directory(
             &format!(
                 "jobs/{}/{}/{}",
@@ -439,6 +484,8 @@ impl HostStore {
             ),
             false,
         )?;
+        admission.validate()?;
+        capacity.validate()?;
         write_json_once(&job_dir, "status.json", status, "terminal status")
     }
 
@@ -448,8 +495,8 @@ impl HostStore {
         lease: &LeaseRecord,
     ) -> Result<CleanupReceipt, WorkerError> {
         lease.validate()?;
-        let _admission = self.admission_lock(lease.job_id())?;
-        let _capacity = self.capacity_lock()?;
+        let admission = self.admission_lock(lease.job_id())?;
+        let capacity = self.capacity_lock()?;
         let final_relative = format!(
             "jobs/{}/{}/{}",
             lease.project_id(),
@@ -493,9 +540,13 @@ impl HostStore {
                 }
             }
         };
+        admission.validate()?;
+        capacity.validate()?;
         self.remove_job_mutable_scopes(lease)?;
         self.verify_job_mutable_scopes_absent(lease)?;
         let proof_dir = self.open_directory(&format!("locks/jobs/{}", lease.job_id()), true)?;
+        admission.validate()?;
+        capacity.validate()?;
         write_json_once(
             &proof_dir,
             "cleanup-complete.json",
@@ -508,7 +559,7 @@ impl HostStore {
             "cleanup marker",
         )?;
         Ok(CleanupReceipt {
-            store: self.clone(),
+            root_identity: self.root_identity()?,
             job_id: lease.job_id(),
             client_id: lease.client_id(),
             lease_token: lease.lease_token(),
@@ -539,10 +590,39 @@ impl HostStore {
         path: &str,
         create: bool,
     ) -> Result<RootedDir, WorkerError> {
-        let path = relative(path)?;
-        let directory = self.inner.root.open_child_directory(&path, create)?;
+        let _ = relative(path)?;
+        let key = self
+            .inner
+            .namespaces
+            .keys()
+            .filter(|key| path == **key || path.starts_with(&format!("{key}/")))
+            .max_by_key(|key| key.len())
+            .ok_or_else(|| WorkerError::Protocol("path is outside host-owned namespaces".into()))?;
+        let namespace = self
+            .inner
+            .namespaces
+            .get(key)
+            .expect("selected host namespace exists");
+        let suffix = path.strip_prefix(key).unwrap().strip_prefix('/');
+        let directory = match suffix {
+            None => namespace.reopen()?,
+            Some(suffix) => namespace.open_child_directory(&relative(suffix)?, create)?,
+        };
         require_private_directory_metadata(&directory.root_metadata()?)?;
         Ok(directory)
+    }
+
+    fn root_identity(&self) -> Result<HostRootIdentity, WorkerError> {
+        self.inner.root.verify_bound()?;
+        let metadata = self.inner.root.root_metadata()?;
+        let current = HostRootIdentity {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino,
+        };
+        if current != self.inner.root_identity {
+            return Err(WorkerError::Protocol("host root identity changed".into()));
+        }
+        Ok(current)
     }
 
     fn remove_job_mutable_scopes(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
@@ -840,16 +920,23 @@ impl CleanupReceipt {
     }
 
     #[allow(dead_code)] // Task 7 lifecycle consumes internal release receipts.
-    pub(crate) fn validate_durable(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
+    pub(crate) fn validate_durable(
+        &self,
+        store: &HostStore,
+        lease: &LeaseRecord,
+    ) -> Result<(), WorkerError> {
         if !self.matches(lease) {
             return Err(WorkerError::Protocol(
                 "cleanup receipt identity mismatch".into(),
             ));
         }
-        self.store.verify_job_mutable_scopes_absent(lease)?;
-        let proof_dir = self
-            .store
-            .open_directory(&format!("locks/jobs/{}", lease.job_id()), false)?;
+        if store.root_identity()? != self.root_identity {
+            return Err(WorkerError::Protocol(
+                "cleanup receipt belongs to another host root".into(),
+            ));
+        }
+        store.verify_job_mutable_scopes_absent(lease)?;
+        let proof_dir = store.open_directory(&format!("locks/jobs/{}", lease.job_id()), false)?;
         let marker: CleanupMarker = read_json_strict_at(&proof_dir, "cleanup-complete.json")?;
         if !marker.terminal_or_abandoned
             || marker.job_id != lease.job_id()
@@ -862,7 +949,7 @@ impl CleanupReceipt {
         }
         match &self.proof {
             CleanupProof::Terminal => {
-                let job_dir = self.store.open_directory(
+                let job_dir = store.open_directory(
                     &format!(
                         "jobs/{}/{}/{}",
                         lease.project_id(),
@@ -879,8 +966,7 @@ impl CleanupReceipt {
                 }
             }
             CleanupProof::Abandoned => {
-                let disposition = self
-                    .store
+                let disposition = store
                     .disposition(lease.job_id())?
                     .ok_or_else(|| WorkerError::Protocol("abandonment proof is absent".into()))?;
                 let expected_hash = format!(
@@ -1023,5 +1109,85 @@ mod review_regression_tests {
         assert!(staged.publish_complete(receipt).is_err());
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
         assert!(!detached.join(material.job_id().to_string()).exists());
+    }
+
+    #[test]
+    fn staged_publication_fails_closed_when_final_grandparent_is_relocated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request(1);
+        let material = request.material();
+        let staged = store
+            .begin_job(
+                material.project_id(),
+                material.worktree_id(),
+                material.job_id(),
+            )
+            .unwrap();
+        let payload = RelativePath::parse(b"payload").unwrap();
+        staged
+            .rooted_dir()
+            .create_empty_directory(&payload)
+            .unwrap();
+        let receipt = staged
+            .complete_materialization(&BTreeSet::from([payload]))
+            .unwrap();
+        let project = root.join("jobs").join(material.project_id());
+        let detached = temp.path().join("detached-project");
+        fs::rename(&project, &detached).unwrap();
+        fs::create_dir(&project).unwrap();
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement = project.join(material.worktree_id());
+        fs::create_dir(&replacement).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(replacement.join("sentinel"), b"keep").unwrap();
+
+        assert!(staged.publish_complete(receipt).is_err());
+        assert!(
+            !detached
+                .join(material.worktree_id())
+                .join(material.job_id().to_string())
+                .exists()
+        );
+        assert!(!replacement.join(material.job_id().to_string()).exists());
+        assert_eq!(fs::read(replacement.join("sentinel")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn admission_lock_domain_cannot_split_after_jobs_namespace_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let first = HostStore::open(&root).unwrap();
+        let second = HostStore::open(&root).unwrap();
+        let job = request(1).material().job_id();
+        let _held = first.admission_lock(job).unwrap();
+        fs::rename(root.join("locks/jobs"), root.join("locks/jobs-detached")).unwrap();
+        fs::create_dir(root.join("locks/jobs")).unwrap();
+        fs::set_permissions(root.join("locks/jobs"), fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(second.admission_lock(job).is_err());
+        assert_eq!(fs::read_dir(root.join("locks/jobs")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn capacity_lock_domain_cannot_split_after_leases_namespace_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let first = HostStore::open(&root).unwrap();
+        let second = HostStore::open(&root).unwrap();
+        let _held = first.capacity_lock().unwrap();
+        fs::rename(root.join("leases"), root.join("leases-detached")).unwrap();
+        fs::create_dir(root.join("leases")).unwrap();
+        fs::set_permissions(root.join("leases"), fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(second.capacity_lock().is_err());
+        assert_eq!(fs::read_dir(root.join("leases")).unwrap().count(), 0);
     }
 }

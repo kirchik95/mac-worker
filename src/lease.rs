@@ -65,7 +65,8 @@ impl<'a> LeaseService<'a> {
             ));
         }
         self.store.validate_layout()?;
-        let _guard = self.store.admission_lock(request.material().job_id())?;
+        let guard = self.store.admission_lock(request.material().job_id())?;
+        guard.validate()?;
         if let Some(disposition) = self.store.disposition(request.material().job_id())? {
             return match disposition {
                 JobDisposition::Accepted {
@@ -92,7 +93,9 @@ impl<'a> LeaseService<'a> {
                 )),
             };
         }
-        let _capacity = self.store.capacity_lock()?;
+        let capacity = self.store.capacity_lock()?;
+        guard.validate()?;
+        capacity.validate()?;
 
         if let Some(existing) = self.load_locked()? {
             if lease_matches_request(&existing, request)? {
@@ -114,7 +117,7 @@ impl<'a> LeaseService<'a> {
             now,
             expires,
         )?;
-        self.publish_lease(&lease)?;
+        self.publish_lease(&lease, &guard, &capacity)?;
         Ok(LeaseAcquireResponse::Acquired { lease })
     }
 
@@ -128,16 +131,19 @@ impl<'a> LeaseService<'a> {
     }
 
     pub fn load_if_present(root: &Path) -> Result<LeaseOccupancy, WorkerError> {
-        let rooted = match RootedDir::open(root) {
+        let mut rooted = match RootedDir::open(root) {
             Ok(rooted) => rooted,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
             Err(error) => return Err(error.into()),
         };
-        let leases = match rooted.open_child_directory(&relative("leases")?, false) {
-            Ok(leases) => leases,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
-            Err(error) => return Err(error.into()),
-        };
+        let root_device = rooted.root_metadata()?.st_dev as u64;
+        rooted.bind_host_device(root_device)?;
+        let leases =
+            match rooted.open_child_directory_on_device(&relative("leases")?, false, root_device) {
+                Ok(leases) => leases,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
+                Err(error) => return Err(error.into()),
+            };
         let live = match leases.open_child_directory(&relative("heavy")?, false) {
             Ok(live) => live,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
@@ -154,21 +160,29 @@ impl<'a> LeaseService<'a> {
     ) -> Result<(), WorkerError> {
         expected.validate()?;
         self.store.validate_layout()?;
-        let _guard = self.store.admission_lock(expected.job_id())?;
-        let _capacity = self.store.capacity_lock()?;
+        let guard = self.store.admission_lock(expected.job_id())?;
+        let capacity = self.store.capacity_lock()?;
+        guard.validate()?;
+        capacity.validate()?;
         let live = self
             .load_locked()?
             .ok_or_else(|| WorkerError::Protocol("live lease is absent".into()))?;
         if live != *expected {
             return Err(WorkerError::Protocol("live lease identity mismatch".into()));
         }
-        receipt.validate_durable(&live)?;
+        receipt.validate_durable(self.store, &live)?;
+        guard.validate()?;
+        capacity.validate()?;
         let leases = self.store.open_directory("leases", false)?;
         let retired = format!(".released-{}", live.job_id());
         if leases.entry_exists(&retired)? {
+            guard.validate()?;
+            capacity.validate()?;
             leases.remove_owned_child(&retired)?;
         }
         let mut live_dir = leases.open_child_directory(&relative("heavy")?, false)?;
+        guard.validate()?;
+        capacity.validate()?;
         live_dir.publish_owned_into(&leases, &retired)?;
         leases.sync_root()?;
         leases.remove_owned_child(&retired)?;
@@ -184,7 +198,14 @@ impl<'a> LeaseService<'a> {
         }
     }
 
-    fn publish_lease(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
+    fn publish_lease(
+        &self,
+        lease: &LeaseRecord,
+        admission: &crate::host_store::AdmissionGuard,
+        capacity: &crate::host_store::AdmissionGuard,
+    ) -> Result<(), WorkerError> {
+        admission.validate()?;
+        capacity.validate()?;
         let leases = self.store.open_directory("leases", false)?;
         let operation_name = format!(".acquire-{}", lease.job_id());
         if leases.entry_exists(&operation_name)? {
@@ -222,6 +243,8 @@ impl<'a> LeaseService<'a> {
         {
             return Err(injected());
         }
+        admission.validate()?;
+        capacity.validate()?;
         operation.publish_owned_into(&leases, "heavy")?;
         if self
             .store
@@ -509,5 +532,39 @@ mod lifecycle_tests {
         );
         service.release_after_cleanup(&lease, &receipt).unwrap();
         assert_eq!(service.load().unwrap(), None);
+    }
+
+    #[test]
+    fn cleanup_receipt_from_another_host_root_cannot_release_identical_lease() {
+        let temp = tempdir().unwrap();
+        let root_a = temp.path().join("host-a");
+        let root_b = temp.path().join("host-b");
+        let store_a = HostStore::open(&root_a).unwrap();
+        let store_b = HostStore::open(&root_b).unwrap();
+        let service_a = LeaseService::new(&store_a);
+        let service_b = LeaseService::new(&store_b);
+        let request = request(1);
+        let lease_a = acquire(&service_a, &request);
+        let lease_b = acquire(&service_b, &request);
+        assert_eq!(lease_a, lease_b);
+        store_b.record_abandoned(&request, 2).unwrap();
+        let receipt_b = store_b.cleanup_job_owned(&lease_b).unwrap();
+        let incoming_a = store_a
+            .incoming_job(lease_a.job_id(), lease_a.lease_token())
+            .unwrap();
+        private_dir(incoming_a.parent().unwrap());
+        private_dir(&incoming_a);
+        private_file(&incoming_a.join("sentinel"), b"must remain");
+
+        assert!(
+            service_a
+                .release_after_cleanup(&lease_a, &receipt_b)
+                .is_err()
+        );
+        assert_eq!(service_a.load().unwrap(), Some(lease_a));
+        assert_eq!(
+            fs::read(incoming_a.join("sentinel")).unwrap(),
+            b"must remain"
+        );
     }
 }

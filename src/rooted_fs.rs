@@ -226,6 +226,16 @@ pub struct RootedDir {
     parent: OwnedFd,
     root_name: CString,
     root_identity: FileIdentity,
+    lineage: Vec<DirectoryBinding>,
+    security_device: Option<u64>,
+}
+
+struct DirectoryBinding {
+    directory: OwnedFd,
+    parent: OwnedFd,
+    name: CString,
+    identity: FileIdentity,
+    security_device: Option<u64>,
 }
 
 impl RootedDir {
@@ -239,6 +249,8 @@ impl RootedDir {
             parent,
             root_name,
             root_identity,
+            lineage: Vec::new(),
+            security_device: None,
         })
     }
 
@@ -259,6 +271,28 @@ impl RootedDir {
             parent,
             root_name,
             root_identity,
+            lineage: Vec::new(),
+            security_device: None,
+        })
+    }
+
+    pub(crate) fn bind_host_device(&mut self, expected_device: u64) -> io::Result<()> {
+        self.verify_root_name()?;
+        let metadata = stat_fd(self.root.as_raw_fd())?;
+        require_private_directory_on_device(&metadata, expected_device)?;
+        self.security_device = Some(expected_device);
+        Ok(())
+    }
+
+    pub(crate) fn reopen(&self) -> io::Result<Self> {
+        self.verify_root_name()?;
+        Ok(Self {
+            root: reopen_directory(self.root.as_raw_fd())?,
+            parent: reopen_directory(self.parent.as_raw_fd())?,
+            root_name: self.root_name.clone(),
+            root_identity: self.root_identity,
+            lineage: clone_lineage(&self.lineage)?,
+            security_device: self.security_device,
         })
     }
 
@@ -276,10 +310,34 @@ impl RootedDir {
         path: &RelativePath,
         create: bool,
     ) -> io::Result<Self> {
+        self.open_child_directory_inner(path, create, self.security_device)
+    }
+
+    pub(crate) fn open_child_directory_on_device(
+        &self,
+        path: &RelativePath,
+        create: bool,
+        expected_device: u64,
+    ) -> io::Result<Self> {
+        self.open_child_directory_inner(path, create, Some(expected_device))
+    }
+
+    fn open_child_directory_inner(
+        &self,
+        path: &RelativePath,
+        create: bool,
+        security_device: Option<u64>,
+    ) -> io::Result<Self> {
         self.verify_root_name()?;
-        require_private_directory(&stat_fd(self.root.as_raw_fd())?)?;
-        let (parent, name) = self.open_private_parent(path, create)?;
+        let root_metadata = stat_fd(self.root.as_raw_fd())?;
+        if let Some(device) = security_device {
+            require_private_directory_on_device(&root_metadata, device)?;
+        } else {
+            require_private_directory(&root_metadata)?;
+        }
+        let (parent, name, lineage) = self.open_private_parent(path, create, security_device)?;
         if create {
+            verify_lineage(&lineage)?;
             match mkdir_at(parent.as_raw_fd(), &name, 0o700) {
                 Ok(()) => cvt(unsafe { libc::fsync(parent.as_raw_fd()) })?,
                 Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
@@ -289,8 +347,13 @@ impl RootedDir {
         let path_stat = stat_at(parent.as_raw_fd(), &name)?;
         let root = open_directory_at(parent.as_raw_fd(), &name)?;
         let opened = stat_fd(root.as_raw_fd())?;
-        require_private_directory(&path_stat)?;
-        require_private_directory(&opened)?;
+        if let Some(device) = security_device {
+            require_private_directory_on_device(&path_stat, device)?;
+            require_private_directory_on_device(&opened, device)?;
+        } else {
+            require_private_directory(&path_stat)?;
+            require_private_directory(&opened)?;
+        }
         if !same_file(&path_stat, &opened) {
             return Err(os_error(libc::ESTALE));
         }
@@ -299,6 +362,8 @@ impl RootedDir {
             parent,
             root_name: name,
             root_identity: FileIdentity::from_stat(&opened),
+            lineage,
+            security_device,
         })
     }
 
@@ -308,13 +373,20 @@ impl RootedDir {
         mkdir_at(self.root.as_raw_fd(), &name, 0o700)?;
         let root = open_directory_at(self.root.as_raw_fd(), &name)?;
         let opened = stat_fd(root.as_raw_fd())?;
-        require_private_directory(&opened)?;
+        if let Some(device) = self.security_device {
+            require_private_directory_on_device(&opened, device)?;
+        } else {
+            require_private_directory(&opened)?;
+        }
+        let lineage = self.child_lineage()?;
         cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
         Ok(Self {
             root,
-            parent: duplicate_fd(self.root.as_raw_fd())?,
+            parent: reopen_directory(self.root.as_raw_fd())?,
             root_name: name,
             root_identity: FileIdentity::from_stat(&opened),
+            lineage,
+            security_device: self.security_device,
         })
     }
 
@@ -432,6 +504,7 @@ impl RootedDir {
         let mut file = File::from(descriptor);
         file.write_all(bytes)?;
         file.sync_all()?;
+        self.verify_root_name()?;
         if let Err(error) = rename_no_replace(
             self.root.as_raw_fd(),
             &temporary,
@@ -472,6 +545,7 @@ impl RootedDir {
             return Err(os_error(libc::ESTALE));
         }
         let private = random_private_name("remove");
+        self.verify_root_name()?;
         rename_no_replace(
             self.root.as_raw_fd(),
             &name,
@@ -494,19 +568,30 @@ impl RootedDir {
         self.verify_root_name()?;
         destination_parent.verify_root_name()?;
         let destination_name = CString::new(destination_name).map_err(interior_nul_error)?;
-        if stat_fd(destination_parent.root.as_raw_fd())?.st_dev
-            != self.root_identity.device as libc::dev_t
-        {
+        let destination_metadata = stat_fd(destination_parent.root.as_raw_fd())?;
+        if destination_metadata.st_dev != self.root_identity.device as libc::dev_t {
             return Err(os_error(libc::EXDEV));
         }
+        if let Some(device) = self.security_device {
+            if destination_parent.security_device != Some(device) {
+                return Err(os_error(libc::EXDEV));
+            }
+            require_private_directory_on_device(&destination_metadata, device)?;
+        }
+        let rebound_parent = reopen_directory(destination_parent.root.as_raw_fd())?;
+        let rebound_lineage = destination_parent.child_lineage()?;
+        self.verify_root_name()?;
+        destination_parent.verify_root_name()?;
         rename_no_replace(
             self.parent.as_raw_fd(),
             &self.root_name,
             destination_parent.root.as_raw_fd(),
             &destination_name,
         )?;
-        self.parent = duplicate_fd(destination_parent.root.as_raw_fd())?;
+        self.parent = rebound_parent;
         self.root_name = destination_name;
+        self.lineage = rebound_lineage;
+        self.security_device = destination_parent.security_device;
         Ok(())
     }
 
@@ -823,7 +908,8 @@ impl RootedDir {
         &self,
         path: &RelativePath,
         create_missing: bool,
-    ) -> io::Result<(OwnedFd, CString)> {
+        security_device: Option<u64>,
+    ) -> io::Result<(OwnedFd, CString, Vec<DirectoryBinding>)> {
         let components = path
             .as_str()
             .split('/')
@@ -832,9 +918,11 @@ impl RootedDir {
         let (name, parents) = components
             .split_last()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty relative path"))?;
-        let mut parent = duplicate_fd(self.root.as_raw_fd())?;
+        let mut lineage = self.child_lineage()?;
+        let mut parent = reopen_directory(self.root.as_raw_fd())?;
         for component in parents {
             if create_missing {
+                verify_lineage(&lineage)?;
                 match mkdir_at(parent.as_raw_fd(), component, 0o700) {
                     Ok(()) => cvt(unsafe { libc::fsync(parent.as_raw_fd()) })?,
                     Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
@@ -842,19 +930,41 @@ impl RootedDir {
                 }
             }
             let path_stat = stat_at(parent.as_raw_fd(), component)?;
-            require_private_directory(&path_stat)?;
+            if let Some(device) = security_device {
+                require_private_directory_on_device(&path_stat, device)?;
+            } else {
+                require_private_directory(&path_stat)?;
+            }
             let child = open_directory_at(parent.as_raw_fd(), component)?;
             let opened = stat_fd(child.as_raw_fd())?;
-            require_private_directory(&opened)?;
+            if let Some(device) = security_device {
+                require_private_directory_on_device(&opened, device)?;
+            } else {
+                require_private_directory(&opened)?;
+            }
             if !same_file(&path_stat, &opened) {
                 return Err(os_error(libc::ESTALE));
             }
+            lineage.push(DirectoryBinding {
+                directory: reopen_directory(child.as_raw_fd())?,
+                parent: reopen_directory(parent.as_raw_fd())?,
+                name: component.clone(),
+                identity: FileIdentity::from_stat(&opened),
+                security_device,
+            });
             parent = child;
         }
-        Ok((parent, name.clone()))
+        Ok((parent, name.clone(), lineage))
     }
 
     fn verify_root_name(&self) -> io::Result<()> {
+        for binding in &self.lineage {
+            binding.verify()?;
+        }
+        self.verify_self()
+    }
+
+    fn verify_self(&self) -> io::Result<()> {
         let current = stat_at(self.parent.as_raw_fd(), &self.root_name)?;
         if file_type(current.st_mode) == libc::S_IFLNK {
             return Err(os_error(libc::ELOOP));
@@ -865,8 +975,68 @@ impl RootedDir {
         if FileIdentity::from_stat(&current) != self.root_identity {
             return Err(os_error(libc::ESTALE));
         }
+        let opened = stat_fd(self.root.as_raw_fd())?;
+        if !same_file(&current, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        if let Some(device) = self.security_device {
+            require_private_directory_on_device(&current, device)?;
+            require_private_directory_on_device(&opened, device)?;
+        }
         Ok(())
     }
+
+    fn child_lineage(&self) -> io::Result<Vec<DirectoryBinding>> {
+        let mut lineage = clone_lineage(&self.lineage)?;
+        lineage.push(DirectoryBinding {
+            directory: reopen_directory(self.root.as_raw_fd())?,
+            parent: reopen_directory(self.parent.as_raw_fd())?,
+            name: self.root_name.clone(),
+            identity: self.root_identity,
+            security_device: self.security_device,
+        });
+        Ok(lineage)
+    }
+}
+
+impl DirectoryBinding {
+    fn verify(&self) -> io::Result<()> {
+        let current = stat_at(self.parent.as_raw_fd(), &self.name)?;
+        let opened = stat_fd(self.directory.as_raw_fd())?;
+        if file_type(current.st_mode) != libc::S_IFDIR
+            || FileIdentity::from_stat(&current) != self.identity
+            || !same_file(&current, &opened)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        if let Some(device) = self.security_device {
+            require_private_directory_on_device(&current, device)?;
+            require_private_directory_on_device(&opened, device)?;
+        }
+        Ok(())
+    }
+}
+
+fn clone_lineage(lineage: &[DirectoryBinding]) -> io::Result<Vec<DirectoryBinding>> {
+    lineage
+        .iter()
+        .map(|binding| {
+            Ok(DirectoryBinding {
+                directory: reopen_directory(binding.directory.as_raw_fd())?,
+                parent: reopen_directory(binding.parent.as_raw_fd())?,
+                name: binding.name.clone(),
+                identity: binding.identity,
+                security_device: binding.security_device,
+            })
+        })
+        .collect()
+}
+
+fn verify_lineage(lineage: &[DirectoryBinding]) -> io::Result<()> {
+    for binding in lineage {
+        binding.verify()?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -979,6 +1149,10 @@ fn open_directory_at(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
     // is an owned, live directory descriptor at every call site.
     let descriptor = unsafe { libc::openat(parent, name.as_ptr(), DIRECTORY_OPEN_FLAGS) };
     owned_fd(descriptor).or_else(|error| normalize_directory_symlink_error(error, parent, name))
+}
+
+fn reopen_directory(descriptor: RawFd) -> io::Result<OwnedFd> {
+    open_directory_at(descriptor, c".")
 }
 
 fn normalize_directory_symlink_error(
@@ -1133,6 +1307,17 @@ fn require_private_directory(metadata: &libc::stat) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             "host directory is not owner-only",
         ));
+    }
+    Ok(())
+}
+
+fn require_private_directory_on_device(
+    metadata: &libc::stat,
+    expected_device: u64,
+) -> io::Result<()> {
+    require_private_directory(metadata)?;
+    if metadata.st_dev as u64 != expected_device {
+        return Err(os_error(libc::EXDEV));
     }
     Ok(())
 }
@@ -3323,5 +3508,26 @@ mod tests {
         let error = open_verified_child_directory(root.as_raw_fd(), &dev, &metadata).unwrap_err();
 
         assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+    }
+
+    #[test]
+    fn host_child_creation_rejects_a_wrong_anchored_device_before_mutation() {
+        // Catches host-owned namespaces being created on a device other than
+        // the filesystem whose admission facts were measured.
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("host");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+        let wrong_device = root.root_metadata().unwrap().st_dev as u64 + 1;
+        let child = RelativePath::parse(b"leases").unwrap();
+
+        let error = match root.open_child_directory_on_device(&child, true, wrong_device) {
+            Ok(_) => panic!("wrong-device host child was created"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+        assert!(!root_path.join("leases").exists());
     }
 }
