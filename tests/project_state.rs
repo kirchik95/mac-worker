@@ -151,49 +151,162 @@ fn nested_empty_working_directory_is_manifested_and_materialized() {
 }
 
 #[test]
-fn settings_requirements_and_head_drift_each_block_before_cache_access() {
-    // Catches equality omitting effective settings (including artifacts),
-    // detected requirements, or Git context from the pre-selection barrier.
-    for mutation in ["settings", "requirements", "head"] {
-        let repo = GitRepo::init();
-        repo.write("README.md", b"tracked\n");
-        repo.commit_all("A state fixture");
-        let before = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
-        match mutation {
-            "settings" => repo.write(
-                ".worker.toml",
-                b"version = 1\n[artifacts]\ninclude = [\"dist/**\"]\nmax_total_bytes = 73\n",
-            ),
-            "requirements" => repo.write("package.json", b"{}\n"),
-            "head" => {
-                repo.write("README.md", b"new committed bytes\n");
-                repo.commit_all("B state fixture");
-            }
-            _ => unreachable!(),
-        }
-        let state = tempfile::tempdir().unwrap();
-        let cache = state.path().join("poison-cache");
-        fs::write(&cache, b"must remain an unopened regular file\n").unwrap();
+fn artifact_settings_drift_alone_blocks_before_selection_or_cache_access() {
+    // Catches omitting effective artifact settings from state equality while
+    // Git context and requirements remain exactly unchanged.
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        b"version = 1\n[artifacts]\ninclude = [\"baseline/**\"]\nmax_total_bytes = 1024\n",
+    );
+    repo.write("README.md", b"tracked\n");
+    repo.write("dirty.txt", b"committed\n");
+    repo.commit_all("artifact policy A fixture");
+    repo.write("dirty.txt", b"already dirty\n");
+    let before = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
 
-        let error =
-            ProjectState::prepare(&SystemProcessRunner, &cache, request(repo.root()), &before)
-                .expect_err("A/B drift must block preparation");
+    repo.write(
+        ".worker.toml",
+        b"version = 1\n[artifacts]\ninclude = [\"changed/**\"]\nmax_total_bytes = 2048\n",
+    );
+    let after = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
 
-        assert!(matches!(
-            error,
-            ProjectPreparationError::Worker {
-                error: WorkerError::Snapshot {
-                    code: "SNAPSHOT_CHANGED",
-                    ..
-                },
+    assert!(before.context.dirty);
+    assert_eq!(before.context, after.context);
+    assert_eq!(before.requirements, after.requirements);
+    assert_eq!(before.settings.requires, after.settings.requires);
+    assert_eq!(
+        before.settings.resource_class,
+        after.settings.resource_class
+    );
+    assert_eq!(before.settings.timeout, after.settings.timeout);
+    assert_eq!(before.settings.snapshot, after.settings.snapshot);
+    assert_eq!(before.settings.artifacts.include, ["baseline/**"]);
+    assert_eq!(before.settings.artifacts.max_total_bytes, Some(1024));
+    assert_eq!(after.settings.artifacts.include, ["changed/**"]);
+    assert_eq!(after.settings.artifacts.max_total_bytes, Some(2048));
+
+    let state = tempfile::tempdir().unwrap();
+    let cache = state.path().join("poison-cache");
+    fs::write(&cache, b"must remain an unopened regular file\n").unwrap();
+    let runner = SelectionCountingRunner::default();
+
+    let error = ProjectState::prepare(&runner, &cache, request(repo.root()), &before)
+        .expect_err("artifact settings drift must block preparation");
+
+    assert_snapshot_changed(error);
+    assert_eq!(runner.selection_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        b"must remain an unopened regular file\n"
+    );
+}
+
+#[test]
+fn detected_requirements_drift_alone_blocks_before_selection_or_cache_access() {
+    // Catches omitting detected requirements from state equality while Git
+    // context and effective settings remain exactly unchanged.
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.write("dirty.txt", b"committed\n");
+    repo.commit_all("requirements A fixture");
+    repo.write("dirty.txt", b"already dirty\n");
+    let before = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+
+    repo.write("package.json", b"{}\n");
+    let after = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+
+    assert!(before.context.dirty);
+    assert_eq!(before.context, after.context);
+    assert_eq!(before.settings, after.settings);
+    assert!(before.requirements.is_empty());
+    assert_eq!(after.requirements, ["node"]);
+
+    let state = tempfile::tempdir().unwrap();
+    let cache = state.path().join("poison-cache");
+    fs::write(&cache, b"must remain an unopened regular file\n").unwrap();
+    let runner = SelectionCountingRunner::default();
+
+    let error = ProjectState::prepare(&runner, &cache, request(repo.root()), &before)
+        .expect_err("detected requirements drift must block preparation");
+
+    assert_snapshot_changed(error);
+    assert_eq!(runner.selection_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        b"must remain an unopened regular file\n"
+    );
+}
+
+#[test]
+fn head_drift_blocks_before_selection_or_cache_access() {
+    // Catches omitting HEAD from context equality while the already-dirty bit,
+    // branch, settings, and requirements remain unchanged.
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.write("dirty.txt", b"committed\n");
+    repo.commit_all("HEAD A fixture");
+    repo.write("dirty.txt", b"already dirty\n");
+    let before = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+
+    assert!(
+        repo.git(&["commit", "--allow-empty", "-m", "HEAD B fixture"])
+            .status
+            .success()
+    );
+    let after = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+
+    assert!(before.context.dirty);
+    assert!(after.context.dirty);
+    assert_ne!(before.context.head, after.context.head);
+    let mut normalized_after = after.context.clone();
+    normalized_after.head = before.context.head.clone();
+    assert_eq!(before.context, normalized_after);
+    assert_eq!(before.settings, after.settings);
+    assert_eq!(before.requirements, after.requirements);
+
+    let state = tempfile::tempdir().unwrap();
+    let cache = state.path().join("poison-cache");
+    fs::write(&cache, b"must remain an unopened regular file\n").unwrap();
+    let runner = SelectionCountingRunner::default();
+
+    let error = ProjectState::prepare(&runner, &cache, request(repo.root()), &before)
+        .expect_err("HEAD drift must block preparation");
+
+    assert_snapshot_changed(error);
+    assert_eq!(runner.selection_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        b"must remain an unopened regular file\n"
+    );
+}
+
+fn assert_snapshot_changed(error: ProjectPreparationError) {
+    assert!(matches!(
+        error,
+        ProjectPreparationError::Worker {
+            error: WorkerError::Snapshot {
+                code: "SNAPSHOT_CHANGED",
                 ..
-            }
-        ));
-        assert_eq!(
-            fs::read(&cache).unwrap(),
-            b"must remain an unopened regular file\n",
-            "{mutation} drift touched the poisoned cache"
-        );
+            },
+            ..
+        }
+    ));
+}
+
+#[derive(Default)]
+struct SelectionCountingRunner {
+    selection_queries: AtomicUsize,
+}
+
+impl ProcessRunner for SelectionCountingRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == OsStr::new("/usr/bin/git")
+            && request.args.iter().any(|argument| argument == "ls-files")
+        {
+            self.selection_queries.fetch_add(1, Ordering::SeqCst);
+        }
+        SystemProcessRunner.run(request)
     }
 }
 
@@ -376,6 +489,10 @@ fn failed_c_reload_exactly_cleans_the_published_capture() {
             ..
         }
     ));
+    let after = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    assert_eq!(before.context, after.context);
+    assert_eq!(before.settings, after.settings);
+    assert_eq!(before.requirements, after.requirements);
     assert_no_owned_capture(cache.path());
 }
 
@@ -384,8 +501,14 @@ fn b_c_settings_mismatch_returns_snapshot_changed_after_exact_cleanup() {
     // Catches accepting a publication whose effective settings no longer
     // match the settings that selected and captured its bytes.
     let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        b"version = 1\n[artifacts]\ninclude = [\"baseline/**\"]\nmax_total_bytes = 1024\n",
+    );
     repo.write("README.md", b"tracked\n");
+    repo.write("dirty.txt", b"committed\n");
     repo.commit_all("B/C settings drift fixture");
+    repo.write("dirty.txt", b"already dirty\n");
     let before = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
     let cache = tempfile::tempdir().unwrap();
     let runner = PostCaptureSettingsMutationRunner {
@@ -406,6 +529,21 @@ fn b_c_settings_mismatch_returns_snapshot_changed_after_exact_cleanup() {
             ..
         }
     ));
+    let after = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    assert!(before.context.dirty);
+    assert_eq!(before.context, after.context);
+    assert_eq!(before.requirements, after.requirements);
+    assert_eq!(before.settings.requires, after.settings.requires);
+    assert_eq!(
+        before.settings.resource_class,
+        after.settings.resource_class
+    );
+    assert_eq!(before.settings.timeout, after.settings.timeout);
+    assert_eq!(before.settings.snapshot, after.settings.snapshot);
+    assert_eq!(before.settings.artifacts.include, ["baseline/**"]);
+    assert_eq!(before.settings.artifacts.max_total_bytes, Some(1024));
+    assert_eq!(after.settings.artifacts.include, ["changed/**"]);
+    assert_eq!(after.settings.artifacts.max_total_bytes, None);
     assert_no_owned_capture(cache.path());
 }
 
@@ -479,6 +617,10 @@ fn failed_c_reload_cleanup_io_error_is_authoritative_and_crosses_no_boundary() {
         }
         other => panic!("cleanup failure had wrong classification: {other}"),
     }
+    let after = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    assert_eq!(before.context, after.context);
+    assert_eq!(before.settings, after.settings);
+    assert_eq!(before.requirements, after.requirements);
     let moved = cache.path().join("moved-owned-capture");
     assert!(moved.join("tree/README.md").is_file());
     let ready = cache.path().join("snapshots/ready");
