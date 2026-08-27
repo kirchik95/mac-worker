@@ -1,8 +1,10 @@
 use mac_worker::{
     error::{ExitKind, WorkerError},
     job::{
-        CommandSpec, JobId, JobState, JobStatus, JsonEvent, LogChunk, LogStream,
-        RequestFingerprint, RequestFingerprintMaterial,
+        CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus, JsonEvent,
+        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LocalJobRecord, LogChunk,
+        LogStream, RequestFingerprint, RequestFingerprintMaterial, StatusResponse, SubmitRequest,
+        SubmitResponse,
     },
     protocol::PROTOCOL_VERSION,
 };
@@ -29,6 +31,42 @@ fn material(command: CommandSpec) -> RequestFingerprintMaterial {
         command,
     )
     .unwrap()
+}
+
+fn meta_json() -> serde_json::Value {
+    serde_json::json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "job_id": JOB_ID,
+        "client_id": CLIENT_ID,
+        "worker_name": "mini-1",
+        "project_id": PROJECT_ID,
+        "worktree_id": WORKTREE_ID,
+        "manifest_digest": MANIFEST_DIGEST,
+        "request_fingerprint": material(CommandSpec::shell("true".into()).unwrap()).fingerprint(),
+        "command_summary": { "mode": "shell" },
+        "relative_working_dir": "packages/app",
+        "timeout_millis": 30_000,
+        "resource_class": "heavy",
+        "created_at_millis": 100,
+    })
+}
+
+fn lease_json() -> serde_json::Value {
+    serde_json::json!({
+        "job_id": JOB_ID,
+        "client_id": CLIENT_ID,
+        "lease_token": LEASE_TOKEN,
+        "request_fingerprint": material(CommandSpec::shell("true".into()).unwrap()).fingerprint(),
+        "worker_name": "mini-1",
+        "project_id": PROJECT_ID,
+        "worktree_id": WORKTREE_ID,
+        "manifest_digest": MANIFEST_DIGEST,
+        "timeout_millis": 30_000,
+        "resource_class": "heavy",
+        "command_summary": { "mode": "shell" },
+        "created_at_millis": 100,
+        "expires_at_millis": 30_100,
+    })
 }
 
 #[test]
@@ -79,6 +117,68 @@ fn command_spec_preserves_non_nul_utf8_and_repeated_arguments() {
         serde_json::from_str::<CommandSpec>(&serde_json::to_string(&shell).unwrap()).unwrap(),
         shell
     );
+}
+
+#[test]
+fn command_spec_preserves_empty_and_repeated_arguments() {
+    let command = CommandSpec::argv(vec!["".into(), "repeat".into(), "repeat".into()]).unwrap();
+    assert_eq!(
+        serde_json::to_string(&command).unwrap(),
+        r#"{"mode":"argv","argv":["","repeat","repeat"]}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<CommandSpec>(r#"{"mode":"argv","argv":["","repeat","repeat"]}"#)
+            .unwrap(),
+        command
+    );
+}
+
+#[test]
+fn serde_rejects_semantically_invalid_persistent_and_wire_dtos() {
+    assert!(serde_json::from_str::<CommandSummary>(r#"{"mode":"argv","arg_count":0}"#).is_err());
+
+    let mut protocol_one_meta = meta_json();
+    protocol_one_meta["protocol_version"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<JobMeta>(protocol_one_meta.clone()).is_err());
+    assert!(
+        serde_json::from_value::<LocalJobRecord>(serde_json::json!({
+            "meta": protocol_one_meta,
+            "lease_token": LEASE_TOKEN,
+            "last_status": null,
+            "cleanup_pending": false,
+        }))
+        .is_err()
+    );
+    assert!(serde_json::from_value::<StatusResponse>(serde_json::json!({
+        "meta": protocol_one_meta,
+        "status": { "state": "accepted", "updated_at_millis": 100, "supervisor_pid": null, "supervisor_start_identity": null, "child_pid": null, "child_start_identity": null, "exit_code": null, "final_stdout_bytes": null, "final_stderr_bytes": null, "error_code": null },
+    })).is_err());
+
+    let mut expired_lease = lease_json();
+    expired_lease["expires_at_millis"] = serde_json::json!(99);
+    assert!(serde_json::from_value::<LeaseRecord>(expired_lease.clone()).is_err());
+    assert!(
+        serde_json::from_value::<LeaseAcquireResponse>(serde_json::json!({
+            "outcome": "acquired",
+            "lease": expired_lease,
+        }))
+        .is_err()
+    );
+
+    let material = material(CommandSpec::shell("true".into()).unwrap());
+    let mut request = serde_json::to_value(LeaseAcquireRequest::new(material.clone())).unwrap();
+    request["request_fingerprint"] =
+        serde_json::json!("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+    assert!(serde_json::from_value::<LeaseAcquireRequest>(request.clone()).is_err());
+    assert!(serde_json::from_value::<SubmitRequest>(request).is_err());
+
+    let mut bad_submit_meta = meta_json();
+    bad_submit_meta["protocol_version"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<SubmitResponse>(serde_json::json!({
+        "outcome": "accepted",
+        "meta": bad_submit_meta,
+        "status": { "state": "accepted", "updated_at_millis": 100, "supervisor_pid": null, "supervisor_start_identity": null, "child_pid": null, "child_start_identity": null, "exit_code": null, "final_stdout_bytes": null, "final_stderr_bytes": null, "error_code": null },
+    })).is_err());
 }
 
 #[test]

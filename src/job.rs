@@ -142,7 +142,7 @@ impl CommandSpec {
                 }
                 let mut total = 0_usize;
                 for argument in argv {
-                    validate_non_nul(argument, MAX_ARG_BYTES, "argv argument")?;
+                    validate_argument(argument)?;
                     total = total
                         .checked_add(argument.len())
                         .ok_or_else(|| protocol_error("argv command exceeds its byte limit"))?;
@@ -158,10 +158,9 @@ impl CommandSpec {
 
     pub fn summary(&self) -> CommandSummary {
         match self {
-            Self::Argv { argv } => CommandSummary::Argv {
-                arg_count: argv.len(),
-            },
-            Self::Shell { .. } => CommandSummary::Shell,
+            Self::Argv { argv } => CommandSummary::argv(argv.len())
+                .expect("validated argv command has a valid argument count"),
+            Self::Shell { .. } => CommandSummary::shell(),
         }
     }
 }
@@ -208,22 +207,90 @@ impl<'de> Deserialize<'de> for CommandSpec {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CommandSummary {
-    Argv { arg_count: usize },
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSummary {
+    mode: CommandSummaryMode,
+    arg_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandSummaryMode {
+    Argv,
     Shell,
 }
 
 impl CommandSummary {
+    pub fn argv(arg_count: usize) -> Result<Self, WorkerError> {
+        let summary = Self {
+            mode: CommandSummaryMode::Argv,
+            arg_count: Some(arg_count),
+        };
+        summary.validate()?;
+        Ok(summary)
+    }
+
+    pub fn shell() -> Self {
+        Self {
+            mode: CommandSummaryMode::Shell,
+            arg_count: None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), WorkerError> {
-        match self {
-            Self::Argv { arg_count } if (1..=MAX_ARG_COUNT).contains(arg_count) => Ok(()),
-            Self::Shell => Ok(()),
-            Self::Argv { .. } => Err(protocol_error(
+        match (self.mode, self.arg_count) {
+            (CommandSummaryMode::Argv, Some(arg_count))
+                if (1..=MAX_ARG_COUNT).contains(&arg_count) =>
+            {
+                Ok(())
+            }
+            (CommandSummaryMode::Shell, None) => Ok(()),
+            _ => Err(protocol_error(
                 "command summary has an invalid argument count",
             )),
         }
+    }
+
+    pub fn arg_count(&self) -> Option<usize> {
+        self.arg_count
+    }
+}
+
+impl Serialize for CommandSummary {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.mode {
+            CommandSummaryMode::Argv => {
+                let mut record = serializer.serialize_struct("CommandSummary", 2)?;
+                record.serialize_field("mode", "argv")?;
+                record.serialize_field("arg_count", &self.arg_count.expect("validated summary"))?;
+                record.end()
+            }
+            CommandSummaryMode::Shell => {
+                let mut record = serializer.serialize_struct("CommandSummary", 1)?;
+                record.serialize_field("mode", "shell")?;
+                record.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandSummary {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Argv { arg_count: usize },
+            Shell,
+        }
+
+        let summary = match Wire::deserialize(deserializer)? {
+            Wire::Argv { arg_count } => Self {
+                mode: CommandSummaryMode::Argv,
+                arg_count: Some(arg_count),
+            },
+            Wire::Shell => Self::shell(),
+        };
+        summary.validate().map_err(de::Error::custom)?;
+        Ok(summary)
     }
 }
 
@@ -265,18 +332,18 @@ impl JobState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestFingerprintMaterial {
-    pub protocol_version: u32,
-    pub job_id: JobId,
-    pub client_id: ClientId,
-    pub lease_token: LeaseToken,
-    pub worker_name: String,
-    pub project_id: String,
-    pub worktree_id: String,
-    pub manifest_digest: String,
-    pub relative_working_dir: String,
-    pub timeout_millis: u64,
-    pub resource_class: String,
-    pub command: CommandSpec,
+    protocol_version: u32,
+    job_id: JobId,
+    client_id: ClientId,
+    lease_token: LeaseToken,
+    worker_name: String,
+    project_id: String,
+    worktree_id: String,
+    manifest_digest: String,
+    relative_working_dir: String,
+    timeout_millis: u64,
+    resource_class: String,
+    command: CommandSpec,
 }
 
 impl RequestFingerprintMaterial {
@@ -337,6 +404,40 @@ impl RequestFingerprintMaterial {
     pub fn fingerprint(&self) -> RequestFingerprint {
         let bytes = serde_json::to_vec(self).expect("request fingerprint material is serializable");
         RequestFingerprint(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    pub fn job_id(&self) -> JobId {
+        self.job_id
+    }
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+    pub fn lease_token(&self) -> LeaseToken {
+        self.lease_token
+    }
+    pub fn worker_name(&self) -> &str {
+        &self.worker_name
+    }
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub fn worktree_id(&self) -> &str {
+        &self.worktree_id
+    }
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+    pub fn relative_working_dir(&self) -> &str {
+        &self.relative_working_dir
+    }
+    pub fn timeout_millis(&self) -> u64 {
+        self.timeout_millis
+    }
+    pub fn resource_class(&self) -> &str {
+        &self.resource_class
+    }
+    pub fn command(&self) -> &CommandSpec {
+        &self.command
     }
 }
 
@@ -400,16 +501,16 @@ impl<'de> Deserialize<'de> for RequestFingerprintMaterial {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct JobStatus {
-    pub state: JobState,
-    pub updated_at_millis: u64,
-    pub supervisor_pid: Option<u32>,
-    pub supervisor_start_identity: Option<u64>,
-    pub child_pid: Option<u32>,
-    pub child_start_identity: Option<u64>,
-    pub exit_code: Option<u8>,
-    pub final_stdout_bytes: Option<u64>,
-    pub final_stderr_bytes: Option<u64>,
-    pub error_code: Option<String>,
+    state: JobState,
+    updated_at_millis: u64,
+    supervisor_pid: Option<u32>,
+    supervisor_start_identity: Option<u64>,
+    child_pid: Option<u32>,
+    child_start_identity: Option<u64>,
+    exit_code: Option<u8>,
+    final_stdout_bytes: Option<u64>,
+    final_stderr_bytes: Option<u64>,
+    error_code: Option<String>,
 }
 
 impl JobStatus {
@@ -569,6 +670,22 @@ impl JobStatus {
         }
         Ok(())
     }
+
+    pub fn state(&self) -> JobState {
+        self.state
+    }
+    pub fn updated_at_millis(&self) -> u64 {
+        self.updated_at_millis
+    }
+    pub fn final_stdout_bytes(&self) -> Option<u64> {
+        self.final_stdout_bytes
+    }
+    pub fn final_stderr_bytes(&self) -> Option<u64> {
+        self.final_stderr_bytes
+    }
+    pub fn exit_code(&self) -> Option<u8> {
+        self.exit_code
+    }
 }
 
 impl<'de> Deserialize<'de> for JobStatus {
@@ -604,25 +721,54 @@ impl<'de> Deserialize<'de> for JobStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JobMeta {
-    pub protocol_version: u32,
-    pub job_id: JobId,
-    pub client_id: ClientId,
-    pub worker_name: String,
-    pub project_id: String,
-    pub worktree_id: String,
-    pub manifest_digest: String,
-    pub request_fingerprint: RequestFingerprint,
-    pub command_summary: CommandSummary,
-    pub relative_working_dir: String,
-    pub timeout_millis: u64,
-    pub resource_class: String,
-    pub created_at_millis: u64,
+    protocol_version: u32,
+    job_id: JobId,
+    client_id: ClientId,
+    worker_name: String,
+    project_id: String,
+    worktree_id: String,
+    manifest_digest: String,
+    request_fingerprint: RequestFingerprint,
+    command_summary: CommandSummary,
+    relative_working_dir: String,
+    timeout_millis: u64,
+    resource_class: String,
+    created_at_millis: u64,
 }
 
 impl JobMeta {
+    pub fn new(
+        material: &RequestFingerprintMaterial,
+        request_fingerprint: RequestFingerprint,
+        created_at_millis: u64,
+    ) -> Result<Self, WorkerError> {
+        if material.fingerprint() != request_fingerprint {
+            return Err(protocol_error(
+                "job metadata fingerprint does not match its material",
+            ));
+        }
+        let meta = Self {
+            protocol_version: PROTOCOL_VERSION,
+            job_id: material.job_id,
+            client_id: material.client_id,
+            worker_name: material.worker_name.clone(),
+            project_id: material.project_id.clone(),
+            worktree_id: material.worktree_id.clone(),
+            manifest_digest: material.manifest_digest.clone(),
+            request_fingerprint,
+            command_summary: material.command.summary(),
+            relative_working_dir: material.relative_working_dir.clone(),
+            timeout_millis: material.timeout_millis,
+            resource_class: material.resource_class.clone(),
+            created_at_millis,
+        };
+        meta.validate()?;
+        Ok(meta)
+    }
+
     pub fn validate(&self) -> Result<(), WorkerError> {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(protocol_error(
@@ -632,6 +778,15 @@ impl JobMeta {
         validate_hex_component(&self.project_id, "project ID")?;
         validate_hex_component(&self.worktree_id, "worktree ID")?;
         validate_hex_component(&self.manifest_digest, "manifest digest")?;
+        validate_non_nul(&self.worker_name, 128, "worker name")?;
+        if self.relative_working_dir.as_bytes().contains(&0)
+            || self.relative_working_dir.len() > MAX_COMMAND_BYTES
+        {
+            return Err(protocol_error(
+                "job metadata relative working directory is invalid",
+            ));
+        }
+        validate_non_nul(&self.resource_class, 64, "resource class")?;
         self.command_summary.validate()?;
         if self.timeout_millis == 0 || self.timeout_millis > MAX_TIMEOUT_MILLIS {
             return Err(protocol_error(
@@ -640,18 +795,91 @@ impl JobMeta {
         }
         Ok(())
     }
+
+    pub fn job_id(&self) -> JobId {
+        self.job_id
+    }
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+    pub fn request_fingerprint(&self) -> &RequestFingerprint {
+        &self.request_fingerprint
+    }
+    pub fn command_summary(&self) -> &CommandSummary {
+        &self.command_summary
+    }
+    pub fn created_at_millis(&self) -> u64 {
+        self.created_at_millis
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for JobMeta {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            protocol_version: u32,
+            job_id: JobId,
+            client_id: ClientId,
+            worker_name: String,
+            project_id: String,
+            worktree_id: String,
+            manifest_digest: String,
+            request_fingerprint: RequestFingerprint,
+            command_summary: CommandSummary,
+            relative_working_dir: String,
+            timeout_millis: u64,
+            resource_class: String,
+            created_at_millis: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let meta = Self {
+            protocol_version: wire.protocol_version,
+            job_id: wire.job_id,
+            client_id: wire.client_id,
+            worker_name: wire.worker_name,
+            project_id: wire.project_id,
+            worktree_id: wire.worktree_id,
+            manifest_digest: wire.manifest_digest,
+            request_fingerprint: wire.request_fingerprint,
+            command_summary: wire.command_summary,
+            relative_working_dir: wire.relative_working_dir,
+            timeout_millis: wire.timeout_millis,
+            resource_class: wire.resource_class,
+            created_at_millis: wire.created_at_millis,
+        };
+        meta.validate().map_err(de::Error::custom)?;
+        Ok(meta)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LocalJobRecord {
-    pub meta: JobMeta,
-    pub lease_token: LeaseToken,
-    pub last_status: Option<JobStatus>,
-    pub cleanup_pending: bool,
+    meta: JobMeta,
+    lease_token: LeaseToken,
+    last_status: Option<JobStatus>,
+    cleanup_pending: bool,
 }
 
 impl LocalJobRecord {
+    pub fn new(
+        meta: JobMeta,
+        lease_token: LeaseToken,
+        last_status: Option<JobStatus>,
+        cleanup_pending: bool,
+    ) -> Result<Self, WorkerError> {
+        let record = Self {
+            meta,
+            lease_token,
+            last_status,
+            cleanup_pending,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
     pub fn validate(&self) -> Result<(), WorkerError> {
         self.meta.validate()?;
         if let Some(status) = &self.last_status {
@@ -659,31 +887,98 @@ impl LocalJobRecord {
         }
         Ok(())
     }
+
+    pub fn meta(&self) -> &JobMeta {
+        &self.meta
+    }
+    pub fn lease_token(&self) -> LeaseToken {
+        self.lease_token
+    }
+    pub fn last_status(&self) -> Option<&JobStatus> {
+        self.last_status.as_ref()
+    }
+    pub fn cleanup_pending(&self) -> bool {
+        self.cleanup_pending
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for LocalJobRecord {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            meta: JobMeta,
+            lease_token: LeaseToken,
+            last_status: Option<JobStatus>,
+            cleanup_pending: bool,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let record = Self {
+            meta: wire.meta,
+            lease_token: wire.lease_token,
+            last_status: wire.last_status,
+            cleanup_pending: wire.cleanup_pending,
+        };
+        record.validate().map_err(de::Error::custom)?;
+        Ok(record)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseRecord {
-    pub job_id: JobId,
-    pub client_id: ClientId,
-    pub lease_token: LeaseToken,
-    pub request_fingerprint: RequestFingerprint,
-    pub worker_name: String,
-    pub project_id: String,
-    pub worktree_id: String,
-    pub manifest_digest: String,
-    pub timeout_millis: u64,
-    pub resource_class: String,
-    pub command_summary: CommandSummary,
-    pub created_at_millis: u64,
-    pub expires_at_millis: u64,
+    job_id: JobId,
+    client_id: ClientId,
+    lease_token: LeaseToken,
+    request_fingerprint: RequestFingerprint,
+    worker_name: String,
+    project_id: String,
+    worktree_id: String,
+    manifest_digest: String,
+    timeout_millis: u64,
+    resource_class: String,
+    command_summary: CommandSummary,
+    created_at_millis: u64,
+    expires_at_millis: u64,
 }
 
 impl LeaseRecord {
+    pub fn new(
+        material: &RequestFingerprintMaterial,
+        request_fingerprint: RequestFingerprint,
+        created_at_millis: u64,
+        expires_at_millis: u64,
+    ) -> Result<Self, WorkerError> {
+        if material.fingerprint() != request_fingerprint {
+            return Err(protocol_error(
+                "lease fingerprint does not match its material",
+            ));
+        }
+        let lease = Self {
+            job_id: material.job_id,
+            client_id: material.client_id,
+            lease_token: material.lease_token,
+            request_fingerprint,
+            worker_name: material.worker_name.clone(),
+            project_id: material.project_id.clone(),
+            worktree_id: material.worktree_id.clone(),
+            manifest_digest: material.manifest_digest.clone(),
+            timeout_millis: material.timeout_millis,
+            resource_class: material.resource_class.clone(),
+            command_summary: material.command.summary(),
+            created_at_millis,
+            expires_at_millis,
+        };
+        lease.validate()?;
+        Ok(lease)
+    }
+
     pub fn validate(&self) -> Result<(), WorkerError> {
         validate_hex_component(&self.project_id, "project ID")?;
         validate_hex_component(&self.worktree_id, "worktree ID")?;
         validate_hex_component(&self.manifest_digest, "manifest digest")?;
+        validate_non_nul(&self.worker_name, 128, "worker name")?;
+        validate_non_nul(&self.resource_class, 64, "resource class")?;
         self.command_summary.validate()?;
         if self.timeout_millis == 0
             || self.timeout_millis > MAX_TIMEOUT_MILLIS
@@ -695,13 +990,66 @@ impl LeaseRecord {
         }
         Ok(())
     }
+
+    pub fn job_id(&self) -> JobId {
+        self.job_id
+    }
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+    pub fn lease_token(&self) -> LeaseToken {
+        self.lease_token
+    }
+    pub fn request_fingerprint(&self) -> &RequestFingerprint {
+        &self.request_fingerprint
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for LeaseRecord {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            job_id: JobId,
+            client_id: ClientId,
+            lease_token: LeaseToken,
+            request_fingerprint: RequestFingerprint,
+            worker_name: String,
+            project_id: String,
+            worktree_id: String,
+            manifest_digest: String,
+            timeout_millis: u64,
+            resource_class: String,
+            command_summary: CommandSummary,
+            created_at_millis: u64,
+            expires_at_millis: u64,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let lease = Self {
+            job_id: wire.job_id,
+            client_id: wire.client_id,
+            lease_token: wire.lease_token,
+            request_fingerprint: wire.request_fingerprint,
+            worker_name: wire.worker_name,
+            project_id: wire.project_id,
+            worktree_id: wire.worktree_id,
+            manifest_digest: wire.manifest_digest,
+            timeout_millis: wire.timeout_millis,
+            resource_class: wire.resource_class,
+            command_summary: wire.command_summary,
+            created_at_millis: wire.created_at_millis,
+            expires_at_millis: wire.expires_at_millis,
+        };
+        lease.validate().map_err(de::Error::custom)?;
+        Ok(lease)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseAcquireRequest {
-    pub material: RequestFingerprintMaterial,
-    pub request_fingerprint: RequestFingerprint,
+    material: RequestFingerprintMaterial,
+    request_fingerprint: RequestFingerprint,
 }
 
 impl LeaseAcquireRequest {
@@ -722,20 +1070,66 @@ impl LeaseAcquireRequest {
         }
         Ok(())
     }
+
+    pub fn material(&self) -> &RequestFingerprintMaterial {
+        &self.material
+    }
+    pub fn request_fingerprint(&self) -> &RequestFingerprint {
+        &self.request_fingerprint
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for LeaseAcquireRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            material: RequestFingerprintMaterial,
+            request_fingerprint: RequestFingerprint,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let request = Self {
+            material: wire.material,
+            request_fingerprint: wire.request_fingerprint,
+        };
+        request.validate().map_err(de::Error::custom)?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LeaseAcquireResponse {
     Acquired { lease: LeaseRecord },
     ExistingAccepted { status: JobStatus },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for LeaseAcquireResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Acquired { lease: LeaseRecord },
+            ExistingAccepted { status: JobStatus },
+        }
+        let response = match Wire::deserialize(deserializer)? {
+            Wire::Acquired { lease } => Self::Acquired { lease },
+            Wire::ExistingAccepted { status } => Self::ExistingAccepted { status },
+        };
+        match &response {
+            Self::Acquired { lease } => lease.validate(),
+            Self::ExistingAccepted { status } => status.validate(),
+        }
+        .map_err(de::Error::custom)?;
+        Ok(response)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitRequest {
-    pub material: RequestFingerprintMaterial,
-    pub request_fingerprint: RequestFingerprint,
+    material: RequestFingerprintMaterial,
+    request_fingerprint: RequestFingerprint,
 }
 
 impl SubmitRequest {
@@ -754,9 +1148,34 @@ impl SubmitRequest {
         }
         .validate()
     }
+
+    pub fn material(&self) -> &RequestFingerprintMaterial {
+        &self.material
+    }
+    pub fn request_fingerprint(&self) -> &RequestFingerprint {
+        &self.request_fingerprint
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for SubmitRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            material: RequestFingerprintMaterial,
+            request_fingerprint: RequestFingerprint,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let request = Self {
+            material: wire.material,
+            request_fingerprint: wire.request_fingerprint,
+        };
+        request.validate().map_err(de::Error::custom)?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SubmitResponse {
     Accepted {
@@ -768,17 +1187,70 @@ pub enum SubmitResponse {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for SubmitResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Accepted {
+                meta: Box<JobMeta>,
+                status: JobStatus,
+            },
+            Existing {
+                status: JobStatus,
+            },
+        }
+        let response = match Wire::deserialize(deserializer)? {
+            Wire::Accepted { meta, status } => Self::Accepted { meta, status },
+            Wire::Existing { status } => Self::Existing { status },
+        };
+        response_status_validate(&response).map_err(de::Error::custom)?;
+        Ok(response)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StatusResponse {
-    pub meta: JobMeta,
-    pub status: JobStatus,
+    meta: JobMeta,
+    status: JobStatus,
+}
+
+impl<'de> Deserialize<'de> for StatusResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            meta: JobMeta,
+            status: JobStatus,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let response = Self {
+            meta: wire.meta,
+            status: wire.status,
+        };
+        response.validate().map_err(de::Error::custom)?;
+        Ok(response)
+    }
 }
 
 impl StatusResponse {
+    pub fn new(meta: JobMeta, status: JobStatus) -> Result<Self, WorkerError> {
+        let response = Self { meta, status };
+        response.validate()?;
+        Ok(response)
+    }
+
     pub fn validate(&self) -> Result<(), WorkerError> {
         self.meta.validate()?;
         self.status.validate()
+    }
+
+    pub fn meta(&self) -> &JobMeta {
+        &self.meta
+    }
+    pub fn status(&self) -> &JobStatus {
+        &self.status
     }
 }
 
@@ -791,10 +1263,10 @@ pub enum LogStream {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LogChunk {
-    pub stream: LogStream,
-    pub offset: u64,
-    pub next_offset: u64,
-    pub data: String,
+    stream: LogStream,
+    offset: u64,
+    next_offset: u64,
+    data: String,
 }
 
 impl LogChunk {
@@ -834,6 +1306,19 @@ impl LogChunk {
 
     pub fn validate(&self) -> Result<(), WorkerError> {
         self.decoded_bytes().map(|_| ())
+    }
+
+    pub fn stream(&self) -> LogStream {
+        self.stream
+    }
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+    pub fn data(&self) -> &str {
+        &self.data
     }
 }
 
@@ -1014,6 +1499,13 @@ fn validate_non_nul(value: &str, max_bytes: usize, label: &str) -> Result<(), Wo
         return Err(protocol_error(&format!(
             "{label} is empty, too long, or contains NUL"
         )));
+    }
+    Ok(())
+}
+
+fn validate_argument(value: &str) -> Result<(), WorkerError> {
+    if value.len() > MAX_ARG_BYTES || value.as_bytes().contains(&0) {
+        return Err(protocol_error("argv argument is too long or contains NUL"));
     }
     Ok(())
 }
