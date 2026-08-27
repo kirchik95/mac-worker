@@ -244,6 +244,8 @@ struct DirectoryBinding {
     parent: OwnedFd,
     name: CString,
     identity: FileIdentity,
+    owner: u32,
+    mode: u32,
     security_device: Option<u64>,
 }
 
@@ -298,6 +300,84 @@ impl RootedDir {
         })
     }
 
+    pub(crate) fn open_anchored_absolute(path: &Path) -> io::Result<Self> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "anchored directory path must be absolute",
+            ));
+        }
+        #[cfg(target_vendor = "apple")]
+        let normalized;
+        #[cfg(target_vendor = "apple")]
+        let path = if let Ok(suffix) = path.strip_prefix("/var") {
+            normalized = PathBuf::from("/private/var").join(suffix);
+            normalized.as_path()
+        } else if let Ok(suffix) = path.strip_prefix("/tmp") {
+            normalized = PathBuf::from("/private/tmp").join(suffix);
+            normalized.as_path()
+        } else {
+            path
+        };
+        let components = path
+            .components()
+            .filter_map(|component| match component {
+                Component::RootDir | Component::CurDir => None,
+                Component::Normal(component) => {
+                    Some(CString::new(component.as_bytes()).map_err(interior_nul_error))
+                }
+                Component::ParentDir | Component::Prefix(_) => Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "physical root path contains unsupported traversal",
+                ))),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let root_name = components.last().cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "anchored path must identify a directory entry",
+            )
+        })?;
+        let mut current = owned_fd(unsafe { libc::open(c"/".as_ptr(), DIRECTORY_OPEN_FLAGS) })?;
+        let mut lineage = Vec::with_capacity(components.len().saturating_sub(1));
+        for (index, component) in components.iter().enumerate() {
+            let child = open_directory_at(current.as_raw_fd(), component)?;
+            let opened = stat_fd(child.as_raw_fd())?;
+            if index + 1 == components.len() {
+                return Ok(Self {
+                    root: child,
+                    parent: current,
+                    root_name,
+                    root_identity: FileIdentity::from_stat(&opened),
+                    lineage,
+                    security_device: None,
+                });
+            }
+            lineage.push(DirectoryBinding {
+                directory: reopen_directory(child.as_raw_fd())?,
+                parent: reopen_directory(current.as_raw_fd())?,
+                name: component.clone(),
+                identity: FileIdentity::from_stat(&opened),
+                owner: opened.st_uid,
+                mode: (opened.st_mode & 0o777) as u32,
+                security_device: None,
+            });
+            current = child;
+        }
+        unreachable!("a non-empty component sequence returns its final directory")
+    }
+
+    pub(crate) fn open_or_create_anchored_absolute(path: &Path) -> io::Result<Self> {
+        match Self::open_anchored_absolute(path) {
+            Ok(directory) => Ok(directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                drop(open_or_create_directory_path(path)?);
+                Self::open_anchored_absolute(path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn bind_host_device(&mut self, expected_device: u64) -> io::Result<()> {
         self.verify_root_name()?;
         let metadata = stat_fd(self.root.as_raw_fd())?;
@@ -325,22 +405,6 @@ impl RootedDir {
     pub(crate) fn root_metadata(&self) -> io::Result<libc::stat> {
         self.verify_root_name()?;
         stat_fd(self.root.as_raw_fd())
-    }
-
-    pub(crate) fn coordination_handle(&self) -> io::Result<File> {
-        self.verify_root_name()?;
-        let descriptor = reopen_directory(self.root.as_raw_fd())?;
-        let anchored = stat_fd(self.root.as_raw_fd())?;
-        let opened = stat_fd(descriptor.as_raw_fd())?;
-        if !same_file(&anchored, &opened) {
-            return Err(os_error(libc::ESTALE));
-        }
-        if let Some(device) = self.security_device {
-            require_private_directory_on_device(&opened, device)?;
-        } else {
-            require_private_directory(&opened)?;
-        }
-        Ok(File::from(descriptor))
     }
 
     pub(crate) fn identity(&self) -> io::Result<PrivateEntryIdentity> {
@@ -488,6 +552,31 @@ impl RootedDir {
         })
     }
 
+    pub(crate) fn open_private_direct_child_on_device(
+        &self,
+        name: &str,
+        expected_device: u64,
+    ) -> io::Result<Self> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let path_stat = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_directory_on_device(&path_stat, expected_device)?;
+        let root = open_directory_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(root.as_raw_fd())?;
+        require_private_directory_on_device(&opened, expected_device)?;
+        if !same_file(&path_stat, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        Ok(Self {
+            root,
+            parent: reopen_directory(self.root.as_raw_fd())?,
+            root_name: name,
+            root_identity: FileIdentity::from_stat(&opened),
+            lineage: self.child_lineage()?,
+            security_device: Some(expected_device),
+        })
+    }
+
     pub(crate) fn list_names(&self) -> io::Result<Vec<Vec<u8>>> {
         self.verify_root_name()?;
         directory_entries(self.root.as_raw_fd()).map(|entries| {
@@ -525,6 +614,11 @@ impl RootedDir {
     }
 
     pub(crate) fn open_private_lock(&self, name: &str) -> io::Result<File> {
+        self.open_private_lock_with_created(name)
+            .map(|(file, _)| file)
+    }
+
+    pub(crate) fn open_private_lock_with_created(&self, name: &str) -> io::Result<(File, bool)> {
         self.verify_root_name()?;
         let name = CString::new(name).map_err(interior_nul_error)?;
         let initial = match stat_at(self.root.as_raw_fd(), &name) {
@@ -532,8 +626,8 @@ impl RootedDir {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        let descriptor = if initial.is_some() {
-            open_regular_rw_at(self.root.as_raw_fd(), &name)?
+        let (descriptor, created) = if initial.is_some() {
+            (open_regular_rw_at(self.root.as_raw_fd(), &name)?, false)
         } else {
             let flags = libc::O_RDWR
                 | libc::O_CREAT
@@ -543,11 +637,12 @@ impl RootedDir {
                 | libc::O_NONBLOCK;
             let raw = unsafe { libc::openat(self.root.as_raw_fd(), name.as_ptr(), flags, 0o600) };
             match owned_fd(raw) {
-                Ok(descriptor) => descriptor,
+                Ok(descriptor) => (descriptor, true),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    return self.open_private_lock(name.to_str().map_err(|_| {
+                    let file = self.open_existing_private_lock(name.to_str().map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidData, "lock name is not UTF-8")
-                    })?);
+                    })?)?;
+                    return Ok((file, false));
                 }
                 Err(error) => return Err(error),
             }
@@ -555,6 +650,20 @@ impl RootedDir {
         let metadata = stat_fd(descriptor.as_raw_fd())?;
         require_private_regular(&metadata)?;
         if initial.is_some_and(|initial| !same_file(&initial, &metadata)) {
+            return Err(os_error(libc::ESTALE));
+        }
+        Ok((File::from(descriptor), created))
+    }
+
+    pub(crate) fn open_existing_private_lock(&self, name: &str) -> io::Result<File> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let initial = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular(&initial)?;
+        let descriptor = open_regular_rw_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(descriptor.as_raw_fd())?;
+        require_private_regular(&opened)?;
+        if !same_file(&initial, &opened) {
             return Err(os_error(libc::ESTALE));
         }
         Ok(File::from(descriptor))
@@ -1435,6 +1544,8 @@ impl RootedDir {
                 parent: reopen_directory(parent.as_raw_fd())?,
                 name: component.clone(),
                 identity: FileIdentity::from_stat(&opened),
+                owner: opened.st_uid,
+                mode: (opened.st_mode & 0o777) as u32,
                 security_device,
             });
             parent = child;
@@ -1473,11 +1584,14 @@ impl RootedDir {
 
     fn child_lineage(&self) -> io::Result<Vec<DirectoryBinding>> {
         let mut lineage = clone_lineage(&self.lineage)?;
+        let metadata = stat_fd(self.root.as_raw_fd())?;
         lineage.push(DirectoryBinding {
             directory: reopen_directory(self.root.as_raw_fd())?,
             parent: reopen_directory(self.parent.as_raw_fd())?,
             name: self.root_name.clone(),
             identity: self.root_identity,
+            owner: metadata.st_uid,
+            mode: (metadata.st_mode & 0o777) as u32,
             security_device: self.security_device,
         });
         Ok(lineage)
@@ -1490,6 +1604,10 @@ impl DirectoryBinding {
         let opened = stat_fd(self.directory.as_raw_fd())?;
         if file_type(current.st_mode) != libc::S_IFDIR
             || FileIdentity::from_stat(&current) != self.identity
+            || current.st_uid != self.owner
+            || (current.st_mode & 0o777) as u32 != self.mode
+            || opened.st_uid != self.owner
+            || (opened.st_mode & 0o777) as u32 != self.mode
             || !same_file(&current, &opened)
         {
             return Err(os_error(libc::ESTALE));
@@ -1511,6 +1629,8 @@ fn clone_lineage(lineage: &[DirectoryBinding]) -> io::Result<Vec<DirectoryBindin
                 parent: reopen_directory(binding.parent.as_raw_fd())?,
                 name: binding.name.clone(),
                 identity: binding.identity,
+                owner: binding.owner,
+                mode: binding.mode,
                 security_device: binding.security_device,
             })
         })
@@ -4260,6 +4380,24 @@ mod tests {
 
         assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
         assert!(!root_path.join("leases").exists());
+    }
+
+    #[test]
+    fn anchored_lineage_rejects_an_ancestor_mode_change() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ancestor = fixture.path().join("ancestor");
+        let parent = ancestor.join("parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let anchored = RootedDir::open_anchored_absolute(&parent).unwrap();
+
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o750)).unwrap();
+
+        assert_eq!(
+            anchored.verify_bound().unwrap_err().raw_os_error(),
+            Some(libc::ESTALE)
+        );
     }
 
     #[test]

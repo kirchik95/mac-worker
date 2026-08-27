@@ -131,25 +131,10 @@ impl<'a> LeaseService<'a> {
     }
 
     pub fn load_if_present(root: &Path) -> Result<LeaseOccupancy, WorkerError> {
-        let mut rooted = match RootedDir::open(root) {
-            Ok(rooted) => rooted,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
-            Err(error) => return Err(error.into()),
+        let Some(store) = HostStore::open_if_present(root)? else {
+            return Ok(idle());
         };
-        let root_device = rooted.root_metadata()?.st_dev as u64;
-        rooted.bind_host_device(root_device)?;
-        let leases =
-            match rooted.open_child_directory_on_device(&relative("leases")?, false, root_device) {
-                Ok(leases) => leases,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
-                Err(error) => return Err(error.into()),
-            };
-        let live = match leases.open_child_directory(&relative("heavy")?, false) {
-            Ok(live) => live,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
-            Err(error) => return Err(error.into()),
-        };
-        occupancy_from_lease(Some(read_lease(&live)?))
+        LeaseService::new(&store).occupancy()
     }
 
     #[allow(dead_code)] // Task 7 lifecycle consumes this internal release boundary.

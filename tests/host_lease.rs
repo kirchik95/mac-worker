@@ -491,6 +491,33 @@ fn read_only_absent_probe_is_idle_and_does_not_create_root() {
 }
 
 #[test]
+fn read_only_probe_treats_every_partial_installation_tuple_as_corruption() {
+    let root_without_anchor = tempdir().unwrap();
+    let root = root_without_anchor.path().join("host");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(LeaseService::load_if_present(&root).is_err());
+
+    let lock_only = tempdir().unwrap();
+    let root = lock_only.path().join("host");
+    assert!(
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterInstallationLock)
+            .is_err()
+    );
+    assert!(!root.exists());
+    assert!(LeaseService::load_if_present(&root).is_err());
+    assert!(!root.exists());
+
+    let missing_root = tempdir().unwrap();
+    let root = missing_root.path().join("host");
+    let _store = HostStore::open(&root).unwrap();
+    let detached = missing_root.path().join("detached-host");
+    fs::rename(&root, &detached).unwrap();
+    assert!(LeaseService::load_if_present(&root).is_err());
+    assert!(!root.exists());
+}
+
+#[test]
 fn every_lease_crash_boundary_leaves_absent_or_complete_live_state() {
     for point in [
         HostStoreWritePoint::AfterLeaseWrite,

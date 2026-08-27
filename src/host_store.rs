@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     fs::File,
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -25,6 +25,8 @@ use crate::{
 
 const MAX_HOST_FILE_BYTES: u64 = 1024 * 1024;
 const HOST_LAYOUT_VERSION: u32 = 1;
+const HOST_INSTALLATION_VERSION: u32 = 1;
+const INSTALLATION_PREFIX: &str = ".mac-worker-installation-";
 const HOST_LAYOUT_FILE: &str = "layout.json";
 const CAPACITY_LOCK_FILE: &str = "capacity.lock";
 const ADMISSION_LOCK_FILE: &str = "admission.lock";
@@ -51,6 +53,10 @@ pub enum HostStoreWritePoint {
     AfterHostNamespaces = 8,
     AfterHostCapacityLock = 9,
     AfterHostLayoutPublish = 10,
+    BeforeInstallationLock = 11,
+    AfterInstallationLock = 12,
+    BeforeInstallationIdentityPublish = 13,
+    AfterInstallationIdentityPublish = 14,
 }
 
 impl LayoutEntry {
@@ -92,12 +98,24 @@ pub struct HostStore {
 
 struct HostStoreInner {
     display_root: PathBuf,
+    installation_parent: RootedDir,
+    installation_names: InstallationNames,
+    installation: HostInstallationIdentity,
+    installation_file_identity: PrivateEntryIdentity,
     root: RootedDir,
     namespaces: BTreeMap<&'static str, RootedDir>,
     root_identity: HostRootIdentity,
     layout: HostLayoutIdentity,
-    layout_file_identity: PrivateEntryIdentity,
     fault: AtomicU8,
+}
+
+#[derive(Clone)]
+struct InstallationNames {
+    key: String,
+    root_name: String,
+    root_name_sha256: String,
+    lock: String,
+    identity: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +131,19 @@ struct HostLayoutIdentity {
     root: LayoutEntry,
     layout_file: LayoutEntry,
     entries: Vec<LayoutEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HostInstallationIdentity {
+    version: u32,
+    key: String,
+    root_name_sha256: String,
+    parent: LayoutEntry,
+    lock: LayoutEntry,
+    root: LayoutEntry,
+    layout: LayoutEntry,
+    identity_file: LayoutEntry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,22 +214,28 @@ impl JobDisposition {
 }
 
 pub struct AdmissionGuard {
-    outer: Arc<RootCoordinationGuard>,
+    outer: Arc<InstallationGuard>,
     file: File,
     namespace: RootedDir,
     file_name: String,
     file_identity: PrivateEntryIdentity,
 }
 
-// Every host mutation follows this fixed order: the stable host-root
-// coordination lock, then the per-job admission lock, then the heavy-slot
-// capacity lock. Capacity-only integrity operations still start at the root.
-struct RootCoordinationGuard {
+// Every host mutation follows this fixed order: the parent-anchored stable
+// installation lock, then the per-job admission lock, then the heavy-slot
+// capacity lock. Capacity-only integrity operations start at the installation
+// anchor as well.
+struct InstallationGuard {
     file: File,
+    parent: RootedDir,
+    lock_name: String,
+    lock_identity: PrivateEntryIdentity,
+    identity_name: String,
+    identity_file: File,
+    identity_file_identity: PrivateEntryIdentity,
+    installation: HostInstallationIdentity,
     root: RootedDir,
-    identity: HostRootIdentity,
-    layout_file: Option<File>,
-    layout_identity: Option<PrivateEntryIdentity>,
+    layout_file: File,
 }
 
 impl AdmissionGuard {
@@ -219,53 +256,58 @@ impl Drop for AdmissionGuard {
     }
 }
 
-impl RootCoordinationGuard {
-    fn acquire(
-        root: &RootedDir,
-        identity: HostRootIdentity,
-        layout_identity: Option<PrivateEntryIdentity>,
-    ) -> Result<Self, WorkerError> {
-        let file = root.coordination_handle()?;
+impl InstallationGuard {
+    fn acquire(store: &HostStoreInner) -> Result<Self, WorkerError> {
+        let file = store
+            .installation_parent
+            .open_existing_private_lock(&store.installation_names.lock)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if result != 0 {
             return Err(WorkerError::Io(std::io::Error::last_os_error()));
         }
-        let layout_file = layout_identity
-            .map(|_| root.open_private_regular_handle(HOST_LAYOUT_FILE))
-            .transpose()?;
+        let identity_file = store
+            .installation_parent
+            .open_private_regular_handle(&store.installation_names.identity)?;
+        let layout_file = store.root.open_private_regular_handle(HOST_LAYOUT_FILE)?;
         let guard = Self {
             file,
-            root: root.reopen()?,
-            identity,
+            parent: store.installation_parent.reopen()?,
+            lock_name: store.installation_names.lock.clone(),
+            lock_identity: store.installation.lock.as_private(),
+            identity_name: store.installation_names.identity.clone(),
+            identity_file,
+            identity_file_identity: store.installation_file_identity,
+            installation: store.installation.clone(),
+            root: store.root.reopen()?,
             layout_file,
-            layout_identity,
         };
         guard.validate()?;
         Ok(guard)
     }
 
     fn validate(&self) -> Result<(), WorkerError> {
+        self.parent.verify_bound()?;
+        self.parent.validate_private_regular_binding(
+            &self.lock_name,
+            &self.file,
+            self.lock_identity,
+        )?;
+        self.parent.validate_private_regular_binding(
+            &self.identity_name,
+            &self.identity_file,
+            self.identity_file_identity,
+        )?;
         self.root.verify_bound()?;
-        let identity = self.root.identity()?;
-        let locked = self.file.metadata()?;
-        if identity.device != self.identity.device
-            || identity.inode != self.identity.inode
-            || locked.dev() != self.identity.device
-            || locked.ino() != self.identity.inode
-        {
-            return Err(WorkerError::Protocol(
-                "host root coordination identity changed".into(),
-            ));
-        }
-        if let (Some(file), Some(expected)) = (&self.layout_file, self.layout_identity) {
-            self.root
-                .validate_private_regular_binding(HOST_LAYOUT_FILE, file, expected)?;
-        }
+        self.root.validate_private_regular_binding(
+            HOST_LAYOUT_FILE,
+            &self.layout_file,
+            self.installation.layout.as_private(),
+        )?;
         Ok(())
     }
 }
 
-impl Drop for RootCoordinationGuard {
+impl Drop for InstallationGuard {
     fn drop(&mut self) {
         unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
@@ -338,7 +380,12 @@ struct CleanupMarker {
 
 impl HostStore {
     pub fn open(root: &Path) -> Result<Self, WorkerError> {
-        Self::open_inner(root, None)
+        Self::open_inner(root, None, true)?
+            .ok_or_else(|| WorkerError::Protocol("host installation was not initialized".into()))
+    }
+
+    pub(crate) fn open_if_present(root: &Path) -> Result<Option<Self>, WorkerError> {
+        Self::open_inner(root, None, false)
     }
 
     #[doc(hidden)]
@@ -346,49 +393,130 @@ impl HostStore {
         root: &Path,
         point: HostStoreWritePoint,
     ) -> Result<Self, WorkerError> {
-        Self::open_inner(root, Some(point))
+        Self::open_inner(root, Some(point), true)?
+            .ok_or_else(|| WorkerError::Protocol("host installation was not initialized".into()))
     }
 
-    fn open_inner(root: &Path, point: Option<HostStoreWritePoint>) -> Result<Self, WorkerError> {
+    fn open_inner(
+        root: &Path,
+        point: Option<HostStoreWritePoint>,
+        create: bool,
+    ) -> Result<Option<Self>, WorkerError> {
         if !root.is_absolute() {
             return Err(WorkerError::Protocol(
                 "host data root must be absolute".into(),
             ));
         }
-        let (mut rooted, created_root) = match RootedDir::open(root) {
-            Ok(rooted) => (rooted, false),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (RootedDir::create(root)?, true)
+        let parent_path = root.parent().ok_or_else(|| {
+            WorkerError::Protocol("host data root has no installation parent".into())
+        })?;
+        let parent = if create {
+            RootedDir::open_or_create_anchored_absolute(parent_path)?
+        } else {
+            match RootedDir::open_anchored_absolute(parent_path) {
+                Ok(parent) => parent,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
+        };
+        let names = installation_names(&parent, root)?;
+        let root_present = parent.entry_exists(&names.root_name)?;
+        let lock_present = parent.entry_exists(&names.lock)?;
+        let identity_present = parent.entry_exists(&names.identity)?;
+        if !root_present && !lock_present && !identity_present && !create {
+            return Ok(None);
+        }
+        if (root_present || identity_present) && !lock_present {
+            return Err(WorkerError::Protocol(
+                "host installation lock is absent".into(),
+            ));
+        }
+        let genuine_first = !root_present && !lock_present && !identity_present;
+        if genuine_first {
+            inject_open_fault(point, HostStoreWritePoint::BeforeInstallationLock)?;
+        }
+        let (installation_lock, created_lock) = if genuine_first {
+            parent.open_private_lock_with_created(&names.lock)?
+        } else {
+            (parent.open_existing_private_lock(&names.lock)?, false)
+        };
+        if created_lock {
+            parent.sync_root()?;
+        }
+        let result = unsafe { libc::flock(installation_lock.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(WorkerError::Io(std::io::Error::last_os_error()));
+        }
+        let mut installation_lock = Some(installation_lock);
+        let mut root_present = parent.entry_exists(&names.root_name)?;
+        let mut identity_present = parent.entry_exists(&names.identity)?;
+        let initialize = genuine_first && !root_present && !identity_present;
+        if !initialize && (!root_present || !identity_present) {
+            drop(installation_lock.take());
+            for _ in 0..64 {
+                std::thread::yield_now();
+                let retry = parent.open_existing_private_lock(&names.lock)?;
+                let result = unsafe { libc::flock(retry.as_raw_fd(), libc::LOCK_EX) };
+                if result != 0 {
+                    return Err(WorkerError::Io(std::io::Error::last_os_error()));
+                }
+                root_present = parent.entry_exists(&names.root_name)?;
+                identity_present = parent.entry_exists(&names.identity)?;
+                installation_lock = Some(retry);
+                if root_present && identity_present {
+                    break;
+                }
+                drop(installation_lock.take());
+            }
+        }
+        if !initialize && (!root_present || !identity_present) {
+            return Err(WorkerError::Protocol(
+                "host installation is incomplete after coordination".into(),
+            ));
+        }
+        let installation_lock = installation_lock.ok_or_else(|| {
+            WorkerError::Protocol("host installation coordination was lost".into())
+        })?;
+        let lock_identity = parent.private_entry_identity(&names.lock)?;
+        parent.validate_private_regular_binding(&names.lock, &installation_lock, lock_identity)?;
+        if initialize {
+            inject_open_fault(point, HostStoreWritePoint::AfterInstallationLock)?;
+        }
+        let mut rooted = if initialize {
+            parent.create_new_child_directory(&names.root_name)?
+        } else {
+            let parent_device = parent.root_metadata()?.st_dev as u64;
+            parent.open_private_direct_child_on_device(&names.root_name, parent_device)?
         };
         let root_metadata = rooted.root_metadata()?;
         require_private_directory_metadata(&root_metadata)?;
         let root_device = root_metadata.st_dev as u64;
+        let parent_device = parent.root_metadata()?.st_dev as u64;
+        if root_device != parent_device {
+            return Err(WorkerError::Protocol(
+                "host installation spans filesystems".into(),
+            ));
+        }
         rooted.bind_host_device(root_device)?;
         let root_identity = HostRootIdentity {
             device: root_device,
             inode: root_metadata.st_ino,
         };
-        let coordination = RootCoordinationGuard::acquire(&rooted, root_identity, None)?;
-        inject_open_fault(point, HostStoreWritePoint::AfterHostRootCreate)?;
-        let initialized = rooted.entry_exists(HOST_LAYOUT_FILE)?;
-        if !created_root && !initialized {
+        if initialize {
+            inject_open_fault(point, HostStoreWritePoint::AfterHostRootCreate)?;
+        }
+        let initialized_layout = rooted.entry_exists(HOST_LAYOUT_FILE)?;
+        if initialize == initialized_layout {
             return Err(WorkerError::Protocol(
-                "existing host data root has no canonical layout identity".into(),
+                "host root and layout initialization state disagree".into(),
             ));
         }
-        if created_root && initialized {
-            return Err(WorkerError::Protocol(
-                "new host data root unexpectedly contains a layout identity".into(),
-            ));
-        }
-        let namespaces = open_host_namespaces(&rooted, root_device, created_root)?;
+        let namespaces = open_host_namespaces(&rooted, root_device, initialize)?;
         inject_open_fault(point, HostStoreWritePoint::AfterHostNamespaces)?;
         let leases = namespaces
             .get("leases")
             .expect("owned leases namespace was inserted");
-        if created_root {
+        if initialize {
             let existed = leases.entry_exists(CAPACITY_LOCK_FILE)?;
             drop(leases.open_private_lock(CAPACITY_LOCK_FILE)?);
             if !existed {
@@ -396,7 +524,7 @@ impl HostStore {
             }
             inject_open_fault(point, HostStoreWritePoint::AfterHostCapacityLock)?;
         }
-        let layout = if initialized {
+        let layout = if initialized_layout {
             let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
             let current_layout = build_host_layout(&rooted, &namespaces, layout_file_identity)?;
             let stored: HostLayoutIdentity = read_json_strict_at(&rooted, HOST_LAYOUT_FILE)?;
@@ -420,7 +548,59 @@ impl HostStore {
             stored
         };
         let layout_file_identity = layout.layout_file.as_private();
-        coordination.validate()?;
+        let (installation, installation_file_identity) = if initialize {
+            inject_open_fault(
+                point,
+                HostStoreWritePoint::BeforeInstallationIdentityPublish,
+            )?;
+            let installation_file_identity = parent.write_private_atomic_no_replace_with_identity(
+                &names.identity,
+                |installation_file_identity| {
+                    let installation = build_installation_identity(
+                        &parent,
+                        &names,
+                        lock_identity,
+                        &rooted,
+                        layout_file_identity,
+                        installation_file_identity,
+                    )
+                    .map_err(worker_error_as_io)?;
+                    serde_json::to_vec(&installation).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })
+                },
+            )?;
+            let current = build_installation_identity(
+                &parent,
+                &names,
+                lock_identity,
+                &rooted,
+                layout_file_identity,
+                installation_file_identity,
+            )?;
+            let stored: HostInstallationIdentity = read_json_strict_at(&parent, &names.identity)?;
+            validate_installation_identity(&stored, &current)?;
+            inject_open_fault(point, HostStoreWritePoint::AfterInstallationIdentityPublish)?;
+            (stored, installation_file_identity)
+        } else {
+            let installation_file_identity = parent.private_entry_identity(&names.identity)?;
+            let current = build_installation_identity(
+                &parent,
+                &names,
+                lock_identity,
+                &rooted,
+                layout_file_identity,
+                installation_file_identity,
+            )?;
+            let stored: HostInstallationIdentity = read_json_strict_at(&parent, &names.identity)?;
+            validate_installation_identity(&stored, &current)?;
+            (stored, installation_file_identity)
+        };
+        parent.validate_private_regular_binding(
+            &names.lock,
+            &installation_lock,
+            installation.lock.as_private(),
+        )?;
         for bytes in rooted.list_names()? {
             let name = std::str::from_utf8(&bytes).map_err(|_| {
                 WorkerError::Protocol("host data root contains a non-UTF-8 entry".into())
@@ -429,23 +609,27 @@ impl HostStore {
                 rooted.validate_private_entry(name)?;
             }
         }
+        drop(installation_lock);
         let store = Self {
             inner: Arc::new(HostStoreInner {
                 display_root: root.to_path_buf(),
+                installation_parent: parent,
+                installation_names: names,
+                installation,
+                installation_file_identity,
                 root: rooted,
                 namespaces,
                 root_identity,
                 layout,
-                layout_file_identity,
                 fault: AtomicU8::new(point.map_or(0, |point| point as u8)),
             }),
         };
         store.validate_layout()?;
-        Ok(store)
+        Ok(Some(store))
     }
 
     pub(crate) fn admission_lock(&self, job: JobId) -> Result<AdmissionGuard, WorkerError> {
-        let outer = Arc::new(self.root_coordination_lock()?);
+        let outer = Arc::new(self.installation_lock()?);
         self.validate_layout_locked(&outer)?;
         let jobs = self.open_directory("locks/jobs", false)?;
         let identity_name = format!("{job}.lock.json");
@@ -500,7 +684,7 @@ impl HostStore {
 
     #[allow(dead_code)] // Standalone capacity locking is exercised by host integrity tests.
     pub(crate) fn capacity_lock(&self) -> Result<AdmissionGuard, WorkerError> {
-        let outer = Arc::new(self.root_coordination_lock()?);
+        let outer = Arc::new(self.installation_lock()?);
         self.capacity_lock_with_outer(outer)
     }
 
@@ -514,7 +698,7 @@ impl HostStore {
 
     fn capacity_lock_with_outer(
         &self,
-        outer: Arc<RootCoordinationGuard>,
+        outer: Arc<InstallationGuard>,
     ) -> Result<AdmissionGuard, WorkerError> {
         self.validate_layout_locked(&outer)?;
         let leases = self.open_directory("leases", false)?;
@@ -828,29 +1012,52 @@ impl HostStore {
     }
 
     pub(crate) fn validate_layout(&self) -> Result<(), WorkerError> {
-        self.inner.root.verify_bound()?;
-        require_private_directory_metadata(&self.inner.root.root_metadata()?)?;
-        for name in OWNED_DIRECTORIES {
-            let child = self.open_directory(name, false)?;
-            require_private_directory_metadata(&child.root_metadata()?)?;
-        }
-        let jobs = self.open_directory("locks/jobs", false)?;
-        require_private_directory_metadata(&jobs.root_metadata()?)
+        self.inner.installation_parent.verify_bound()?;
+        let lock = self
+            .inner
+            .installation_parent
+            .open_existing_private_lock(&self.inner.installation_names.lock)?;
+        self.inner
+            .installation_parent
+            .validate_private_regular_binding(
+                &self.inner.installation_names.lock,
+                &lock,
+                self.inner.installation.lock.as_private(),
+            )?;
+        let identity_file = self
+            .inner
+            .installation_parent
+            .open_private_regular_handle(&self.inner.installation_names.identity)?;
+        self.inner
+            .installation_parent
+            .validate_private_regular_binding(
+                &self.inner.installation_names.identity,
+                &identity_file,
+                self.inner.installation_file_identity,
+            )?;
+        let layout_file = self
+            .inner
+            .root
+            .open_private_regular_handle(HOST_LAYOUT_FILE)?;
+        self.inner.root.validate_private_regular_binding(
+            HOST_LAYOUT_FILE,
+            &layout_file,
+            self.inner.installation.layout.as_private(),
+        )?;
+        self.validate_layout_records()
     }
 
-    fn root_coordination_lock(&self) -> Result<RootCoordinationGuard, WorkerError> {
-        RootCoordinationGuard::acquire(
-            &self.inner.root,
-            self.inner.root_identity,
-            Some(self.inner.layout_file_identity),
-        )
+    fn installation_lock(&self) -> Result<InstallationGuard, WorkerError> {
+        InstallationGuard::acquire(&self.inner)
     }
 
-    fn validate_layout_locked(
-        &self,
-        coordination: &RootCoordinationGuard,
-    ) -> Result<(), WorkerError> {
+    fn validate_layout_locked(&self, coordination: &InstallationGuard) -> Result<(), WorkerError> {
         coordination.validate()?;
+        self.validate_layout_records()?;
+        coordination.validate()
+    }
+
+    fn validate_layout_records(&self) -> Result<(), WorkerError> {
         let current_layout_identity = self.inner.root.private_entry_identity(HOST_LAYOUT_FILE)?;
         let current = build_host_layout(
             &self.inner.root,
@@ -864,7 +1071,25 @@ impl HostStore {
                 "canonical host layout record changed".into(),
             ));
         }
-        coordination.validate()
+        let current_installation = build_installation_identity(
+            &self.inner.installation_parent,
+            &self.inner.installation_names,
+            self.inner.installation.lock.as_private(),
+            &self.inner.root,
+            current_layout_identity,
+            self.inner.installation_file_identity,
+        )?;
+        validate_installation_identity(&self.inner.installation, &current_installation)?;
+        let stored_installation: HostInstallationIdentity = read_json_strict_at(
+            &self.inner.installation_parent,
+            &self.inner.installation_names.identity,
+        )?;
+        if stored_installation != self.inner.installation {
+            return Err(WorkerError::Protocol(
+                "canonical host installation record changed".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn open_directory(
@@ -1066,6 +1291,75 @@ fn build_host_layout(
         layout_file: LayoutEntry::new(HOST_LAYOUT_FILE.into(), layout_file_identity),
         entries,
     })
+}
+
+fn installation_names(parent: &RootedDir, root: &Path) -> Result<InstallationNames, WorkerError> {
+    let root_component = root.file_name().ok_or_else(|| {
+        WorkerError::Protocol("host data root must identify one directory entry".into())
+    })?;
+    let root_name = root_component
+        .to_str()
+        .ok_or_else(|| WorkerError::Protocol("host data root name must be UTF-8".into()))?
+        .to_owned();
+    let parent_identity = parent.identity()?;
+    let mut digest = Sha256::new();
+    digest.update(b"mac-worker-installation-v1\0");
+    digest.update(parent_identity.device.to_be_bytes());
+    digest.update(parent_identity.inode.to_be_bytes());
+    digest.update((root_component.as_bytes().len() as u64).to_be_bytes());
+    digest.update(root_component.as_bytes());
+    let key = format!("{:x}", digest.finalize());
+    let root_name_sha256 = format!("{:x}", Sha256::digest(root_component.as_bytes()));
+    Ok(InstallationNames {
+        lock: format!("{INSTALLATION_PREFIX}{key}.lock"),
+        identity: format!("{INSTALLATION_PREFIX}{key}.json"),
+        key,
+        root_name,
+        root_name_sha256,
+    })
+}
+
+fn build_installation_identity(
+    parent: &RootedDir,
+    names: &InstallationNames,
+    lock_identity: PrivateEntryIdentity,
+    root: &RootedDir,
+    layout_identity: PrivateEntryIdentity,
+    identity_file: PrivateEntryIdentity,
+) -> Result<HostInstallationIdentity, WorkerError> {
+    let parent_identity = parent.identity()?;
+    let root_identity = root.identity()?;
+    if lock_identity.device != parent_identity.device
+        || identity_file.device != parent_identity.device
+        || root_identity.device != parent_identity.device
+        || layout_identity.device != parent_identity.device
+    {
+        return Err(WorkerError::Protocol(
+            "host installation spans filesystems".into(),
+        ));
+    }
+    Ok(HostInstallationIdentity {
+        version: HOST_INSTALLATION_VERSION,
+        key: names.key.clone(),
+        root_name_sha256: names.root_name_sha256.clone(),
+        parent: LayoutEntry::new("installation-parent".into(), parent_identity),
+        lock: LayoutEntry::new("installation-lock".into(), lock_identity),
+        root: LayoutEntry::new("host-root".into(), root_identity),
+        layout: LayoutEntry::new("host-layout".into(), layout_identity),
+        identity_file: LayoutEntry::new("installation-identity".into(), identity_file),
+    })
+}
+
+fn validate_installation_identity(
+    stored: &HostInstallationIdentity,
+    current: &HostInstallationIdentity,
+) -> Result<(), WorkerError> {
+    if stored.version != HOST_INSTALLATION_VERSION || stored != current {
+        return Err(WorkerError::Protocol(
+            "canonical host installation identity changed".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn worker_error_as_io(error: WorkerError) -> std::io::Error {
@@ -1381,6 +1675,20 @@ mod review_regression_tests {
     use crate::job::{ClientId, CommandSpec, LeaseToken, RequestFingerprintMaterial};
     use std::{fs, sync::mpsc, thread, time::Duration};
     use tempfile::tempdir;
+
+    fn installation_entries(parent: &Path) -> Vec<PathBuf> {
+        let mut entries = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".mac-worker-installation-"))
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
 
     fn request(seed: u128) -> LeaseAcquireRequest {
         let material = RequestFingerprintMaterial::new(
@@ -1782,7 +2090,7 @@ mod review_regression_tests {
     }
 
     #[test]
-    fn interruption_after_complete_layout_publish_is_reopenable() {
+    fn layout_without_the_external_installation_identity_is_not_adopted() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("host");
 
@@ -1791,6 +2099,152 @@ mod review_regression_tests {
                 .is_err()
         );
         assert!(root.join(HOST_LAYOUT_FILE).is_file());
-        assert!(HostStore::open(&root).is_ok());
+        assert!(HostStore::open(&root).is_err());
+    }
+
+    #[test]
+    fn active_root_renamed_to_an_absent_canonical_path_cannot_form_a_second_domain() {
+        use crate::lease::{AdmissionFacts, LeaseService};
+        use crate::protocol::MemoryPressure;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let detached = temp.path().join("detached-host");
+        let first = HostStore::open(&root).unwrap();
+        LeaseService::new(&first)
+            .acquire(
+                &request(1),
+                &AdmissionFacts {
+                    free_disk_bytes: 200 * 1024 * 1024 * 1024,
+                    total_disk_bytes: 500 * 1024 * 1024 * 1024,
+                    memory_pressure: MemoryPressure::Normal,
+                    swap_used_bytes: Some(0),
+                },
+                1,
+            )
+            .unwrap();
+        fs::rename(&root, &detached).unwrap();
+
+        assert!(HostStore::open(&root).is_err());
+        assert!(!root.exists());
+        assert!(detached.join("leases/heavy/lease.json").is_file());
+    }
+
+    #[test]
+    fn installation_anchor_deletion_replacement_and_copy_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for attack in [
+            "delete-lock",
+            "delete-identity",
+            "replace-lock",
+            "copy-identity",
+            "corrupt-identity",
+            "unsafe-identity",
+        ] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let _store = HostStore::open(&root).unwrap();
+            let entries = installation_entries(temp.path());
+            assert_eq!(entries.len(), 2);
+            let lock = entries
+                .iter()
+                .find(|path| path.extension().is_some_and(|value| value == "lock"))
+                .unwrap();
+            let identity = entries
+                .iter()
+                .find(|path| path.extension().is_some_and(|value| value == "json"))
+                .unwrap();
+
+            match attack {
+                "delete-lock" => fs::remove_file(lock).unwrap(),
+                "delete-identity" => fs::remove_file(identity).unwrap(),
+                "replace-lock" => {
+                    let retained = temp.path().join("retained-lock");
+                    fs::rename(lock, &retained).unwrap();
+                    fs::write(lock, b"replacement").unwrap();
+                    fs::set_permissions(lock, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                "copy-identity" => {
+                    let retained = temp.path().join("retained-identity");
+                    fs::rename(identity, &retained).unwrap();
+                    fs::copy(&retained, identity).unwrap();
+                    fs::set_permissions(identity, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                "corrupt-identity" => fs::write(identity, b"{}").unwrap(),
+                "unsafe-identity" => {
+                    fs::set_permissions(identity, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(HostStore::open(&root).is_err(), "attack {attack}");
+        }
+    }
+
+    #[test]
+    fn concurrent_first_initializers_share_one_external_anchor() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempdir().unwrap();
+        let root = Arc::new(temp.path().join("host"));
+        let barrier = Arc::new(Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let root = Arc::clone(&root);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    HostStore::open(&root)
+                        .map(drop)
+                        .map_err(|error| format!("{error:?}"))
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+
+        assert_eq!(installation_entries(temp.path()).len(), 2);
+        assert!(root.join(HOST_LAYOUT_FILE).is_file());
+    }
+
+    #[test]
+    fn installation_initialization_crashes_are_never_implicitly_adopted() {
+        for point in [
+            HostStoreWritePoint::AfterInstallationLock,
+            HostStoreWritePoint::AfterHostRootCreate,
+            HostStoreWritePoint::AfterHostLayoutPublish,
+            HostStoreWritePoint::BeforeInstallationIdentityPublish,
+        ] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            assert!(HostStore::open_with_write_fault(&root, point).is_err());
+            assert!(HostStore::open(&root).is_err());
+        }
+
+        let before = tempdir().unwrap();
+        let before_root = before.path().join("host");
+        assert!(
+            HostStore::open_with_write_fault(
+                &before_root,
+                HostStoreWritePoint::BeforeInstallationLock,
+            )
+            .is_err()
+        );
+        assert!(!before_root.exists());
+        assert!(installation_entries(before.path()).is_empty());
+        assert!(HostStore::open(&before_root).is_ok());
+
+        let complete = tempdir().unwrap();
+        let complete_root = complete.path().join("host");
+        assert!(
+            HostStore::open_with_write_fault(
+                &complete_root,
+                HostStoreWritePoint::AfterInstallationIdentityPublish,
+            )
+            .is_err()
+        );
+        assert!(HostStore::open(&complete_root).is_ok());
     }
 }
