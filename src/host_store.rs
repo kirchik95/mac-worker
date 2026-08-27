@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     fs::File,
-    os::fd::AsRawFd,
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -20,10 +20,14 @@ use crate::{
         ClientId, JobId, JobStatus, LeaseAcquireRequest, LeaseRecord, LeaseToken,
         RequestFingerprint,
     },
-    rooted_fs::RootedDir,
+    rooted_fs::{PrivateEntryIdentity, RootedDir},
 };
 
 const MAX_HOST_FILE_BYTES: u64 = 1024 * 1024;
+const HOST_LAYOUT_VERSION: u32 = 1;
+const HOST_LAYOUT_FILE: &str = "layout.json";
+const CAPACITY_LOCK_FILE: &str = "capacity.lock";
+const ADMISSION_LOCK_FILE: &str = "admission.lock";
 const OWNED_DIRECTORIES: &[&str] = &[
     "incoming",
     "verified",
@@ -45,6 +49,38 @@ pub enum HostStoreWritePoint {
     AfterLeasePublishSync = 6,
 }
 
+impl LayoutEntry {
+    fn new(path: String, identity: PrivateEntryIdentity) -> Self {
+        Self {
+            path,
+            device: identity.device,
+            inode: identity.inode,
+            kind: identity.kind,
+            owner: identity.owner,
+            mode: identity.mode,
+        }
+    }
+
+    fn as_private(&self) -> PrivateEntryIdentity {
+        PrivateEntryIdentity {
+            device: self.device,
+            inode: self.inode,
+            kind: self.kind,
+            owner: self.owner,
+            mode: self.mode,
+        }
+    }
+}
+
+impl HostLayoutIdentity {
+    fn entry(&self, path: &str) -> Result<&LayoutEntry, WorkerError> {
+        self.entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .ok_or_else(|| WorkerError::Protocol("canonical host layout entry is absent".into()))
+    }
+}
+
 #[derive(Clone)]
 pub struct HostStore {
     inner: Arc<HostStoreInner>,
@@ -55,6 +91,8 @@ struct HostStoreInner {
     root: RootedDir,
     namespaces: BTreeMap<&'static str, RootedDir>,
     root_identity: HostRootIdentity,
+    layout: HostLayoutIdentity,
+    layout_file_identity: PrivateEntryIdentity,
     fault: AtomicU8,
 }
 
@@ -62,6 +100,35 @@ struct HostStoreInner {
 struct HostRootIdentity {
     device: u64,
     inode: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HostLayoutIdentity {
+    version: u32,
+    root: LayoutEntry,
+    layout_file: LayoutEntry,
+    entries: Vec<LayoutEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LayoutEntry {
+    path: String,
+    device: u64,
+    inode: u64,
+    kind: u32,
+    owner: u32,
+    mode: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AdmissionLockIdentity {
+    version: u32,
+    job_id: JobId,
+    directory: LayoutEntry,
+    lock: LayoutEntry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,18 +179,89 @@ impl JobDisposition {
 }
 
 pub struct AdmissionGuard {
+    outer: Arc<RootCoordinationGuard>,
     file: File,
     namespace: RootedDir,
+    file_name: String,
+    file_identity: PrivateEntryIdentity,
+}
+
+// Every host mutation follows this fixed order: the stable host-root
+// coordination lock, then the per-job admission lock, then the heavy-slot
+// capacity lock. Capacity-only integrity operations still start at the root.
+struct RootCoordinationGuard {
+    file: File,
+    root: RootedDir,
+    identity: HostRootIdentity,
+    layout_file: Option<File>,
+    layout_identity: Option<PrivateEntryIdentity>,
 }
 
 impl AdmissionGuard {
     pub(crate) fn validate(&self) -> Result<(), WorkerError> {
-        self.namespace.verify_bound()?;
+        self.outer.validate()?;
+        self.namespace.validate_private_regular_binding(
+            &self.file_name,
+            &self.file,
+            self.file_identity,
+        )?;
         Ok(())
     }
 }
 
 impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+impl RootCoordinationGuard {
+    fn acquire(
+        root: &RootedDir,
+        identity: HostRootIdentity,
+        layout_identity: Option<PrivateEntryIdentity>,
+    ) -> Result<Self, WorkerError> {
+        let file = root.coordination_handle()?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(WorkerError::Io(std::io::Error::last_os_error()));
+        }
+        let layout_file = layout_identity
+            .map(|_| root.open_private_regular_handle(HOST_LAYOUT_FILE))
+            .transpose()?;
+        let guard = Self {
+            file,
+            root: root.reopen()?,
+            identity,
+            layout_file,
+            layout_identity,
+        };
+        guard.validate()?;
+        Ok(guard)
+    }
+
+    fn validate(&self) -> Result<(), WorkerError> {
+        self.root.verify_bound()?;
+        let identity = self.root.identity()?;
+        let locked = self.file.metadata()?;
+        if identity.device != self.identity.device
+            || identity.inode != self.identity.inode
+            || locked.dev() != self.identity.device
+            || locked.ino() != self.identity.inode
+        {
+            return Err(WorkerError::Protocol(
+                "host root coordination identity changed".into(),
+            ));
+        }
+        if let (Some(file), Some(expected)) = (&self.layout_file, self.layout_identity) {
+            self.root
+                .validate_private_regular_binding(HOST_LAYOUT_FILE, file, expected)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RootCoordinationGuard {
     fn drop(&mut self) {
         unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
@@ -135,6 +273,7 @@ pub struct StagedJob {
     final_name: String,
     job_id: JobId,
     receipt_nonce: [u8; 16],
+    guard: AdmissionGuard,
 }
 
 pub struct WorkspaceReceipt {
@@ -225,24 +364,48 @@ impl HostStore {
             device: root_device,
             inode: root_metadata.st_ino,
         };
-        let mut namespaces = BTreeMap::new();
-        for name in OWNED_DIRECTORIES {
-            let child =
-                rooted.open_child_directory_on_device(&relative(name)?, true, root_device)?;
-            require_private_directory_metadata(&child.root_metadata()?)?;
-            namespaces.insert(*name, child);
+        let coordination = RootCoordinationGuard::acquire(&rooted, root_identity, None)?;
+        let initialized = rooted.entry_exists(HOST_LAYOUT_FILE)?;
+        let namespaces = open_host_namespaces(&rooted, root_device, !initialized)?;
+        let leases = namespaces
+            .get("leases")
+            .expect("owned leases namespace was inserted");
+        if !initialized {
+            let existed = leases.entry_exists(CAPACITY_LOCK_FILE)?;
+            drop(leases.open_private_lock(CAPACITY_LOCK_FILE)?);
+            if !existed {
+                leases.sync_root()?;
+            }
         }
-        let locks = namespaces
-            .get("locks")
-            .expect("owned locks namespace was inserted");
-        let jobs = locks.open_child_directory_on_device(&relative("jobs")?, true, root_device)?;
-        require_private_directory_metadata(&jobs.root_metadata()?)?;
-        namespaces.insert("locks/jobs", jobs);
+        let layout = if initialized {
+            let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
+            let current_layout = build_host_layout(&rooted, &namespaces, layout_file_identity)?;
+            let stored: HostLayoutIdentity = read_json_strict_at(&rooted, HOST_LAYOUT_FILE)?;
+            validate_host_layout(&stored, &current_layout)?;
+            stored
+        } else {
+            let layout_file_identity = rooted.write_private_atomic_no_replace_with_identity(
+                HOST_LAYOUT_FILE,
+                |layout_file_identity| {
+                    let layout = build_host_layout(&rooted, &namespaces, layout_file_identity)
+                        .map_err(worker_error_as_io)?;
+                    serde_json::to_vec(&layout).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })
+                },
+            )?;
+            let current_layout = build_host_layout(&rooted, &namespaces, layout_file_identity)?;
+            let stored: HostLayoutIdentity = read_json_strict_at(&rooted, HOST_LAYOUT_FILE)?;
+            validate_host_layout(&stored, &current_layout)?;
+            stored
+        };
+        let layout_file_identity = layout.layout_file.as_private();
+        coordination.validate()?;
         for bytes in rooted.list_names()? {
             let name = std::str::from_utf8(&bytes).map_err(|_| {
                 WorkerError::Protocol("host data root contains a non-UTF-8 entry".into())
             })?;
-            if !OWNED_DIRECTORIES.contains(&name) {
+            if !OWNED_DIRECTORIES.contains(&name) && name != HOST_LAYOUT_FILE {
                 rooted.validate_private_entry(name)?;
             }
         }
@@ -252,6 +415,8 @@ impl HostStore {
                 root: rooted,
                 namespaces,
                 root_identity,
+                layout,
+                layout_file_identity,
                 fault: AtomicU8::new(point.map_or(0, |point| point as u8)),
             }),
         };
@@ -260,30 +425,96 @@ impl HostStore {
     }
 
     pub(crate) fn admission_lock(&self, job: JobId) -> Result<AdmissionGuard, WorkerError> {
-        let directory = self.open_directory(&format!("locks/jobs/{job}"), true)?;
-        let file = directory.open_private_lock("admission.lock")?;
+        let outer = Arc::new(self.root_coordination_lock()?);
+        self.validate_layout_locked(&outer)?;
+        let jobs = self.open_directory("locks/jobs", false)?;
+        let identity_name = format!("{job}.lock.json");
+        let initialized = jobs.entry_exists(&identity_name)?;
+        let directory = self.open_directory(&format!("locks/jobs/{job}"), !initialized)?;
+        if !initialized && !directory.entry_exists(ADMISSION_LOCK_FILE)? {
+            drop(directory.open_private_lock(ADMISSION_LOCK_FILE)?);
+            directory.sync_root()?;
+        }
+        let file = directory.open_private_lock(ADMISSION_LOCK_FILE)?;
+        let current = AdmissionLockIdentity {
+            version: HOST_LAYOUT_VERSION,
+            job_id: job,
+            directory: LayoutEntry::new(job.to_string(), directory.identity()?),
+            lock: LayoutEntry::new(
+                format!("{job}/{ADMISSION_LOCK_FILE}"),
+                directory.private_entry_identity(ADMISSION_LOCK_FILE)?,
+            ),
+        };
+        let identity = if initialized {
+            let stored: AdmissionLockIdentity = read_json_strict_at(&jobs, &identity_name)?;
+            if stored != current {
+                return Err(WorkerError::Protocol(
+                    "canonical admission lock identity changed".into(),
+                ));
+            }
+            stored
+        } else {
+            atomic_write_at(&jobs, &identity_name, &current)?;
+            current
+        };
+        outer.validate()?;
+        directory.validate_private_regular_binding(
+            ADMISSION_LOCK_FILE,
+            &file,
+            identity.lock.as_private(),
+        )?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if result != 0 {
             return Err(WorkerError::Io(std::io::Error::last_os_error()));
         }
         let guard = AdmissionGuard {
+            outer,
             file,
             namespace: directory,
+            file_name: ADMISSION_LOCK_FILE.into(),
+            file_identity: identity.lock.as_private(),
         };
         guard.validate()?;
         Ok(guard)
     }
 
+    #[allow(dead_code)] // Standalone capacity locking is exercised by host integrity tests.
     pub(crate) fn capacity_lock(&self) -> Result<AdmissionGuard, WorkerError> {
+        let outer = Arc::new(self.root_coordination_lock()?);
+        self.capacity_lock_with_outer(outer)
+    }
+
+    pub(crate) fn capacity_lock_after(
+        &self,
+        admission: &AdmissionGuard,
+    ) -> Result<AdmissionGuard, WorkerError> {
+        admission.validate()?;
+        self.capacity_lock_with_outer(Arc::clone(&admission.outer))
+    }
+
+    fn capacity_lock_with_outer(
+        &self,
+        outer: Arc<RootCoordinationGuard>,
+    ) -> Result<AdmissionGuard, WorkerError> {
+        self.validate_layout_locked(&outer)?;
         let leases = self.open_directory("leases", false)?;
-        let file = leases.open_private_lock("capacity.lock")?;
+        let expected = self
+            .inner
+            .layout
+            .entry("leases/capacity.lock")?
+            .as_private();
+        let file = leases.open_private_lock(CAPACITY_LOCK_FILE)?;
+        leases.validate_private_regular_binding(CAPACITY_LOCK_FILE, &file, expected)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if result != 0 {
             return Err(WorkerError::Io(std::io::Error::last_os_error()));
         }
         let guard = AdmissionGuard {
+            outer,
             file,
             namespace: leases,
+            file_name: CAPACITY_LOCK_FILE.into(),
+            file_identity: expected,
         };
         guard.validate()?;
         Ok(guard)
@@ -358,6 +589,7 @@ impl HostStore {
         self.validate_layout()?;
         validate_digest(project, "project ID")?;
         validate_digest(worktree, "worktree ID")?;
+        let guard = self.admission_lock(job)?;
         let nonce = *uuid::Uuid::new_v4().as_bytes();
         let leases = self.open_directory("leases", false)?;
         let root = leases.create_new_child_directory(&format!(".job-{job}-{}", hex_16(nonce)))?;
@@ -368,6 +600,7 @@ impl HostStore {
             final_name: job.to_string(),
             job_id: job,
             receipt_nonce: nonce,
+            guard,
         })
     }
 
@@ -474,7 +707,7 @@ impl HostStore {
             ));
         }
         let admission = self.admission_lock(lease.job_id())?;
-        let capacity = self.capacity_lock()?;
+        let capacity = self.capacity_lock_after(&admission)?;
         let job_dir = self.open_directory(
             &format!(
                 "jobs/{}/{}/{}",
@@ -496,7 +729,7 @@ impl HostStore {
     ) -> Result<CleanupReceipt, WorkerError> {
         lease.validate()?;
         let admission = self.admission_lock(lease.job_id())?;
-        let capacity = self.capacity_lock()?;
+        let capacity = self.capacity_lock_after(&admission)?;
         let final_relative = format!(
             "jobs/{}/{}/{}",
             lease.project_id(),
@@ -583,6 +816,35 @@ impl HostStore {
         }
         let jobs = self.open_directory("locks/jobs", false)?;
         require_private_directory_metadata(&jobs.root_metadata()?)
+    }
+
+    fn root_coordination_lock(&self) -> Result<RootCoordinationGuard, WorkerError> {
+        RootCoordinationGuard::acquire(
+            &self.inner.root,
+            self.inner.root_identity,
+            Some(self.inner.layout_file_identity),
+        )
+    }
+
+    fn validate_layout_locked(
+        &self,
+        coordination: &RootCoordinationGuard,
+    ) -> Result<(), WorkerError> {
+        coordination.validate()?;
+        let current_layout_identity = self.inner.root.private_entry_identity(HOST_LAYOUT_FILE)?;
+        let current = build_host_layout(
+            &self.inner.root,
+            &self.inner.namespaces,
+            current_layout_identity,
+        )?;
+        validate_host_layout(&self.inner.layout, &current)?;
+        let stored: HostLayoutIdentity = read_json_strict_at(&self.inner.root, HOST_LAYOUT_FILE)?;
+        if stored != self.inner.layout {
+            return Err(WorkerError::Protocol(
+                "canonical host layout record changed".into(),
+            ));
+        }
+        coordination.validate()
     }
 
     pub(crate) fn open_directory(
@@ -721,6 +983,76 @@ impl HostStore {
             Err(error) => Err(error),
         }
     }
+}
+
+fn open_host_namespaces(
+    root: &RootedDir,
+    device: u64,
+    create: bool,
+) -> Result<BTreeMap<&'static str, RootedDir>, WorkerError> {
+    let mut namespaces = BTreeMap::new();
+    for name in OWNED_DIRECTORIES {
+        let child = root.open_child_directory_on_device(&relative(name)?, create, device)?;
+        require_private_directory_metadata(&child.root_metadata()?)?;
+        namespaces.insert(*name, child);
+    }
+    let locks = namespaces
+        .get("locks")
+        .expect("owned locks namespace was inserted");
+    let jobs = locks.open_child_directory_on_device(&relative("jobs")?, create, device)?;
+    require_private_directory_metadata(&jobs.root_metadata()?)?;
+    namespaces.insert("locks/jobs", jobs);
+    Ok(namespaces)
+}
+
+fn build_host_layout(
+    root: &RootedDir,
+    namespaces: &BTreeMap<&'static str, RootedDir>,
+    layout_file_identity: PrivateEntryIdentity,
+) -> Result<HostLayoutIdentity, WorkerError> {
+    let mut entries = Vec::with_capacity(OWNED_DIRECTORIES.len() + 2);
+    for name in OWNED_DIRECTORIES {
+        let namespace = namespaces
+            .get(name)
+            .expect("owned namespace identity exists");
+        entries.push(LayoutEntry::new((*name).into(), namespace.identity()?));
+    }
+    let jobs = namespaces
+        .get("locks/jobs")
+        .expect("owned jobs lock namespace identity exists");
+    entries.push(LayoutEntry::new("locks/jobs".into(), jobs.identity()?));
+    let leases = namespaces
+        .get("leases")
+        .expect("owned leases namespace identity exists");
+    entries.push(LayoutEntry::new(
+        "leases/capacity.lock".into(),
+        leases.private_entry_identity(CAPACITY_LOCK_FILE)?,
+    ));
+    Ok(HostLayoutIdentity {
+        version: HOST_LAYOUT_VERSION,
+        root: LayoutEntry::new(".".into(), root.identity()?),
+        layout_file: LayoutEntry::new(HOST_LAYOUT_FILE.into(), layout_file_identity),
+        entries,
+    })
+}
+
+fn worker_error_as_io(error: WorkerError) -> std::io::Error {
+    match error {
+        WorkerError::Io(error) => error,
+        error => std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
+    }
+}
+
+fn validate_host_layout(
+    stored: &HostLayoutIdentity,
+    current: &HostLayoutIdentity,
+) -> Result<(), WorkerError> {
+    if stored.version != HOST_LAYOUT_VERSION || stored != current {
+        return Err(WorkerError::Protocol(
+            "canonical host layout identity changed".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn same_disposition_identity(left: &JobDisposition, right: &JobDisposition) -> bool {
@@ -904,6 +1236,7 @@ impl StagedJob {
                 "final job path already exists",
             ));
         }
+        self.guard.validate()?;
         self.root
             .publish_owned_into(&self.final_parent, &self.final_name)?;
         self.final_parent.sync_root()?;
@@ -1014,7 +1347,7 @@ fn hex_16(bytes: [u8; 16]) -> String {
 mod review_regression_tests {
     use super::*;
     use crate::job::{ClientId, CommandSpec, LeaseToken, RequestFingerprintMaterial};
-    use std::fs;
+    use std::{fs, sync::mpsc, thread, time::Duration};
     use tempfile::tempdir;
 
     fn request(seed: u128) -> LeaseAcquireRequest {
@@ -1165,12 +1498,22 @@ mod review_regression_tests {
         let first = HostStore::open(&root).unwrap();
         let second = HostStore::open(&root).unwrap();
         let job = request(1).material().job_id();
-        let _held = first.admission_lock(job).unwrap();
+        let held = first.admission_lock(job).unwrap();
         fs::rename(root.join("locks/jobs"), root.join("locks/jobs-detached")).unwrap();
         fs::create_dir(root.join("locks/jobs")).unwrap();
         fs::set_permissions(root.join("locks/jobs"), fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(second.admission_lock(job).is_err());
+        let (sender, receiver) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            sender.send(second.admission_lock(job).is_err()).unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        contender.join().unwrap();
         assert_eq!(fs::read_dir(root.join("locks/jobs")).unwrap().count(), 0);
     }
 
@@ -1182,12 +1525,162 @@ mod review_regression_tests {
         let root = temp.path().join("host");
         let first = HostStore::open(&root).unwrap();
         let second = HostStore::open(&root).unwrap();
-        let _held = first.capacity_lock().unwrap();
+        let held = first.capacity_lock().unwrap();
         fs::rename(root.join("leases"), root.join("leases-detached")).unwrap();
         fs::create_dir(root.join("leases")).unwrap();
         fs::set_permissions(root.join("leases"), fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(second.capacity_lock().is_err());
+        let (sender, receiver) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            sender.send(second.capacity_lock().is_err()).unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        contender.join().unwrap();
         assert_eq!(fs::read_dir(root.join("leases")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn capacity_lock_file_replacement_cannot_create_a_second_lock_domain() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let first = HostStore::open(&root).unwrap();
+        let second = HostStore::open(&root).unwrap();
+        let held = first.capacity_lock().unwrap();
+        let lock = root.join("leases/capacity.lock");
+        let detached = root.join("leases/capacity.lock-detached");
+        fs::rename(&lock, &detached).unwrap();
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            sender.send(second.capacity_lock().is_err()).unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        contender.join().unwrap();
+        assert!(detached.is_file());
+        assert!(lock.is_file());
+    }
+
+    #[test]
+    fn admission_lock_file_replacement_cannot_create_a_second_lock_domain() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let first = HostStore::open(&root).unwrap();
+        let second = HostStore::open(&root).unwrap();
+        let job = request(1).material().job_id();
+        let held = first.admission_lock(job).unwrap();
+        let lock = root
+            .join("locks/jobs")
+            .join(job.to_string())
+            .join("admission.lock");
+        let detached = lock.with_file_name("admission.lock-detached");
+        fs::rename(&lock, &detached).unwrap();
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            sender.send(second.admission_lock(job).is_err()).unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        contender.join().unwrap();
+        assert!(detached.is_file());
+        assert!(lock.is_file());
+    }
+
+    #[test]
+    fn opening_after_leases_replacement_rejects_the_new_namespace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let first = HostStore::open(&root).unwrap();
+        let held = first.capacity_lock().unwrap();
+        fs::rename(root.join("leases"), root.join("leases-detached")).unwrap();
+        fs::create_dir(root.join("leases")).unwrap();
+        fs::set_permissions(root.join("leases"), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let contender_root = root.clone();
+        let contender = thread::spawn(move || {
+            sender
+                .send(HostStore::open(&contender_root).is_err())
+                .unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        contender.join().unwrap();
+        assert_eq!(fs::read_dir(root.join("leases")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn opening_after_jobs_lock_namespace_replacement_rejects_the_new_namespace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let first = HostStore::open(&root).unwrap();
+        let job = request(1).material().job_id();
+        let held = first.admission_lock(job).unwrap();
+        fs::rename(root.join("locks/jobs"), root.join("locks/jobs-detached")).unwrap();
+        fs::create_dir(root.join("locks/jobs")).unwrap();
+        fs::set_permissions(root.join("locks/jobs"), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let contender_root = root.clone();
+        let contender = thread::spawn(move || {
+            sender
+                .send(HostStore::open(&contender_root).is_err())
+                .unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        contender.join().unwrap();
+        assert_eq!(fs::read_dir(root.join("locks/jobs")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn copied_layout_bytes_cannot_bless_a_replacement_layout_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let _first = HostStore::open(&root).unwrap();
+        let layout = root.join(HOST_LAYOUT_FILE);
+        let bytes = fs::read(&layout).unwrap();
+        fs::rename(&layout, root.join("layout-original.json")).unwrap();
+        fs::write(&layout, &bytes).unwrap();
+        fs::set_permissions(&layout, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(HostStore::open(&root).is_err());
+        assert_eq!(fs::read(&layout).unwrap(), bytes);
     }
 }

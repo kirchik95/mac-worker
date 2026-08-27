@@ -93,7 +93,7 @@ impl<'a> LeaseService<'a> {
                 )),
             };
         }
-        let capacity = self.store.capacity_lock()?;
+        let capacity = self.store.capacity_lock_after(&guard)?;
         guard.validate()?;
         capacity.validate()?;
 
@@ -161,7 +161,7 @@ impl<'a> LeaseService<'a> {
         expected.validate()?;
         self.store.validate_layout()?;
         let guard = self.store.admission_lock(expected.job_id())?;
-        let capacity = self.store.capacity_lock()?;
+        let capacity = self.store.capacity_lock_after(&guard)?;
         guard.validate()?;
         capacity.validate()?;
         let live = self

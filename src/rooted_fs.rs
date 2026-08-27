@@ -230,12 +230,33 @@ pub struct RootedDir {
     security_device: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrivateEntryIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) kind: u32,
+    pub(crate) owner: u32,
+    pub(crate) mode: u32,
+}
+
 struct DirectoryBinding {
     directory: OwnedFd,
     parent: OwnedFd,
     name: CString,
     identity: FileIdentity,
     security_device: Option<u64>,
+}
+
+impl PrivateEntryIdentity {
+    fn from_stat(metadata: &libc::stat) -> Self {
+        Self {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino,
+            kind: file_type(metadata.st_mode) as u32,
+            owner: metadata.st_uid,
+            mode: (metadata.st_mode & 0o777) as u32,
+        }
+    }
 }
 
 impl RootedDir {
@@ -303,6 +324,82 @@ impl RootedDir {
     pub(crate) fn root_metadata(&self) -> io::Result<libc::stat> {
         self.verify_root_name()?;
         stat_fd(self.root.as_raw_fd())
+    }
+
+    pub(crate) fn coordination_handle(&self) -> io::Result<File> {
+        self.verify_root_name()?;
+        let descriptor = reopen_directory(self.root.as_raw_fd())?;
+        let anchored = stat_fd(self.root.as_raw_fd())?;
+        let opened = stat_fd(descriptor.as_raw_fd())?;
+        if !same_file(&anchored, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        if let Some(device) = self.security_device {
+            require_private_directory_on_device(&opened, device)?;
+        } else {
+            require_private_directory(&opened)?;
+        }
+        Ok(File::from(descriptor))
+    }
+
+    pub(crate) fn identity(&self) -> io::Result<PrivateEntryIdentity> {
+        self.verify_root_name()?;
+        Ok(PrivateEntryIdentity::from_stat(&stat_fd(
+            self.root.as_raw_fd(),
+        )?))
+    }
+
+    pub(crate) fn private_entry_identity(&self, name: &str) -> io::Result<PrivateEntryIdentity> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let metadata = stat_at(self.root.as_raw_fd(), &name)?;
+        match file_type(metadata.st_mode) {
+            libc::S_IFDIR => {
+                if let Some(device) = self.security_device {
+                    require_private_directory_on_device(&metadata, device)?;
+                } else {
+                    require_private_directory(&metadata)?;
+                }
+            }
+            libc::S_IFREG => {
+                require_private_regular(&metadata)?;
+                if self
+                    .security_device
+                    .is_some_and(|device| metadata.st_dev as u64 != device)
+                {
+                    return Err(os_error(libc::EXDEV));
+                }
+            }
+            _ => return Err(invalid_type_error()),
+        }
+        Ok(PrivateEntryIdentity::from_stat(&metadata))
+    }
+
+    pub(crate) fn validate_private_regular_binding(
+        &self,
+        name: &str,
+        file: &File,
+        expected: PrivateEntryIdentity,
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let current = stat_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(file.as_raw_fd())?;
+        require_private_regular(&current)?;
+        require_private_regular(&opened)?;
+        if PrivateEntryIdentity::from_stat(&current) != expected
+            || PrivateEntryIdentity::from_stat(&opened) != expected
+            || !same_file(&current, &opened)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        if self
+            .security_device
+            .is_some_and(|device| current.st_dev as u64 != device)
+        {
+            return Err(os_error(libc::EXDEV));
+        }
+        Ok(())
     }
 
     pub(crate) fn open_child_directory(
@@ -492,17 +589,47 @@ impl RootedDir {
         Ok(bytes)
     }
 
+    pub(crate) fn open_private_regular_handle(&self, name: &str) -> io::Result<File> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let path_stat = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular(&path_stat)?;
+        let descriptor = open_regular_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(descriptor.as_raw_fd())?;
+        require_private_regular(&opened)?;
+        if !same_file(&path_stat, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        Ok(File::from(descriptor))
+    }
+
     pub(crate) fn write_private_atomic_no_replace(
         &self,
         name: &str,
         bytes: &[u8],
     ) -> io::Result<()> {
+        self.write_private_atomic_no_replace_with_hook(name, bytes, || {})
+    }
+
+    pub(crate) fn write_private_atomic_no_replace_with_identity(
+        &self,
+        name: &str,
+        build: impl FnOnce(PrivateEntryIdentity) -> io::Result<Vec<u8>>,
+    ) -> io::Result<PrivateEntryIdentity> {
         self.verify_root_name()?;
         let target = CString::new(name).map_err(interior_nul_error)?;
         let temporary = random_private_name("write");
         let descriptor = create_regular_at(self.root.as_raw_fd(), &temporary)?;
+        let identity = PrivateEntryIdentity::from_stat(&stat_fd(descriptor.as_raw_fd())?);
+        let bytes = match build(identity) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
+                return Err(error);
+            }
+        };
         let mut file = File::from(descriptor);
-        file.write_all(bytes)?;
+        file.write_all(&bytes)?;
         file.sync_all()?;
         self.verify_root_name()?;
         if let Err(error) = rename_no_replace(
@@ -513,6 +640,62 @@ impl RootedDir {
         ) {
             let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
             return Err(error);
+        }
+        if let Err(validation_error) = self.verify_root_name() {
+            let recovery = self.recover_published_regular(
+                &target,
+                &temporary,
+                file.as_raw_fd(),
+                FileIdentity {
+                    device: identity.device,
+                    inode: identity.inode,
+                },
+            );
+            return match recovery {
+                Ok(()) => Err(validation_error),
+                Err(recovery_error) => Err(recovery_error),
+            };
+        }
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
+        Ok(identity)
+    }
+
+    fn write_private_atomic_no_replace_with_hook(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        after_final_validation: impl FnOnce(),
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        let target = CString::new(name).map_err(interior_nul_error)?;
+        let temporary = random_private_name("write");
+        let descriptor = create_regular_at(self.root.as_raw_fd(), &temporary)?;
+        let mut file = File::from(descriptor);
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let file_identity = FileIdentity::from_stat(&stat_fd(file.as_raw_fd())?);
+        self.verify_root_name()?;
+        after_final_validation();
+        if let Err(error) = rename_no_replace(
+            self.root.as_raw_fd(),
+            &temporary,
+            self.root.as_raw_fd(),
+            &target,
+        ) {
+            let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
+            return Err(error);
+        }
+        if let Err(validation_error) = self.verify_root_name() {
+            let recovery = self.recover_published_regular(
+                &target,
+                &temporary,
+                file.as_raw_fd(),
+                file_identity,
+            );
+            return match recovery {
+                Ok(()) => Err(validation_error),
+                Err(recovery_error) => Err(recovery_error),
+            };
         }
         cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
     }
@@ -556,6 +739,19 @@ impl RootedDir {
         if !same_file(&opened, &moved) {
             return Err(os_error(libc::ESTALE));
         }
+        if let Err(validation_error) = self.verify_root_name() {
+            let recovery = rename_no_replace(
+                self.root.as_raw_fd(),
+                &private,
+                self.root.as_raw_fd(),
+                &name,
+            )
+            .and_then(|()| cvt(unsafe { libc::fsync(self.root.as_raw_fd()) }));
+            return match recovery {
+                Ok(()) => Err(validation_error),
+                Err(recovery_error) => Err(recovery_error),
+            };
+        }
         unlink_at(self.root.as_raw_fd(), &private, 0)?;
         cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
     }
@@ -564,6 +760,15 @@ impl RootedDir {
         &mut self,
         destination_parent: &RootedDir,
         destination_name: &str,
+    ) -> io::Result<()> {
+        self.publish_owned_into_with_hook(destination_parent, destination_name, || {})
+    }
+
+    fn publish_owned_into_with_hook(
+        &mut self,
+        destination_parent: &RootedDir,
+        destination_name: &str,
+        after_final_validation: impl FnOnce(),
     ) -> io::Result<()> {
         self.verify_root_name()?;
         destination_parent.verify_root_name()?;
@@ -582,17 +787,78 @@ impl RootedDir {
         let rebound_lineage = destination_parent.child_lineage()?;
         self.verify_root_name()?;
         destination_parent.verify_root_name()?;
+        after_final_validation();
         rename_no_replace(
             self.parent.as_raw_fd(),
             &self.root_name,
             destination_parent.root.as_raw_fd(),
             &destination_name,
         )?;
+        let published = stat_at(destination_parent.root.as_raw_fd(), &destination_name);
+        let validation = published.and_then(|published| {
+            let opened = stat_fd(self.root.as_raw_fd())?;
+            if file_type(published.st_mode) != libc::S_IFDIR
+                || FileIdentity::from_stat(&published) != self.root_identity
+                || !same_file(&published, &opened)
+            {
+                return Err(os_error(libc::ESTALE));
+            }
+            verify_lineage(&self.lineage)?;
+            destination_parent.verify_root_name()
+        });
+        if let Err(validation_error) = validation {
+            let recovery = rename_no_replace(
+                destination_parent.root.as_raw_fd(),
+                &destination_name,
+                self.parent.as_raw_fd(),
+                &self.root_name,
+            )
+            .and_then(|()| {
+                cvt(unsafe { libc::fsync(destination_parent.root.as_raw_fd()) })?;
+                cvt(unsafe { libc::fsync(self.parent.as_raw_fd()) })
+            });
+            return match recovery {
+                Ok(()) => Err(validation_error),
+                Err(recovery_error) => Err(recovery_error),
+            };
+        }
+        cvt(unsafe { libc::fsync(self.parent.as_raw_fd()) })?;
+        cvt(unsafe { libc::fsync(destination_parent.root.as_raw_fd()) })?;
         self.parent = rebound_parent;
         self.root_name = destination_name;
         self.lineage = rebound_lineage;
         self.security_device = destination_parent.security_device;
         Ok(())
+    }
+
+    fn recover_published_regular(
+        &self,
+        target: &CStr,
+        temporary: &CStr,
+        file: RawFd,
+        expected: FileIdentity,
+    ) -> io::Result<()> {
+        let published = stat_at(self.root.as_raw_fd(), target)?;
+        let opened = stat_fd(file)?;
+        if file_type(published.st_mode) != libc::S_IFREG
+            || FileIdentity::from_stat(&published) != expected
+            || FileIdentity::from_stat(&opened) != expected
+            || !same_file(&published, &opened)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        rename_no_replace(
+            self.root.as_raw_fd(),
+            target,
+            self.root.as_raw_fd(),
+            temporary,
+        )?;
+        let recovered = stat_at(self.root.as_raw_fd(), temporary)?;
+        if FileIdentity::from_stat(&recovered) != expected || !same_file(&recovered, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        unlink_at(self.root.as_raw_fd(), temporary, 0)?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
     }
 
     pub(crate) fn validate_and_sync_declared_tree(
@@ -833,6 +1099,8 @@ impl RootedDir {
             };
         }
         after_private_rename();
+        cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })?;
+        cvt(unsafe { libc::fsync(self.parent.as_raw_fd()) })?;
         let moved = stat_at(namespace.directory.as_raw_fd(), &private_name);
         let validation = moved.and_then(|moved| {
             let opened = stat_fd(self.root.as_raw_fd())?;
@@ -842,6 +1110,7 @@ impl RootedDir {
             {
                 return Err(os_error(libc::ESTALE));
             }
+            verify_lineage(&self.lineage)?;
             Ok(())
         });
         let validation = validation.and_then(|()| injected_cleanup_validation_result());
@@ -852,11 +1121,20 @@ impl RootedDir {
                 self.parent.as_raw_fd(),
                 &self.root_name,
             );
+            let durability = if rename_restoration.is_ok() {
+                cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })
+                    .and_then(|()| cvt(unsafe { libc::fsync(self.parent.as_raw_fd()) }))
+            } else {
+                Ok(())
+            };
             let mode_restoration = chmod_fd(self.root.as_raw_fd(), original_mode);
             return match rename_restoration {
-                Ok(()) => match mode_restoration {
-                    Ok(()) => Err(validation_error),
-                    Err(restoration_error) => Err(restoration_error),
+                Ok(()) => match durability {
+                    Ok(()) => match mode_restoration {
+                        Ok(()) => Err(validation_error),
+                        Err(restoration_error) => Err(restoration_error),
+                    },
+                    Err(durability_error) => Err(durability_error),
                 },
                 // The private entry failed identity validation and could not
                 // be restored. It remains untouched in the private namespace.
@@ -874,7 +1152,7 @@ impl RootedDir {
             &private_name,
             libc::AT_REMOVEDIR,
         )?;
-        Ok(())
+        cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })
     }
 
     fn open_parent(
@@ -3529,5 +3807,139 @@ mod tests {
 
         assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
         assert!(!root_path.join("leases").exists());
+    }
+
+    #[test]
+    fn atomic_json_publication_rolls_back_when_a_grandparent_moves_at_commit() {
+        let fixture = tempfile::tempdir().unwrap();
+        let host_path = fixture.path().join("host");
+        fs::create_dir(&host_path).unwrap();
+        fs::set_permissions(&host_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut host = RootedDir::open(&host_path).unwrap();
+        let device = host.root_metadata().unwrap().st_dev as u64;
+        host.bind_host_device(device).unwrap();
+        let index = host
+            .open_child_directory_on_device(
+                &RelativePath::parse(b"outer/job-index").unwrap(),
+                true,
+                device,
+            )
+            .unwrap();
+        let detached = fixture.path().join("detached-outer");
+        let replacement = host_path.join("outer/job-index");
+
+        let error = index
+            .write_private_atomic_no_replace_with_hook("job.json", b"{}", || {
+                fs::rename(host_path.join("outer"), &detached).unwrap();
+                fs::create_dir_all(&replacement).unwrap();
+                fs::set_permissions(host_path.join("outer"), fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(replacement.join("sentinel"), b"keep").unwrap();
+            })
+            .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(fs::read(replacement.join("sentinel")).unwrap(), b"keep");
+        assert!(!replacement.join("job.json").exists());
+        assert_eq!(fs::read_dir(detached.join("job-index")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn directory_publication_rolls_back_when_a_grandparent_moves_at_commit() {
+        let fixture = tempfile::tempdir().unwrap();
+        let host_path = fixture.path().join("host");
+        fs::create_dir(&host_path).unwrap();
+        fs::set_permissions(&host_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut host = RootedDir::open(&host_path).unwrap();
+        let device = host.root_metadata().unwrap().st_dev as u64;
+        host.bind_host_device(device).unwrap();
+        let incoming = host
+            .open_child_directory_on_device(
+                &RelativePath::parse(b"incoming").unwrap(),
+                true,
+                device,
+            )
+            .unwrap();
+        let mut stage = incoming.create_new_child_directory("stage").unwrap();
+        stage.write_new_private_file("payload", b"owned").unwrap();
+        let destination = host
+            .open_child_directory_on_device(
+                &RelativePath::parse(b"jobs/project/worktree").unwrap(),
+                true,
+                device,
+            )
+            .unwrap();
+        let detached = fixture.path().join("detached-project");
+        let replacement = host_path.join("jobs/project/worktree");
+
+        let error = stage
+            .publish_owned_into_with_hook(&destination, "job", || {
+                fs::rename(host_path.join("jobs/project"), &detached).unwrap();
+                fs::create_dir_all(&replacement).unwrap();
+                fs::set_permissions(
+                    host_path.join("jobs/project"),
+                    fs::Permissions::from_mode(0o700),
+                )
+                .unwrap();
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(replacement.join("sentinel"), b"keep").unwrap();
+            })
+            .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(fs::read(replacement.join("sentinel")).unwrap(), b"keep");
+        assert!(!replacement.join("job").exists());
+        assert!(!detached.join("worktree/job").exists());
+        assert_eq!(
+            fs::read(host_path.join("incoming/stage/payload")).unwrap(),
+            b"owned"
+        );
+    }
+
+    #[test]
+    fn destructive_cleanup_rolls_back_when_a_grandparent_moves_at_commit() {
+        let fixture = tempfile::tempdir().unwrap();
+        let host_path = fixture.path().join("host");
+        fs::create_dir(&host_path).unwrap();
+        fs::set_permissions(&host_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut host = RootedDir::open(&host_path).unwrap();
+        let device = host.root_metadata().unwrap().st_dev as u64;
+        host.bind_host_device(device).unwrap();
+        let job = host
+            .open_child_directory_on_device(
+                &RelativePath::parse(b"jobs/project/worktree/job").unwrap(),
+                true,
+                device,
+            )
+            .unwrap();
+        job.write_new_private_file("payload", b"owned").unwrap();
+        let detached = fixture.path().join("detached-project");
+        let replacement = host_path.join("jobs/project/worktree");
+
+        let error = job
+            .remove_owned_tree_with_hooks(
+                || {
+                    fs::rename(host_path.join("jobs/project"), &detached).unwrap();
+                    fs::create_dir_all(&replacement).unwrap();
+                    fs::set_permissions(
+                        host_path.join("jobs/project"),
+                        fs::Permissions::from_mode(0o700),
+                    )
+                    .unwrap();
+                    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+                    fs::write(replacement.join("sentinel"), b"keep").unwrap();
+                },
+                || {},
+                || {},
+            )
+            .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(fs::read(replacement.join("sentinel")).unwrap(), b"keep");
+        assert_eq!(
+            fs::read(detached.join("worktree/job/payload")).unwrap(),
+            b"owned"
+        );
     }
 }
