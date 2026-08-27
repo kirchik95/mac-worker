@@ -1,13 +1,14 @@
 use std::{
+    collections::BTreeSet,
     ffi::{CStr, CString},
     fs::File,
-    io::{self, Read},
+    io::{self, Read, Write},
     mem::MaybeUninit,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::ffi::OsStrExt,
     },
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 use crate::inputs::RelativePath;
@@ -243,7 +244,7 @@ impl RootedDir {
 
     pub fn create(path: &Path) -> io::Result<Self> {
         let (parent_path, root_name) = split_root_path(path)?;
-        let parent = open_directory_path(parent_path)?;
+        let parent = open_or_create_directory_path(parent_path)?;
         mkdir_at(parent.as_raw_fd(), &root_name, 0o700)?;
         let root = match open_directory_at(parent.as_raw_fd(), &root_name) {
             Ok(root) => root,
@@ -259,6 +260,276 @@ impl RootedDir {
             root_name,
             root_identity,
         })
+    }
+
+    pub(crate) fn verify_bound(&self) -> io::Result<()> {
+        self.verify_root_name()
+    }
+
+    pub(crate) fn root_metadata(&self) -> io::Result<libc::stat> {
+        self.verify_root_name()?;
+        stat_fd(self.root.as_raw_fd())
+    }
+
+    pub(crate) fn open_child_directory(
+        &self,
+        path: &RelativePath,
+        create: bool,
+    ) -> io::Result<Self> {
+        self.verify_root_name()?;
+        require_private_directory(&stat_fd(self.root.as_raw_fd())?)?;
+        let (parent, name) = self.open_private_parent(path, create)?;
+        if create {
+            match mkdir_at(parent.as_raw_fd(), &name, 0o700) {
+                Ok(()) => cvt(unsafe { libc::fsync(parent.as_raw_fd()) })?,
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let path_stat = stat_at(parent.as_raw_fd(), &name)?;
+        let root = open_directory_at(parent.as_raw_fd(), &name)?;
+        let opened = stat_fd(root.as_raw_fd())?;
+        require_private_directory(&path_stat)?;
+        require_private_directory(&opened)?;
+        if !same_file(&path_stat, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        Ok(Self {
+            root,
+            parent,
+            root_name: name,
+            root_identity: FileIdentity::from_stat(&opened),
+        })
+    }
+
+    pub(crate) fn create_new_child_directory(&self, name: &str) -> io::Result<Self> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        mkdir_at(self.root.as_raw_fd(), &name, 0o700)?;
+        let root = open_directory_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(root.as_raw_fd())?;
+        require_private_directory(&opened)?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
+        Ok(Self {
+            root,
+            parent: duplicate_fd(self.root.as_raw_fd())?,
+            root_name: name,
+            root_identity: FileIdentity::from_stat(&opened),
+        })
+    }
+
+    pub(crate) fn list_names(&self) -> io::Result<Vec<Vec<u8>>> {
+        self.verify_root_name()?;
+        directory_entries(self.root.as_raw_fd()).map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| entry.into_bytes())
+                .collect()
+        })
+    }
+
+    pub(crate) fn validate_private_entry(&self, name: &str) -> io::Result<()> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let metadata = stat_at(self.root.as_raw_fd(), &name)?;
+        if metadata.st_uid != unsafe { libc::geteuid() } || metadata.st_mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "host entry is not owner-only",
+            ));
+        }
+        match file_type(metadata.st_mode) {
+            libc::S_IFDIR | libc::S_IFREG => Ok(()),
+            _ => Err(invalid_type_error()),
+        }
+    }
+
+    pub(crate) fn entry_exists(&self, name: &str) -> io::Result<bool> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        match stat_at(self.root.as_raw_fd(), &name) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn open_private_lock(&self, name: &str) -> io::Result<File> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let initial = match stat_at(self.root.as_raw_fd(), &name) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let descriptor = if initial.is_some() {
+            open_regular_rw_at(self.root.as_raw_fd(), &name)?
+        } else {
+            let flags = libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK;
+            let raw = unsafe { libc::openat(self.root.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+            match owned_fd(raw) {
+                Ok(descriptor) => descriptor,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    return self.open_private_lock(name.to_str().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "lock name is not UTF-8")
+                    })?);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let metadata = stat_fd(descriptor.as_raw_fd())?;
+        require_private_regular(&metadata)?;
+        if initial.is_some_and(|initial| !same_file(&initial, &metadata)) {
+            return Err(os_error(libc::ESTALE));
+        }
+        Ok(File::from(descriptor))
+    }
+
+    pub(crate) fn read_private_regular(&self, name: &str, maximum: u64) -> io::Result<Vec<u8>> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let path_stat = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular(&path_stat)?;
+        let descriptor = open_regular_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(descriptor.as_raw_fd())?;
+        require_private_regular(&opened)?;
+        if !same_file(&path_stat, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        if opened.st_size < 0 || opened.st_size as u64 > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "host file exceeds limit",
+            ));
+        }
+        let mut bytes = Vec::new();
+        File::from(descriptor)
+            .take(maximum.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "host file exceeds limit",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn write_private_atomic_no_replace(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        let target = CString::new(name).map_err(interior_nul_error)?;
+        let temporary = random_private_name("write");
+        let descriptor = create_regular_at(self.root.as_raw_fd(), &temporary)?;
+        let mut file = File::from(descriptor);
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        if let Err(error) = rename_no_replace(
+            self.root.as_raw_fd(),
+            &temporary,
+            self.root.as_raw_fd(),
+            &target,
+        ) {
+            let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
+            return Err(error);
+        }
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
+    pub(crate) fn write_new_private_file(&self, name: &str, bytes: &[u8]) -> io::Result<File> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let descriptor = create_regular_at(self.root.as_raw_fd(), &name)?;
+        let mut file = File::from(descriptor);
+        file.write_all(bytes)?;
+        Ok(file)
+    }
+
+    pub(crate) fn remove_owned_child(&self, name: &str) -> io::Result<()> {
+        let relative = RelativePath::parse(name.as_bytes())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        self.open_child_directory(&relative, false)?
+            .remove_owned_tree()?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
+    pub(crate) fn remove_owned_regular(&self, name: &str) -> io::Result<()> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let before = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular(&before)?;
+        let file = open_regular_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(file.as_raw_fd())?;
+        if !same_file(&before, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        let private = random_private_name("remove");
+        rename_no_replace(
+            self.root.as_raw_fd(),
+            &name,
+            self.root.as_raw_fd(),
+            &private,
+        )?;
+        let moved = stat_at(self.root.as_raw_fd(), &private)?;
+        if !same_file(&opened, &moved) {
+            return Err(os_error(libc::ESTALE));
+        }
+        unlink_at(self.root.as_raw_fd(), &private, 0)?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
+    pub(crate) fn publish_owned_into(
+        &mut self,
+        destination_parent: &RootedDir,
+        destination_name: &str,
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        destination_parent.verify_root_name()?;
+        let destination_name = CString::new(destination_name).map_err(interior_nul_error)?;
+        if stat_fd(destination_parent.root.as_raw_fd())?.st_dev
+            != self.root_identity.device as libc::dev_t
+        {
+            return Err(os_error(libc::EXDEV));
+        }
+        rename_no_replace(
+            self.parent.as_raw_fd(),
+            &self.root_name,
+            destination_parent.root.as_raw_fd(),
+            &destination_name,
+        )?;
+        self.parent = duplicate_fd(destination_parent.root.as_raw_fd())?;
+        self.root_name = destination_name;
+        Ok(())
+    }
+
+    pub(crate) fn validate_and_sync_declared_tree(
+        &self,
+        declared: &BTreeSet<RelativePath>,
+    ) -> io::Result<()> {
+        if declared.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty staged tree",
+            ));
+        }
+        self.verify_root_name()?;
+        let mut actual = BTreeSet::new();
+        collect_and_sync_tree(self.root.as_raw_fd(), "", &mut actual)?;
+        if &actual != declared {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged tree does not match its declaration",
+            ));
+        }
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
     }
 
     pub fn inspect(&self, path: &RelativePath) -> io::Result<EntryInspection> {
@@ -548,6 +819,41 @@ impl RootedDir {
         Ok((parent, name.clone()))
     }
 
+    fn open_private_parent(
+        &self,
+        path: &RelativePath,
+        create_missing: bool,
+    ) -> io::Result<(OwnedFd, CString)> {
+        let components = path
+            .as_str()
+            .split('/')
+            .map(|component| CString::new(component).map_err(interior_nul_error))
+            .collect::<io::Result<Vec<_>>>()?;
+        let (name, parents) = components
+            .split_last()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty relative path"))?;
+        let mut parent = duplicate_fd(self.root.as_raw_fd())?;
+        for component in parents {
+            if create_missing {
+                match mkdir_at(parent.as_raw_fd(), component, 0o700) {
+                    Ok(()) => cvt(unsafe { libc::fsync(parent.as_raw_fd()) })?,
+                    Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let path_stat = stat_at(parent.as_raw_fd(), component)?;
+            require_private_directory(&path_stat)?;
+            let child = open_directory_at(parent.as_raw_fd(), component)?;
+            let opened = stat_fd(child.as_raw_fd())?;
+            require_private_directory(&opened)?;
+            if !same_file(&path_stat, &opened) {
+                return Err(os_error(libc::ESTALE));
+            }
+            parent = child;
+        }
+        Ok((parent, name.clone()))
+    }
+
     fn verify_root_name(&self) -> io::Result<()> {
         let current = stat_at(self.parent.as_raw_fd(), &self.root_name)?;
         if file_type(current.st_mode) == libc::S_IFLNK {
@@ -591,6 +897,21 @@ fn split_root_path(path: &Path) -> io::Result<(&Path, CString)> {
 }
 
 fn open_directory_path(path: &Path) -> io::Result<OwnedFd> {
+    // macOS exposes these two immutable system aliases as symlinks. Resolve
+    // only the fixed alias lexically; every caller-controlled descendant is
+    // still walked one component at a time with O_NOFOLLOW.
+    #[cfg(target_vendor = "apple")]
+    let normalized;
+    #[cfg(target_vendor = "apple")]
+    let path = if let Ok(suffix) = path.strip_prefix("/var") {
+        normalized = PathBuf::from("/private/var").join(suffix);
+        normalized.as_path()
+    } else if let Ok(suffix) = path.strip_prefix("/tmp") {
+        normalized = PathBuf::from("/private/tmp").join(suffix);
+        normalized.as_path()
+    } else {
+        path
+    };
     let start = if path.is_absolute() { c"/" } else { c"." };
     // SAFETY: `start` is a static NUL-terminated path. This acquires only the
     // trusted filesystem root or current-directory base and retains no pointer.
@@ -601,6 +922,45 @@ fn open_directory_path(path: &Path) -> io::Result<OwnedFd> {
             Component::RootDir | Component::CurDir => {}
             Component::Normal(component) => {
                 let component = CString::new(component.as_bytes()).map_err(interior_nul_error)?;
+                current = open_directory_at(current.as_raw_fd(), &component)?;
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "physical root path contains unsupported traversal",
+                ));
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn open_or_create_directory_path(path: &Path) -> io::Result<OwnedFd> {
+    #[cfg(target_vendor = "apple")]
+    let normalized;
+    #[cfg(target_vendor = "apple")]
+    let path = if let Ok(suffix) = path.strip_prefix("/var") {
+        normalized = PathBuf::from("/private/var").join(suffix);
+        normalized.as_path()
+    } else if let Ok(suffix) = path.strip_prefix("/tmp") {
+        normalized = PathBuf::from("/private/tmp").join(suffix);
+        normalized.as_path()
+    } else {
+        path
+    };
+    let start = if path.is_absolute() { c"/" } else { c"." };
+    let descriptor = unsafe { libc::open(start.as_ptr(), DIRECTORY_OPEN_FLAGS) };
+    let mut current = owned_fd(descriptor)?;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(component) => {
+                let component = CString::new(component.as_bytes()).map_err(interior_nul_error)?;
+                match mkdir_at(current.as_raw_fd(), &component, 0o700) {
+                    Ok(()) => cvt(unsafe { libc::fsync(current.as_raw_fd()) })?,
+                    Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
+                    Err(error) => return Err(error),
+                }
                 current = open_directory_at(current.as_raw_fd(), &component)?;
             }
             Component::ParentDir | Component::Prefix(_) => {
@@ -640,6 +1000,12 @@ fn normalize_directory_symlink_error(
 fn open_regular_at(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
     // SAFETY: `name` and `parent` remain live for this non-retaining call.
     let descriptor = unsafe { libc::openat(parent, name.as_ptr(), REGULAR_OPEN_FLAGS) };
+    owned_fd(descriptor)
+}
+
+fn open_regular_rw_at(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
+    let flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let descriptor = unsafe { libc::openat(parent, name.as_ptr(), flags) };
     owned_fd(descriptor)
 }
 
@@ -743,6 +1109,74 @@ fn stat_fd(descriptor: RawFd) -> io::Result<libc::stat> {
         // SAFETY: the successful fstat call initialized every stat field.
         Ok(unsafe { metadata.assume_init() })
     }
+}
+
+fn require_private_regular(metadata: &libc::stat) -> io::Result<()> {
+    if file_type(metadata.st_mode) != libc::S_IFREG
+        || metadata.st_uid != unsafe { libc::geteuid() }
+        || metadata.st_mode & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "host file is not an owner-only regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn require_private_directory(metadata: &libc::stat) -> io::Result<()> {
+    if file_type(metadata.st_mode) != libc::S_IFDIR
+        || metadata.st_uid != unsafe { libc::geteuid() }
+        || metadata.st_mode & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "host directory is not owner-only",
+        ));
+    }
+    Ok(())
+}
+
+fn collect_and_sync_tree(
+    directory: RawFd,
+    prefix: &str,
+    actual: &mut BTreeSet<RelativePath>,
+) -> io::Result<()> {
+    for name in directory_entries(directory)? {
+        let name_text = std::str::from_utf8(name.to_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "staged entry name is not UTF-8")
+        })?;
+        let path = if prefix.is_empty() {
+            name_text.to_owned()
+        } else {
+            format!("{prefix}/{name_text}")
+        };
+        let relative = RelativePath::parse(path.as_bytes())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let metadata = stat_at(directory, &name)?;
+        match file_type(metadata.st_mode) {
+            libc::S_IFDIR => {
+                let child = open_verified_child_directory(directory, &name, &metadata)?;
+                actual.insert(relative);
+                collect_and_sync_tree(child.as_raw_fd(), &path, actual)?;
+                cvt(unsafe { libc::fsync(child.as_raw_fd()) })?;
+            }
+            libc::S_IFREG => {
+                let file = open_regular_at(directory, &name)?;
+                let opened = stat_fd(file.as_raw_fd())?;
+                if !same_file(&metadata, &opened) {
+                    return Err(os_error(libc::ESTALE));
+                }
+                cvt(unsafe { libc::fsync(file.as_raw_fd()) })?;
+                actual.insert(relative);
+            }
+            libc::S_IFLNK => {
+                actual.insert(relative);
+            }
+            _ => return Err(invalid_type_error()),
+        }
+    }
+    Ok(())
 }
 
 fn read_link_at(parent: RawFd, name: &CStr, reported_size: libc::off_t) -> io::Result<Vec<u8>> {

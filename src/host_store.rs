@@ -1,15 +1,8 @@
 use std::{
-    ffi::CString,
+    collections::BTreeSet,
     fmt,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    os::{
-        fd::AsRawFd,
-        unix::{
-            ffi::OsStrExt,
-            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-        },
-    },
+    fs::File,
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -22,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::WorkerError,
+    inputs::RelativePath,
     job::{
         ClientId, JobId, JobStatus, LeaseAcquireRequest, LeaseRecord, LeaseToken,
         RequestFingerprint,
@@ -57,7 +51,8 @@ pub struct HostStore {
 }
 
 struct HostStoreInner {
-    root: PathBuf,
+    display_root: PathBuf,
+    root: RootedDir,
     fault: AtomicU8,
 }
 
@@ -120,7 +115,8 @@ impl Drop for AdmissionGuard {
 
 pub struct StagedJob {
     root: RootedDir,
-    final_path: PathBuf,
+    final_parent: RootedDir,
+    final_name: String,
     job_id: JobId,
     receipt_nonce: [u8; 16],
 }
@@ -130,19 +126,18 @@ pub struct WorkspaceReceipt {
     nonce: [u8; 16],
 }
 
-#[derive(Clone)]
 pub struct CleanupReceipt {
+    store: HostStore,
     job_id: JobId,
     client_id: ClientId,
     lease_token: LeaseToken,
-    marker: PathBuf,
     proof: CleanupProof,
 }
 
 #[derive(Debug, Clone)]
 enum CleanupProof {
-    Terminal(PathBuf),
-    Abandoned(PathBuf),
+    Terminal,
+    Abandoned,
 }
 
 impl fmt::Debug for StagedJob {
@@ -173,7 +168,7 @@ impl fmt::Debug for CleanupReceipt {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct CleanupMarker {
     job_id: JobId,
@@ -201,42 +196,41 @@ impl HostStore {
                 "host data root must be absolute".into(),
             ));
         }
-        let root_existed = match fs::symlink_metadata(root) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        let rooted = match RootedDir::open(root) {
+            Ok(rooted) => rooted,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => RootedDir::create(root)?,
             Err(error) => return Err(error.into()),
         };
-        if !root_existed {
-            create_private_tree(root)?;
-        }
-        if let Some(parent) = root.parent() {
-            reject_symlink_or_wrong_type(parent, true)?;
-        }
-        reject_symlink_or_wrong_type(root, true)?;
-        if root_existed {
-            require_private_mode(root)?;
-        } else {
-            fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
-        }
+        require_private_directory_metadata(&rooted.root_metadata()?)?;
         for name in OWNED_DIRECTORIES {
-            let path = root.join(name);
-            create_owned_directory(&path)?;
+            let child = rooted.open_child_directory(&relative(name)?, true)?;
+            require_private_directory_metadata(&child.root_metadata()?)?;
         }
-        create_owned_directory(&root.join("locks/jobs"))?;
-        validate_owned_entries(root)?;
-        sync_directory(root)?;
-        Ok(Self {
+        let locks = rooted.open_child_directory(&relative("locks")?, false)?;
+        let jobs = locks.open_child_directory(&relative("jobs")?, true)?;
+        require_private_directory_metadata(&jobs.root_metadata()?)?;
+        for bytes in rooted.list_names()? {
+            let name = std::str::from_utf8(&bytes).map_err(|_| {
+                WorkerError::Protocol("host data root contains a non-UTF-8 entry".into())
+            })?;
+            if !OWNED_DIRECTORIES.contains(&name) {
+                rooted.validate_private_entry(name)?;
+            }
+        }
+        let store = Self {
             inner: Arc::new(HostStoreInner {
-                root: root.to_path_buf(),
+                display_root: root.to_path_buf(),
+                root: rooted,
                 fault: AtomicU8::new(point.map_or(0, |point| point as u8)),
             }),
-        })
+        };
+        store.validate_layout()?;
+        Ok(store)
     }
 
     pub(crate) fn admission_lock(&self, job: JobId) -> Result<AdmissionGuard, WorkerError> {
-        let directory = self.inner.root.join("locks/jobs").join(job.to_string());
-        create_owned_directory(&directory)?;
-        let file = open_private_regular(&directory.join("admission.lock"), true)?;
+        let directory = self.open_directory(&format!("locks/jobs/{job}"), true)?;
+        let file = directory.open_private_lock("admission.lock")?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if result != 0 {
             return Err(WorkerError::Io(std::io::Error::last_os_error()));
@@ -245,7 +239,8 @@ impl HostStore {
     }
 
     pub(crate) fn capacity_lock(&self) -> Result<AdmissionGuard, WorkerError> {
-        let file = open_private_regular(&self.inner.root.join("leases/capacity.lock"), true)?;
+        let leases = self.open_directory("leases", false)?;
+        let file = leases.open_private_lock("capacity.lock")?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if result != 0 {
             return Err(WorkerError::Io(std::io::Error::last_os_error()));
@@ -257,7 +252,7 @@ impl HostStore {
         self.validate_layout()?;
         Ok(self
             .inner
-            .root
+            .display_root
             .join("incoming")
             .join(job.to_string())
             .join(token.to_string()))
@@ -265,7 +260,11 @@ impl HostStore {
 
     pub fn verified_receipt(&self, job: JobId) -> Result<PathBuf, WorkerError> {
         self.validate_layout()?;
-        Ok(self.inner.root.join("verified").join(format!("{job}.json")))
+        Ok(self
+            .inner
+            .display_root
+            .join("verified")
+            .join(format!("{job}.json")))
     }
 
     pub fn job(&self, project: &str, worktree: &str, job: JobId) -> Result<PathBuf, WorkerError> {
@@ -274,7 +273,7 @@ impl HostStore {
         validate_digest(worktree, "worktree ID")?;
         Ok(self
             .inner
-            .root
+            .display_root
             .join("jobs")
             .join(project)
             .join(worktree)
@@ -293,7 +292,7 @@ impl HostStore {
         validate_digest(digest, "snapshot digest")?;
         Ok(self
             .inner
-            .root
+            .display_root
             .join("snapshots")
             .join(project)
             .join(worktree)
@@ -304,7 +303,7 @@ impl HostStore {
         self.validate_layout()?;
         Ok(self
             .inner
-            .root
+            .display_root
             .join("job-index")
             .join(format!("{job}.json")))
     }
@@ -315,23 +314,17 @@ impl HostStore {
         worktree: &str,
         job: JobId,
     ) -> Result<StagedJob, WorkerError> {
-        let final_path = self.job(project, worktree, job)?;
+        self.validate_layout()?;
+        validate_digest(project, "project ID")?;
+        validate_digest(worktree, "worktree ID")?;
         let nonce = *uuid::Uuid::new_v4().as_bytes();
-        let staging_parent = fs::canonicalize(self.inner.root.join("leases"))?;
-        let root =
-            RootedDir::create(&staging_parent.join(format!(".job-{job}-{}", hex_16(nonce))))?;
-        if let Some(parent) = final_path.parent() {
-            create_owned_directory(parent)?;
-        }
-        let final_parent = fs::canonicalize(
-            final_path
-                .parent()
-                .expect("validated final job path has a parent"),
-        )?;
-        let final_path = final_parent.join(job.to_string());
+        let leases = self.open_directory("leases", false)?;
+        let root = leases.create_new_child_directory(&format!(".job-{job}-{}", hex_16(nonce)))?;
+        let final_parent = self.open_directory(&format!("jobs/{project}/{worktree}"), true)?;
         Ok(StagedJob {
             root,
-            final_path,
+            final_parent,
+            final_name: job.to_string(),
             job_id: job,
             receipt_nonce: nonce,
         })
@@ -380,9 +373,17 @@ impl HostStore {
     }
 
     pub(crate) fn disposition(&self, job: JobId) -> Result<Option<JobDisposition>, WorkerError> {
-        let disposition: Option<JobDisposition> = read_json_optional(&self.job_index(job)?)?;
+        let index = self.open_directory("job-index", false)?;
+        let disposition: Option<JobDisposition> =
+            read_json_optional_at(&index, &format!("{job}.json"))?;
         if let Some(disposition) = &disposition {
             disposition.validate()?;
+            if disposition_job_id(disposition) != job {
+                return Err(protocol_code(
+                    "JOB_ID_CONFLICT",
+                    "disposition job ID does not match its canonical filename",
+                ));
+            }
         }
         Ok(disposition)
     }
@@ -394,10 +395,17 @@ impl HostStore {
                 *job_id
             }
         };
-        let target = self.job_index(job)?;
-        if target.exists() {
-            let existing: JobDisposition = read_json_strict(&target)?;
+        let index = self.open_directory("job-index", false)?;
+        let name = format!("{job}.json");
+        if index.entry_exists(&name)? {
+            let existing: JobDisposition = read_json_strict_at(&index, &name)?;
             existing.validate()?;
+            if disposition_job_id(&existing) != job {
+                return Err(protocol_code(
+                    "JOB_ID_CONFLICT",
+                    "disposition job ID does not match its canonical filename",
+                ));
+            }
             if same_disposition_identity(&existing, disposition) {
                 return Ok(());
             }
@@ -406,11 +414,11 @@ impl HostStore {
                 "job ID already has a permanent disposition",
             ));
         }
-        atomic_write_new(&target, disposition)
+        atomic_write_at(&index, &name, disposition)
     }
 
-    #[doc(hidden)]
-    pub fn record_terminal_status(
+    #[allow(dead_code)] // Task 7 lifecycle consumes this internal proof writer.
+    pub(crate) fn record_terminal_status(
         &self,
         lease: &LeaseRecord,
         status: &JobStatus,
@@ -422,29 +430,48 @@ impl HostStore {
                 "terminal status proof is required".into(),
             ));
         }
-        let job_dir = self.job(lease.project_id(), lease.worktree_id(), lease.job_id())?;
-        create_owned_directory(&job_dir)?;
-        atomic_write_replace(&job_dir.join("status.json"), status)
+        let job_dir = self.open_directory(
+            &format!(
+                "jobs/{}/{}/{}",
+                lease.project_id(),
+                lease.worktree_id(),
+                lease.job_id()
+            ),
+            false,
+        )?;
+        write_json_once(&job_dir, "status.json", status, "terminal status")
     }
 
-    #[doc(hidden)]
-    pub fn record_cleanup_complete(
+    #[allow(dead_code)] // Task 7 lifecycle consumes the only cleanup-receipt minting path.
+    pub(crate) fn cleanup_job_owned(
         &self,
         lease: &LeaseRecord,
     ) -> Result<CleanupReceipt, WorkerError> {
         lease.validate()?;
-        let job_dir = self.job(lease.project_id(), lease.worktree_id(), lease.job_id())?;
-        create_owned_directory(&job_dir)?;
-        let status_path = job_dir.join("status.json");
-        let proof = match read_json_optional::<JobStatus>(&status_path)? {
-            Some(status) if status.state().is_terminal() => CleanupProof::Terminal(status_path),
+        let _admission = self.admission_lock(lease.job_id())?;
+        let _capacity = self.capacity_lock()?;
+        let final_relative = format!(
+            "jobs/{}/{}/{}",
+            lease.project_id(),
+            lease.worktree_id(),
+            lease.job_id()
+        );
+        let terminal = match self.open_directory(&final_relative, false) {
+            Ok(job_dir) => match read_json_optional_at::<JobStatus>(&job_dir, "status.json")? {
+                Some(status) if status.state().is_terminal() => Some(job_dir),
+                _ => None,
+            },
+            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let proof = match terminal {
+            Some(_) => CleanupProof::Terminal,
             _ => {
-                let disposition_path = self.job_index(lease.job_id())?;
                 let expected_hash = format!(
                     "{:x}",
                     Sha256::digest(lease.lease_token().to_string().as_bytes())
                 );
-                match read_json_optional::<JobDisposition>(&disposition_path)? {
+                match self.disposition(lease.job_id())? {
                     Some(JobDisposition::Abandoned {
                         job_id,
                         client_id,
@@ -456,7 +483,7 @@ impl HostStore {
                         && request_fingerprint == *lease.request_fingerprint()
                         && lease_token_sha256 == expected_hash =>
                     {
-                        CleanupProof::Abandoned(disposition_path)
+                        CleanupProof::Abandoned
                     }
                     _ => {
                         return Err(WorkerError::Protocol(
@@ -466,21 +493,25 @@ impl HostStore {
                 }
             }
         };
-        let marker = job_dir.join("cleanup-complete.json");
-        atomic_write_replace(
-            &marker,
+        self.remove_job_mutable_scopes(lease)?;
+        self.verify_job_mutable_scopes_absent(lease)?;
+        let proof_dir = self.open_directory(&format!("locks/jobs/{}", lease.job_id()), true)?;
+        write_json_once(
+            &proof_dir,
+            "cleanup-complete.json",
             &CleanupMarker {
                 job_id: lease.job_id(),
                 client_id: lease.client_id(),
                 request_fingerprint: lease.request_fingerprint().clone(),
                 terminal_or_abandoned: true,
             },
+            "cleanup marker",
         )?;
         Ok(CleanupReceipt {
+            store: self.clone(),
             job_id: lease.job_id(),
             client_id: lease.client_id(),
             lease_token: lease.lease_token(),
-            marker,
             proof,
         })
     }
@@ -492,21 +523,123 @@ impl HostStore {
             .is_ok()
     }
 
-    pub(crate) fn lease_operation_path(&self, job: JobId) -> PathBuf {
-        self.inner
-            .root
-            .join("leases")
-            .join(format!(".acquire-{job}"))
-    }
-
-    pub(crate) fn live_lease_path(&self) -> PathBuf {
-        self.inner.root.join("leases/heavy")
-    }
-
     pub(crate) fn validate_layout(&self) -> Result<(), WorkerError> {
-        reject_symlink_or_wrong_type(&self.inner.root, true)?;
-        require_private_mode(&self.inner.root)?;
-        validate_owned_entries(&self.inner.root)
+        self.inner.root.verify_bound()?;
+        require_private_directory_metadata(&self.inner.root.root_metadata()?)?;
+        for name in OWNED_DIRECTORIES {
+            let child = self.open_directory(name, false)?;
+            require_private_directory_metadata(&child.root_metadata()?)?;
+        }
+        let jobs = self.open_directory("locks/jobs", false)?;
+        require_private_directory_metadata(&jobs.root_metadata()?)
+    }
+
+    pub(crate) fn open_directory(
+        &self,
+        path: &str,
+        create: bool,
+    ) -> Result<RootedDir, WorkerError> {
+        let path = relative(path)?;
+        let directory = self.inner.root.open_child_directory(&path, create)?;
+        require_private_directory_metadata(&directory.root_metadata()?)?;
+        Ok(directory)
+    }
+
+    fn remove_job_mutable_scopes(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
+        if let Some(incoming) =
+            self.open_optional_directory(&format!("incoming/{}", lease.job_id()))?
+        {
+            let token = lease.lease_token().to_string();
+            if incoming.entry_exists(&token)? {
+                incoming.remove_owned_child(&token)?;
+            }
+        }
+        if let Some(job) = self.open_optional_directory(&format!(
+            "jobs/{}/{}/{}",
+            lease.project_id(),
+            lease.worktree_id(),
+            lease.job_id()
+        ))? {
+            for name in ["workspace", "home", "tmp"] {
+                if job.entry_exists(name)? {
+                    job.remove_owned_child(name)?;
+                }
+            }
+            if job.entry_exists("execution.json")? {
+                job.remove_owned_regular("execution.json")?;
+            }
+        }
+        let leases = self.open_directory("leases", false)?;
+        for name in leases.list_names()? {
+            let name = std::str::from_utf8(&name).map_err(|_| {
+                WorkerError::Protocol("lease namespace contains a non-UTF-8 entry".into())
+            })?;
+            let stage_prefix = format!(".job-{}-", lease.job_id());
+            let exact_acquire = format!(".acquire-{}", lease.job_id());
+            let exact_released = format!(".released-{}", lease.job_id());
+            let owned = if let Some(suffix) = name.strip_prefix(&stage_prefix) {
+                if !is_lower_hex(suffix, 32) {
+                    return Err(WorkerError::Protocol(
+                        "unsafe job-owned staging replacement".into(),
+                    ));
+                }
+                true
+            } else {
+                name == exact_acquire || name == exact_released
+            };
+            if owned {
+                leases.remove_owned_child(name)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_job_mutable_scopes_absent(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
+        if let Some(incoming) =
+            self.open_optional_directory(&format!("incoming/{}", lease.job_id()))?
+            && incoming.entry_exists(&lease.lease_token().to_string())?
+        {
+            return Err(WorkerError::Protocol(
+                "incoming job scope remains after cleanup".into(),
+            ));
+        }
+        if let Some(job) = self.open_optional_directory(&format!(
+            "jobs/{}/{}/{}",
+            lease.project_id(),
+            lease.worktree_id(),
+            lease.job_id()
+        ))? {
+            for name in ["workspace", "home", "tmp", "execution.json"] {
+                if job.entry_exists(name)? {
+                    return Err(WorkerError::Protocol(format!(
+                        "mutable job scope {name} remains after cleanup"
+                    )));
+                }
+            }
+        }
+        let leases = self.open_directory("leases", false)?;
+        let stage_prefix = format!(".job-{}-", lease.job_id());
+        let exact_acquire = format!(".acquire-{}", lease.job_id());
+        let exact_released = format!(".released-{}", lease.job_id());
+        for name in leases.list_names()? {
+            let name = std::str::from_utf8(&name).map_err(|_| {
+                WorkerError::Protocol("lease namespace contains a non-UTF-8 entry".into())
+            })?;
+            if name.starts_with(&stage_prefix) || name == exact_acquire || name == exact_released {
+                return Err(WorkerError::Protocol(
+                    "operation-owned residue remains after cleanup".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn open_optional_directory(&self, path: &str) -> Result<Option<RootedDir>, WorkerError> {
+        match self.open_directory(path, false) {
+            Ok(directory) => Ok(Some(directory)),
+            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -561,17 +694,122 @@ fn same_disposition_identity(left: &JobDisposition, right: &JobDisposition) -> b
     }
 }
 
+fn disposition_job_id(disposition: &JobDisposition) -> JobId {
+    match disposition {
+        JobDisposition::Accepted { job_id, .. } | JobDisposition::Abandoned { job_id, .. } => {
+            *job_id
+        }
+    }
+}
+
+fn relative(path: &str) -> Result<RelativePath, WorkerError> {
+    RelativePath::parse(path.as_bytes()).map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
+fn require_private_directory_metadata(metadata: &libc::stat) -> Result<(), WorkerError> {
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || metadata.st_uid != unsafe { libc::geteuid() }
+        || metadata.st_mode & 0o077 != 0
+    {
+        return Err(WorkerError::Protocol(
+            "host-store directory is not owner-only and descriptor-bound".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn read_json_strict_at<T: DeserializeOwned + Serialize>(
+    directory: &RootedDir,
+    name: &str,
+) -> Result<T, WorkerError> {
+    let bytes = directory.read_private_regular(name, MAX_HOST_FILE_BYTES)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let value = T::deserialize(&mut deserializer)
+        .map_err(|error| WorkerError::Protocol(format!("invalid host JSON: {error}")))?;
+    deserializer
+        .end()
+        .map_err(|error| WorkerError::Protocol(format!("trailing host JSON data: {error}")))?;
+    let canonical = serde_json::to_vec(&value).map_err(|error| {
+        WorkerError::Protocol(format!("failed to canonicalize host JSON: {error}"))
+    })?;
+    if canonical != bytes {
+        return Err(WorkerError::Protocol("host JSON is not canonical".into()));
+    }
+    Ok(value)
+}
+
+fn read_json_optional_at<T: DeserializeOwned + Serialize>(
+    directory: &RootedDir,
+    name: &str,
+) -> Result<Option<T>, WorkerError> {
+    if !directory.entry_exists(name)? {
+        return Ok(None);
+    }
+    read_json_strict_at(directory, name).map(Some)
+}
+
+fn atomic_write_at<T: Serialize>(
+    directory: &RootedDir,
+    name: &str,
+    value: &T,
+) -> Result<(), WorkerError> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        WorkerError::Protocol(format!("failed to serialize host JSON: {error}"))
+    })?;
+    if bytes.len() as u64 > MAX_HOST_FILE_BYTES {
+        return Err(WorkerError::Protocol("host JSON exceeds 1 MiB".into()));
+    }
+    directory
+        .write_private_atomic_no_replace(name, &bytes)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                protocol_code("JOB_ID_CONFLICT", "host record already exists")
+            } else {
+                WorkerError::Io(error)
+            }
+        })
+}
+
+fn write_json_once<T: Serialize + DeserializeOwned + PartialEq>(
+    directory: &RootedDir,
+    name: &str,
+    value: &T,
+    label: &str,
+) -> Result<(), WorkerError> {
+    if directory.entry_exists(name)? {
+        let existing: T = read_json_strict_at(directory, name)?;
+        if existing == *value {
+            return Ok(());
+        }
+        return Err(WorkerError::Protocol(format!(
+            "{label} already exists with different content"
+        )));
+    }
+    atomic_write_at(directory, name, value)
+}
+
 #[allow(dead_code)] // Task 6 consumes the opaque staging handle and receipt.
 impl StagedJob {
     pub(crate) fn rooted_dir(&self) -> &RootedDir {
         &self.root
     }
 
-    pub(crate) fn workspace_receipt(&self) -> WorkspaceReceipt {
-        WorkspaceReceipt {
+    pub(crate) fn complete_materialization(
+        &self,
+        declared: &BTreeSet<RelativePath>,
+    ) -> Result<WorkspaceReceipt, WorkerError> {
+        self.root.validate_and_sync_declared_tree(declared)?;
+        Ok(WorkspaceReceipt {
             job_id: self.job_id,
             nonce: self.receipt_nonce,
-        }
+        })
     }
 
     pub(crate) fn publish_complete(mut self, receipt: WorkspaceReceipt) -> Result<(), WorkerError> {
@@ -580,33 +818,39 @@ impl StagedJob {
                 "workspace receipt does not match staged job".into(),
             ));
         }
-        self.root.sync_root()?;
-        if self.final_path.exists() {
+        if self.final_parent.entry_exists(&self.final_name)? {
             return Err(protocol_code(
                 "JOB_ID_CONFLICT",
                 "final job path already exists",
             ));
         }
-        self.root.publish_owned_to(&self.final_path)?;
-        self.root.sync_parent()?;
+        self.root
+            .publish_owned_into(&self.final_parent, &self.final_name)?;
+        self.final_parent.sync_root()?;
         Ok(())
     }
 }
 
 impl CleanupReceipt {
+    #[allow(dead_code)] // Task 7 lifecycle consumes internal release receipts.
     pub(crate) fn matches(&self, lease: &LeaseRecord) -> bool {
         self.job_id == lease.job_id()
             && self.client_id == lease.client_id()
             && self.lease_token == lease.lease_token()
     }
 
+    #[allow(dead_code)] // Task 7 lifecycle consumes internal release receipts.
     pub(crate) fn validate_durable(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
         if !self.matches(lease) {
             return Err(WorkerError::Protocol(
                 "cleanup receipt identity mismatch".into(),
             ));
         }
-        let marker: CleanupMarker = read_json_strict(&self.marker)?;
+        self.store.verify_job_mutable_scopes_absent(lease)?;
+        let proof_dir = self
+            .store
+            .open_directory(&format!("locks/jobs/{}", lease.job_id()), false)?;
+        let marker: CleanupMarker = read_json_strict_at(&proof_dir, "cleanup-complete.json")?;
         if !marker.terminal_or_abandoned
             || marker.job_id != lease.job_id()
             || marker.client_id != lease.client_id()
@@ -617,17 +861,28 @@ impl CleanupReceipt {
             ));
         }
         match &self.proof {
-            CleanupProof::Terminal(path) => {
-                let status: JobStatus = read_json_strict(path)?;
+            CleanupProof::Terminal => {
+                let job_dir = self.store.open_directory(
+                    &format!(
+                        "jobs/{}/{}/{}",
+                        lease.project_id(),
+                        lease.worktree_id(),
+                        lease.job_id()
+                    ),
+                    false,
+                )?;
+                let status: JobStatus = read_json_strict_at(&job_dir, "status.json")?;
                 if !status.state().is_terminal() {
                     return Err(WorkerError::Protocol(
                         "terminal cleanup proof is not terminal".into(),
                     ));
                 }
             }
-            CleanupProof::Abandoned(path) => {
-                let disposition: JobDisposition = read_json_strict(path)?;
-                disposition.validate()?;
+            CleanupProof::Abandoned => {
+                let disposition = self
+                    .store
+                    .disposition(lease.job_id())?
+                    .ok_or_else(|| WorkerError::Protocol("abandonment proof is absent".into()))?;
                 let expected_hash = format!(
                     "{:x}",
                     Sha256::digest(lease.lease_token().to_string().as_bytes())
@@ -645,261 +900,6 @@ impl CleanupReceipt {
         }
         Ok(())
     }
-}
-
-fn create_private_tree(path: &Path) -> Result<(), WorkerError> {
-    if path.exists() {
-        return Ok(());
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| WorkerError::Protocol("host root has no parent".into()))?;
-    if !parent.exists() {
-        create_private_tree(parent)?;
-    }
-    reject_symlink_or_wrong_type(parent, true)?;
-    match fs::create_dir(path) {
-        Ok(()) => {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-            sync_directory(parent)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    reject_symlink_or_wrong_type(path, true)
-}
-
-fn create_owned_directory(path: &Path) -> Result<(), WorkerError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {
-            reject_symlink_or_wrong_type(path, true)?;
-            require_private_mode(path)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            create_private_tree(path)?;
-            reject_symlink_or_wrong_type(path, true)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn reject_symlink_or_wrong_type(path: &Path, directory: bool) -> Result<(), WorkerError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || (directory && !metadata.is_dir())
-        || (!directory && !metadata.is_file())
-    {
-        return Err(WorkerError::Protocol(format!(
-            "unsafe host-store component: {}",
-            path.display()
-        )));
-    }
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(WorkerError::Protocol(format!(
-            "host-store component has the wrong owner: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_owned_entries(root: &Path) -> Result<(), WorkerError> {
-    for name in OWNED_DIRECTORIES {
-        let path = root.join(name);
-        reject_symlink_or_wrong_type(&path, true)?;
-        require_private_mode(&path)?;
-    }
-    let jobs = root.join("locks/jobs");
-    reject_symlink_or_wrong_type(&jobs, true)?;
-    require_private_mode(&jobs)?;
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            return Err(WorkerError::Protocol(
-                "host data root contains a non-UTF-8 entry".into(),
-            ));
-        };
-        if OWNED_DIRECTORIES.contains(&name.as_str()) {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink()
-            || (!metadata.is_file() && !metadata.is_dir())
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return Err(WorkerError::Protocol(format!(
-                "host data root contains an unsafe unrelated entry: {name}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn require_private_mode(path: &Path) -> Result<(), WorkerError> {
-    if fs::symlink_metadata(path)?.permissions().mode() & 0o077 != 0 {
-        return Err(WorkerError::Protocol(format!(
-            "host-store component is not owner-only: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn open_private_regular(path: &Path, create: bool) -> Result<File, WorkerError> {
-    let existed = match fs::symlink_metadata(path) {
-        Ok(_) => {
-            reject_symlink_or_wrong_type(path, false)?;
-            require_private_mode(path)?;
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error.into()),
-    };
-    if !existed && !create {
-        return Err(WorkerError::Io(std::io::Error::from(
-            std::io::ErrorKind::NotFound,
-        )));
-    }
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    if !existed {
-        options.create_new(true);
-    }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if !existed && create && error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return open_private_regular(path, false);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(WorkerError::Protocol(
-            "host-store file is not regular".into(),
-        ));
-    }
-    if !existed {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(file)
-}
-
-pub(crate) fn read_json_strict<T: DeserializeOwned + Serialize>(
-    path: &Path,
-) -> Result<T, WorkerError> {
-    reject_symlink_or_wrong_type(path, false)?;
-    require_private_mode(path)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)?;
-    if file.metadata()?.len() > MAX_HOST_FILE_BYTES {
-        return Err(WorkerError::Protocol("host file exceeds 1 MiB".into()));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_HOST_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_HOST_FILE_BYTES {
-        return Err(WorkerError::Protocol("host file exceeds 1 MiB".into()));
-    }
-    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-    let value = T::deserialize(&mut deserializer)
-        .map_err(|error| WorkerError::Protocol(format!("invalid host JSON: {error}")))?;
-    deserializer
-        .end()
-        .map_err(|error| WorkerError::Protocol(format!("trailing host JSON data: {error}")))?;
-    let canonical = serde_json::to_vec(&value).map_err(|error| {
-        WorkerError::Protocol(format!("failed to canonicalize host JSON: {error}"))
-    })?;
-    if canonical != bytes {
-        return Err(WorkerError::Protocol("host JSON is not canonical".into()));
-    }
-    Ok(value)
-}
-
-fn read_json_optional<T: DeserializeOwned + Serialize>(
-    path: &Path,
-) -> Result<Option<T>, WorkerError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => read_json_strict(path).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-pub(crate) fn atomic_write_new<T: Serialize>(path: &Path, value: &T) -> Result<(), WorkerError> {
-    atomic_write(path, value, false)
-}
-
-fn atomic_write_replace<T: Serialize>(path: &Path, value: &T) -> Result<(), WorkerError> {
-    atomic_write(path, value, true)
-}
-
-fn atomic_write<T: Serialize>(path: &Path, value: &T, replace: bool) -> Result<(), WorkerError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| WorkerError::Protocol("host file has no parent".into()))?;
-    create_owned_directory(parent)?;
-    let bytes = serde_json::to_vec(value).map_err(|error| {
-        WorkerError::Protocol(format!("failed to serialize host JSON: {error}"))
-    })?;
-    if bytes.len() as u64 > MAX_HOST_FILE_BYTES {
-        return Err(WorkerError::Protocol("host JSON exceeds 1 MiB".into()));
-    }
-    let temp = parent.join(format!(".write-{}", uuid::Uuid::new_v4().simple()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&temp)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    if replace {
-        fs::rename(&temp, path)?;
-    } else if let Err(error) = rename_no_replace(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        if error.to_string().contains("already exists")
-            || matches!(&error, WorkerError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists)
-        {
-            return Err(protocol_code(
-                "JOB_ID_CONFLICT",
-                "host record already exists",
-            ));
-        }
-        return Err(error);
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    sync_directory(parent)
-}
-
-pub(crate) fn sync_directory(path: &Path) -> Result<(), WorkerError> {
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| WorkerError::Protocol("host path contains NUL".into()))?;
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        return Err(WorkerError::Io(std::io::Error::last_os_error()));
-    }
-    let result = unsafe { libc::fsync(fd) };
-    let close_result = unsafe { libc::close(fd) };
-    if result != 0 {
-        return Err(WorkerError::Io(std::io::Error::last_os_error()));
-    }
-    if close_result != 0 {
-        return Err(WorkerError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
 }
 
 fn validate_digest(value: &str, label: &str) -> Result<(), WorkerError> {
@@ -924,45 +924,104 @@ fn hex_16(bytes: [u8; 16]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), WorkerError> {
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| WorkerError::Protocol("host source path contains NUL".into()))?;
-    let destination = CString::new(destination.as_os_str().as_bytes())
-        .map_err(|_| WorkerError::Protocol("host destination path contains NUL".into()))?;
+#[cfg(test)]
+mod review_regression_tests {
+    use super::*;
+    use crate::job::{ClientId, CommandSpec, LeaseToken, RequestFingerprintMaterial};
+    use std::fs;
+    use tempfile::tempdir;
 
-    #[cfg(target_os = "linux")]
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
+    fn request(seed: u128) -> LeaseAcquireRequest {
+        let material = RequestFingerprintMaterial::new(
+            JobId::new(uuid::Uuid::from_u128(seed)),
+            ClientId::new(uuid::Uuid::from_u128(seed + 10_000)),
+            LeaseToken::new(uuid::Uuid::from_u128(seed + 20_000)),
+            "mini-1".into(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            String::new(),
+            60_000,
+            "heavy".into(),
+            CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
         )
-    };
-    #[cfg(target_os = "macos")]
-    let result = unsafe {
-        unsafe extern "C" {
-            fn renamex_np(
-                from: *const libc::c_char,
-                to: *const libc::c_char,
-                flags: libc::c_uint,
-            ) -> libc::c_int;
-        }
-        const RENAME_EXCL: libc::c_uint = 0x0000_0004;
-        renamex_np(source.as_ptr(), destination.as_ptr(), RENAME_EXCL)
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let result = -1;
+        .unwrap();
+        LeaseAcquireRequest::new(material)
+    }
 
-    if result == 0 {
-        Ok(())
-    } else {
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        return Err(WorkerError::Protocol(
-            "atomic no-replace publication is unsupported on this host".into(),
-        ));
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        return Err(WorkerError::Io(std::io::Error::last_os_error()));
+    #[test]
+    fn empty_staging_tree_cannot_mint_a_publishable_workspace_receipt() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request(1);
+        let material = request.material();
+        let staged = store
+            .begin_job(
+                material.project_id(),
+                material.worktree_id(),
+                material.job_id(),
+            )
+            .unwrap();
+        assert!(staged.complete_materialization(&BTreeSet::new()).is_err());
+        assert!(
+            !store
+                .job(
+                    material.project_id(),
+                    material.worktree_id(),
+                    material.job_id()
+                )
+                .unwrap()
+                .exists()
+        );
+
+        let payload = RelativePath::parse(b"payload").unwrap();
+        staged
+            .rooted_dir()
+            .create_empty_directory(&payload)
+            .unwrap();
+        let receipt = staged
+            .complete_materialization(&BTreeSet::from([payload]))
+            .unwrap();
+        staged.publish_complete(receipt).unwrap();
+    }
+
+    #[test]
+    fn staged_publication_fails_closed_when_nested_final_ancestor_is_swapped() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let store = HostStore::open(&root).unwrap();
+        let request = request(1);
+        let material = request.material();
+        let staged = store
+            .begin_job(
+                material.project_id(),
+                material.worktree_id(),
+                material.job_id(),
+            )
+            .unwrap();
+        let payload = RelativePath::parse(b"payload").unwrap();
+        staged
+            .rooted_dir()
+            .create_empty_directory(&payload)
+            .unwrap();
+        let receipt = staged
+            .complete_materialization(&BTreeSet::from([payload]))
+            .unwrap();
+        let worktree = root
+            .join("jobs")
+            .join(material.project_id())
+            .join(material.worktree_id());
+        let detached = worktree.with_file_name(format!("{}-detached", material.worktree_id()));
+        fs::rename(&worktree, &detached).unwrap();
+        symlink(&outside, &worktree).unwrap();
+
+        assert!(staged.publish_complete(receipt).is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!detached.join(material.job_id().to_string()).exists());
     }
 }

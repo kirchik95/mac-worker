@@ -1,17 +1,10 @@
-use std::{
-    fs,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::Path,
-};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::WorkerError,
-    host_store::{
-        CleanupReceipt, HostStore, HostStoreWritePoint, JobDisposition, read_json_strict,
-        rename_no_replace, sync_directory,
-    },
+    host_store::{CleanupReceipt, HostStore, HostStoreWritePoint, JobDisposition},
     job::{JobId, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord},
     protocol::MemoryPressure,
     rooted_fs::RootedDir,
@@ -135,38 +128,26 @@ impl<'a> LeaseService<'a> {
     }
 
     pub fn load_if_present(root: &Path) -> Result<LeaseOccupancy, WorkerError> {
-        match fs::symlink_metadata(root) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(idle()),
-            Err(error) => Err(error.into()),
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                Err(WorkerError::Protocol("unsafe host data root".into()))
-            }
-            Ok(_) => {
-                let leases = root.join("leases");
-                let leases_metadata = match fs::symlink_metadata(&leases) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
-                    Err(error) => return Err(error.into()),
-                    Ok(metadata) => metadata,
-                };
-                if leases_metadata.file_type().is_symlink() || !leases_metadata.is_dir() {
-                    return Err(WorkerError::Protocol("unsafe lease namespace".into()));
-                }
-                let live_directory = root.join("leases/heavy");
-                let live_metadata = match fs::symlink_metadata(&live_directory) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
-                    Err(error) => return Err(error.into()),
-                    Ok(metadata) => metadata,
-                };
-                if live_metadata.file_type().is_symlink() || !live_metadata.is_dir() {
-                    return Err(WorkerError::Protocol("unsafe live lease directory".into()));
-                }
-                occupancy_from_lease(Some(read_json_strict(&live_directory.join("lease.json"))?))
-            }
-        }
+        let rooted = match RootedDir::open(root) {
+            Ok(rooted) => rooted,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
+            Err(error) => return Err(error.into()),
+        };
+        let leases = match rooted.open_child_directory(&relative("leases")?, false) {
+            Ok(leases) => leases,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
+            Err(error) => return Err(error.into()),
+        };
+        let live = match leases.open_child_directory(&relative("heavy")?, false) {
+            Ok(live) => live,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(idle()),
+            Err(error) => return Err(error.into()),
+        };
+        occupancy_from_lease(Some(read_lease(&live)?))
     }
 
-    #[doc(hidden)]
-    pub fn release_after_cleanup(
+    #[allow(dead_code)] // Task 7 lifecycle consumes this internal release boundary.
+    pub(crate) fn release_after_cleanup(
         &self,
         expected: &LeaseRecord,
         receipt: &CleanupReceipt,
@@ -182,54 +163,38 @@ impl<'a> LeaseService<'a> {
             return Err(WorkerError::Protocol("live lease identity mismatch".into()));
         }
         receipt.validate_durable(&live)?;
-        let live_dir = self.store.live_lease_path();
-        let retired = live_dir
-            .parent()
-            .expect("lease path has parent")
-            .join(format!(".released-{}", live.job_id()));
-        if retired.exists() {
-            remove_owned_directory(&retired, live_dir.parent().expect("lease path has parent"))?;
+        let leases = self.store.open_directory("leases", false)?;
+        let retired = format!(".released-{}", live.job_id());
+        if leases.entry_exists(&retired)? {
+            leases.remove_owned_child(&retired)?;
         }
-        rename_no_replace(&live_dir, &retired)?;
-        sync_directory(live_dir.parent().expect("lease path has parent"))?;
-        remove_owned_directory(&retired, live_dir.parent().expect("lease path has parent"))?;
-        sync_directory(live_dir.parent().expect("lease path has parent"))
+        let mut live_dir = leases.open_child_directory(&relative("heavy")?, false)?;
+        live_dir.publish_owned_into(&leases, &retired)?;
+        leases.sync_root()?;
+        leases.remove_owned_child(&retired)?;
+        leases.sync_root()?;
+        Ok(())
     }
 
     fn load_locked(&self) -> Result<Option<LeaseRecord>, WorkerError> {
-        let path = self.store.live_lease_path();
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                Err(WorkerError::Protocol("unsafe live lease directory".into()))
-            }
-            Ok(_) => Ok(Some(read_json_strict(&path.join("lease.json"))?)),
+        match self.store.open_directory("leases/heavy", false) {
+            Ok(live) => Ok(Some(read_lease(&live)?)),
+            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
     fn publish_lease(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
-        let operation = self.store.lease_operation_path(lease.job_id());
-        if operation.exists() {
-            remove_owned_directory(
-                &operation,
-                operation.parent().expect("operation has parent"),
-            )?;
+        let leases = self.store.open_directory("leases", false)?;
+        let operation_name = format!(".acquire-{}", lease.job_id());
+        if leases.entry_exists(&operation_name)? {
+            leases.remove_owned_child(&operation_name)?;
         }
-        fs::create_dir(&operation)?;
-        fs::set_permissions(&operation, fs::Permissions::from_mode(0o700))?;
-        let lease_path = operation.join("lease.json");
+        let mut operation = leases.create_new_child_directory(&operation_name)?;
         let bytes = serde_json::to_vec(lease).map_err(|error| {
             WorkerError::Protocol(format!("failed to serialize lease: {error}"))
         })?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&lease_path)?;
-        use std::io::Write;
-        file.write_all(&bytes)?;
+        let file = operation.write_new_private_file("lease.json", &bytes)?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeaseWrite)
@@ -243,29 +208,28 @@ impl<'a> LeaseService<'a> {
         {
             return Err(injected());
         }
-        sync_directory(&operation)?;
+        operation.sync_root()?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeaseDirectorySync)
         {
             return Err(injected());
         }
-        let parent = operation.parent().expect("operation has parent");
-        sync_directory(parent)?;
+        leases.sync_root()?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeaseParentSync)
         {
             return Err(injected());
         }
-        rename_no_replace(&operation, &self.store.live_lease_path())?;
+        operation.publish_owned_into(&leases, "heavy")?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeasePublish)
         {
             return Err(injected());
         }
-        sync_directory(parent)?;
+        leases.sync_root()?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeasePublishSync)
@@ -342,27 +306,208 @@ fn idle() -> LeaseOccupancy {
     }
 }
 
-fn remove_owned_directory(path: &Path, namespace: &Path) -> Result<(), WorkerError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(WorkerError::Protocol(
-            "unsafe operation-owned directory".into(),
-        ));
-    }
-    let namespace = fs::canonicalize(namespace)?;
-    let path = fs::canonicalize(path)?;
-    if path.parent() != Some(namespace.as_path()) {
-        return Err(WorkerError::Protocol(
-            "operation directory escaped its namespace".into(),
-        ));
-    }
-    RootedDir::open(&path)?.remove_owned_tree()?;
-    Ok(())
-}
-
 fn injected() -> WorkerError {
     WorkerError::Io(std::io::Error::other("injected lease crash boundary"))
 }
+
+fn relative(path: &str) -> Result<crate::inputs::RelativePath, WorkerError> {
+    crate::inputs::RelativePath::parse(path.as_bytes())
+        .map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
+fn read_lease(directory: &RootedDir) -> Result<LeaseRecord, WorkerError> {
+    let bytes = directory.read_private_regular("lease.json", 1024 * 1024)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let lease = LeaseRecord::deserialize(&mut deserializer)
+        .map_err(|error| WorkerError::Protocol(format!("invalid host JSON: {error}")))?;
+    deserializer
+        .end()
+        .map_err(|error| WorkerError::Protocol(format!("trailing host JSON data: {error}")))?;
+    if serde_json::to_vec(&lease).map_err(|error| WorkerError::Protocol(error.to_string()))?
+        != bytes
+    {
+        return Err(WorkerError::Protocol("host JSON is not canonical".into()));
+    }
+    lease.validate()?;
+    Ok(lease)
+}
 fn protocol_code(code: &'static str, message: &str) -> WorkerError {
     WorkerError::Protocol(format!("{code}: {message}"))
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::{
+        collections::BTreeSet,
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
+
+    use super::*;
+    use crate::{
+        inputs::RelativePath,
+        job::{ClientId, CommandSpec, JobStatus, LeaseToken, RequestFingerprintMaterial},
+    };
+    use tempfile::tempdir;
+
+    fn request(seed: u128) -> LeaseAcquireRequest {
+        let material = RequestFingerprintMaterial::new(
+            JobId::new(uuid::Uuid::from_u128(seed)),
+            ClientId::new(uuid::Uuid::from_u128(seed + 10_000)),
+            LeaseToken::new(uuid::Uuid::from_u128(seed + 20_000)),
+            "mini-1".into(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            String::new(),
+            60_000,
+            "heavy".into(),
+            CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+        )
+        .unwrap();
+        LeaseAcquireRequest::new(material)
+    }
+
+    fn healthy() -> AdmissionFacts {
+        AdmissionFacts {
+            free_disk_bytes: 100 * GIB,
+            total_disk_bytes: 250 * GIB,
+            memory_pressure: MemoryPressure::Normal,
+            swap_used_bytes: Some(0),
+        }
+    }
+
+    fn acquire<'a>(service: &LeaseService<'a>, request: &LeaseAcquireRequest) -> LeaseRecord {
+        match service.acquire(request, &healthy(), 1).unwrap() {
+            LeaseAcquireResponse::Acquired { lease } => lease,
+            _ => unreachable!(),
+        }
+    }
+
+    fn publish_job(store: &HostStore, lease: &LeaseRecord) {
+        let staged = store
+            .begin_job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        let payload = RelativePath::parse(b"payload").unwrap();
+        staged
+            .rooted_dir()
+            .create_empty_directory(&payload)
+            .unwrap();
+        let receipt = staged
+            .complete_materialization(&BTreeSet::from([payload]))
+            .unwrap();
+        staged.publish_complete(receipt).unwrap();
+    }
+
+    fn private_dir(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn private_file(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn targeted_cleanup_removes_exact_mutable_scopes_before_release() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        let acquire_request = request(1);
+        let lease = acquire(&service, &acquire_request);
+        assert!(store.cleanup_job_owned(&lease).is_err());
+        publish_job(&store, &lease);
+        store
+            .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
+            .unwrap();
+
+        let incoming = store
+            .incoming_job(lease.job_id(), lease.lease_token())
+            .unwrap();
+        private_dir(incoming.parent().unwrap());
+        private_dir(&incoming);
+        private_file(&incoming.join("payload"), b"incoming");
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        for name in ["workspace", "home", "tmp"] {
+            let scope = job.join(name);
+            private_dir(&scope);
+            private_file(&scope.join("sentinel"), name.as_bytes());
+        }
+        private_file(&job.join("execution.json"), b"mutable");
+
+        let receipt = store.cleanup_job_owned(&lease).unwrap();
+        assert!(!incoming.exists());
+        assert!(!job.join("workspace").exists());
+        assert!(!job.join("home").exists());
+        assert!(!job.join("tmp").exists());
+        assert!(!job.join("execution.json").exists());
+
+        let wrong_request = request(2);
+        let wrong = LeaseRecord::new(
+            wrong_request.material(),
+            wrong_request.request_fingerprint().clone(),
+            1,
+            60_001,
+        )
+        .unwrap();
+        assert!(service.release_after_cleanup(&wrong, &receipt).is_err());
+        assert_eq!(service.load().unwrap(), Some(lease.clone()));
+        service.release_after_cleanup(&lease, &receipt).unwrap();
+        assert_eq!(service.load().unwrap(), None);
+    }
+
+    #[test]
+    fn cleanup_preserves_substituted_scope_and_release_rechecks_absence() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let outside = temp.path().join("outside");
+        private_dir(&outside);
+        private_file(&outside.join("sentinel"), b"keep");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        let lease = acquire(&service, &request(1));
+        publish_job(&store, &lease);
+        store
+            .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
+            .unwrap();
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        symlink(&outside, job.join("workspace")).unwrap();
+
+        assert!(store.cleanup_job_owned(&lease).is_err());
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
+        assert!(job.join("workspace").symlink_metadata().is_ok());
+        assert_eq!(service.load().unwrap(), Some(lease.clone()));
+
+        fs::remove_file(job.join("workspace")).unwrap();
+        let receipt = store.cleanup_job_owned(&lease).unwrap();
+        private_dir(&job.join("workspace"));
+        assert!(service.release_after_cleanup(&lease, &receipt).is_err());
+        assert_eq!(service.load().unwrap(), Some(lease));
+    }
+
+    #[test]
+    fn exact_abandonment_cleanup_can_release_without_creating_final_job() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        let request = request(1);
+        let lease = acquire(&service, &request);
+        store.record_abandoned(&request, 2).unwrap();
+        let receipt = store.cleanup_job_owned(&lease).unwrap();
+        assert!(
+            !store
+                .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                .unwrap()
+                .exists()
+        );
+        service.release_after_cleanup(&lease, &receipt).unwrap();
+        assert_eq!(service.load().unwrap(), None);
+    }
 }

@@ -182,6 +182,30 @@ fn symlinked_root_or_owned_component_is_rejected() {
 }
 
 #[test]
+fn replacing_a_retained_nested_namespace_never_redirects_host_mutation() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let store = HostStore::open(&root).unwrap();
+    fs::rename(root.join("locks/jobs"), root.join("locks/jobs-original")).unwrap();
+    symlink(&outside, root.join("locks/jobs")).unwrap();
+
+    assert!(
+        LeaseService::new(&store)
+            .acquire(&request(1), &healthy(), 1)
+            .is_err()
+    );
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(root.join("locks/jobs-original"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn safe_unrelated_entries_are_preserved_but_non_utf8_entries_fail_closed() {
     let temp = tempdir().unwrap();
     let root = temp.path().join("host");
@@ -400,54 +424,55 @@ fn accepted_and_abandoned_dispositions_fence_job_ids_without_leases() {
 }
 
 #[test]
-fn matching_terminal_cleanup_releases_but_mismatch_and_expiry_do_not() {
+fn accepted_disposition_embedded_job_id_must_match_canonical_filename() {
     let temp = tempdir().unwrap();
-    let store = HostStore::open(&temp.path().join("host")).unwrap();
-    let service = LeaseService::new(&store);
-    let req = request(1);
-    let lease = match service.acquire(&req, &healthy(), 1).unwrap() {
-        LeaseAcquireResponse::Acquired { lease } => lease,
-        _ => unreachable!(),
-    };
-    assert!(lease.expires_at_millis() < 1_000_000);
-    assert_eq!(service.load().unwrap(), Some(lease.clone()));
-
-    let wrong_request = request(2);
-    let wrong_lease = mac_worker::job::LeaseRecord::new(
-        wrong_request.material(),
-        wrong_request.request_fingerprint().clone(),
-        1,
-        60_001,
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let accepted = request(1);
+    store
+        .record_accepted(&accepted, &JobStatus::accepted(100).unwrap(), 100)
+        .unwrap();
+    let requested = accepted.material().job_id();
+    let path = store.job_index(requested).unwrap();
+    let bytes = fs::read_to_string(&path).unwrap();
+    let mismatched = request(2).material().job_id();
+    fs::write(
+        &path,
+        bytes.replacen(&requested.to_string(), &mismatched.to_string(), 1),
     )
     .unwrap();
-    assert!(store.record_cleanup_complete(&lease).is_err());
-    store
-        .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
-        .unwrap();
-    let proof = store.record_cleanup_complete(&lease).unwrap();
-    assert!(service.release_after_cleanup(&wrong_lease, &proof).is_err());
-    assert_eq!(service.load().unwrap(), Some(lease.clone()));
 
-    service.release_after_cleanup(&lease, &proof).unwrap();
-    assert_eq!(service.load().unwrap(), None);
+    let error = LeaseService::new(&store)
+        .acquire(&accepted, &healthy(), 200)
+        .unwrap_err();
+
+    assert!(matches!(error, WorkerError::Protocol(message) if message.contains("JOB_ID_CONFLICT")));
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 }
 
 #[test]
-fn matching_abandonment_and_cleanup_receipt_release_the_exact_lease() {
+fn abandoned_disposition_embedded_job_id_must_match_canonical_filename() {
     let temp = tempdir().unwrap();
-    let store = HostStore::open(&temp.path().join("host")).unwrap();
-    let service = LeaseService::new(&store);
-    let req = request(1);
-    let lease = match service.acquire(&req, &healthy(), 1).unwrap() {
-        LeaseAcquireResponse::Acquired { lease } => lease,
-        _ => unreachable!(),
-    };
-    store.record_abandoned(&req, 2).unwrap();
-    let receipt = store.record_cleanup_complete(&lease).unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let abandoned = request(1);
+    store.record_abandoned(&abandoned, 100).unwrap();
+    let requested = abandoned.material().job_id();
+    let path = store.job_index(requested).unwrap();
+    let bytes = fs::read_to_string(&path).unwrap();
+    let mismatched = request(2).material().job_id();
+    fs::write(
+        &path,
+        bytes.replacen(&requested.to_string(), &mismatched.to_string(), 1),
+    )
+    .unwrap();
 
-    service.release_after_cleanup(&lease, &receipt).unwrap();
+    let error = LeaseService::new(&store)
+        .acquire(&abandoned, &healthy(), 200)
+        .unwrap_err();
 
-    assert_eq!(service.load().unwrap(), None);
+    assert!(matches!(error, WorkerError::Protocol(message) if message.contains("JOB_ID_CONFLICT")));
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 }
 
 #[test]
@@ -511,25 +536,12 @@ fn corrupt_or_unsafe_live_lease_fails_closed_and_is_never_released() {
     let temp = tempdir().unwrap();
     let root = temp.path().join("host");
     let store = HostStore::open(&root).unwrap();
-    let lease = match LeaseService::new(&store)
+    LeaseService::new(&store)
         .acquire(&request(1), &healthy(), 1)
-        .unwrap()
-    {
-        LeaseAcquireResponse::Acquired { lease } => lease,
-        _ => unreachable!(),
-    };
-    store
-        .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
         .unwrap();
-    let proof = store.record_cleanup_complete(&lease).unwrap();
     fs::write(root.join("leases/heavy/lease.json"), b"{}\n").unwrap();
 
     assert!(LeaseService::new(&store).load().is_err());
-    assert!(
-        LeaseService::new(&store)
-            .release_after_cleanup(&lease, &proof)
-            .is_err()
-    );
     assert!(root.join("leases/heavy").exists());
 }
 
