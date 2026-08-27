@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     error::WorkerError,
-    host_store::{HostStore, JobDisposition, SupervisorGuard},
+    host_store::{AdmissionGuard, HostStore, JobDisposition, SupervisorGuard},
     inputs::RelativePath,
     job::{
         ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseRecord, LeaseToken,
-        ProcessIdentity, RequestFingerprint, RequestFingerprintMaterial, SubmitRequest,
-        SubmitResponse,
+        ProcessIdentity, RequestFingerprint, RequestFingerprintMaterial, StatusResponse,
+        SubmitRequest, SubmitResponse,
     },
     lease::LeaseService,
     remote_snapshot::{RemoteSnapshotService, VerifiedRemoteSnapshot},
@@ -171,6 +171,223 @@ impl<'a> JobService<'a> {
                 WorkerError::Protocol("system clock is outside the supported range".into())
             })?;
         self.submit_at(request, now)
+    }
+
+    pub fn status(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
+        self.status_with_supervisor_ensure(job_id, true)
+    }
+
+    fn status_with_supervisor_ensure(
+        &self,
+        job_id: JobId,
+        ensure_supervisor: bool,
+    ) -> Result<StatusResponse, WorkerError> {
+        let admission = self.store.admission_lock(job_id)?;
+        match self.store.disposition(job_id).map_err(|error| {
+            if matches!(&error, WorkerError::Protocol(message) if message.starts_with("JOB_ID_CONFLICT:")) {
+                error
+            } else {
+                job_state_invalid("job disposition is invalid")
+            }
+        })? {
+            Some(JobDisposition::Abandoned { .. }) => Err(protocol_code(
+                "JOB_ABANDONED",
+                "job ID was permanently abandoned",
+            )),
+            Some(disposition @ JobDisposition::Accepted { .. }) => {
+                self.status_from_accepted_after(admission, disposition, ensure_supervisor)
+            }
+            None => {
+                self.status_without_disposition_after(admission, job_id, ensure_supervisor)
+            }
+        }
+    }
+
+    fn status_without_disposition_after(
+        &self,
+        admission: AdmissionGuard,
+        job_id: JobId,
+        ensure_supervisor: bool,
+    ) -> Result<StatusResponse, WorkerError> {
+        admission.validate_for(job_id)?;
+        let Some(lease) = self
+            .leases
+            .load_after(&admission, job_id)
+            .map_err(|_| job_state_invalid("live lease is invalid"))?
+        else {
+            return Err(protocol_code("JOB_NOT_FOUND", "job ID is not indexed"));
+        };
+        if lease.job_id() != job_id {
+            return Err(protocol_code("JOB_NOT_FOUND", "job ID is not indexed"));
+        }
+        let job = match self.store.open_directory(
+            &format!(
+                "jobs/{}/{}/{}",
+                lease.project_id(),
+                lease.worktree_id(),
+                lease.job_id()
+            ),
+            false,
+        ) {
+            Ok(job) => job,
+            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(protocol_code("JOB_NOT_FOUND", "job ID is not indexed"));
+            }
+            Err(_) => {
+                return Err(job_state_invalid("unindexed final job directory is unsafe"));
+            }
+        };
+        let meta: JobMeta = read_canonical_json(&job, "meta.json")
+            .map_err(|_| job_state_invalid("unindexed final metadata is invalid"))?;
+        require_meta_matches_live_lease(&meta, &lease)?;
+        let status: JobStatus = read_canonical_json(&job, "status.json")
+            .map_err(|_| job_state_invalid("unindexed final status is invalid"))?;
+        let expected = JobStatus::accepted(meta.created_at_millis())
+            .map_err(|_| job_state_invalid("unindexed acceptance timestamp is invalid"))?;
+        if status != expected {
+            return Err(job_state_invalid(
+                "unindexed final job is not an exact prelaunch Accepted job",
+            ));
+        }
+        validate_empty_prelaunch_private_directories(&job)?;
+        let request = reconstruct_submit_request(&job, &meta, &lease)?;
+        let verified = self.snapshots.load_verified_after(
+            &admission,
+            &lease,
+            request.request_fingerprint(),
+        )?;
+        let Some((validated_meta, validated_status)) =
+            self.read_repairable_final(&request, &lease, &verified)?
+        else {
+            return Err(protocol_code("JOB_NOT_FOUND", "job ID is not indexed"));
+        };
+        if validated_meta != meta || validated_status != status {
+            return Err(job_state_invalid(
+                "unindexed final job changed during validation",
+            ));
+        }
+        let published = self.store.reopen_published_after(
+            admission,
+            lease.project_id(),
+            lease.worktree_id(),
+            job_id,
+        )?;
+        self.store.record_accepted_after(
+            &published,
+            &request,
+            &status,
+            meta.created_at_millis(),
+        )?;
+        drop(published);
+        self.status_with_supervisor_ensure(job_id, ensure_supervisor)
+    }
+
+    fn status_from_accepted_after(
+        &self,
+        admission: AdmissionGuard,
+        disposition: JobDisposition,
+        ensure_supervisor: bool,
+    ) -> Result<StatusResponse, WorkerError> {
+        let JobDisposition::Accepted {
+            job_id,
+            client_id,
+            project_id,
+            worktree_id,
+            request_fingerprint,
+            status: initial_status,
+            ..
+        } = disposition
+        else {
+            unreachable!("accepted status loader receives an Accepted disposition")
+        };
+        admission.validate_for(job_id)?;
+        let job = self
+            .store
+            .open_directory(&format!("jobs/{project_id}/{worktree_id}/{job_id}"), false)
+            .map_err(|_| job_state_invalid("accepted job directory is absent or unsafe"))?;
+        let meta: JobMeta = read_canonical_json(&job, "meta.json")
+            .map_err(|_| job_state_invalid("canonical job metadata is invalid"))?;
+        if meta.job_id() != job_id
+            || meta.client_id() != client_id
+            || meta.project_id() != project_id
+            || meta.worktree_id() != worktree_id
+            || meta.request_fingerprint() != &request_fingerprint
+        {
+            return Err(protocol_code(
+                "JOB_ID_CONFLICT",
+                "accepted index does not match canonical job metadata",
+            ));
+        }
+        let expected_initial = JobStatus::accepted(meta.created_at_millis())
+            .map_err(|_| job_state_invalid("accepted job timestamp is invalid"))?;
+        if initial_status != expected_initial {
+            return Err(job_state_invalid(
+                "accepted index does not contain the immutable initial status",
+            ));
+        }
+        let status: JobStatus = read_mutable_canonical_json(&job, "status.json")
+            .map_err(|_| job_state_invalid("canonical mutable job status is invalid"))?;
+        validate_queryable_status(&meta, &status)?;
+
+        let lease = if status.state().is_terminal() {
+            validate_terminal_log_lengths(&job, &status)?;
+            None
+        } else {
+            let lease = self
+                .leases
+                .load_after(&admission, job_id)
+                .map_err(|_| job_state_invalid("live lease is invalid"))?
+                .ok_or_else(|| job_state_invalid("nonterminal job has no live lease"))?;
+            require_meta_matches_live_lease(&meta, &lease)?;
+            Some(lease)
+        };
+        let response = StatusResponse::new(meta.clone(), status.clone())
+            .map_err(|_| job_state_invalid("job status response is inconsistent"))?;
+
+        if status.state() != JobState::Accepted
+            || status.supervisor_identity().is_some()
+            || status.child_identity().is_some()
+            || !ensure_supervisor
+        {
+            drop(admission);
+            return Ok(response);
+        }
+
+        let lease = lease.expect("validated identityless Accepted status has a live lease");
+        let supervisor = self
+            .store
+            .supervisor_lock_after(&admission, job_id, false)?;
+        let Some(supervisor) = supervisor else {
+            drop(admission);
+            return Ok(response);
+        };
+        let current: JobStatus = read_mutable_canonical_json(&job, "status.json")
+            .map_err(|_| job_state_invalid("canonical mutable job status is invalid"))?;
+        validate_queryable_status(&meta, &current)?;
+        if current != status {
+            drop(supervisor);
+            drop(admission);
+            return self.status_with_supervisor_ensure(job_id, false);
+        }
+        validate_empty_prelaunch_private_directories(&job)?;
+        let request = reconstruct_submit_request(&job, &meta, &lease)?;
+        let verified = self.snapshots.load_verified_for_accepted_after(
+            &admission,
+            &lease,
+            meta.request_fingerprint(),
+        )?;
+        drop(admission);
+        match self.launch_after_election(job_id, supervisor, &request, &lease, &verified, false) {
+            Ok(_) => self.status(job_id),
+            Err(error) if matches!(&error, WorkerError::Protocol(message) if message.starts_with("SUPERVISOR_PRELAUNCH_FAILED:")) => {
+                match self.status_with_supervisor_ensure(job_id, false) {
+                    Ok(authoritative) if authoritative.status() != &status => Ok(authoritative),
+                    Ok(_) => Err(error),
+                    Err(authority_error) => Err(authority_error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[doc(hidden)]
@@ -785,6 +1002,170 @@ where
     unreachable!("bounded mutable JSON retry always returns")
 }
 
+fn validate_queryable_status(meta: &JobMeta, status: &JobStatus) -> Result<(), WorkerError> {
+    meta.validate()
+        .map_err(|_| job_state_invalid("canonical job metadata is invalid"))?;
+    status
+        .validate()
+        .map_err(|_| job_state_invalid("canonical mutable job status is invalid"))?;
+    if matches!(status.state(), JobState::Uploading | JobState::Verified) {
+        return Err(job_state_invalid(
+            "an accepted job cannot return to a pre-acceptance state",
+        ));
+    }
+    if status.state() == JobState::Accepted
+        && status.supervisor_identity().is_none()
+        && status.child_identity().is_none()
+        && status
+            != &JobStatus::accepted(meta.created_at_millis())
+                .map_err(|_| job_state_invalid("accepted job timestamp is invalid"))?
+    {
+        return Err(job_state_invalid(
+            "identityless accepted status must equal durable initial acceptance",
+        ));
+    }
+    match status.state() {
+        JobState::Succeeded | JobState::Failed | JobState::Cancelled | JobState::TimedOut
+            if status.supervisor_identity().is_none() || status.child_identity().is_none() =>
+        {
+            return Err(job_state_invalid(
+                "command terminal status requires both durable process identities",
+            ));
+        }
+        JobState::Lost if status.supervisor_identity().is_none() => {
+            return Err(job_state_invalid(
+                "lost accepted job requires a durable supervisor identity",
+            ));
+        }
+        _ => {}
+    }
+    match status.state() {
+        JobState::Accepted | JobState::Running | JobState::Succeeded | JobState::Failed
+            if status.error_code().is_some() =>
+        {
+            return Err(job_state_invalid(
+                "ordinary lifecycle status cannot carry an infrastructure error",
+            ));
+        }
+        JobState::Cancelled | JobState::TimedOut | JobState::Lost
+            if status.error_code().is_none() =>
+        {
+            return Err(job_state_invalid(
+                "infrastructure terminal status requires an error code",
+            ));
+        }
+        _ => {}
+    }
+    if status.updated_at_millis() < meta.created_at_millis() {
+        return Err(job_state_invalid(
+            "mutable job status predates durable acceptance",
+        ));
+    }
+    Ok(())
+}
+
+fn require_meta_matches_live_lease(meta: &JobMeta, lease: &LeaseRecord) -> Result<(), WorkerError> {
+    lease
+        .validate()
+        .map_err(|_| job_state_invalid("live lease is invalid"))?;
+    if meta.job_id() != lease.job_id()
+        || meta.client_id() != lease.client_id()
+        || meta.request_fingerprint() != lease.request_fingerprint()
+        || meta.worker_name() != lease.worker_name()
+        || meta.project_id() != lease.project_id()
+        || meta.worktree_id() != lease.worktree_id()
+        || meta.manifest_digest() != lease.manifest_digest()
+        || meta.timeout_millis() != lease.timeout_millis()
+        || meta.resource_class() != lease.resource_class()
+        || meta.command_summary() != lease.command_summary()
+    {
+        return Err(protocol_code(
+            "JOB_ID_CONFLICT",
+            "nonterminal job metadata does not match the live lease",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_terminal_log_lengths(job: &RootedDir, status: &JobStatus) -> Result<(), WorkerError> {
+    let expected = [
+        status
+            .final_stdout_bytes()
+            .expect("validated terminal status has a stdout length"),
+        status
+            .final_stderr_bytes()
+            .expect("validated terminal status has a stderr length"),
+    ];
+    for (name, expected_length) in ["stdout.log", "stderr.log"].into_iter().zip(expected) {
+        let file = job
+            .open_private_append(name)
+            .map_err(|_| job_state_invalid("terminal log is absent or unsafe"))?;
+        let actual_length = job
+            .validate_private_append_binding(name, &file)
+            .map_err(|_| job_state_invalid("terminal log binding is invalid"))?;
+        if actual_length != expected_length {
+            return Err(job_state_invalid(
+                "terminal log length does not match durable status",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reconstruct_submit_request(
+    job: &RootedDir,
+    meta: &JobMeta,
+    lease: &LeaseRecord,
+) -> Result<SubmitRequest, WorkerError> {
+    let payload: ExecutionPayload = read_canonical_json(job, "execution.json")
+        .map_err(|_| job_state_invalid("identityless accepted payload is invalid"))?;
+    payload
+        .validate_for_durable_job(lease, meta)
+        .map_err(|_| protocol_code("JOB_ID_CONFLICT", "execution payload identity differs"))?;
+    let material = RequestFingerprintMaterial::new(
+        meta.job_id(),
+        meta.client_id(),
+        lease.lease_token(),
+        meta.worker_name().into(),
+        meta.project_id().into(),
+        meta.worktree_id().into(),
+        meta.manifest_digest().into(),
+        meta.relative_working_dir().into(),
+        meta.timeout_millis(),
+        meta.resource_class().into(),
+        payload.command().clone(),
+    )
+    .map_err(|_| job_state_invalid("identityless accepted intent is invalid"))?;
+    let request = SubmitRequest::new(material);
+    if request.request_fingerprint() != meta.request_fingerprint() {
+        return Err(protocol_code(
+            "JOB_ID_CONFLICT",
+            "identityless accepted intent has a different fingerprint",
+        ));
+    }
+    require_exact_lease(lease, &request)?;
+    require_exact_meta(meta, &request, lease)?;
+    Ok(request)
+}
+
+fn validate_empty_prelaunch_private_directories(job: &RootedDir) -> Result<(), WorkerError> {
+    for name in ["home", "tmp"] {
+        let directory = job
+            .open_child_directory(&relative(name)?, false)
+            .map_err(|_| job_state_invalid("prelaunch private directory is absent or unsafe"))?;
+        if !directory
+            .list_names()
+            .map_err(|_| job_state_invalid("prelaunch private directory is unsafe"))?
+            .is_empty()
+        {
+            return Err(job_state_invalid(
+                "prelaunch private directory is not empty",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn require_exact_lease(lease: &LeaseRecord, request: &SubmitRequest) -> Result<(), WorkerError> {
     lease.validate()?;
     let material = request.material();
@@ -883,6 +1264,10 @@ fn relative(path: &str) -> Result<RelativePath, WorkerError> {
 
 fn protocol_code(code: &'static str, message: &str) -> WorkerError {
     WorkerError::Protocol(format!("{code}: {message}"))
+}
+
+fn job_state_invalid(message: &str) -> WorkerError {
+    protocol_code("JOB_STATE_INVALID", message)
 }
 
 fn is_prelaunch_terminal(status: &JobStatus) -> bool {
