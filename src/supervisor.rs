@@ -34,6 +34,7 @@ const CONTROLLED_PATHS: &[&str] = &[
 ];
 const MAX_HOST_JSON_BYTES: u64 = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SUPERVISOR_IDENTITY_RETRY: Duration = Duration::from_millis(250);
 const TERM_GRACE: Duration = Duration::from_secs(10);
 pub(crate) const SUPERVISOR_LOCK_FD: RawFd = 3;
 
@@ -391,16 +392,6 @@ impl SupervisorLauncher for SystemSupervisorLauncher {
         }
         drop(exec_result.write);
         drop(dev_null);
-        let pid_u32: u32 = pid.try_into().map_err(|_| {
-            protocol_code("SUPERVISOR_IDENTITY_INVALID", "supervisor PID is invalid")
-        })?;
-        let identity = match self.inspector.identity_for_pid(pid_u32) {
-            Ok(identity) => identity,
-            Err(error) => {
-                let _ = wait_blocking(pid);
-                return Err(error);
-            }
-        };
         let result = File::from(exec_result.read);
         let mut bytes = Vec::new();
         result.take(5).read_to_end(&mut bytes)?;
@@ -411,8 +402,59 @@ impl SupervisorLauncher for SystemSupervisorLauncher {
                 "installed worker supervisor could not be started",
             ));
         }
+        let identity =
+            identify_launched_supervisor(pid, &self.inspector, SUPERVISOR_IDENTITY_RETRY)?;
         drop(guard);
         Ok(LaunchCandidate::new(identity))
+    }
+}
+
+fn identify_launched_supervisor(
+    pid: libc::pid_t,
+    inspector: &dyn ProcessInspector,
+    retry_for: Duration,
+) -> Result<ProcessIdentity, WorkerError> {
+    let pid_u32: u32 = pid
+        .try_into()
+        .map_err(|_| protocol_code("SUPERVISOR_IDENTITY_INVALID", "supervisor PID is invalid"))?;
+    let deadline = Instant::now()
+        .checked_add(retry_for)
+        .ok_or_else(|| protocol_code("SUPERVISOR_HANDSHAKE", "identity deadline overflow"))?;
+    loop {
+        if let Ok(identity) = inspector.identity_for_pid(pid_u32) {
+            return Ok(identity);
+        }
+        loop {
+            let mut status = 0;
+            let result = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+            if result == pid {
+                return Err(protocol_code(
+                    "SUPERVISOR_EXITED",
+                    "detached supervisor exited before its identity was observed",
+                ));
+            }
+            if result == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return Err(protocol_code(
+                    "SUPERVISOR_ACCEPTANCE_AMBIGUOUS",
+                    "detached supervisor ownership became ambiguous before handshake",
+                ));
+            }
+            return Err(WorkerError::Io(error));
+        }
+        if Instant::now() >= deadline {
+            return Err(protocol_code(
+                "SUPERVISOR_ACCEPTANCE_AMBIGUOUS",
+                "detached supervisor identity could not be inspected within the bounded retry",
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -508,7 +550,11 @@ impl<'a> Supervisor<'a> {
         }
     }
 
-    pub fn run_with_guard(&self, job_id: JobId, guard: SupervisorGuard) -> Result<(), WorkerError> {
+    pub fn run_with_guard(
+        &self,
+        job_id: JobId,
+        mut guard: SupervisorGuard,
+    ) -> Result<(), WorkerError> {
         guard.validate()?;
         if guard.job_id() != job_id {
             return Err(protocol_code(
@@ -548,7 +594,15 @@ impl<'a> Supervisor<'a> {
 
         let supervisor_identity = self.inspector.identity_for_pid(std::process::id())?;
         let supervised = status.with_supervisor(supervisor_identity, now_millis()?)?;
-        replace_status(&job, &status_bytes, &status, &supervised)?;
+        replace_status(
+            self.store,
+            &lease,
+            &mut guard,
+            &job,
+            &status_bytes,
+            &status,
+            &supervised,
+        )?;
         status = supervised;
         status_bytes = canonical_json(&status)?;
         if self.fault == Some(SupervisorFaultPoint::AfterSupervisorIdentity) {
@@ -723,6 +777,9 @@ impl<'a> Supervisor<'a> {
         if self.fault == Some(SupervisorFaultPoint::AfterChildReady) {
             let abort_result = child.abort_and_reap();
             let terminal = match erase_payload_and_record_prelaunch(
+                self.store,
+                &lease,
+                &mut guard,
                 &job,
                 &status_bytes,
                 &status,
@@ -749,7 +806,15 @@ impl<'a> Supervisor<'a> {
             now_millis()
                 .and_then(|updated_at| status.with_child(child_identity, updated_at))
                 .and_then(|child_status| {
-                    replace_status(&job, &status_bytes, &status, &child_status)?;
+                    replace_status(
+                        self.store,
+                        &lease,
+                        &mut guard,
+                        &job,
+                        &status_bytes,
+                        &status,
+                        &child_status,
+                    )?;
                     Ok(child_status)
                 })
         };
@@ -767,6 +832,9 @@ impl<'a> Supervisor<'a> {
                     }
                 });
                 let terminal = match erase_payload_and_record_prelaunch(
+                    self.store,
+                    &lease,
+                    &mut guard,
                     &job,
                     &status_bytes,
                     &status,
@@ -789,6 +857,9 @@ impl<'a> Supervisor<'a> {
         if self.fault == Some(SupervisorFaultPoint::AfterChildIdentity) {
             let abort_result = child.abort_and_reap();
             let terminal = match erase_payload_and_record_prelaunch(
+                self.store,
+                &lease,
+                &mut guard,
                 &job,
                 &status_bytes,
                 &status,
@@ -814,6 +885,9 @@ impl<'a> Supervisor<'a> {
         if let Err(error) = payload_removal {
             child.abort();
             let _ = record_prelaunch_failure(
+                self.store,
+                &lease,
+                &mut guard,
                 &job,
                 &status_bytes,
                 &status,
@@ -835,14 +909,26 @@ impl<'a> Supervisor<'a> {
             Ok(()) => {}
             Err(ExecStartError::ProvenPrelaunch { code, error }) => {
                 child.abort();
-                let terminal =
-                    prelaunch_terminal(&job, &status_bytes, &status, &stdout, &stderr, code)?;
+                let terminal = prelaunch_terminal(
+                    self.store,
+                    &lease,
+                    &mut guard,
+                    &job,
+                    &status_bytes,
+                    &status,
+                    &stdout,
+                    &stderr,
+                    code,
+                )?;
                 drop(guard);
                 self.cleanup_and_release(&lease, &job, terminal)?;
                 return Err(error);
             }
             Err(ExecStartError::Ambiguous(error)) => {
                 finish_ambiguous_child(
+                    self.store,
+                    &lease,
+                    &mut guard,
                     &job,
                     &status_bytes,
                     &status,
@@ -866,7 +952,15 @@ impl<'a> Supervisor<'a> {
             now_millis()
                 .and_then(|updated_at| status.into_running(updated_at))
                 .and_then(|running| {
-                    replace_status(&job, &status_bytes, &status, &running)?;
+                    replace_status(
+                        self.store,
+                        &lease,
+                        &mut guard,
+                        &job,
+                        &status_bytes,
+                        &status,
+                        &running,
+                    )?;
                     Ok(running)
                 })
         };
@@ -874,6 +968,9 @@ impl<'a> Supervisor<'a> {
             Ok(running) => running,
             Err(error) => {
                 finish_ambiguous_child(
+                    self.store,
+                    &lease,
+                    &mut guard,
                     &job,
                     &status_bytes,
                     &status,
@@ -922,7 +1019,15 @@ impl<'a> Supervisor<'a> {
                 "COMMAND_TIMEOUT".into(),
             )?,
         };
-        replace_status(&job, &status_bytes, &status, &terminal)?;
+        replace_status(
+            self.store,
+            &lease,
+            &mut guard,
+            &job,
+            &status_bytes,
+            &status,
+            &terminal,
+        )?;
         if self.fault == Some(SupervisorFaultPoint::AfterTerminalStatus) {
             return Err(injected_supervisor_fault("terminal status"));
         }
@@ -941,13 +1046,19 @@ impl<'a> Supervisor<'a> {
                 if let Err(error) =
                     LeaseService::new(self.store).release_after_cleanup(lease, &receipt)
                 {
-                    enrich_cleanup_error(job, &terminal, "LEASE_RELEASE_FAILED")?;
+                    enrich_cleanup_error(
+                        self.store,
+                        lease,
+                        job,
+                        &terminal,
+                        "LEASE_RELEASE_FAILED",
+                    )?;
                     return Err(error);
                 }
                 Ok(())
             }
             Err(error) => {
-                enrich_cleanup_error(job, &terminal, "MUTABLE_CLEANUP_FAILED")?;
+                enrich_cleanup_error(self.store, lease, job, &terminal, "MUTABLE_CLEANUP_FAILED")?;
                 Err(error)
             }
         }
@@ -960,18 +1071,25 @@ impl<'a> Supervisor<'a> {
         job: &RootedDir,
         expected_status_bytes: &[u8],
         status: &JobStatus,
-        guard: SupervisorGuard,
+        mut guard: SupervisorGuard,
         code: &str,
         original: WorkerError,
     ) -> Result<(), WorkerError> {
-        let terminal =
-            match erase_payload_and_record_prelaunch(job, expected_status_bytes, status, code) {
-                Ok(terminal) => terminal,
-                Err(error) => {
-                    drop(guard);
-                    return Err(error);
-                }
-            };
+        let terminal = match erase_payload_and_record_prelaunch(
+            self.store,
+            lease,
+            &mut guard,
+            job,
+            expected_status_bytes,
+            status,
+            code,
+        ) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                drop(guard);
+                return Err(error);
+            }
+        };
         drop(guard);
         self.cleanup_and_release(lease, job, terminal)?;
         Err(original)
@@ -1013,24 +1131,27 @@ impl PreparedCommand {
                     .map_err(|_| protocol_code("INVALID_COMMAND", "command argument contains NUL"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let environment = [
+        let mut environment = [
             "LC_ALL=C".to_owned(),
             "LANG=C".to_owned(),
             format!("PATH={CONTROLLED_PATH}"),
-            format!("HOME={}", home.display()),
-            format!("TMPDIR={}", tmp.display()),
-            format!("MAC_WORKER_JOB_ID={}", lease.job_id()),
-            format!("MAC_WORKER_CLIENT_ID={}", lease.client_id()),
-            format!("MAC_WORKER_PROJECT_ID={}", lease.project_id()),
-            format!("MAC_WORKER_WORKTREE_ID={}", lease.worktree_id()),
         ]
         .into_iter()
-        .map(|entry| {
-            CString::new(entry).map_err(|_| {
-                protocol_code("INVALID_ENVIRONMENT", "controlled environment is invalid")
-            })
-        })
+        .map(controlled_environment_entry)
         .collect::<Result<Vec<_>, _>>()?;
+        environment.push(controlled_path_environment_entry(b"HOME=", home)?);
+        environment.push(controlled_path_environment_entry(b"TMPDIR=", tmp)?);
+        environment.extend(
+            [
+                format!("MAC_WORKER_JOB_ID={}", lease.job_id()),
+                format!("MAC_WORKER_CLIENT_ID={}", lease.client_id()),
+                format!("MAC_WORKER_PROJECT_ID={}", lease.project_id()),
+                format!("MAC_WORKER_WORKTREE_ID={}", lease.worktree_id()),
+            ]
+            .into_iter()
+            .map(controlled_environment_entry)
+            .collect::<Result<Vec<_>, _>>()?,
+        );
         let mut argument_pointers = arguments
             .iter()
             .map(|argument| argument.as_ptr())
@@ -1049,6 +1170,20 @@ impl PreparedCommand {
             environment_pointers,
         })
     }
+}
+
+fn controlled_environment_entry(entry: String) -> Result<CString, WorkerError> {
+    CString::new(entry)
+        .map_err(|_| protocol_code("INVALID_ENVIRONMENT", "controlled environment is invalid"))
+}
+
+fn controlled_path_environment_entry(key: &[u8], path: &Path) -> Result<CString, WorkerError> {
+    let path = path.as_os_str().as_bytes();
+    let mut entry = Vec::with_capacity(key.len() + path.len());
+    entry.extend_from_slice(key);
+    entry.extend_from_slice(path);
+    CString::new(entry)
+        .map_err(|_| protocol_code("INVALID_ENVIRONMENT", "controlled environment is invalid"))
 }
 
 struct Pipe {
@@ -1360,8 +1495,7 @@ fn wait_for_child(
             return complete_waitable_child(identity, inspector);
         }
         if Instant::now() >= deadline {
-            terminate_exact_group(identity, inspector)?;
-            return Ok(ChildOutcome::TimedOut);
+            return terminate_exact_group(identity, inspector);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -1386,10 +1520,7 @@ fn complete_waitable_child(
         ProcessGroupMembership::OtherMembers => {
             if unsafe { libc::kill(-pid, libc::SIGTERM) } != 0 {
                 let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH)
-                    || inspector.observe_group_members(identity.pid())
-                        != ProcessGroupMembership::LeaderOnly
-                {
+                if !failed_group_signal_has_only_waitable_leader(identity, inspector)? {
                     return Err(WorkerError::Io(error));
                 }
             } else {
@@ -1409,10 +1540,9 @@ fn complete_waitable_child(
                         ProcessGroupMembership::OtherMembers => {
                             if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
                                 let error = io::Error::last_os_error();
-                                if error.raw_os_error() != Some(libc::ESRCH)
-                                    || inspector.observe_group_members(identity.pid())
-                                        != ProcessGroupMembership::LeaderOnly
-                                {
+                                if !failed_group_signal_has_only_waitable_leader(
+                                    identity, inspector,
+                                )? {
                                     return Err(WorkerError::Io(error));
                                 }
                             }
@@ -1443,11 +1573,14 @@ fn complete_waitable_child(
 fn terminate_exact_group(
     identity: ProcessIdentity,
     inspector: &dyn ProcessInspector,
-) -> Result<(), WorkerError> {
+) -> Result<ChildOutcome, WorkerError> {
     let pid = identity.pid();
-    require_matching_group(identity, inspector)?;
+    if let Err(error) = require_matching_group(identity, inspector) {
+        return complete_newly_waitable_or(identity, inspector, error);
+    }
     if unsafe { libc::kill(-(pid as i32), libc::SIGTERM) } != 0 {
-        return Err(WorkerError::Io(io::Error::last_os_error()));
+        let error = WorkerError::Io(io::Error::last_os_error());
+        return complete_newly_waitable_or(identity, inspector, error);
     }
     let deadline = Instant::now() + TERM_GRACE;
     loop {
@@ -1456,24 +1589,29 @@ fn terminate_exact_group(
         // already-validated PID/start/PGID remains the authority for a final
         // group signal even though macOS proc_pidinfo no longer reports the
         // zombie as a live matching process.
-        if !child_is_waitable(pid as libc::pid_t)? {
-            require_matching_group(identity, inspector)?;
+        if !child_is_waitable(pid as libc::pid_t)?
+            && let Err(error) = require_matching_group(identity, inspector)
+            && !child_is_waitable(pid as libc::pid_t)?
+        {
+            return Err(error);
         }
         if Instant::now() >= deadline {
             break;
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    let waitable = child_is_waitable(pid as libc::pid_t)?;
-    if !waitable {
-        require_matching_group(identity, inspector)?;
+    let mut waitable = child_is_waitable(pid as libc::pid_t)?;
+    if !waitable && let Err(error) = require_matching_group(identity, inspector) {
+        waitable = child_is_waitable(pid as libc::pid_t)?;
+        if !waitable {
+            return Err(error);
+        }
     }
     let should_kill = if waitable {
         match inspector.observe_group_members(pid) {
             ProcessGroupMembership::LeaderOnly => false,
             ProcessGroupMembership::OtherMembers => true,
             ProcessGroupMembership::Ambiguous => {
-                let _ = wait_blocking(pid as libc::pid_t);
                 return Err(protocol_code(
                     "CHILD_TERMINATION_AMBIGUOUS",
                     "exact process-group membership could not be inspected",
@@ -1484,10 +1622,43 @@ fn terminate_exact_group(
         true
     };
     if should_kill && unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
-        return Err(WorkerError::Io(io::Error::last_os_error()));
+        let error = io::Error::last_os_error();
+        if !failed_group_signal_has_only_waitable_leader(identity, inspector)? {
+            return Err(WorkerError::Io(error));
+        }
     }
     wait_blocking(pid as libc::pid_t)?;
-    wait_for_terminated_group_absence(identity, inspector)
+    wait_for_terminated_group_absence(identity, inspector)?;
+    Ok(ChildOutcome::TimedOut)
+}
+
+fn complete_newly_waitable_or(
+    identity: ProcessIdentity,
+    inspector: &dyn ProcessInspector,
+    original: WorkerError,
+) -> Result<ChildOutcome, WorkerError> {
+    if child_is_waitable(identity.pid() as libc::pid_t)? {
+        complete_waitable_child(identity, inspector)
+    } else {
+        Err(original)
+    }
+}
+
+fn failed_group_signal_has_only_waitable_leader(
+    identity: ProcessIdentity,
+    inspector: &dyn ProcessInspector,
+) -> Result<bool, WorkerError> {
+    if !child_is_waitable(identity.pid() as libc::pid_t)? {
+        return Ok(false);
+    }
+    match inspector.observe_group_members(identity.pid()) {
+        ProcessGroupMembership::LeaderOnly => Ok(true),
+        ProcessGroupMembership::OtherMembers => Ok(false),
+        ProcessGroupMembership::Ambiguous => Err(protocol_code(
+            "CHILD_TERMINATION_AMBIGUOUS",
+            "failed group signal could not be reconciled to the waitable leader anchor",
+        )),
+    }
 }
 
 fn wait_for_terminated_group_absence(
@@ -1590,7 +1761,11 @@ fn decode_wait_status(status: c_int) -> Result<ChildOutcome, WorkerError> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prelaunch_terminal(
+    store: &HostStore,
+    lease: &LeaseRecord,
+    status_guard: &mut SupervisorGuard,
     job: &RootedDir,
     expected_bytes: &[u8],
     status: &JobStatus,
@@ -1609,11 +1784,22 @@ fn prelaunch_terminal(
         stderr_length,
         code.into(),
     )?;
-    replace_status(job, expected_bytes, status, &terminal)?;
+    replace_status(
+        store,
+        lease,
+        status_guard,
+        job,
+        expected_bytes,
+        status,
+        &terminal,
+    )?;
     Ok(terminal)
 }
 
 fn erase_payload_and_record_prelaunch(
+    store: &HostStore,
+    lease: &LeaseRecord,
+    status_guard: &mut SupervisorGuard,
     job: &RootedDir,
     expected_bytes: &[u8],
     status: &JobStatus,
@@ -1625,6 +1811,9 @@ fn erase_payload_and_record_prelaunch(
             job.open_private_append("stderr.log"),
         ) {
             let _ = record_prelaunch_failure(
+                store,
+                lease,
+                status_guard,
                 job,
                 expected_bytes,
                 status,
@@ -1637,11 +1826,24 @@ fn erase_payload_and_record_prelaunch(
     }
     let stdout = job.open_private_append("stdout.log")?;
     let stderr = job.open_private_append("stderr.log")?;
-    prelaunch_terminal(job, expected_bytes, status, &stdout, &stderr, code)
+    prelaunch_terminal(
+        store,
+        lease,
+        status_guard,
+        job,
+        expected_bytes,
+        status,
+        &stdout,
+        &stderr,
+        code,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn finish_ambiguous_child(
+    store: &HostStore,
+    lease: &LeaseRecord,
+    status_guard: &mut SupervisorGuard,
     job: &RootedDir,
     expected_bytes: &[u8],
     status: &JobStatus,
@@ -1664,11 +1866,23 @@ fn finish_ambiguous_child(
         stderr_length,
         code.into(),
     )?;
-    replace_status(job, expected_bytes, status, &terminal)?;
+    replace_status(
+        store,
+        lease,
+        status_guard,
+        job,
+        expected_bytes,
+        status,
+        &terminal,
+    )?;
     Ok(terminal)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_prelaunch_failure(
+    store: &HostStore,
+    lease: &LeaseRecord,
+    status_guard: &mut SupervisorGuard,
     job: &RootedDir,
     expected_bytes: &[u8],
     status: &JobStatus,
@@ -1676,14 +1890,37 @@ fn record_prelaunch_failure(
     stderr: &File,
     code: &str,
 ) -> Result<(), WorkerError> {
-    prelaunch_terminal(job, expected_bytes, status, stdout, stderr, code).map(|_| ())
+    prelaunch_terminal(
+        store,
+        lease,
+        status_guard,
+        job,
+        expected_bytes,
+        status,
+        stdout,
+        stderr,
+        code,
+    )
+    .map(|_| ())
 }
 
 fn enrich_cleanup_error(
+    store: &HostStore,
+    lease: &LeaseRecord,
     job: &RootedDir,
     terminal: &JobStatus,
     code: &str,
 ) -> Result<(), WorkerError> {
+    let admission = store.admission_lock(lease.job_id())?;
+    let mut status_guard = store
+        .supervisor_lock_after(&admission, lease.job_id(), true)?
+        .ok_or_else(|| {
+            protocol_code(
+                "STATUS_CAPABILITY_BUSY",
+                "status capability remained busy during terminal enrichment",
+            )
+        })?;
+    drop(admission);
     let (bytes, current): (Vec<u8>, JobStatus) =
         read_canonical_json_with_bytes(job, "status.json")?;
     if current != *terminal {
@@ -1693,19 +1930,35 @@ fn enrich_cleanup_error(
         ));
     }
     let enriched = current.with_cleanup_error(code.into(), now_millis()?)?;
-    replace_status(job, &bytes, &current, &enriched)
+    replace_status(
+        store,
+        lease,
+        &mut status_guard,
+        job,
+        &bytes,
+        &current,
+        &enriched,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replace_status(
+    store: &HostStore,
+    lease: &LeaseRecord,
+    status_guard: &mut SupervisorGuard,
     job: &RootedDir,
     expected_bytes: &[u8],
     expected: &JobStatus,
     replacement: &JobStatus,
 ) -> Result<(), WorkerError> {
-    expected.transition(replacement.clone())?;
-    let bytes = canonical_json(replacement)?;
-    job.replace_private_regular_exact("status.json", expected_bytes, &bytes)?;
-    Ok(())
+    store.replace_job_status_after(
+        status_guard,
+        lease,
+        job,
+        expected_bytes,
+        expected,
+        replacement,
+    )
 }
 
 fn require_accepted_disposition(
@@ -1805,10 +2058,7 @@ fn resolve_executable(program: &str) -> Result<PathBuf, WorkerError> {
         return require_executable(candidate);
     }
     if program.contains('/') {
-        return Err(protocol_code(
-            "EXECUTABLE_NOT_FOUND",
-            "relative executable paths containing separators are unsupported",
-        ));
+        return Ok(candidate.to_owned());
     }
     CONTROLLED_PATHS
         .iter()
@@ -1924,9 +2174,15 @@ mod tests {
     use super::*;
     use std::{
         fs::{self, OpenOptions},
+        os::unix::ffi::OsStringExt,
         process::Command,
-        sync::atomic::{AtomicU32, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicU32, Ordering},
+        },
     };
+
+    use crate::job::RequestFingerprintMaterial;
 
     struct RejectingInspector {
         observed_pid: AtomicU32,
@@ -1960,6 +2216,341 @@ mod tests {
         fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
             ProcessGroupMembership::Ambiguous
         }
+    }
+
+    struct TransientLauncherInspector {
+        ambiguous: AtomicBool,
+    }
+
+    impl ProcessInspector for TransientLauncherInspector {
+        fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+            if self.ambiguous.load(Ordering::SeqCst) {
+                return Err(protocol_code(
+                    "PROCESS_AMBIGUOUS",
+                    "injected transient launcher inspection failure",
+                ));
+            }
+            SystemProcessInspector.identity_for_pid(pid)
+        }
+
+        fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+            SystemProcessInspector.observe(expected)
+        }
+
+        fn observe_group(&self, process_group: u32) -> ProcessGroupObservation {
+            SystemProcessInspector.observe_group(process_group)
+        }
+
+        fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership {
+            SystemProcessInspector.observe_group_members(leader)
+        }
+    }
+
+    struct ExitBeforeTermInspector {
+        release: Mutex<Option<OwnedFd>>,
+        triggered: AtomicBool,
+    }
+
+    impl ProcessInspector for ExitBeforeTermInspector {
+        fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+            SystemProcessInspector.identity_for_pid(pid)
+        }
+
+        fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+            if !self.triggered.swap(true, Ordering::SeqCst) {
+                let release = self.release.lock().unwrap().take().unwrap();
+                let byte = 1_u8;
+                assert_eq!(
+                    unsafe {
+                        libc::write(
+                            release.as_raw_fd(),
+                            (&raw const byte).cast(),
+                            std::mem::size_of_val(&byte),
+                        )
+                    },
+                    1
+                );
+                drop(release);
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !child_is_waitable(expected.pid() as libc::pid_t).unwrap() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "test child did not become waitable"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+            SystemProcessInspector.observe(expected)
+        }
+
+        fn observe_group(&self, process_group: u32) -> ProcessGroupObservation {
+            SystemProcessInspector.observe_group(process_group)
+        }
+
+        fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership {
+            SystemProcessInspector.observe_group_members(leader)
+        }
+    }
+
+    struct VanishingBeforeKillInspector {
+        descendant: libc::pid_t,
+        triggered: AtomicBool,
+    }
+
+    impl ProcessInspector for VanishingBeforeKillInspector {
+        fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+            SystemProcessInspector.identity_for_pid(pid)
+        }
+
+        fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+            SystemProcessInspector.observe(expected)
+        }
+
+        fn observe_group(&self, process_group: u32) -> ProcessGroupObservation {
+            SystemProcessInspector.observe_group(process_group)
+        }
+
+        fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership {
+            let observed = SystemProcessInspector.observe_group_members(leader);
+            if !self.triggered.swap(true, Ordering::SeqCst) {
+                assert_eq!(observed, ProcessGroupMembership::OtherMembers);
+                assert_eq!(unsafe { libc::kill(self.descendant, libc::SIGKILL) }, 0);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while SystemProcessInspector.observe_group_members(leader)
+                    != ProcessGroupMembership::LeaderOnly
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "descendant did not leave the process group"
+                    );
+                    std::thread::yield_now();
+                }
+                return ProcessGroupMembership::OtherMembers;
+            }
+            observed
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait_for_group_identity(pid: libc::pid_t) -> ProcessIdentity {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(identity) = SystemProcessInspector.identity_for_pid(pid as u32)
+                && matches!(
+                    SystemProcessInspector.observe(identity),
+                    ProcessObservation::Matching { process_group } if process_group == pid as u32
+                )
+            {
+                return identity;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "group leader identity was not ready"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_blocked_group_leader(exit_code: u8) -> (libc::pid_t, OwnedFd) {
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::close(descriptors[1]);
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(70);
+                }
+                let mut byte = 0_u8;
+                libc::read(descriptors[0], (&raw mut byte).cast(), 1);
+                libc::_exit(exit_code as i32);
+            }
+        }
+        assert_eq!(unsafe { libc::close(descriptors[0]) }, 0);
+        (pid, unsafe { OwnedFd::from_raw_fd(descriptors[1]) })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_group_with_ignoring_descendant() -> (libc::pid_t, libc::pid_t) {
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let leader = unsafe { libc::fork() };
+        assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
+        if leader == 0 {
+            unsafe {
+                libc::close(descriptors[0]);
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(70);
+                }
+                let descendant = libc::fork();
+                if descendant < 0 {
+                    libc::_exit(70);
+                }
+                if descendant == 0 {
+                    libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    let own_pid = libc::getpid();
+                    libc::write(
+                        descriptors[1],
+                        (&raw const own_pid).cast(),
+                        std::mem::size_of::<libc::pid_t>(),
+                    );
+                    loop {
+                        libc::pause();
+                    }
+                }
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        assert_eq!(unsafe { libc::close(descriptors[1]) }, 0);
+        let mut descendant = 0;
+        let read = unsafe {
+            libc::read(
+                descriptors[0],
+                (&raw mut descendant).cast(),
+                std::mem::size_of::<libc::pid_t>(),
+            )
+        };
+        assert_eq!(read as usize, std::mem::size_of::<libc::pid_t>());
+        assert_eq!(unsafe { libc::close(descriptors[0]) }, 0);
+        (leader, descendant)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn timeout_rechecks_waitable_anchor_when_leader_exits_before_term_identity_check() {
+        let (pid, release) = spawn_blocked_group_leader(7);
+        let identity = wait_for_group_identity(pid);
+        let inspector = ExitBeforeTermInspector {
+            release: Mutex::new(Some(release)),
+            triggered: AtomicBool::new(false),
+        };
+
+        let result = wait_for_child(identity, 0, &inspector);
+        if result.is_err() {
+            let _ = wait_blocking(pid);
+        }
+
+        assert_eq!(result.unwrap(), ChildOutcome::Exited(7));
+        assert_eq!(
+            SystemProcessInspector.observe_group(identity.pid()),
+            ProcessGroupObservation::Absent
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn timeout_rechecks_waitable_anchor_when_descendants_vanish_before_kill() {
+        let (leader, descendant) = spawn_group_with_ignoring_descendant();
+        let identity = wait_for_group_identity(leader);
+        assert_eq!(
+            SystemProcessInspector.observe_group_members(identity.pid()),
+            ProcessGroupMembership::OtherMembers,
+            "descendant was not ready in the leader's process group"
+        );
+        let inspector = VanishingBeforeKillInspector {
+            descendant,
+            triggered: AtomicBool::new(false),
+        };
+        let started = Instant::now();
+
+        let result = wait_for_child(identity, 0, &inspector);
+        if result.is_err() {
+            let _ = wait_blocking(leader);
+        }
+
+        assert_eq!(result.unwrap(), ChildOutcome::TimedOut);
+        assert!(
+            started.elapsed() >= TERM_GRACE,
+            "full TERM grace was skipped"
+        );
+        assert_eq!(
+            SystemProcessInspector.observe_group(identity.pid()),
+            ProcessGroupObservation::Absent
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn transient_launcher_inspection_never_waits_for_a_live_detached_candidate() {
+        let inspector = TransientLauncherInspector {
+            ambiguous: AtomicBool::new(true),
+        };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+        if pid == 0 {
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        let started = Instant::now();
+
+        let error = identify_launched_supervisor(pid, &inspector, Duration::from_millis(50))
+            .expect_err("transient identity inspection remains ambiguous");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "launcher blocked on the live detached candidate"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("SUPERVISOR_ACCEPTANCE_AMBIGUOUS"),
+            "{error}"
+        );
+        let mut wait_status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &raw mut wait_status, libc::WNOHANG) },
+            0,
+            "ambiguous candidate was reaped or exited"
+        );
+        inspector.ambiguous.store(false, Ordering::SeqCst);
+        let later = inspector.identity_for_pid(pid as u32).unwrap();
+        assert_eq!(later.pid(), pid as u32, "candidate is later discoverable");
+
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        assert_eq!(unsafe { libc::waitpid(pid, &raw mut wait_status, 0) }, pid);
+    }
+
+    #[test]
+    fn prepared_command_preserves_raw_home_and_tmpdir_bytes_under_non_utf8_host_root() {
+        let command = CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap();
+        let material = RequestFingerprintMaterial::new(
+            "018f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
+            "102f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
+            "202f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
+            "mini-1".into(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+            String::new(),
+            30_000,
+            "heavy".into(),
+            command.clone(),
+        )
+        .unwrap();
+        let lease = LeaseRecord::new(&material, material.fingerprint(), 1, 2).unwrap();
+        let host_root = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/mac-worker-\x80-host".to_vec(),
+        ));
+        let home = host_root.join("jobs/job/home");
+        let tmp = host_root.join("jobs/job/tmp");
+
+        let prepared = PreparedCommand::new(&command, &lease, &home, &tmp).unwrap();
+        let environment = prepared
+            ._environment
+            .iter()
+            .map(|entry| entry.as_bytes())
+            .collect::<Vec<_>>();
+        let expected_home = [b"HOME=".as_slice(), home.as_os_str().as_bytes()].concat();
+        let expected_tmpdir = [b"TMPDIR=".as_slice(), tmp.as_os_str().as_bytes()].concat();
+
+        assert!(environment.contains(&expected_home.as_slice()));
+        assert!(environment.contains(&expected_tmpdir.as_slice()));
     }
 
     fn prepared_touch(marker: &Path) -> PreparedCommand {

@@ -21,7 +21,7 @@ use crate::{
     inputs::RelativePath,
     job::{
         ClientId, JobId, JobMeta, JobStatus, LeaseAcquireRequest, LeaseRecord, LeaseToken,
-        RequestFingerprint, SubmitRequest,
+        RequestFingerprint, RequestFingerprintMaterial, SubmitRequest,
     },
     rooted_fs::{PrivateEntryIdentity, RootedDir},
 };
@@ -252,6 +252,34 @@ pub enum JobDisposition {
 }
 
 impl JobDisposition {
+    pub(crate) fn is_exact_abandonment_for(
+        &self,
+        material: &RequestFingerprintMaterial,
+        request_fingerprint: &RequestFingerprint,
+    ) -> bool {
+        let token_hash = format!(
+            "{:x}",
+            Sha256::digest(material.lease_token().to_string().as_bytes())
+        );
+        matches!(
+            self,
+            Self::Abandoned {
+                job_id,
+                client_id,
+                project_id,
+                worktree_id,
+                request_fingerprint: abandoned_fingerprint,
+                lease_token_sha256,
+                ..
+            } if *job_id == material.job_id()
+                && *client_id == material.client_id()
+                && project_id == material.project_id()
+                && worktree_id == material.worktree_id()
+                && abandoned_fingerprint == request_fingerprint
+                && lease_token_sha256 == &token_hash
+        )
+    }
+
     fn validate(&self) -> Result<(), WorkerError> {
         match self {
             Self::Accepted {
@@ -1479,6 +1507,64 @@ impl HostStore {
         Ok(guard)
     }
 
+    pub(crate) fn replace_job_status_after(
+        &self,
+        status: &mut SupervisorGuard,
+        lease: &LeaseRecord,
+        job: &RootedDir,
+        expected_bytes: &[u8],
+        expected: &JobStatus,
+        replacement: &JobStatus,
+    ) -> Result<(), WorkerError> {
+        lease.validate()?;
+        expected.validate()?;
+        expected.transition(replacement.clone())?;
+        status.validate()?;
+        if status.job_id() != lease.job_id() {
+            return Err(protocol_code(
+                "STATUS_CAPABILITY_MISMATCH",
+                "status capability belongs to another job",
+            ));
+        }
+        let canonical_expected = serde_json::to_vec(expected).map_err(|error| {
+            WorkerError::Protocol(format!("failed to serialize job status: {error}"))
+        })?;
+        if canonical_expected != expected_bytes {
+            return Err(protocol_code(
+                "STATUS_CHANGED",
+                "expected status bytes are not canonical for the expected status",
+            ));
+        }
+        let replacement_bytes = serde_json::to_vec(replacement).map_err(|error| {
+            WorkerError::Protocol(format!("failed to serialize job status: {error}"))
+        })?;
+        if replacement_bytes.len() as u64 > MAX_HOST_FILE_BYTES {
+            return Err(WorkerError::Protocol("job status exceeds 1 MiB".into()));
+        }
+        let canonical = self.open_directory(
+            &format!(
+                "jobs/{}/{}/{}",
+                lease.project_id(),
+                lease.worktree_id(),
+                lease.job_id()
+            ),
+            false,
+        )?;
+        job.verify_bound()?;
+        if canonical.identity()? != job.identity()? {
+            return Err(protocol_code(
+                "STATUS_CAPABILITY_MISMATCH",
+                "status target is not the capability's canonical job",
+            ));
+        }
+        status.validate()?;
+        job.replace_private_regular_exact("status.json", expected_bytes, &replacement_bytes)?;
+        status.validate()?;
+        canonical.verify_bound()?;
+        job.verify_bound()?;
+        Ok(())
+    }
+
     pub fn incoming_job(&self, job: JobId, token: LeaseToken) -> Result<PathBuf, WorkerError> {
         self.validate_layout()?;
         Ok(self
@@ -1835,7 +1921,7 @@ impl HostStore {
         }
     }
 
-    #[allow(dead_code)] // Task 7 lifecycle consumes this internal proof writer.
+    #[cfg(test)] // Lease cleanup fixtures create a terminal-only job without running Task 7.
     pub(crate) fn record_terminal_status(
         &self,
         lease: &LeaseRecord,
@@ -2942,8 +3028,16 @@ fn hex_16(bytes: [u8; 16]) -> String {
 #[cfg(test)]
 mod review_regression_tests {
     use super::*;
-    use crate::job::{ClientId, CommandSpec, LeaseToken, RequestFingerprintMaterial};
-    use std::{fs, os::unix::fs::PermissionsExt, sync::mpsc, thread, time::Duration};
+    use crate::job::{
+        ClientId, CommandSpec, LeaseToken, ProcessIdentity, RequestFingerprintMaterial,
+    };
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, Barrier, mpsc},
+        thread,
+        time::Duration,
+    };
     use tempfile::tempdir;
 
     fn installation_entries(parent: &Path) -> Vec<PathBuf> {
@@ -3690,6 +3784,102 @@ mod review_regression_tests {
                 .supervisor_lock_after(&admission, job, false)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn task7_status_capability_serializes_expected_value_writers() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request(75);
+        let material = request.material();
+        let lease =
+            LeaseRecord::new(material, request.request_fingerprint().clone(), 1, 60_001).unwrap();
+        let job = store
+            .open_directory(
+                &format!(
+                    "jobs/{}/{}/{}",
+                    lease.project_id(),
+                    lease.worktree_id(),
+                    lease.job_id()
+                ),
+                true,
+            )
+            .unwrap();
+        let initial = JobStatus::accepted(1).unwrap();
+        let initial_bytes = serde_json::to_vec(&initial).unwrap();
+        job.write_private_atomic_no_replace("status.json", &initial_bytes)
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let outcomes = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (pid, start, updated) in [(7001, 70_001, 2), (7002, 70_002, 3)] {
+                let store = store.clone();
+                let lease = lease.clone();
+                let barrier = Arc::clone(&barrier);
+                let initial = initial.clone();
+                let initial_bytes = initial_bytes.clone();
+                handles.push(scope.spawn(move || {
+                    let replacement = initial
+                        .with_supervisor(ProcessIdentity::new(pid, start).unwrap(), updated)
+                        .unwrap();
+                    let job = store
+                        .open_directory(
+                            &format!(
+                                "jobs/{}/{}/{}",
+                                lease.project_id(),
+                                lease.worktree_id(),
+                                lease.job_id()
+                            ),
+                            false,
+                        )
+                        .unwrap();
+                    barrier.wait();
+                    let admission = store.admission_lock(lease.job_id()).unwrap();
+                    let mut status = store
+                        .supervisor_lock_after(&admission, lease.job_id(), true)
+                        .unwrap()
+                        .unwrap();
+                    drop(admission);
+                    let committed = store
+                        .replace_job_status_after(
+                            &mut status,
+                            &lease,
+                            &job,
+                            &initial_bytes,
+                            &initial,
+                            &replacement,
+                        )
+                        .is_ok();
+                    (replacement, committed)
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let winners = outcomes
+            .iter()
+            .filter(|(_, committed)| *committed)
+            .map(|(replacement, _)| replacement)
+            .collect::<Vec<_>>();
+        assert_eq!(winners.len(), 1, "exactly one expected-value write commits");
+        let canonical: JobStatus =
+            read_json_strict_at(&job, "status.json").expect("canonical winner remains readable");
+        assert_eq!(
+            &canonical, winners[0],
+            "the loser never replaces the winner"
+        );
+        assert!(
+            job.list_names()
+                .unwrap()
+                .iter()
+                .all(|name| !name.starts_with(b".replace-")),
+            "conditional replacement residue remains"
         );
     }
 

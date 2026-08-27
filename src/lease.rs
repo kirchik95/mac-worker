@@ -68,7 +68,7 @@ impl<'a> LeaseService<'a> {
         let guard = self.store.admission_lock(request.material().job_id())?;
         guard.validate()?;
         if let Some(disposition) = self.store.disposition(request.material().job_id())? {
-            return match disposition {
+            return match &disposition {
                 JobDisposition::Accepted {
                     client_id,
                     project_id,
@@ -76,17 +76,26 @@ impl<'a> LeaseService<'a> {
                     request_fingerprint,
                     status,
                     ..
-                } if client_id == request.material().client_id()
+                } if *client_id == request.material().client_id()
                     && project_id == request.material().project_id()
                     && worktree_id == request.material().worktree_id()
-                    && request_fingerprint == *request.request_fingerprint() =>
+                    && request_fingerprint == request.request_fingerprint() =>
                 {
-                    Ok(LeaseAcquireResponse::ExistingAccepted { status })
+                    Ok(LeaseAcquireResponse::ExistingAccepted {
+                        status: status.clone(),
+                    })
                 }
-                JobDisposition::Abandoned { .. } => Err(protocol_code(
-                    "JOB_ABANDONED",
-                    "job ID was permanently abandoned",
-                )),
+                JobDisposition::Abandoned { .. }
+                    if disposition.is_exact_abandonment_for(
+                        request.material(),
+                        request.request_fingerprint(),
+                    ) =>
+                {
+                    Err(protocol_code(
+                        "JOB_ABANDONED",
+                        "job ID was permanently abandoned",
+                    ))
+                }
                 _ => Err(protocol_code(
                     "JOB_ID_CONFLICT",
                     "job ID belongs to another immutable request",

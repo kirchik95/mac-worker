@@ -428,6 +428,39 @@ fn accepted_and_abandoned_dispositions_fence_job_ids_without_leases() {
 }
 
 #[test]
+fn mismatched_same_job_abandonment_is_a_conflict_during_lease_acquisition() {
+    let temp = tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let abandoned = request(3);
+    store.record_abandoned(&abandoned, 100).unwrap();
+    let different_client = request(4).material().client_id();
+    let material = abandoned.material();
+    let mismatched = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            material.job_id(),
+            different_client,
+            material.lease_token(),
+            material.worker_name().into(),
+            material.project_id().into(),
+            material.worktree_id().into(),
+            material.manifest_digest().into(),
+            material.relative_working_dir().into(),
+            material.timeout_millis(),
+            material.resource_class().into(),
+            material.command().clone(),
+        )
+        .unwrap(),
+    );
+
+    let error = LeaseService::new(&store)
+        .acquire(&mismatched, &healthy(), 200)
+        .unwrap_err();
+
+    assert!(matches!(error, WorkerError::Protocol(message) if message.contains("JOB_ID_CONFLICT")));
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
 fn accepted_disposition_embedded_job_id_must_match_canonical_filename() {
     let temp = tempdir().unwrap();
     let root = temp.path().join("host");

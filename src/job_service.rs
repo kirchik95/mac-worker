@@ -196,7 +196,7 @@ impl<'a> JobService<'a> {
         require_exact_lease(&lease, &request)?;
 
         if let Some(disposition) = self.store.disposition(job_id)? {
-            let status = require_matching_accepted(&disposition, &request)?;
+            require_matching_accepted(&disposition, &request)?;
             let (_, authoritative) = self.read_exact_job(&request, &lease)?;
             self.store.repair_indexed_publication_after(
                 &admission,
@@ -225,9 +225,7 @@ impl<'a> JobService<'a> {
                 }
                 None => {
                     drop(admission);
-                    Ok(SubmitResponse::Existing {
-                        status: self.wait_for_existing_supervisor(&request, &lease, status)?,
-                    })
+                    self.wait_for_existing_supervisor(&request, &lease)
                 }
             };
         }
@@ -254,9 +252,7 @@ impl<'a> JobService<'a> {
                 Some(guard) => {
                     self.launch_after_election(job_id, guard, &request, &lease, &verified, false)
                 }
-                None => Ok(SubmitResponse::Existing {
-                    status: self.wait_for_existing_supervisor(&request, &lease, status)?,
-                }),
+                None => self.wait_for_existing_supervisor(&request, &lease),
             };
         }
         let mut staged = self.store.begin_job_after(
@@ -427,17 +423,66 @@ impl<'a> JobService<'a> {
         &self,
         request: &SubmitRequest,
         lease: &LeaseRecord,
-        initial: JobStatus,
-    ) -> Result<JobStatus, WorkerError> {
+    ) -> Result<SubmitResponse, WorkerError> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let (_, status) = self.read_exact_job(request, lease)?;
             if status.supervisor_identity().is_some() || status.state().is_terminal() {
                 reject_prelaunch_terminal(&status)?;
-                return Ok(status);
+                return Ok(SubmitResponse::Existing { status });
             }
             if Instant::now() >= deadline {
-                return Ok(initial);
+                let job_id = request.material().job_id();
+                let admission = self.store.admission_lock(job_id)?;
+                let authoritative_lease =
+                    self.leases.load_after(&admission, job_id)?.ok_or_else(|| {
+                        protocol_code("LEASE_MISSING", "matching live lease is absent")
+                    })?;
+                require_exact_lease(&authoritative_lease, request)?;
+                let (_, status) = self.read_exact_job(request, &authoritative_lease)?;
+                self.store.repair_indexed_publication_after(
+                    &admission,
+                    request.material().project_id(),
+                    request.material().worktree_id(),
+                    job_id,
+                )?;
+                if status.supervisor_identity().is_some() || status.state().is_terminal() {
+                    drop(admission);
+                    reject_prelaunch_terminal(&status)?;
+                    return Ok(SubmitResponse::Existing { status });
+                }
+                if status.state() != JobState::Accepted || status.child_identity().is_some() {
+                    drop(admission);
+                    return Err(protocol_code(
+                        "JOB_ID_CONFLICT",
+                        "supervisor retry found a non-prelaunch job state",
+                    ));
+                }
+                let supervisor = self
+                    .store
+                    .supervisor_lock_after(&admission, job_id, false)?;
+                return match supervisor {
+                    Some(guard) => {
+                        let verified = self.snapshots.load_verified_for_accepted_after(
+                            &admission,
+                            &authoritative_lease,
+                            request.request_fingerprint(),
+                        )?;
+                        drop(admission);
+                        self.launch_after_election(
+                            job_id,
+                            guard,
+                            request,
+                            &authoritative_lease,
+                            &verified,
+                            false,
+                        )
+                    }
+                    None => {
+                        drop(admission);
+                        Ok(SubmitResponse::Existing { status })
+                    }
+                };
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -785,10 +830,15 @@ fn require_matching_accepted(
             status.validate()?;
             Ok(status.clone())
         }
-        JobDisposition::Abandoned { .. } => Err(protocol_code(
-            "JOB_ABANDONED",
-            "job ID was permanently abandoned",
-        )),
+        JobDisposition::Abandoned { .. }
+            if disposition
+                .is_exact_abandonment_for(request.material(), request.request_fingerprint()) =>
+        {
+            Err(protocol_code(
+                "JOB_ABANDONED",
+                "job ID was permanently abandoned",
+            ))
+        }
         _ => Err(protocol_code(
             "JOB_ID_CONFLICT",
             "job ID belongs to another immutable request",

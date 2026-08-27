@@ -5,8 +5,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Barrier,
+        Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -153,6 +154,8 @@ fn prepared_host_with_nested_cwd(
     command: CommandSpec,
 ) -> (HostStore, LeaseRecord, SubmitRequest) {
     let store = HostStore::open(root).unwrap();
+    let script = b"#!/bin/sh\nprintf '%s' \"$1\"\n";
+    let script_digest = format!("{:x}", Sha256::digest(script));
     let manifest = format!(
         concat!(
             r#"{{"version":1,"project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
@@ -161,10 +164,13 @@ fn prepared_host_with_nested_cwd(
             r#""sha256":"4b66bf93b3932a9539880b2421e35019af9daf84363a0246280ffcac173b2678","#,
             r#""symlink_target":null}},{{"path":"nested/payload.txt","kind":"file","mode":420,"size":7,"#,
             r#""sha256":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5","#,
-            r#""symlink_target":null}}],"tracked_deletions":[]}}"#,
+            r#""symlink_target":null}},{{"path":"nested/run-argv","kind":"file","mode":493,"size":{SCRIPT_SIZE},"#,
+            r#""sha256":"{SCRIPT_DIGEST}","symlink_target":null}}],"tracked_deletions":[]}}"#,
         ),
         PROJECT_ID = PROJECT_ID,
         WORKTREE_ID = WORKTREE_ID,
+        SCRIPT_SIZE = script.len(),
+        SCRIPT_DIGEST = script_digest,
     )
     .into_bytes();
     let digest = format!("{:x}", Sha256::digest(&manifest));
@@ -204,6 +210,7 @@ fn prepared_host_with_nested_cwd(
     }
     fs::write(incoming.join("manifest.json"), manifest).unwrap();
     fs::write(incoming.join("tree/nested/payload.txt"), b"payload").unwrap();
+    fs::write(incoming.join("tree/nested/run-argv"), script).unwrap();
     fs::set_permissions(
         incoming.join("manifest.json"),
         fs::Permissions::from_mode(0o444),
@@ -212,6 +219,11 @@ fn prepared_host_with_nested_cwd(
     fs::set_permissions(
         incoming.join("tree/nested/payload.txt"),
         fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(
+        incoming.join("tree/nested/run-argv"),
+        fs::Permissions::from_mode(0o555),
     )
     .unwrap();
     fs::set_permissions(
@@ -320,6 +332,16 @@ struct FailingLauncher {
     launches: Arc<AtomicUsize>,
 }
 
+struct CapturedPreidentityLauncher {
+    held: Arc<Mutex<Option<SupervisorGuard>>>,
+    entered: mpsc::Sender<()>,
+}
+
+struct CountingInlineSupervisorLauncher {
+    store: HostStore,
+    launches: Arc<AtomicUsize>,
+}
+
 impl SupervisorLauncher for FailingLauncher {
     fn launch(
         &self,
@@ -330,6 +352,34 @@ impl SupervisorLauncher for FailingLauncher {
         Err(mac_worker::error::WorkerError::Protocol(
             "injected launcher failure".into(),
         ))
+    }
+}
+
+impl SupervisorLauncher for CapturedPreidentityLauncher {
+    fn launch(
+        &self,
+        _job_id: mac_worker::job::JobId,
+        guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+        *self.held.lock().unwrap() = Some(guard);
+        self.entered.send(()).unwrap();
+        Ok(LaunchCandidate::new(
+            ProcessIdentity::new(99_001, 9_900_001).unwrap(),
+        ))
+    }
+}
+
+impl SupervisorLauncher for CountingInlineSupervisorLauncher {
+    fn launch(
+        &self,
+        job_id: mac_worker::job::JobId,
+        guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        let inspector = SystemProcessInspector;
+        let identity = inspector.identity_for_pid(std::process::id())?;
+        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Ok(LaunchCandidate::new(identity))
     }
 }
 
@@ -677,6 +727,41 @@ fn submit_conflicts_on_changed_request_and_honours_an_abandonment_tombstone() {
         .submit_at(abandoned_request, 4)
         .unwrap_err();
     assert!(error.to_string().contains("JOB_ABANDONED"));
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn submit_treats_a_mismatched_same_job_abandonment_as_a_conflict() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    store
+        .record_abandoned(&LeaseAcquireRequest::new(request.material().clone()), 3)
+        .unwrap();
+    let disposition_path = store.job_index(request.material().job_id()).unwrap();
+    let disposition = fs::read_to_string(&disposition_path).unwrap();
+    fs::write(
+        disposition_path,
+        disposition.replacen(
+            &request.material().client_id().to_string(),
+            "ffffffffffffffffffffffffffffffff",
+            1,
+        ),
+    )
+    .unwrap();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launcher = RecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap(),
+        identity: ProcessIdentity::new(41_004, 4_100_004).unwrap(),
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 4)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
     assert_eq!(launches.load(Ordering::SeqCst), 0);
 }
 
@@ -1281,6 +1366,81 @@ fn sixty_four_concurrent_identical_submits_publish_and_launch_exactly_once() {
     assert_eq!(launches.load(Ordering::SeqCst), 1);
     assert!(job_path.is_dir());
     assert!(store.job_index(lease.job_id()).unwrap().is_file());
+}
+
+#[test]
+fn dead_preidentity_owner_is_reelected_once_after_the_bounded_wait() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, _lease, request) = prepared_host(&temp.path().join("dead-owner"));
+    let held = Arc::new(Mutex::new(None));
+    let (entered, observed) = mpsc::channel();
+    let first_store = store.clone();
+    let first_request = request.clone();
+    let first_held = Arc::clone(&held);
+    let first = std::thread::spawn(move || {
+        let launcher = CapturedPreidentityLauncher {
+            held: first_held,
+            entered,
+        };
+        JobService::new(&first_store, &launcher).submit_at(first_request, 10)
+    });
+    observed.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let retry_store = store.clone();
+    let retry_request = request.clone();
+    let retry_launches = Arc::clone(&launches);
+    let retry = std::thread::spawn(move || {
+        let launcher = CountingInlineSupervisorLauncher {
+            store: retry_store.clone(),
+            launches: retry_launches,
+        };
+        JobService::new(&retry_store, &launcher).submit_at(retry_request, 11)
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    drop(held.lock().unwrap().take());
+
+    let response = retry.join().unwrap().unwrap();
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert!(response.status().supervisor_identity().is_some());
+    assert!(response.status().child_identity().is_some());
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert!(first.join().unwrap().is_err());
+}
+
+#[test]
+fn still_busy_preidentity_owner_remains_ambiguous_without_a_second_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host(&temp.path().join("busy-owner"));
+    let held = Arc::new(Mutex::new(None));
+    let (entered, observed) = mpsc::channel();
+    let first_store = store.clone();
+    let first_request = request.clone();
+    let first_held = Arc::clone(&held);
+    let first = std::thread::spawn(move || {
+        let launcher = CapturedPreidentityLauncher {
+            held: first_held,
+            entered,
+        };
+        JobService::new(&first_store, &launcher).submit_at(first_request, 10)
+    });
+    observed.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launcher = FailingLauncher {
+        launches: Arc::clone(&launches),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 11)
+        .unwrap();
+
+    assert_eq!(response.status().state(), JobState::Accepted);
+    assert!(response.status().supervisor_identity().is_none());
+    assert!(response.status().child_identity().is_none());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    drop(held.lock().unwrap().take());
+    assert!(first.join().unwrap().is_err());
 }
 
 #[test]
@@ -1918,6 +2078,35 @@ fn nested_manifest_cwd_and_bare_executable_use_descriptor_root_and_fixed_path() 
         fs::read(job.join("stdout.log")).unwrap(),
         format!("{}\n", physical_job.join("workspace/tree/nested").display()).as_bytes()
     );
+}
+
+#[test]
+fn relative_slash_argv_executes_exact_script_from_descriptor_bound_cwd() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("must-not-exist");
+    let literal = format!("; touch {}", marker.display());
+    let (store, lease, request) = prepared_host_with_nested_cwd(
+        &temp.path().join("relative-script"),
+        CommandSpec::argv(vec!["./run-argv".into(), literal.clone()]).unwrap(),
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert_eq!(
+        fs::read(job.join("stdout.log")).unwrap(),
+        literal.as_bytes()
+    );
+    assert_eq!(fs::read(job.join("stderr.log")).unwrap(), b"");
+    assert!(!marker.exists(), "relative argv was interpreted by a shell");
 }
 
 #[test]
