@@ -6,6 +6,8 @@ use std::{
 
 use crate::error::WorkerError;
 
+const HOST_STATE_DIRECTORY: &str = "host";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathLayout {
     pub config: PathBuf,
@@ -36,6 +38,12 @@ impl PathLayout {
             cache: cache_home.join("mac-worker"),
             data: data_home.join("mac-worker"),
         })
+    }
+
+    /// Returns the fixed worker-owned execution root beneath the installer data container.
+    #[must_use]
+    pub fn host_state_root(&self) -> PathBuf {
+        self.data.join(HOST_STATE_DIRECTORY)
     }
 }
 
@@ -124,6 +132,48 @@ mod tests {
         assert_eq!(
             paths.config,
             PathBuf::from(config_home).join("mac-worker/config.toml")
+        );
+    }
+
+    #[test]
+    fn host_state_root_is_a_fixed_child_of_the_default_data_container() {
+        let paths =
+            PathLayout::discover(None, &BTreeMap::new(), Path::new("/Users/tester")).unwrap();
+
+        assert_eq!(
+            paths.host_state_root(),
+            PathBuf::from("/Users/tester/.local/share/mac-worker/host")
+        );
+    }
+
+    #[test]
+    fn host_state_root_uses_the_absolute_xdg_data_container() {
+        let paths = PathLayout::discover(
+            None,
+            &BTreeMap::from([("XDG_DATA_HOME".into(), "/srv/worker-data".into())]),
+            Path::new("/Users/tester"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            paths.host_state_root(),
+            PathBuf::from("/srv/worker-data/mac-worker/host")
+        );
+    }
+
+    #[test]
+    fn host_state_root_joins_non_utf8_xdg_data_without_text_conversion() {
+        let data_home = OsString::from_vec(b"/tmp/data-\xff".to_vec());
+        let paths = PathLayout::discover(
+            None,
+            &BTreeMap::from([("XDG_DATA_HOME".into(), data_home.clone())]),
+            Path::new("/Users/tester"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            paths.host_state_root(),
+            PathBuf::from(data_home).join("mac-worker/host")
         );
     }
 }

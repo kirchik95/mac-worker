@@ -145,8 +145,8 @@ fn execute_with_context(
             command: HostCommand::Probe,
         } => {
             let paths = discover_paths(cli.config, runtime)?;
-            Ok(CommandOutput::Probe(ProbeCollector::collect_at(
-                &paths.data,
+            Ok(CommandOutput::Probe(ProbeCollector::collect_for_paths(
+                &paths,
             )?))
         }
         Command::Host {
@@ -256,14 +256,15 @@ fn run_host_lease_acquire(
             WorkerError::Protocol("lease-acquire request contained trailing data".into())
         })?;
         let paths = discover_paths(config_override, runtime)?;
-        let probe = ProbeCollector::collect_at(&paths.data)?;
+        let host_state_root = paths.host_state_root();
+        let probe = ProbeCollector::collect_at(&host_state_root)?;
         let facts = AdmissionFacts {
             free_disk_bytes: probe.free_disk_bytes,
             total_disk_bytes: probe.total_disk_bytes,
             memory_pressure: probe.memory_pressure,
             swap_used_bytes: probe.swap_used_bytes,
         };
-        let store = HostStore::open(&paths.data)?;
+        let store = HostStore::open(&host_state_root)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| WorkerError::Protocol("system clock predates Unix epoch".into()))?

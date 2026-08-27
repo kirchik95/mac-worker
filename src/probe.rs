@@ -11,6 +11,7 @@ use std::ffi::{c_char, c_int, c_void};
 use crate::{
     error::WorkerError,
     lease::{LeaseService, SlotState},
+    paths::PathLayout,
     process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse},
 };
@@ -143,11 +144,18 @@ impl ProbeCollector {
             .map(PathBuf::from)
             .unwrap_or_default();
         let env = std::env::vars_os().collect();
-        let paths = crate::paths::PathLayout::discover(None, &env, &home)?;
-        Self::collect_at(&paths.data)
+        let paths = PathLayout::discover(None, &env, &home)?;
+        Self::collect_for_paths(&paths)
     }
 
-    pub fn collect_at(data_root: &Path) -> Result<ProbeResponse, WorkerError> {
+    pub(crate) fn collect_for_paths(paths: &PathLayout) -> Result<ProbeResponse, WorkerError> {
+        Self::collect_at(&paths.host_state_root())
+    }
+
+    /// Collects host facts and occupancy for an already selected host-state root.
+    ///
+    /// This low-level boundary does not accept the enclosing installer data container.
+    pub fn collect_at(host_state_root: &Path) -> Result<ProbeResponse, WorkerError> {
         let search_paths = CONTROLLED_HOST_PATHS
             .iter()
             .map(PathBuf::from)
@@ -159,10 +167,10 @@ impl ProbeCollector {
             std::env::consts::OS,
             std::env::consts::ARCH,
         )?;
-        let (free, total) = filesystem_capacity(data_root)?;
+        let (free, total) = filesystem_capacity(host_state_root)?;
         response.free_disk_bytes = free;
         response.total_disk_bytes = total;
-        let occupancy = LeaseService::load_if_present(data_root)?;
+        let occupancy = LeaseService::load_if_present(host_state_root)?;
         response.slot_state = occupancy.slot_state;
         response.active_lease = occupancy.active_lease;
         Ok(response)

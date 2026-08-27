@@ -22,6 +22,7 @@ use mac_worker::{
         LeaseToken, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService, SlotState},
+    paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner},
     protocol::MemoryPressure,
     run_with_stdio_in_context,
@@ -488,6 +489,106 @@ fn read_only_absent_probe_is_idle_and_does_not_create_root() {
     assert_eq!(occupancy.slot_state, SlotState::Idle);
     assert!(occupancy.active_lease.is_none());
     assert!(!root.exists());
+}
+
+#[test]
+fn setup_container_is_isolated_from_production_probe_and_lease_acquire() {
+    let temp = tempdir().unwrap();
+    let environment = BTreeMap::from([(
+        OsString::from("XDG_DATA_HOME"),
+        temp.path().join("data").into_os_string(),
+    )]);
+    let home = temp.path().join("home");
+    let paths = PathLayout::discover(None, &environment, &home).unwrap();
+    fs::create_dir_all(paths.data.join("setup")).unwrap();
+    fs::set_permissions(&paths.data, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(paths.data.join("setup"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(paths.data.join("setup/sentinel"), b"setup-owned").unwrap();
+    let host_root = paths.host_state_root();
+    let runtime = RuntimeContext::isolated(environment, home, temp.path().to_path_buf());
+    let cli = Cli::try_parse_from(["worker", "host", "probe"]).unwrap();
+    let mut stdin = Cursor::new(Vec::<u8>::new());
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_with_stdio_in_context(
+        cli,
+        &NoProcess,
+        &runtime,
+        &mut stdin,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(
+        exit,
+        0,
+        "host probe failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(stderr.is_empty());
+    let response: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(response["slot_state"], "idle");
+    assert!(response["active_lease"].is_null());
+    let entries = fs::read_dir(&paths.data)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, [OsString::from("setup")]);
+    assert!(!host_root.exists());
+
+    let lease_request = request(901);
+    let store = HostStore::open(&host_root).unwrap();
+    let acquired = LeaseService::new(&store)
+        .acquire(&lease_request, &healthy(), 1)
+        .unwrap();
+    drop(store);
+
+    let cli = Cli::try_parse_from(["worker", "host", "lease-acquire"]).unwrap();
+    let mut stdin = Cursor::new(serde_json::to_vec(&lease_request).unwrap());
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_stdio_in_context(
+        cli,
+        &NoProcess,
+        &runtime,
+        &mut stdin,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(
+        exit,
+        0,
+        "host lease-acquire failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<LeaseAcquireResponse>(&stdout).unwrap(),
+        acquired
+    );
+    assert_eq!(
+        fs::read(paths.data.join("setup/sentinel")).unwrap(),
+        b"setup-owned"
+    );
+    assert!(host_root.join("leases/heavy/lease.json").is_file());
+    let entries = fs::read_dir(&paths.data)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 5);
+    assert!(entries.contains(&OsString::from("setup")));
+    assert!(entries.contains(&OsString::from("host")));
+    assert!(entries.contains(&OsString::from(".mac-worker-rooted-fs")));
+    let anchors = entries
+        .iter()
+        .filter_map(|entry| entry.to_str())
+        .filter(|entry| entry.starts_with(".mac-worker-installation-"))
+        .collect::<Vec<_>>();
+    assert_eq!(anchors.len(), 2);
+    assert!(anchors.iter().any(|entry| entry.ends_with(".lock")));
+    assert!(anchors.iter().any(|entry| entry.ends_with(".json")));
 }
 
 #[test]
