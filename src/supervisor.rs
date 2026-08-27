@@ -2229,7 +2229,7 @@ mod tests {
     use super::*;
     use std::{
         fs::{self, OpenOptions},
-        os::unix::ffi::OsStringExt,
+        os::unix::{ffi::OsStringExt, process::CommandExt},
         process::Command,
         sync::{
             Mutex,
@@ -2416,13 +2416,22 @@ mod tests {
 
     struct RawProcessGroupGuard {
         leader: libc::pid_t,
+        identity: Option<ProcessIdentity>,
         armed: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RawChildAnchor {
+        Live,
+        Waitable,
+        Reaped,
     }
 
     impl RawProcessGroupGuard {
         fn new(leader: libc::pid_t) -> Self {
             Self {
                 leader,
+                identity: None,
                 armed: true,
             }
         }
@@ -2431,8 +2440,160 @@ mod tests {
             self.leader
         }
 
-        fn disarm(&mut self) {
+        fn bind_identity(&mut self, identity: ProcessIdentity) {
+            assert_eq!(identity.pid(), self.leader as u32);
+            assert!(self.identity.replace(identity).is_none());
+        }
+
+        fn finish(&mut self) -> Result<(), WorkerError> {
+            self.cleanup_owned()
+        }
+
+        fn cleanup_owned(&mut self) -> Result<(), WorkerError> {
+            if !self.armed {
+                return Ok(());
+            }
+            let anchor = raw_child_anchor(self.leader)?;
+            if anchor == RawChildAnchor::Reaped {
+                self.armed = false;
+                return match SystemProcessInspector.observe_group(self.leader as u32) {
+                    ProcessGroupObservation::Absent => Ok(()),
+                    ProcessGroupObservation::Present | ProcessGroupObservation::Ambiguous => {
+                        Err(protocol_code(
+                            "RAW_GROUP_CHILD_ANCHOR_LOST",
+                            "raw process-group cleanup lost its direct-child anchor",
+                        ))
+                    }
+                };
+            }
+            let Some(identity) = self.identity else {
+                return self.cleanup_unbound_child(anchor);
+            };
+            if anchor == RawChildAnchor::Live
+                && !matches!(
+                    SystemProcessInspector.observe(identity),
+                    ProcessObservation::Matching { process_group }
+                        if process_group == identity.pid()
+                )
+            {
+                self.cleanup_unbound_child(anchor)?;
+                return Err(protocol_code(
+                    "RAW_GROUP_IDENTITY_LOST",
+                    "raw process-group cleanup lost its bound live identity",
+                ));
+            }
+
+            match SystemProcessInspector.observe_group_members(identity.pid()) {
+                ProcessGroupMembership::LeaderOnly if anchor == RawChildAnchor::Live => {
+                    if unsafe { libc::kill(self.leader, libc::SIGKILL) } != 0 {
+                        let error = io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::ESRCH) {
+                            return Err(WorkerError::Io(error));
+                        }
+                    }
+                }
+                ProcessGroupMembership::LeaderOnly => {}
+                ProcessGroupMembership::OtherMembers | ProcessGroupMembership::Ambiguous => {
+                    if unsafe { libc::kill(-self.leader, libc::SIGKILL) } != 0 {
+                        let error = io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::ESRCH) {
+                            return Err(WorkerError::Io(error));
+                        }
+                    }
+                }
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match raw_child_anchor(self.leader)? {
+                    RawChildAnchor::Waitable => break,
+                    RawChildAnchor::Live if Instant::now() < deadline => {
+                        std::thread::yield_now();
+                    }
+                    RawChildAnchor::Live => {
+                        return Err(protocol_code(
+                            "RAW_GROUP_CLEANUP_TIMEOUT",
+                            "raw group leader did not become waitable after exact cleanup",
+                        ));
+                    }
+                    RawChildAnchor::Reaped => {
+                        self.armed = false;
+                        return Err(protocol_code(
+                            "RAW_GROUP_CHILD_ANCHOR_LOST",
+                            "raw group leader was reaped outside exact cleanup",
+                        ));
+                    }
+                }
+            }
+            loop {
+                match SystemProcessInspector.observe_group_members(identity.pid()) {
+                    ProcessGroupMembership::LeaderOnly => break,
+                    ProcessGroupMembership::OtherMembers | ProcessGroupMembership::Ambiguous
+                        if Instant::now() < deadline =>
+                    {
+                        std::thread::yield_now();
+                    }
+                    ProcessGroupMembership::OtherMembers | ProcessGroupMembership::Ambiguous => {
+                        return Err(protocol_code(
+                            "RAW_GROUP_CLEANUP_TIMEOUT",
+                            "raw group descendants did not terminate while the leader was anchored",
+                        ));
+                    }
+                }
+            }
+            wait_blocking(self.leader)?;
             self.armed = false;
+            wait_for_terminated_group_absence(identity, &SystemProcessInspector)
+        }
+
+        fn cleanup_unbound_child(&mut self, anchor: RawChildAnchor) -> Result<(), WorkerError> {
+            // A successful WNOWAIT probe with no event still proves this PID is
+            // our live direct child. It authorizes the positive-PID signal,
+            // but never a process-group signal without the bound start/PGID.
+            if anchor == RawChildAnchor::Live
+                && unsafe { libc::kill(self.leader, libc::SIGKILL) } != 0
+            {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(WorkerError::Io(error));
+                }
+            }
+            if anchor == RawChildAnchor::Live {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while raw_child_anchor(self.leader)? == RawChildAnchor::Live {
+                    if Instant::now() >= deadline {
+                        return Err(protocol_code(
+                            "RAW_CHILD_CLEANUP_TIMEOUT",
+                            "unbound raw child did not become waitable after exact PID cleanup",
+                        ));
+                    }
+                    std::thread::yield_now();
+                }
+            }
+            if raw_child_anchor(self.leader)? == RawChildAnchor::Waitable {
+                wait_blocking(self.leader)?;
+            }
+            self.armed = false;
+            match SystemProcessInspector.observe_group(self.leader as u32) {
+                ProcessGroupObservation::Absent => Ok(()),
+                ProcessGroupObservation::Present | ProcessGroupObservation::Ambiguous => {
+                    Err(protocol_code(
+                        "RAW_GROUP_IDENTITY_MISSING",
+                        "raw child was reaped without authority to signal its process group",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn raw_child_anchor(pid: libc::pid_t) -> Result<RawChildAnchor, WorkerError> {
+        match child_is_waitable(pid) {
+            Ok(true) => Ok(RawChildAnchor::Waitable),
+            Ok(false) => Ok(RawChildAnchor::Live),
+            Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::ECHILD) => {
+                Ok(RawChildAnchor::Reaped)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -2441,32 +2602,12 @@ mod tests {
             if !self.armed {
                 return;
             }
-            unsafe {
-                libc::kill(-self.leader, libc::SIGKILL);
-                libc::kill(self.leader, libc::SIGKILL);
-            }
-            let mut status = 0;
-            loop {
-                let result = unsafe { libc::waitpid(self.leader, &raw mut status, 0) };
-                if result == self.leader {
-                    break;
-                }
-                if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                break;
-            }
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                if unsafe { libc::kill(-self.leader, 0) } != 0
-                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(POLL_INTERVAL);
+            assert!(
+                std::thread::panicking(),
+                "armed raw process-group guard requires explicit cleanup"
+            );
+            if self.cleanup_owned().is_err() && self.armed {
+                std::process::abort();
             }
         }
     }
@@ -2547,7 +2688,8 @@ mod tests {
                 libc::_exit(exit_code as i32);
             }
         }
-        let cleanup = RawProcessGroupGuard::new(pid);
+        let mut cleanup = RawProcessGroupGuard::new(pid);
+        cleanup.bind_identity(wait_for_group_identity(pid));
         assert_eq!(unsafe { libc::close(descriptors[0]) }, 0);
         (cleanup, unsafe { OwnedFd::from_raw_fd(descriptors[1]) })
     }
@@ -2586,7 +2728,8 @@ mod tests {
                 }
             }
         }
-        let cleanup = RawProcessGroupGuard::new(leader);
+        let mut cleanup = RawProcessGroupGuard::new(leader);
+        cleanup.bind_identity(wait_for_group_identity(leader));
         assert_eq!(unsafe { libc::close(descriptors[1]) }, 0);
         let mut descendant = 0;
         let read = unsafe {
@@ -2599,6 +2742,63 @@ mod tests {
         assert_eq!(read as usize, std::mem::size_of::<libc::pid_t>());
         assert_eq!(unsafe { libc::close(descriptors[0]) }, 0);
         (cleanup, descendant)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_group_with_releasable_descendant() -> (RawProcessGroupGuard, libc::pid_t, OwnedFd) {
+        let mut report = [-1; 2];
+        let mut release = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(report.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        let leader = unsafe { libc::fork() };
+        assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
+        if leader == 0 {
+            unsafe {
+                libc::close(report[0]);
+                libc::close(release[1]);
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(70);
+                }
+                let descendant = libc::fork();
+                if descendant < 0 {
+                    libc::_exit(70);
+                }
+                if descendant == 0 {
+                    let own_pid = libc::getpid();
+                    libc::write(
+                        report[1],
+                        (&raw const own_pid).cast(),
+                        std::mem::size_of::<libc::pid_t>(),
+                    );
+                    libc::close(report[1]);
+                    let mut byte = 0_u8;
+                    libc::read(release[0], (&raw mut byte).cast(), 1);
+                    libc::_exit(0);
+                }
+                libc::close(report[1]);
+                libc::close(release[0]);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        let mut cleanup = RawProcessGroupGuard::new(leader);
+        cleanup.bind_identity(wait_for_group_identity(leader));
+        assert_eq!(unsafe { libc::close(report[1]) }, 0);
+        assert_eq!(unsafe { libc::close(release[0]) }, 0);
+        let mut descendant = 0;
+        let read = unsafe {
+            libc::read(
+                report[0],
+                (&raw mut descendant).cast(),
+                std::mem::size_of::<libc::pid_t>(),
+            )
+        };
+        assert_eq!(read as usize, std::mem::size_of::<libc::pid_t>());
+        assert_eq!(unsafe { libc::close(report[0]) }, 0);
+        (cleanup, descendant, unsafe {
+            OwnedFd::from_raw_fd(release[1])
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -2632,7 +2832,8 @@ mod tests {
                 libc::_exit(exit_code as i32);
             }
         }
-        let cleanup = RawProcessGroupGuard::new(leader);
+        let mut cleanup = RawProcessGroupGuard::new(leader);
+        cleanup.bind_identity(wait_for_group_identity(leader));
         assert_eq!(unsafe { libc::close(release[0]) }, 0);
         assert_eq!(unsafe { libc::close(ready[1]) }, 0);
         let mut ready_byte = 0_u8;
@@ -2652,6 +2853,32 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn fence_test_subprocess_descriptors(command: &mut Command) -> Result<(), WorkerError> {
+        let descriptor_ceiling = descriptor_ceiling()?;
+        unsafe {
+            command.pre_exec(move || {
+                let mut descriptor = 3;
+                while descriptor < descriptor_ceiling {
+                    let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                    if flags < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::EBADF) {
+                            return Err(error);
+                        }
+                    } else if flags & libc::FD_CLOEXEC == 0
+                        && libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    descriptor += 1;
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
     fn run_isolated_raw_fork_scenario<F>(test_name: &'static str, scenario: F)
     where
         F: FnOnce(),
@@ -2660,6 +2887,8 @@ mod tests {
         const SENTINEL_FD_ENV: &str = "MAC_WORKER_TEST_RAW_FORK_SENTINEL_FD";
         const SENTINEL_DEVICE_ENV: &str = "MAC_WORKER_TEST_RAW_FORK_SENTINEL_DEVICE";
         const SENTINEL_INODE_ENV: &str = "MAC_WORKER_TEST_RAW_FORK_SENTINEL_INODE";
+        const STDOUT_MARKER: &str = "raw-fork-isolation-stdout-ready";
+        const STDERR_MARKER: &str = "raw-fork-isolation-stderr-ready";
 
         if let Some(actual) = std::env::var_os(SCENARIO_ENV) {
             assert_eq!(actual, test_name);
@@ -2681,6 +2910,8 @@ mod tests {
                     "raw-fork sentinel inspection was ambiguous"
                 );
             }
+            println!("{STDOUT_MARKER}");
+            eprintln!("{STDERR_MARKER}");
             scenario();
             return;
         }
@@ -2692,24 +2923,46 @@ mod tests {
             .create_new(true)
             .open(temp.path().join("parent-test-sentinel"))
             .unwrap();
-        set_cloexec(sentinel.as_raw_fd()).unwrap();
         let sentinel_flags = unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_GETFD) };
         assert_ne!(sentinel_flags, -1);
-        assert_ne!(sentinel_flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    sentinel.as_raw_fd(),
+                    libc::F_SETFD,
+                    sentinel_flags & !libc::FD_CLOEXEC,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "sentinel must model a foreign inheritable test descriptor"
+        );
         let sentinel_stat = descriptor_stat(sentinel.as_raw_fd()).unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .env(SCENARIO_ENV, test_name)
             .env(SENTINEL_FD_ENV, sentinel.as_raw_fd().to_string())
             .env(SENTINEL_DEVICE_ENV, sentinel_stat.st_dev.to_string())
             .env(SENTINEL_INODE_ENV, sentinel_stat.st_ino.to_string())
-            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-            .output()
-            .unwrap();
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"]);
+        fence_test_subprocess_descriptors(&mut command).unwrap();
+        let output = command.output().unwrap();
         assert!(
             output.status.success(),
             "stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(STDOUT_MARKER),
+            "isolated child stdout capture was fenced"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(STDERR_MARKER),
+            "isolated child stderr capture was fenced"
         );
     }
 
@@ -2720,6 +2973,19 @@ mod tests {
             "supervisor::tests::raw_fork_scenarios_do_not_inherit_parent_test_descriptors",
             || {},
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raw_fork_descriptor_fence_preserves_spawn_exec_errors() {
+        let mut command = Command::new("/definitely/missing/mac-worker-test-subprocess");
+        fence_test_subprocess_descriptors(&mut command).unwrap();
+
+        let error = command
+            .output()
+            .expect_err("missing executable must remain an observable spawn error");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[cfg(target_os = "macos")]
@@ -2765,6 +3031,183 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn raw_process_group_finish_reaps_a_live_anchor_after_descendant_cleanup() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::raw_process_group_finish_reaps_a_live_anchor_after_descendant_cleanup",
+            || {
+                let (mut cleanup, _descendant) = spawn_group_with_ignoring_descendant();
+                let leader = cleanup.leader();
+
+                cleanup.finish().unwrap();
+
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(leader, &raw mut status, libc::WNOHANG) },
+                    -1,
+                    "explicit cleanup did not reap its direct child"
+                );
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+                assert_eq!(
+                    SystemProcessInspector.observe_group(leader as u32),
+                    ProcessGroupObservation::Absent
+                );
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raw_process_group_guard_never_signals_after_its_child_anchor_was_reaped() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::raw_process_group_guard_never_signals_after_its_child_anchor_was_reaped",
+            || {
+                let (cleanup, descendant, release) = spawn_group_with_releasable_descendant();
+                let leader = cleanup.leader();
+                let descendant_identity = SystemProcessInspector
+                    .identity_for_pid(descendant as u32)
+                    .unwrap();
+                assert_eq!(unsafe { libc::kill(leader, libc::SIGKILL) }, 0);
+                assert_eq!(
+                    wait_blocking(leader).unwrap(),
+                    ChildOutcome::Signalled(libc::SIGKILL as u32)
+                );
+                assert_eq!(
+                    SystemProcessInspector.observe_group(leader as u32),
+                    ProcessGroupObservation::Present,
+                    "descendant did not retain the original process group"
+                );
+
+                let drop_result = std::panic::catch_unwind(move || drop(cleanup));
+                let descendant_after_drop = SystemProcessInspector.observe(descendant_identity);
+                drop(release);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while SystemProcessInspector.observe(descendant_identity)
+                    != ProcessObservation::Absent
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "releasable descendant did not exit"
+                    );
+                    std::thread::yield_now();
+                }
+
+                assert!(
+                    matches!(
+                        descendant_after_drop,
+                        ProcessObservation::Matching { process_group }
+                            if process_group == leader as u32
+                    ),
+                    "guard signalled a numeric process group after losing its child anchor"
+                );
+                assert!(
+                    drop_result.is_err(),
+                    "ordinary armed-guard disposal hid the lost ownership proof"
+                );
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raw_process_group_cleanup_reports_a_reaped_anchor_without_signalling() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::raw_process_group_cleanup_reports_a_reaped_anchor_without_signalling",
+            || {
+                let (mut cleanup, descendant, release) = spawn_group_with_releasable_descendant();
+                let leader = cleanup.leader();
+                let descendant_identity = SystemProcessInspector
+                    .identity_for_pid(descendant as u32)
+                    .unwrap();
+                assert_eq!(unsafe { libc::kill(leader, libc::SIGKILL) }, 0);
+                assert_eq!(
+                    wait_blocking(leader).unwrap(),
+                    ChildOutcome::Signalled(libc::SIGKILL as u32)
+                );
+
+                let error = cleanup
+                    .finish()
+                    .expect_err("a reaped anchor with a live group must fail closed");
+                let descendant_after_cleanup = SystemProcessInspector.observe(descendant_identity);
+                drop(release);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while SystemProcessInspector.observe(descendant_identity)
+                    != ProcessObservation::Absent
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "releasable descendant did not exit"
+                    );
+                    std::thread::yield_now();
+                }
+
+                assert!(
+                    error.to_string().contains("RAW_GROUP_CHILD_ANCHOR_LOST"),
+                    "{error}"
+                );
+                assert!(
+                    matches!(
+                        descendant_after_cleanup,
+                        ProcessObservation::Matching { process_group }
+                            if process_group == leader as u32
+                    ),
+                    "explicit cleanup signalled after losing the direct-child anchor"
+                );
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raw_process_group_panicking_guard_does_not_signal_after_its_child_anchor_was_reaped() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::raw_process_group_panicking_guard_does_not_signal_after_its_child_anchor_was_reaped",
+            || {
+                let (cleanup, descendant, release) = spawn_group_with_releasable_descendant();
+                let leader = cleanup.leader();
+                let descendant_identity = SystemProcessInspector
+                    .identity_for_pid(descendant as u32)
+                    .unwrap();
+                assert_eq!(unsafe { libc::kill(leader, libc::SIGKILL) }, 0);
+                assert_eq!(
+                    wait_blocking(leader).unwrap(),
+                    ChildOutcome::Signalled(libc::SIGKILL as u32)
+                );
+
+                let panic = std::panic::catch_unwind(move || {
+                    let _cleanup = cleanup;
+                    panic!("injected panic after direct-child reap");
+                });
+                let descendant_after_panic = SystemProcessInspector.observe(descendant_identity);
+                drop(release);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while SystemProcessInspector.observe(descendant_identity)
+                    != ProcessObservation::Absent
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "releasable descendant did not exit"
+                    );
+                    std::thread::yield_now();
+                }
+
+                assert!(panic.is_err());
+                assert!(
+                    matches!(
+                        descendant_after_panic,
+                        ProcessObservation::Matching { process_group }
+                            if process_group == leader as u32
+                    ),
+                    "panic cleanup signalled a numeric group without a child anchor"
+                );
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn timeout_rechecks_waitable_anchor_when_leader_exits_before_term_identity_check() {
         run_isolated_raw_fork_scenario(
             "supervisor::tests::timeout_rechecks_waitable_anchor_when_leader_exits_before_term_identity_check",
@@ -2778,9 +3221,7 @@ mod tests {
                 };
 
                 let result = wait_for_child(identity, 0, &inspector);
-                if result.is_ok() {
-                    cleanup.disarm();
-                }
+                cleanup.finish().unwrap();
 
                 assert_eq!(result.unwrap(), ChildOutcome::Exited(7));
                 assert_eq!(
@@ -2812,9 +3253,7 @@ mod tests {
                 let started = Instant::now();
 
                 let result = wait_for_child(identity, 0, &inspector);
-                if result.is_ok() {
-                    cleanup.disarm();
-                }
+                cleanup.finish().unwrap();
 
                 assert_eq!(result.unwrap(), ChildOutcome::TimedOut);
                 assert!(
@@ -2862,9 +3301,7 @@ mod tests {
 
                 let result = wait_for_child(identity, 0, &inspector);
                 releaser.join().unwrap();
-                if result.is_ok() {
-                    cleanup.disarm();
-                }
+                cleanup.finish().unwrap();
 
                 assert_eq!(result.unwrap(), ChildOutcome::TimedOut);
                 assert!(
@@ -2920,9 +3357,7 @@ mod tests {
                     WorkerError::Io(io::Error::from_raw_os_error(libc::ESRCH)),
                 );
                 releaser.join().unwrap();
-                if result.is_ok() {
-                    cleanup.disarm();
-                }
+                cleanup.finish().unwrap();
 
                 assert_eq!(result.unwrap(), ChildOutcome::Exited(9));
                 assert!(
