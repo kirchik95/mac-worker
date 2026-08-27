@@ -5,6 +5,7 @@ use std::{
     collections::VecDeque,
     ffi::OsStr,
     fs,
+    io::{self, Write},
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::ExitStatus,
@@ -15,12 +16,19 @@ use std::{
 };
 
 use mac_worker::{
+    cli::{Cli, Command},
     config::{Config, WorkerEntry},
     doctor::{DoctorRequest, DoctorService},
-    error::WorkerError,
+    error::{ExitKind, WorkerError},
+    output::CommandOutput,
     paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::{HealthStatus, IssueSeverity},
+    protocol::{
+        DoctorIssue, DoctorProject, DoctorReport, HealthStatus, IssueSeverity, MemoryPressure,
+        PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
+    },
+    run_with_io,
+    snapshot::SnapshotSummary,
 };
 
 use support::GitRepo;
@@ -34,6 +42,18 @@ struct DoctorRunner {
 struct SnapshotMutation {
     root: PathBuf,
     stage_queries: AtomicUsize,
+}
+
+struct BrokenWriter;
+
+impl Write for BrokenWriter {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl DoctorRunner {
@@ -190,6 +210,358 @@ fn assert_no_doctor_snapshot(cache: &Path) {
             }
         }
     }
+}
+
+fn ready_output_report() -> DoctorReport {
+    DoctorReport {
+        version: 1,
+        ready: true,
+        project: DoctorProject {
+            display_name: "demo".into(),
+            project_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            worktree_id: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+            head: Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into()),
+            branch: Some("main".into()),
+            dirty: true,
+            relative_working_dir: "crates/app".into(),
+        },
+        requirements: vec!["node".into(), "docker".into()],
+        snapshot: Some(SnapshotSummary {
+            digest: "9999999999999999999999999999999999999999999999999999999999999999".into(),
+            file_count: 3,
+            total_bytes: 42,
+            tracked_deletion_count: 1,
+            included_untracked_count: 1,
+            warning_count: 1,
+        }),
+        workers: vec![WorkerHealth {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            status: HealthStatus::Ready,
+            probe: Some(ProbeResponse {
+                protocol_version: PROTOCOL_VERSION,
+                hostname: "mini-1.local".into(),
+                arch: "arm64".into(),
+                os_version: "26.2".into(),
+                free_disk_bytes: 536_870_912,
+                memory_pressure: MemoryPressure::Normal,
+                swap_used_bytes: Some(134_217_728),
+                capabilities: vec!["node".into(), "docker".into()],
+            }),
+            missing_capabilities: Vec::new(),
+            error_code: None,
+            error_message: None,
+        }],
+        issues: vec![DoctorIssue {
+            severity: IssueSeverity::Warning,
+            code: "SENSITIVE_PATH_ALLOWED".into(),
+            message: "allowed sensitive input".into(),
+            paths: vec![".env".into()],
+        }],
+    }
+}
+
+fn blocked_output_report(code: &str) -> DoctorReport {
+    DoctorReport {
+        version: 1,
+        ready: false,
+        project: DoctorProject {
+            display_name: "demo".into(),
+            project_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            worktree_id: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+            head: Some("deadbeefcafe0123456789abcdef0123456789abcdef0123456789abcdef0123".into()),
+            branch: None,
+            dirty: false,
+            relative_working_dir: String::new(),
+        },
+        requirements: Vec::new(),
+        snapshot: None,
+        workers: vec![WorkerHealth {
+            name: "mini-2".into(),
+            ssh: "mac2".into(),
+            status: HealthStatus::Unavailable,
+            probe: Some(ProbeResponse {
+                protocol_version: PROTOCOL_VERSION,
+                hostname: "mini-2.local".into(),
+                arch: "arm64".into(),
+                os_version: "26.2".into(),
+                free_disk_bytes: 268_435_456,
+                memory_pressure: MemoryPressure::Warn,
+                swap_used_bytes: None,
+                capabilities: vec!["node".into()],
+            }),
+            missing_capabilities: vec!["docker".into()],
+            error_code: Some("MISSING_CAPABILITIES".into()),
+            error_message: Some("worker mini-2 is missing required capabilities: docker".into()),
+        }],
+        issues: vec![
+            DoctorIssue {
+                severity: IssueSeverity::Blocker,
+                code: code.into(),
+                message: "selected input changed during capture".into(),
+                paths: vec!["src/lib.rs".into()],
+            },
+            DoctorIssue {
+                severity: IssueSeverity::Warning,
+                code: "MISSING_CAPABILITIES".into(),
+                message: "worker mini-2 is missing required capabilities: docker".into(),
+                paths: Vec::new(),
+            },
+        ],
+    }
+}
+
+fn write_inventory(root: &Path) -> PathBuf {
+    let path = root.join("config.toml");
+    fs::write(
+        &path,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+    )
+    .unwrap();
+    path
+}
+
+fn doctor_cli(config: PathBuf, project: &Path, includes: Vec<String>, json: bool) -> Cli {
+    Cli {
+        config: Some(config),
+        json,
+        command: Command::Doctor {
+            project: Some(project.to_path_buf()),
+            includes,
+        },
+    }
+}
+
+#[test]
+fn doctor_output_json_is_one_compact_tagged_sanitized_report() {
+    let ready = CommandOutput::Doctor(ready_output_report());
+    let blocked = CommandOutput::Doctor(blocked_output_report("SNAPSHOT_CHANGED"));
+
+    for (output, expected_codes) in [
+        (&ready, vec!["SENSITIVE_PATH_ALLOWED"]),
+        (&blocked, vec!["SNAPSHOT_CHANGED", "MISSING_CAPABILITIES"]),
+    ] {
+        let rendered = output.render_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(rendered.lines().count(), 1);
+        assert!(!rendered.contains(['\n', '\r']));
+        assert_eq!(value["kind"], "doctor");
+        assert_eq!(
+            value["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|issue| issue["code"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_codes
+        );
+        for forbidden in [
+            "git@github.com:private/example.git",
+            "DOCTOR_PLANTED_SECRET=never-report-this",
+            "/Users/alice/private/example",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "doctor JSON leaked {forbidden:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn doctor_output_human_renders_complete_ready_and_blocked_reports_without_ssh() {
+    let ready = CommandOutput::Doctor(ready_output_report()).render_human();
+    let blocked = CommandOutput::Doctor(blocked_output_report("SNAPSHOT_CHANGED")).render_human();
+
+    assert_eq!(
+        ready,
+        concat!(
+            "doctor: ready\n",
+            "project: demo\n",
+            "  project id: 0123456789ab\n",
+            "  worktree id: fedcba987654\n",
+            "  source: branch main at abcdef012345\n",
+            "  dirty: yes\n",
+            "  working directory: crates/app\n",
+            "requirements: node, docker\n",
+            "snapshot:\n",
+            "  digest: 9999999999999999999999999999999999999999999999999999999999999999\n",
+            "  file count: 3\n",
+            "  total bytes: 42\n",
+            "  tracked deletions: 1\n",
+            "  included untracked: 1\n",
+            "  warnings: 1\n",
+            "workers:\n",
+            "  mini-1: eligible (mini-1.local; arm64; macOS 26.2; protocol 1)\n",
+            "    capabilities: node, docker\n",
+            "    free disk bytes: 536870912\n",
+            "    memory pressure: normal\n",
+            "    swap used bytes: 134217728\n",
+            "issues:\n",
+            "  warning [SENSITIVE_PATH_ALLOWED]: allowed sensitive input\n",
+            "    path: .env",
+        )
+    );
+    assert_eq!(
+        blocked,
+        concat!(
+            "doctor: blocked\n",
+            "project: demo\n",
+            "  project id: 0123456789ab\n",
+            "  worktree id: fedcba987654\n",
+            "  source: detached HEAD at deadbeefcafe\n",
+            "  dirty: no\n",
+            "  working directory: .\n",
+            "requirements: none\n",
+            "snapshot: unavailable\n",
+            "workers:\n",
+            "  mini-2: ineligible [MISSING_CAPABILITIES]: worker mini-2 is missing required capabilities: docker\n",
+            "    missing capabilities: docker\n",
+            "    capabilities: node\n",
+            "    free disk bytes: 268435456\n",
+            "    memory pressure: warn\n",
+            "    swap used bytes: unavailable\n",
+            "issues:\n",
+            "  blocker [SNAPSHOT_CHANGED]: selected input changed during capture\n",
+            "    path: src/lib.rs\n",
+            "  warning [MISSING_CAPABILITIES]: worker mini-2 is missing required capabilities: docker",
+        )
+    );
+    for forbidden in ["mac1", "mac2", "/Users/alice/private/example"] {
+        assert!(
+            !ready.contains(forbidden),
+            "ready human output leaked {forbidden}"
+        );
+        assert!(
+            !blocked.contains(forbidden),
+            "blocked human output leaked {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn doctor_aggregate_exit_uses_ready_usage_and_snapshot_integrity_categories() {
+    assert_eq!(
+        CommandOutput::Doctor(ready_output_report()).aggregate_exit_kind(),
+        None
+    );
+    assert_eq!(
+        CommandOutput::Doctor(blocked_output_report("NO_ELIGIBLE_WORKER")).aggregate_exit_kind(),
+        Some(ExitKind::Usage)
+    );
+    assert_eq!(
+        CommandOutput::Doctor(blocked_output_report("SNAPSHOT_CHANGED")).aggregate_exit_kind(),
+        Some(ExitKind::Infrastructure)
+    );
+}
+
+#[test]
+fn executable_doctor_ready_report_goes_to_stdout_and_exits_zero() {
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("ready executable doctor fixture");
+    repo.write("fixtures/generated/data.txt", b"included untracked\n");
+    let state = tempfile::tempdir().unwrap();
+    let config_path = write_inventory(state.path());
+    let runner = DoctorRunner::new(vec![ready_probe(&[])]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_with_io(
+        doctor_cli(
+            config_path,
+            repo.root(),
+            vec!["fixtures/generated/**".into()],
+            true,
+        ),
+        &runner,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 0);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["kind"], "doctor");
+    assert_eq!(value["ready"], true);
+    assert_eq!(value["snapshot"]["included_untracked_count"], 1);
+}
+
+#[test]
+fn executable_doctor_project_blocker_goes_to_stdout_and_exits_usage() {
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("blocked executable doctor fixture");
+    repo.write("local-input.txt", b"uncovered untracked input\n");
+    let state = tempfile::tempdir().unwrap();
+    let config_path = write_inventory(state.path());
+    let runner = DoctorRunner::new(vec![ready_probe(&[])]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_with_io(
+        doctor_cli(config_path, repo.root(), Vec::new(), true),
+        &runner,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 64);
+    assert!(stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["kind"], "doctor");
+    assert_eq!(value["ready"], false);
+    assert_eq!(value["issues"][0]["code"], "UNTRACKED_INPUT");
+}
+
+#[test]
+fn executable_doctor_snapshot_change_goes_to_stdout_and_exits_infrastructure() {
+    let repo = GitRepo::init();
+    repo.write("tracked.txt", b"initial bytes\n");
+    repo.commit_all("mutating executable doctor fixture");
+    let state = tempfile::tempdir().unwrap();
+    let config_path = write_inventory(state.path());
+    let runner = DoctorRunner::mutating_snapshot(repo.root(), vec![ready_probe(&[])]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_with_io(
+        doctor_cli(config_path, repo.root(), Vec::new(), true),
+        &runner,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 70);
+    assert!(stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["kind"], "doctor");
+    assert_eq!(value["ready"], false);
+    assert_eq!(value["issues"][0]["code"], "SNAPSHOT_CHANGED");
+}
+
+#[test]
+fn executable_doctor_broken_stdout_is_an_io_error_on_stderr_and_exit_74() {
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("broken writer executable doctor fixture");
+    repo.write("local-input.txt", b"uncovered untracked input\n");
+    let state = tempfile::tempdir().unwrap();
+    let config_path = write_inventory(state.path());
+    let runner = DoctorRunner::new(vec![ready_probe(&[])]);
+    let mut stderr = Vec::new();
+
+    let exit = run_with_io(
+        doctor_cli(config_path, repo.root(), Vec::new(), true),
+        &runner,
+        &mut BrokenWriter,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 74);
+    assert!(String::from_utf8(stderr).unwrap().contains("I/O error"));
 }
 
 #[test]

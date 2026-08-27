@@ -1,8 +1,11 @@
 use assert_cmd::Command;
+use clap::Parser;
+use mac_worker::cli::{Cli, Command as WorkerCommand};
 use predicates::prelude::*;
+use std::path::PathBuf;
 
 #[test]
-fn help_exposes_only_the_phase_one_public_commands() {
+fn help_exposes_doctor_but_keeps_host_hidden() {
     let mut command = Command::cargo_bin("worker").unwrap();
     command.arg("--help");
 
@@ -10,8 +13,74 @@ fn help_exposes_only_the_phase_one_public_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("setup"))
+        .stdout(predicate::str::contains("doctor"))
         .stdout(predicate::str::contains("workers"))
         .stdout(predicate::str::contains("host").not());
+}
+
+#[test]
+fn doctor_parses_the_public_command_forms_without_resolving_the_project() {
+    let cases = [
+        (vec!["worker", "doctor"], false, None, Vec::<String>::new()),
+        (
+            vec!["worker", "doctor", "--project", "/path/to/worktree"],
+            false,
+            Some(PathBuf::from("/path/to/worktree")),
+            Vec::new(),
+        ),
+        (
+            vec![
+                "worker",
+                "doctor",
+                "--include",
+                "fixtures/generated/**",
+                "--include",
+                "tmp/contract.json",
+            ],
+            false,
+            None,
+            vec!["fixtures/generated/**".into(), "tmp/contract.json".into()],
+        ),
+        (
+            vec![
+                "worker",
+                "--json",
+                "doctor",
+                "--project",
+                "/path/to/worktree",
+            ],
+            true,
+            Some(PathBuf::from("/path/to/worktree")),
+            Vec::new(),
+        ),
+    ];
+
+    for (arguments, expected_json, expected_project, expected_includes) in cases {
+        let cli = Cli::try_parse_from(arguments).expect("public doctor form must parse");
+        assert_eq!(cli.json, expected_json);
+        let WorkerCommand::Doctor { project, includes } = cli.command else {
+            panic!("doctor arguments must select the doctor command");
+        };
+        assert_eq!(project, expected_project);
+        assert_eq!(includes, expected_includes);
+    }
+}
+
+#[test]
+fn doctor_rejects_empty_includes_and_unexpected_positionals_as_usage() {
+    for arguments in [
+        vec!["doctor", "--include", ""],
+        vec!["doctor", "unexpected"],
+    ] {
+        let mut command = Command::cargo_bin("worker").unwrap();
+        command.args(arguments);
+
+        command
+            .assert()
+            .code(64)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::is_empty().not());
+    }
 }
 
 #[test]

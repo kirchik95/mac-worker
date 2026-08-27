@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
 use cli::{Cli, Command, HostCommand};
 use config::{Config, WorkerEntry};
+use doctor::{DoctorRequest, DoctorService};
 use error::WorkerError;
 use install::Installer;
 use output::CommandOutput;
@@ -44,6 +45,23 @@ pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutpu
                 protocol_version: PROTOCOL_VERSION,
                 workers,
             }))
+        }
+        Command::Doctor { project, includes } => {
+            let paths = discover_paths(cli.config)?;
+            let config = Config::load(&paths.config)?;
+            let project = match project {
+                Some(project) => project,
+                None => std::env::current_dir()?,
+            };
+            let service = DoctorService {
+                runner,
+                config: &config,
+                paths: &paths,
+            };
+            Ok(CommandOutput::Doctor(service.inspect(DoctorRequest {
+                project,
+                cli_includes: includes,
+            })?))
         }
         Command::Workers => {
             let config = load_config(cli.config)?;
@@ -93,13 +111,17 @@ fn write_error(stderr: &mut dyn Write, error: &WorkerError) {
 }
 
 fn load_config(config_override: Option<PathBuf>) -> Result<Config, WorkerError> {
+    let paths = discover_paths(config_override)?;
+    Config::load(&paths.config)
+}
+
+fn discover_paths(config_override: Option<PathBuf>) -> Result<PathLayout, WorkerError> {
     let env = std::env::vars_os().collect::<BTreeMap<_, _>>();
     let home = env
         .get(&std::ffi::OsString::from("HOME"))
         .map(PathBuf::from)
         .unwrap_or_default();
-    let paths = PathLayout::discover(config_override, &env, &home)?;
-    Config::load(&paths.config)
+    PathLayout::discover(config_override, &env, &home)
 }
 
 fn select_workers(config: &Config, hosts: &[String]) -> Result<Vec<WorkerEntry>, WorkerError> {

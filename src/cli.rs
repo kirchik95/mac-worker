@@ -22,6 +22,12 @@ pub enum Command {
     Setup {
         hosts: Vec<String>,
     },
+    Doctor {
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long = "include", value_parser = non_empty_pattern)]
+        includes: Vec<String>,
+    },
     Workers,
     #[command(hide = true)]
     Host {
@@ -33,4 +39,12 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum HostCommand {
     Probe,
+}
+
+fn non_empty_pattern(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err("include pattern must not be empty".into())
+    } else {
+        Ok(value.to_owned())
+    }
 }
