@@ -134,6 +134,70 @@ fn command_spec_preserves_empty_and_repeated_arguments() {
 }
 
 #[test]
+fn serialization_rejects_directly_constructed_invalid_public_protocol_variants() {
+    assert!(serde_json::to_string(&CommandSpec::Argv { argv: Vec::new() }).is_err());
+    assert!(
+        serde_json::to_string(&CommandSpec::Shell {
+            shell: String::new(),
+        })
+        .is_err()
+    );
+    assert!(
+        serde_json::to_string(&JsonEvent::Error {
+            protocol_version: 1,
+            code: "CAPACITY_BUSY".into(),
+            message: "worker is busy".into(),
+        })
+        .is_err()
+    );
+    assert!(
+        serde_json::to_string(&JsonEvent::Error {
+            protocol_version: PROTOCOL_VERSION,
+            code: "CAPACITY_BUSY\0".into(),
+            message: "worker is busy".into(),
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn public_protocol_variants_keep_valid_round_trip_behavior() {
+    let command = CommandSpec::Argv {
+        argv: vec!["".into(), "repeat".into(), "repeat".into()],
+    };
+    let command_json = serde_json::to_string(&command).unwrap();
+    assert_eq!(
+        serde_json::from_str::<CommandSpec>(&command_json).unwrap(),
+        command
+    );
+
+    let event = JsonEvent::Error {
+        protocol_version: PROTOCOL_VERSION,
+        code: "CAPACITY_BUSY".into(),
+        message: "worker is busy".into(),
+    };
+    let event_json = serde_json::to_string(&event).unwrap();
+    assert_eq!(
+        serde_json::from_str::<JsonEvent>(&event_json).unwrap(),
+        event
+    );
+}
+
+#[test]
+fn command_summary_returns_a_typed_error_for_directly_invalid_commands() {
+    let invalid = CommandSpec::Argv { argv: Vec::new() };
+    assert!(invalid.summary().is_err());
+
+    let valid = CommandSpec::Argv {
+        argv: vec!["tool".into()],
+    };
+    assert_eq!(
+        serde_json::to_string(&valid.summary().unwrap()).unwrap(),
+        r#"{"mode":"argv","arg_count":1}"#
+    );
+}
+
+#[test]
 fn serde_rejects_semantically_invalid_persistent_and_wire_dtos() {
     assert!(serde_json::from_str::<CommandSummary>(r#"{"mode":"argv","arg_count":0}"#).is_err());
 

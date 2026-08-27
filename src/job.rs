@@ -1,7 +1,10 @@
 use std::{fmt, str::FromStr};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeStruct};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer, de,
+    ser::{self, SerializeStruct},
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -156,17 +159,18 @@ impl CommandSpec {
         Ok(())
     }
 
-    pub fn summary(&self) -> CommandSummary {
+    pub fn summary(&self) -> Result<CommandSummary, WorkerError> {
+        self.validate()?;
         match self {
-            Self::Argv { argv } => CommandSummary::argv(argv.len())
-                .expect("validated argv command has a valid argument count"),
-            Self::Shell { .. } => CommandSummary::shell(),
+            Self::Argv { argv } => CommandSummary::argv(argv.len()),
+            Self::Shell { .. } => Ok(CommandSummary::shell()),
         }
     }
 }
 
 impl Serialize for CommandSpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
         match self {
             Self::Argv { argv } => {
                 let mut record = serializer.serialize_struct("CommandSpec", 2)?;
@@ -257,11 +261,15 @@ impl CommandSummary {
 
 impl Serialize for CommandSummary {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
         match self.mode {
             CommandSummaryMode::Argv => {
                 let mut record = serializer.serialize_struct("CommandSummary", 2)?;
                 record.serialize_field("mode", "argv")?;
-                record.serialize_field("arg_count", &self.arg_count.expect("validated summary"))?;
+                let arg_count = self.arg_count.ok_or_else(|| {
+                    ser::Error::custom("validated argv summary has an argument count")
+                })?;
+                record.serialize_field("arg_count", &arg_count)?;
                 record.end()
             }
             CommandSummaryMode::Shell => {
@@ -443,6 +451,7 @@ impl RequestFingerprintMaterial {
 
 impl Serialize for RequestFingerprintMaterial {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
         let mut record = serializer.serialize_struct("RequestFingerprintMaterial", 12)?;
         record.serialize_field("protocol_version", &self.protocol_version)?;
         record.serialize_field("job_id", &self.job_id)?;
@@ -499,7 +508,7 @@ impl<'de> Deserialize<'de> for RequestFingerprintMaterial {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobStatus {
     state: JobState,
     updated_at_millis: u64,
@@ -511,6 +520,24 @@ pub struct JobStatus {
     final_stdout_bytes: Option<u64>,
     final_stderr_bytes: Option<u64>,
     error_code: Option<String>,
+}
+
+impl Serialize for JobStatus {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("JobStatus", 10)?;
+        record.serialize_field("state", &self.state)?;
+        record.serialize_field("updated_at_millis", &self.updated_at_millis)?;
+        record.serialize_field("supervisor_pid", &self.supervisor_pid)?;
+        record.serialize_field("supervisor_start_identity", &self.supervisor_start_identity)?;
+        record.serialize_field("child_pid", &self.child_pid)?;
+        record.serialize_field("child_start_identity", &self.child_start_identity)?;
+        record.serialize_field("exit_code", &self.exit_code)?;
+        record.serialize_field("final_stdout_bytes", &self.final_stdout_bytes)?;
+        record.serialize_field("final_stderr_bytes", &self.final_stderr_bytes)?;
+        record.serialize_field("error_code", &self.error_code)?;
+        record.end()
+    }
 }
 
 impl JobStatus {
@@ -721,8 +748,7 @@ impl<'de> Deserialize<'de> for JobStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobMeta {
     protocol_version: u32,
     job_id: JobId,
@@ -737,6 +763,27 @@ pub struct JobMeta {
     timeout_millis: u64,
     resource_class: String,
     created_at_millis: u64,
+}
+
+impl Serialize for JobMeta {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("JobMeta", 13)?;
+        record.serialize_field("protocol_version", &self.protocol_version)?;
+        record.serialize_field("job_id", &self.job_id)?;
+        record.serialize_field("client_id", &self.client_id)?;
+        record.serialize_field("worker_name", &self.worker_name)?;
+        record.serialize_field("project_id", &self.project_id)?;
+        record.serialize_field("worktree_id", &self.worktree_id)?;
+        record.serialize_field("manifest_digest", &self.manifest_digest)?;
+        record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
+        record.serialize_field("command_summary", &self.command_summary)?;
+        record.serialize_field("relative_working_dir", &self.relative_working_dir)?;
+        record.serialize_field("timeout_millis", &self.timeout_millis)?;
+        record.serialize_field("resource_class", &self.resource_class)?;
+        record.serialize_field("created_at_millis", &self.created_at_millis)?;
+        record.end()
+    }
 }
 
 impl JobMeta {
@@ -759,7 +806,7 @@ impl JobMeta {
             worktree_id: material.worktree_id.clone(),
             manifest_digest: material.manifest_digest.clone(),
             request_fingerprint,
-            command_summary: material.command.summary(),
+            command_summary: material.command.summary()?,
             relative_working_dir: material.relative_working_dir.clone(),
             timeout_millis: material.timeout_millis,
             resource_class: material.resource_class.clone(),
@@ -854,13 +901,24 @@ impl<'de> Deserialize<'de> for JobMeta {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalJobRecord {
     meta: JobMeta,
     lease_token: LeaseToken,
     last_status: Option<JobStatus>,
     cleanup_pending: bool,
+}
+
+impl Serialize for LocalJobRecord {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("LocalJobRecord", 4)?;
+        record.serialize_field("meta", &self.meta)?;
+        record.serialize_field("lease_token", &self.lease_token)?;
+        record.serialize_field("last_status", &self.last_status)?;
+        record.serialize_field("cleanup_pending", &self.cleanup_pending)?;
+        record.end()
+    }
 }
 
 impl LocalJobRecord {
@@ -924,8 +982,7 @@ impl<'de> Deserialize<'de> for LocalJobRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseRecord {
     job_id: JobId,
     client_id: ClientId,
@@ -940,6 +997,27 @@ pub struct LeaseRecord {
     command_summary: CommandSummary,
     created_at_millis: u64,
     expires_at_millis: u64,
+}
+
+impl Serialize for LeaseRecord {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("LeaseRecord", 13)?;
+        record.serialize_field("job_id", &self.job_id)?;
+        record.serialize_field("client_id", &self.client_id)?;
+        record.serialize_field("lease_token", &self.lease_token)?;
+        record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
+        record.serialize_field("worker_name", &self.worker_name)?;
+        record.serialize_field("project_id", &self.project_id)?;
+        record.serialize_field("worktree_id", &self.worktree_id)?;
+        record.serialize_field("manifest_digest", &self.manifest_digest)?;
+        record.serialize_field("timeout_millis", &self.timeout_millis)?;
+        record.serialize_field("resource_class", &self.resource_class)?;
+        record.serialize_field("command_summary", &self.command_summary)?;
+        record.serialize_field("created_at_millis", &self.created_at_millis)?;
+        record.serialize_field("expires_at_millis", &self.expires_at_millis)?;
+        record.end()
+    }
 }
 
 impl LeaseRecord {
@@ -965,7 +1043,7 @@ impl LeaseRecord {
             manifest_digest: material.manifest_digest.clone(),
             timeout_millis: material.timeout_millis,
             resource_class: material.resource_class.clone(),
-            command_summary: material.command.summary(),
+            command_summary: material.command.summary()?,
             created_at_millis,
             expires_at_millis,
         };
@@ -1045,11 +1123,20 @@ impl<'de> Deserialize<'de> for LeaseRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseAcquireRequest {
     material: RequestFingerprintMaterial,
     request_fingerprint: RequestFingerprint,
+}
+
+impl Serialize for LeaseAcquireRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("LeaseAcquireRequest", 2)?;
+        record.serialize_field("material", &self.material)?;
+        record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
+        record.end()
+    }
 }
 
 impl LeaseAcquireRequest {
@@ -1097,11 +1184,37 @@ impl<'de> Deserialize<'de> for LeaseAcquireRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseAcquireResponse {
     Acquired { lease: LeaseRecord },
     ExistingAccepted { status: JobStatus },
+}
+
+impl LeaseAcquireResponse {
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        match self {
+            Self::Acquired { lease } => lease.validate(),
+            Self::ExistingAccepted { status } => status.validate(),
+        }
+    }
+}
+
+impl Serialize for LeaseAcquireResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        #[derive(Serialize)]
+        #[serde(tag = "outcome", rename_all = "snake_case")]
+        enum Wire<'a> {
+            Acquired { lease: &'a LeaseRecord },
+            ExistingAccepted { status: &'a JobStatus },
+        }
+        match self {
+            Self::Acquired { lease } => Wire::Acquired { lease }.serialize(serializer),
+            Self::ExistingAccepted { status } => {
+                Wire::ExistingAccepted { status }.serialize(serializer)
+            }
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for LeaseAcquireResponse {
@@ -1116,20 +1229,25 @@ impl<'de> Deserialize<'de> for LeaseAcquireResponse {
             Wire::Acquired { lease } => Self::Acquired { lease },
             Wire::ExistingAccepted { status } => Self::ExistingAccepted { status },
         };
-        match &response {
-            Self::Acquired { lease } => lease.validate(),
-            Self::ExistingAccepted { status } => status.validate(),
-        }
-        .map_err(de::Error::custom)?;
+        response.validate().map_err(de::Error::custom)?;
         Ok(response)
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitRequest {
     material: RequestFingerprintMaterial,
     request_fingerprint: RequestFingerprint,
+}
+
+impl Serialize for SubmitRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("SubmitRequest", 2)?;
+        record.serialize_field("material", &self.material)?;
+        record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
+        record.end()
+    }
 }
 
 impl SubmitRequest {
@@ -1175,8 +1293,7 @@ impl<'de> Deserialize<'de> for SubmitRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitResponse {
     Accepted {
         meta: Box<JobMeta>,
@@ -1185,6 +1302,35 @@ pub enum SubmitResponse {
     Existing {
         status: JobStatus,
     },
+}
+
+impl SubmitResponse {
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        response_status_validate(self)
+    }
+}
+
+impl Serialize for SubmitResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        #[derive(Serialize)]
+        #[serde(tag = "outcome", rename_all = "snake_case")]
+        enum Wire<'a> {
+            Accepted {
+                meta: &'a JobMeta,
+                status: &'a JobStatus,
+            },
+            Existing {
+                status: &'a JobStatus,
+            },
+        }
+        match self {
+            Self::Accepted { meta, status } => {
+                Wire::Accepted { meta, status }.serialize(serializer)
+            }
+            Self::Existing { status } => Wire::Existing { status }.serialize(serializer),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for SubmitResponse {
@@ -1204,16 +1350,25 @@ impl<'de> Deserialize<'de> for SubmitResponse {
             Wire::Accepted { meta, status } => Self::Accepted { meta, status },
             Wire::Existing { status } => Self::Existing { status },
         };
-        response_status_validate(&response).map_err(de::Error::custom)?;
+        response.validate().map_err(de::Error::custom)?;
         Ok(response)
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusResponse {
     meta: JobMeta,
     status: JobStatus,
+}
+
+impl Serialize for StatusResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("StatusResponse", 2)?;
+        record.serialize_field("meta", &self.meta)?;
+        record.serialize_field("status", &self.status)?;
+        record.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for StatusResponse {
@@ -1261,12 +1416,24 @@ pub enum LogStream {
     Stderr,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogChunk {
     stream: LogStream,
     offset: u64,
     next_offset: u64,
     data: String,
+}
+
+impl Serialize for LogChunk {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("LogChunk", 4)?;
+        record.serialize_field("stream", &self.stream)?;
+        record.serialize_field("offset", &self.offset)?;
+        record.serialize_field("next_offset", &self.next_offset)?;
+        record.serialize_field("data", &self.data)?;
+        record.end()
+    }
 }
 
 impl LogChunk {
@@ -1344,8 +1511,7 @@ impl<'de> Deserialize<'de> for LogChunk {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonEvent {
     Accepted {
         protocol_version: u32,
@@ -1364,6 +1530,70 @@ pub enum JsonEvent {
         code: String,
         message: String,
     },
+}
+
+impl Serialize for JsonEvent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        #[derive(Serialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        enum Wire<'a> {
+            Accepted {
+                protocol_version: u32,
+                response: &'a SubmitResponse,
+            },
+            Log {
+                protocol_version: u32,
+                chunk: &'a LogChunk,
+            },
+            Status {
+                protocol_version: u32,
+                response: &'a StatusResponse,
+            },
+            Error {
+                protocol_version: u32,
+                code: &'a str,
+                message: &'a str,
+            },
+        }
+
+        match self {
+            Self::Accepted {
+                protocol_version,
+                response,
+            } => Wire::Accepted {
+                protocol_version: *protocol_version,
+                response,
+            }
+            .serialize(serializer),
+            Self::Log {
+                protocol_version,
+                chunk,
+            } => Wire::Log {
+                protocol_version: *protocol_version,
+                chunk,
+            }
+            .serialize(serializer),
+            Self::Status {
+                protocol_version,
+                response,
+            } => Wire::Status {
+                protocol_version: *protocol_version,
+                response,
+            }
+            .serialize(serializer),
+            Self::Error {
+                protocol_version,
+                code,
+                message,
+            } => Wire::Error {
+                protocol_version: *protocol_version,
+                code,
+                message,
+            }
+            .serialize(serializer),
+        }
+    }
 }
 
 impl JsonEvent {
