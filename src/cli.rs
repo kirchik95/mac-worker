@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{convert::Infallible, ffi::OsString, fmt, path::PathBuf, str::FromStr};
 
 use clap::{Parser, Subcommand};
 
@@ -41,6 +41,38 @@ pub enum HostCommand {
     Probe,
     #[command(name = "lease-acquire")]
     LeaseAcquire,
+    #[command(name = "rsync-receive", trailing_var_arg = true)]
+    RsyncReceive {
+        job_id: HiddenComponent,
+        client_id: HiddenComponent,
+        lease_token: HiddenComponent,
+        request_fingerprint: HiddenComponent,
+        #[arg(num_args = 1.., allow_hyphen_values = true)]
+        server_args: Vec<OsString>,
+    },
+}
+
+#[derive(Clone)]
+pub struct HiddenComponent(String);
+
+impl HiddenComponent {
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for HiddenComponent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HiddenComponent([REDACTED])")
+    }
+}
+
+impl FromStr for HiddenComponent {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.into()))
+    }
 }
 
 fn non_empty_pattern(value: &str) -> Result<String, String> {

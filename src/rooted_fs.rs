@@ -402,6 +402,25 @@ impl RootedDir {
         self.verify_root_name()
     }
 
+    pub(crate) fn verify_descriptors_cloexec(&self) -> io::Result<()> {
+        self.verify_root_name()?;
+        require_fd_cloexec(self.root.as_raw_fd())?;
+        require_fd_cloexec(self.parent.as_raw_fd())?;
+        for binding in &self.lineage {
+            require_fd_cloexec(binding.directory.as_raw_fd())?;
+            require_fd_cloexec(binding.parent.as_raw_fd())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_as_current_directory(&self) -> io::Result<()> {
+        self.verify_root_name()?;
+        if unsafe { libc::fchdir(self.root.as_raw_fd()) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub(crate) fn root_metadata(&self) -> io::Result<libc::stat> {
         self.verify_root_name()?;
         stat_fd(self.root.as_raw_fd())
@@ -3282,6 +3301,20 @@ fn cvt(result: libc::c_int) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn require_fd_cloexec(descriptor: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::FD_CLOEXEC == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "internal descriptor is inheritable",
+        ));
+    }
+    Ok(())
 }
 
 fn invalid_type_error() -> io::Error {

@@ -17,7 +17,7 @@ pub struct ProcessPolicy {
     pub deadline: Duration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProcessRequest {
     pub program: OsString,
     pub args: Vec<OsString>,
@@ -25,6 +25,20 @@ pub struct ProcessRequest {
     pub environment_remove: Vec<OsString>,
     pub stdin: Option<Vec<u8>>,
     pub policy: ProcessPolicy,
+}
+
+impl std::fmt::Debug for ProcessRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessRequest")
+            .field("program", &self.program)
+            .field("argument_count", &self.args.len())
+            .field("environment_count", &self.environment.len())
+            .field("environment_remove_count", &self.environment_remove.len())
+            .field("stdin_bytes", &self.stdin.as_ref().map(Vec::len))
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]

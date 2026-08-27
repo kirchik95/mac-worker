@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
 };
 
-use cli::{Cli, Command, HostCommand};
+use cli::{Cli, Command, HiddenComponent, HostCommand};
 use config::{Config, WorkerEntry};
 use doctor::{DoctorRequest, DoctorService};
 use error::WorkerError;
@@ -19,6 +19,9 @@ use probe::ProbeCollector;
 use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport};
 use serde::Deserialize;
+use transfer::{
+    HostTransferService, RsyncServerExecutor, SystemRsyncServerExecutor, TransferIdentity,
+};
 use transport::{SshTransport, WorkersService};
 
 pub mod agent;
@@ -44,6 +47,7 @@ pub mod protocol;
 pub mod requirements;
 pub mod rooted_fs;
 pub mod snapshot;
+pub mod transfer;
 pub mod transport;
 
 #[doc(hidden)]
@@ -154,6 +158,11 @@ fn execute_with_context(
         } => Err(WorkerError::Protocol(
             "host lease-acquire requires the stdio execution boundary".into(),
         )),
+        Command::Host {
+            command: HostCommand::RsyncReceive { .. },
+        } => Err(WorkerError::Protocol(
+            "host rsync-receive requires the binary stdio execution boundary".into(),
+        )),
     }
 }
 
@@ -199,6 +208,27 @@ pub fn run_with_stdio_in_context(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    run_with_rsync_executor_in_context(
+        cli,
+        runner,
+        &SystemRsyncServerExecutor,
+        runtime,
+        stdin,
+        stdout,
+        stderr,
+    )
+}
+
+#[doc(hidden)]
+pub fn run_with_rsync_executor_in_context(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    rsync_executor: &dyn RsyncServerExecutor,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
     if matches!(
         &cli.command,
         Command::Host {
@@ -206,6 +236,29 @@ pub fn run_with_stdio_in_context(
         }
     ) {
         return run_host_lease_acquire(cli.config, runtime, stdin, stdout);
+    }
+    if let Command::Host {
+        command:
+            HostCommand::RsyncReceive {
+                job_id,
+                client_id,
+                lease_token,
+                request_fingerprint,
+                server_args,
+            },
+    } = cli.command
+    {
+        return run_host_rsync_receive(
+            cli.config,
+            runtime,
+            job_id,
+            client_id,
+            lease_token,
+            request_fingerprint,
+            server_args,
+            rsync_executor,
+            stderr,
+        );
     }
     let json = cli.json;
     let raw_probe = matches!(
@@ -230,6 +283,76 @@ pub fn run_with_stdio_in_context(
             write_error(stderr, &error);
             error.exit_code()
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_host_rsync_receive(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    job_id: HiddenComponent,
+    client_id: HiddenComponent,
+    lease_token: HiddenComponent,
+    request_fingerprint: HiddenComponent,
+    server_args: Vec<OsString>,
+    executor: &dyn RsyncServerExecutor,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let job_id = job_id
+            .expose()
+            .parse()
+            .map_err(|_| WorkerError::Protocol("invalid receiver job identity".into()))?;
+        let client_id = client_id
+            .expose()
+            .parse()
+            .map_err(|_| WorkerError::Protocol("invalid receiver client identity".into()))?;
+        let lease_token = lease_token
+            .expose()
+            .parse()
+            .map_err(|_| WorkerError::Protocol("invalid receiver lease identity".into()))?;
+        let request_fingerprint = request_fingerprint
+            .expose()
+            .parse()
+            .map_err(|_| WorkerError::Protocol("invalid receiver fingerprint".into()))?;
+        let paths = discover_paths(config_override, runtime)?;
+        let store = HostStore::open(&paths.host_state_root())?;
+        HostTransferService::new(&store).receive(
+            &TransferIdentity::new(job_id, client_id, lease_token, request_fingerprint),
+            &server_args,
+            executor,
+        )
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            let code = public_rsync_receiver_error(&error);
+            if writeln!(stderr, "{code}").is_err() || stderr.flush().is_err() {
+                crate::error::ExitKind::Io as u8
+            } else {
+                error.exit_code()
+            }
+        }
+    }
+}
+
+fn public_rsync_receiver_error(error: &WorkerError) -> &'static str {
+    match error {
+        WorkerError::Protocol(message) if message.starts_with("INVALID_RSYNC_SERVER_ARGS:") => {
+            "HOST_RSYNC_INVALID_ARGS"
+        }
+        WorkerError::Protocol(message)
+            if message.starts_with("JOB_ABANDONED:")
+                || message.starts_with("JOB_ACCEPTED:")
+                || message.starts_with("JOB_ID_CONFLICT:") =>
+        {
+            "HOST_RSYNC_FENCED"
+        }
+        WorkerError::Protocol(message) if message.starts_with("LEASE_IDENTITY_MISMATCH:") => {
+            "HOST_RSYNC_LEASE"
+        }
+        WorkerError::Io(_) => "HOST_RSYNC_IO",
+        _ => "HOST_RSYNC_REJECTED",
     }
 }
 
