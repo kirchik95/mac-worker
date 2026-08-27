@@ -14,6 +14,7 @@ use transport::{SshTransport, WorkersService};
 
 pub mod agent;
 pub mod cli;
+pub mod client_state;
 pub mod config;
 pub mod doctor;
 pub mod error;
