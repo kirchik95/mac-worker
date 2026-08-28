@@ -1,4 +1,13 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use crate::{
     config::{Config, WorkerEntry},
@@ -18,6 +27,31 @@ const MAX_ARCH_BYTES: usize = 32;
 const MAX_OS_VERSION_BYTES: usize = 64;
 const MAX_CAPABILITY_BYTES: usize = 64;
 const MAX_CAPABILITY_COUNT: usize = 64;
+const MAX_CONCURRENT_PROBES: usize = 3;
+const MAX_PROBE_DEADLINE: Duration = Duration::from_secs(15);
+
+#[doc(hidden)]
+pub trait ProbeClock: Send + Sync {
+    fn now(&self) -> Duration;
+}
+
+struct SystemProbeClock {
+    origin: Instant,
+}
+
+impl SystemProbeClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl ProbeClock for SystemProbeClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
 
 pub struct SshTransport<R> {
     runner: R,
@@ -25,11 +59,20 @@ pub struct SshTransport<R> {
 
 pub struct WorkersService<R> {
     transport: SshTransport<R>,
+    clock: Arc<dyn ProbeClock>,
 }
 
 impl<R: ProcessRunner> WorkersService<R> {
     pub fn new(transport: SshTransport<R>) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            clock: Arc::new(SystemProbeClock::new()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_clock(transport: SshTransport<R>, clock: Arc<dyn ProbeClock>) -> Self {
+        Self { transport, clock }
     }
 
     pub fn inspect(&self, config: &Config) -> WorkersReport {
@@ -60,6 +103,81 @@ impl<R: ProcessRunner> WorkersService<R> {
                 .collect(),
         }
     }
+
+    pub fn inspect_with_budget(&self, config: &Config, budget: Duration) -> WorkersReport {
+        self.inspect_budgeted(config, &[], budget, false)
+    }
+
+    pub fn inspect_with_requirements_and_budget(
+        &self,
+        config: &Config,
+        requirements: &[String],
+        budget: Duration,
+    ) -> WorkersReport {
+        self.inspect_budgeted(config, requirements, budget, true)
+    }
+
+    fn inspect_budgeted(
+        &self,
+        config: &Config,
+        requirements: &[String],
+        budget: Duration,
+        include_project_requirements: bool,
+    ) -> WorkersReport {
+        let started = self.clock.now();
+        let next = AtomicUsize::new(0);
+        let results = Mutex::new(
+            config
+                .workers
+                .iter()
+                .map(|_| None)
+                .collect::<Vec<Option<WorkerHealth>>>(),
+        );
+
+        thread::scope(|scope| {
+            for _ in 0..MAX_CONCURRENT_PROBES.min(config.workers.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(worker) = config.workers.get(index) else {
+                            break;
+                        };
+                        let health = catch_unwind(AssertUnwindSafe(|| {
+                            let elapsed = self.clock.now().saturating_sub(started);
+                            let remaining = budget.saturating_sub(elapsed);
+                            if include_project_requirements {
+                                let required = stable_required_capabilities(worker, requirements);
+                                self.transport
+                                    .probe_with_required_deadline_and_failure_kind(
+                                        worker, &required, remaining,
+                                    )
+                                    .0
+                            } else {
+                                self.transport.probe_with_deadline(worker, remaining)
+                            }
+                        }))
+                        .unwrap_or_else(|_| probe_aborted(worker));
+                        results
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] = Some(health);
+                    }
+                });
+            }
+        });
+
+        let mut results = results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let workers = results
+            .iter_mut()
+            .zip(&config.workers)
+            .map(|(health, worker)| health.take().unwrap_or_else(|| probe_aborted(worker)))
+            .collect();
+        WorkersReport {
+            protocol_version: PROTOCOL_VERSION,
+            workers,
+        }
+    }
 }
 
 impl<R: ProcessRunner> SshTransport<R> {
@@ -71,6 +189,11 @@ impl<R: ProcessRunner> SshTransport<R> {
         self.probe_with_failure_kind(worker, &worker.capabilities).0
     }
 
+    pub fn probe_with_deadline(&self, worker: &WorkerEntry, deadline: Duration) -> WorkerHealth {
+        self.probe_with_required_deadline_and_failure_kind(worker, &worker.capabilities, deadline)
+            .0
+    }
+
     pub(crate) fn probe_with_failure_kind(
         &self,
         worker: &WorkerEntry,
@@ -80,6 +203,7 @@ impl<R: ProcessRunner> SshTransport<R> {
             worker,
             required_capabilities,
             REMOTE_PROBE_COMMAND.into(),
+            MAX_PROBE_DEADLINE,
         )
     }
 
@@ -92,6 +216,21 @@ impl<R: ProcessRunner> SshTransport<R> {
             worker,
             &worker.capabilities,
             remote_command,
+            MAX_PROBE_DEADLINE,
+        )
+    }
+
+    fn probe_with_required_deadline_and_failure_kind(
+        &self,
+        worker: &WorkerEntry,
+        required_capabilities: &[String],
+        deadline: Duration,
+    ) -> (WorkerHealth, Option<SetupFailureKind>) {
+        self.probe_with_required_command_and_failure_kind(
+            worker,
+            required_capabilities,
+            REMOTE_PROBE_COMMAND.into(),
+            deadline,
         )
     }
 
@@ -100,52 +239,68 @@ impl<R: ProcessRunner> SshTransport<R> {
         worker: &WorkerEntry,
         required_capabilities: &[String],
         remote_command: String,
+        deadline: Duration,
     ) -> (WorkerHealth, Option<SetupFailureKind>) {
-        let result = match self.runner.run(&ssh_request(
+        if deadline.is_zero() {
+            return (probe_budget_exhausted(worker), None);
+        }
+        let request = ssh_request(
             worker,
             remote_command,
             ProcessPolicy {
                 stdout_limit: MAX_PROBE_RESPONSE_BYTES,
                 stderr_limit: MAX_PROBE_RESPONSE_BYTES,
-                deadline: Duration::from_secs(15),
+                deadline: deadline.min(MAX_PROBE_DEADLINE),
             },
-        )) {
-            Ok(result) => result,
-            Err(error) => {
-                if matches!(
-                    &error,
-                    WorkerError::Process(ProcessError::OutputLimitExceeded {
-                        stream: ProcessStream::Stdout,
-                        ..
-                    })
-                ) {
+        );
+        let run_result = catch_unwind(AssertUnwindSafe(|| self.runner.run(&request)));
+        let result = match run_result {
+            Err(_) => {
+                return (
+                    probe_aborted(worker),
+                    Some(SetupFailureKind::Infrastructure),
+                );
+            }
+            Ok(result) => match result {
+                Ok(result) => result,
+                Err(error) => {
+                    if matches!(
+                        &error,
+                        WorkerError::Process(ProcessError::OutputLimitExceeded {
+                            stream: ProcessStream::Stdout,
+                            ..
+                        })
+                    ) {
+                        return (
+                            unavailable(
+                                worker,
+                                "INVALID_RESPONSE",
+                                format!(
+                                    "SSH probe response exceeded {MAX_PROBE_RESPONSE_BYTES} bytes"
+                                ),
+                                None,
+                                Vec::new(),
+                            ),
+                            Some(SetupFailureKind::Infrastructure),
+                        );
+                    }
+                    let failure_kind = if matches!(&error, WorkerError::Io(_)) {
+                        SetupFailureKind::Io
+                    } else {
+                        SetupFailureKind::Infrastructure
+                    };
                     return (
                         unavailable(
                             worker,
-                            "INVALID_RESPONSE",
-                            format!("SSH probe response exceeded {MAX_PROBE_RESPONSE_BYTES} bytes"),
+                            "SSH_UNAVAILABLE",
+                            format!("failed to launch SSH probe: {error}"),
                             None,
                             Vec::new(),
                         ),
-                        Some(SetupFailureKind::Infrastructure),
+                        Some(failure_kind),
                     );
                 }
-                let failure_kind = if matches!(&error, WorkerError::Io(_)) {
-                    SetupFailureKind::Io
-                } else {
-                    SetupFailureKind::Infrastructure
-                };
-                return (
-                    unavailable(
-                        worker,
-                        "SSH_UNAVAILABLE",
-                        format!("failed to launch SSH probe: {error}"),
-                        None,
-                        Vec::new(),
-                    ),
-                    Some(failure_kind),
-                );
-            }
+            },
         };
 
         if !result.status.success() {
@@ -484,4 +639,24 @@ fn unavailable(
         error_code: Some(error_code.into()),
         error_message: Some(error_message),
     }
+}
+
+fn probe_budget_exhausted(worker: &WorkerEntry) -> WorkerHealth {
+    unavailable(
+        worker,
+        "SSH_UNAVAILABLE",
+        "worker probe budget was exhausted".into(),
+        None,
+        Vec::new(),
+    )
+}
+
+fn probe_aborted(worker: &WorkerEntry) -> WorkerHealth {
+    unavailable(
+        worker,
+        "SSH_UNAVAILABLE",
+        "worker probe aborted unexpectedly".into(),
+        None,
+        Vec::new(),
+    )
 }

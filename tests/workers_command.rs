@@ -1,9 +1,13 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     os::unix::process::ExitStatusExt,
     process::ExitStatus,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
     time::Duration,
 };
 
@@ -16,7 +20,7 @@ use mac_worker::{
     protocol::{
         HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth, WorkersReport,
     },
-    transport::{SshTransport, WorkersService},
+    transport::{ProbeClock, SshTransport, WorkersService},
 };
 
 #[derive(Clone)]
@@ -62,6 +66,137 @@ impl ProcessRunner for RecordingRunner {
             .unwrap()
             .pop_front()
             .expect("a predetermined process result")
+    }
+}
+
+#[derive(Clone, Default)]
+struct ManualProbeClock {
+    millis: Arc<AtomicU64>,
+}
+
+impl ManualProbeClock {
+    fn set_millis(&self, millis: u64) {
+        self.millis.store(millis, Ordering::SeqCst);
+    }
+}
+
+impl ProbeClock for ManualProbeClock {
+    fn now(&self) -> Duration {
+        Duration::from_millis(self.millis.load(Ordering::SeqCst))
+    }
+}
+
+#[derive(Default)]
+struct ControlledState {
+    active: usize,
+    max_active: usize,
+    started: Vec<String>,
+    released: HashSet<String>,
+    panic_destinations: HashSet<String>,
+    requests: Vec<ProcessRequest>,
+}
+
+#[derive(Clone, Default)]
+struct ControlledRunner {
+    state: Arc<(Mutex<ControlledState>, Condvar)>,
+}
+
+impl ControlledRunner {
+    fn wait_for_started(&self, count: usize) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        while state.started.len() < count {
+            state = changed.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self, destination: &str) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.released.insert(destination.to_owned());
+        changed.notify_all();
+    }
+
+    fn panic_on(&self, destination: &str) {
+        let (state, _) = &*self.state;
+        state
+            .lock()
+            .unwrap()
+            .panic_destinations
+            .insert(destination.to_owned());
+    }
+
+    fn started(&self) -> Vec<String> {
+        self.state.0.lock().unwrap().started.clone()
+    }
+
+    fn max_active(&self) -> usize {
+        self.state.0.lock().unwrap().max_active
+    }
+
+    fn requests_by_destination(&self) -> HashMap<String, ProcessRequest> {
+        self.state
+            .0
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .cloned()
+            .map(|request| (request_destination(&request), request))
+            .collect()
+    }
+}
+
+impl ProcessRunner for ControlledRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let destination = request_destination(request);
+        let should_panic = {
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().unwrap();
+            state.active += 1;
+            state.max_active = state.max_active.max(state.active);
+            state.started.push(destination.clone());
+            state.requests.push(request.clone());
+            changed.notify_all();
+            while !state.released.contains(&destination) {
+                state = changed.wait(state).unwrap();
+            }
+            state.active -= 1;
+            state.panic_destinations.contains(&destination)
+        };
+        if should_panic {
+            panic!("controlled probe panic for {destination}");
+        }
+        Ok(ProcessResult {
+            status: exit_status(0),
+            stdout: structured_probe_json(
+                PROTOCOL_VERSION,
+                &format!("{destination}.local"),
+                "arm64",
+                "26.2",
+                vec!["darwin-arm64".into(), "node".into()],
+            ),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+fn request_destination(request: &ProcessRequest) -> String {
+    request.args[9].to_string_lossy().into_owned()
+}
+
+fn config_with_workers(count: usize) -> Config {
+    Config {
+        version: 1,
+        workers: (1..=count)
+            .map(|index| {
+                worker(
+                    &format!("mini-{index}"),
+                    &format!("mac{index}"),
+                    &["darwin-arm64"],
+                )
+            })
+            .collect(),
     }
 }
 
@@ -168,6 +303,244 @@ fn probe_disables_forwarding_and_uses_the_fixed_host_command() {
             policy: probe_policy(),
         }]
     );
+}
+
+#[test]
+fn probe_with_deadline_uses_the_exact_nonzero_deadline_and_fifteen_second_cap() {
+    // Break caught: a caller budget is ignored, rounded, or allowed to exceed
+    // the established per-probe SSH bound.
+    let exact_runner = RecordingRunner::returning_json(valid_probe_json());
+    let exact_transport = SshTransport::new(exact_runner.clone());
+    let capped_runner = RecordingRunner::returning_json(valid_probe_json());
+    let capped_transport = SshTransport::new(capped_runner.clone());
+    let worker = worker("mini-1", "mac1", &["darwin-arm64"]);
+
+    assert_eq!(
+        exact_transport
+            .probe_with_deadline(&worker, Duration::from_millis(2_750))
+            .status,
+        HealthStatus::Ready
+    );
+    assert_eq!(
+        capped_transport
+            .probe_with_deadline(&worker, Duration::from_secs(60))
+            .status,
+        HealthStatus::Ready
+    );
+
+    assert_eq!(
+        exact_runner.requests()[0].policy.deadline,
+        Duration::from_millis(2_750)
+    );
+    assert_eq!(
+        capped_runner.requests()[0].policy.deadline,
+        Duration::from_secs(15)
+    );
+}
+
+#[test]
+fn zero_probe_deadline_skips_the_runner_and_returns_bounded_unavailable() {
+    // Break caught: an already-expired fleet budget still launches SSH.
+    let runner = RecordingRunner::returning_results(Vec::new());
+    let transport = SshTransport::new(runner.clone());
+
+    let health =
+        transport.probe_with_deadline(&worker("mini-1", "mac1", &["darwin-arm64"]), Duration::ZERO);
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("SSH_UNAVAILABLE"));
+    assert!(health.probe.is_none());
+    assert!(runner.requests().is_empty());
+}
+
+#[test]
+fn budgeted_inspection_runs_three_probes_concurrently_and_retains_config_order() {
+    // Break caught: collection becomes sequential, exceeds three active SSH
+    // probes, or returns completion order instead of inventory order.
+    let runner = ControlledRunner::default();
+    let clock = ManualProbeClock::default();
+    let service = WorkersService::with_clock(SshTransport::new(runner.clone()), Arc::new(clock));
+    let config = config_with_workers(4);
+    let handle =
+        thread::spawn(move || service.inspect_with_budget(&config, Duration::from_secs(20)));
+
+    runner.wait_for_started(3);
+    assert_eq!(runner.max_active(), 3);
+    assert_eq!(
+        runner.started().into_iter().collect::<HashSet<_>>(),
+        HashSet::from(["mac1".into(), "mac2".into(), "mac3".into()])
+    );
+
+    runner.release("mac3");
+    runner.wait_for_started(4);
+    runner.release("mac4");
+    runner.release("mac2");
+    runner.release("mac1");
+    let report = handle.join().unwrap();
+
+    assert_eq!(runner.max_active(), 3);
+    assert_eq!(
+        report
+            .workers
+            .iter()
+            .map(|health| health.name.as_str())
+            .collect::<Vec<_>>(),
+        ["mini-1", "mini-2", "mini-3", "mini-4"]
+    );
+    assert!(
+        report
+            .workers
+            .iter()
+            .all(|health| health.status == HealthStatus::Ready)
+    );
+}
+
+#[test]
+fn later_probe_batch_receives_only_the_remaining_global_budget() {
+    // Break caught: each pool claim restarts the caller's full fleet budget.
+    let runner = ControlledRunner::default();
+    let clock = ManualProbeClock::default();
+    let service =
+        WorkersService::with_clock(SshTransport::new(runner.clone()), Arc::new(clock.clone()));
+    let config = config_with_workers(4);
+    let handle =
+        thread::spawn(move || service.inspect_with_budget(&config, Duration::from_secs(10)));
+
+    runner.wait_for_started(3);
+    clock.set_millis(4_000);
+    runner.release("mac1");
+    runner.wait_for_started(4);
+    runner.release("mac2");
+    runner.release("mac3");
+    runner.release("mac4");
+    let report = handle.join().unwrap();
+
+    assert!(
+        report
+            .workers
+            .iter()
+            .all(|health| health.status == HealthStatus::Ready)
+    );
+    let requests = runner.requests_by_destination();
+    assert_eq!(requests["mac1"].policy.deadline, Duration::from_secs(10));
+    assert_eq!(requests["mac2"].policy.deadline, Duration::from_secs(10));
+    assert_eq!(requests["mac3"].policy.deadline, Duration::from_secs(10));
+    assert_eq!(requests["mac4"].policy.deadline, Duration::from_secs(6));
+}
+
+#[test]
+fn expired_global_budget_skips_unstarted_hosts_instead_of_multiplying_duration() {
+    // Break caught: a six-host fleet consumes one complete budget per host or
+    // starts later SSH probes after the monotonic deadline has expired.
+    let runner = ControlledRunner::default();
+    let clock = ManualProbeClock::default();
+    let service =
+        WorkersService::with_clock(SshTransport::new(runner.clone()), Arc::new(clock.clone()));
+    let config = config_with_workers(6);
+    let handle =
+        thread::spawn(move || service.inspect_with_budget(&config, Duration::from_secs(10)));
+
+    runner.wait_for_started(3);
+    clock.set_millis(10_000);
+    runner.release("mac1");
+    runner.release("mac2");
+    runner.release("mac3");
+    let report = handle.join().unwrap();
+
+    assert_eq!(runner.started().len(), 3);
+    assert_eq!(report.workers.len(), 6);
+    assert!(
+        report.workers[..3]
+            .iter()
+            .all(|health| health.status == HealthStatus::Ready)
+    );
+    assert!(
+        report.workers[3..]
+            .iter()
+            .all(|health| { health.status == HealthStatus::Unavailable && health.probe.is_none() })
+    );
+}
+
+#[test]
+fn panicking_probe_becomes_one_unavailable_row_without_losing_peers() {
+    // Break caught: one runner panic unwinds the fleet collection or drops
+    // successful rows that completed in the same pool.
+    let runner = ControlledRunner::default();
+    runner.panic_on("mac2");
+    let service = WorkersService::with_clock(
+        SshTransport::new(runner.clone()),
+        Arc::new(ManualProbeClock::default()),
+    );
+    let config = config_with_workers(4);
+    let handle =
+        thread::spawn(move || service.inspect_with_budget(&config, Duration::from_secs(20)));
+
+    runner.wait_for_started(3);
+    runner.release("mac1");
+    runner.release("mac2");
+    runner.release("mac3");
+    runner.wait_for_started(4);
+    runner.release("mac4");
+    let report = handle.join().unwrap();
+
+    assert_eq!(report.workers.len(), 4);
+    assert_eq!(report.workers[1].name, "mini-2");
+    assert_eq!(report.workers[1].status, HealthStatus::Unavailable);
+    assert_eq!(
+        report.workers[1].error_code.as_deref(),
+        Some("SSH_UNAVAILABLE")
+    );
+    assert!(report.workers[1].probe.is_none());
+    assert!(
+        [0, 2, 3]
+            .into_iter()
+            .all(|index| report.workers[index].status == HealthStatus::Ready)
+    );
+}
+
+#[test]
+fn budgeted_requirement_inspection_keeps_inventory_first_stable_union() {
+    // Break caught: the budgeted path diverges from the established project
+    // requirement ordering or mutates configured capabilities.
+    let runner = RecordingRunner::returning_json(structured_probe_json(
+        PROTOCOL_VERSION,
+        "mini-1.local",
+        "arm64",
+        "26.2",
+        vec!["node".into()],
+    ));
+    let config = Config {
+        version: 1,
+        workers: vec![worker(
+            "mini-1",
+            "mac1",
+            &["darwin-arm64", "docker", "darwin-arm64", "ruby"],
+        )],
+    };
+    let original_inventory = config.workers[0].capabilities.clone();
+    let service = WorkersService::with_clock(
+        SshTransport::new(runner.clone()),
+        Arc::new(ManualProbeClock::default()),
+    );
+
+    let report = service.inspect_with_requirements_and_budget(
+        &config,
+        &[
+            "node".into(),
+            "docker".into(),
+            "swift".into(),
+            "node".into(),
+            "go".into(),
+        ],
+        Duration::from_secs(4),
+    );
+
+    assert_eq!(
+        report.workers[0].missing_capabilities,
+        ["darwin-arm64", "docker", "ruby", "swift", "go"]
+    );
+    assert_eq!(config.workers[0].capabilities, original_inventory);
+    assert_eq!(runner.requests()[0].policy.deadline, Duration::from_secs(4));
 }
 
 #[test]
