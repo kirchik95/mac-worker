@@ -385,6 +385,27 @@ impl ClientStateStore {
         })
     }
 
+    pub(crate) fn update_observation_if_same_immutable(
+        &self,
+        expected: &LocalJobRecord,
+        status: JobStatus,
+    ) -> Result<LocalJobRecord, WorkerError> {
+        expected.validate()?;
+        self.require_local_client(expected)?;
+        status.validate()?;
+        let job_id = expected.meta().job_id();
+        self.update_locked(job_id, move |existing| {
+            require_same_immutable(existing, expected)?;
+            require_forward_observation(existing.last_status(), Some(&status))?;
+            LocalJobRecord::new(
+                existing.meta().clone(),
+                existing.lease_token(),
+                Some(status),
+                existing.remote_uncertainty().clone(),
+            )
+        })
+    }
+
     pub fn set_remote_uncertainty(
         &self,
         job_id: JobId,
@@ -392,6 +413,26 @@ impl ClientStateStore {
     ) -> Result<LocalJobRecord, WorkerError> {
         uncertainty.validate()?;
         self.update_locked(job_id, move |existing| {
+            LocalJobRecord::new(
+                existing.meta().clone(),
+                existing.lease_token(),
+                existing.last_status().cloned(),
+                uncertainty,
+            )
+        })
+    }
+
+    pub(crate) fn set_remote_uncertainty_if_same_immutable(
+        &self,
+        expected: &LocalJobRecord,
+        uncertainty: RemoteUncertainty,
+    ) -> Result<LocalJobRecord, WorkerError> {
+        expected.validate()?;
+        self.require_local_client(expected)?;
+        uncertainty.validate()?;
+        let job_id = expected.meta().job_id();
+        self.update_locked(job_id, move |existing| {
+            require_same_immutable(existing, expected)?;
             LocalJobRecord::new(
                 existing.meta().clone(),
                 existing.lease_token(),

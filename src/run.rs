@@ -122,6 +122,17 @@ pub struct StatusService<'a> {
     pub remote: &'a RemoteJobClient<'a>,
 }
 
+enum StatusApply {
+    Applied(LocalJobRecord),
+    ConcurrentConflict(LocalJobRecord),
+}
+
+enum ObservationRelation {
+    RemoteAdvances,
+    CurrentAtLeastRemote,
+    Conflict,
+}
+
 impl StatusService<'_> {
     pub fn inspect(&self, job_id: Option<JobId>) -> Result<StatusReport, WorkerError> {
         match job_id {
@@ -152,23 +163,32 @@ impl StatusService<'_> {
             if refreshed == STATUS_REFRESH_LIMIT || !eligible_for_list_refresh(record) {
                 continue;
             }
-            refreshed += 1;
             let Some(worker) = self.config.worker(record.meta().worker_name()) else {
                 continue;
             };
+            refreshed += 1;
             let response = self.remote.status_with_deadline(
                 worker,
                 record.meta().job_id(),
                 STATUS_REFRESH_DEADLINE,
             );
-            if let Ok(response) = response
-                && let Ok(status) = normalize_authoritative_status(record, response)
-            {
-                let _ = self.apply_authoritative_status(record.meta().job_id(), status);
-            }
-            if let Ok(current) = self.client_state.load_job(record.meta().job_id()) {
-                *record = current;
-            }
+            let response = match response {
+                Ok(response) => response,
+                Err(_) => {
+                    *record = self.load_same_immutable(record)?;
+                    continue;
+                }
+            };
+            let status = match normalize_authoritative_status(record, response) {
+                Ok(status) => status,
+                Err(_) => {
+                    *record = self.load_same_immutable(record)?;
+                    continue;
+                }
+            };
+            *record = match self.apply_authoritative_status(record, status)? {
+                StatusApply::Applied(current) | StatusApply::ConcurrentConflict(current) => current,
+            };
         }
 
         let jobs = records
@@ -182,27 +202,67 @@ impl StatusService<'_> {
         let record = self.load_exact(job_id)?;
         let worker = self.worker_for(&record)?;
         let record = if matches!(record.remote_uncertainty(), RemoteUncertainty::None) {
-            let response = self.remote.status(worker, job_id)?;
-            let status = normalize_authoritative_status(&record, response)?;
-            self.apply_authoritative_status(job_id, status)?
+            let response = match self.remote.status(worker, job_id) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.load_same_immutable(&record)?;
+                    return Err(error);
+                }
+            };
+            let status = match normalize_authoritative_status(&record, response) {
+                Ok(status) => status,
+                Err(error) => {
+                    self.load_same_immutable(&record)?;
+                    return Err(error);
+                }
+            };
+            match self.apply_authoritative_status(&record, status)? {
+                StatusApply::Applied(current) => current,
+                StatusApply::ConcurrentConflict(_) => return Err(local_status_conflict()),
+            }
         } else {
             let request = ResolveOrAbandonRequest::try_from(&record)?;
-            match self.remote.resolve_preacceptance(worker, &request)? {
+            let disposition = match self.remote.resolve_preacceptance(worker, &request) {
+                Ok(disposition) => disposition,
+                Err(error) => {
+                    self.load_same_immutable(&record)?;
+                    return Err(error);
+                }
+            };
+            match disposition {
                 PreacceptanceDisposition::Accepted(response) => {
-                    let status = normalize_authoritative_status(&record, response)?;
-                    self.apply_authoritative_status(job_id, status)?
+                    let status = match normalize_authoritative_status(&record, response) {
+                        Ok(status) => status,
+                        Err(error) => {
+                            self.load_same_immutable(&record)?;
+                            return Err(error);
+                        }
+                    };
+                    match self.apply_authoritative_status(&record, status)? {
+                        StatusApply::Applied(current) => current,
+                        StatusApply::ConcurrentConflict(_) => {
+                            return Err(local_status_conflict());
+                        }
+                    }
                 }
                 PreacceptanceDisposition::Abandoned => {
+                    self.load_same_immutable(&record)?;
                     return Err(WorkerError::Protocol(
                         "JOB_ABANDONED: remote job was authoritatively abandoned".into(),
                     ));
                 }
-                PreacceptanceDisposition::CleanupPending { code } => self
-                    .client_state
-                    .set_remote_uncertainty(job_id, RemoteUncertainty::cleanup_pending(code)?)?,
-                PreacceptanceDisposition::UnknownRemote { code } => self
-                    .client_state
-                    .set_remote_uncertainty(job_id, RemoteUncertainty::unknown_remote(code)?)?,
+                PreacceptanceDisposition::CleanupPending { code } => {
+                    self.client_state.set_remote_uncertainty_if_same_immutable(
+                        &record,
+                        RemoteUncertainty::cleanup_pending(code)?,
+                    )?
+                }
+                PreacceptanceDisposition::UnknownRemote { code } => {
+                    self.client_state.set_remote_uncertainty_if_same_immutable(
+                        &record,
+                        RemoteUncertainty::unknown_remote(code)?,
+                    )?
+                }
             }
         };
         Ok(StatusReport::new(
@@ -235,42 +295,116 @@ impl StatusService<'_> {
 
     fn apply_authoritative_status(
         &self,
-        job_id: JobId,
+        expected: &LocalJobRecord,
         status: JobStatus,
-    ) -> Result<LocalJobRecord, WorkerError> {
-        let current = self.client_state.load_job(job_id)?;
-        let preserve_current = observation_is_forward_of(&current, &status);
-        if !preserve_current
-            && let Err(error) = self.client_state.update_observation(job_id, status.clone())
-        {
-            let reloaded = self.client_state.load_job(job_id)?;
-            if !observation_is_forward_of(&reloaded, &status) {
-                return Err(error);
+    ) -> Result<StatusApply, WorkerError> {
+        let before = self.load_same_immutable(expected)?;
+        match observation_relation(&before, &status) {
+            ObservationRelation::CurrentAtLeastRemote => {
+                return self
+                    .client_state
+                    .set_remote_uncertainty_if_same_immutable(expected, RemoteUncertainty::None)
+                    .map(StatusApply::Applied);
             }
+            ObservationRelation::Conflict => {
+                return Ok(StatusApply::ConcurrentConflict(before));
+            }
+            ObservationRelation::RemoteAdvances => {}
+        }
+        match self
+            .client_state
+            .update_observation_if_same_immutable(expected, status.clone())
+        {
+            Ok(_) => {}
+            Err(error @ WorkerError::Protocol(_)) => {
+                let current = self.load_same_immutable(expected)?;
+                if current.last_status() == before.last_status() {
+                    return Err(error);
+                }
+                return match observation_relation(&current, &status) {
+                    ObservationRelation::CurrentAtLeastRemote => self
+                        .client_state
+                        .set_remote_uncertainty_if_same_immutable(expected, RemoteUncertainty::None)
+                        .map(StatusApply::Applied),
+                    ObservationRelation::RemoteAdvances | ObservationRelation::Conflict => {
+                        Ok(StatusApply::ConcurrentConflict(current))
+                    }
+                };
+            }
+            Err(error) => return Err(error),
         }
         self.client_state
-            .set_remote_uncertainty(job_id, RemoteUncertainty::None)
+            .set_remote_uncertainty_if_same_immutable(expected, RemoteUncertainty::None)
+            .map(StatusApply::Applied)
+    }
+
+    fn load_same_immutable(
+        &self,
+        expected: &LocalJobRecord,
+    ) -> Result<LocalJobRecord, WorkerError> {
+        let current = self.client_state.load_job(expected.meta().job_id())?;
+        if same_immutable(&current, expected) {
+            Ok(current)
+        } else {
+            Err(job_id_conflict())
+        }
     }
 }
 
-fn observation_is_forward_of(record: &LocalJobRecord, status: &JobStatus) -> bool {
-    let Some(observed) = record.last_status() else {
-        return false;
+fn same_immutable(left: &LocalJobRecord, right: &LocalJobRecord) -> bool {
+    left.meta() == right.meta() && left.lease_token() == right.lease_token()
+}
+
+fn job_id_conflict() -> WorkerError {
+    WorkerError::Protocol(
+        "JOB_ID_CONFLICT: job ID is already bound to different immutable metadata".into(),
+    )
+}
+
+fn local_status_conflict() -> WorkerError {
+    WorkerError::Protocol(
+        "LOCAL_STATUS_CONFLICT: local job observation conflicts with remote authority".into(),
+    )
+}
+
+fn accepted_enrichment_is_transitively_forward(previous: &JobStatus, observed: &JobStatus) -> bool {
+    previous.state() == JobState::Accepted
+        && previous.supervisor_identity().is_none()
+        && previous.child_identity().is_none()
+        && observed.supervisor_identity().is_some()
+        && observed.child_identity().is_some()
+        && observed.updated_at_millis() >= previous.updated_at_millis()
+}
+
+fn observation_relation(current: &LocalJobRecord, remote: &JobStatus) -> ObservationRelation {
+    let Some(current) = current.last_status() else {
+        return ObservationRelation::RemoteAdvances;
     };
-    if observed == status {
+    if current == remote || status_is_valid_forward(remote, current) {
+        ObservationRelation::CurrentAtLeastRemote
+    } else if status_is_valid_forward(current, remote) {
+        ObservationRelation::RemoteAdvances
+    } else {
+        ObservationRelation::Conflict
+    }
+}
+
+fn status_is_valid_forward(previous: &JobStatus, next: &JobStatus) -> bool {
+    if next.updated_at_millis() < previous.updated_at_millis() {
+        return false;
+    }
+    if previous == next {
         return true;
     }
-    if observed.updated_at_millis() < status.updated_at_millis() {
+    if next.state() == previous.state() {
+        return previous.transition(next.clone()).is_ok()
+            || accepted_enrichment_is_transitively_forward(previous, next);
+    }
+    if previous.state().is_terminal() || !can_skip_forward(previous.state(), next.state()) {
         return false;
     }
-    if observed.state() == status.state() {
-        return status.transition(observed.clone()).is_ok();
-    }
-    if status.state().is_terminal() || !can_skip_forward(status.state(), observed.state()) {
-        return false;
-    }
-    sticky_identity_matches(status.supervisor_identity(), observed.supervisor_identity())
-        && sticky_identity_matches(status.child_identity(), observed.child_identity())
+    sticky_identity_matches(previous.supervisor_identity(), next.supervisor_identity())
+        && sticky_identity_matches(previous.child_identity(), next.child_identity())
 }
 
 fn eligible_for_list_refresh(record: &LocalJobRecord) -> bool {

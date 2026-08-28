@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     ffi::OsStr,
+    fs,
     os::unix::process::ExitStatusExt,
     path::PathBuf,
     process::ExitStatus,
@@ -15,12 +16,12 @@ use assert_cmd::Command;
 use clap::Parser;
 use mac_worker::{
     cli::{Cli, Command as WorkerCommand},
-    client_state::ClientStateStore,
+    client_state::{ClientStateStore, ClientStateWritePoint},
     config::{Config, WorkerEntry},
     error::WorkerError,
     job::{
         ClientId, CommandSpec, JobId, JobMeta, JobStatus, LeaseToken, LocalJobRecord,
-        RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
+        ProcessIdentity, RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
         ResolveOrAbandonResponse, StatusRequest, StatusResponse,
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner},
@@ -257,6 +258,20 @@ fn service<'a>(
 
 fn state_store(temp: &tempfile::TempDir) -> ClientStateStore {
     ClientStateStore::open(&temp.path().canonicalize().unwrap().join("state")).unwrap()
+}
+
+fn job_file(temp: &tempfile::TempDir, job_id: JobId) -> PathBuf {
+    temp.path()
+        .canonicalize()
+        .unwrap()
+        .join("state/jobs")
+        .join(format!("{job_id}.json"))
+}
+
+fn canonical_job_bytes(record: &LocalJobRecord) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(record).unwrap();
+    bytes.push(b'\n');
+    bytes
 }
 
 fn assert_status_call(request: &ProcessRequest, deadline: Duration, job_id: JobId) {
@@ -1349,4 +1364,327 @@ fn status_refresh_preserves_concurrent_forward_local_observation() {
     assert!(
         matches!(report.jobs[0].remote_uncertainty, RemoteUncertainty::UnknownRemote { ref code } if code == "IDENTITY_RACE")
     );
+}
+
+#[test]
+fn status_refresh_binds_remote_authority_to_full_expected_local_immutable_identity() {
+    // Catches a same-ID record replacement between response validation and
+    // the two local mutations, including the lease identity absent from meta.
+    for replacement_kind in ["meta", "lease"] {
+        let temp = tempfile::tempdir().unwrap();
+        let store = state_store(&temp);
+        let original = test_record(
+            &store,
+            40,
+            100,
+            Some(JobStatus::accepted(101).unwrap()),
+            RemoteUncertainty::None,
+        );
+        store.create_job(original.clone()).unwrap();
+        let replacement = if replacement_kind == "meta" {
+            record_with_meta_parts(
+                original.meta().job_id(),
+                store.client_id(),
+                "mini-1",
+                &"d".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                30_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                None,
+                None,
+                RemoteUncertainty::unknown_remote("REPLACED_META").unwrap(),
+            )
+        } else {
+            LocalJobRecord::new(
+                original.meta().clone(),
+                LeaseToken::new(uuid::Uuid::from_u128(999_999)),
+                None,
+                RemoteUncertainty::unknown_remote("REPLACED_LEASE").unwrap(),
+            )
+            .unwrap()
+        };
+        let response = StatusResponse::new(
+            original.meta().clone(),
+            JobStatus::running(200, 11, 12, 13, 14).unwrap(),
+        )
+        .unwrap();
+        let path = job_file(&temp, original.meta().job_id());
+        let replacement_bytes = canonical_job_bytes(&replacement);
+        let runner = RecordingRunner::with_hook(vec![status_result(&response)], move |_| {
+            fs::write(&path, &replacement_bytes).unwrap();
+        });
+        let remote = RemoteJobClient::new(&runner);
+        let config = config();
+
+        let error = service(&config, &store, &remote)
+            .inspect(Some(original.meta().job_id()))
+            .unwrap_err();
+
+        assert!(
+            matches!(error, WorkerError::Protocol(ref message) if message.contains("JOB_ID_CONFLICT")),
+            "{replacement_kind}: {error}"
+        );
+        assert_eq!(
+            store.load_job(original.meta().job_id()).unwrap(),
+            replacement,
+            "{replacement_kind}"
+        );
+    }
+}
+
+#[test]
+fn status_list_propagates_in_flight_local_registry_corruption_and_replacement() {
+    // Catches list mode treating local corruption, disappearance, or a new
+    // immutable binding as a tolerable remote refresh failure.
+    for mutation in ["truncate", "remove", "replace"] {
+        let temp = tempfile::tempdir().unwrap();
+        let store = state_store(&temp);
+        let original = test_record(&store, 50, 100, None, RemoteUncertainty::None);
+        store.create_job(original.clone()).unwrap();
+        let path = job_file(&temp, original.meta().job_id());
+        let replacement = record_with_meta_parts(
+            original.meta().job_id(),
+            store.client_id(),
+            "mini-1",
+            &"e".repeat(64),
+            &"b".repeat(64),
+            &"c".repeat(64),
+            "packages/app",
+            30_000,
+            "heavy",
+            CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+            100,
+            None,
+            None,
+            RemoteUncertainty::None,
+        );
+        let replacement_bytes = canonical_job_bytes(&replacement);
+        let runner =
+            RecordingRunner::with_hook(vec![transport_failure()], move |_| match mutation {
+                "truncate" => fs::write(&path, b"{").unwrap(),
+                "remove" => fs::remove_file(&path).unwrap(),
+                "replace" => fs::write(&path, &replacement_bytes).unwrap(),
+                _ => unreachable!(),
+            });
+        let remote = RemoteJobClient::new(&runner);
+        let config = config();
+
+        let error = service(&config, &store, &remote).inspect(None).unwrap_err();
+
+        match mutation {
+            "truncate" => assert!(
+                matches!(error, WorkerError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidData)
+            ),
+            "remove" => assert!(
+                matches!(error, WorkerError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
+            ),
+            "replace" => assert!(
+                matches!(error, WorkerError::Protocol(ref message) if message.contains("JOB_ID_CONFLICT"))
+            ),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn status_list_propagates_local_conditional_update_io_failure() {
+    // Catches treating a local conditional-write failure as a tolerable
+    // remote response failure or as a concurrent observation conflict.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(&store, 55, 100, None, RemoteUncertainty::None);
+    store.create_job(record.clone()).unwrap();
+    let response =
+        StatusResponse::new(record.meta().clone(), JobStatus::accepted(101).unwrap()).unwrap();
+    let hook_store = store.clone();
+    let runner = RecordingRunner::with_hook(vec![status_result(&response)], move |_| {
+        hook_store.inject_write_failure_once(ClientStateWritePoint::BeforePublish);
+    });
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let error = service(&config, &store, &remote).inspect(None).unwrap_err();
+
+    assert!(matches!(error, WorkerError::Io(ref io) if io.kind() == std::io::ErrorKind::Other));
+    assert_eq!(store.load_job(record.meta().job_id()).unwrap(), record);
+}
+
+#[test]
+fn status_refresh_preserves_each_valid_accepted_identity_enrichment_step() {
+    // Catches requiring one direct transition when the local observation may
+    // have advanced through both valid Accepted identity enrichments in flight.
+    for observed_step in ["supervisor", "transitive_child", "direct_child"] {
+        let temp = tempfile::tempdir().unwrap();
+        let store = state_store(&temp);
+        let bare = JobStatus::accepted(101).unwrap();
+        let supervisor = bare
+            .with_supervisor(ProcessIdentity::new(11, 12).unwrap(), 150)
+            .unwrap();
+        let child = supervisor
+            .with_child(ProcessIdentity::new(13, 14).unwrap(), 200)
+            .unwrap();
+        let initial = if observed_step == "direct_child" {
+            supervisor.clone()
+        } else {
+            bare.clone()
+        };
+        let record = test_record(
+            &store,
+            60,
+            100,
+            Some(initial.clone()),
+            RemoteUncertainty::unknown_remote("ENRICHMENT_RACE").unwrap(),
+        );
+        store.create_job(record.clone()).unwrap();
+        let response = StatusResponse::new(record.meta().clone(), initial).unwrap();
+        let expected = if observed_step == "supervisor" {
+            supervisor.clone()
+        } else {
+            child.clone()
+        };
+        let hook_store = store.clone();
+        let hook_supervisor = supervisor.clone();
+        let hook_child = child.clone();
+        let job_id = record.meta().job_id();
+        let runner = RecordingRunner::with_hook(vec![status_result(&response)], move |_| {
+            if observed_step == "direct_child" {
+                hook_store
+                    .update_observation(job_id, hook_child.clone())
+                    .unwrap();
+            } else {
+                hook_store
+                    .update_observation(job_id, hook_supervisor.clone())
+                    .unwrap();
+                if observed_step == "transitive_child" {
+                    hook_store
+                        .update_observation(job_id, hook_child.clone())
+                        .unwrap();
+                }
+            }
+        });
+        let remote = RemoteJobClient::new(&runner);
+        let config = config();
+
+        let report = service(&config, &store, &remote).inspect(None).unwrap();
+
+        assert_eq!(
+            report.jobs[0].status.as_ref(),
+            Some(&expected),
+            "{observed_step}"
+        );
+        assert_eq!(report.jobs[0].remote_uncertainty, RemoteUncertainty::None);
+    }
+}
+
+#[test]
+fn status_exact_surfaces_same_immutable_concurrent_observation_conflict() {
+    // Catches exact mode silently returning a divergent terminal or identity
+    // observation as a successful status lookup.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(
+        &store,
+        65,
+        100,
+        Some(JobStatus::accepted(101).unwrap()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(record.clone()).unwrap();
+    let response = StatusResponse::new(
+        record.meta().clone(),
+        JobStatus::succeeded(200, 1, 2).unwrap(),
+    )
+    .unwrap();
+    let concurrent = JobStatus::failed(300, 7, 3, 4).unwrap();
+    let hook_store = store.clone();
+    let hook_status = concurrent.clone();
+    let job_id = record.meta().job_id();
+    let runner = RecordingRunner::with_hook(vec![status_result(&response)], move |_| {
+        hook_store
+            .update_observation(job_id, hook_status.clone())
+            .unwrap();
+    });
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let error = service(&config, &store, &remote)
+        .inspect(Some(job_id))
+        .unwrap_err();
+
+    assert!(
+        matches!(error, WorkerError::Protocol(ref message) if message.starts_with("LOCAL_STATUS_CONFLICT:"))
+    );
+    assert_eq!(
+        store.load_job(job_id).unwrap().last_status(),
+        Some(&concurrent)
+    );
+}
+
+#[test]
+fn status_list_missing_workers_do_not_consume_the_remote_refresh_budget() {
+    // Catches counting eligible but uncallable rows against the 16 actual
+    // bounded status calls available to later configured rows.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    for index in 0..17 {
+        let record = record_with_meta_parts(
+            JobId::new(uuid::Uuid::from_u128(1_000 + index)),
+            store.client_id(),
+            "missing-mini",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"c".repeat(64),
+            "packages/app",
+            30_000,
+            "heavy",
+            CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+            2_000 + index as u64,
+            None,
+            None,
+            RemoteUncertainty::None,
+        );
+        store.create_job(record).unwrap();
+    }
+    let mut configured = Vec::new();
+    for index in 0..16 {
+        let record = test_record(
+            &store,
+            2_000 + index,
+            1_000 + index as u64,
+            None,
+            RemoteUncertainty::None,
+        );
+        store.create_job(record.clone()).unwrap();
+        configured.push(record);
+    }
+    configured.sort_by_key(|record| std::cmp::Reverse(record.meta().created_at_millis()));
+    let results = configured
+        .iter()
+        .map(|record| {
+            status_result(
+                &StatusResponse::new(
+                    record.meta().clone(),
+                    JobStatus::accepted(record.meta().created_at_millis()).unwrap(),
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+    let runner = RecordingRunner::returning(results);
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let report = service(&config, &store, &remote).inspect(None).unwrap();
+
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 16);
+    for (request, record) in requests.iter().zip(&configured) {
+        assert_status_call(request, Duration::from_secs(5), record.meta().job_id());
+    }
+    assert!(report.jobs[..17].iter().all(|row| row.status.is_none()));
+    assert!(report.jobs[17..].iter().all(|row| row.status.is_some()));
 }
