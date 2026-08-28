@@ -1,12 +1,16 @@
+#[allow(dead_code)]
+mod support;
+
 use std::{
     collections::{BTreeSet, VecDeque},
     ffi::OsStr,
     fs,
+    io::{self, Write},
     os::unix::process::ExitStatusExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitStatus,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -22,20 +26,24 @@ use mac_worker::{
     config::{Config, WorkerEntry},
     error::WorkerError,
     job::{
-        ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobState, JobStatus, LeaseToken,
-        LocalJobRecord, ProcessIdentity, RemoteUncertainty, RequestFingerprintMaterial,
-        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest, StatusResponse,
+        ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobState, JobStatus, JsonEvent,
+        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LocalJobRecord,
+        ProcessIdentity, RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
+        ResolveOrAbandonResponse, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
     },
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
+    paths::PathLayout,
+    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
+    remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     run::{
-        RunCompletion, RunReport, RunRequest, STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE,
-        STATUS_REFRESH_LIMIT, StatusReport, StatusRow, StatusService,
+        JobFollower, RunCompletion, RunReport, RunRequest, RunService, STATUS_LIST_LIMIT,
+        STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT, StatusReport, StatusRow, StatusService,
     },
     transfer::{HostOperation, RemoteJobClient, ResolutionRuntime},
 };
 use predicates::prelude::*;
 use serde_json::Value;
+use support::GitRepo;
 
 const JOB_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
 const CLIENT_ID: &str = "102f0f4a6b5c7d8e9f00112233445566";
@@ -2104,4 +2112,1390 @@ fn status_list_advances_a_compatible_intermediate_update_queued_before_the_cas()
     assert_eq!(persisted.remote_uncertainty(), &RemoteUncertainty::None);
     assert_eq!(requests.len(), 1);
     assert_status_call(&requests[0], Duration::from_secs(5), target_id);
+}
+
+const STOCK_RSYNC_STATS: &[u8] = b"Number of files: 2\nNumber of files transferred: 1\nTotal file size: 8 B\nTotal transferred file size: 8 B\nUnmatched data: 8 B\nMatched data: 0 B\nFile list size: 64 B\nTotal sent: 128 B\nTotal received: 32 B\n\nsent 128 bytes  received 32 bytes  1000 bytes/sec\ntotal size is 8  speedup is 0.05\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunScriptStep {
+    ProbeReady,
+    ProbeUnavailable,
+    Acquire,
+    AcquireExisting,
+    Upload,
+    Verify,
+    SubmitAccepted,
+    TransportFailure(HostOperation),
+    AuthoritativeFailure(HostOperation, &'static str),
+    UploadFailure,
+    StatusAccepted,
+    StatusTransportFailure,
+    ResolveAccepted,
+    ResolveAbandoned,
+    ResolveCleanupPending,
+    ResolveTransportFailure,
+}
+
+#[derive(Default)]
+struct RunScriptState {
+    steps: VecDeque<RunScriptStep>,
+    requests: Vec<ProcessRequest>,
+    events: Vec<String>,
+    material: Option<RequestFingerprintMaterial>,
+}
+
+struct RunScriptRunner {
+    state: Mutex<RunScriptState>,
+    state_root: PathBuf,
+}
+
+impl RunScriptRunner {
+    fn new(state_root: PathBuf, steps: impl IntoIterator<Item = RunScriptStep>) -> Self {
+        Self {
+            state: Mutex::new(RunScriptState {
+                steps: steps.into_iter().collect(),
+                ..RunScriptState::default()
+            }),
+            state_root,
+        }
+    }
+
+    fn requests(&self) -> Vec<ProcessRequest> {
+        self.state.lock().unwrap().requests.clone()
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.state.lock().unwrap().events.clone()
+    }
+
+    fn assert_consumed(&self) {
+        assert!(
+            self.state.lock().unwrap().steps.is_empty(),
+            "unused scripted run steps remain"
+        );
+    }
+
+    fn material(&self) -> RequestFingerprintMaterial {
+        self.state
+            .lock()
+            .unwrap()
+            .material
+            .clone()
+            .expect("acquire material was recorded")
+    }
+}
+
+fn successful_process(bytes: Vec<u8>) -> Result<ProcessResult, WorkerError> {
+    Ok(ProcessResult {
+        status: ExitStatus::from_raw(0),
+        stdout: bytes,
+        stderr: Vec::new(),
+    })
+}
+
+fn canonical_process(value: &impl serde::Serialize) -> Result<ProcessResult, WorkerError> {
+    let mut bytes = serde_json::to_vec(value).unwrap();
+    bytes.push(b'\n');
+    successful_process(bytes)
+}
+
+fn ready_probe() -> ProbeResponse {
+    ProbeResponse {
+        protocol_version: PROTOCOL_VERSION,
+        supervision_version: SUPERVISION_VERSION,
+        hostname: "mini-1.local".into(),
+        arch: "arm64".into(),
+        os_version: "26.2".into(),
+        free_disk_bytes: 100 * 1024 * 1024 * 1024,
+        total_disk_bytes: 250 * 1024 * 1024 * 1024,
+        memory_pressure: MemoryPressure::Normal,
+        swap_used_bytes: Some(0),
+        slot_state: mac_worker::lease::SlotState::Idle,
+        active_lease: None,
+        capabilities: vec!["declared-capability".into(), "project-capability".into()],
+    }
+}
+
+fn material_status(material: &RequestFingerprintMaterial, status: JobStatus) -> StatusResponse {
+    StatusResponse::new(
+        JobMeta::new(material, material.fingerprint()).unwrap(),
+        status,
+    )
+    .unwrap()
+}
+
+fn assert_resolution_matches(
+    request: &ResolveOrAbandonRequest,
+    material: &RequestFingerprintMaterial,
+) {
+    assert_eq!(request.job_id(), material.job_id());
+    assert_eq!(request.client_id(), material.client_id());
+    assert_eq!(request.lease_token(), material.lease_token());
+    assert_eq!(request.created_at_millis(), material.created_at_millis());
+    assert_eq!(request.request_fingerprint(), &material.fingerprint());
+    assert_eq!(request.worker_name(), material.worker_name());
+    assert_eq!(request.project_id(), material.project_id());
+    assert_eq!(request.worktree_id(), material.worktree_id());
+    assert_eq!(request.manifest_digest(), material.manifest_digest());
+    assert_eq!(
+        request.relative_working_dir(),
+        material.relative_working_dir()
+    );
+    assert_eq!(request.timeout_millis(), material.timeout_millis());
+    assert_eq!(request.resource_class(), material.resource_class());
+}
+
+impl ProcessRunner for RunScriptRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == OsStr::new("/usr/bin/git") {
+            self.state.lock().unwrap().events.push("git".into());
+            return SystemProcessRunner.run(request);
+        }
+
+        let mut state = self.state.lock().unwrap();
+        state.requests.push(request.clone());
+        let step = state
+            .steps
+            .pop_front()
+            .expect("an unexpected post-failure stage was reached");
+        state.events.push(format!("{step:?}"));
+
+        match step {
+            RunScriptStep::ProbeReady => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    "~/.local/bin/worker host probe"
+                );
+                canonical_process(&ready_probe())
+            }
+            RunScriptStep::ProbeUnavailable => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    "~/.local/bin/worker host probe"
+                );
+                Ok(ProcessResult {
+                    status: ExitStatus::from_raw(255 << 8),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+            RunScriptStep::Acquire | RunScriptStep::AcquireExisting => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    HostOperation::LeaseAcquire.command()
+                );
+                let acquire: LeaseAcquireRequest =
+                    serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                let material = acquire.material().clone();
+                assert!(
+                    self.state_root
+                        .join("jobs")
+                        .join(format!("{}.json", material.job_id()))
+                        .is_file(),
+                    "the durable local identity must precede lease acquisition"
+                );
+                state.material = Some(material.clone());
+                if step == RunScriptStep::AcquireExisting {
+                    canonical_process(&LeaseAcquireResponse::ExistingAccepted {
+                        status: JobStatus::accepted(material.created_at_millis()).unwrap(),
+                    })
+                } else {
+                    let lease = LeaseRecord::new(
+                        &material,
+                        material.fingerprint(),
+                        material.created_at_millis(),
+                        material.created_at_millis() + material.timeout_millis(),
+                    )
+                    .unwrap();
+                    canonical_process(&LeaseAcquireResponse::Acquired { lease })
+                }
+            }
+            RunScriptStep::Upload | RunScriptStep::UploadFailure => {
+                assert_eq!(request.program, OsStr::new("/usr/bin/rsync"));
+                let material = state.material.as_ref().unwrap();
+                let args = request
+                    .args
+                    .iter()
+                    .map(|value| value.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                for identity in [
+                    material.job_id().to_string(),
+                    material.client_id().to_string(),
+                    material.lease_token().to_string(),
+                    material.fingerprint().to_string(),
+                ] {
+                    assert!(args.contains(&identity));
+                }
+                if step == RunScriptStep::UploadFailure {
+                    Ok(ProcessResult {
+                        status: ExitStatus::from_raw(23 << 8),
+                        stdout: Vec::new(),
+                        stderr: b"content-free rsync failure".to_vec(),
+                    })
+                } else {
+                    successful_process(STOCK_RSYNC_STATS.to_vec())
+                }
+            }
+            RunScriptStep::Verify => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    HostOperation::SnapshotVerify.command()
+                );
+                let verify: SnapshotVerifyRequest =
+                    serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                let material = state.material.as_ref().unwrap();
+                assert_eq!(verify.job_id(), material.job_id());
+                assert_eq!(verify.client_id(), material.client_id());
+                assert_eq!(verify.lease_token(), material.lease_token());
+                assert_eq!(verify.request_fingerprint(), &material.fingerprint());
+                assert_eq!(verify.project_id(), material.project_id());
+                assert_eq!(verify.worktree_id(), material.worktree_id());
+                assert_eq!(verify.manifest_digest(), material.manifest_digest());
+                canonical_process(
+                    &VerifiedSnapshotResponse::new(
+                        verify.job_id(),
+                        verify.client_id(),
+                        verify.project_id().into(),
+                        verify.worktree_id().into(),
+                        verify.manifest_digest().into(),
+                        material.created_at_millis() + 1,
+                        false,
+                    )
+                    .unwrap(),
+                )
+            }
+            RunScriptStep::SubmitAccepted => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    HostOperation::Submit.command()
+                );
+                let submit: SubmitRequest =
+                    serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                let material = state.material.as_ref().unwrap();
+                assert_eq!(submit.material(), material);
+                assert_eq!(submit.request_fingerprint(), &material.fingerprint());
+                canonical_process(&SubmitResponse::Accepted {
+                    meta: Box::new(JobMeta::new(material, material.fingerprint()).unwrap()),
+                    status: JobStatus::accepted(material.created_at_millis()).unwrap(),
+                })
+            }
+            RunScriptStep::TransportFailure(operation) => {
+                assert_eq!(request.args.last().unwrap(), operation.command());
+                if operation == HostOperation::LeaseAcquire {
+                    let acquire: LeaseAcquireRequest =
+                        serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                    state.material = Some(acquire.material().clone());
+                } else if operation == HostOperation::SnapshotVerify {
+                    let verify: SnapshotVerifyRequest =
+                        serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                    assert_eq!(verify.job_id(), state.material.as_ref().unwrap().job_id());
+                } else if operation == HostOperation::Submit {
+                    let submit: SubmitRequest =
+                        serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                    assert_eq!(submit.material(), state.material.as_ref().unwrap());
+                }
+                Ok(ProcessResult {
+                    status: ExitStatus::from_raw(255 << 8),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+            RunScriptStep::AuthoritativeFailure(operation, code) => {
+                assert_eq!(request.args.last().unwrap(), operation.command());
+                if operation == HostOperation::Submit {
+                    let submit: SubmitRequest =
+                        serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                    assert_eq!(submit.material(), state.material.as_ref().unwrap());
+                }
+                let mut stdout = serde_json::to_vec(
+                    &HostControlError::new(code, "authoritative admission failure").unwrap(),
+                )
+                .unwrap();
+                stdout.push(b'\n');
+                Ok(ProcessResult {
+                    status: ExitStatus::from_raw(23 << 8),
+                    stdout,
+                    stderr: Vec::new(),
+                })
+            }
+            RunScriptStep::StatusAccepted
+            | RunScriptStep::StatusTransportFailure
+            | RunScriptStep::ResolveAccepted => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    HostOperation::Status.command()
+                );
+                let status: StatusRequest =
+                    serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                let material = state.material.as_ref().unwrap();
+                assert_eq!(status.job_id(), material.job_id());
+                if step == RunScriptStep::StatusTransportFailure {
+                    Ok(ProcessResult {
+                        status: ExitStatus::from_raw(255 << 8),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                } else {
+                    canonical_process(&material_status(
+                        material,
+                        JobStatus::accepted(material.created_at_millis()).unwrap(),
+                    ))
+                }
+            }
+            RunScriptStep::ResolveAbandoned
+            | RunScriptStep::ResolveCleanupPending
+            | RunScriptStep::ResolveTransportFailure => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    HostOperation::ResolveOrAbandon.command()
+                );
+                let resolution: ResolveOrAbandonRequest =
+                    serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                let material = state.material.as_ref().unwrap();
+                assert_resolution_matches(&resolution, material);
+                match step {
+                    RunScriptStep::ResolveAbandoned => {
+                        canonical_process(&ResolveOrAbandonResponse::abandoned())
+                    }
+                    RunScriptStep::ResolveCleanupPending => canonical_process(
+                        &ResolveOrAbandonResponse::cleanup_pending("CLEANUP_STILL_PENDING")
+                            .unwrap(),
+                    ),
+                    RunScriptStep::ResolveTransportFailure => Ok(ProcessResult {
+                        status: ExitStatus::from_raw(255 << 8),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    }),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct OutputState {
+    bytes: Vec<u8>,
+    flushes: usize,
+}
+
+struct RecordingWriter {
+    state: Arc<Mutex<OutputState>>,
+    fail_write: bool,
+}
+
+impl RecordingWriter {
+    fn new(state: Arc<Mutex<OutputState>>) -> Self {
+        Self {
+            state,
+            fail_write: false,
+        }
+    }
+
+    fn failing(state: Arc<Mutex<OutputState>>) -> Self {
+        Self {
+            state,
+            fail_write: true,
+        }
+    }
+}
+
+impl Write for RecordingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.fail_write {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "planted writer failure",
+            ));
+        }
+        self.state.lock().unwrap().bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.state.lock().unwrap().flushes += 1;
+        Ok(())
+    }
+}
+
+struct RecordingFollower {
+    calls: AtomicUsize,
+    output: Option<Arc<Mutex<OutputState>>>,
+    outcome: FollowerOutcome,
+    cleanup_error: bool,
+    sabotage_cleanup_under: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowerOutcome {
+    Exit(u8),
+    Signal(u32),
+    Infrastructure,
+    Nonterminal,
+    MismatchedMeta,
+    Error(&'static str),
+}
+
+impl RecordingFollower {
+    fn succeeding(exit_code: u8) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            output: None,
+            outcome: FollowerOutcome::Exit(exit_code),
+            cleanup_error: false,
+            sabotage_cleanup_under: None,
+        }
+    }
+
+    fn requiring_flushed(output: Arc<Mutex<OutputState>>) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            output: Some(output),
+            outcome: FollowerOutcome::Exit(0),
+            cleanup_error: false,
+            sabotage_cleanup_under: None,
+        }
+    }
+
+    fn failing() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            output: None,
+            outcome: FollowerOutcome::Error("planted follower failure"),
+            cleanup_error: false,
+            sabotage_cleanup_under: None,
+        }
+    }
+
+    fn terminal(outcome: FollowerOutcome, cleanup_error: bool) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            output: None,
+            outcome,
+            cleanup_error,
+            sabotage_cleanup_under: None,
+        }
+    }
+
+    fn failing_with_cleanup_sabotage(cache: PathBuf) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            output: None,
+            outcome: FollowerOutcome::Error("primary follower failure"),
+            cleanup_error: false,
+            sabotage_cleanup_under: Some(cache),
+        }
+    }
+}
+
+fn find_snapshot_publication(directory: &Path) -> Option<PathBuf> {
+    for entry in fs::read_dir(directory).ok()? {
+        let path = entry.ok()?.path();
+        if path.is_dir() {
+            if path.join("manifest.json").is_file() {
+                return Some(path);
+            }
+            if let Some(found) = find_snapshot_publication(&path) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+impl JobFollower for RecordingFollower {
+    fn follow(
+        &self,
+        record: &LocalJobRecord,
+        _json: bool,
+        _stdout: &mut dyn Write,
+        _stderr: &mut dyn Write,
+    ) -> Result<StatusResponse, WorkerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(output) = &self.output {
+            let output = output.lock().unwrap();
+            assert!(output.flushes > 0, "accepted output was not flushed");
+            assert!(!output.bytes.is_empty(), "accepted output was not written");
+        }
+        if let Some(cache) = &self.sabotage_cleanup_under {
+            let publication = find_snapshot_publication(&cache.join("snapshots/ready"))
+                .expect("prepared snapshot publication must exist while following");
+            let moved = publication.with_extension("moved-by-test");
+            fs::rename(&publication, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &publication).unwrap();
+        }
+        let updated = record.meta().created_at_millis() + 2;
+        let status = match self.outcome {
+            FollowerOutcome::Exit(0) => JobStatus::succeeded(updated, 0, 0).unwrap(),
+            FollowerOutcome::Exit(code) => JobStatus::failed(updated, code, 0, 0).unwrap(),
+            FollowerOutcome::Signal(signal) => JobStatus::new(
+                JobState::Failed,
+                updated,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(signal),
+                Some(0),
+                Some(0),
+                None,
+                None,
+            )
+            .unwrap(),
+            FollowerOutcome::Infrastructure => JobStatus::new(
+                JobState::TimedOut,
+                updated,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(0),
+                Some(0),
+                Some("REMOTE_TIMEOUT".into()),
+                None,
+            )
+            .unwrap(),
+            FollowerOutcome::Nonterminal | FollowerOutcome::MismatchedMeta => {
+                JobStatus::accepted(updated).unwrap()
+            }
+            FollowerOutcome::Error(message) => {
+                return Err(WorkerError::Transport {
+                    code: "FOLLOW_FAILED",
+                    message: message.into(),
+                });
+            }
+        };
+        let status = if self.cleanup_error {
+            status
+                .with_cleanup_error("REMOTE_CLEANUP_FAILED".into(), updated + 1)
+                .unwrap()
+        } else {
+            status
+        };
+        let meta = if self.outcome == FollowerOutcome::MismatchedMeta {
+            let mut meta = serde_json::to_value(record.meta()).unwrap();
+            meta["worker_name"] = Value::String("different-worker".into());
+            serde_json::from_value(meta).unwrap()
+        } else {
+            record.meta().clone()
+        };
+        StatusResponse::new(meta, status)
+    }
+}
+
+fn run_config() -> Config {
+    Config {
+        version: 1,
+        workers: vec![
+            WorkerEntry {
+                name: "mini-1".into(),
+                ssh: "mac1".into(),
+                slots: 1,
+                capabilities: vec!["declared-capability".into()],
+                remote_binary: "~/.local/bin/worker".into(),
+            },
+            WorkerEntry {
+                name: "poison-worker".into(),
+                ssh: "poison-host".into(),
+                slots: 1,
+                capabilities: Vec::new(),
+                remote_binary: "~/.local/bin/worker".into(),
+            },
+        ],
+    }
+}
+
+fn run_paths(temp: &tempfile::TempDir) -> PathLayout {
+    let root = temp.path().canonicalize().unwrap();
+    PathLayout {
+        config: root.join("config.toml"),
+        state: root.join("state"),
+        cache: root.join("cache"),
+        data: root.join("data"),
+    }
+}
+
+fn run_repo(settings: &[u8]) -> GitRepo {
+    let repo = GitRepo::init();
+    repo.write(".worker.toml", settings);
+    repo.write("tracked.txt", b"tracked\n");
+    repo.commit_all("run orchestration fixture");
+    repo
+}
+
+fn orchestration_request(repo: &GitRepo) -> RunRequest {
+    RunRequest {
+        worker: "mini-1".into(),
+        project: repo.root().to_path_buf(),
+        cli_includes: Vec::new(),
+        timeout: None,
+        command: CommandSpec::argv(vec![
+            "printf".into(),
+            "literal $HOME".into(),
+            "--literal".into(),
+        ])
+        .unwrap(),
+    }
+}
+
+fn assert_no_run_capture(cache: &Path) {
+    for directory in [
+        cache.join("snapshots/staging"),
+        cache.join("snapshots/ready"),
+    ] {
+        if !directory.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&directory).unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(entry.file_name(), ".mac-worker-rooted-fs");
+            assert!(fs::read_dir(entry.path()).unwrap().next().is_none());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_script(
+    repo: &GitRepo,
+    temp: &tempfile::TempDir,
+    steps: impl IntoIterator<Item = RunScriptStep>,
+    follower: &RecordingFollower,
+    runtime: Option<&dyn ResolutionRuntime>,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> (
+    Result<RunCompletion, WorkerError>,
+    RunScriptRunner,
+    ClientStateStore,
+) {
+    let paths = run_paths(temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(paths.state.clone(), steps);
+    let config = run_config();
+    let service = if let Some(runtime) = runtime {
+        RunService::with_follower_and_resolution_runtime(
+            &runner, &config, &paths, &store, follower, runtime,
+        )
+    } else {
+        RunService::with_follower(&runner, &config, &paths, &store, follower)
+    };
+    let result = service.submit_and_follow(orchestration_request(repo), json, stdout, stderr);
+    (result, runner, store)
+}
+
+#[test]
+fn run_performs_the_exact_twelve_stage_order_against_one_worker() {
+    // Break caught: any remote effect precedes durable identity, any stage is
+    // reordered/duplicated, or terminal follower authority is not persisted.
+    let repo = run_repo(b"version = 1\ntimeout = \"2m\"\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(7);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let (result, runner, store) = run_with_script(
+        &repo,
+        &temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &follower,
+        None,
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    let completion = result.unwrap();
+    assert_eq!(completion.exit_code, 7);
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.list_jobs().unwrap().len(), 1);
+    let persisted = store.load_job(completion.report.job_id).unwrap();
+    assert_eq!(persisted.last_status().unwrap().state(), JobState::Failed);
+    assert_eq!(persisted.last_status().unwrap().exit_code(), Some(7));
+    assert_eq!(persisted.remote_uncertainty(), &RemoteUncertainty::None);
+    let remote_events = runner
+        .events()
+        .into_iter()
+        .filter(|event| event != "git")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        remote_events,
+        [
+            "ProbeReady",
+            "Acquire",
+            "Upload",
+            "Verify",
+            "SubmitAccepted",
+        ]
+    );
+    assert!(String::from_utf8(stdout).unwrap().starts_with("job "));
+    assert!(stderr.is_empty());
+    runner.assert_consumed();
+    assert_no_run_capture(&run_paths(&temp).cache);
+}
+
+#[test]
+fn artifact_configuration_stops_before_every_remote_or_capture_effect() {
+    // Break caught: unsupported artifact policy reaches probe, capture, state
+    // creation, or any remote mutation before being rejected.
+    let repo =
+        run_repo(b"version = 1\n[artifacts]\ninclude = [\"target/**\"]\nmax_total_bytes = 10\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let (result, runner, store) = run_with_script(
+        &repo,
+        &temp,
+        [],
+        &follower,
+        None,
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert!(matches!(
+        result.unwrap_err(),
+        WorkerError::Project {
+            code: "ARTIFACTS_UNSUPPORTED",
+            ..
+        }
+    ));
+    assert!(runner.requests().is_empty());
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    assert!(!run_paths(&temp).cache.join("snapshots").exists());
+    runner.assert_consumed();
+}
+
+#[test]
+fn each_preflight_or_stage_failure_poisons_all_later_stages() {
+    // Break caught: a failed stage falls through to a later remote operation or
+    // follower. An empty script after the intended recovery is a poison guard.
+    let cases = [
+        vec![RunScriptStep::ProbeUnavailable],
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::TransportFailure(HostOperation::LeaseAcquire),
+            RunScriptStep::StatusTransportFailure,
+            RunScriptStep::ResolveAbandoned,
+        ],
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::UploadFailure,
+            RunScriptStep::StatusTransportFailure,
+            RunScriptStep::ResolveAbandoned,
+        ],
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::TransportFailure(HostOperation::SnapshotVerify),
+            RunScriptStep::StatusTransportFailure,
+            RunScriptStep::ResolveAbandoned,
+        ],
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::TransportFailure(HostOperation::Submit),
+            RunScriptStep::StatusTransportFailure,
+            RunScriptStep::ResolveAbandoned,
+        ],
+    ];
+
+    for steps in cases {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let (result, runner, _) = run_with_script(
+            &repo,
+            &temp,
+            steps,
+            &follower,
+            Some(&runtime),
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert!(result.is_err());
+        assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+        runner.assert_consumed();
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+}
+
+#[test]
+fn run_reuses_one_identity_through_acquire_upload_verify_submit_and_resolution() {
+    // Break caught: recovery regenerates an ID/token/time/fingerprint or a
+    // transfer/control request is built from different immutable material.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let runtime = ImmediateResolution::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let (result, runner, store) = run_with_script(
+        &repo,
+        &temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::TransportFailure(HostOperation::Submit),
+            RunScriptStep::ResolveAccepted,
+        ],
+        &follower,
+        Some(&runtime),
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    let completion = result.unwrap();
+    let material = runner.material();
+    assert_eq!(completion.report.job_id, material.job_id());
+    let records = store.list_jobs().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].meta().job_id(), material.job_id());
+    assert_eq!(records[0].lease_token(), material.lease_token());
+    assert_eq!(
+        records[0].meta().created_at_millis(),
+        material.created_at_millis()
+    );
+    assert_eq!(
+        records[0].meta().request_fingerprint(),
+        &material.fingerprint()
+    );
+    runner.assert_consumed();
+}
+
+#[test]
+fn existing_accepted_skips_upload_verify_and_submit() {
+    // Break caught: idempotent acquire acceptance retransfers or resubmits
+    // instead of obtaining exact authoritative status and following the job.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let (result, runner, _) = run_with_script(
+        &repo,
+        &temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::AcquireExisting,
+            RunScriptStep::StatusAccepted,
+        ],
+        &follower,
+        None,
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
+    assert!(runner.requests().iter().all(|request| {
+        request.program != OsStr::new("/usr/bin/rsync")
+            && request.args.last().is_none_or(|argument| {
+                argument != HostOperation::SnapshotVerify.command()
+                    && argument != HostOperation::Submit.command()
+            })
+    }));
+    runner.assert_consumed();
+}
+
+#[test]
+fn accepted_resolution_continues_the_same_job() {
+    // Break caught: a lost acquire reply that resolves Accepted returns an
+    // error, starts transfer, or allocates a replacement identity.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let runtime = ImmediateResolution::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let (result, runner, store) = run_with_script(
+        &repo,
+        &temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::TransportFailure(HostOperation::LeaseAcquire),
+            RunScriptStep::ResolveAccepted,
+        ],
+        &follower,
+        Some(&runtime),
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    let completion = result.unwrap();
+    assert_eq!(completion.report.job_id, runner.material().job_id());
+    assert_eq!(store.list_jobs().unwrap().len(), 1);
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
+    runner.assert_consumed();
+}
+
+#[test]
+fn abandoned_preserves_original_typed_failure_without_persisting_abandoned() {
+    // Break caught: authoritative abandonment becomes a fabricated local state
+    // or masks the original typed admission error.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let runtime = ImmediateResolution::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let (result, runner, store) = run_with_script(
+        &repo,
+        &temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::AuthoritativeFailure(HostOperation::Submit, "CAPACITY_BUSY"),
+            RunScriptStep::StatusTransportFailure,
+            RunScriptStep::ResolveAbandoned,
+        ],
+        &follower,
+        Some(&runtime),
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert!(matches!(
+        result.unwrap_err(),
+        WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            ..
+        }
+    ));
+    let record = store.list_jobs().unwrap().pop().unwrap();
+    assert!(record.last_status().is_none());
+    assert_eq!(record.remote_uncertainty(), &RemoteUncertainty::None);
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    runner.assert_consumed();
+}
+
+#[test]
+fn unknown_remote_and_cleanup_pending_persist_distinct_markers() {
+    // Break caught: typed recovery outcomes are conflated, discarded, or
+    // represented as an invented durable Abandoned status.
+    for (tail, cleanup) in [
+        (
+            vec![
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveTransportFailure,
+            ],
+            false,
+        ),
+        (
+            vec![
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveCleanupPending,
+            ],
+            true,
+        ),
+    ] {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let mut steps = vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::TransportFailure(HostOperation::Submit),
+        ];
+        steps.extend(tail);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let (result, runner, store) = run_with_script(
+            &repo,
+            &temp,
+            steps,
+            &follower,
+            Some(&runtime),
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.exit_code(), 70);
+        let record = store.list_jobs().unwrap().pop().unwrap();
+        if cleanup {
+            assert!(matches!(
+                record.remote_uncertainty(),
+                RemoteUncertainty::CleanupPending { code } if code == "CLEANUP_STILL_PENDING"
+            ));
+        } else {
+            assert!(matches!(
+                record.remote_uncertainty(),
+                RemoteUncertainty::UnknownRemote { code } if code == "UNKNOWN_REMOTE"
+            ));
+        }
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains(&record.meta().job_id().to_string()));
+        assert!(diagnostic.contains("worker status"));
+        assert!(record.last_status().is_none());
+        runner.assert_consumed();
+    }
+}
+
+#[test]
+fn snapshot_cleanup_runs_once_on_every_success_and_failure_path() {
+    // Break caught: prepared snapshot ownership leaks on remote, writer, or
+    // follower failure, or cleanup is attempted twice.
+    for (steps, follower, writer_fails) in [
+        (
+            vec![
+                RunScriptStep::ProbeReady,
+                RunScriptStep::Acquire,
+                RunScriptStep::Upload,
+                RunScriptStep::Verify,
+                RunScriptStep::SubmitAccepted,
+            ],
+            RecordingFollower::succeeding(0),
+            false,
+        ),
+        (
+            vec![
+                RunScriptStep::ProbeReady,
+                RunScriptStep::Acquire,
+                RunScriptStep::Upload,
+                RunScriptStep::Verify,
+                RunScriptStep::SubmitAccepted,
+            ],
+            RecordingFollower::failing(),
+            false,
+        ),
+        (
+            vec![
+                RunScriptStep::ProbeReady,
+                RunScriptStep::Acquire,
+                RunScriptStep::Upload,
+                RunScriptStep::Verify,
+                RunScriptStep::SubmitAccepted,
+            ],
+            RecordingFollower::succeeding(0),
+            true,
+        ),
+    ] {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let output = Arc::new(Mutex::new(OutputState::default()));
+        let mut stdout = if writer_fails {
+            RecordingWriter::failing(Arc::clone(&output))
+        } else {
+            RecordingWriter::new(Arc::clone(&output))
+        };
+        let mut stderr = Vec::new();
+        let (result, runner, _) = run_with_script(
+            &repo,
+            &temp,
+            steps,
+            &follower,
+            None,
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        if !matches!(follower.outcome, FollowerOutcome::Error(_)) && !writer_fails {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.is_err());
+        }
+        runner.assert_consumed();
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let cache = run_paths(&temp).cache;
+    let follower = RecordingFollower::failing_with_cleanup_sabotage(cache);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let (result, runner, _) = run_with_script(
+        &repo,
+        &temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &follower,
+        None,
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert!(
+        matches!(result.unwrap_err(), WorkerError::Io(_)),
+        "cleanup I/O failure must take precedence over the follower failure"
+    );
+    runner.assert_consumed();
+}
+
+#[test]
+fn accepted_human_and_json_records_are_flushed_before_following() {
+    // Break caught: accepted output is buffered until after follower output, is
+    // sent to stderr in JSON mode, or uses a noncanonical event shape.
+    for json in [false, true] {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let output = Arc::new(Mutex::new(OutputState::default()));
+        let follower = RecordingFollower::requiring_flushed(Arc::clone(&output));
+        let mut stdout = RecordingWriter::new(Arc::clone(&output));
+        let mut stderr = Vec::new();
+        let (result, runner, _) = run_with_script(
+            &repo,
+            &temp,
+            [
+                RunScriptStep::ProbeReady,
+                RunScriptStep::Acquire,
+                RunScriptStep::Upload,
+                RunScriptStep::Verify,
+                RunScriptStep::SubmitAccepted,
+            ],
+            &follower,
+            None,
+            json,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert!(result.is_ok());
+        let output = output.lock().unwrap();
+        assert_eq!(output.flushes, 1);
+        assert!(stderr.is_empty());
+        if json {
+            assert_eq!(
+                output.bytes.iter().filter(|byte| **byte == b'\n').count(),
+                1
+            );
+            assert!(matches!(
+                serde_json::from_slice::<JsonEvent>(&output.bytes).unwrap(),
+                JsonEvent::Accepted { .. }
+            ));
+        } else {
+            let text = std::str::from_utf8(&output.bytes).unwrap();
+            assert!(text.starts_with("job "));
+            assert!(text.ends_with(" accepted on mini-1\n"));
+        }
+        runner.assert_consumed();
+    }
+}
+
+#[test]
+fn run_uses_cli_timeout_over_project_timeout_and_preserves_literal_argv() {
+    // Break caught: project timeout overrides CLI, argv is shell-expanded, or
+    // command material changes between local persistence and submission.
+    let repo = run_repo(b"version = 1\ntimeout = \"99s\"\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(
+        paths.state.clone(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+    );
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower);
+    let command = CommandSpec::argv(vec![
+        "printf".into(),
+        "literal $HOME".into(),
+        "semi;colon".into(),
+    ])
+    .unwrap();
+    let result = service.submit_and_follow(
+        RunRequest {
+            timeout: Some(Duration::from_secs(45)),
+            command: command.clone(),
+            ..orchestration_request(&repo)
+        },
+        false,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+
+    assert!(result.is_ok());
+    let material = runner.material();
+    assert_eq!(material.timeout_millis(), 45_000);
+    assert_eq!(material.command(), &command);
+    runner.assert_consumed();
+}
+
+#[test]
+fn run_probes_only_the_explicit_inventory_worker() {
+    // Break caught: run fans out across inventory, accepts the SSH destination
+    // as a worker name, or omits project requirements from the one probe.
+    let repo = run_repo(b"version = 1\nrequires = [\"project-capability\"]\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let (result, runner, _) = run_with_script(
+        &repo,
+        &temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &follower,
+        None,
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert!(result.is_ok());
+    let requests = runner.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request
+                .args
+                .last()
+                .is_some_and(|arg| arg == "~/.local/bin/worker host probe"))
+            .count(),
+        1
+    );
+    assert!(requests.iter().all(|request| {
+        if request.program == OsStr::new("/usr/bin/ssh") {
+            request.args[9] == OsStr::new("mac1")
+        } else {
+            !request
+                .args
+                .iter()
+                .any(|argument| argument == "poison-host")
+        }
+    }));
+    runner.assert_consumed();
+}
+
+#[test]
+fn run_completion_preserves_exact_command_outcomes_before_cleanup_failures() {
+    // Break caught: cleanup enrichment masks an established exact command
+    // result, or infrastructure/signal outcomes are normalized as command exits.
+    let cases = [
+        (FollowerOutcome::Exit(7), true, Ok(7)),
+        (FollowerOutcome::Exit(0), true, Ok(0)),
+        (FollowerOutcome::Exit(64), false, Ok(64)),
+        (FollowerOutcome::Signal(15), false, Ok(143)),
+        (FollowerOutcome::Infrastructure, true, Err(70)),
+    ];
+
+    for (outcome, cleanup_error, expected) in cases {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::terminal(outcome, cleanup_error);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let (result, runner, store) = run_with_script(
+            &repo,
+            &temp,
+            [
+                RunScriptStep::ProbeReady,
+                RunScriptStep::Acquire,
+                RunScriptStep::Upload,
+                RunScriptStep::Verify,
+                RunScriptStep::SubmitAccepted,
+            ],
+            &follower,
+            None,
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        match expected {
+            Ok(code) => assert_eq!(result.unwrap().exit_code, code, "{outcome:?}"),
+            Err(code) => assert_eq!(result.unwrap_err().exit_code(), code, "{outcome:?}"),
+        }
+        let persisted = store.list_jobs().unwrap().pop().unwrap();
+        assert!(persisted.last_status().unwrap().state().is_terminal());
+        assert_eq!(
+            persisted
+                .last_status()
+                .unwrap()
+                .cleanup_error_code()
+                .is_some(),
+            cleanup_error
+        );
+        runner.assert_consumed();
+    }
+}
+
+#[test]
+fn run_completion_classifies_inconsistent_terminal_outcomes_as_infrastructure() {
+    // Break caught: post-acceptance outcome-shape failures are mistaken for a
+    // remote transport failure, or a real follower transport failure is hidden.
+    let cases = [
+        (FollowerOutcome::Nonterminal, 70),
+        (FollowerOutcome::MismatchedMeta, 70),
+        (FollowerOutcome::Signal(128), 70),
+        (FollowerOutcome::Error("remote follow failed"), 69),
+    ];
+
+    for (outcome, expected_code) in cases {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::terminal(outcome, false);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let (result, runner, _) = run_with_script(
+            &repo,
+            &temp,
+            [
+                RunScriptStep::ProbeReady,
+                RunScriptStep::Acquire,
+                RunScriptStep::Upload,
+                RunScriptStep::Verify,
+                RunScriptStep::SubmitAccepted,
+            ],
+            &follower,
+            None,
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(
+            result.unwrap_err().exit_code(),
+            expected_code,
+            "{outcome:?}"
+        );
+        runner.assert_consumed();
+    }
 }

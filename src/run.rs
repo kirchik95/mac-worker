@@ -1,4 +1,8 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    io::Write,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde::Serialize;
 
@@ -11,11 +15,24 @@ use crate::{
     error::WorkerError,
     inputs::RelativePath,
     job::{
-        CommandSpec, CommandSummary, JobId, JobStatus, LocalJobRecord, PreacceptanceDisposition,
-        RemoteUncertainty, ResolveOrAbandonRequest, StatusResponse,
+        CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus, JsonEvent,
+        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LocalJobRecord,
+        PreacceptanceDisposition, RemoteUncertainty, RequestFingerprintMaterial,
+        ResolveOrAbandonRequest, StatusResponse, SubmitRequest, SubmitResponse,
+    },
+    paths::PathLayout,
+    process::{ProcessPolicy, ProcessRunner},
+    project_config::ResourceClass,
+    project_state::{
+        PreparedProject, ProjectPreparationError, ProjectPreparationRequest, ProjectState,
     },
     protocol::PROTOCOL_VERSION,
-    transfer::RemoteJobClient,
+    remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
+    transfer::{
+        HostOperation, RemoteJobClient, ResolutionRuntime, RsyncTransport, SshJsonTransport,
+        TransferIdentity,
+    },
+    transport::{SshTransport, WorkersService},
 };
 
 pub const STATUS_LIST_LIMIT: usize = 100;
@@ -117,6 +134,486 @@ impl StatusReport {
 pub struct RunCompletion {
     pub report: RunReport,
     pub exit_code: u8,
+}
+
+#[doc(hidden)]
+pub trait JobFollower {
+    fn follow(
+        &self,
+        record: &LocalJobRecord,
+        json: bool,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> Result<StatusResponse, WorkerError>;
+}
+
+pub struct RunService<'a> {
+    pub runner: &'a dyn ProcessRunner,
+    pub config: &'a Config,
+    pub paths: &'a PathLayout,
+    pub client_state: &'a ClientStateStore,
+    follower: &'a dyn JobFollower,
+    resolution_runtime: Option<&'a dyn ResolutionRuntime>,
+}
+
+impl<'a> RunService<'a> {
+    #[doc(hidden)]
+    pub fn with_follower(
+        runner: &'a dyn ProcessRunner,
+        config: &'a Config,
+        paths: &'a PathLayout,
+        client_state: &'a ClientStateStore,
+        follower: &'a dyn JobFollower,
+    ) -> Self {
+        Self {
+            runner,
+            config,
+            paths,
+            client_state,
+            follower,
+            resolution_runtime: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_follower_and_resolution_runtime(
+        runner: &'a dyn ProcessRunner,
+        config: &'a Config,
+        paths: &'a PathLayout,
+        client_state: &'a ClientStateStore,
+        follower: &'a dyn JobFollower,
+        resolution_runtime: &'a dyn ResolutionRuntime,
+    ) -> Self {
+        Self {
+            runner,
+            config,
+            paths,
+            client_state,
+            follower,
+            resolution_runtime: Some(resolution_runtime),
+        }
+    }
+
+    pub fn submit_and_follow(
+        &self,
+        request: RunRequest,
+        json: bool,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> Result<RunCompletion, WorkerError> {
+        let initial = ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
+        if !initial.settings.artifacts.include.is_empty()
+            || initial.settings.artifacts.max_total_bytes.is_some()
+        {
+            return Err(WorkerError::Project {
+                code: "ARTIFACTS_UNSUPPORTED",
+                message: "artifact collection is not supported in this phase".into(),
+            });
+        }
+
+        let worker = self
+            .config
+            .worker(&request.worker)
+            .ok_or_else(|| {
+                WorkerError::Config("WORKER_NOT_FOUND: worker is not configured".into())
+            })?
+            .clone();
+        self.require_eligible_worker(&worker, &initial.requirements)?;
+
+        let prepared = ProjectState::prepare(
+            self.runner,
+            &self.paths.cache,
+            ProjectPreparationRequest {
+                project: request.project.clone(),
+                cli_includes: request.cli_includes.clone(),
+            },
+            &initial,
+        )
+        .map_err(project_preparation_error)?;
+
+        let primary = self.submit_prepared(request, worker, &prepared, json, stdout, stderr);
+        match prepared.cleanup() {
+            Ok(()) => primary,
+            Err(cleanup_error) => Err(cleanup_error),
+        }
+    }
+
+    fn require_eligible_worker(
+        &self,
+        worker: &WorkerEntry,
+        project_requirements: &[String],
+    ) -> Result<(), WorkerError> {
+        let one_worker = Config {
+            version: self.config.version,
+            workers: vec![worker.clone()],
+        };
+        let report = WorkersService::new(SshTransport::new(self.runner))
+            .inspect_with_requirements(&one_worker, project_requirements);
+        let health = report
+            .workers
+            .into_iter()
+            .next()
+            .expect("one explicit worker produces one health result");
+        if !matches!(health.status, crate::protocol::HealthStatus::Ready)
+            || health.probe.is_none()
+            || !health.missing_capabilities.is_empty()
+        {
+            let code = health
+                .error_code
+                .unwrap_or_else(|| "WORKER_UNAVAILABLE".into());
+            return Err(WorkerError::Unavailable(format!(
+                "{code}: explicit worker is not ready"
+            )));
+        }
+        let probe = health
+            .probe
+            .expect("ready worker health contains its validated probe");
+        if probe.slot_state != crate::lease::SlotState::Idle {
+            return Err(WorkerError::Capacity {
+                code: "CAPACITY_BUSY",
+                message: "the explicit worker heavy slot is busy".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn submit_prepared(
+        &self,
+        request: RunRequest,
+        worker: WorkerEntry,
+        prepared: &PreparedProject,
+        json: bool,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> Result<RunCompletion, WorkerError> {
+        let timeout = request.timeout.unwrap_or(prepared.state.settings.timeout);
+        let timeout_millis = u64::try_from(timeout.as_millis()).map_err(|_| {
+            WorkerError::Config("run timeout is outside the supported range".into())
+        })?;
+        let resource_class = match prepared.state.settings.resource_class {
+            ResourceClass::Heavy => "heavy",
+        };
+        let created_at_millis = current_time_millis()?;
+        let material = RequestFingerprintMaterial::new(
+            JobId::generate(),
+            self.client_state.client_id(),
+            LeaseToken::generate(),
+            created_at_millis,
+            worker.name.clone(),
+            prepared.state.context.project_id.clone(),
+            prepared.state.context.worktree_id.clone(),
+            prepared.snapshot.digest.clone(),
+            prepared.snapshot.manifest.relative_working_dir.clone(),
+            timeout_millis,
+            resource_class.into(),
+            request.command,
+        )?;
+        let fingerprint = material.fingerprint();
+        let record = LocalJobRecord::new(
+            JobMeta::new(&material, fingerprint)?,
+            material.lease_token(),
+            None,
+            RemoteUncertainty::None,
+        )?;
+        self.client_state.create_job(record.clone())?;
+
+        let transport = SshJsonTransport::new(self.runner);
+        let remote = match self.resolution_runtime {
+            Some(runtime) => RemoteJobClient::new_with_runtime(self.runner, runtime),
+            None => RemoteJobClient::new(self.runner),
+        };
+        let acquire = LeaseAcquireRequest::new(material.clone());
+        let acquire_result: Result<LeaseAcquireResponse, WorkerError> = transport.request(
+            &worker,
+            HostOperation::LeaseAcquire,
+            &acquire,
+            control_policy(),
+        );
+
+        let accepted = match acquire_result {
+            Ok(LeaseAcquireResponse::ExistingAccepted { .. }) => {
+                remote.status(&worker, material.job_id())?
+            }
+            Ok(LeaseAcquireResponse::Acquired { lease }) => {
+                require_exact_lease(&material, &lease)?;
+                let identity = TransferIdentity::from_acquire_request(&acquire)?;
+                if let Err(error) =
+                    RsyncTransport::new(self.runner).upload(&worker, &prepared.snapshot, &identity)
+                {
+                    self.resolve_after_error(&remote, &worker, &record, error)?
+                } else {
+                    let verify = SnapshotVerifyRequest::new(
+                        material.job_id(),
+                        material.client_id(),
+                        material.lease_token(),
+                        material.fingerprint(),
+                        material.project_id().into(),
+                        material.worktree_id().into(),
+                        material.manifest_digest().into(),
+                    )?;
+                    let verified: Result<VerifiedSnapshotResponse, WorkerError> = transport
+                        .request(
+                            &worker,
+                            HostOperation::SnapshotVerify,
+                            &verify,
+                            control_policy(),
+                        );
+                    match verified {
+                        Err(error) => self.resolve_after_error(&remote, &worker, &record, error)?,
+                        Ok(response) => {
+                            require_exact_verification(&material, &response)?;
+                            let submit = SubmitRequest::new(material.clone());
+                            let raw: Result<SubmitResponse, WorkerError> = transport.request(
+                                &worker,
+                                HostOperation::Submit,
+                                &submit,
+                                control_policy(),
+                            );
+                            match raw {
+                                Ok(response) => {
+                                    let response = remote.resolve_submission(
+                                        &worker,
+                                        &submit,
+                                        Ok(response),
+                                    )?;
+                                    status_from_submit(&record, response)?
+                                }
+                                Err(error) => {
+                                    self.resolve_after_error(&remote, &worker, &record, error)?
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => self.resolve_after_error(&remote, &worker, &record, error)?,
+        };
+
+        let accepted_status = normalize_authoritative_status(&record, accepted)?;
+        let accepted_record = persist_authoritative(self.client_state, &record, accepted_status)?;
+        write_accepted(&accepted_record, json, stdout)?;
+
+        let terminal = self
+            .follower
+            .follow(&accepted_record, json, stdout, stderr)?;
+        let terminal_status = normalize_authoritative_status(&accepted_record, terminal)
+            .map_err(|_| inconsistent_terminal_outcome())?;
+        if !terminal_status.state().is_terminal() {
+            return Err(inconsistent_terminal_outcome());
+        }
+        let terminal_record =
+            persist_authoritative(self.client_state, &accepted_record, terminal_status.clone())?;
+        let exit_code = terminal_exit_code(&terminal_status)?;
+        Ok(RunCompletion {
+            report: RunReport::new(
+                terminal_record.meta().job_id(),
+                terminal_record.meta().worker_name().into(),
+                terminal_status,
+            )?,
+            exit_code,
+        })
+    }
+
+    fn resolve_after_error(
+        &self,
+        remote: &RemoteJobClient<'_>,
+        worker: &WorkerEntry,
+        record: &LocalJobRecord,
+        original: WorkerError,
+    ) -> Result<StatusResponse, WorkerError> {
+        let resolution = ResolveOrAbandonRequest::try_from(record)?;
+        match remote.resolve_preacceptance(worker, &resolution)? {
+            PreacceptanceDisposition::Accepted(response) => Ok(response),
+            PreacceptanceDisposition::Abandoned => Err(original),
+            PreacceptanceDisposition::CleanupPending { code } => {
+                self.client_state.set_remote_uncertainty_if_same_immutable(
+                    record,
+                    RemoteUncertainty::cleanup_pending(code.clone())?,
+                )?;
+                Err(recovery_error(record, &code, true))
+            }
+            PreacceptanceDisposition::UnknownRemote { code } => {
+                self.client_state.set_remote_uncertainty_if_same_immutable(
+                    record,
+                    RemoteUncertainty::unknown_remote(code.clone())?,
+                )?;
+                Err(recovery_error(record, &code, false))
+            }
+        }
+    }
+}
+
+fn project_preparation_error(error: ProjectPreparationError) -> WorkerError {
+    match error {
+        ProjectPreparationError::Selection(failure) => WorkerError::Snapshot {
+            code: failure.code,
+            message: failure.message,
+        },
+        ProjectPreparationError::Worker { error, .. } => error,
+    }
+}
+
+fn current_time_millis() -> Result<u64, WorkerError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| WorkerError::Io(std::io::Error::other("system clock predates Unix epoch")))?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| WorkerError::Io(std::io::Error::other("system clock is out of range")))
+}
+
+fn control_policy() -> ProcessPolicy {
+    ProcessPolicy {
+        stdout_limit: 1024 * 1024,
+        stderr_limit: 64 * 1024,
+        deadline: Duration::from_secs(30),
+    }
+}
+
+fn require_exact_lease(
+    material: &RequestFingerprintMaterial,
+    lease: &LeaseRecord,
+) -> Result<(), WorkerError> {
+    lease.validate().map_err(|_| invalid_status_response())?;
+    if lease.job_id() != material.job_id()
+        || lease.client_id() != material.client_id()
+        || lease.lease_token() != material.lease_token()
+        || lease.request_fingerprint() != &material.fingerprint()
+        || lease.worker_name() != material.worker_name()
+        || lease.project_id() != material.project_id()
+        || lease.worktree_id() != material.worktree_id()
+        || lease.manifest_digest() != material.manifest_digest()
+        || lease.timeout_millis() != material.timeout_millis()
+        || lease.resource_class() != material.resource_class()
+        || lease.command_summary() != &material.command().summary()?
+    {
+        return Err(invalid_status_response());
+    }
+    Ok(())
+}
+
+fn require_exact_verification(
+    material: &RequestFingerprintMaterial,
+    response: &VerifiedSnapshotResponse,
+) -> Result<(), WorkerError> {
+    response.validate().map_err(|_| invalid_status_response())?;
+    if response.job_id() != material.job_id()
+        || response.client_id() != material.client_id()
+        || response.project_id() != material.project_id()
+        || response.worktree_id() != material.worktree_id()
+        || response.manifest_digest() != material.manifest_digest()
+    {
+        return Err(invalid_status_response());
+    }
+    Ok(())
+}
+
+fn status_from_submit(
+    record: &LocalJobRecord,
+    response: SubmitResponse,
+) -> Result<StatusResponse, WorkerError> {
+    match response {
+        SubmitResponse::Accepted { meta, status } => StatusResponse::new(*meta, status),
+        SubmitResponse::Existing { status } => StatusResponse::new(record.meta().clone(), status),
+    }
+}
+
+fn persist_authoritative(
+    client_state: &ClientStateStore,
+    expected: &LocalJobRecord,
+    status: JobStatus,
+) -> Result<LocalJobRecord, WorkerError> {
+    match client_state.reconcile_authoritative_status(expected, status)? {
+        ConditionalStatusUpdate::Applied(record) => Ok(record),
+        ConditionalStatusUpdate::Conflict(_) => Err(local_status_conflict()),
+    }
+}
+
+fn write_accepted(
+    record: &LocalJobRecord,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    let status = record
+        .last_status()
+        .cloned()
+        .ok_or_else(invalid_status_response)?;
+    if json {
+        let event = JsonEvent::Accepted {
+            protocol_version: PROTOCOL_VERSION,
+            response: SubmitResponse::Accepted {
+                meta: Box::new(record.meta().clone()),
+                status,
+            },
+        };
+        serde_json::to_writer(&mut *stdout, &event)
+            .map_err(|error| WorkerError::Io(std::io::Error::other(error)))?;
+        stdout.write_all(b"\n")?;
+    } else {
+        writeln!(
+            stdout,
+            "job {} accepted on {}",
+            record.meta().job_id(),
+            record.meta().worker_name()
+        )?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+pub(crate) fn terminal_exit_code(status: &JobStatus) -> Result<u8, WorkerError> {
+    status
+        .validate()
+        .map_err(|_| inconsistent_terminal_outcome())?;
+    if status.state() == JobState::Succeeded
+        && status.exit_code() == Some(0)
+        && status.terminating_signal().is_none()
+    {
+        return Ok(0);
+    }
+    if status.state() == JobState::Failed
+        && let (Some(code), None) = (status.exit_code(), status.terminating_signal())
+    {
+        return Ok(code);
+    }
+    if status.cleanup_error_code().is_some() {
+        return Err(WorkerError::Protocol(
+            "REMOTE_CLEANUP_FAILED: terminal remote cleanup failed".into(),
+        ));
+    }
+    match status.state() {
+        JobState::Failed => match status.terminating_signal() {
+            Some(signal) if status.exit_code().is_none() => u8::try_from(signal)
+                .ok()
+                .and_then(|signal| 128_u8.checked_add(signal))
+                .ok_or_else(|| {
+                    WorkerError::Protocol("remote command signal is out of range".into())
+                }),
+            _ => Err(inconsistent_terminal_outcome()),
+        },
+        _ => Err(WorkerError::Protocol(
+            "REMOTE_COMMAND_FAILED: remote command ended without an exact exit code".into(),
+        )),
+    }
+}
+
+fn inconsistent_terminal_outcome() -> WorkerError {
+    WorkerError::Protocol(
+        "REMOTE_OUTCOME_INVALID: remote command ended with an inconsistent outcome".into(),
+    )
+}
+
+fn recovery_error(record: &LocalJobRecord, code: &str, cleanup_pending: bool) -> WorkerError {
+    let state = if cleanup_pending {
+        "remote cleanup is pending"
+    } else {
+        "remote job state is unknown"
+    };
+    WorkerError::Protocol(format!(
+        "{code}: {state} for job {}; recover with `worker status {}`",
+        record.meta().job_id(),
+        record.meta().job_id()
+    ))
 }
 
 pub struct StatusService<'a> {
