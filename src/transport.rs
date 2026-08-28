@@ -253,54 +253,43 @@ impl<R: ProcessRunner> SshTransport<R> {
                 deadline: deadline.min(MAX_PROBE_DEADLINE),
             },
         );
-        let run_result = catch_unwind(AssertUnwindSafe(|| self.runner.run(&request)));
-        let result = match run_result {
-            Err(_) => {
-                return (
-                    probe_aborted(worker),
-                    Some(SetupFailureKind::Infrastructure),
-                );
-            }
-            Ok(result) => match result {
-                Ok(result) => result,
-                Err(error) => {
-                    if matches!(
-                        &error,
-                        WorkerError::Process(ProcessError::OutputLimitExceeded {
-                            stream: ProcessStream::Stdout,
-                            ..
-                        })
-                    ) {
-                        return (
-                            unavailable(
-                                worker,
-                                "INVALID_RESPONSE",
-                                format!(
-                                    "SSH probe response exceeded {MAX_PROBE_RESPONSE_BYTES} bytes"
-                                ),
-                                None,
-                                Vec::new(),
-                            ),
-                            Some(SetupFailureKind::Infrastructure),
-                        );
-                    }
-                    let failure_kind = if matches!(&error, WorkerError::Io(_)) {
-                        SetupFailureKind::Io
-                    } else {
-                        SetupFailureKind::Infrastructure
-                    };
+        let result = match self.runner.run(&request) {
+            Ok(result) => result,
+            Err(error) => {
+                if matches!(
+                    &error,
+                    WorkerError::Process(ProcessError::OutputLimitExceeded {
+                        stream: ProcessStream::Stdout,
+                        ..
+                    })
+                ) {
                     return (
                         unavailable(
                             worker,
-                            "SSH_UNAVAILABLE",
-                            format!("failed to launch SSH probe: {error}"),
+                            "INVALID_RESPONSE",
+                            format!("SSH probe response exceeded {MAX_PROBE_RESPONSE_BYTES} bytes"),
                             None,
                             Vec::new(),
                         ),
-                        Some(failure_kind),
+                        Some(SetupFailureKind::Infrastructure),
                     );
                 }
-            },
+                let failure_kind = if matches!(&error, WorkerError::Io(_)) {
+                    SetupFailureKind::Io
+                } else {
+                    SetupFailureKind::Infrastructure
+                };
+                return (
+                    unavailable(
+                        worker,
+                        "SSH_UNAVAILABLE",
+                        format!("failed to launch SSH probe: {error}"),
+                        None,
+                        Vec::new(),
+                    ),
+                    Some(failure_kind),
+                );
+            }
         };
 
         if !result.status.success() {

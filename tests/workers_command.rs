@@ -6,9 +6,10 @@ use std::{
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mac_worker::{
@@ -22,6 +23,8 @@ use mac_worker::{
     },
     transport::{ProbeClock, SshTransport, WorkersService},
 };
+
+const TEST_COORDINATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct RecordingRunner {
@@ -69,6 +72,14 @@ impl ProcessRunner for RecordingRunner {
     }
 }
 
+struct PanickingRunner;
+
+impl ProcessRunner for PanickingRunner {
+    fn run(&self, _request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        panic!("injected legacy runner panic");
+    }
+}
+
 #[derive(Clone, Default)]
 struct ManualProbeClock {
     millis: Arc<AtomicU64>,
@@ -94,6 +105,7 @@ struct ControlledState {
     released: HashSet<String>,
     panic_destinations: HashSet<String>,
     requests: Vec<ProcessRequest>,
+    release_all: bool,
 }
 
 #[derive(Clone, Default)]
@@ -105,8 +117,29 @@ impl ControlledRunner {
     fn wait_for_started(&self, count: usize) {
         let (state, changed) = &*self.state;
         let mut state = state.lock().unwrap();
+        let deadline = Instant::now() + TEST_COORDINATION_TIMEOUT;
         while state.started.len() < count {
-            state = changed.wait(state).unwrap();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let started = state.started.clone();
+                state.release_all = true;
+                changed.notify_all();
+                drop(state);
+                panic!(
+                    "timed out after {TEST_COORDINATION_TIMEOUT:?} waiting for {count} probes to start; started {started:?}"
+                );
+            }
+            let (next, timeout) = changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if timeout.timed_out() && state.started.len() < count {
+                let started = state.started.clone();
+                state.release_all = true;
+                changed.notify_all();
+                drop(state);
+                panic!(
+                    "timed out after {TEST_COORDINATION_TIMEOUT:?} waiting for {count} probes to start; started {started:?}"
+                );
+            }
         }
     }
 
@@ -124,6 +157,12 @@ impl ControlledRunner {
             .unwrap()
             .panic_destinations
             .insert(destination.to_owned());
+    }
+
+    fn release_all(&self) {
+        let (state, changed) = &*self.state;
+        state.lock().unwrap().release_all = true;
+        changed.notify_all();
     }
 
     fn started(&self) -> Vec<String> {
@@ -158,8 +197,30 @@ impl ProcessRunner for ControlledRunner {
             state.started.push(destination.clone());
             state.requests.push(request.clone());
             changed.notify_all();
-            while !state.released.contains(&destination) {
-                state = changed.wait(state).unwrap();
+            let deadline = Instant::now() + TEST_COORDINATION_TIMEOUT;
+            while !state.release_all && !state.released.contains(&destination) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    state.release_all = true;
+                    changed.notify_all();
+                    drop(state);
+                    panic!(
+                        "timed out after {TEST_COORDINATION_TIMEOUT:?} waiting to release probe {destination}"
+                    );
+                }
+                let (next, timeout) = changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                if timeout.timed_out()
+                    && !state.release_all
+                    && !state.released.contains(&destination)
+                {
+                    state.release_all = true;
+                    changed.notify_all();
+                    drop(state);
+                    panic!(
+                        "timed out after {TEST_COORDINATION_TIMEOUT:?} waiting to release probe {destination}"
+                    );
+                }
             }
             state.active -= 1;
             state.panic_destinations.contains(&destination)
@@ -197,6 +258,39 @@ fn config_with_workers(count: usize) -> Config {
                 )
             })
             .collect(),
+    }
+}
+
+fn spawn_budgeted_inspection(
+    service: WorkersService<ControlledRunner>,
+    config: Config,
+    budget: Duration,
+) -> Receiver<WorkersReport> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let report = service.inspect_with_budget(&config, budget);
+        let _ = sender.send(report);
+    });
+    receiver
+}
+
+fn receive_budgeted_report(
+    receiver: Receiver<WorkersReport>,
+    runner: &ControlledRunner,
+) -> WorkersReport {
+    match receiver.recv_timeout(TEST_COORDINATION_TIMEOUT) {
+        Ok(report) => report,
+        Err(error) => {
+            runner.release_all();
+            let reason = match error {
+                RecvTimeoutError::Timeout => "timed out",
+                RecvTimeoutError::Disconnected => "worker thread disconnected",
+            };
+            panic!(
+                "budgeted inspection {reason} before reporting within {TEST_COORDINATION_TIMEOUT:?}; started {:?}",
+                runner.started()
+            );
+        }
     }
 }
 
@@ -306,6 +400,19 @@ fn probe_disables_forwarding_and_uses_the_fixed_host_command() {
 }
 
 #[test]
+fn legacy_probe_preserves_runner_panic_propagation() {
+    // Break caught: panic isolation is moved into the shared probe primitive,
+    // silently changing legacy probe, workers, Doctor, and setup behavior.
+    let transport = SshTransport::new(PanickingRunner);
+    let worker = worker("mini-1", "mac1", &["darwin-arm64"]);
+
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| transport.probe(&worker)));
+
+    assert!(outcome.is_err(), "legacy probe swallowed the runner panic");
+}
+
+#[test]
 fn probe_with_deadline_uses_the_exact_nonzero_deadline_and_fifteen_second_cap() {
     // Break caught: a caller budget is ignored, rounded, or allowed to exceed
     // the established per-probe SSH bound.
@@ -361,8 +468,7 @@ fn budgeted_inspection_runs_three_probes_concurrently_and_retains_config_order()
     let clock = ManualProbeClock::default();
     let service = WorkersService::with_clock(SshTransport::new(runner.clone()), Arc::new(clock));
     let config = config_with_workers(4);
-    let handle =
-        thread::spawn(move || service.inspect_with_budget(&config, Duration::from_secs(20)));
+    let report = spawn_budgeted_inspection(service, config, Duration::from_secs(20));
 
     runner.wait_for_started(3);
     assert_eq!(runner.max_active(), 3);
@@ -376,7 +482,7 @@ fn budgeted_inspection_runs_three_probes_concurrently_and_retains_config_order()
     runner.release("mac4");
     runner.release("mac2");
     runner.release("mac1");
-    let report = handle.join().unwrap();
+    let report = receive_budgeted_report(report, &runner);
 
     assert_eq!(runner.max_active(), 3);
     assert_eq!(
@@ -403,8 +509,7 @@ fn later_probe_batch_receives_only_the_remaining_global_budget() {
     let service =
         WorkersService::with_clock(SshTransport::new(runner.clone()), Arc::new(clock.clone()));
     let config = config_with_workers(4);
-    let handle =
-        thread::spawn(move || service.inspect_with_budget(&config, Duration::from_secs(10)));
+    let report = spawn_budgeted_inspection(service, config, Duration::from_secs(10));
 
     runner.wait_for_started(3);
     clock.set_millis(4_000);
@@ -413,7 +518,7 @@ fn later_probe_batch_receives_only_the_remaining_global_budget() {
     runner.release("mac2");
     runner.release("mac3");
     runner.release("mac4");
-    let report = handle.join().unwrap();
+    let report = receive_budgeted_report(report, &runner);
 
     assert!(
         report
@@ -437,15 +542,14 @@ fn expired_global_budget_skips_unstarted_hosts_instead_of_multiplying_duration()
     let service =
         WorkersService::with_clock(SshTransport::new(runner.clone()), Arc::new(clock.clone()));
     let config = config_with_workers(6);
-    let handle =
-        thread::spawn(move || service.inspect_with_budget(&config, Duration::from_secs(10)));
+    let report = spawn_budgeted_inspection(service, config, Duration::from_secs(10));
 
     runner.wait_for_started(3);
     clock.set_millis(10_000);
     runner.release("mac1");
     runner.release("mac2");
     runner.release("mac3");
-    let report = handle.join().unwrap();
+    let report = receive_budgeted_report(report, &runner);
 
     assert_eq!(runner.started().len(), 3);
     assert_eq!(report.workers.len(), 6);
@@ -472,8 +576,7 @@ fn panicking_probe_becomes_one_unavailable_row_without_losing_peers() {
         Arc::new(ManualProbeClock::default()),
     );
     let config = config_with_workers(4);
-    let handle =
-        thread::spawn(move || service.inspect_with_budget(&config, Duration::from_secs(20)));
+    let report = spawn_budgeted_inspection(service, config, Duration::from_secs(20));
 
     runner.wait_for_started(3);
     runner.release("mac1");
@@ -481,7 +584,7 @@ fn panicking_probe_becomes_one_unavailable_row_without_losing_peers() {
     runner.release("mac3");
     runner.wait_for_started(4);
     runner.release("mac4");
-    let report = handle.join().unwrap();
+    let report = receive_budgeted_report(report, &runner);
 
     assert_eq!(report.workers.len(), 4);
     assert_eq!(report.workers[1].name, "mini-2");
