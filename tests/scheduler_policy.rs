@@ -240,6 +240,11 @@ fn arbitrary_health_sets() -> impl Strategy<Value = Vec<CandidateObservation>> {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
     #[test]
     fn ranking_is_deterministic_and_unique(input in arbitrary_health_sets()) {
         let a = SchedulerPolicy::rank(&input, &[], &AffinityHints::none());
