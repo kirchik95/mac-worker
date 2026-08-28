@@ -3,13 +3,16 @@ use std::{path::PathBuf, time::Duration};
 use serde::Serialize;
 
 use crate::{
-    client_state::{ClientStateStore, ConditionalStatusUpdate},
+    client_state::{
+        ClientStateStore, ConditionalStatusUpdate, ObservationRelation,
+        authoritative_observation_relation,
+    },
     config::{Config, WorkerEntry},
     error::WorkerError,
     inputs::RelativePath,
     job::{
-        CommandSpec, CommandSummary, JobId, JobState, JobStatus, LocalJobRecord,
-        PreacceptanceDisposition, RemoteUncertainty, ResolveOrAbandonRequest, StatusResponse,
+        CommandSpec, CommandSummary, JobId, JobStatus, LocalJobRecord, PreacceptanceDisposition,
+        RemoteUncertainty, ResolveOrAbandonRequest, StatusResponse,
     },
     protocol::PROTOCOL_VERSION,
     transfer::RemoteJobClient,
@@ -125,12 +128,6 @@ pub struct StatusService<'a> {
 enum StatusApply {
     Applied(LocalJobRecord),
     ConcurrentConflict(LocalJobRecord),
-}
-
-enum ObservationRelation {
-    RemoteAdvances,
-    CurrentAtLeastRemote,
-    Conflict,
 }
 
 impl StatusService<'_> {
@@ -302,34 +299,12 @@ impl StatusService<'_> {
         expected: &LocalJobRecord,
         status: JobStatus,
     ) -> Result<StatusApply, WorkerError> {
-        let before = self.load_same_immutable(expected)?;
-        let selected = match observation_relation(&before, &status) {
-            ObservationRelation::CurrentAtLeastRemote => before
-                .last_status()
-                .expect("a current-at-least-remote relation requires an observation")
-                .clone(),
-            ObservationRelation::Conflict => {
-                return Ok(StatusApply::ConcurrentConflict(before));
-            }
-            ObservationRelation::RemoteAdvances => status.clone(),
-        };
         let published = match self
             .client_state
-            .update_authoritative_status_if_unchanged(&before, selected)
+            .reconcile_authoritative_status(expected, status.clone())
         {
             Ok(ConditionalStatusUpdate::Applied(published)) => published,
             Ok(ConditionalStatusUpdate::Conflict(current)) => {
-                if !same_immutable(&current, expected) {
-                    return Err(job_id_conflict());
-                }
-                if matches!(current.remote_uncertainty(), RemoteUncertainty::None)
-                    && matches!(
-                        observation_relation(&current, &status),
-                        ObservationRelation::CurrentAtLeastRemote
-                    )
-                {
-                    return Ok(StatusApply::Applied(current));
-                }
                 return Ok(StatusApply::ConcurrentConflict(current));
             }
             Err(error) => return Err(error),
@@ -338,7 +313,7 @@ impl StatusService<'_> {
         if current == published
             || matches!(current.remote_uncertainty(), RemoteUncertainty::None)
                 && matches!(
-                    observation_relation(&current, &status),
+                    authoritative_observation_relation(&current, &status),
                     ObservationRelation::CurrentAtLeastRemote
                 )
         {
@@ -377,77 +352,11 @@ fn local_status_conflict() -> WorkerError {
     )
 }
 
-fn accepted_enrichment_is_transitively_forward(previous: &JobStatus, observed: &JobStatus) -> bool {
-    let Some(supervisor) = observed.supervisor_identity() else {
-        return false;
-    };
-    if observed.child_identity().is_none() {
-        return false;
-    }
-    let Ok(intermediate) = previous.with_supervisor(supervisor, observed.updated_at_millis())
-    else {
-        return false;
-    };
-    intermediate.transition(observed.clone()).is_ok()
-}
-
-fn observation_relation(current: &LocalJobRecord, remote: &JobStatus) -> ObservationRelation {
-    let Some(current) = current.last_status() else {
-        return ObservationRelation::RemoteAdvances;
-    };
-    if current == remote || status_is_valid_forward(remote, current) {
-        ObservationRelation::CurrentAtLeastRemote
-    } else if status_is_valid_forward(current, remote) {
-        ObservationRelation::RemoteAdvances
-    } else {
-        ObservationRelation::Conflict
-    }
-}
-
-fn status_is_valid_forward(previous: &JobStatus, next: &JobStatus) -> bool {
-    if next.updated_at_millis() < previous.updated_at_millis() {
-        return false;
-    }
-    if previous == next {
-        return true;
-    }
-    if next.state() == previous.state() {
-        return previous.transition(next.clone()).is_ok()
-            || accepted_enrichment_is_transitively_forward(previous, next);
-    }
-    if previous.state().is_terminal() || !can_skip_forward(previous.state(), next.state()) {
-        return false;
-    }
-    sticky_identity_matches(previous.supervisor_identity(), next.supervisor_identity())
-        && sticky_identity_matches(previous.child_identity(), next.child_identity())
-}
-
 fn eligible_for_list_refresh(record: &LocalJobRecord) -> bool {
     !matches!(record.remote_uncertainty(), RemoteUncertainty::None)
         || record
             .last_status()
             .is_none_or(|status| !status.state().is_terminal())
-}
-
-fn can_skip_forward(previous: JobState, next: JobState) -> bool {
-    match previous {
-        JobState::Uploading => next != JobState::Uploading,
-        JobState::Verified => !matches!(next, JobState::Uploading | JobState::Verified),
-        JobState::Accepted => !matches!(
-            next,
-            JobState::Uploading | JobState::Verified | JobState::Accepted
-        ),
-        JobState::Running => next.is_terminal(),
-        JobState::Succeeded
-        | JobState::Failed
-        | JobState::Cancelled
-        | JobState::TimedOut
-        | JobState::Lost => false,
-    }
-}
-
-fn sticky_identity_matches<T: Copy + PartialEq>(previous: Option<T>, next: Option<T>) -> bool {
-    previous.is_none_or(|identity| next == Some(identity))
 }
 
 fn normalize_authoritative_status(

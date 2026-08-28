@@ -83,6 +83,12 @@ pub(crate) enum ConditionalStatusUpdate {
     Conflict(LocalJobRecord),
 }
 
+pub(crate) enum ObservationRelation {
+    RemoteAdvances,
+    CurrentAtLeastRemote,
+    Conflict,
+}
+
 struct ClientStateInner {
     root: OwnedFd,
     jobs: OwnedFd,
@@ -391,7 +397,7 @@ impl ClientStateStore {
         })
     }
 
-    pub(crate) fn update_authoritative_status_if_unchanged(
+    pub(crate) fn reconcile_authoritative_status(
         &self,
         expected: &LocalJobRecord,
         status: JobStatus,
@@ -400,25 +406,32 @@ impl ClientStateStore {
         self.require_local_client(expected)?;
         status.validate()?;
         let job_id = expected.meta().job_id();
-        let mut matched = false;
+        let mut conflicted = false;
         let current = self.update_locked(job_id, |existing| {
-            if existing != expected {
-                return Ok(None);
-            }
-            matched = true;
-            require_forward_observation(existing.last_status(), Some(&status))?;
+            require_same_immutable(existing, expected)?;
+            let selected = match authoritative_observation_relation(existing, &status) {
+                ObservationRelation::CurrentAtLeastRemote => existing
+                    .last_status()
+                    .expect("a current-at-least-remote relation requires an observation")
+                    .clone(),
+                ObservationRelation::RemoteAdvances => status.clone(),
+                ObservationRelation::Conflict => {
+                    conflicted = true;
+                    return Ok(None);
+                }
+            };
             LocalJobRecord::new(
                 existing.meta().clone(),
                 existing.lease_token(),
-                Some(status),
+                Some(selected),
                 RemoteUncertainty::None,
             )
             .map(Some)
         })?;
-        Ok(if matched {
-            ConditionalStatusUpdate::Applied(current)
-        } else {
+        Ok(if conflicted {
             ConditionalStatusUpdate::Conflict(current)
+        } else {
+            ConditionalStatusUpdate::Applied(current)
         })
     }
 
@@ -666,6 +679,41 @@ fn require_forward_observation(
             )
         }
     }
+}
+
+pub(crate) fn authoritative_observation_relation(
+    current: &LocalJobRecord,
+    remote: &JobStatus,
+) -> ObservationRelation {
+    let Some(current) = current.last_status() else {
+        return ObservationRelation::RemoteAdvances;
+    };
+    if current == remote || status_is_valid_forward(remote, current) {
+        ObservationRelation::CurrentAtLeastRemote
+    } else if status_is_valid_forward(current, remote) {
+        ObservationRelation::RemoteAdvances
+    } else {
+        ObservationRelation::Conflict
+    }
+}
+
+fn status_is_valid_forward(previous: &JobStatus, next: &JobStatus) -> bool {
+    require_forward_observation(Some(previous), Some(next)).is_ok()
+        || accepted_enrichment_is_transitively_forward(previous, next)
+}
+
+fn accepted_enrichment_is_transitively_forward(previous: &JobStatus, observed: &JobStatus) -> bool {
+    let Some(supervisor) = observed.supervisor_identity() else {
+        return false;
+    };
+    if observed.child_identity().is_none() {
+        return false;
+    }
+    let Ok(intermediate) = previous.with_supervisor(supervisor, observed.updated_at_millis())
+    else {
+        return false;
+    };
+    intermediate.transition(observed.clone()).is_ok()
 }
 
 fn require_sticky_observed_identity<T: Copy + PartialEq>(

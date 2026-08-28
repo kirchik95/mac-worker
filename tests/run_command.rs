@@ -8,6 +8,7 @@ use std::{
     sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::Duration,
@@ -1912,4 +1913,192 @@ fn status_transitive_accepted_enrichment_rejects_divergent_non_identity_fields()
         Duration::from_secs(30),
         record.meta().job_id(),
     );
+}
+
+#[test]
+fn status_exact_reconciles_a_current_at_least_remote_update_queued_before_the_cas() {
+    // Break caught: an ordinary compatible observation update wins after the
+    // pre-CAS reload, but the stale full-record CAS reports a conflict instead
+    // of atomically preserving that observation and clearing uncertainty.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let bare = JobStatus::accepted(101).unwrap();
+    let concurrent = bare
+        .with_supervisor(ProcessIdentity::new(11, 12).unwrap(), 150)
+        .unwrap();
+    let target = test_record(
+        &store,
+        4_000,
+        100,
+        Some(bare.clone()),
+        RemoteUncertainty::unknown_remote("PRE_CAS_AMBIGUITY").unwrap(),
+    );
+    store.create_job(target.clone()).unwrap();
+    let blocker_status = JobStatus::succeeded(101, 0, 0).unwrap();
+    let blocker = test_record(
+        &store,
+        4_001,
+        50,
+        Some(blocker_status.clone()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(blocker.clone()).unwrap();
+
+    let blocker_pause = store.pause_cleanup_after_move_once();
+    let blocker_store = store.clone();
+    let blocker_id = blocker.meta().job_id();
+    let blocker_update = blocker_status
+        .with_cleanup_error("BLOCKER_CLEANUP".into(), 150)
+        .unwrap();
+    let blocker_thread =
+        thread::spawn(move || blocker_store.update_observation(blocker_id, blocker_update));
+    blocker_pause.wait_until_paused();
+
+    let concurrent_pause = store.pause_cleanup_after_move_once();
+    let update_contention = store.observe_next_lock_contention();
+    let update_store = store.clone();
+    let target_id = target.meta().job_id();
+    let update_status = concurrent.clone();
+    let update_thread =
+        thread::spawn(move || update_store.update_observation(target_id, update_status));
+    update_contention.wait_until_confirmed();
+
+    let status_contention = store.observe_next_lock_contention();
+    let status_store = store.clone();
+    let response = StatusResponse::new(target.meta().clone(), bare).unwrap();
+    let status_thread = thread::spawn(move || {
+        let runner = RecordingRunner::returning(vec![status_result(&response)]);
+        let retry = ImmediateResolution::new();
+        let remote = RemoteJobClient::new_with_runtime(&runner, &retry);
+        let config = config();
+        let result = service(&config, &status_store, &remote).inspect(Some(target_id));
+        (result, runner.requests())
+    });
+    status_contention.wait_until_confirmed();
+
+    blocker_pause.resume();
+    concurrent_pause.wait_until_paused();
+    let queued = store.load_job(target_id).unwrap();
+    assert_eq!(queued.last_status(), Some(&concurrent));
+    assert!(matches!(
+        queued.remote_uncertainty(),
+        RemoteUncertainty::UnknownRemote { code } if code == "PRE_CAS_AMBIGUITY"
+    ));
+    concurrent_pause.resume();
+    blocker_thread.join().unwrap().unwrap();
+    update_thread.join().unwrap().unwrap();
+
+    let (report, requests) = status_thread.join().unwrap();
+    let report = report.unwrap();
+
+    assert_eq!(report.jobs[0].status.as_ref(), Some(&concurrent));
+    assert_eq!(report.jobs[0].remote_uncertainty, RemoteUncertainty::None);
+    let persisted = store.load_job(target_id).unwrap();
+    assert_eq!(persisted.last_status(), Some(&concurrent));
+    assert_eq!(persisted.remote_uncertainty(), &RemoteUncertainty::None);
+    assert_eq!(requests.len(), 1);
+    assert_status_call(&requests[0], Duration::from_secs(30), target_id);
+}
+
+#[test]
+fn status_list_advances_a_compatible_intermediate_update_queued_before_the_cas() {
+    // Break caught: a compatible intermediate observation wins after the
+    // pre-CAS reload, but list mode returns it with stale uncertainty instead
+    // of atomically advancing to the authoritative remote observation.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let bare = JobStatus::accepted(101).unwrap();
+    let intermediate = bare
+        .with_supervisor(ProcessIdentity::new(31, 32).unwrap(), 150)
+        .unwrap();
+    let remote_status = intermediate
+        .with_child(ProcessIdentity::new(33, 34).unwrap(), 200)
+        .unwrap();
+    let target = test_record(
+        &store,
+        4_100,
+        100,
+        Some(bare),
+        RemoteUncertainty::unknown_remote("PRE_CAS_AMBIGUITY").unwrap(),
+    );
+    store.create_job(target.clone()).unwrap();
+    let blocker_status = JobStatus::succeeded(101, 0, 0).unwrap();
+    let blocker = test_record(
+        &store,
+        4_101,
+        50,
+        Some(blocker_status.clone()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(blocker.clone()).unwrap();
+
+    let target_id = target.meta().job_id();
+    let response = StatusResponse::new(target.meta().clone(), remote_status.clone()).unwrap();
+    let (entered_sender, entered_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let status_store = store.clone();
+    let status_thread = thread::spawn(move || {
+        let release_receiver = Mutex::new(release_receiver);
+        let runner = RecordingRunner::with_hook(vec![status_result(&response)], move |_| {
+            entered_sender.send(()).unwrap();
+            release_receiver.lock().unwrap().recv().unwrap();
+        });
+        let remote = RemoteJobClient::new(&runner);
+        let config = config();
+        let result = service(&config, &status_store, &remote).inspect(None);
+        (result, runner.requests())
+    });
+    entered_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("list status call did not reach the remote runner");
+
+    let blocker_pause = store.pause_cleanup_after_move_once();
+    let blocker_store = store.clone();
+    let blocker_id = blocker.meta().job_id();
+    let blocker_update = blocker_status
+        .with_cleanup_error("BLOCKER_CLEANUP".into(), 150)
+        .unwrap();
+    let blocker_thread =
+        thread::spawn(move || blocker_store.update_observation(blocker_id, blocker_update));
+    blocker_pause.wait_until_paused();
+
+    let concurrent_pause = store.pause_cleanup_after_move_once();
+    let update_contention = store.observe_next_lock_contention();
+    let update_store = store.clone();
+    let update_status = intermediate.clone();
+    let update_thread =
+        thread::spawn(move || update_store.update_observation(target_id, update_status));
+    update_contention.wait_until_confirmed();
+
+    let status_contention = store.observe_next_lock_contention();
+    release_sender.send(()).unwrap();
+    status_contention.wait_until_confirmed();
+
+    blocker_pause.resume();
+    concurrent_pause.wait_until_paused();
+    let queued = store.load_job(target_id).unwrap();
+    assert_eq!(queued.last_status(), Some(&intermediate));
+    assert!(matches!(
+        queued.remote_uncertainty(),
+        RemoteUncertainty::UnknownRemote { code } if code == "PRE_CAS_AMBIGUITY"
+    ));
+    concurrent_pause.resume();
+    blocker_thread.join().unwrap().unwrap();
+    update_thread.join().unwrap().unwrap();
+
+    let (report, requests) = status_thread.join().unwrap();
+    let report = report.unwrap();
+
+    let row = report
+        .jobs
+        .iter()
+        .find(|row| row.job_id == target_id)
+        .unwrap();
+    assert_eq!(row.status.as_ref(), Some(&remote_status));
+    assert_eq!(row.remote_uncertainty, RemoteUncertainty::None);
+    let persisted = store.load_job(target_id).unwrap();
+    assert_eq!(persisted.last_status(), Some(&remote_status));
+    assert_eq!(persisted.remote_uncertainty(), &RemoteUncertainty::None);
+    assert_eq!(requests.len(), 1);
+    assert_status_call(&requests[0], Duration::from_secs(5), target_id);
 }
