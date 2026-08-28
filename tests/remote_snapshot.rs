@@ -22,13 +22,13 @@ use mac_worker::{
     error::WorkerError,
     host_store::{HostStore, HostStoreWritePoint},
     job::{
-        ClientId, CommandSpec, JobId, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseRecord, LeaseToken, RequestFingerprintMaterial,
+        ClientId, CommandSpec, HostControlError, JobId, JobStatus, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseRecord, LeaseToken, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
     manifest::{ManifestEntry, ManifestEntryKind, SnapshotManifest},
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::MemoryPressure,
+    protocol::{MemoryPressure, PROTOCOL_VERSION},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedReceipt, VerifiedSnapshotResponse},
     run_with_stdio_in_context,
     transfer::{
@@ -1146,6 +1146,57 @@ fn hidden_snapshot_verify_is_fixed_bounded_compact_and_inventory_independent() {
         assert_eq!(response.job_id(), lease.job_id());
         assert_eq!(response.manifest_digest(), digest);
         assert!(!String::from_utf8_lossy(&stdout).contains(LEASE_TOKEN));
+    }
+}
+
+#[test]
+fn hidden_snapshot_verify_failures_are_versioned() {
+    // Break caught: snapshot-verify emits its legacy unversioned error shape
+    // and reflects private request material instead of a canonical envelope.
+    let fixture = tempfile::tempdir().unwrap();
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::from([(
+            OsString::from("XDG_DATA_HOME"),
+            fixture.path().join("data").into_os_string(),
+        )]),
+        fixture.path().join("home"),
+        fixture.path().join("PLANTED-HOST-PATH"),
+    );
+    let input = br#"{"protocol_version":2,"lease_token":"PLANTED-LEASE-TOKEN","incoming_path":"/tmp/PLANTED-SNAPSHOT-PATH","command":"PLANTED-COMMAND"}"#;
+    let cli = Cli::try_parse_from(["worker", "host", "snapshot-verify"]).unwrap();
+    let mut stdin = Cursor::new(input);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_stdio_in_context(
+        cli,
+        &NoProcess,
+        &runtime,
+        &mut stdin,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 70);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.last(), Some(&b'\n'));
+    assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let error: HostControlError = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(error.protocol_version(), PROTOCOL_VERSION);
+    assert_eq!(error.error().code(), "INVALID_REQUEST");
+    assert_eq!(error.error().message(), "host request was invalid");
+    assert_eq!(
+        stdout,
+        br#"{"protocol_version":2,"error":{"code":"INVALID_REQUEST","message":"host request was invalid"}}
+"#
+    );
+    let rendered = String::from_utf8(stdout).unwrap();
+    for planted in [
+        "PLANTED-LEASE-TOKEN",
+        "/tmp/PLANTED-SNAPSHOT-PATH",
+        "PLANTED-COMMAND",
+        "PLANTED-HOST-PATH",
+    ] {
+        assert!(!rendered.contains(planted));
     }
 }
 

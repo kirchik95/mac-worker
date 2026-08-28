@@ -18,13 +18,13 @@ use mac_worker::{
     error::WorkerError,
     host_store::{HostStore, HostStoreWritePoint},
     job::{
-        ClientId, CommandSpec, JobId, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseToken, RequestFingerprintMaterial,
+        ClientId, CommandSpec, HostControlError, JobId, JobStatus, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseToken, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService, SlotState},
     paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::MemoryPressure,
+    protocol::{MemoryPressure, PROTOCOL_VERSION},
     run_with_stdio_in_context,
 };
 use tempfile::tempdir;
@@ -794,6 +794,58 @@ fn hidden_acquire_is_bounded_strict_json_with_one_compact_response() {
         assert!(response.get("error").is_some());
         assert!(!String::from_utf8_lossy(&stdout).contains("lease_token"));
     }
+}
+
+#[test]
+fn hidden_lease_acquire_failures_are_versioned_and_capacity_typed() {
+    // Break caught: lease-acquire returns its legacy unversioned error object,
+    // so a remote client cannot authoritatively preserve admission typing.
+    let temp = tempdir().unwrap();
+    let environment = BTreeMap::from([(
+        OsString::from("XDG_DATA_HOME"),
+        temp.path().join("data").into_os_string(),
+    )]);
+    let home = temp.path().join("home");
+    let paths = PathLayout::discover(None, &environment, &home).unwrap();
+    let runtime =
+        RuntimeContext::isolated(environment, home, temp.path().join("PLANTED-HOST-PATH"));
+    let store = HostStore::open(&paths.host_state_root()).unwrap();
+    LeaseService::new(&store)
+        .acquire(&request(80_000), &healthy(), 1)
+        .unwrap();
+    let contender = request(80_001);
+    let planted_token = contender.material().lease_token().to_string();
+
+    let cli = Cli::try_parse_from(["worker", "host", "lease-acquire"]).unwrap();
+    let mut stdin = Cursor::new(serde_json::to_vec(&contender).unwrap());
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_stdio_in_context(
+        cli,
+        &NoProcess,
+        &runtime,
+        &mut stdin,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 75);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.last(), Some(&b'\n'));
+    assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let error: HostControlError = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(error.protocol_version(), PROTOCOL_VERSION);
+    assert_eq!(error.error().code(), "CAPACITY_BUSY");
+    assert_eq!(error.error().message(), "worker admission rejected");
+    assert_eq!(
+        stdout,
+        br#"{"protocol_version":2,"error":{"code":"CAPACITY_BUSY","message":"worker admission rejected"}}
+"#
+    );
+    let rendered = String::from_utf8(stdout).unwrap();
+    assert!(!rendered.contains(&planted_token));
+    assert!(!rendered.contains("cargo"));
+    assert!(!rendered.contains("PLANTED-HOST-PATH"));
 }
 
 #[test]

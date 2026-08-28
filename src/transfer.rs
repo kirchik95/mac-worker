@@ -747,6 +747,19 @@ fn decode_host_control_error(bytes: &[u8]) -> Option<WorkerError> {
     if serde_json::to_vec(&error).ok()?.as_slice() != body {
         return None;
     }
+    let capacity_code = match error.error().code() {
+        "CAPACITY_BUSY" => Some("CAPACITY_BUSY"),
+        "INSUFFICIENT_DISK" => Some("INSUFFICIENT_DISK"),
+        "MEMORY_PRESSURE" => Some("MEMORY_PRESSURE"),
+        "SWAP_LIMIT" => Some("SWAP_LIMIT"),
+        _ => None,
+    };
+    if let Some(code) = capacity_code {
+        return Some(WorkerError::Capacity {
+            code,
+            message: error.error().message().to_owned(),
+        });
+    }
     Some(WorkerError::Protocol(format!(
         "{}: {}",
         error.error().code(),

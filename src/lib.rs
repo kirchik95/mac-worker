@@ -415,13 +415,7 @@ fn run_host_submit(
     };
     let write_result = match result {
         Ok(response) => serde_json::to_writer(&mut *stdout, &response),
-        Err(error) => {
-            let (code, message) = public_host_error(&error);
-            serde_json::to_writer(
-                &mut *stdout,
-                &serde_json::json!({"error": {"code": code, "message": message}}),
-            )
-        }
+        Err(error) => serde_json::to_writer(&mut *stdout, &versioned_host_error(&error)),
     };
     if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
         return crate::error::ExitKind::Io as u8;
@@ -692,13 +686,7 @@ fn run_host_lease_acquire(
     };
     let write_result = match result {
         Ok(response) => serde_json::to_writer(&mut *stdout, &response),
-        Err(error) => {
-            let (code, message) = public_host_error(&error);
-            serde_json::to_writer(
-                &mut *stdout,
-                &serde_json::json!({"error": {"code": code, "message": message}}),
-            )
-        }
+        Err(error) => serde_json::to_writer(&mut *stdout, &versioned_host_error(&error)),
     };
     if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
         return crate::error::ExitKind::Io as u8;
@@ -738,51 +726,12 @@ fn run_host_snapshot_verify(
     };
     let write_result = match result {
         Ok(response) => serde_json::to_writer(&mut *stdout, &response),
-        Err(error) => {
-            let (code, message) = public_host_error(&error);
-            serde_json::to_writer(
-                &mut *stdout,
-                &serde_json::json!({"error": {"code": code, "message": message}}),
-            )
-        }
+        Err(error) => serde_json::to_writer(&mut *stdout, &versioned_host_error(&error)),
     };
     if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
         return crate::error::ExitKind::Io as u8;
     }
     exit
-}
-
-fn public_host_error(error: &WorkerError) -> (&'static str, &'static str) {
-    match error {
-        WorkerError::Capacity { code, .. } => (code, "worker admission rejected"),
-        WorkerError::Protocol(message) if message.starts_with("JOB_ABANDONED:") => {
-            ("JOB_ABANDONED", "job ID was abandoned")
-        }
-        WorkerError::Protocol(message) if message.starts_with("JOB_ACCEPTED:") => {
-            ("JOB_ACCEPTED", "job ID was already accepted")
-        }
-        WorkerError::Protocol(message) if message.starts_with("JOB_ID_CONFLICT:") => (
-            "JOB_ID_CONFLICT",
-            "job ID conflicts with durable host state",
-        ),
-        WorkerError::Protocol(message) if message.starts_with("LEASE_IDENTITY_MISMATCH:") => (
-            "LEASE_IDENTITY_MISMATCH",
-            "live lease identity was rejected",
-        ),
-        WorkerError::Snapshot {
-            code: "MANIFEST_MISMATCH",
-            ..
-        } => ("MANIFEST_MISMATCH", "snapshot did not match its manifest"),
-        WorkerError::Snapshot {
-            code: "UNSAFE_REMOTE_SNAPSHOT",
-            ..
-        } => (
-            "UNSAFE_REMOTE_SNAPSHOT",
-            "snapshot filesystem state was rejected",
-        ),
-        WorkerError::Io(_) => ("HOST_IO", "host state operation failed"),
-        _ => ("INVALID_REQUEST", "host request was invalid"),
-    }
 }
 
 fn write_error(stderr: &mut dyn Write, error: &WorkerError) {

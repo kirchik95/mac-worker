@@ -42,8 +42,8 @@ use mac_worker::{
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project::{ProjectContext, ProjectInspector},
     project_config::SnapshotSettings,
-    protocol::MemoryPressure,
-    run_with_rsync_executor_in_context,
+    protocol::{MemoryPressure, PROTOCOL_VERSION},
+    run_with_rsync_executor_in_context, run_with_stdio_in_context,
     snapshot::{Snapshot, SnapshotBuilder},
     transfer::{
         AbandonTransferResult, HostOperation, HostTransferService, RemoteJobClient,
@@ -2000,9 +2000,100 @@ fn query_operations_use_only_the_three_fixed_commands_and_compact_requests() {
 }
 
 #[test]
-fn typed_nonzero_host_errors_are_authoritative_only_when_strict_and_versioned() {
-    // Break caught: a valid host JOB_ID_CONFLICT is collapsed into a generic
-    // transport failure, or planted/noncanonical output becomes diagnostic.
+fn hidden_submit_failures_are_versioned() {
+    // Break caught: submit emits its legacy unversioned error shape or leaks
+    // private request material instead of one canonical public error line.
+    let fixture = tempfile::tempdir().unwrap();
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::from([(
+            OsString::from("XDG_DATA_HOME"),
+            fixture.path().join("data").into_os_string(),
+        )]),
+        fixture.path().join("home"),
+        fixture.path().join("PLANTED-HOST-PATH"),
+    );
+    let input = br#"{"protocol_version":2,"lease_token":"PLANTED-LEASE-TOKEN","project_path":"/tmp/PLANTED-PROJECT-PATH","command":"PLANTED-COMMAND"}"#;
+    let cli = Cli::try_parse_from(["worker", "host", "submit"]).unwrap();
+    let mut stdin = Cursor::new(input);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_stdio_in_context(
+        cli,
+        &RecordingRunner::returning(Vec::new()),
+        &runtime,
+        &mut stdin,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 70);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.last(), Some(&b'\n'));
+    assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let error: HostControlError = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(error.protocol_version(), PROTOCOL_VERSION);
+    assert_eq!(error.error().code(), "INVALID_REQUEST");
+    assert_eq!(error.error().message(), "host request was invalid");
+    assert_eq!(
+        stdout,
+        br#"{"protocol_version":2,"error":{"code":"INVALID_REQUEST","message":"host request was invalid"}}
+"#
+    );
+    let rendered = String::from_utf8(stdout).unwrap();
+    for planted in [
+        "PLANTED-LEASE-TOKEN",
+        "/tmp/PLANTED-PROJECT-PATH",
+        "PLANTED-COMMAND",
+        "PLANTED-HOST-PATH",
+    ] {
+        assert!(!rendered.contains(planted));
+    }
+}
+
+#[test]
+fn all_four_admission_codes_decode_to_capacity_exit_75() {
+    // Break caught: one authoritative admission rejection is flattened into
+    // Protocol, so public orchestration reports infrastructure exit 70.
+    let request = LiteralRequest {
+        alpha: 7,
+        beta: "fixed",
+    };
+    for (code, message) in [
+        ("CAPACITY_BUSY", "one heavy job is already active"),
+        ("INSUFFICIENT_DISK", "free disk is below the required floor"),
+        ("MEMORY_PRESSURE", "memory pressure is critical"),
+        ("SWAP_LIMIT", "swap usage exceeds the admission threshold"),
+    ] {
+        let stdout = canonical_line(&HostControlError::new(code, message).unwrap());
+        let runner = RecordingRunner::returning(vec![Ok(result(
+            status(23),
+            &stdout,
+            b"PLANTED-REMOTE-SECRET",
+        ))]);
+        let error = SshJsonTransport::new(&runner)
+            .request::<_, LiteralResponse>(
+                &worker(),
+                HostOperation::LeaseAcquire,
+                &request,
+                policy(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            WorkerError::Capacity {
+                code: actual_code,
+                message: actual_message,
+            } if *actual_code == code && actual_message == message
+        ));
+        assert_eq!(error.exit_code(), 75, "{code}: {error}");
+        assert!(!error.to_string().contains("PLANTED"));
+    }
+}
+
+#[test]
+fn non_admission_host_codes_remain_authoritative_protocol_errors() {
+    // Break caught: a valid non-admission host code is incorrectly promoted
+    // to Capacity instead of retaining the established coded Protocol error.
     let request = LiteralRequest {
         alpha: 7,
         beta: "fixed",
@@ -2026,8 +2117,24 @@ fn typed_nonzero_host_errors_are_authoritative_only_when_strict_and_versioned() 
         WorkerError::Protocol(ref message)
             if message == "JOB_ID_CONFLICT: job ID conflicts with durable host state"
     ));
+    assert_eq!(error.exit_code(), 70);
     assert!(!error.to_string().contains("PLANTED"));
+}
 
+#[test]
+fn legacy_or_wrong_version_host_errors_are_not_authoritative() {
+    // Break caught: an unversioned or incompatible host payload is decoded
+    // with ad-hoc JSON and allowed to control client-side error typing.
+    let request = LiteralRequest {
+        alpha: 7,
+        beta: "fixed",
+    };
+    let authoritative = HostControlError::new(
+        "JOB_ID_CONFLICT",
+        "job ID conflicts with durable host state",
+    )
+    .unwrap();
+    let valid = canonical_line(&authoritative);
     let mut wrong_version = serde_json::to_value(&authoritative).unwrap();
     wrong_version["protocol_version"] = serde_json::json!(999);
     let mut duplicate = valid.clone();
@@ -2036,6 +2143,9 @@ fn typed_nonzero_host_errors_are_authoritative_only_when_strict_and_versioned() 
     oversized[0] = b'{';
     let invalid = vec![
         Vec::new(),
+        br#"{"error":{"code":"CAPACITY_BUSY","message":"PLANTED-LEGACY-MESSAGE"}}
+"#
+        .to_vec(),
         serde_json::to_vec(&authoritative).unwrap(),
         b"not-json\n".to_vec(),
         canonical_line(&wrong_version),
