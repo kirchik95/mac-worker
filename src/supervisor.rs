@@ -283,9 +283,17 @@ fn prove_killed_group_absent(
         match (runtime.observe(child), runtime.observe_group(child.pid())) {
             (ProcessObservation::Absent, ProcessGroupObservation::Absent) => return Ok(()),
             (ProcessObservation::Matching { process_group }, ProcessGroupObservation::Present)
-                if process_group == child.pid() && runtime.monotonic_now() < deadline =>
+                if process_group == child.pid() =>
             {
-                let remaining = deadline - runtime.monotonic_now();
+                let now = runtime.monotonic_now();
+                let Some(remaining) = deadline
+                    .checked_sub(now)
+                    .filter(|remaining| !remaining.is_zero())
+                else {
+                    return Err(reconciliation_ambiguous(
+                        "targeted child leader and process group remained live at the KILL proof deadline",
+                    ));
+                };
                 runtime.sleep(POLL_INTERVAL.min(remaining));
             }
             _ => {

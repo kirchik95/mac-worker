@@ -479,23 +479,23 @@ impl<'a> JobService<'a> {
         match self.store.cleanup_job_owned(lease) {
             Ok(receipt) => {
                 if let Err(error) = self.leases.release_after_cleanup(lease, &receipt) {
-                    self.enrich_reconciliation_cleanup_error(
+                    let _ = self.enrich_reconciliation_cleanup_error(
                         lease,
                         job,
                         terminal,
                         "LEASE_RELEASE_FAILED",
-                    )?;
+                    );
                     return Err(error);
                 }
                 Ok(())
             }
             Err(error) => {
-                self.enrich_reconciliation_cleanup_error(
+                let _ = self.enrich_reconciliation_cleanup_error(
                     lease,
                     job,
                     terminal,
                     "MUTABLE_CLEANUP_FAILED",
-                )?;
+                );
                 Err(error)
             }
         }
@@ -512,15 +512,12 @@ impl<'a> JobService<'a> {
             return Ok(());
         }
         let admission = self.store.admission_lock(lease.job_id())?;
-        let mut supervisor = self
+        let supervisor = self
             .store
-            .supervisor_lock_after(&admission, lease.job_id(), true)?
-            .ok_or_else(|| {
-                protocol_code(
-                    "RECONCILIATION_AMBIGUOUS",
-                    "status capability remained busy during cleanup enrichment",
-                )
-            })?;
+            .supervisor_lock_after(&admission, lease.job_id(), false)?;
+        let Some(mut supervisor) = supervisor else {
+            return Ok(());
+        };
         drop(admission);
         let (bytes, current): (Vec<u8>, JobStatus) =
             read_mutable_canonical_json_with_bytes(job, "status.json")?;

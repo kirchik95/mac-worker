@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::Write as _,
+    os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::{
@@ -10,7 +11,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mac_worker::{
@@ -83,6 +84,13 @@ struct ScriptedReconciliationInner {
     signals: Mutex<Vec<(u32, i32)>>,
     sleeps: Mutex<Vec<Duration>>,
     now: Mutex<Duration>,
+    clock: Mutex<Option<VecDeque<Duration>>>,
+    first_observation_gate: Mutex<Option<FirstObservationGate>>,
+}
+
+struct FirstObservationGate {
+    start_contender: mpsc::Sender<()>,
+    contender_queued: mpsc::Receiver<()>,
 }
 
 impl ScriptedReconciliation {
@@ -97,8 +105,20 @@ impl ScriptedReconciliation {
                 signals: Mutex::new(Vec::new()),
                 sleeps: Mutex::new(Vec::new()),
                 now: Mutex::new(Duration::ZERO),
+                clock: Mutex::new(None),
+                first_observation_gate: Mutex::new(None),
             }),
         }
+    }
+
+    fn with_clock(self, clock: impl IntoIterator<Item = Duration>) -> Self {
+        *self.inner.clock.lock().unwrap() = Some(clock.into_iter().collect());
+        self
+    }
+
+    fn with_first_observation_gate(self, gate: FirstObservationGate) -> Self {
+        *self.inner.first_observation_gate.lock().unwrap() = Some(gate);
+        self
     }
 
     fn signals(&self) -> Vec<(u32, i32)> {
@@ -119,6 +139,13 @@ impl ProcessInspector for ScriptedReconciliation {
     }
 
     fn observe(&self, _expected: ProcessIdentity) -> ProcessObservation {
+        if let Some(gate) = self.inner.first_observation_gate.lock().unwrap().take() {
+            gate.start_contender.send(()).unwrap();
+            gate.contender_queued
+                .recv_timeout(Duration::from_secs(2))
+                .expect("supervisor contender did not queue");
+            thread::sleep(Duration::from_millis(50));
+        }
         self.inner
             .process
             .lock()
@@ -156,6 +183,9 @@ impl ReconciliationRuntime for ScriptedReconciliation {
     }
 
     fn monotonic_now(&self) -> Duration {
+        if let Some(clock) = self.inner.clock.lock().unwrap().as_mut() {
+            return clock.pop_front().expect("unexpected monotonic clock read");
+        }
         *self.inner.now.lock().unwrap()
     }
 
@@ -163,6 +193,53 @@ impl ReconciliationRuntime for ScriptedReconciliation {
         self.inner.sleeps.lock().unwrap().push(duration);
         *self.inner.now.lock().unwrap() += duration;
     }
+}
+
+fn queue_supervisor_lock_contender(
+    root: &Path,
+    job_id: JobId,
+) -> (
+    FirstObservationGate,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+    thread::JoinHandle<()>,
+) {
+    let (start_tx, start_rx) = mpsc::channel();
+    let (queued_tx, queued_rx) = mpsc::channel();
+    let (acquired_tx, acquired_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let lock = root
+        .join("locks/jobs")
+        .join(job_id.to_string())
+        .join("supervisor/supervisor.lock");
+    let contender = thread::spawn(move || {
+        start_rx.recv().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock)
+            .unwrap();
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, -1, "status did not hold the supervisor lock");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EWOULDBLOCK)
+        );
+        queued_tx.send(()).unwrap();
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        acquired_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) }, 0);
+    });
+    (
+        FirstObservationGate {
+            start_contender: start_tx,
+            contender_queued: queued_rx,
+        },
+        acquired_rx,
+        release_tx,
+        contender,
+    )
 }
 
 impl SupervisorLauncher for RejectLauncher {
@@ -1224,6 +1301,151 @@ fn term_disappearance_still_waits_full_grace_and_skips_kill_only_after_exact_abs
 }
 
 #[test]
+fn kill_proof_deadline_crossing_fails_closed_without_panicking() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("kill-proof-clock-boundary");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let supervisor = identity(84_101);
+    let child = identity(84_102);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(supervisor, 11)
+        .unwrap()
+        .with_child(child, 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    let before_scopes = mutable_job_scope_presence(&store, &lease);
+    let runtime = ScriptedReconciliation::new(
+        [
+            ProcessObservation::Absent,
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+        ],
+        [
+            ProcessGroupObservation::Present,
+            ProcessGroupObservation::Present,
+        ],
+    )
+    .with_clock([
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::from_secs(10),
+        Duration::from_secs(20),
+        Duration::from_millis(29_999),
+        Duration::from_millis(30_001),
+    ]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+            .status(lease.job_id())
+    }));
+
+    assert!(result.is_ok(), "KILL proof deadline crossing panicked");
+    let error = result.unwrap().unwrap_err();
+    assert_error_code(error, "RECONCILIATION_AMBIGUOUS", "KILL proof deadline");
+    assert_eq!(
+        runtime.signals(),
+        vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+    );
+    assert_eq!(
+        runtime.sleeps(),
+        vec![Duration::from_secs(10), Duration::from_millis(1)]
+    );
+    assert_eq!(read_job_status(&store, &lease), status);
+    assert_eq!(mutable_job_scope_presence(&store, &lease), before_scopes);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+}
+
+#[test]
+fn unsafe_post_term_transitions_never_kill_mutate_or_release() {
+    let cases = [
+        (
+            "leader-absent-group-present",
+            ProcessObservation::Absent,
+            Some(ProcessGroupObservation::Present),
+        ),
+        (
+            "leader-absent-group-ambiguous",
+            ProcessObservation::Absent,
+            Some(ProcessGroupObservation::Ambiguous),
+        ),
+        ("reused", ProcessObservation::Reused, None),
+        (
+            "wrong-pgid",
+            ProcessObservation::Matching {
+                process_group: 99_998,
+            },
+            None,
+        ),
+        ("ambiguous", ProcessObservation::Ambiguous, None),
+    ];
+
+    for (index, (label, transition, group)) in cases.into_iter().enumerate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(format!("post-term-transition-{index}"));
+        let (store, lease, _request) = indexed_identityless_job(&root);
+        let supervisor = identity(84_201);
+        let child = identity(84_202);
+        let status = JobStatus::accepted(10)
+            .unwrap()
+            .with_supervisor(supervisor, 11)
+            .unwrap()
+            .with_child(child, 12)
+            .unwrap()
+            .into_running(13)
+            .unwrap();
+        install_job_status(&store, &lease, &status, true);
+        let before_scopes = mutable_job_scope_presence(&store, &lease);
+        let runtime = ScriptedReconciliation::new(
+            [
+                ProcessObservation::Absent,
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                transition,
+            ],
+            group,
+        );
+
+        let error =
+            JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+                .status(lease.job_id())
+                .unwrap_err();
+
+        assert_error_code(error, "RECONCILIATION_AMBIGUOUS", label);
+        assert_eq!(
+            runtime.signals(),
+            vec![(child.pid(), libc::SIGTERM)],
+            "{label}"
+        );
+        assert_eq!(runtime.sleeps(), vec![Duration::from_secs(10)], "{label}");
+        assert_eq!(read_job_status(&store, &lease), status, "{label}");
+        assert_eq!(
+            mutable_job_scope_presence(&store, &lease),
+            before_scopes,
+            "{label}"
+        );
+        assert_eq!(
+            LeaseService::new(&store).load().unwrap(),
+            Some(lease),
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn child_identity_or_group_ambiguity_never_signals_cleans_or_releases() {
     let cases = [
         (
@@ -1355,6 +1577,106 @@ fn cleanup_proof_failure_keeps_the_exact_lease_for_idempotent_terminal_retry() {
     .unwrap();
     assert_eq!(response.status().state(), JobState::Lost);
     assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+}
+
+#[test]
+fn cleanup_and_release_failures_return_promptly_under_enrichment_contention() {
+    let cases = [
+        (
+            "cleanup",
+            HostStoreWritePoint::AfterJobCleanupProof,
+            "injected cleanup-proof crash boundary",
+        ),
+        (
+            "release",
+            HostStoreWritePoint::BeforeJobLeaseRetirement,
+            "injected lease retirement failure",
+        ),
+    ];
+
+    for (index, (label, fault, primary_error)) in cases.into_iter().enumerate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp
+            .path()
+            .join(format!("cleanup-enrichment-contention-{index}"));
+        let (store, lease, _request) = indexed_identityless_job(&root);
+        let status = JobStatus::accepted(10)
+            .unwrap()
+            .with_supervisor(identity(87_101), 11)
+            .unwrap();
+        install_job_status(&store, &lease, &status, false);
+        drop(store);
+        let (gate, acquired_rx, release_tx, contender) =
+            queue_supervisor_lock_contender(&root, lease.job_id());
+        let runtime = ScriptedReconciliation::new([ProcessObservation::Absent], [])
+            .with_first_observation_gate(gate);
+        let status_root = root.clone();
+        let job_id = lease.job_id();
+        let (result_tx, result_rx) = mpsc::channel();
+        let status_thread = thread::spawn(move || {
+            let faulted = HostStore::open_with_write_fault(&status_root, fault).unwrap();
+            let result =
+                JobService::new_with_reconciliation(&faulted, &RejectLauncher, Arc::new(runtime))
+                    .status(job_id);
+            result_tx.send(result).unwrap();
+        });
+
+        acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("supervisor contender did not acquire after reconciliation");
+        let cleanup_marker = root
+            .join("locks/jobs")
+            .join(lease.job_id().to_string())
+            .join("cleanup-complete.json");
+        let marker_deadline = Instant::now() + Duration::from_secs(2);
+        while !cleanup_marker.exists() {
+            assert!(
+                Instant::now() < marker_deadline,
+                "{label} did not publish its durable cleanup marker"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        let prompt = result_rx.recv_timeout(Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        contender.join().unwrap();
+        let result = match prompt {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = result_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("status remained blocked after releasing the contender");
+                status_thread.join().unwrap();
+                panic!("{label} enrichment blocked on a busy supervisor lock");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                status_thread.join().unwrap();
+                panic!("{label} status thread disconnected without a result");
+            }
+        };
+        status_thread.join().unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{label} did not return within the contention bound"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains(primary_error),
+            "{label} primary error was replaced: {error}"
+        );
+        let reopened = HostStore::open(&root).unwrap();
+        let durable = read_job_status(&reopened, &lease);
+        assert_eq!(durable.state(), JobState::Lost, "{label}");
+        assert_eq!(durable.error_code(), Some("SUPERVISOR_LOST"), "{label}");
+        assert_eq!(durable.cleanup_error_code(), None, "{label}");
+        assert_mutable_job_scopes_absent(&reopened, &lease);
+        assert_eq!(
+            LeaseService::new(&reopened).load().unwrap(),
+            Some(lease),
+            "{label}"
+        );
+    }
 }
 
 #[test]
@@ -1656,6 +1978,16 @@ fn assert_mutable_job_scopes_absent(store: &HostStore, lease: &LeaseRecord) {
     for name in ["workspace", "home", "tmp", "execution.json"] {
         assert!(!job.join(name).exists(), "mutable scope {name} remains");
     }
+}
+
+fn mutable_job_scope_presence(store: &HostStore, lease: &LeaseRecord) -> Vec<(String, bool)> {
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    ["workspace", "home", "tmp", "execution.json"]
+        .into_iter()
+        .map(|name| (name.into(), job.join(name).exists()))
+        .collect()
 }
 
 fn replace_json<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
