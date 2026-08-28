@@ -866,14 +866,33 @@ impl RootedDir {
         maximum: u64,
         after_open: impl FnOnce(),
     ) -> io::Result<Vec<u8>> {
+        self.read_private_regular_with_hooks(name, maximum, || {}, after_open)
+    }
+
+    fn read_private_regular_with_hooks(
+        &self,
+        name: &str,
+        maximum: u64,
+        after_descriptor_open: impl FnOnce(),
+        after_opened_validation: impl FnOnce(),
+    ) -> io::Result<Vec<u8>> {
         self.verify_root_name()?;
         let name = CString::new(name).map_err(interior_nul_error)?;
         let path_stat = stat_at(self.root.as_raw_fd(), &name)?;
         require_private_regular(&path_stat)?;
         let descriptor = open_regular_at(self.root.as_raw_fd(), &name)?;
+        after_descriptor_open();
         let opened = stat_fd(descriptor.as_raw_fd())?;
-        require_private_regular_opened(&opened)?;
+        if let Err(error) = require_private_regular_opened(&opened) {
+            if error.raw_os_error() == Some(libc::ESTALE) {
+                let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+                require_private_regular(&rebound)?;
+            }
+            return Err(error);
+        }
         if !same_file(&path_stat, &opened) {
+            let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+            require_private_regular(&rebound)?;
             return Err(os_error(libc::ESTALE));
         }
         if opened.st_size < 0 || opened.st_size as u64 > maximum {
@@ -882,7 +901,7 @@ impl RootedDir {
                 "host file exceeds limit",
             ));
         }
-        after_open();
+        after_opened_validation();
         let mut bytes = Vec::new();
         let mut file = File::from(descriptor);
         Read::by_ref(&mut file)
@@ -896,8 +915,8 @@ impl RootedDir {
         }
         let after = stat_fd(file.as_raw_fd())?;
         let rebound = stat_at(self.root.as_raw_fd(), &name)?;
-        require_private_regular_opened(&after)?;
         require_private_regular(&rebound)?;
+        require_private_regular_opened(&after)?;
         if bytes.len() as u64 != path_stat.st_size as u64
             || !snapshot_metadata_stable(&path_stat, &after)
             || !snapshot_metadata_stable(&path_stat, &rebound)
@@ -4385,6 +4404,67 @@ mod tests {
     };
     use crate::inputs::RelativePath;
 
+    #[derive(Clone, Copy, Debug)]
+    enum UnsafePrivateReadReplacement {
+        PermissiveRegular,
+        HardlinkedRegular,
+        Directory,
+    }
+
+    fn install_unsafe_private_read_replacement(
+        root_path: &Path,
+        replacement: UnsafePrivateReadReplacement,
+    ) {
+        let target = root_path.join("receipt.json");
+        let staged = root_path.join("replacement.json");
+        match replacement {
+            UnsafePrivateReadReplacement::PermissiveRegular => {
+                fs::write(&staged, b"replacement").unwrap();
+                fs::set_permissions(&staged, fs::Permissions::from_mode(0o644)).unwrap();
+                fs::rename(&staged, target).unwrap();
+            }
+            UnsafePrivateReadReplacement::HardlinkedRegular => {
+                fs::write(&staged, b"replacement").unwrap();
+                fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::hard_link(&staged, root_path.join("replacement-alias.json")).unwrap();
+                fs::rename(&staged, target).unwrap();
+            }
+            UnsafePrivateReadReplacement::Directory => {
+                fs::create_dir(&staged).unwrap();
+                fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(staged.join("sentinel"), b"replacement").unwrap();
+                fs::remove_file(&target).unwrap();
+                fs::rename(&staged, target).unwrap();
+            }
+        }
+    }
+
+    fn assert_unsafe_private_read_replacement_preserved(
+        root_path: &Path,
+        replacement: UnsafePrivateReadReplacement,
+    ) {
+        let target = root_path.join("receipt.json");
+        match replacement {
+            UnsafePrivateReadReplacement::PermissiveRegular => {
+                assert_eq!(fs::read(&target).unwrap(), b"replacement");
+                assert_eq!(
+                    fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    0o644
+                );
+            }
+            UnsafePrivateReadReplacement::HardlinkedRegular => {
+                let alias = root_path.join("replacement-alias.json");
+                assert_eq!(fs::read(&target).unwrap(), b"replacement");
+                assert_eq!(fs::read(&alias).unwrap(), b"replacement");
+                assert_eq!(fs::metadata(&target).unwrap().nlink(), 2);
+            }
+            UnsafePrivateReadReplacement::Directory => {
+                assert!(target.is_dir());
+                assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"replacement");
+            }
+        }
+    }
+
     #[test]
     fn clone_fallback_replaces_only_its_owned_partial_before_byte_copy() {
         // Catches byte fallback publishing a partial clone or leaving its
@@ -5682,6 +5762,103 @@ mod tests {
             b"replacement"
         );
         assert!(!root_path.join("replacement.json").exists());
+    }
+
+    #[test]
+    fn bounded_private_read_checks_unsafe_rebound_before_post_read_staleness() {
+        for replacement in [
+            UnsafePrivateReadReplacement::PermissiveRegular,
+            UnsafePrivateReadReplacement::HardlinkedRegular,
+            UnsafePrivateReadReplacement::Directory,
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root_path = fixture.path().join("private");
+            fs::create_dir(&root_path).unwrap();
+            fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+            let root = RootedDir::open(&root_path).unwrap();
+            root.write_private_atomic_no_replace("receipt.json", b"old")
+                .unwrap();
+
+            let error = root
+                .read_private_regular_with_hook("receipt.json", 1024, || {
+                    install_unsafe_private_read_replacement(&root_path, replacement);
+                })
+                .unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{replacement:?}"
+            );
+            assert_ne!(error.raw_os_error(), Some(libc::ESTALE), "{replacement:?}");
+            assert_unsafe_private_read_replacement_preserved(&root_path, replacement);
+        }
+    }
+
+    #[test]
+    fn bounded_private_read_first_opened_stat_reports_safe_atomic_replacement_as_stale() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("private");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+        root.write_private_atomic_no_replace("receipt.json", b"old")
+            .unwrap();
+
+        let error = root
+            .read_private_regular_with_hooks(
+                "receipt.json",
+                1024,
+                || {
+                    let replacement = root_path.join("replacement.json");
+                    fs::write(&replacement, b"replacement").unwrap();
+                    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::rename(&replacement, root_path.join("receipt.json")).unwrap();
+                },
+                || {},
+            )
+            .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(
+            fs::read(root_path.join("receipt.json")).unwrap(),
+            b"replacement"
+        );
+        assert!(!root_path.join("replacement.json").exists());
+    }
+
+    #[test]
+    fn bounded_private_read_checks_unsafe_rebound_before_first_opened_stat_staleness() {
+        for replacement in [
+            UnsafePrivateReadReplacement::PermissiveRegular,
+            UnsafePrivateReadReplacement::HardlinkedRegular,
+            UnsafePrivateReadReplacement::Directory,
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root_path = fixture.path().join("private");
+            fs::create_dir(&root_path).unwrap();
+            fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+            let root = RootedDir::open(&root_path).unwrap();
+            root.write_private_atomic_no_replace("receipt.json", b"old")
+                .unwrap();
+
+            let error = root
+                .read_private_regular_with_hooks(
+                    "receipt.json",
+                    1024,
+                    || install_unsafe_private_read_replacement(&root_path, replacement),
+                    || {},
+                )
+                .unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{replacement:?}"
+            );
+            assert_ne!(error.raw_os_error(), Some(libc::ESTALE), "{replacement:?}");
+            assert_unsafe_private_read_replacement_preserved(&root_path, replacement);
+        }
     }
 
     #[test]
