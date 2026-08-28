@@ -2053,11 +2053,13 @@ fn typed_nonzero_host_errors_are_authoritative_only_when_strict_and_versioned() 
         let error = SshJsonTransport::new(&runner)
             .request::<_, LiteralResponse>(&worker(), HostOperation::Status, &request, policy())
             .unwrap_err();
-        assert!(
-            error.to_string().contains("HOST_REQUEST_FAILED")
-                || error.to_string().contains("SSH_RESPONSE_TOO_LARGE"),
-            "{error}"
-        );
+        assert!(matches!(
+            error,
+            WorkerError::Transport {
+                code: "HOST_REQUEST_FAILED",
+                ref message,
+            } if message == "SSH control request failed"
+        ));
         assert!(!error.to_string().contains("PLANTED"));
     }
 
@@ -2110,6 +2112,75 @@ fn remote_status_and_log_bind_the_selected_worker_job_stream_and_offset() {
             .log_chunk(&worker(), requested, LogStream::Stdout, 7, 64)
             .unwrap_err();
         assert!(error.to_string().contains("INVALID_RESPONSE"), "{error}");
+    }
+}
+
+#[test]
+fn remote_log_chunk_enforces_the_callers_effective_requested_limit() {
+    // Break caught: the client trusts any protocol-valid chunk up to 64 KiB,
+    // even when it exceeds the smaller limit in this exact request.
+    let submit = remote_submit(81_250);
+    let job_id = submit.material().job_id();
+    let cases = [
+        ("zero accepts empty", 0, 0usize, true),
+        ("zero rejects one", 0, 1, false),
+        ("one accepts empty", 1, 0, true),
+        ("one accepts exact", 1, 1, true),
+        ("one rejects two", 1, 2, false),
+        ("smaller limit accepts short", 4_096, 4_095, true),
+        ("smaller limit accepts exact", 4_096, 4_096, true),
+        ("smaller limit rejects larger", 4_095, 4_096, false),
+        (
+            "over host maximum accepts host maximum",
+            65_537,
+            65_536,
+            true,
+        ),
+    ];
+
+    for (label, limit, response_len, accepted) in cases {
+        let response = LogChunkResponse::new(
+            LogChunk::new(LogStream::Stdout, 7, vec![b'x'; response_len]).unwrap(),
+        )
+        .unwrap();
+        let runner = RecordingRunner::returning(vec![Ok(result(
+            status(0),
+            &canonical_line(&response),
+            b"",
+        ))]);
+        let result =
+            RemoteJobClient::new(&runner).log_chunk(&worker(), job_id, LogStream::Stdout, 7, limit);
+
+        if accepted {
+            let chunk = result.unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!(
+                chunk.decoded_bytes().unwrap().len(),
+                response_len,
+                "{label}"
+            );
+        } else {
+            let error = result.expect_err(label);
+            assert!(matches!(
+                error,
+                WorkerError::Transport {
+                    code: "INVALID_RESPONSE",
+                    ref message,
+                } if message == "host response was invalid"
+            ));
+        }
+        assert_eq!(
+            runner.requests()[0].stdin,
+            Some(
+                serde_json::to_vec(&mac_worker::job::LogChunkRequest::new(
+                    job_id,
+                    LogStream::Stdout,
+                    7,
+                    limit,
+                ))
+                .unwrap()
+            ),
+            "{label}"
+        );
     }
 }
 
@@ -2452,5 +2523,62 @@ fn resolution_outcomes_keep_host_authority_and_submission_error_rules_exact() {
             code: "CAPACITY_BUSY",
             ..
         }
+    ));
+
+    let runner = RecordingRunner::returning(vec![
+        Err(ProcessError::DeadlineExceeded {
+            deadline: Duration::from_secs(30),
+        }
+        .into()),
+        Ok(result(
+            status(0),
+            &canonical_line(
+                &ResolveOrAbandonResponse::cleanup_pending("MUTABLE_CLEANUP_FAILED").unwrap(),
+            ),
+            b"",
+        )),
+    ]);
+    let runtime = JumpResolutionRuntime::new();
+    let error = RemoteJobClient::new_with_runtime(&runner, &runtime)
+        .resolve_submission(
+            &worker(),
+            &submit,
+            Err(WorkerError::Capacity {
+                code: "CAPACITY_BUSY",
+                message: "original typed error".into(),
+            }),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Protocol(ref message)
+            if message == "MUTABLE_CLEANUP_FAILED: remote cleanup is pending"
+    ));
+
+    let runner = RecordingRunner::returning(vec![
+        Err(ProcessError::DeadlineExceeded {
+            deadline: Duration::from_secs(30),
+        }
+        .into()),
+        Err(ProcessError::DeadlineExceeded {
+            deadline: Duration::from_secs(30),
+        }
+        .into()),
+    ]);
+    let runtime = JumpResolutionRuntime::new();
+    let error = RemoteJobClient::new_with_runtime(&runner, &runtime)
+        .resolve_submission(
+            &worker(),
+            &submit,
+            Err(WorkerError::Capacity {
+                code: "CAPACITY_BUSY",
+                message: "original typed error".into(),
+            }),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Protocol(ref message)
+            if message == "UNKNOWN_REMOTE: remote job state is unknown"
     ));
 }

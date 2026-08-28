@@ -19,9 +19,10 @@ use crate::{
     host_store::{HostStore, JobDisposition},
     job::{
         ClientId, HostControlError, JobId, LeaseAcquireRequest, LeaseRecord, LeaseToken, LogChunk,
-        LogChunkRequest, LogChunkResponse, LogStream, PreacceptanceDisposition, RequestFingerprint,
-        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest,
-        StatusResponse, SubmitRequest, SubmitResponse,
+        LogChunkRequest, LogChunkResponse, LogStream, MAX_LOG_CHUNK_BYTES,
+        PreacceptanceDisposition, RequestFingerprint, ResolveOrAbandonOutcome,
+        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest, StatusResponse,
+        SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
@@ -572,7 +573,14 @@ impl<'a> RemoteJobClient<'a> {
             control_policy(MAX_CONTROL_DEADLINE),
         )?;
         let chunk = response.into_chunk();
-        if chunk.stream() != stream || chunk.offset() != offset {
+        let response_len = chunk
+            .decoded_bytes()
+            .map_err(|_| invalid_remote_response())?
+            .len();
+        let effective_limit = usize::try_from(limit)
+            .expect("u32 fits in usize on supported hosts")
+            .min(MAX_LOG_CHUNK_BYTES);
+        if chunk.stream() != stream || chunk.offset() != offset || response_len > effective_limit {
             return Err(invalid_remote_response());
         }
         Ok(chunk)
