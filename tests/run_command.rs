@@ -1,16 +1,35 @@
-use std::{collections::BTreeSet, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    ffi::OsStr,
+    os::unix::process::ExitStatusExt,
+    path::PathBuf,
+    process::ExitStatus,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use assert_cmd::Command;
 use clap::Parser;
 use mac_worker::{
     cli::{Cli, Command as WorkerCommand},
+    client_state::ClientStateStore,
+    config::{Config, WorkerEntry},
     error::WorkerError,
     job::{
-        CommandSpec, JobMeta, JobStatus, LocalJobRecord, RemoteUncertainty,
-        RequestFingerprintMaterial,
+        ClientId, CommandSpec, JobId, JobMeta, JobStatus, LeaseToken, LocalJobRecord,
+        RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
+        ResolveOrAbandonResponse, StatusRequest, StatusResponse,
     },
+    process::{ProcessRequest, ProcessResult, ProcessRunner},
     protocol::PROTOCOL_VERSION,
-    run::{RunCompletion, RunReport, RunRequest, StatusReport, StatusRow},
+    run::{
+        RunCompletion, RunReport, RunRequest, STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE,
+        STATUS_REFRESH_LIMIT, StatusReport, StatusRow, StatusService,
+    },
+    transfer::{HostOperation, RemoteJobClient, ResolutionRuntime},
 };
 use predicates::prelude::*;
 use serde_json::Value;
@@ -55,6 +74,202 @@ fn local_record(relative_working_dir: &str) -> LocalJobRecord {
         RemoteUncertainty::None,
     )
     .unwrap()
+}
+
+type BeforeResultHook = dyn Fn(&ProcessRequest) + Send + Sync;
+
+struct RecordingRunner {
+    results: Mutex<VecDeque<Result<ProcessResult, WorkerError>>>,
+    requests: Mutex<Vec<ProcessRequest>>,
+    before_result: Option<Box<BeforeResultHook>>,
+}
+
+impl RecordingRunner {
+    fn returning(results: Vec<Result<ProcessResult, WorkerError>>) -> Self {
+        Self {
+            results: Mutex::new(results.into()),
+            requests: Mutex::new(Vec::new()),
+            before_result: None,
+        }
+    }
+
+    fn with_hook(
+        results: Vec<Result<ProcessResult, WorkerError>>,
+        hook: impl Fn(&ProcessRequest) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            results: Mutex::new(results.into()),
+            requests: Mutex::new(Vec::new()),
+            before_result: Some(Box::new(hook)),
+        }
+    }
+
+    fn requests(&self) -> Vec<ProcessRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl ProcessRunner for RecordingRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.requests.lock().unwrap().push(request.clone());
+        if let Some(hook) = &self.before_result {
+            hook(request);
+        }
+        self.results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("a scripted SSH result must exist")
+    }
+}
+
+struct ImmediateResolution {
+    calls: AtomicUsize,
+}
+
+impl ImmediateResolution {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ResolutionRuntime for ImmediateResolution {
+    fn monotonic_now(&self) -> Duration {
+        if self.calls.fetch_add(1, Ordering::SeqCst) % 3 < 2 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(30)
+        }
+    }
+
+    fn sleep(&self, _duration: Duration) {
+        panic!("status lookup must not sleep")
+    }
+}
+
+fn config() -> Config {
+    Config {
+        version: 1,
+        workers: vec![WorkerEntry {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            slots: 1,
+            capabilities: Vec::new(),
+            remote_binary: "~/.local/bin/worker".into(),
+        }],
+    }
+}
+
+fn status_result(response: &impl serde::Serialize) -> Result<ProcessResult, WorkerError> {
+    let mut stdout = serde_json::to_vec(response).unwrap();
+    stdout.push(b'\n');
+    Ok(ProcessResult {
+        status: ExitStatus::from_raw(0),
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
+fn transport_failure() -> Result<ProcessResult, WorkerError> {
+    Ok(ProcessResult {
+        status: ExitStatus::from_raw(255 << 8),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
+}
+
+fn test_record(
+    store: &ClientStateStore,
+    seed: u128,
+    created_at_millis: u64,
+    status: Option<JobStatus>,
+    uncertainty: RemoteUncertainty,
+) -> LocalJobRecord {
+    record_with_meta_parts(
+        JobId::new(uuid::Uuid::from_u128(seed)),
+        store.client_id(),
+        "mini-1",
+        &"a".repeat(64),
+        &"b".repeat(64),
+        &"c".repeat(64),
+        "packages/app",
+        30_000,
+        "heavy",
+        CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+        created_at_millis,
+        None,
+        status,
+        uncertainty,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_with_meta_parts(
+    job_id: JobId,
+    client_id: ClientId,
+    worker: &str,
+    project_id: &str,
+    worktree_id: &str,
+    manifest_digest: &str,
+    relative_working_dir: &str,
+    timeout_millis: u64,
+    resource_class: &str,
+    command: CommandSpec,
+    created_at_millis: u64,
+    lease_token: Option<LeaseToken>,
+    status: Option<JobStatus>,
+    uncertainty: RemoteUncertainty,
+) -> LocalJobRecord {
+    let lease_token = lease_token.unwrap_or_else(|| {
+        LeaseToken::new(uuid::Uuid::from_u128(job_id.as_uuid().as_u128() + 10_000))
+    });
+    let material = RequestFingerprintMaterial::new(
+        job_id,
+        client_id,
+        lease_token,
+        worker.into(),
+        project_id.into(),
+        worktree_id.into(),
+        manifest_digest.into(),
+        relative_working_dir.into(),
+        timeout_millis,
+        resource_class.into(),
+        command,
+    )
+    .unwrap();
+    let meta = JobMeta::new(&material, material.fingerprint(), created_at_millis).unwrap();
+    LocalJobRecord::new(meta, material.lease_token(), status, uncertainty).unwrap()
+}
+
+fn service<'a>(
+    config: &'a Config,
+    store: &'a ClientStateStore,
+    remote: &'a RemoteJobClient<'a>,
+) -> StatusService<'a> {
+    StatusService {
+        config,
+        client_state: store,
+        remote,
+    }
+}
+
+fn state_store(temp: &tempfile::TempDir) -> ClientStateStore {
+    ClientStateStore::open(&temp.path().canonicalize().unwrap().join("state")).unwrap()
+}
+
+fn assert_status_call(request: &ProcessRequest, deadline: Duration, job_id: JobId) {
+    assert_control_call(request, HostOperation::Status, deadline);
+    let status: StatusRequest = serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+    assert_eq!(status.job_id(), job_id);
+}
+
+fn assert_control_call(request: &ProcessRequest, operation: HostOperation, deadline: Duration) {
+    assert_eq!(request.program, OsStr::new("/usr/bin/ssh"));
+    assert_eq!(request.args.last().unwrap(), operation.command());
+    assert_eq!(request.args[9], OsStr::new("mac1"));
+    assert_eq!(request.policy.deadline, deadline);
 }
 
 #[test]
@@ -398,4 +613,740 @@ fn status_row_allows_an_empty_root_relative_working_directory() {
     // Catches treating the canonical project root as an unsafe empty path.
     let row = StatusRow::try_from_record(&local_record("")).unwrap();
     assert_eq!(row.relative_working_dir, "");
+}
+
+#[test]
+fn status_without_id_lists_100_newest_and_reports_exact_omission() {
+    // Catches an unbounded list, wrong newest-first ordering, unstable ties,
+    // or an approximate omitted count.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    for seed in 1..=101 {
+        let created = match seed {
+            1 | 2 => 999,
+            101 => 1_000,
+            _ => seed as u64,
+        };
+        store
+            .create_job(test_record(
+                &store,
+                seed,
+                created,
+                Some(JobStatus::succeeded(created, 0, 0).unwrap()),
+                RemoteUncertainty::None,
+            ))
+            .unwrap();
+    }
+    let runner = RecordingRunner::returning(Vec::new());
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let report = service(&config, &store, &remote).inspect(None).unwrap();
+
+    assert_eq!(report.jobs.len(), 100);
+    assert_eq!(report.omitted, 1);
+    assert_eq!(
+        report.jobs[0].job_id,
+        JobId::new(uuid::Uuid::from_u128(101))
+    );
+    assert_eq!(report.jobs[1].job_id, JobId::new(uuid::Uuid::from_u128(1)));
+    assert_eq!(report.jobs[2].job_id, JobId::new(uuid::Uuid::from_u128(2)));
+    assert_eq!(report.jobs.last().unwrap().created_at_millis, 4);
+    assert!(runner.requests().is_empty());
+    assert_eq!(STATUS_LIST_LIMIT, 100);
+}
+
+#[test]
+fn status_list_never_implicitly_selects_latest_job() {
+    // Catches no-ID mode returning only the newest record as if it were an
+    // exact-ID lookup.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    for (seed, created) in [(1, 100), (2, 200)] {
+        store
+            .create_job(test_record(
+                &store,
+                seed,
+                created,
+                Some(JobStatus::succeeded(created, 0, 0).unwrap()),
+                RemoteUncertainty::None,
+            ))
+            .unwrap();
+    }
+    let runner = RecordingRunner::returning(Vec::new());
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let report = service(&config, &store, &remote).inspect(None).unwrap();
+
+    assert_eq!(report.jobs.len(), 2);
+    assert_eq!(report.jobs[0].job_id, JobId::new(uuid::Uuid::from_u128(2)));
+    assert_eq!(report.jobs[1].job_id, JobId::new(uuid::Uuid::from_u128(1)));
+    assert_eq!(report.omitted, 0);
+}
+
+#[test]
+fn status_list_refreshes_at_most_16_active_or_unknown_rows_once_at_five_seconds() {
+    // Catches refreshing beyond the cap, using the 30-second exact deadline,
+    // retrying, or selecting rows outside newest-first list order.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let mut newest = Vec::new();
+    let mut results = Vec::new();
+    for seed in 1..=18 {
+        let created = 1_000 + seed as u64;
+        let uncertainty = if seed % 2 == 0 {
+            RemoteUncertainty::unknown_remote("STATUS_UNCERTAIN").unwrap()
+        } else {
+            RemoteUncertainty::None
+        };
+        let record = test_record(&store, seed, created, None, uncertainty);
+        store.create_job(record.clone()).unwrap();
+        newest.push(record);
+    }
+    newest.sort_by(|left, right| {
+        right
+            .meta()
+            .created_at_millis()
+            .cmp(&left.meta().created_at_millis())
+    });
+    for (index, record) in newest.iter().take(16).enumerate() {
+        results.push(if index == 0 {
+            transport_failure()
+        } else {
+            status_result(
+                &StatusResponse::new(
+                    record.meta().clone(),
+                    JobStatus::accepted(record.meta().created_at_millis()).unwrap(),
+                )
+                .unwrap(),
+            )
+        });
+    }
+    let runner = RecordingRunner::returning(results);
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let report = service(&config, &store, &remote).inspect(None).unwrap();
+
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 16);
+    for (request, record) in requests.iter().zip(&newest) {
+        assert_status_call(request, Duration::from_secs(5), record.meta().job_id());
+    }
+    assert!(report.jobs[0].status.is_none());
+    assert!(
+        matches!(report.jobs[0].remote_uncertainty, RemoteUncertainty::UnknownRemote { ref code } if code == "STATUS_UNCERTAIN")
+    );
+    assert!(report.jobs[1..16].iter().all(|row| row.status.is_some()));
+    assert!(report.jobs[16..].iter().all(|row| row.status.is_none()));
+    assert_eq!(STATUS_REFRESH_LIMIT, 16);
+    assert_eq!(STATUS_REFRESH_DEADLINE, Duration::from_secs(5));
+}
+
+#[test]
+fn status_exact_id_never_falls_back_to_another_record() {
+    // Catches load failure falling back to newest local history.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    store
+        .create_job(test_record(
+            &store,
+            1,
+            100,
+            Some(JobStatus::succeeded(100, 0, 0).unwrap()),
+            RemoteUncertainty::None,
+        ))
+        .unwrap();
+    let runner = RecordingRunner::returning(Vec::new());
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let error = service(&config, &store, &remote)
+        .inspect(Some(JobId::new(uuid::Uuid::from_u128(999))))
+        .unwrap_err();
+
+    assert!(matches!(error, WorkerError::Config(message) if message.starts_with("JOB_NOT_FOUND:")));
+    assert!(runner.requests().is_empty());
+}
+
+#[test]
+fn status_rejects_same_id_response_with_any_immutable_meta_difference() {
+    // Catches partial metadata checks. Each persisted immutable JobMeta field
+    // is independently mismatched, including creation time and fingerprint.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let local = test_record(
+        &store,
+        1,
+        100,
+        Some(JobStatus::accepted(101).unwrap()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(local.clone()).unwrap();
+    let id = local.meta().job_id();
+    let different_client = ClientId::new(uuid::Uuid::from_u128(777));
+    let different_lease = LeaseToken::new(uuid::Uuid::from_u128(777));
+    let cases = vec![
+        (
+            "job_id",
+            record_with_meta_parts(
+                JobId::new(uuid::Uuid::from_u128(2)),
+                store.client_id(),
+                "mini-1",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                30_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                None,
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "client_id",
+            record_with_meta_parts(
+                id,
+                different_client,
+                "mini-1",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                30_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                None,
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "worker_name",
+            record_with_meta_parts(
+                id,
+                store.client_id(),
+                "mini-2",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                30_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                None,
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "project_id",
+            record_with_meta_parts(
+                id,
+                store.client_id(),
+                "mini-1",
+                &"d".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                30_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                None,
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "worktree_id",
+            record_with_meta_parts(
+                id,
+                store.client_id(),
+                "mini-1",
+                &"a".repeat(64),
+                &"d".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                30_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                None,
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "manifest_digest",
+            record_with_meta_parts(
+                id,
+                store.client_id(),
+                "mini-1",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"d".repeat(64),
+                "packages/app",
+                30_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                None,
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "request_fingerprint",
+            record_with_meta_parts(
+                id,
+                store.client_id(),
+                "mini-1",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                30_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                Some(different_lease),
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "command_summary",
+            record_with_meta_parts(
+                id,
+                store.client_id(),
+                "mini-1",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                30_000,
+                "heavy",
+                CommandSpec::shell("cargo test".into()).unwrap(),
+                100,
+                None,
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "relative_working_dir",
+            record_with_meta_parts(
+                id,
+                store.client_id(),
+                "mini-1",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/other",
+                30_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                None,
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "timeout_millis",
+            record_with_meta_parts(
+                id,
+                store.client_id(),
+                "mini-1",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                45_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                None,
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "resource_class",
+            record_with_meta_parts(
+                id,
+                store.client_id(),
+                "mini-1",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                30_000,
+                "light",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                100,
+                None,
+                Some(JobStatus::accepted(101).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+        (
+            "created_at_millis",
+            record_with_meta_parts(
+                id,
+                store.client_id(),
+                "mini-1",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                "packages/app",
+                30_000,
+                "heavy",
+                CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+                102,
+                None,
+                Some(JobStatus::accepted(102).unwrap()),
+                RemoteUncertainty::None,
+            ),
+        ),
+    ];
+    let config = config();
+    for (field, remote_record) in cases {
+        let response = StatusResponse::new(
+            remote_record.meta().clone(),
+            remote_record.last_status().unwrap().clone(),
+        )
+        .unwrap();
+        let runner = RecordingRunner::returning(vec![status_result(&response)]);
+        let remote = RemoteJobClient::new(&runner);
+        let error = service(&config, &store, &remote)
+            .inspect(Some(id))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WorkerError::Transport {
+                    code: "INVALID_RESPONSE",
+                    ..
+                }
+            ),
+            "field {field}: {error}"
+        );
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1, "field {field}");
+        assert_status_call(&requests[0], Duration::from_secs(30), id);
+        assert_eq!(store.load_job(id).unwrap(), local, "field {field}");
+    }
+
+    let valid =
+        StatusResponse::new(local.meta().clone(), JobStatus::accepted(101).unwrap()).unwrap();
+    let mut wrong_protocol = serde_json::to_value(valid).unwrap();
+    wrong_protocol["meta"]["protocol_version"] = serde_json::json!(999);
+    let mut stdout = serde_json::to_vec(&wrong_protocol).unwrap();
+    stdout.push(b'\n');
+    let runner = RecordingRunner::returning(vec![Ok(ProcessResult {
+        status: ExitStatus::from_raw(0),
+        stdout,
+        stderr: Vec::new(),
+    })]);
+    let remote = RemoteJobClient::new(&runner);
+    let error = service(&config, &store, &remote)
+        .inspect(Some(id))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Transport {
+            code: "INVALID_RESPONSE",
+            ..
+        }
+    ));
+    assert_eq!(runner.requests().len(), 1);
+    assert_eq!(store.load_job(id).unwrap(), local);
+}
+
+#[test]
+fn status_exact_unknown_and_cleanup_pending_retry_resolution_without_conflation() {
+    // Catches uncertainty markers taking the normal status path, being merged,
+    // or being cleared without accepted authority.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let to_unknown = test_record(
+        &store,
+        1,
+        100,
+        None,
+        RemoteUncertainty::cleanup_pending("OLD_CLEANUP").unwrap(),
+    );
+    let to_cleanup = test_record(
+        &store,
+        2,
+        200,
+        None,
+        RemoteUncertainty::unknown_remote("LOST_REPLY").unwrap(),
+    );
+    let to_accepted = test_record(
+        &store,
+        3,
+        300,
+        None,
+        RemoteUncertainty::unknown_remote("LOST_ACCEPT").unwrap(),
+    );
+    store.create_job(to_unknown.clone()).unwrap();
+    store.create_job(to_cleanup.clone()).unwrap();
+    store.create_job(to_accepted.clone()).unwrap();
+    let cleanup_response =
+        ResolveOrAbandonResponse::cleanup_pending("LEASE_RELEASE_FAILED").unwrap();
+    let accepted_status = StatusResponse::new(
+        to_accepted.meta().clone(),
+        JobStatus::accepted(301).unwrap(),
+    )
+    .unwrap();
+    let accepted_response = ResolveOrAbandonResponse::accepted(accepted_status.clone()).unwrap();
+    let runner = RecordingRunner::returning(vec![
+        transport_failure(),
+        transport_failure(),
+        transport_failure(),
+        status_result(&cleanup_response),
+        transport_failure(),
+        status_result(&accepted_response),
+    ]);
+    let runtime = ImmediateResolution::new();
+    let remote = RemoteJobClient::new_with_runtime(&runner, &runtime);
+    let config = config();
+
+    let unknown_report = service(&config, &store, &remote)
+        .inspect(Some(to_unknown.meta().job_id()))
+        .unwrap();
+    let cleanup_report = service(&config, &store, &remote)
+        .inspect(Some(to_cleanup.meta().job_id()))
+        .unwrap();
+    let accepted_report = service(&config, &store, &remote)
+        .inspect(Some(to_accepted.meta().job_id()))
+        .unwrap();
+
+    assert!(
+        matches!(unknown_report.jobs[0].remote_uncertainty, RemoteUncertainty::UnknownRemote { ref code } if code == "UNKNOWN_REMOTE")
+    );
+    assert!(
+        matches!(cleanup_report.jobs[0].remote_uncertainty, RemoteUncertainty::CleanupPending { ref code } if code == "LEASE_RELEASE_FAILED")
+    );
+    assert_eq!(
+        accepted_report.jobs[0].status.as_ref(),
+        Some(accepted_status.status())
+    );
+    assert_eq!(
+        accepted_report.jobs[0].remote_uncertainty,
+        RemoteUncertainty::None
+    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 6);
+    let (pairs, remainder) = requests.as_chunks::<2>();
+    assert!(remainder.is_empty());
+    for (pair, record) in pairs.iter().zip([&to_unknown, &to_cleanup, &to_accepted]) {
+        assert_status_call(&pair[0], Duration::from_secs(30), record.meta().job_id());
+        assert_control_call(
+            &pair[1],
+            HostOperation::ResolveOrAbandon,
+            Duration::from_secs(30),
+        );
+    }
+    let unknown_request: ResolveOrAbandonRequest =
+        serde_json::from_slice(requests[1].stdin.as_deref().unwrap()).unwrap();
+    let cleanup_request: ResolveOrAbandonRequest =
+        serde_json::from_slice(requests[3].stdin.as_deref().unwrap()).unwrap();
+    let accepted_request: ResolveOrAbandonRequest =
+        serde_json::from_slice(requests[5].stdin.as_deref().unwrap()).unwrap();
+    assert_eq!(unknown_request.job_id(), to_unknown.meta().job_id());
+    assert_eq!(cleanup_request.job_id(), to_cleanup.meta().job_id());
+    assert_eq!(accepted_request.job_id(), to_accepted.meta().job_id());
+}
+
+#[test]
+fn status_never_persists_or_fabricates_abandoned_job_state() {
+    // Catches converting transient Abandoned authority into a durable status
+    // or erasing the pre-existing uncertainty marker.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(
+        &store,
+        1,
+        100,
+        None,
+        RemoteUncertainty::unknown_remote("LOST_REPLY").unwrap(),
+    );
+    store.create_job(record.clone()).unwrap();
+    let runner = RecordingRunner::returning(vec![
+        transport_failure(),
+        status_result(&ResolveOrAbandonResponse::abandoned()),
+    ]);
+    let runtime = ImmediateResolution::new();
+    let remote = RemoteJobClient::new_with_runtime(&runner, &runtime);
+    let config = config();
+
+    let error = service(&config, &store, &remote)
+        .inspect(Some(record.meta().job_id()))
+        .unwrap_err();
+
+    assert!(
+        matches!(error, WorkerError::Protocol(message) if message.starts_with("JOB_ABANDONED:"))
+    );
+    assert_eq!(store.load_job(record.meta().job_id()).unwrap(), record);
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 2);
+    assert_status_call(
+        &requests[0],
+        Duration::from_secs(30),
+        record.meta().job_id(),
+    );
+    assert_control_call(
+        &requests[1],
+        HostOperation::ResolveOrAbandon,
+        Duration::from_secs(30),
+    );
+    let resolve: ResolveOrAbandonRequest =
+        serde_json::from_slice(requests[1].stdin.as_deref().unwrap()).unwrap();
+    assert_eq!(resolve.job_id(), record.meta().job_id());
+}
+
+#[test]
+fn status_terminal_rows_are_not_refreshed_in_list_mode() {
+    // Catches needless remote effects for already-terminal rows.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    for seed in 1..=20 {
+        store
+            .create_job(test_record(
+                &store,
+                seed,
+                100 + seed as u64,
+                Some(JobStatus::succeeded(100 + seed as u64, 0, 0).unwrap()),
+                RemoteUncertainty::None,
+            ))
+            .unwrap();
+    }
+    let runner = RecordingRunner::returning(Vec::new());
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let report = service(&config, &store, &remote).inspect(None).unwrap();
+
+    assert_eq!(report.jobs.len(), 20);
+    assert!(
+        report
+            .jobs
+            .iter()
+            .all(|row| row.status.as_ref().unwrap().state().is_terminal())
+    );
+    assert!(runner.requests().is_empty());
+}
+
+#[test]
+fn status_refresh_preserves_concurrent_forward_local_observation() {
+    // Catches writing a stale remote response over a local observation that
+    // advanced while SSH status was in flight.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(
+        &store,
+        1,
+        100,
+        Some(JobStatus::accepted(101).unwrap()),
+        RemoteUncertainty::unknown_remote("LOST_REPLY").unwrap(),
+    );
+    store.create_job(record.clone()).unwrap();
+    let remote_status = JobStatus::running(200, 11, 12, 13, 14).unwrap();
+    let response = StatusResponse::new(record.meta().clone(), remote_status.clone()).unwrap();
+    let concurrent = remote_status.into_succeeded(300, 7, 9).unwrap();
+    let hook_store = store.clone();
+    let hook_status = concurrent.clone();
+    let runner = RecordingRunner::with_hook(vec![status_result(&response)], move |_| {
+        hook_store
+            .update_observation(record.meta().job_id(), hook_status.clone())
+            .unwrap();
+    });
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let report = service(&config, &store, &remote).inspect(None).unwrap();
+
+    assert_eq!(report.jobs[0].status.as_ref(), Some(&concurrent));
+    let persisted = store.load_job(report.jobs[0].job_id).unwrap();
+    assert_eq!(persisted.last_status(), Some(&concurrent));
+    assert_eq!(persisted.remote_uncertainty(), &RemoteUncertainty::None);
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 1);
+    assert_status_call(&requests[0], Duration::from_secs(5), report.jobs[0].job_id);
+
+    let terminal_temp = tempfile::tempdir().unwrap();
+    let terminal_store = state_store(&terminal_temp);
+    let terminal_record = test_record(
+        &terminal_store,
+        2,
+        100,
+        Some(JobStatus::accepted(101).unwrap()),
+        RemoteUncertainty::unknown_remote("TERMINAL_RACE").unwrap(),
+    );
+    let terminal_id = terminal_record.meta().job_id();
+    terminal_store.create_job(terminal_record.clone()).unwrap();
+    let response = StatusResponse::new(
+        terminal_record.meta().clone(),
+        JobStatus::succeeded(200, 1, 2).unwrap(),
+    )
+    .unwrap();
+    let concurrent_failed = JobStatus::failed(300, 7, 3, 4).unwrap();
+    let hook_store = terminal_store.clone();
+    let hook_status = concurrent_failed.clone();
+    let runner = RecordingRunner::with_hook(vec![status_result(&response)], move |_| {
+        hook_store
+            .update_observation(terminal_id, hook_status.clone())
+            .unwrap();
+    });
+    let remote = RemoteJobClient::new(&runner);
+    let report = service(&config, &terminal_store, &remote)
+        .inspect(None)
+        .unwrap();
+    assert_eq!(report.jobs[0].status.as_ref(), Some(&concurrent_failed));
+    assert!(
+        matches!(report.jobs[0].remote_uncertainty, RemoteUncertainty::UnknownRemote { ref code } if code == "TERMINAL_RACE")
+    );
+
+    let identity_temp = tempfile::tempdir().unwrap();
+    let identity_store = state_store(&identity_temp);
+    let identity_record = test_record(
+        &identity_store,
+        3,
+        100,
+        Some(JobStatus::accepted(101).unwrap()),
+        RemoteUncertainty::unknown_remote("IDENTITY_RACE").unwrap(),
+    );
+    let identity_id = identity_record.meta().job_id();
+    identity_store.create_job(identity_record.clone()).unwrap();
+    let response = StatusResponse::new(
+        identity_record.meta().clone(),
+        JobStatus::running(200, 11, 12, 13, 14).unwrap(),
+    )
+    .unwrap();
+    let concurrent_running = JobStatus::running(300, 21, 22, 23, 24).unwrap();
+    let hook_store = identity_store.clone();
+    let hook_status = concurrent_running.clone();
+    let runner = RecordingRunner::with_hook(vec![status_result(&response)], move |_| {
+        hook_store
+            .update_observation(identity_id, hook_status.clone())
+            .unwrap();
+    });
+    let remote = RemoteJobClient::new(&runner);
+    let report = service(&config, &identity_store, &remote)
+        .inspect(None)
+        .unwrap();
+    assert_eq!(report.jobs[0].status.as_ref(), Some(&concurrent_running));
+    assert!(
+        matches!(report.jobs[0].remote_uncertainty, RemoteUncertainty::UnknownRemote { ref code } if code == "IDENTITY_RACE")
+    );
 }
