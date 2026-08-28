@@ -2051,6 +2051,75 @@ fn hidden_submit_failures_are_versioned() {
 }
 
 #[test]
+fn oversized_nonzero_host_error_stdout_is_not_authoritative() {
+    // Break caught: a runner that bypasses stdout enforcement can let an
+    // over-limit capacity envelope control the public error classification.
+    let planted = "PLANTED-OVER-LIMIT-CAPACITY-MESSAGE";
+    let stdout = canonical_line(&HostControlError::new("CAPACITY_BUSY", planted).unwrap());
+    let mut request_policy = policy();
+    request_policy.stdout_limit = stdout.len() - 1;
+    let runner = RecordingRunner::returning(vec![Ok(result(status(23), &stdout, b""))]);
+
+    let error = SshJsonTransport::new(&runner)
+        .request::<_, LiteralResponse>(
+            &worker(),
+            HostOperation::LeaseAcquire,
+            &LiteralRequest {
+                alpha: 7,
+                beta: "fixed",
+            },
+            request_policy,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Transport {
+            code: "HOST_REQUEST_FAILED",
+            ref message,
+        } if message == "SSH control request failed"
+    ));
+    assert_eq!(error.exit_code(), 69);
+    assert!(!error.to_string().contains(planted));
+}
+
+#[test]
+fn oversized_nonzero_host_error_stderr_is_not_authoritative() {
+    // Break caught: a runner that bypasses stderr enforcement can let the
+    // accompanying stdout envelope remain authoritative.
+    let planted = "PLANTED-OVER-LIMIT-STDERR";
+    let stdout = canonical_line(
+        &HostControlError::new("CAPACITY_BUSY", "one heavy job is already active").unwrap(),
+    );
+    let mut request_policy = policy();
+    request_policy.stderr_limit = planted.len() - 1;
+    let runner =
+        RecordingRunner::returning(vec![Ok(result(status(23), &stdout, planted.as_bytes()))]);
+
+    let error = SshJsonTransport::new(&runner)
+        .request::<_, LiteralResponse>(
+            &worker(),
+            HostOperation::LeaseAcquire,
+            &LiteralRequest {
+                alpha: 7,
+                beta: "fixed",
+            },
+            request_policy,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Transport {
+            code: "HOST_REQUEST_FAILED",
+            ref message,
+        } if message == "SSH control request failed"
+    ));
+    assert_eq!(error.exit_code(), 69);
+    assert!(!error.to_string().contains(planted));
+}
+
+#[test]
 fn all_four_admission_codes_decode_to_capacity_exit_75() {
     // Break caught: one authoritative admission rejection is flattened into
     // Protocol, so public orchestration reports infrastructure exit 70.
@@ -2178,8 +2247,15 @@ fn legacy_or_wrong_version_host_errors_are_not_authoritative() {
         &valid,
         b"PLANTED-REMOTE-SECRET",
     ))]);
+    let mut unavailable_policy = policy();
+    unavailable_policy.stdout_limit = valid.len() - 1;
     let error = SshJsonTransport::new(&runner)
-        .request::<_, LiteralResponse>(&worker(), HostOperation::Status, &request, policy())
+        .request::<_, LiteralResponse>(
+            &worker(),
+            HostOperation::Status,
+            &request,
+            unavailable_policy,
+        )
         .unwrap_err();
     assert!(error.to_string().contains("SSH_UNAVAILABLE"), "{error}");
     assert!(!error.to_string().contains("JOB_ID_CONFLICT"));

@@ -497,6 +497,14 @@ impl<'a> SshJsonTransport<'a> {
                     "SSH control request failed",
                 ));
             }
+            if result.stdout.len() > policy.stdout_limit
+                || result.stderr.len() > policy.stderr_limit
+            {
+                return Err(transport_error(
+                    "HOST_REQUEST_FAILED",
+                    "SSH control request failed",
+                ));
+            }
             return Err(
                 decode_host_control_error(&result.stdout).unwrap_or_else(|| {
                     transport_error("HOST_REQUEST_FAILED", "SSH control request failed")
