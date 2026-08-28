@@ -872,7 +872,7 @@ impl RootedDir {
         require_private_regular(&path_stat)?;
         let descriptor = open_regular_at(self.root.as_raw_fd(), &name)?;
         let opened = stat_fd(descriptor.as_raw_fd())?;
-        require_private_regular(&opened)?;
+        require_private_regular_opened(&opened)?;
         if !same_file(&path_stat, &opened) {
             return Err(os_error(libc::ESTALE));
         }
@@ -896,7 +896,7 @@ impl RootedDir {
         }
         let after = stat_fd(file.as_raw_fd())?;
         let rebound = stat_at(self.root.as_raw_fd(), &name)?;
-        require_private_regular(&after)?;
+        require_private_regular_opened(&after)?;
         require_private_regular(&rebound)?;
         if bytes.len() as u64 != path_stat.st_size as u64
             || !snapshot_metadata_stable(&path_stat, &after)
@@ -2591,6 +2591,17 @@ fn require_private_regular(metadata: &libc::stat) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn require_private_regular_opened(metadata: &libc::stat) -> io::Result<()> {
+    if metadata.st_nlink == 0
+        && file_type(metadata.st_mode) == libc::S_IFREG
+        && metadata.st_uid == unsafe { libc::geteuid() }
+        && metadata.st_mode & 0o077 == 0
+    {
+        return Err(os_error(libc::ESTALE));
+    }
+    require_private_regular(metadata)
 }
 
 fn require_private_directory(metadata: &libc::stat) -> io::Result<()> {
@@ -5639,6 +5650,76 @@ mod tests {
             fs::read(root_path.join("receipt.json")).unwrap(),
             b"planted"
         );
+    }
+
+    #[test]
+    fn bounded_private_read_reports_stale_when_atomic_replacement_unlinks_opened_inode() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("private");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+        root.write_private_atomic_no_replace("receipt.json", b"old")
+            .unwrap();
+
+        let error = root
+            .read_private_regular_with_hook("receipt.json", 1024, || {
+                let replacement = root_path.join("replacement.json");
+                fs::write(&replacement, b"replacement").unwrap();
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::rename(&replacement, root_path.join("receipt.json")).unwrap();
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ESTALE),
+            "unexpected error kind: {:?}",
+            error.kind()
+        );
+        assert_eq!(
+            fs::read(root_path.join("receipt.json")).unwrap(),
+            b"replacement"
+        );
+        assert!(!root_path.join("replacement.json").exists());
+    }
+
+    #[test]
+    fn bounded_private_read_keeps_unsafe_named_entries_permission_denied() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("private");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+
+        fs::write(root_path.join("permissive.json"), b"permissive").unwrap();
+        fs::set_permissions(
+            root_path.join("permissive.json"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        fs::write(root_path.join("hardlinked.json"), b"hardlinked").unwrap();
+        fs::set_permissions(
+            root_path.join("hardlinked.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::hard_link(
+            root_path.join("hardlinked.json"),
+            root_path.join("hardlink-alias.json"),
+        )
+        .unwrap();
+        fs::create_dir(root_path.join("directory.json")).unwrap();
+        fs::set_permissions(
+            root_path.join("directory.json"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        for name in ["permissive.json", "hardlinked.json", "directory.json"] {
+            let error = root.read_private_regular(name, 1024).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{name}");
+        }
     }
 
     #[test]
