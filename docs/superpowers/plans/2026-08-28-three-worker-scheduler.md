@@ -12,13 +12,13 @@
 
 ## Global Constraints
 
-- Begin after Phase 3 Tasks 8--10 land: public `RunService`, typed remote status/log/resolve, reconnectable logs, and the single-worker live gate.
+- Task 1 is independently startable now on `8acab2d`: it is a pure scheduler-owned policy with no Phase 3, probe, protocol, filesystem, clock, SSH, or process dependency. Tasks 2 and later begin only after Phase 3 Tasks 8--10 land and pass their live gate.
 - Automatic selection is default. `--worker NAME` is a configured-name pin for diagnosis, never a raw SSH destination.
 - Every worker has one heavy slot. Fresh probes are advisory; the existing atomic host lease is the only admission authority.
 - The MacBook is the source of truth. Upload only a verified immutable `Snapshot`; never sync a live worktree or source changes back.
 - Queue state is canonical owner-only JSON below `PathLayout::state`, protected by the existing cross-process lock and no-follow filesystem layer. No daemon/database is introduced.
 - Queue records hold only IDs, sanitized command summary, requirements, worker preference, timestamps, owner identity, and bounded error codes—never argv/shell, environment values, paths, snapshot paths, or lease tokens.
-- FIFO is immutable enqueue order. Reap only an identity-proven absent queue owner under the queue lock; retain live, reused, or ambiguous identities.
+- FIFO is immutable enqueue order and means claim/admission consideration order, not wall-clock child-start order. A queue row is persistently `Waiting` or `Dispatching`; a dead dispatcher is recovered to `Waiting`, never silently deleted. Multiple distinct-worker dispatches may be in flight to fill three slots.
 - Eligible means fresh ready/protocol/capability-compatible idle probe plus successful atomic lease. Ranking is worktree affinity, project affinity, greatest available memory, greatest free disk, lexical worker name; affinity never overrides eligibility.
 - `--no-wait` returns `CAPACITY_BUSY` without queue entry, snapshot, lease, or remote mutation.
 - Once remotely accepted, resolve every ambiguity with its original job/client/token/fingerprint through Phase 3 `resolve-or-abandon`; never create a replacement job.
@@ -32,9 +32,10 @@
 ## File Map
 
 ```text
-src/protocol.rs                 available-memory probe field and typed queue/cancel/fleet DTOs
-src/probe.rs                    bounded macOS available-memory collection
-src/scheduler.rs                pure eligibility and deterministic candidate ranking
+src/protocol.rs                 one Phase 4 probe protocol bump: memory and CPU counter DTOs
+src/probe.rs                    bounded macOS available-memory and cumulative CPU collection
+src/scheduler.rs                pure scheduler-owned observations, eligibility, and ranking
+src/scheduler_adapter.rs        post-Phase-3 projection from WorkerHealth/ProbeResponse to policy facts
 src/client_state.rs             descriptor-bound queue persistence and affinity history
 src/job.rs                      QueueId/QueueEntry and cancellation records
 src/job_service.rs              host cancellation and exact-job reconciliation entry points
@@ -44,6 +45,7 @@ src/cli.rs                      worker preference/no-wait/cancel grammar and hid
 src/lib.rs                      host stdio dispatch and streaming public commands
 src/output.rs                   sanitized run/queue/cancel reports
 tests/scheduler_policy.rs       ranking and proptest properties
+tests/scheduler_adapter.rs      typed probe projection and protocol-v3 fixtures
 tests/scheduler_queue.rs        queue durability/FIFO/owner lifecycle
 tests/run_command.rs            automatic/pinned/no-wait orchestration
 tests/job_queries.rs            host cancellation/reconciliation operations
@@ -53,95 +55,181 @@ docs/phase-four-validation.md   sanitized three-Mac validation evidence
 README.md                       Phase 4 usage and explicit remaining boundary
 ```
 
-### Task 1: Probe Memory Fact and Pure Deterministic Candidate Ranking
+### Task 1: Pure Deterministic Candidate-Ranking Contract
 
 **Files:**
-- Modify: `src/protocol.rs`
-- Modify: `src/probe.rs`
 - Create: `src/scheduler.rs`
 - Create: `tests/scheduler_policy.rs`
-- Modify: `tests/workers_command.rs`
 
 **Interfaces:**
-- Consumes: `Config`, `WorkerEntry`, `ProbeResponse`, `WorkerHealth`, `HealthStatus`, `SlotState`, and requirement strings.
-- Produces: `ProbeResponse::available_memory_bytes`, `AffinityHints`, `CandidateRejection`, `RankedWorker`, `Selection`, and `SchedulerPolicy::{rank,select}`.
+- Consumes: only scheduler-owned strings, booleans, `CandidateSlot`, optional numeric facts, and requirement strings.
+- Produces: `CandidateObservation`, `AffinityHints`, `CandidateRejection`, `RankedCandidate`, `Selection`, `WorkerPreference`, and `SchedulerPolicy::{rank,select}`.
 
 - [ ] **Step 1: Write failing probe and ranking tests**
 
 ```rust
 #[test]
 fn ranks_worktree_affinity_before_more_memory_and_disk() {
-    let ranked = SchedulerPolicy::rank(&config(), &healths(), &["node".into()],
+    let ranked = SchedulerPolicy::rank(&observations(), &["node".into()],
         &AffinityHints { worktree_worker: Some("mini-2".into()), project_worker: Some("mini-1".into()) });
     assert_eq!(names(&ranked), vec!["mini-2", "mini-1", "mini-3"]);
 }
 
 #[test]
-fn rejects_busy_offline_missing_capability_and_unknown_inventory_workers() {
-    assert!(matches!(SchedulerPolicy::select(&config(), &mixed_healths(), &["ruby".into()], &AffinityHints::none()),
+fn rejects_busy_offline_or_missing_capability() {
+    assert!(matches!(SchedulerPolicy::select(&mixed_observations(), &["ruby".into()], &WorkerPreference::Automatic, &AffinityHints::none()),
         Selection::NoEligible { rejections } if rejections.len() == 4));
 }
 
 proptest! {
     #[test]
     fn ranking_is_deterministic_and_unique(input in arbitrary_health_sets()) {
-        let a = SchedulerPolicy::rank(&config_for(&input), &input, &[], &AffinityHints::none());
-        let b = SchedulerPolicy::rank(&config_for(&input), &input, &[], &AffinityHints::none());
+        let a = SchedulerPolicy::rank(&input, &[], &AffinityHints::none());
+        let b = SchedulerPolicy::rank(&input, &[], &AffinityHints::none());
         prop_assert_eq!(a, b); prop_assert!(has_unique_names(&a));
     }
 }
 ```
 
-Also test valid available bytes, missing fact, overflow/malformed `vm_stat`, and unavailable memory collection. A missing memory fact must sort below every known fact; it cannot itself make a worker ineligible.
+Test a missing memory fact, duplicate worker identity, an unavailable observation, an occupied slot, missing capabilities, affinity, disk ties, and pin filtering. A missing memory fact sorts below every known fact but does not itself make a candidate ineligible.
 
 - [ ] **Step 2: Run focused tests to verify RED**
 
-Run: `cargo test --locked --test scheduler_policy --test workers_command -- --nocapture`
+Run: `cargo test --locked --test scheduler_policy -- --nocapture`
 
-Expected: FAIL because the memory field and scheduler policy do not exist.
+Expected: FAIL because scheduler-owned observation and policy types do not exist.
 
-- [ ] **Step 3: Implement the bounded fact and pure policy**
+- [ ] **Step 3: Implement the pure policy**
 
-Add this `#[serde(default)]` field to `ProbeResponse`:
-
-```rust
-pub available_memory_bytes: Option<u64>,
-```
-
-Add controlled bounded `vm_stat` parsing in `probe.rs`: calculate `(Pages free + Pages speculative) * page_size`, return `None` for unavailable/invalid results, and preserve existing memory-pressure/swap admission behavior.
-
-Create `src/scheduler.rs` with no clock, filesystem, SSH, or process calls:
+Create `src/scheduler.rs`; it must not import `protocol`, `probe`, `transport`, `Config`, or `WorkerEntry`:
 
 ```rust
+pub enum CandidateSlot { Idle, Busy }
+pub enum CandidateObservationError { InvalidWorkerName, DuplicateCapability { capability: String } }
+pub struct CandidateObservation { worker_name: String, ready: bool, slot: CandidateSlot, capabilities: Vec<String>, available_memory_bytes: Option<u64>, free_disk_bytes: u64 }
+impl CandidateObservation { pub fn new(worker_name: String, ready: bool, slot: CandidateSlot, capabilities: Vec<String>, available_memory_bytes: Option<u64>, free_disk_bytes: u64) -> Result<Self, CandidateObservationError>; pub fn worker_name(&self) -> &str; pub fn available_memory_bytes(&self) -> Option<u64>; }
 pub struct AffinityHints { pub worktree_worker: Option<String>, pub project_worker: Option<String> }
-pub enum CandidateRejection { UnknownWorker { name: String }, Unavailable { name: String }, MissingCapabilities { name: String, missing: Vec<String> }, Busy { name: String } }
-pub struct RankedWorker { worker: WorkerEntry, probe: ProbeResponse }
-pub enum Selection { Selected(RankedWorker), NoEligible { rejections: Vec<CandidateRejection> } }
+impl AffinityHints { pub fn none() -> Self; }
+pub enum WorkerPreference { Automatic, Pinned { worker: String } }
+pub enum CandidateRejection { DuplicateIdentity { name: String }, Unavailable { name: String }, MissingCapabilities { name: String, missing: Vec<String> }, Busy { name: String } }
+pub struct RankedCandidate { observation: CandidateObservation }
+impl RankedCandidate { pub fn worker_name(&self) -> &str; }
+pub enum Selection { Selected(RankedCandidate), NoEligible { rejections: Vec<CandidateRejection> } }
 pub struct SchedulerPolicy;
 impl SchedulerPolicy {
-    pub fn rank(config: &Config, health: &[WorkerHealth], requirements: &[String], affinity: &AffinityHints) -> Vec<RankedWorker>;
-    pub fn select(config: &Config, health: &[WorkerHealth], requirements: &[String], affinity: &AffinityHints) -> Selection;
+    pub fn rank(observations: &[CandidateObservation], requirements: &[String], affinity: &AffinityHints) -> Vec<RankedCandidate>;
+    pub fn select(observations: &[CandidateObservation], requirements: &[String], preference: &WorkerPreference, affinity: &AffinityHints) -> Selection;
 }
 ```
 
-Validate inventory/health identity pairing. Require `Ready`, a probe, `Idle`, no missing capability, and every declared/project requirement. Sort by one explicit tuple: affinity class, reverse known-memory class/value, reverse disk, name; report rejections in lexical worker order.
+Reject duplicate names. Require ready, idle, and every requirement. Sort by one explicit tuple: affinity class, reverse known-memory class/value, reverse disk, name; report rejections in lexical worker order. The later adapter is solely responsible for proving that observation identity came from a configured worker.
 
 - [ ] **Step 4: Run focused policy/probe regression tests**
 
-Run: `cargo test --locked --test scheduler_policy --test workers_command --lib probe::tests -- --nocapture`
+Run: `cargo test --locked --test scheduler_policy -- --nocapture`
 
-Expected: PASS; no test performs SSH or mutates client/host state.
+Expected: PASS; this deliverable compiles/runs without any Phase 3, host-probe, or client-state change.
 
 - [ ] **Step 5: Commit the independent policy**
 
 ```bash
-git add src/protocol.rs src/probe.rs src/scheduler.rs tests/scheduler_policy.rs tests/workers_command.rs
+git add src/scheduler.rs tests/scheduler_policy.rs
 git commit -m "feat: rank compatible scheduler candidates"
 ```
 
 ---
 
-### Task 2: Durable Queue Contract and Canonical Queue Persistence
+### Task 2: Shared Protocol-v3 Probe Adapter
+
+**Gate:** Start only after the Phase 3 Task 10 commit, its full local gate, and its sanitized one-worker live acceptance. This is the sole Phase 4/4.5 probe wire-format change.
+
+**Files:**
+- Modify: `src/protocol.rs`
+- Modify: `src/probe.rs`
+- Modify: `src/transport.rs`
+- Create: `src/scheduler_adapter.rs`
+- Create: `tests/scheduler_adapter.rs`
+- Modify: `tests/workers_command.rs`
+- Modify: `tests/doctor_command.rs`
+- Modify: `tests/setup_command.rs`
+- Modify: `tests/job_protocol.rs`
+
+**Interfaces:**
+- Consumes: Task 1 `CandidateObservation`, current `WorkerHealth`/`ProbeResponse`, and configured `WorkerEntry` identities.
+- Produces: protocol version `3`, `CpuCounters`, `ProbeResponse::{available_memory_bytes,cpu_counters}`, and `SchedulerProbeAdapter::observations`.
+
+- [ ] **Step 1: Write failing protocol-v3 and adapter tests**
+
+```rust
+#[test]
+fn adapter_projects_only_matching_ready_inventory_probe_into_policy_fact() {
+    let facts = SchedulerProbeAdapter::observations(&config(), &worker_healths()).unwrap();
+    assert_eq!(facts[0].worker_name(), "mini-1");
+    assert_eq!(facts[0].available_memory_bytes(), Some(12 * GIB));
+}
+
+#[test]
+fn protocol_v2_probe_is_ineligible_after_the_single_v3_bump() {
+    let health = protocol_v2_worker_health();
+    assert!(matches!(SchedulerProbeAdapter::observations(&config(), &[health]), Err(WorkerError::Protocol(_))));
+}
+```
+
+Test canonical protocol-v3 fixtures in workers/Doctor/setup/job-protocol suites; valid/missing memory; valid CPU tick counters; counter overflow; malformed `vm_stat` and `host_processor_info`; inventory/health name or SSH mismatch; and the absence of a probe. Assert that both new fact groups are added by one version change, never two.
+
+- [ ] **Step 2: Run adapter tests to verify RED**
+
+Run: `cargo test --locked --test scheduler_adapter --test workers_command --test doctor_command --test setup_command --test job_protocol -- --nocapture`
+
+Expected: FAIL because protocol 3 fields and the adapter do not exist.
+
+- [ ] **Step 3: Add the one probe wire-version change**
+
+Set `PROTOCOL_VERSION` to `3` while retaining `SUPERVISION_VERSION == 2`. Add these exact DTOs to `src/protocol.rs`:
+
+```rust
+pub struct CpuCounters { pub user_ticks: u64, pub system_ticks: u64, pub idle_ticks: u64, pub nice_ticks: u64 }
+pub struct ProbeResponse {
+    // existing fields unchanged
+    pub available_memory_bytes: Option<u64>,
+    pub cpu_counters: Option<CpuCounters>,
+}
+```
+
+Use `#[serde(default)]` only for field decoding; protocol-2 helpers remain ineligible because the version field is now `3`. In `probe.rs`, compute available memory from bounded `vm_stat` `(Pages free + Pages speculative) * page_size`; collect cumulative CPU ticks with a bounded macOS `host_processor_info` call; return `None` for unavailable/invalid facts and never fabricate a zero. Update every literal probe/setup/Doctor fixture to protocol 3.
+
+The later Phase 4.5 dashboard consumes `CpuCounters` through this adapter and computes deltas locally; it must not modify `ProbeResponse`, `PROTOCOL_VERSION`, or host probe collection. This task is the only planned version bump for both scheduler memory and dashboard CPU facts.
+
+- [ ] **Step 4: Implement the typed projection**
+
+```rust
+pub struct SchedulerProbeAdapter;
+impl SchedulerProbeAdapter {
+    pub fn observations(config: &Config, health: &[WorkerHealth]) -> Result<Vec<CandidateObservation>, WorkerError>;
+}
+```
+
+Require one matching configured worker entry per health name and matching SSH identity; turn unavailable/no-probe into `CandidateObservation::new(..., false, CandidateSlot::Busy, Vec::new(), None, 0)`. For a ready probe, map `SlotState::{Idle,Busy}` to `CandidateSlot::{Idle,Busy}`, then map capabilities, memory, and disk. The adapter does not rank, mutate state, acquire a lease, or calculate CPU percentage.
+Map an impossible `CandidateObservationError` from already validated probe text to `WorkerError::Protocol("scheduler probe projection is invalid")`; do not disclose probe payloads.
+
+- [ ] **Step 5: Run the protocol/adapter regression suite**
+
+Run: `cargo test --locked --test scheduler_policy --test scheduler_adapter --test workers_command --test doctor_command --test setup_command --test job_protocol -- --nocapture`
+
+Expected: PASS; all protocol fixtures say `3`, all protocol-2 helpers are excluded, and dashboard CPU data requires no later protocol change.
+
+- [ ] **Step 6: Commit the shared adapter**
+
+```bash
+git add src/protocol.rs src/probe.rs src/transport.rs src/scheduler_adapter.rs tests/scheduler_adapter.rs tests/workers_command.rs tests/doctor_command.rs tests/setup_command.rs tests/job_protocol.rs
+git commit -m "feat: expose scheduler and dashboard probe facts"
+```
+
+---
+
+### Task 3: Durable Queue Contract and Canonical Queue Persistence
+
+**Gate:** Start after Phase 3 Task 10's full/live gate and Task 2's protocol-v3 adapter commit; it may not change Phase 3 job/orchestration records before that gate.
 
 **Files:**
 - Modify: `src/job.rs`
@@ -151,22 +239,24 @@ git commit -m "feat: rank compatible scheduler candidates"
 - Modify: `tests/client_state.rs`
 
 **Interfaces:**
-- Consumes: Phase 3 `JobId`, `ClientId`, `CommandSummary`, `ClientStateStore`, and Task 1 `AffinityHints`.
-- Produces: `QueueId`, `QueueState`, `WorkerPreference`, `QueueEntry`, `QueueSnapshot`, and `ClientStateStore::{enqueue,queue_snapshot,claim_head,remove_queued,record_affinity,affinity_hints}`.
+- Consumes: Phase 3 `JobId`, `ClientId`, `CommandSummary`, `ProcessIdentity`, `ClientStateStore`, Task 1 `WorkerPreference`/`AffinityHints`, and Task 2 configured candidate projections.
+- Produces: `QueueId`, `QueueState`, `QueueEntry`, `QueueSnapshot`, `QueueClaim`, `QueueCancel`, and `ClientStateStore::{enqueue,queue_snapshot,claim_next,revert_dispatch,request_queue_cancel,remove_after_terminal,recover_dead_dispatches,remove_queued,record_affinity,affinity_hints}`.
 
 - [ ] **Step 1: Write failing queue schema and persistence tests**
 
-After Task 9's public orchestration schema lands, create these tests and extend them for canonical JSON/mode/containment:
+After the stated Phase 3 gate and Task 2 adapter commit, create these tests and extend them for canonical JSON/mode/containment:
 
 ```rust
 #[test]
-fn only_oldest_claimable_entry_is_claimed() {
+fn claim_marks_oldest_eligible_waiting_entry_dispatching_without_removing_it() {
     let store = open_queue();
     let first = queued("00000000000000000000000000000001", 10);
     let second = queued("00000000000000000000000000000002", 11);
     store.enqueue(first.clone()).unwrap(); store.enqueue(second).unwrap();
-    assert_eq!(store.claim_head().unwrap().unwrap().job_id(), first.job_id());
-    assert_eq!(store.queue_snapshot().unwrap().entries().len(), 1);
+    let claim = store.claim_next(dispatcher(), &["mini-1".into()], 13).unwrap();
+    assert_eq!(claim.entry().job_id(), first.job_id());
+    assert!(matches!(claim.entry().state(), QueueState::Dispatching { selected_worker, .. } if selected_worker == "mini-1"));
+    assert_eq!(store.queue_snapshot().unwrap().entries().len(), 2);
 }
 
 #[test]
@@ -177,7 +267,7 @@ fn live_or_ambiguous_owner_is_never_reaped_as_abandoned() {
 }
 ```
 
-Cover duplicate job/sequence IDs, stale lock state, malformed/noncanonical JSON, symlink/FIFO/device replacement, interrupted atomic write, simultaneous enqueue, crash after retirement rename, PID reuse, and cancel racing `claim_head`. Assert only identity-proven absent owners are reaped.
+Cover duplicate job/sequence IDs, stale lock state, malformed/noncanonical JSON, symlink/FIFO/device replacement, interrupted atomic write, simultaneous enqueue, crash after retirement rename, PID reuse, cancel racing `claim_next`, and lease-busy/failed-preacceptance reversion. Prove a dead dispatcher is first persisted back to `Waiting`, not removed. Prove three rows can be `Dispatching` only when their selected workers are distinct; no later compatible `Waiting` row is claimed before an older compatible `Waiting` row.
 
 - [ ] **Step 2: Run queue tests to verify RED**
 
@@ -191,17 +281,21 @@ Add strict manual serialization/validation in `src/job.rs`:
 
 ```rust
 pub struct QueueId(u64);
-pub enum WorkerPreference { Automatic, Pinned { worker: String } }
-pub enum QueueState { Waiting, Claimed }
+pub enum QueueState { Waiting, Dispatching { dispatch_owner: ProcessIdentity, selected_worker: String, claimed_at_millis: u64 } }
 pub struct QueueEntry {
     queue_id: QueueId, job_id: JobId, client_id: ClientId, project_id: String,
     worktree_id: String, command_summary: CommandSummary, requirements: Vec<String>,
-    preference: WorkerPreference, owner: ProcessIdentity, state: QueueState, enqueued_at_millis: u64,
+    preference: WorkerPreference, enqueue_owner: ProcessIdentity, state: QueueState,
+    cancel_requested_at_millis: Option<u64>, enqueued_at_millis: u64,
 }
+impl QueueEntry { pub fn job_id(&self) -> JobId; pub fn state(&self) -> &QueueState; pub fn is_cancel_requested(&self) -> bool; }
 pub struct QueueSnapshot { next_id: QueueId, entries: Vec<QueueEntry> }
+pub struct QueueClaim { entry: QueueEntry }
+impl QueueClaim { pub fn entry(&self) -> &QueueEntry; }
+pub enum QueueCancel { RemovedWaiting { job_id: JobId }, RequestedDispatch { job_id: JobId, dispatch_owner: ProcessIdentity } }
 ```
 
-`QueueEntry::new` and `validate` reuse canonical identifiers and bounded lowercase capabilities. It must not contain exact command data, environment values, local paths, manifest digest, snapshot path, or lease token. `QueueSnapshot::validate` requires monotonically increasing IDs/timestamps and rejects persisted `Claimed`: a crash can never wedge a head.
+`QueueEntry::new` and `validate` reuse canonical identifiers and bounded lowercase capabilities. It must not contain exact command data, environment values, local paths, manifest digest, snapshot path, or lease token. `QueueSnapshot::validate` requires monotonically increasing IDs/timestamps, unique dispatching worker names, and valid owner identities. It accepts persisted `Dispatching` so a crash can be recovered precisely.
 
 - [ ] **Step 4: Implement descriptor-bound queue operations**
 
@@ -210,13 +304,17 @@ Create only `queue/state.json`, `queue/lock`, and owner-scoped retirement record
 ```rust
 pub fn enqueue(&self, entry: QueueEntry) -> Result<QueueEntry, WorkerError>;
 pub fn queue_snapshot(&self) -> Result<QueueSnapshot, WorkerError>;
-pub fn claim_head(&self) -> Result<Option<QueueEntry>, WorkerError>;
+pub fn claim_next(&self, dispatch_owner: ProcessIdentity, ranked_workers: &[String], claimed_at_millis: u64) -> Result<Option<QueueClaim>, WorkerError>;
+pub fn revert_dispatch(&self, job_id: JobId, dispatch_owner: ProcessIdentity) -> Result<QueueEntry, WorkerError>;
+pub fn request_queue_cancel(&self, job_id: JobId, requested_at_millis: u64) -> Result<Option<QueueCancel>, WorkerError>;
+pub fn remove_after_terminal(&self, job_id: JobId, dispatch_owner: ProcessIdentity) -> Result<QueueEntry, WorkerError>;
+pub fn recover_dead_dispatches(&self) -> Result<Vec<JobId>, WorkerError>;
 pub fn remove_queued(&self, job_id: JobId) -> Result<Option<QueueEntry>, WorkerError>;
 pub fn record_affinity(&self, project_id: &str, worktree_id: &str, worker: &str, observed_at_millis: u64) -> Result<(), WorkerError>;
 pub fn affinity_hints(&self, project_id: &str, worktree_id: &str) -> Result<AffinityHints, WorkerError>;
 ```
 
-`claim_head` repairs identity-proven abandoned waiting entries, then removes/returns exactly the first remaining entry under one lock. `remove_queued` is idempotent and refuses another client mapping. Keep project/worktree and project-level healthy worker names as separate canonical affinity records; malformed records fail closed.
+`claim_next` examines the oldest uncancelled `Waiting` row only; it marks that row `Dispatching` with the first ranked compatible worker not already selected by a live dispatch. It never holds the queue lock during SSH. If the head has no eligible worker, it returns `None` and does not inspect later waiting rows. `revert_dispatch` changes exactly matching dispatcher/job rows back to `Waiting` after lease busy or any pre-acceptance failure. `request_queue_cancel` removes a waiting row immediately, or persists `cancel_requested_at_millis` on a dispatching row and returns its dispatcher identity. Dispatch code rereads/checks that flag before snapshot, lease, upload, verify, and submit; after any race it uses the original-ID Phase 3 resolution before deciding whether remote cancellation is needed. `remove_after_terminal` removes only a durably accepted-and-terminal or durably abandoned row. `recover_dead_dispatches` changes identity-proven dead dispatchers to `Waiting`; it never deletes them. `remove_queued` is an internal waiting-only primitive. Keep project/worktree and project-level healthy worker names as separate canonical affinity records; malformed records fail closed.
 
 - [ ] **Step 5: Run queue and local state tests**
 
@@ -233,7 +331,9 @@ git commit -m "feat: persist durable local scheduler queue"
 
 ---
 
-### Task 3: Wait/No-Wait Dispatch and Automatic/Pinned Run Integration
+### Task 4: Wait/No-Wait Dispatch and Automatic/Pinned Run Integration
+
+**Gate:** Start after Tasks 1--3; it is the first task allowed to modify Phase 3 public orchestration files.
 
 **Files:**
 - Modify: `src/run.rs`
@@ -245,12 +345,12 @@ git commit -m "feat: persist durable local scheduler queue"
 - Modify: `tests/cli_help.rs`
 
 **Interfaces:**
-- Consumes: Phase 3 `RunService`, `RunCompletion`, `RemoteJobClient`, `ProjectState`, `PreparedProject`; Task 1 `SchedulerPolicy`; Task 2 queue APIs.
+- Consumes: Phase 3 `RunService`, `RunCompletion`, `RemoteJobClient`, `ProjectState`, `PreparedProject`; Task 1 `SchedulerPolicy`; Task 2 `SchedulerProbeAdapter`; Task 3 queue APIs.
 - Produces: updated `RunRequest`, `SchedulerService::submit_and_follow`, and automatic/pinned `worker run [--worker NAME] [--no-wait]`.
 
 - [ ] **Step 1: Write failing CLI/orchestration tests**
 
-Pin `worker run -- npm test`, `worker run --worker mini-2 -- npm test`, `worker run --no-wait -- npm test`, and `worker run --worker mini-2 --no-wait -- npm test`. Record effects in this exact order: inspect/settings/requirements; concurrent fresh fleet probe; no-wait rejection before enqueue/snapshot; enqueue; claim head; affinity/ranking; snapshot; lease; upload/verify/submit; flush acceptance; follow logs. Assert pinned busy/unavailable workers are never silently rerouted, and a later entry cannot snapshot/upload while an earlier compatible entry waits.
+Pin `worker run -- npm test`, `worker run --worker mini-2 -- npm test`, `worker run --no-wait -- npm test`, and `worker run --worker mini-2 --no-wait -- npm test`. Record effects in this exact order: inspect/settings/requirements; concurrent fresh fleet probe; no-wait rejection before enqueue/snapshot; enqueue; recover dead dispatches; rank the oldest waiting row; persist `Dispatching`; snapshot; lease; upload/verify/submit; flush acceptance; follow logs. Assert pinned busy/unavailable workers are never silently rerouted; no later compatible waiting row is claimed before an older compatible waiting row; and up to three distinct worker rows may be dispatching simultaneously.
 
 - [ ] **Step 2: Run command tests to verify RED**
 
@@ -279,7 +379,7 @@ Omitted `--worker` becomes `Automatic`; supplied values must pass `Config::worke
 
 Probe configured workers concurrently with `WorkersService::inspect_with_requirements`; never reuse Doctor data. For a pin, rank only that health record. `NoEligible` plus no-wait returns `WorkerError::Capacity { code: "CAPACITY_BUSY", .. }` before enqueue. Waiting requests generate the original job/client identity, enqueue, and poll under one-second bounded waits; never hold queue lock during SSH, capture, rsync, or log follow.
 
-When the head has a candidate, atomically claim it then call Phase 3 preparation/upload/lease/submit with the original identity and selected configured worker. On lease race, re-enqueue unchanged at its original ID; never bypass an older compatible entry. On preparation failure remove only that entry. Record affinity only after a fresh successful remote observation.
+When the head has a candidate, `claim_next` atomically persists its `Dispatching` owner/worker then the scheduler releases the queue lock and calls Phase 3 preparation/upload/lease/submit with the original identity and selected configured worker. A lease race or any pre-acceptance failure calls `revert_dispatch` for the same queue ID and dispatcher; no re-enqueue occurs. A durably accepted job remains dispatching until terminal or durable abandonment, when `remove_after_terminal` removes it. Command starts may occur out of order between independently dispatching workers, but admission consideration remains FIFO. Record affinity only after a fresh successful remote observation.
 
 - [ ] **Step 5: Run orchestration regressions**
 
@@ -296,7 +396,9 @@ git commit -m "feat: schedule queued jobs across workers"
 
 ---
 
-### Task 4: Explicit Queue and Remote Job Cancellation
+### Task 5: Explicit Queue and Remote Job Cancellation
+
+**Gate:** Start after Task 4 proves automatic/pinned dispatch and dispatch reversion.
 
 **Files:**
 - Modify: `src/job.rs`
@@ -312,7 +414,7 @@ git commit -m "feat: schedule queued jobs across workers"
 - Modify: `tests/cli_help.rs`
 
 **Interfaces:**
-- Consumes: Task 2 queue persistence, Phase 3 `StatusResponse`, `JobService`, exact lease cleanup, and supervisor process inspection.
+- Consumes: Task 3 queue persistence, Phase 3 `StatusResponse`, `JobService`, exact lease cleanup, and supervisor process inspection.
 - Produces: `CancelRequest`, `CancelResponse`, `JobService::cancel`, `RemoteJobClient::cancel`, hidden `host cancel`, public `worker cancel JOB_ID`, and `CancelReport`.
 
 - [ ] **Step 1: Write failing cancellation tests**
@@ -355,7 +457,7 @@ Use `Serialize`, `Deserialize`, `deny_unknown_fields`, constructors, and `valida
 
 Implement `JobService::cancel(&self, request: CancelRequest) -> Result<CancelResponse, WorkerError>`. Under admission lock, validate indexed job and reconcile it first; then take supervisor lock. Reuse the supervisor TERM/wait/KILL/proof path; atomically transition `Cancelled`, remove only execution payload/workspace/home/tmp, fsync, then invoke `release_after_cleanup`. For accepted/no-child jobs fence launch under the supervisor lock, transition/cancel/clean/release directly.
 
-`worker cancel JOB_ID` first calls `remove_queued`; if found emit a queued-cancelled report. Otherwise load the local record; reject `UnknownRemote`/`CleanupPending` as recovery-required infrastructure; then send exactly one typed cancel request to the recorded worker. Any transport ambiguity is resolved by original-ID status, never another host/job.
+`worker cancel JOB_ID` first calls `request_queue_cancel`. For `RemovedWaiting`, emit a queued-cancelled report with no SSH. For `RequestedDispatch`, the dispatch owner observes the durable cancellation flag before every remote boundary and removes the row after a proven pre-acceptance abandonment; if a host may already have accepted, it resolves the original ID and sends typed remote cancel only for the accepted job. Otherwise load the local record; reject `UnknownRemote`/`CleanupPending` as recovery-required infrastructure; then send exactly one typed cancel request to the recorded worker. Any transport ambiguity is resolved by original-ID status, never another host/job.
 
 - [ ] **Step 5: Run cancellation/lifecycle regressions**
 
@@ -372,7 +474,9 @@ git commit -m "feat: cancel queued and running jobs"
 
 ---
 
-### Task 5: Fleet Reconciliation and Scheduler Recovery
+### Task 6: Fleet Reconciliation and Scheduler Recovery
+
+**Gate:** Start after Task 5's cancellation contract and Phase 3 Task 8's typed per-job reconciliation are both passing.
 
 **Files:**
 - Modify: `src/job.rs`
@@ -386,7 +490,7 @@ git commit -m "feat: cancel queued and running jobs"
 - Modify: `tests/job_queries.rs`
 
 **Interfaces:**
-- Consumes: Task 1 probes, Task 2 queue/affinity records, Task 4 cancellation, and Phase 3 `JobService::reconcile_job`/`RemoteJobClient::status`.
+- Consumes: Task 2 typed probes, Task 3 queue/affinity records, Task 5 cancellation, and Phase 3 `JobService::reconcile_job`/`RemoteJobClient::status`.
 - Produces: `FleetReconcileRequest`, `FleetWorkerReport`, `FleetReconcileReport`, `RemoteJobClient::reconcile`, and `FleetReconciler::reconcile`.
 
 - [ ] **Step 1: Write failing fleet tests**
@@ -408,7 +512,7 @@ fn failed_probe_is_not_evidence_that_a_retained_job_is_lost() {
 }
 ```
 
-Cover all terminal states, indexed/non-indexed crash repair delegated to Task 8, corrupt status/lease, timeout, stale observations, jobs from another client, stale affinity, and repeated reconciliation. Assert every repair names a known job ID; no worker-wide file scan, arbitrary path, or broad cleanup is allowed.
+Cover all terminal states, indexed/non-indexed crash repair delegated to Phase 3 Task 8, corrupt status/lease, timeout, stale observations, jobs from another client, stale affinity, and repeated reconciliation. Assert every repair names a known job ID; no worker-wide file scan, arbitrary path, or broad cleanup is allowed.
 
 - [ ] **Step 2: Run fleet tests to verify RED**
 
@@ -451,7 +555,9 @@ git commit -m "feat: reconcile scheduler fleet state"
 
 ---
 
-### Task 6: Scheduler Concurrency, Lifecycle, and Privacy Matrix
+### Task 7: Scheduler Concurrency, Lifecycle, and Privacy Matrix
+
+**Gate:** Start after Tasks 1--6; it adds only deterministic test seams and does not add a production control plane.
 
 **Files:**
 - Create: `tests/scheduler_concurrency.rs`
@@ -461,7 +567,7 @@ git commit -m "feat: reconcile scheduler fleet state"
 - Modify: `tests/scheduler_policy.rs`
 
 **Interfaces:**
-- Consumes: Tasks 1--5 public and host interfaces.
+- Consumes: Tasks 1--6 public and host interfaces.
 - Produces: deterministic evidence for FIFO, one-slot leases, cancellation, reconciliation, and non-disclosure contracts.
 
 - [ ] **Step 1: Add deterministic adversarial tests**
@@ -498,7 +604,7 @@ Expected: FAIL until deterministic synchronization seams expose every required r
 
 - [ ] **Step 3: Add only inert test seams and close race windows**
 
-Add `#[doc(hidden)]` test-only barriers/fault points at queue publication, lease-acquire handoff, remote-cancel handoff, and reconciliation response handling. Production defaults remain inert. Fix failures by retaining Task 1--5 authority rules; do not add background threads, hidden daemons, broad cleanup, or alternate retry/lifecycle state.
+Add `#[doc(hidden)]` test-only barriers/fault points at queue publication, dispatch-to-lease handoff, remote-cancel handoff, and reconciliation response handling. Production defaults remain inert. Fix failures by retaining Task 1--6 authority rules; do not add background threads, hidden daemons, broad cleanup, or alternate retry/lifecycle state.
 
 - [ ] **Step 4: Run focused Phase 3/4 lifecycle suite**
 
@@ -515,7 +621,9 @@ git commit -m "test: harden three-worker scheduler lifecycle"
 
 ---
 
-### Task 7: Documentation, Three-Mac Acceptance, and Final Phase 4 Gate
+### Task 8: Documentation, Three-Mac Acceptance, and Final Phase 4 Gate
+
+**Gate:** Start after Task 7 passes the focused scheduler lifecycle matrix.
 
 **Files:**
 - Modify: `README.md`
@@ -579,6 +687,6 @@ git commit -m "test: validate three-worker scheduler"
 
 ## Plan Self-Review Results
 
-- **Spec coverage:** Task 1 covers candidate facts/ranking; Task 2 covers durable FIFO and owner cleanup; Task 3 covers default automatic selection, pins, and no-wait; Task 4 covers queued/running cancellation; Task 5 covers fleet/reboot/offline recovery; Task 6 covers concurrency, lifecycle, and privacy; Task 7 covers docs and three-Mac acceptance. Dashboard, artifacts, caches, Docker, general GC, and Phase 5 hardening are intentionally absent.
+- **Spec coverage:** Task 1 is start-now pure ranking; Task 2 is the single protocol-v3 probe adapter shared with Phase 4.5; Task 3 covers durable FIFO/dispatch recovery; Task 4 covers automatic selection, pins, and no-wait; Task 5 covers queued/running cancellation; Task 6 covers fleet/reboot/offline recovery; Task 7 covers concurrency/lifecycle/privacy; Task 8 covers docs and three-Mac acceptance. Dashboard, artifacts, caches, Docker, general GC, and Phase 5 hardening are intentionally absent.
 - **Placeholder scan:** Clean: every task specifies files, interfaces, concrete assertions, RED/PASS commands, implementation boundary, and commit.
-- **Type consistency:** Task 1 defines `AffinityHints`/`SchedulerPolicy`; Task 2 returns `AffinityHints` from persisted affinity; Task 3 consumes both and defines public `RunRequest`; Task 4 defines cancellation; Task 5 composes status into fleet reports; Tasks 6--7 consume prior public interfaces.
+- **Type consistency:** Task 1 defines `CandidateObservation`, `AffinityHints`, `WorkerPreference`, and `SchedulerPolicy`; Task 2 maps version-3 `WorkerHealth`/`ProbeResponse` into that observation; Task 3 persists preference/affinity and `Dispatching`; Task 4 consumes all three for `RunRequest`; Task 5 defines cancellation; Task 6 composes status into fleet reports; Tasks 7--8 consume prior public interfaces.
