@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Cursor, Write as _},
     os::fd::AsRawFd,
@@ -503,7 +503,11 @@ fn resolve_without_a_live_lease_fences_delayed_acquire_and_executes_nothing() {
         "{verify_error}"
     );
     let submit_error = delayed_submit.join().unwrap().unwrap_err();
-    assert!(submit_error.to_string().contains("LEASE_MISSING"));
+    // Durable exact Abandoned authority is selected before lease absence.
+    assert!(
+        submit_error.to_string().contains("JOB_ABANDONED"),
+        "{submit_error}"
+    );
     assert_eq!(launches.load(Ordering::SeqCst), 0);
     assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 }
@@ -2078,6 +2082,213 @@ fn terminal_status_rejects_log_length_mismatch_after_release() {
         .unwrap_err();
 
     assert_error_code(error, "JOB_STATE_INVALID", "terminal log length");
+}
+
+#[test]
+fn terminal_accepted_submit_retry_after_lease_retirement() {
+    // Break caught: submit checks for a live lease before durable Accepted
+    // authority, so an exact retry after legitimate terminal cleanup becomes
+    // LEASE_MISSING and immutable conflicts are masked by the same error.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("terminal-submit-retry");
+    let marker = temp.path().join("terminal-submit-marker");
+    let (store, lease, request) = prepared_host_with_command(&root, matrix_command(&marker));
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let original = JobService::new(&store, &launcher)
+        .submit_at(request.clone(), 10)
+        .unwrap();
+    assert!(original.status().state().is_terminal());
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let authority_paths = [
+        store.job_index(lease.job_id()).unwrap(),
+        job.join("meta.json"),
+        job.join("status.json"),
+        job.join("stdout.log"),
+        job.join("stderr.log"),
+    ];
+    let authority_before = authority_paths
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+    let names_before = fs::read_dir(&job)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<BTreeSet<_>>();
+    let launches = Arc::new(AtomicUsize::new(0));
+
+    let retry = JobService::new(
+        &store,
+        &CountingRejectLauncher {
+            launches: Arc::clone(&launches),
+        },
+    )
+    .submit_at(request.clone(), 11)
+    .unwrap();
+
+    assert!(matches!(retry, SubmitResponse::Existing { .. }));
+    assert_eq!(retry.status(), original.status());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert_eq!(
+        authority_paths
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect::<Vec<_>>(),
+        authority_before
+    );
+    assert_eq!(
+        fs::read_dir(&job)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>(),
+        names_before
+    );
+
+    for mutation in [
+        "client", "token", "worker", "project", "worktree", "digest", "cwd", "timeout", "resource",
+        "command",
+    ] {
+        let material = request.material();
+        let changed = SubmitRequest::new(
+            RequestFingerprintMaterial::new(
+                material.job_id(),
+                if mutation == "client" {
+                    ClientId::new(uuid::Uuid::from_u128(91_001))
+                } else {
+                    material.client_id()
+                },
+                if mutation == "token" {
+                    LeaseToken::new(uuid::Uuid::from_u128(91_002))
+                } else {
+                    material.lease_token()
+                },
+                if mutation == "worker" {
+                    "mini-2".into()
+                } else {
+                    material.worker_name().into()
+                },
+                if mutation == "project" {
+                    "d".repeat(64)
+                } else {
+                    material.project_id().into()
+                },
+                if mutation == "worktree" {
+                    "e".repeat(64)
+                } else {
+                    material.worktree_id().into()
+                },
+                if mutation == "digest" {
+                    "f".repeat(64)
+                } else {
+                    material.manifest_digest().into()
+                },
+                if mutation == "cwd" {
+                    "nested".into()
+                } else {
+                    material.relative_working_dir().into()
+                },
+                if mutation == "timeout" {
+                    material.timeout_millis() + 1
+                } else {
+                    material.timeout_millis()
+                },
+                if mutation == "resource" {
+                    "light".into()
+                } else {
+                    material.resource_class().into()
+                },
+                if mutation == "command" {
+                    CommandSpec::argv(vec!["/usr/bin/false".into()]).unwrap()
+                } else {
+                    material.command().clone()
+                },
+            )
+            .unwrap(),
+        );
+        let error = JobService::new(
+            &store,
+            &CountingRejectLauncher {
+                launches: Arc::clone(&launches),
+            },
+        )
+        .submit_at(changed, 12)
+        .unwrap_err();
+        assert_error_code(error, "JOB_ID_CONFLICT", mutation);
+    }
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+
+    let absent = HostStore::open(&temp.path().join("absent")).unwrap();
+    let error = JobService::new(&absent, &RejectLauncher)
+        .submit_at(request.clone(), 13)
+        .unwrap_err();
+    assert_error_code(error, "LEASE_MISSING", "no durable disposition");
+
+    for (index, mutation) in [
+        "missing-final",
+        "missing-meta",
+        "corrupt-meta",
+        "missing-status",
+        "corrupt-status",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let corrupt_root = temp.path().join(format!("corrupt-terminal-{index}"));
+        let corrupt_marker = temp.path().join(format!("corrupt-marker-{index}"));
+        let (corrupt_store, corrupt_lease, corrupt_request) =
+            prepared_host_with_command(&corrupt_root, matrix_command(&corrupt_marker));
+        let corrupt_launcher = InlineSupervisorLauncher {
+            store: corrupt_store.clone(),
+        };
+        JobService::new(&corrupt_store, &corrupt_launcher)
+            .submit_at(corrupt_request.clone(), 20)
+            .unwrap();
+        assert_eq!(LeaseService::new(&corrupt_store).load().unwrap(), None);
+        let corrupt_job = corrupt_store
+            .job(
+                corrupt_lease.project_id(),
+                corrupt_lease.worktree_id(),
+                corrupt_lease.job_id(),
+            )
+            .unwrap();
+        match mutation {
+            "missing-final" => {
+                let parent = corrupt_job.parent().unwrap();
+                fs::remove_dir_all(&corrupt_job).unwrap();
+                File::open(parent).unwrap().sync_all().unwrap();
+            }
+            "missing-meta" => remove_and_sync(&corrupt_job.join("meta.json")),
+            "corrupt-meta" => replace_bytes(&corrupt_job.join("meta.json"), b"{").unwrap(),
+            "missing-status" => remove_and_sync(&corrupt_job.join("status.json")),
+            "corrupt-status" => replace_bytes(&corrupt_job.join("status.json"), b"{").unwrap(),
+            _ => unreachable!(),
+        }
+        let corrupt_launches = Arc::new(AtomicUsize::new(0));
+        let error = JobService::new(
+            &corrupt_store,
+            &CountingRejectLauncher {
+                launches: Arc::clone(&corrupt_launches),
+            },
+        )
+        .submit_at(corrupt_request, 21)
+        .unwrap_err();
+        assert!(
+            !error.to_string().contains("LEASE_MISSING"),
+            "{mutation}: accepted corruption was masked by {error}"
+        );
+        assert_eq!(corrupt_launches.load(Ordering::SeqCst), 0, "{mutation}");
+        assert_eq!(fs::read(&corrupt_marker).unwrap(), b"x", "{mutation}");
+    }
 }
 
 #[test]

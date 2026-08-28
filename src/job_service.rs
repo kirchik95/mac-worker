@@ -1074,46 +1074,58 @@ impl<'a> JobService<'a> {
 
         let job_id = request.material().job_id();
         let admission = self.store.admission_lock(job_id)?;
+        if let Some(disposition) = self.store.disposition(job_id)? {
+            require_matching_accepted(&disposition, &request)?;
+            if let Some(lease) = self.leases.load_after(&admission, job_id)? {
+                require_exact_lease(&lease, &request)?;
+                let (_, authoritative) = self.read_exact_job(&request, &lease)?;
+                self.store.repair_indexed_publication_after(
+                    &admission,
+                    request.material().project_id(),
+                    request.material().worktree_id(),
+                    job_id,
+                )?;
+                if authoritative.supervisor_identity().is_some() {
+                    reject_prelaunch_terminal(&authoritative)?;
+                    return Ok(SubmitResponse::Existing {
+                        status: authoritative,
+                    });
+                }
+                let supervisor = self
+                    .store
+                    .supervisor_lock_after(&admission, job_id, false)?;
+                return match supervisor {
+                    Some(guard) => {
+                        let verified = self.snapshots.load_verified_for_accepted_after(
+                            &admission,
+                            &lease,
+                            request.request_fingerprint(),
+                        )?;
+                        drop(admission);
+                        self.launch_after_election(
+                            job_id, guard, &request, &lease, &verified, false,
+                        )
+                    }
+                    None => {
+                        drop(admission);
+                        self.wait_for_existing_supervisor(&request, &lease)
+                    }
+                };
+            }
+            let resolution_request = ResolveOrAbandonRequest::from_submit_request(&request)?;
+            let identity = ResolutionIdentity::from_request(&resolution_request)?;
+            drop(admission);
+            let authoritative = self.status(job_id)?;
+            require_resolution_response(&identity, &authoritative)?;
+            return Ok(SubmitResponse::Existing {
+                status: authoritative.status().clone(),
+            });
+        }
         let lease = self
             .leases
             .load_after(&admission, job_id)?
             .ok_or_else(|| protocol_code("LEASE_MISSING", "matching live lease is absent"))?;
         require_exact_lease(&lease, &request)?;
-
-        if let Some(disposition) = self.store.disposition(job_id)? {
-            require_matching_accepted(&disposition, &request)?;
-            let (_, authoritative) = self.read_exact_job(&request, &lease)?;
-            self.store.repair_indexed_publication_after(
-                &admission,
-                request.material().project_id(),
-                request.material().worktree_id(),
-                job_id,
-            )?;
-            if authoritative.supervisor_identity().is_some() {
-                reject_prelaunch_terminal(&authoritative)?;
-                return Ok(SubmitResponse::Existing {
-                    status: authoritative,
-                });
-            }
-            let supervisor = self
-                .store
-                .supervisor_lock_after(&admission, job_id, false)?;
-            return match supervisor {
-                Some(guard) => {
-                    let verified = self.snapshots.load_verified_for_accepted_after(
-                        &admission,
-                        &lease,
-                        request.request_fingerprint(),
-                    )?;
-                    drop(admission);
-                    self.launch_after_election(job_id, guard, &request, &lease, &verified, false)
-                }
-                None => {
-                    drop(admission);
-                    self.wait_for_existing_supervisor(&request, &lease)
-                }
-            };
-        }
 
         let verified = self.snapshots.load_verified_after(
             &admission,
