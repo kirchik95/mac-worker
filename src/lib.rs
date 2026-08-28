@@ -6,14 +6,15 @@ use std::{
 };
 
 use cli::{Cli, Command, HiddenComponent, HostCommand};
+use client_state::ClientStateStore;
 use config::{Config, WorkerEntry};
 use doctor::{DoctorRequest, DoctorService};
 use error::WorkerError;
 use host_store::HostStore;
 use install::Installer;
 use job::{
-    HostControlError, LeaseAcquireRequest, LogChunkRequest, LogChunkResponse,
-    ResolveOrAbandonRequest, StatusRequest, SubmitRequest,
+    CommandSpec, HostControlError, JsonEvent, LeaseAcquireRequest, LogChunkRequest,
+    LogChunkResponse, ResolveOrAbandonRequest, StatusRequest, SubmitRequest,
 };
 use job_service::JobService;
 use lease::{AdmissionFacts, LeaseService};
@@ -23,13 +24,17 @@ use probe::ProbeCollector;
 use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport};
 use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnapshotResponse};
+use run::{
+    LogsService, RunRequest, RunService, StatusService, SystemFollowRuntime, terminal_exit_code,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use supervisor::{
     SUPERVISOR_LOCK_FD, Supervisor, SystemProcessInspector, SystemSupervisorLauncher,
     validate_detached_supervisor_context,
 };
 use transfer::{
-    HostTransferService, RsyncServerExecutor, SystemRsyncServerExecutor, TransferIdentity,
+    HostTransferService, RemoteJobClient, RsyncServerExecutor, SystemRsyncServerExecutor,
+    TransferIdentity,
 };
 use transport::{SshTransport, WorkersService};
 
@@ -161,9 +166,18 @@ fn execute_with_context(
         Command::Run { .. } => Err(WorkerError::Protocol(
             "public run requires the stdio execution boundary".into(),
         )),
-        Command::Status { .. } => Err(WorkerError::Protocol(
-            "public status requires the stdio execution boundary".into(),
-        )),
+        Command::Status { job_id } => {
+            let paths = discover_paths(cli.config, runtime)?;
+            let config = Config::load(&paths.config)?;
+            let client_state = ClientStateStore::open(&paths.state)?;
+            let remote = RemoteJobClient::new(runner);
+            let service = StatusService {
+                config: &config,
+                client_state: &client_state,
+                remote: &remote,
+            };
+            Ok(CommandOutput::Status(service.inspect(job_id)?))
+        }
         Command::Logs { .. } => Err(WorkerError::Protocol(
             "public logs requires the stdio execution boundary".into(),
         )),
@@ -239,6 +253,109 @@ pub fn run_with_stdio(
     run_with_stdio_in_context(cli, runner, &runtime, stdin, stdout, stderr)
 }
 
+fn run_public_streaming_command(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    runtime: &RuntimeContext,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let json = cli.json;
+    let result = (|| -> Result<u8, WorkerError> {
+        let paths = discover_paths(cli.config, runtime)?;
+        let config = Config::load(&paths.config)?;
+        let client_state = ClientStateStore::open(&paths.state)?;
+        let remote = RemoteJobClient::new(runner);
+        let follow_runtime = SystemFollowRuntime;
+        let logs = LogsService {
+            config: &config,
+            client_state: &client_state,
+            remote: &remote,
+            runtime: &follow_runtime,
+        };
+        match cli.command {
+            Command::Run {
+                worker,
+                project,
+                includes,
+                timeout,
+                shell,
+                argv,
+            } => {
+                let project = match project {
+                    Some(project) => project,
+                    None => runtime.current_dir()?,
+                };
+                let command = match shell {
+                    Some(shell) => CommandSpec::shell(shell)?,
+                    None => CommandSpec::argv(argv)?,
+                };
+                let service =
+                    RunService::with_follower(runner, &config, &paths, &client_state, &logs);
+                let completion = service.submit_and_follow(
+                    RunRequest {
+                        worker,
+                        project,
+                        cli_includes: includes,
+                        timeout,
+                        command,
+                    },
+                    json,
+                    stdout,
+                    stderr,
+                )?;
+                Ok(completion.exit_code)
+            }
+            Command::Logs { follow, job_id } => {
+                let response = logs.stream(job_id, follow, json, stdout, stderr)?;
+                if response.status().state().is_terminal() {
+                    terminal_exit_code(response.status())
+                } else {
+                    Ok(0)
+                }
+            }
+            _ => Err(WorkerError::Protocol(
+                "public streaming dispatcher received a non-streaming command".into(),
+            )),
+        }
+    })();
+    match result {
+        Ok(code) => code,
+        Err(error) => write_public_stream_error(json, stdout, stderr, &error),
+    }
+}
+
+fn write_public_stream_error(
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    error: &WorkerError,
+) -> u8 {
+    if json {
+        match write_json_error_event(stdout, error) {
+            Ok(()) => error.exit_code(),
+            Err(_) => crate::error::ExitKind::Io as u8,
+        }
+    } else {
+        write_error(stderr, error);
+        error.exit_code()
+    }
+}
+
+fn write_json_error_event(stdout: &mut dyn Write, error: &WorkerError) -> Result<(), WorkerError> {
+    let event = JsonEvent::Error {
+        protocol_version: PROTOCOL_VERSION,
+        code: error.public_code(),
+        message: error.public_message(),
+    };
+    let encoded = serde_json::to_vec(&event)
+        .map_err(|error| WorkerError::Io(std::io::Error::other(error)))?;
+    stdout.write_all(&encoded)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn run_with_io_in_context(
     cli: Cli,
@@ -260,6 +377,9 @@ pub fn run_with_stdio_in_context(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    if matches!(cli.command, Command::Run { .. } | Command::Logs { .. }) {
+        return run_public_streaming_command(cli, runner, runtime, stdout, stderr);
+    }
     run_with_rsync_executor_in_context(
         cli,
         runner,

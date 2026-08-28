@@ -5,6 +5,7 @@ pub enum CommandOutput {
     Doctor(crate::protocol::DoctorReport),
     Workers(crate::protocol::WorkersReport),
     Probe(crate::protocol::ProbeResponse),
+    Status(crate::run::StatusReport),
 }
 
 impl CommandOutput {
@@ -55,6 +56,7 @@ impl CommandOutput {
                 "{}: {} (macOS {}; protocol {})",
                 probe.hostname, probe.arch, probe.os_version, probe.protocol_version
             ),
+            Self::Status(report) => render_status_report(report),
         }
     }
 
@@ -332,5 +334,55 @@ fn setup_warning_code(code: &crate::protocol::SetupWarningCode) -> &'static str 
     match code {
         crate::protocol::SetupWarningCode::CleanupFailed => "CLEANUP_FAILED",
         crate::protocol::SetupWarningCode::RollbackFailed => "ROLLBACK_FAILED",
+    }
+}
+
+fn render_status_report(report: &crate::run::StatusReport) -> String {
+    let mut lines = report
+        .jobs
+        .iter()
+        .map(render_status_row)
+        .collect::<Vec<_>>();
+    if report.omitted > 0 {
+        lines.push(format!("{} older jobs omitted", report.omitted));
+    }
+    lines.join("\n")
+}
+
+fn render_status_row(row: &crate::run::StatusRow) -> String {
+    let state = row
+        .status
+        .as_ref()
+        .map_or("unknown", |status| job_state_name(status.state()));
+    let uncertainty = match &row.remote_uncertainty {
+        crate::job::RemoteUncertainty::None => "none".to_owned(),
+        crate::job::RemoteUncertainty::UnknownRemote { code } => {
+            format!("unknown_remote {code}")
+        }
+        crate::job::RemoteUncertainty::CleanupPending { code } => {
+            format!("cleanup_pending {code}")
+        }
+    };
+    let command = match row.command_summary.arg_count() {
+        Some(count) => format!("argv {count}"),
+        None => "shell".into(),
+    };
+    format!(
+        "{} {} {state} {uncertainty} {} {} {command}",
+        row.job_id, row.worker, row.created_at_millis, row.manifest_digest
+    )
+}
+
+fn job_state_name(state: crate::job::JobState) -> &'static str {
+    match state {
+        crate::job::JobState::Uploading => "uploading",
+        crate::job::JobState::Verified => "verified",
+        crate::job::JobState::Accepted => "accepted",
+        crate::job::JobState::Running => "running",
+        crate::job::JobState::Succeeded => "succeeded",
+        crate::job::JobState::Failed => "failed",
+        crate::job::JobState::Cancelled => "cancelled",
+        crate::job::JobState::TimedOut => "timed_out",
+        crate::job::JobState::Lost => "lost",
     }
 }

@@ -2,8 +2,8 @@
 mod support;
 
 use std::{
-    collections::{BTreeSet, VecDeque},
-    ffi::OsStr,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Write},
     os::unix::process::ExitStatusExt,
@@ -21,6 +21,7 @@ use std::{
 use assert_cmd::Command;
 use clap::Parser;
 use mac_worker::{
+    RuntimeContext,
     cli::{Cli, Command as WorkerCommand},
     client_state::{ClientStateStore, ClientStateWritePoint},
     config::{Config, WorkerEntry},
@@ -32,6 +33,7 @@ use mac_worker::{
         RequestFingerprintMaterial, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
         StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
     },
+    lease::{LeaseSummary, SlotState},
     paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
@@ -41,6 +43,7 @@ use mac_worker::{
         RunService, RunStage, STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT,
         StatusReport, StatusRow, StatusService, SystemFollowRuntime,
     },
+    run_with_io_in_context,
     transfer::{HostOperation, RemoteJobClient, ResolutionRuntime},
 };
 use predicates::prelude::*;
@@ -2121,6 +2124,7 @@ const STOCK_RSYNC_STATS: &[u8] = b"Number of files: 2\nNumber of files transferr
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunScriptStep {
     ProbeReady,
+    ProbeBusy,
     ProbeUnavailable,
     Acquire,
     AcquireMismatch(LeaseMismatch),
@@ -2135,8 +2139,18 @@ enum RunScriptStep {
     AuthoritativeFailure(HostOperation, &'static str),
     UploadFailure,
     StatusAccepted,
+    StatusTerminal {
+        exit_code: u8,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+    },
     StatusMismatch,
     StatusTransportFailure,
+    LogChunkBytes {
+        stream: LogStream,
+        offset: u64,
+        bytes: &'static [u8],
+    },
     ResolveAccepted,
     ResolveAbandoned,
     ResolveCleanupPending,
@@ -2412,6 +2426,21 @@ impl ProcessRunner for RunScriptRunner {
                 );
                 canonical_process(&ready_probe())
             }
+            RunScriptStep::ProbeBusy => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    "~/.local/bin/worker host probe"
+                );
+                let mut probe = ready_probe();
+                probe.slot_state = SlotState::Busy;
+                probe.active_lease = Some(LeaseSummary {
+                    job_id: JOB_ID.parse().unwrap(),
+                    project_id: "a".repeat(64),
+                    worktree_id: "b".repeat(64),
+                    created_at_millis: 10,
+                });
+                canonical_process(&probe)
+            }
             RunScriptStep::ProbeUnavailable => {
                 assert_eq!(
                     request.args.last().unwrap(),
@@ -2592,6 +2621,7 @@ impl ProcessRunner for RunScriptRunner {
                 })
             }
             RunScriptStep::StatusAccepted
+            | RunScriptStep::StatusTerminal { .. }
             | RunScriptStep::StatusMismatch
             | RunScriptStep::StatusTransportFailure
             | RunScriptStep::ResolveAccepted => {
@@ -2614,12 +2644,42 @@ impl ProcessRunner for RunScriptRunner {
                         material,
                         JobStatus::accepted(material.created_at_millis()).unwrap(),
                     ))
+                } else if let RunScriptStep::StatusTerminal {
+                    exit_code,
+                    stdout_bytes,
+                    stderr_bytes,
+                } = step
+                {
+                    let updated = material.created_at_millis() + 2;
+                    let status = if exit_code == 0 {
+                        JobStatus::succeeded(updated, stdout_bytes, stderr_bytes).unwrap()
+                    } else {
+                        JobStatus::failed(updated, exit_code, stdout_bytes, stderr_bytes).unwrap()
+                    };
+                    canonical_process(&material_status(material, status))
                 } else {
                     canonical_process(&material_status(
                         material,
                         JobStatus::accepted(material.created_at_millis()).unwrap(),
                     ))
                 }
+            }
+            RunScriptStep::LogChunkBytes {
+                stream,
+                offset,
+                bytes,
+            } => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    HostOperation::LogChunk.command()
+                );
+                let chunk: LogChunkRequest =
+                    serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                let material = state.material.as_ref().unwrap();
+                assert_eq!(chunk.job_id(), material.job_id());
+                assert_eq!(chunk.stream(), stream);
+                assert_eq!(chunk.offset(), offset);
+                log_chunk_result(stream, offset, bytes)
             }
             RunScriptStep::ResolveAbandoned
             | RunScriptStep::ResolveCleanupPending
@@ -5789,4 +5849,1092 @@ fn logs_requires_the_exact_local_job_and_never_falls_back() {
     .unwrap_err();
     assert!(matches!(error, WorkerError::Protocol(message) if message.contains("JOB_ID_CONFLICT")));
     assert!(runner.requests().is_empty());
+}
+
+const PUBLIC_INVENTORY: &str =
+    "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n";
+const PUBLIC_STDOUT_BYTES: &[u8] = b"run-stdout";
+const PUBLIC_STDERR_BYTES: &[u8] = b"run-stderr";
+const HIDDEN_HOST_FRAGMENTS: &[&str] = &[
+    "lease-acquire",
+    "log-chunk",
+    "resolve-or-abandon",
+    "rsync-receive",
+    "snapshot-verify",
+    "host supervise",
+    "host submit",
+];
+
+struct PublicRuntime {
+    config: PathBuf,
+    state: PathBuf,
+    context: RuntimeContext,
+}
+
+struct FailOnJsonErrorEvent {
+    bytes: Vec<u8>,
+}
+
+impl Write for FailOnJsonErrorEvent {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes
+            .windows(b"\"event\":\"error\"".len())
+            .any(|window| window == b"\"event\":\"error\"")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "planted error-event write failure",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn public_runtime(root: &Path, current_dir: &Path) -> PublicRuntime {
+    let root = root.canonicalize().unwrap();
+    let current_dir = current_dir.canonicalize().unwrap();
+    let home = root.join("runtime-home");
+    let config_home = root.join("xdg-config");
+    let state_home = root.join("xdg-state");
+    let cache_home = root.join("xdg-cache");
+    let data_home = root.join("xdg-data");
+    fs::create_dir_all(&home).unwrap();
+    let config = root.join("config.toml");
+    fs::write(&config, PUBLIC_INVENTORY).unwrap();
+    let environment = BTreeMap::from([
+        (
+            OsString::from("XDG_CONFIG_HOME"),
+            config_home.into_os_string(),
+        ),
+        (
+            OsString::from("XDG_STATE_HOME"),
+            state_home.into_os_string(),
+        ),
+        (
+            OsString::from("XDG_CACHE_HOME"),
+            cache_home.into_os_string(),
+        ),
+        (OsString::from("XDG_DATA_HOME"), data_home.into_os_string()),
+    ]);
+    PublicRuntime {
+        config,
+        state: root.join("xdg-state/mac-worker"),
+        context: RuntimeContext::isolated(environment, home, current_dir.to_path_buf()),
+    }
+}
+
+fn dispatch(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    runtime: &RuntimeContext,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    run_with_io_in_context(cli, runner, runtime, stdout, stderr)
+}
+
+fn public_cli(config: PathBuf, json: bool, command: WorkerCommand) -> Cli {
+    Cli {
+        config: Some(config),
+        json,
+        command,
+    }
+}
+
+fn persist_public_job(state: &Path, status: Option<JobStatus>) -> LocalJobRecord {
+    let store = ClientStateStore::open(state).unwrap();
+    persist_log_job(&store, status)
+}
+
+fn expected_status_line(row: &StatusRow) -> String {
+    let state = row.status.as_ref().map_or_else(
+        || "unknown".to_owned(),
+        |status| {
+            match status.state() {
+                JobState::Uploading => "uploading",
+                JobState::Verified => "verified",
+                JobState::Accepted => "accepted",
+                JobState::Running => "running",
+                JobState::Succeeded => "succeeded",
+                JobState::Failed => "failed",
+                JobState::Cancelled => "cancelled",
+                JobState::TimedOut => "timed_out",
+                JobState::Lost => "lost",
+            }
+            .to_owned()
+        },
+    );
+    let uncertainty = match &row.remote_uncertainty {
+        RemoteUncertainty::None => "none".to_owned(),
+        RemoteUncertainty::UnknownRemote { code } => format!("unknown_remote {code}"),
+        RemoteUncertainty::CleanupPending { code } => format!("cleanup_pending {code}"),
+    };
+    let command = match row.command_summary.arg_count() {
+        Some(count) => format!("argv {count}"),
+        None => "shell".into(),
+    };
+    format!(
+        "{} {} {state} {uncertainty} {} {} {command}",
+        row.job_id, row.worker, row.created_at_millis, row.manifest_digest
+    )
+}
+
+fn expected_human_status(report: &StatusReport) -> String {
+    let mut lines = report
+        .jobs
+        .iter()
+        .map(expected_status_line)
+        .collect::<Vec<_>>();
+    if report.omitted > 0 {
+        lines.push(format!("{} older jobs omitted", report.omitted));
+    }
+    lines.join("\n")
+}
+
+fn assert_no_hidden_host_leak(stdout: &[u8], stderr: &[u8]) {
+    let combined = [stdout, stderr].concat();
+    let text = String::from_utf8_lossy(&combined);
+    for fragment in HIDDEN_HOST_FRAGMENTS {
+        assert!(
+            !text.contains(fragment),
+            "public output leaked hidden host command {fragment}"
+        );
+    }
+}
+
+fn run_terminal_steps(exit_code: u8) -> Vec<RunScriptStep> {
+    run_follow_steps(exit_code, b"", b"")
+}
+
+fn run_follow_steps(
+    exit_code: u8,
+    stdout: &'static [u8],
+    stderr: &'static [u8],
+) -> Vec<RunScriptStep> {
+    let stdout_len = stdout.len() as u64;
+    let stderr_len = stderr.len() as u64;
+    let mut steps = vec![
+        RunScriptStep::ProbeReady,
+        RunScriptStep::Acquire,
+        RunScriptStep::Upload,
+        RunScriptStep::Verify,
+        RunScriptStep::SubmitAccepted,
+        RunScriptStep::StatusTerminal {
+            exit_code,
+            stdout_bytes: stdout_len,
+            stderr_bytes: stderr_len,
+        },
+    ];
+    if !stdout.is_empty() {
+        steps.push(RunScriptStep::LogChunkBytes {
+            stream: LogStream::Stdout,
+            offset: 0,
+            bytes: stdout,
+        });
+    }
+    if !stderr.is_empty() {
+        steps.push(RunScriptStep::LogChunkBytes {
+            stream: LogStream::Stderr,
+            offset: 0,
+            bytes: stderr,
+        });
+    }
+    steps.push(RunScriptStep::LogChunkBytes {
+        stream: LogStream::Stdout,
+        offset: stdout_len,
+        bytes: b"",
+    });
+    steps.push(RunScriptStep::LogChunkBytes {
+        stream: LogStream::Stderr,
+        offset: stderr_len,
+        bytes: b"",
+    });
+    steps.push(RunScriptStep::StatusTerminal {
+        exit_code,
+        stdout_bytes: stdout_len,
+        stderr_bytes: stderr_len,
+    });
+    steps
+}
+
+fn terminal_log_script(
+    record: &LocalJobRecord,
+    status: JobStatus,
+) -> Vec<Result<ProcessResult, WorkerError>> {
+    vec![
+        status_result(&log_status_response(record, status)),
+        log_chunk_result(LogStream::Stdout, 0, b""),
+        log_chunk_result(LogStream::Stderr, 0, b""),
+    ]
+}
+
+#[test]
+fn dispatcher_routes_run_and_logs_directly_to_live_writers() {
+    // Break caught: public run/logs buffer into CommandOutput/String or skip
+    // the live writers, so accepted/log bytes appear only as one document.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = public_runtime(temp.path(), repo.root());
+    let store = ClientStateStore::open(&runtime.state).unwrap();
+    let runner = RunScriptRunner::new(
+        runtime.state.canonicalize().unwrap(),
+        run_follow_steps(0, PUBLIC_STDOUT_BYTES, PUBLIC_STDERR_BYTES),
+    );
+    let stdout_state = Arc::new(Mutex::new(OutputState::default()));
+    let stderr_state = Arc::new(Mutex::new(OutputState::default()));
+    let mut stdout = RecordingWriter::new(stdout_state.clone());
+    let mut stderr = RecordingWriter::new(stderr_state.clone());
+
+    let exit = dispatch(
+        public_cli(
+            runtime.config.clone(),
+            false,
+            WorkerCommand::Run {
+                worker: "mini-1".into(),
+                project: None,
+                includes: Vec::new(),
+                timeout: None,
+                shell: None,
+                argv: vec!["npm".into(), "test".into(), "--".into(), "--literal".into()],
+            },
+        ),
+        &runner,
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    let run_stdout = stdout_state.lock().unwrap().bytes.clone();
+    let run_stderr = stderr_state.lock().unwrap().bytes.clone();
+    let run_flushes = stdout_state.lock().unwrap().flushes;
+    assert_eq!(exit, 0);
+    let run_text = String::from_utf8(run_stdout.clone()).unwrap();
+    let accepted_end = run_text
+        .find('\n')
+        .map(|index| index + 1)
+        .expect("accepted line must be flushed as its own write");
+    let accepted = &run_text[..accepted_end];
+    assert!(accepted.starts_with("job "));
+    assert!(accepted.ends_with(" accepted on mini-1\n"));
+    assert!(!accepted.starts_with('{'));
+    assert!(!run_text.contains("\"kind\""));
+    assert_eq!(&run_stdout[accepted_end..], PUBLIC_STDOUT_BYTES);
+    assert_eq!(run_stderr, PUBLIC_STDERR_BYTES);
+    assert!(run_flushes >= 1, "accepted output must be flushed live");
+    assert_no_hidden_host_leak(&run_stdout, &run_stderr);
+    runner.assert_consumed();
+    let job_id = accepted
+        .trim()
+        .strip_prefix("job ")
+        .and_then(|line| line.strip_suffix(" accepted on mini-1"))
+        .unwrap()
+        .parse::<JobId>()
+        .unwrap();
+    assert_eq!(store.list_jobs().unwrap().len(), 1);
+
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let raw_stdout = [0xff, 0xfe, 0x00, b'\n', 0x80];
+    let raw_stderr = [0xc0, 0x00, 0x81];
+    let logs_runner = RecordingRunner::returning(vec![
+        status_result(&log_status_response(
+            &record,
+            JobStatus::accepted(101).unwrap(),
+        )),
+        log_chunk_result(LogStream::Stdout, 0, &raw_stdout),
+        log_chunk_result(LogStream::Stderr, 0, &raw_stderr),
+    ]);
+    let mut logs_stdout = Vec::new();
+    let mut logs_stderr = Vec::new();
+
+    let logs_exit = dispatch(
+        public_cli(
+            runtime.config,
+            false,
+            WorkerCommand::Logs {
+                follow: false,
+                job_id: record.meta().job_id(),
+            },
+        ),
+        &logs_runner,
+        &runtime.context,
+        &mut logs_stdout,
+        &mut logs_stderr,
+    );
+
+    assert_eq!(logs_exit, 0);
+    assert_eq!(logs_stdout, raw_stdout);
+    assert_eq!(logs_stderr, raw_stderr);
+    assert!(!logs_stdout.starts_with(b"{"));
+    assert_no_hidden_host_leak(&logs_stdout, &logs_stderr);
+    let _ = job_id;
+}
+
+#[test]
+fn dispatcher_keeps_status_as_one_document_and_other_commands_unchanged() {
+    // Break caught: status becomes NDJSON, or setup/doctor/workers/probe leave
+    // the CommandOutput document path.
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = public_runtime(temp.path(), temp.path());
+    let store = ClientStateStore::open(&runtime.state).unwrap();
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let expected = StatusRow::try_from_record(&record).unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let status_exit = dispatch(
+        public_cli(
+            runtime.config.clone(),
+            true,
+            WorkerCommand::Status {
+                job_id: Some(record.meta().job_id()),
+            },
+        ),
+        &RecordingRunner::returning(vec![status_result(&log_status_response(
+            &record,
+            JobStatus::accepted(101).unwrap(),
+        ))]),
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(status_exit, 0);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let status: Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(status["kind"], "status");
+    assert_eq!(status["protocol_version"], PROTOCOL_VERSION);
+    assert_eq!(status["omitted"], 0);
+    assert_eq!(status["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(status["jobs"][0]["job_id"], expected.job_id.to_string());
+    assert!(status.get("event").is_none());
+    assert!(!stdout.windows(2).any(|pair| pair == b"}\n{"));
+
+    stdout.clear();
+    let workers_exit = dispatch(
+        public_cli(runtime.config.clone(), true, WorkerCommand::Workers),
+        &RecordingRunner::returning(vec![canonical_process(&ready_probe())]),
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(workers_exit, 0);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let workers: Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(workers["kind"], "workers");
+    assert_eq!(workers["protocol_version"], PROTOCOL_VERSION);
+
+    stdout.clear();
+    let probe_exit = dispatch(
+        public_cli(
+            runtime.config,
+            true,
+            WorkerCommand::Host {
+                command: mac_worker::cli::HostCommand::Probe,
+            },
+        ),
+        &RecordingRunner::returning(Vec::new()),
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(probe_exit, 0);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let probe: Value = serde_json::from_slice(&stdout).unwrap();
+    assert!(probe.get("kind").is_none());
+    assert_eq!(probe["protocol_version"], PROTOCOL_VERSION);
+}
+
+#[test]
+fn json_stream_errors_use_stdout_only_and_writer_failure_is_74() {
+    // Break caught: JSON follow errors go to stderr, emit a second diagnostic,
+    // or treat a failed error-event write as the original service exit.
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = public_runtime(temp.path(), temp.path());
+    let record = persist_public_job(&runtime.state, Some(JobStatus::accepted(101).unwrap()));
+    let terminal = JobStatus::succeeded(
+        110,
+        PUBLIC_STDOUT_BYTES.len() as u64,
+        PUBLIC_STDERR_BYTES.len() as u64,
+    )
+    .unwrap();
+    let runner = RecordingRunner::returning(vec![
+        status_result(&log_status_response(&record, terminal.clone())),
+        log_chunk_result(LogStream::Stdout, 0, PUBLIC_STDOUT_BYTES),
+        transport_failure(),
+    ]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = dispatch(
+        public_cli(
+            runtime.config.clone(),
+            true,
+            WorkerCommand::Logs {
+                follow: false,
+                job_id: record.meta().job_id(),
+            },
+        ),
+        &runner,
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, 69);
+    assert!(stderr.is_empty());
+    let events = parse_json_events(&stdout);
+    assert_eq!(events.len(), 2);
+    match &events[0] {
+        JsonEvent::Log {
+            protocol_version,
+            chunk,
+        } => {
+            assert_eq!(*protocol_version, PROTOCOL_VERSION);
+            assert_eq!(chunk.stream(), LogStream::Stdout);
+            assert_eq!(chunk.decoded_bytes().unwrap(), PUBLIC_STDOUT_BYTES);
+        }
+        other => panic!("first JSON stream event must be the log chunk, got {other:?}"),
+    }
+    match &events[1] {
+        JsonEvent::Error {
+            protocol_version,
+            code,
+            message,
+        } => {
+            assert_eq!(*protocol_version, PROTOCOL_VERSION);
+            assert_eq!(code, "SSH_UNAVAILABLE");
+            assert_eq!(message, "SSH control request failed");
+        }
+        other => panic!("JSON stream error must be one error event, got {other:?}"),
+    }
+    assert!(!String::from_utf8_lossy(&stdout).contains("mac1"));
+
+    let fail_runner = RecordingRunner::returning(vec![
+        status_result(&log_status_response(&record, terminal)),
+        log_chunk_result(LogStream::Stdout, 0, PUBLIC_STDOUT_BYTES),
+        transport_failure(),
+    ]);
+    let mut failing = FailOnJsonErrorEvent { bytes: Vec::new() };
+    let mut fail_stderr = Vec::new();
+    let fail_exit = dispatch(
+        public_cli(
+            runtime.config,
+            true,
+            WorkerCommand::Logs {
+                follow: false,
+                job_id: record.meta().job_id(),
+            },
+        ),
+        &fail_runner,
+        &runtime.context,
+        &mut failing,
+        &mut fail_stderr,
+    );
+    assert_eq!(fail_exit, 74);
+    assert!(fail_stderr.is_empty());
+    let surviving = parse_json_events(&failing.bytes);
+    assert_eq!(surviving.len(), 1);
+    assert!(matches!(surviving[0], JsonEvent::Log { .. }));
+    assert!(
+        !failing
+            .bytes
+            .windows(b"\"event\":\"error\"".len())
+            .any(|window| window == b"\"event\":\"error\"")
+    );
+}
+
+#[test]
+fn human_status_and_json_status_share_the_same_sanitized_report() {
+    // Break caught: human status invents fields, omits the shared DTO, or
+    // renders planted command/path/token/SSH values.
+    let command_secret = "printf TASK9_COMMAND_SECRET";
+    let planted_path = "/Users/alice/PLANTED_PROJECT_PATH";
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = public_runtime(temp.path(), temp.path());
+    let store = ClientStateStore::open(&runtime.state).unwrap();
+    let secret_record = record_with_meta_parts(
+        JOB_ID.parse().unwrap(),
+        store.client_id(),
+        "mini-1",
+        PROJECT_ID,
+        WORKTREE_ID,
+        MANIFEST_DIGEST,
+        "packages/app",
+        30_000,
+        "heavy",
+        CommandSpec::shell(command_secret.into()).unwrap(),
+        1_000,
+        Some(LEASE_TOKEN.parse().unwrap()),
+        Some(JobStatus::succeeded(1_001, 0, 0).unwrap()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(secret_record.clone()).unwrap();
+    for seed in 1..=100 {
+        store
+            .create_job(test_record(
+                &store,
+                seed,
+                seed as u64,
+                Some(JobStatus::succeeded(seed as u64, 0, 0).unwrap()),
+                RemoteUncertainty::None,
+            ))
+            .unwrap();
+    }
+    let report = StatusService {
+        config: &config(),
+        client_state: &store,
+        remote: &RemoteJobClient::new(&RecordingRunner::returning(Vec::new())),
+    }
+    .inspect(None)
+    .unwrap();
+    assert_eq!(report.jobs.len(), 100);
+    assert_eq!(report.omitted, 1);
+    let expected_human = expected_human_status(&report);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let human_exit = dispatch(
+        public_cli(
+            runtime.config.clone(),
+            false,
+            WorkerCommand::Status { job_id: None },
+        ),
+        &RecordingRunner::returning(Vec::new()),
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(human_exit, 0);
+    assert!(stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(stdout.clone()).unwrap(),
+        format!("{expected_human}\n")
+    );
+    let human = String::from_utf8(stdout.clone()).unwrap();
+    assert!(human.contains("1 older jobs omitted"));
+    for secret in [command_secret, planted_path, CLIENT_ID, LEASE_TOKEN, "mac1"] {
+        assert!(!human.contains(secret), "human status leaked {secret}");
+    }
+
+    stdout.clear();
+    let json_exit = dispatch(
+        public_cli(runtime.config, true, WorkerCommand::Status { job_id: None }),
+        &RecordingRunner::returning(Vec::new()),
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(json_exit, 0);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let value: Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["kind"], "status");
+    assert_eq!(value["omitted"], report.omitted);
+    assert_eq!(value["jobs"].as_array().unwrap().len(), report.jobs.len());
+    assert_eq!(
+        value["jobs"][0]["job_id"],
+        report.jobs[0].job_id.to_string()
+    );
+    assert_eq!(value["jobs"][0]["worker"], report.jobs[0].worker);
+    assert_eq!(
+        value["jobs"][0]["created_at_millis"],
+        report.jobs[0].created_at_millis
+    );
+    assert_eq!(
+        value["jobs"][0]["manifest_digest"],
+        report.jobs[0].manifest_digest
+    );
+    let encoded = String::from_utf8(stdout).unwrap();
+    for secret in [command_secret, planted_path, CLIENT_ID, LEASE_TOKEN, "mac1"] {
+        assert!(!encoded.contains(secret), "JSON status leaked {secret}");
+    }
+}
+
+#[test]
+fn reserved_preexecution_exits_are_64_69_70_74_75() {
+    // Break caught: pre-execution project/transport/protocol/I/O/capacity
+    // failures are remapped or emit a started-command exit.
+    let repo = run_repo(b"version = 1\n[artifacts]\ninclude = [\"target/**\"]\n");
+    let temp = tempfile::tempdir().unwrap();
+    let artifacts_runtime = public_runtime(temp.path(), repo.root());
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let artifacts_exit = dispatch(
+        public_cli(
+            artifacts_runtime.config,
+            false,
+            WorkerCommand::Run {
+                worker: "mini-1".into(),
+                project: None,
+                includes: Vec::new(),
+                timeout: None,
+                shell: None,
+                argv: vec!["true".into()],
+            },
+        ),
+        &RunScriptRunner::new(
+            artifacts_runtime
+                .state
+                .canonicalize()
+                .unwrap_or_else(|_| artifacts_runtime.state.clone()),
+            [],
+        ),
+        &artifacts_runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(artifacts_exit, 64);
+    assert!(stdout.is_empty());
+    assert!(!stderr.is_empty());
+
+    let missing = tempfile::tempdir().unwrap();
+    let missing_runtime = public_runtime(missing.path(), missing.path());
+    stdout.clear();
+    stderr.clear();
+    let missing_exit = dispatch(
+        public_cli(
+            missing_runtime.config,
+            false,
+            WorkerCommand::Logs {
+                follow: false,
+                job_id: JOB_ID.parse().unwrap(),
+            },
+        ),
+        &RecordingRunner::returning(Vec::new()),
+        &missing_runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(missing_exit, 64);
+    assert!(stdout.is_empty());
+
+    let transport = tempfile::tempdir().unwrap();
+    let transport_runtime = public_runtime(transport.path(), transport.path());
+    let record = persist_public_job(
+        &transport_runtime.state,
+        Some(JobStatus::accepted(101).unwrap()),
+    );
+    stdout.clear();
+    stderr.clear();
+    let transport_exit = dispatch(
+        public_cli(
+            transport_runtime.config,
+            false,
+            WorkerCommand::Logs {
+                follow: false,
+                job_id: record.meta().job_id(),
+            },
+        ),
+        &RecordingRunner::returning(vec![transport_failure()]),
+        &transport_runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(transport_exit, 69);
+    assert!(stdout.is_empty());
+
+    let protocol = tempfile::tempdir().unwrap();
+    let protocol_runtime = public_runtime(protocol.path(), protocol.path());
+    let protocol_record = persist_public_job(
+        &protocol_runtime.state,
+        Some(JobStatus::accepted(101).unwrap()),
+    );
+    stdout.clear();
+    stderr.clear();
+    let protocol_exit = dispatch(
+        public_cli(
+            protocol_runtime.config,
+            false,
+            WorkerCommand::Logs {
+                follow: false,
+                job_id: protocol_record.meta().job_id(),
+            },
+        ),
+        &RecordingRunner::returning(vec![status_result(&mismatched_status_for(
+            &protocol_record,
+        ))]),
+        &protocol_runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(protocol_exit, 70);
+    assert!(stdout.is_empty());
+
+    let io_temp = tempfile::tempdir().unwrap();
+    let io_runtime = public_runtime(io_temp.path(), io_temp.path());
+    persist_public_job(
+        &io_runtime.state,
+        Some(JobStatus::succeeded(110, 0, 0).unwrap()),
+    );
+    let fail_state = Arc::new(Mutex::new(OutputState::default()));
+    let mut failing = RecordingWriter::failing(fail_state);
+    stderr.clear();
+    let io_exit = dispatch(
+        public_cli(
+            io_runtime.config,
+            true,
+            WorkerCommand::Status { job_id: None },
+        ),
+        &RecordingRunner::returning(Vec::new()),
+        &io_runtime.context,
+        &mut failing,
+        &mut stderr,
+    );
+    assert_eq!(io_exit, 74);
+
+    let busy = tempfile::tempdir().unwrap();
+    let busy_repo = run_repo(b"version = 1\n");
+    let busy_runtime = public_runtime(busy.path(), busy_repo.root());
+    stdout.clear();
+    stderr.clear();
+    let busy_exit = dispatch(
+        public_cli(
+            busy_runtime.config,
+            false,
+            WorkerCommand::Run {
+                worker: "mini-1".into(),
+                project: None,
+                includes: Vec::new(),
+                timeout: None,
+                shell: None,
+                argv: vec!["true".into()],
+            },
+        ),
+        &RunScriptRunner::new(
+            busy_runtime
+                .state
+                .canonicalize()
+                .unwrap_or(busy_runtime.state.clone()),
+            [RunScriptStep::ProbeBusy],
+        ),
+        &busy_runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(busy_exit, 75);
+    assert!(stdout.is_empty());
+}
+
+fn mismatched_status_for(record: &LocalJobRecord) -> StatusResponse {
+    let response = log_status_response(record, JobStatus::accepted(101).unwrap());
+    let mut value = serde_json::to_value(response).unwrap();
+    value["meta"]["client_id"] = Value::String(CLIENT_ID.into());
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn started_command_exits_0_7_64_143_are_preserved() {
+    // Break caught: representable command exits are remapped through reserved
+    // usage/capacity/infrastructure codes after the remote command started.
+    let cases: [(u8, JobStatus); 4] = [
+        (0, JobStatus::succeeded(110, 0, 0).unwrap()),
+        (7, JobStatus::failed(110, 7, 0, 0).unwrap()),
+        (64, JobStatus::failed(110, 64, 0, 0).unwrap()),
+        (143, signal_status(110, 15, 0, 0)),
+    ];
+    for (expected, status) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = public_runtime(temp.path(), temp.path());
+        let record = persist_public_job(&runtime.state, Some(JobStatus::accepted(101).unwrap()));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = dispatch(
+            public_cli(
+                runtime.config,
+                false,
+                WorkerCommand::Logs {
+                    follow: false,
+                    job_id: record.meta().job_id(),
+                },
+            ),
+            &RecordingRunner::returning(terminal_log_script(&record, status)),
+            &runtime.context,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(exit, expected, "logs must preserve started exit {expected}");
+        assert!(stderr.is_empty());
+    }
+
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = public_runtime(temp.path(), repo.root());
+    let _ = ClientStateStore::open(&runtime.state).unwrap();
+    let runner = RunScriptRunner::new(
+        runtime.state.canonicalize().unwrap(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+            RunScriptStep::StatusTerminal {
+                exit_code: 64,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+            RunScriptStep::LogChunkBytes {
+                stream: LogStream::Stdout,
+                offset: 0,
+                bytes: b"",
+            },
+            RunScriptStep::LogChunkBytes {
+                stream: LogStream::Stderr,
+                offset: 0,
+                bytes: b"",
+            },
+            RunScriptStep::StatusTerminal {
+                exit_code: 64,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        ],
+    );
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let run_exit = dispatch(
+        public_cli(
+            runtime.config,
+            false,
+            WorkerCommand::Run {
+                worker: "mini-1".into(),
+                project: None,
+                includes: Vec::new(),
+                timeout: None,
+                shell: None,
+                argv: vec!["true".into()],
+            },
+        ),
+        &runner,
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(run_exit, 64);
+    assert!(
+        String::from_utf8(stdout)
+            .unwrap()
+            .contains(" accepted on mini-1\n")
+    );
+    assert!(stderr.is_empty());
+    runner.assert_consumed();
+}
+
+#[test]
+fn full_public_forms_execute_without_exposing_hidden_host_commands() {
+    // Break caught: one of the seven public forms is rejected, or public
+    // execution prints a hidden host verb.
+    let repo = run_repo(b"version = 1\n");
+    let project = repo.root().display().to_string();
+    let parsed = [
+        vec![
+            "worker",
+            "run",
+            "--worker",
+            "mini-1",
+            "--",
+            "npm",
+            "test",
+            "--",
+            "--literal",
+        ],
+        vec![
+            "worker",
+            "run",
+            "--worker",
+            "mini-1",
+            "--project",
+            "/repo",
+            "--include",
+            "fixtures/generated/**",
+            "--timeout",
+            "45m",
+            "--",
+            "npm",
+            "test",
+        ],
+        vec![
+            "worker",
+            "run",
+            "--worker",
+            "mini-1",
+            "--shell",
+            "npm run build && npm test",
+        ],
+        vec!["worker", "status"],
+        vec!["worker", "status", JOB_ID],
+        vec!["worker", "logs", JOB_ID],
+        vec!["worker", "logs", "-f", JOB_ID],
+    ];
+    for arguments in parsed {
+        let cli = Cli::try_parse_from(&arguments).expect("public form must parse");
+        match cli.command {
+            WorkerCommand::Run { .. }
+            | WorkerCommand::Status { .. }
+            | WorkerCommand::Logs { .. } => {}
+            WorkerCommand::Host { .. } => panic!("public form selected a hidden host command"),
+            _ => {}
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = public_runtime(temp.path(), repo.root());
+    let store = ClientStateStore::open(&runtime.state).unwrap();
+    let record = persist_log_job(&store, Some(JobStatus::succeeded(110, 0, 0).unwrap()));
+    let job_id = record.meta().job_id().to_string();
+    let forms = [
+        (
+            {
+                let mut cli = Cli::try_parse_from([
+                    "worker",
+                    "run",
+                    "--worker",
+                    "mini-1",
+                    "--",
+                    "npm",
+                    "test",
+                    "--",
+                    "--literal",
+                ])
+                .unwrap();
+                cli.config = Some(runtime.config.clone());
+                cli
+            },
+            RunScriptRunner::new(runtime.state.canonicalize().unwrap(), run_terminal_steps(0)),
+        ),
+        (
+            {
+                let mut cli = Cli::try_parse_from([
+                    "worker",
+                    "run",
+                    "--worker",
+                    "mini-1",
+                    "--project",
+                    project.as_str(),
+                    "--include",
+                    "tracked.txt",
+                    "--timeout",
+                    "45m",
+                    "--",
+                    "npm",
+                    "test",
+                ])
+                .unwrap();
+                cli.config = Some(runtime.config.clone());
+                cli
+            },
+            RunScriptRunner::new(runtime.state.canonicalize().unwrap(), run_terminal_steps(0)),
+        ),
+        (
+            {
+                let mut cli = Cli::try_parse_from([
+                    "worker",
+                    "run",
+                    "--worker",
+                    "mini-1",
+                    "--shell",
+                    "npm run build && npm test",
+                ])
+                .unwrap();
+                cli.config = Some(runtime.config.clone());
+                cli
+            },
+            RunScriptRunner::new(runtime.state.canonicalize().unwrap(), run_terminal_steps(0)),
+        ),
+    ];
+    for (cli, runner) in forms {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = dispatch(cli, &runner, &runtime.context, &mut stdout, &mut stderr);
+        assert_eq!(exit, 0);
+        assert_no_hidden_host_leak(&stdout, &stderr);
+        runner.assert_consumed();
+    }
+
+    let status_runner = RecordingRunner::returning(Vec::new());
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut status_cli = Cli::try_parse_from(["worker", "status"]).unwrap();
+    status_cli.config = Some(runtime.config.clone());
+    assert_eq!(
+        dispatch(
+            status_cli,
+            &status_runner,
+            &runtime.context,
+            &mut stdout,
+            &mut stderr
+        ),
+        0
+    );
+    assert_no_hidden_host_leak(&stdout, &stderr);
+
+    stdout.clear();
+    let mut exact_cli = Cli::try_parse_from(["worker", "status", job_id.as_str()]).unwrap();
+    exact_cli.config = Some(runtime.config.clone());
+    assert_eq!(
+        dispatch(
+            exact_cli,
+            &RecordingRunner::returning(vec![status_result(&log_status_response(
+                &record,
+                JobStatus::succeeded(110, 0, 0).unwrap(),
+            ))]),
+            &runtime.context,
+            &mut stdout,
+            &mut stderr
+        ),
+        0
+    );
+    assert_no_hidden_host_leak(&stdout, &stderr);
+
+    stdout.clear();
+    let mut logs_cli = Cli::try_parse_from(["worker", "logs", job_id.as_str()]).unwrap();
+    logs_cli.config = Some(runtime.config.clone());
+    assert_eq!(
+        dispatch(
+            logs_cli,
+            &RecordingRunner::returning(terminal_log_script(
+                &record,
+                JobStatus::succeeded(110, 0, 0).unwrap(),
+            )),
+            &runtime.context,
+            &mut stdout,
+            &mut stderr
+        ),
+        0
+    );
+    assert_no_hidden_host_leak(&stdout, &stderr);
+
+    stdout.clear();
+    let mut follow_cli = Cli::try_parse_from(["worker", "logs", "-f", job_id.as_str()]).unwrap();
+    follow_cli.config = Some(runtime.config);
+    assert_eq!(
+        dispatch(
+            follow_cli,
+            &RecordingRunner::returning(vec![
+                status_result(&log_status_response(
+                    &record,
+                    JobStatus::succeeded(110, 0, 0).unwrap(),
+                )),
+                log_chunk_result(LogStream::Stdout, 0, b""),
+                log_chunk_result(LogStream::Stderr, 0, b""),
+                status_result(&log_status_response(
+                    &record,
+                    JobStatus::succeeded(110, 0, 0).unwrap(),
+                )),
+            ]),
+            &runtime.context,
+            &mut stdout,
+            &mut stderr
+        ),
+        0
+    );
+    assert_no_hidden_host_leak(&stdout, &stderr);
 }

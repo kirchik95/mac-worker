@@ -78,6 +78,65 @@ impl WorkerError {
             _ => self.exit_kind() as u8,
         }
     }
+
+    pub fn public_code(&self) -> String {
+        match self {
+            Self::Project { code, .. }
+            | Self::Snapshot { code, .. }
+            | Self::Capacity { code, .. }
+            | Self::Transport { code, .. } => (*code).to_owned(),
+            Self::Config(message) => coded_prefix(message).unwrap_or("CONFIG").to_owned(),
+            Self::Unavailable(message) => coded_prefix(message).unwrap_or("UNAVAILABLE").to_owned(),
+            Self::Protocol(message) => coded_prefix(message).unwrap_or("PROTOCOL").to_owned(),
+            Self::CommandExit { .. } => "COMMAND_EXIT".to_owned(),
+            Self::Io(_) => "IO".to_owned(),
+            Self::Process(_) => "PROCESS".to_owned(),
+        }
+    }
+
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::Project { message, .. }
+            | Self::Snapshot { message, .. }
+            | Self::Capacity { message, .. }
+            | Self::Transport { message, .. } => message.clone(),
+            Self::Config(message) => coded_suffix(message)
+                .map(str::to_owned)
+                .unwrap_or_else(|| "configuration error".into()),
+            Self::Unavailable(message) => coded_suffix(message)
+                .map(str::to_owned)
+                .unwrap_or_else(|| "worker unavailable".into()),
+            Self::Protocol(message) => coded_suffix(message)
+                .map(str::to_owned)
+                .unwrap_or_else(|| "protocol error".into()),
+            Self::CommandExit { code } => format!("command exited with status {code}"),
+            Self::Io(_) => "I/O error".into(),
+            Self::Process(_) => "process error".into(),
+        }
+    }
+}
+
+fn coded_prefix(message: &str) -> Option<&str> {
+    coded_parts(message).map(|(code, _)| code)
+}
+
+fn coded_suffix(message: &str) -> Option<&str> {
+    coded_parts(message).map(|(_, detail)| detail)
+}
+
+fn coded_parts(message: &str) -> Option<(&str, &str)> {
+    let (code, detail) = message.split_once(": ")?;
+    if !code.is_empty()
+        && code.len() <= 128
+        && code.starts_with(|byte: char| byte.is_ascii_uppercase())
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        Some((code, detail))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
