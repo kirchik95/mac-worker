@@ -332,54 +332,84 @@ impl<'a> RunService<'a> {
 
         let accepted = match acquire_result {
             Ok(LeaseAcquireResponse::ExistingAccepted { .. }) => {
-                remote.status(&worker, material.job_id())?
+                match remote.status(&worker, material.job_id()) {
+                    Ok(status) => status,
+                    Err(error) => {
+                        self.resolve_after_acceptance_evidence(&remote, &worker, &record, error)?
+                    }
+                }
             }
             Ok(LeaseAcquireResponse::Acquired { lease }) => {
-                require_exact_lease(&material, &lease)?;
-                let identity = TransferIdentity::from_acquire_request(&acquire)?;
-                if let Err(error) =
-                    RsyncTransport::new(self.runner).upload(&worker, &prepared.snapshot, &identity)
-                {
+                if let Err(error) = require_exact_lease(&material, &lease) {
                     self.resolve_after_error(&remote, &worker, &record, error)?
                 } else {
-                    let verify = SnapshotVerifyRequest::new(
-                        material.job_id(),
-                        material.client_id(),
-                        material.lease_token(),
-                        material.fingerprint(),
-                        material.project_id().into(),
-                        material.worktree_id().into(),
-                        material.manifest_digest().into(),
-                    )?;
-                    let verified: Result<VerifiedSnapshotResponse, WorkerError> = transport
-                        .request(
-                            &worker,
-                            HostOperation::SnapshotVerify,
-                            &verify,
-                            control_policy(),
-                        );
-                    match verified {
-                        Err(error) => self.resolve_after_error(&remote, &worker, &record, error)?,
-                        Ok(response) => {
-                            require_exact_verification(&material, &response)?;
-                            let submit = SubmitRequest::new(material.clone());
-                            let raw: Result<SubmitResponse, WorkerError> = transport.request(
+                    let identity = TransferIdentity::from_acquire_request(&acquire)?;
+                    if let Err(error) = RsyncTransport::new(self.runner).upload(
+                        &worker,
+                        &prepared.snapshot,
+                        &identity,
+                    ) {
+                        self.resolve_after_error(&remote, &worker, &record, error)?
+                    } else {
+                        let verify = SnapshotVerifyRequest::new(
+                            material.job_id(),
+                            material.client_id(),
+                            material.lease_token(),
+                            material.fingerprint(),
+                            material.project_id().into(),
+                            material.worktree_id().into(),
+                            material.manifest_digest().into(),
+                        )?;
+                        let verified: Result<VerifiedSnapshotResponse, WorkerError> = transport
+                            .request(
                                 &worker,
-                                HostOperation::Submit,
-                                &submit,
+                                HostOperation::SnapshotVerify,
+                                &verify,
                                 control_policy(),
                             );
-                            match raw {
-                                Ok(response) => {
-                                    let response = remote.resolve_submission(
-                                        &worker,
-                                        &submit,
-                                        Ok(response),
-                                    )?;
-                                    status_from_submit(&record, response)?
-                                }
-                                Err(error) => {
+                        match verified {
+                            Err(error) => {
+                                self.resolve_after_error(&remote, &worker, &record, error)?
+                            }
+                            Ok(response) => {
+                                if let Err(error) = require_exact_verification(&material, &response)
+                                {
                                     self.resolve_after_error(&remote, &worker, &record, error)?
+                                } else {
+                                    let submit = SubmitRequest::new(material.clone());
+                                    let raw: Result<SubmitResponse, WorkerError> = transport
+                                        .request(
+                                            &worker,
+                                            HostOperation::Submit,
+                                            &submit,
+                                            control_policy(),
+                                        );
+                                    match raw {
+                                        Ok(response) => {
+                                            match remote.resolve_submission(
+                                                &worker,
+                                                &submit,
+                                                Ok(response),
+                                            ) {
+                                                Ok(response) => {
+                                                    match status_from_submit(&record, response) {
+                                                        Ok(response) => response,
+                                                        Err(error) => self
+                                                            .resolve_after_acceptance_evidence(
+                                                                &remote, &worker, &record, error,
+                                                            )?,
+                                                    }
+                                                }
+                                                Err(error) => self
+                                                    .resolve_after_acceptance_evidence(
+                                                        &remote, &worker, &record, error,
+                                                    )?,
+                                            }
+                                        }
+                                        Err(error) => self.resolve_after_error(
+                                            &remote, &worker, &record, error,
+                                        )?,
+                                    }
                                 }
                             }
                         }
@@ -389,7 +419,15 @@ impl<'a> RunService<'a> {
             Err(error) => self.resolve_after_error(&remote, &worker, &record, error)?,
         };
 
-        let accepted_status = normalize_authoritative_status(&record, accepted)?;
+        let accepted_status = match normalize_authoritative_status(&record, accepted) {
+            Ok(status) => status,
+            Err(error) => {
+                let resolved =
+                    self.resolve_after_acceptance_evidence(&remote, &worker, &record, error)?;
+                normalize_authoritative_status(&record, resolved)
+                    .map_err(|_| inconsistent_acceptance_evidence())?
+            }
+        };
         let accepted_record = persist_authoritative(self.client_state, &record, accepted_status)?;
         write_accepted(&accepted_record, json, stdout)?;
 
@@ -403,6 +441,13 @@ impl<'a> RunService<'a> {
         }
         let terminal_record =
             persist_authoritative(self.client_state, &accepted_record, terminal_status.clone())?;
+        let terminal_status = terminal_record
+            .last_status()
+            .cloned()
+            .ok_or_else(inconsistent_terminal_outcome)?;
+        if !terminal_status.state().is_terminal() {
+            return Err(inconsistent_terminal_outcome());
+        }
         let exit_code = terminal_exit_code(&terminal_status)?;
         Ok(RunCompletion {
             report: RunReport::new(
@@ -421,31 +466,85 @@ impl<'a> RunService<'a> {
         record: &LocalJobRecord,
         original: WorkerError,
     ) -> Result<StatusResponse, WorkerError> {
+        self.resolve_disposition(remote, worker, record, original, false)
+    }
+
+    fn resolve_after_acceptance_evidence(
+        &self,
+        remote: &RemoteJobClient<'_>,
+        worker: &WorkerEntry,
+        record: &LocalJobRecord,
+        original: WorkerError,
+    ) -> Result<StatusResponse, WorkerError> {
+        self.resolve_disposition(remote, worker, record, original, true)
+    }
+
+    fn resolve_disposition(
+        &self,
+        remote: &RemoteJobClient<'_>,
+        worker: &WorkerEntry,
+        record: &LocalJobRecord,
+        original: WorkerError,
+        acceptance_evidence: bool,
+    ) -> Result<StatusResponse, WorkerError> {
         let resolution = ResolveOrAbandonRequest::try_from(record)?;
-        match remote.resolve_preacceptance(worker, &resolution)? {
+        let disposition = match remote.resolve_preacceptance(worker, &resolution) {
+            Ok(disposition) => disposition,
+            Err(error) if !acceptance_evidence => return Err(error),
+            Err(_) => {
+                self.persist_uncertainty(record, "ACCEPTANCE_EVIDENCE_CONFLICT", false)?;
+                return Err(inconsistent_acceptance_evidence());
+            }
+        };
+        match disposition {
             PreacceptanceDisposition::Accepted(response) => Ok(response),
-            PreacceptanceDisposition::Abandoned => Err(original),
+            PreacceptanceDisposition::Abandoned if !acceptance_evidence => Err(original),
+            PreacceptanceDisposition::Abandoned => {
+                self.persist_uncertainty(record, "ACCEPTANCE_EVIDENCE_CONFLICT", false)?;
+                Err(inconsistent_acceptance_evidence())
+            }
             PreacceptanceDisposition::CleanupPending { code } => {
-                self.client_state.set_remote_uncertainty_if_same_immutable(
-                    record,
-                    RemoteUncertainty::cleanup_pending(code.clone())?,
-                )?;
+                self.persist_uncertainty(record, &code, true)?;
                 Err(recovery_error(record, &code, true))
             }
             PreacceptanceDisposition::UnknownRemote { code } => {
-                self.client_state.set_remote_uncertainty_if_same_immutable(
-                    record,
-                    RemoteUncertainty::unknown_remote(code.clone())?,
-                )?;
+                self.persist_uncertainty(record, &code, false)?;
                 Err(recovery_error(record, &code, false))
             }
         }
+    }
+
+    fn persist_uncertainty(
+        &self,
+        record: &LocalJobRecord,
+        code: &str,
+        cleanup_pending: bool,
+    ) -> Result<(), WorkerError> {
+        let uncertainty = if cleanup_pending {
+            RemoteUncertainty::cleanup_pending(code.to_owned())?
+        } else {
+            RemoteUncertainty::unknown_remote(code.to_owned())?
+        };
+        self.client_state
+            .set_remote_uncertainty_if_same_immutable(record, uncertainty)?;
+        Ok(())
     }
 }
 
 fn project_preparation_error(error: ProjectPreparationError) -> WorkerError {
     match error {
-        ProjectPreparationError::Selection(failure) => WorkerError::Snapshot {
+        ProjectPreparationError::Selection(failure)
+            if matches!(
+                failure.code,
+                "GIT_INPUT_SELECTION_FAILED" | "INVALID_GIT_OUTPUT" | "INPUT_INSPECTION_FAILED"
+            ) =>
+        {
+            WorkerError::Snapshot {
+                code: failure.code,
+                message: failure.message,
+            }
+        }
+        ProjectPreparationError::Selection(failure) => WorkerError::Project {
             code: failure.code,
             message: failure.message,
         },
@@ -600,6 +699,12 @@ pub(crate) fn terminal_exit_code(status: &JobStatus) -> Result<u8, WorkerError> 
 fn inconsistent_terminal_outcome() -> WorkerError {
     WorkerError::Protocol(
         "REMOTE_OUTCOME_INVALID: remote command ended with an inconsistent outcome".into(),
+    )
+}
+
+fn inconsistent_acceptance_evidence() -> WorkerError {
+    WorkerError::Protocol(
+        "ACCEPTANCE_EVIDENCE_CONFLICT: remote acceptance evidence was inconsistent".into(),
     )
 }
 

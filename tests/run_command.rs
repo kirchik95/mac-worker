@@ -2121,19 +2121,48 @@ enum RunScriptStep {
     ProbeReady,
     ProbeUnavailable,
     Acquire,
+    AcquireMismatch(LeaseMismatch),
     AcquireExisting,
     Upload,
     Verify,
+    VerifyMismatch(VerificationMismatch),
     SubmitAccepted,
+    SubmitAcceptedMismatch,
+    SubmitExisting,
     TransportFailure(HostOperation),
     AuthoritativeFailure(HostOperation, &'static str),
     UploadFailure,
     StatusAccepted,
+    StatusMismatch,
     StatusTransportFailure,
     ResolveAccepted,
     ResolveAbandoned,
     ResolveCleanupPending,
     ResolveTransportFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseMismatch {
+    JobId,
+    ClientId,
+    LeaseToken,
+    RequestFingerprint,
+    WorkerName,
+    ProjectId,
+    WorktreeId,
+    ManifestDigest,
+    TimeoutMillis,
+    ResourceClass,
+    CommandSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerificationMismatch {
+    JobId,
+    ClientId,
+    ProjectId,
+    WorktreeId,
+    ManifestDigest,
 }
 
 #[derive(Default)]
@@ -2142,6 +2171,7 @@ struct RunScriptState {
     requests: Vec<ProcessRequest>,
     events: Vec<String>,
     material: Option<RequestFingerprintMaterial>,
+    fail_index_query: bool,
 }
 
 struct RunScriptRunner {
@@ -2154,6 +2184,20 @@ impl RunScriptRunner {
         Self {
             state: Mutex::new(RunScriptState {
                 steps: steps.into_iter().collect(),
+                ..RunScriptState::default()
+            }),
+            state_root,
+        }
+    }
+
+    fn with_index_query_failure(
+        state_root: PathBuf,
+        steps: impl IntoIterator<Item = RunScriptStep>,
+    ) -> Self {
+        Self {
+            state: Mutex::new(RunScriptState {
+                steps: steps.into_iter().collect(),
+                fail_index_query: true,
                 ..RunScriptState::default()
             }),
             state_root,
@@ -2224,6 +2268,89 @@ fn material_status(material: &RequestFingerprintMaterial, status: JobStatus) -> 
     .unwrap()
 }
 
+fn mismatched_lease(material: &RequestFingerprintMaterial, mismatch: LeaseMismatch) -> LeaseRecord {
+    let lease = LeaseRecord::new(
+        material,
+        material.fingerprint(),
+        material.created_at_millis(),
+        material.created_at_millis() + material.timeout_millis(),
+    )
+    .unwrap();
+    let mut value = serde_json::to_value(lease).unwrap();
+    match mismatch {
+        LeaseMismatch::JobId => value["job_id"] = Value::String(JOB_ID.into()),
+        LeaseMismatch::ClientId => value["client_id"] = Value::String(CLIENT_ID.into()),
+        LeaseMismatch::LeaseToken => value["lease_token"] = Value::String(LEASE_TOKEN.into()),
+        LeaseMismatch::RequestFingerprint => {
+            value["request_fingerprint"] = Value::String("d".repeat(64));
+        }
+        LeaseMismatch::WorkerName => value["worker_name"] = Value::String("other-worker".into()),
+        LeaseMismatch::ProjectId => value["project_id"] = Value::String("d".repeat(64)),
+        LeaseMismatch::WorktreeId => value["worktree_id"] = Value::String("d".repeat(64)),
+        LeaseMismatch::ManifestDigest => {
+            value["manifest_digest"] = Value::String("d".repeat(64));
+        }
+        LeaseMismatch::TimeoutMillis => {
+            value["timeout_millis"] = Value::from(material.timeout_millis() + 1);
+        }
+        LeaseMismatch::ResourceClass => {
+            value["resource_class"] = Value::String("other-class".into());
+        }
+        LeaseMismatch::CommandSummary => {
+            value["command_summary"] = serde_json::json!({"mode": "shell"});
+        }
+    }
+    serde_json::from_value(value).unwrap()
+}
+
+fn mismatched_verification(
+    material: &RequestFingerprintMaterial,
+    mismatch: VerificationMismatch,
+) -> VerifiedSnapshotResponse {
+    let job_id = if mismatch == VerificationMismatch::JobId {
+        JOB_ID.parse().unwrap()
+    } else {
+        material.job_id()
+    };
+    let client_id = if mismatch == VerificationMismatch::ClientId {
+        CLIENT_ID.parse().unwrap()
+    } else {
+        material.client_id()
+    };
+    let project_id = if mismatch == VerificationMismatch::ProjectId {
+        "d".repeat(64)
+    } else {
+        material.project_id().into()
+    };
+    let worktree_id = if mismatch == VerificationMismatch::WorktreeId {
+        "d".repeat(64)
+    } else {
+        material.worktree_id().into()
+    };
+    let manifest_digest = if mismatch == VerificationMismatch::ManifestDigest {
+        "d".repeat(64)
+    } else {
+        material.manifest_digest().into()
+    };
+    VerifiedSnapshotResponse::new(
+        job_id,
+        client_id,
+        project_id,
+        worktree_id,
+        manifest_digest,
+        material.created_at_millis() + 1,
+        false,
+    )
+    .unwrap()
+}
+
+fn mismatched_status(material: &RequestFingerprintMaterial, status: JobStatus) -> StatusResponse {
+    let response = material_status(material, status);
+    let mut value = serde_json::to_value(response).unwrap();
+    value["meta"]["client_id"] = Value::String(CLIENT_ID.into());
+    serde_json::from_value(value).unwrap()
+}
+
 fn assert_resolution_matches(
     request: &ResolveOrAbandonRequest,
     material: &RequestFingerprintMaterial,
@@ -2248,7 +2375,18 @@ fn assert_resolution_matches(
 impl ProcessRunner for RunScriptRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
         if request.program == OsStr::new("/usr/bin/git") {
-            self.state.lock().unwrap().events.push("git".into());
+            let mut state = self.state.lock().unwrap();
+            state.events.push("git".into());
+            if state.fail_index_query
+                && request.args.iter().any(|argument| argument == "ls-files")
+                && request.args.iter().any(|argument| argument == "--stage")
+            {
+                state.fail_index_query = false;
+                return Err(WorkerError::Io(io::Error::other(
+                    "planted Git input query failure",
+                )));
+            }
+            drop(state);
             return SystemProcessRunner.run(request);
         }
 
@@ -2279,7 +2417,9 @@ impl ProcessRunner for RunScriptRunner {
                     stderr: Vec::new(),
                 })
             }
-            RunScriptStep::Acquire | RunScriptStep::AcquireExisting => {
+            RunScriptStep::Acquire
+            | RunScriptStep::AcquireMismatch(_)
+            | RunScriptStep::AcquireExisting => {
                 assert_eq!(
                     request.args.last().unwrap(),
                     HostOperation::LeaseAcquire.command()
@@ -2298,6 +2438,10 @@ impl ProcessRunner for RunScriptRunner {
                 if step == RunScriptStep::AcquireExisting {
                     canonical_process(&LeaseAcquireResponse::ExistingAccepted {
                         status: JobStatus::accepted(material.created_at_millis()).unwrap(),
+                    })
+                } else if let RunScriptStep::AcquireMismatch(mismatch) = step {
+                    canonical_process(&LeaseAcquireResponse::Acquired {
+                        lease: mismatched_lease(&material, mismatch),
                     })
                 } else {
                     let lease = LeaseRecord::new(
@@ -2337,7 +2481,7 @@ impl ProcessRunner for RunScriptRunner {
                     successful_process(STOCK_RSYNC_STATS.to_vec())
                 }
             }
-            RunScriptStep::Verify => {
+            RunScriptStep::Verify | RunScriptStep::VerifyMismatch(_) => {
                 assert_eq!(
                     request.args.last().unwrap(),
                     HostOperation::SnapshotVerify.command()
@@ -2352,20 +2496,26 @@ impl ProcessRunner for RunScriptRunner {
                 assert_eq!(verify.project_id(), material.project_id());
                 assert_eq!(verify.worktree_id(), material.worktree_id());
                 assert_eq!(verify.manifest_digest(), material.manifest_digest());
-                canonical_process(
-                    &VerifiedSnapshotResponse::new(
-                        verify.job_id(),
-                        verify.client_id(),
-                        verify.project_id().into(),
-                        verify.worktree_id().into(),
-                        verify.manifest_digest().into(),
-                        material.created_at_millis() + 1,
-                        false,
+                if let RunScriptStep::VerifyMismatch(mismatch) = step {
+                    canonical_process(&mismatched_verification(material, mismatch))
+                } else {
+                    canonical_process(
+                        &VerifiedSnapshotResponse::new(
+                            verify.job_id(),
+                            verify.client_id(),
+                            verify.project_id().into(),
+                            verify.worktree_id().into(),
+                            verify.manifest_digest().into(),
+                            material.created_at_millis() + 1,
+                            false,
+                        )
+                        .unwrap(),
                     )
-                    .unwrap(),
-                )
+                }
             }
-            RunScriptStep::SubmitAccepted => {
+            RunScriptStep::SubmitAccepted
+            | RunScriptStep::SubmitAcceptedMismatch
+            | RunScriptStep::SubmitExisting => {
                 assert_eq!(
                     request.args.last().unwrap(),
                     HostOperation::Submit.command()
@@ -2375,10 +2525,26 @@ impl ProcessRunner for RunScriptRunner {
                 let material = state.material.as_ref().unwrap();
                 assert_eq!(submit.material(), material);
                 assert_eq!(submit.request_fingerprint(), &material.fingerprint());
-                canonical_process(&SubmitResponse::Accepted {
-                    meta: Box::new(JobMeta::new(material, material.fingerprint()).unwrap()),
-                    status: JobStatus::accepted(material.created_at_millis()).unwrap(),
-                })
+                if step == RunScriptStep::SubmitExisting {
+                    canonical_process(&SubmitResponse::Existing {
+                        status: JobStatus::accepted(material.created_at_millis()).unwrap(),
+                    })
+                } else {
+                    let meta = if step == RunScriptStep::SubmitAcceptedMismatch {
+                        mismatched_status(
+                            material,
+                            JobStatus::accepted(material.created_at_millis()).unwrap(),
+                        )
+                        .meta()
+                        .clone()
+                    } else {
+                        JobMeta::new(material, material.fingerprint()).unwrap()
+                    };
+                    canonical_process(&SubmitResponse::Accepted {
+                        meta: Box::new(meta),
+                        status: JobStatus::accepted(material.created_at_millis()).unwrap(),
+                    })
+                }
             }
             RunScriptStep::TransportFailure(operation) => {
                 assert_eq!(request.args.last().unwrap(), operation.command());
@@ -2420,6 +2586,7 @@ impl ProcessRunner for RunScriptRunner {
                 })
             }
             RunScriptStep::StatusAccepted
+            | RunScriptStep::StatusMismatch
             | RunScriptStep::StatusTransportFailure
             | RunScriptStep::ResolveAccepted => {
                 assert_eq!(
@@ -2436,6 +2603,11 @@ impl ProcessRunner for RunScriptRunner {
                         stdout: Vec::new(),
                         stderr: Vec::new(),
                     })
+                } else if step == RunScriptStep::StatusMismatch {
+                    canonical_process(&mismatched_status(
+                        material,
+                        JobStatus::accepted(material.created_at_millis()).unwrap(),
+                    ))
                 } else {
                     canonical_process(&material_status(
                         material,
@@ -2684,6 +2856,31 @@ impl JobFollower for RecordingFollower {
             record.meta().clone()
         };
         StatusResponse::new(meta, status)
+    }
+}
+
+struct ConcurrentTerminalFollower {
+    store: ClientStateStore,
+}
+
+impl JobFollower for ConcurrentTerminalFollower {
+    fn follow(
+        &self,
+        record: &LocalJobRecord,
+        _json: bool,
+        _stdout: &mut dyn Write,
+        _stderr: &mut dyn Write,
+    ) -> Result<StatusResponse, WorkerError> {
+        let updated = record.meta().created_at_millis() + 2;
+        let follower_status = JobStatus::failed(updated, 7, 0, 0).unwrap();
+        let concurrent = follower_status
+            .clone()
+            .with_cleanup_error("CONCURRENT_CLEANUP".into(), updated + 1)
+            .unwrap();
+        self.store
+            .update_observation(record.meta().job_id(), concurrent)
+            .unwrap();
+        StatusResponse::new(record.meta().clone(), follower_status)
     }
 }
 
@@ -3475,7 +3672,7 @@ fn run_completion_classifies_inconsistent_terminal_outcomes_as_infrastructure() 
         let follower = RecordingFollower::terminal(outcome, false);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let (result, runner, _) = run_with_script(
+        let (result, runner, store) = run_with_script(
             &repo,
             &temp,
             [
@@ -3496,6 +3693,469 @@ fn run_completion_classifies_inconsistent_terminal_outcomes_as_infrastructure() 
             expected_code,
             "{outcome:?}"
         );
+        if matches!(outcome, FollowerOutcome::Error(_)) {
+            let persisted = store.list_jobs().unwrap().pop().unwrap();
+            assert_eq!(persisted.last_status().unwrap().state(), JobState::Accepted);
+            assert_eq!(persisted.remote_uncertainty(), &RemoteUncertainty::None);
+        }
         runner.assert_consumed();
     }
+}
+
+#[test]
+fn mismatched_acquire_and_verify_identity_responses_always_resolve_before_returning() {
+    // Break caught: a structurally valid but wrong acquire/verify response
+    // returns immediately even though the remote side may already have mutated.
+    let lease_mismatches = [
+        LeaseMismatch::JobId,
+        LeaseMismatch::ClientId,
+        LeaseMismatch::LeaseToken,
+        LeaseMismatch::RequestFingerprint,
+        LeaseMismatch::WorkerName,
+        LeaseMismatch::ProjectId,
+        LeaseMismatch::WorktreeId,
+        LeaseMismatch::ManifestDigest,
+        LeaseMismatch::TimeoutMillis,
+        LeaseMismatch::ResourceClass,
+        LeaseMismatch::CommandSummary,
+    ];
+    for mismatch in lease_mismatches {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let (result, runner, store) = run_with_script(
+            &repo,
+            &temp,
+            [
+                RunScriptStep::ProbeReady,
+                RunScriptStep::AcquireMismatch(mismatch),
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveAbandoned,
+            ],
+            &follower,
+            Some(&runtime),
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                WorkerError::Transport {
+                    code: "INVALID_RESPONSE",
+                    ..
+                }
+            ),
+            "{mismatch:?}"
+        );
+        let record = store.list_jobs().unwrap().pop().unwrap();
+        assert!(record.last_status().is_none(), "{mismatch:?}");
+        assert_eq!(record.remote_uncertainty(), &RemoteUncertainty::None);
+        runner.assert_consumed();
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+
+    let verification_mismatches = [
+        VerificationMismatch::JobId,
+        VerificationMismatch::ClientId,
+        VerificationMismatch::ProjectId,
+        VerificationMismatch::WorktreeId,
+        VerificationMismatch::ManifestDigest,
+    ];
+    for mismatch in verification_mismatches {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let (result, runner, _) = run_with_script(
+            &repo,
+            &temp,
+            [
+                RunScriptStep::ProbeReady,
+                RunScriptStep::Acquire,
+                RunScriptStep::Upload,
+                RunScriptStep::VerifyMismatch(mismatch),
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveAbandoned,
+            ],
+            &follower,
+            Some(&runtime),
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                WorkerError::Transport {
+                    code: "INVALID_RESPONSE",
+                    ..
+                }
+            ),
+            "{mismatch:?}"
+        );
+        runner.assert_consumed();
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+}
+
+#[test]
+fn mismatched_mutation_responses_preserve_typed_resolution_outcomes() {
+    // Break caught: mismatch recovery cannot continue an accepted job or
+    // durably distinguish unknown remote state from cleanup pending.
+    for steps in [
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::AcquireMismatch(LeaseMismatch::ProjectId),
+            RunScriptStep::ResolveAccepted,
+        ],
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::VerifyMismatch(VerificationMismatch::ManifestDigest),
+            RunScriptStep::ResolveAccepted,
+        ],
+    ] {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let (result, runner, store) = run_with_script(
+            &repo,
+            &temp,
+            steps,
+            &follower,
+            Some(&runtime),
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(result.unwrap().exit_code, 0);
+        assert!(
+            store.list_jobs().unwrap()[0]
+                .last_status()
+                .unwrap()
+                .state()
+                .is_terminal()
+        );
+        runner.assert_consumed();
+    }
+
+    for (tail, cleanup_pending) in [
+        (
+            vec![
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveTransportFailure,
+            ],
+            false,
+        ),
+        (
+            vec![
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveCleanupPending,
+            ],
+            true,
+        ),
+    ] {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let mut steps = vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::AcquireMismatch(LeaseMismatch::LeaseToken),
+        ];
+        steps.extend(tail);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let (result, runner, store) = run_with_script(
+            &repo,
+            &temp,
+            steps,
+            &follower,
+            Some(&runtime),
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(result.unwrap_err().exit_code(), 70);
+        let record = store.list_jobs().unwrap().pop().unwrap();
+        assert_eq!(
+            matches!(
+                record.remote_uncertainty(),
+                RemoteUncertainty::CleanupPending { .. }
+            ),
+            cleanup_pending
+        );
+        assert_eq!(
+            matches!(
+                record.remote_uncertainty(),
+                RemoteUncertainty::UnknownRemote { .. }
+            ),
+            !cleanup_pending
+        );
+        runner.assert_consumed();
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+}
+
+#[test]
+fn every_acceptance_evidence_failure_resolves_before_following_or_returning() {
+    // Break caught: accepted/existing evidence can return transport failure
+    // without persisting an exact accepted status or typed uncertainty.
+    let cases = [
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::AcquireExisting,
+            RunScriptStep::StatusTransportFailure,
+            RunScriptStep::ResolveAccepted,
+        ],
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::AcquireExisting,
+            RunScriptStep::StatusMismatch,
+            RunScriptStep::ResolveAccepted,
+        ],
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAcceptedMismatch,
+            RunScriptStep::ResolveAccepted,
+        ],
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitExisting,
+            RunScriptStep::StatusTransportFailure,
+            RunScriptStep::ResolveAccepted,
+        ],
+        vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitExisting,
+            RunScriptStep::StatusMismatch,
+            RunScriptStep::ResolveAccepted,
+        ],
+    ];
+    for steps in cases {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let (result, runner, store) = run_with_script(
+            &repo,
+            &temp,
+            steps,
+            &follower,
+            Some(&runtime),
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(result.unwrap().exit_code, 0);
+        assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
+        let record = store.list_jobs().unwrap().pop().unwrap();
+        assert!(record.last_status().unwrap().state().is_terminal());
+        assert_eq!(record.remote_uncertainty(), &RemoteUncertainty::None);
+        runner.assert_consumed();
+    }
+}
+
+#[test]
+fn contradictory_or_uncertain_acceptance_evidence_is_durable_and_infrastructure() {
+    // Break caught: contradictory acceptance evidence becomes unavailable/69
+    // or exits without a durable uncertainty marker.
+    for (tail, expected_code) in [
+        (
+            vec![
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveTransportFailure,
+            ],
+            "UNKNOWN_REMOTE",
+        ),
+        (
+            vec![
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveCleanupPending,
+            ],
+            "CLEANUP_STILL_PENDING",
+        ),
+        (
+            vec![
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveAbandoned,
+            ],
+            "ACCEPTANCE_EVIDENCE_CONFLICT",
+        ),
+        (
+            vec![RunScriptStep::AuthoritativeFailure(
+                HostOperation::Status,
+                "JOB_ID_CONFLICT",
+            )],
+            "ACCEPTANCE_EVIDENCE_CONFLICT",
+        ),
+    ] {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let mut steps = vec![
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAcceptedMismatch,
+        ];
+        steps.extend(tail);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let (result, runner, store) = run_with_script(
+            &repo,
+            &temp,
+            steps,
+            &follower,
+            Some(&runtime),
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(result.unwrap_err().exit_code(), 70);
+        let record = store.list_jobs().unwrap().pop().unwrap();
+        assert_eq!(record.remote_uncertainty().code(), Some(expected_code));
+        assert!(record.last_status().is_none());
+        assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+        runner.assert_consumed();
+    }
+}
+
+#[test]
+fn completion_uses_the_concurrently_enriched_persisted_terminal_status() {
+    // Break caught: terminal reconciliation preserves a compatible concurrent
+    // enrichment, but RunCompletion is built from the stale follower status.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(
+        paths.state.clone(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+    );
+    let config = run_config();
+    let follower = ConcurrentTerminalFollower {
+        store: store.clone(),
+    };
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let completion = service
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+    assert_eq!(completion.exit_code, 7);
+    assert_eq!(
+        completion.report.status.cleanup_error_code(),
+        Some("CONCURRENT_CLEANUP")
+    );
+    let persisted = store.load_job(completion.report.job_id).unwrap();
+    assert_eq!(completion.report.status, *persisted.last_status().unwrap());
+    runner.assert_consumed();
+}
+
+#[test]
+fn user_correctable_input_selection_failures_are_project_usage_errors() {
+    // Break caught: an actionable input-policy blocker is classified as an
+    // infrastructure snapshot failure instead of Project/usage 64.
+    let repo = run_repo(b"version = 1\n");
+    repo.write("untracked.txt", b"declare me explicitly\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let (result, runner, store) = run_with_script(
+        &repo,
+        &temp,
+        [RunScriptStep::ProbeReady],
+        &follower,
+        None,
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert!(matches!(
+        result.unwrap_err(),
+        WorkerError::Project {
+            code: "UNTRACKED_INPUT",
+            ..
+        }
+    ));
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    runner.assert_consumed();
+}
+
+#[test]
+fn operational_git_selection_failures_remain_snapshot_infrastructure_errors() {
+    // Break caught: the Project/64 classification for actionable selection
+    // policy blockers accidentally masks a genuine Git/process failure.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner =
+        RunScriptRunner::with_index_query_failure(paths.state.clone(), [RunScriptStep::ProbeReady]);
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let error = service
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Snapshot {
+            code: "GIT_INPUT_SELECTION_FAILED",
+            ..
+        }
+    ));
+    assert_eq!(error.exit_code(), 70);
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    runner.assert_consumed();
 }
