@@ -6,7 +6,7 @@ use predicates::prelude::*;
 use std::path::PathBuf;
 
 #[test]
-fn help_exposes_doctor_but_keeps_host_hidden() {
+fn help_exposes_run_status_logs_and_keeps_host_hidden() {
     let mut command = Command::cargo_bin("worker").unwrap();
     command.arg("--help");
 
@@ -16,7 +16,20 @@ fn help_exposes_doctor_but_keeps_host_hidden() {
         .stdout(predicate::str::contains("setup"))
         .stdout(predicate::str::contains("doctor"))
         .stdout(predicate::str::contains("workers"))
+        .stdout(predicate::str::contains("run"))
+        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("logs"))
         .stdout(predicate::str::contains("host").not());
+
+    for public_command in ["run", "status", "logs"] {
+        let mut command = Command::cargo_bin("worker").unwrap();
+        command.args([public_command, "--help"]);
+        command
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(public_command))
+            .stdout(predicate::str::contains("Usage:"));
+    }
 }
 
 #[test]

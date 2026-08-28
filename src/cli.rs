@@ -1,6 +1,8 @@
-use std::{convert::Infallible, ffi::OsString, fmt, path::PathBuf, str::FromStr};
+use std::{convert::Infallible, ffi::OsString, fmt, path::PathBuf, str::FromStr, time::Duration};
 
 use clap::{Parser, Subcommand};
+
+use crate::job::JobId;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -29,6 +31,28 @@ pub enum Command {
         includes: Vec<String>,
     },
     Workers,
+    Run {
+        #[arg(long, value_parser = non_empty_worker)]
+        worker: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long = "include", value_parser = non_empty_pattern)]
+        includes: Vec<String>,
+        #[arg(long, value_parser = supported_duration)]
+        timeout: Option<Duration>,
+        #[arg(long, value_parser = non_empty_shell, conflicts_with = "argv")]
+        shell: Option<String>,
+        #[arg(last = true, num_args = 1.., required_unless_present = "shell")]
+        argv: Vec<String>,
+    },
+    Status {
+        job_id: Option<JobId>,
+    },
+    Logs {
+        #[arg(short = 'f')]
+        follow: bool,
+        job_id: JobId,
+    },
     #[command(hide = true)]
     Host {
         #[command(subcommand)]
@@ -91,5 +115,30 @@ fn non_empty_pattern(value: &str) -> Result<String, String> {
         Err("include pattern must not be empty".into())
     } else {
         Ok(value.to_owned())
+    }
+}
+
+fn non_empty_worker(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err("worker name must not be empty".into())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn non_empty_shell(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err("shell command must not be empty".into())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn supported_duration(value: &str) -> Result<Duration, String> {
+    let duration = humantime::parse_duration(value).map_err(|error| error.to_string())?;
+    if duration.is_zero() || duration > Duration::from_secs(24 * 60 * 60) {
+        Err("timeout must be greater than zero and at most 24h".into())
+    } else {
+        Ok(duration)
     }
 }

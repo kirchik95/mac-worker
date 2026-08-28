@@ -57,6 +57,7 @@ pub mod protocol;
 pub mod remote_snapshot;
 pub mod requirements;
 pub mod rooted_fs;
+pub mod run;
 pub mod snapshot;
 pub mod supervisor;
 pub mod transfer;
@@ -157,6 +158,15 @@ fn execute_with_context(
             let service = WorkersService::new(SshTransport::new(runner));
             Ok(CommandOutput::Workers(service.inspect(&config)))
         }
+        Command::Run { .. } => Err(WorkerError::Protocol(
+            "public run requires the stdio execution boundary".into(),
+        )),
+        Command::Status { .. } => Err(WorkerError::Protocol(
+            "public status requires the stdio execution boundary".into(),
+        )),
+        Command::Logs { .. } => Err(WorkerError::Protocol(
+            "public logs requires the stdio execution boundary".into(),
+        )),
         Command::Host {
             command: HostCommand::Probe,
         } => {
