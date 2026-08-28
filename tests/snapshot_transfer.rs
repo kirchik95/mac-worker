@@ -30,9 +30,11 @@ use mac_worker::{
     host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
     inputs::RelativePath,
     job::{
-        ClientId, CommandSpec, JobId, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseRecord, LeaseToken, RequestFingerprint, RequestFingerprintMaterial,
-        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, SubmitRequest,
+        ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk, LogChunkResponse, LogStream,
+        PreacceptanceDisposition, RequestFingerprint, RequestFingerprintMaterial,
+        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusResponse,
+        SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
@@ -44,9 +46,10 @@ use mac_worker::{
     run_with_rsync_executor_in_context,
     snapshot::{Snapshot, SnapshotBuilder},
     transfer::{
-        AbandonTransferResult, HostOperation, HostTransferService, RsyncServerExecutor,
-        RsyncServerInvocation, RsyncTransport, SshJsonTransport, TransferFailureDisposition,
-        TransferIdentity, TransferReceipt, transfer_failure_disposition,
+        AbandonTransferResult, HostOperation, HostTransferService, RemoteJobClient,
+        ResolutionRuntime, RsyncServerExecutor, RsyncServerInvocation, RsyncTransport,
+        SshJsonTransport, TransferFailureDisposition, TransferIdentity, TransferReceipt,
+        transfer_failure_disposition,
     },
 };
 use sha2::Digest;
@@ -72,7 +75,7 @@ struct LiteralRequest<'a> {
     beta: &'a str,
 }
 
-#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct LiteralResponse {
     accepted: bool,
@@ -138,6 +141,89 @@ fn result(status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> ProcessResult {
         status,
         stdout: stdout.to_vec(),
         stderr: stderr.to_vec(),
+    }
+}
+
+fn canonical_line(value: &impl serde::Serialize) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+fn remote_submit(seed: u128) -> SubmitRequest {
+    SubmitRequest::new(
+        RequestFingerprintMaterial::new(
+            JobId::new(uuid::Uuid::from_u128(seed)),
+            ClientId::new(uuid::Uuid::from_u128(seed + 1)),
+            LeaseToken::new(uuid::Uuid::from_u128(seed + 2)),
+            "mini-1".into(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "packages/app".into(),
+            30_000,
+            "heavy".into(),
+            CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+        )
+        .unwrap(),
+    )
+}
+
+fn accepted_status(request: &SubmitRequest, created_at: u64) -> StatusResponse {
+    StatusResponse::new(
+        JobMeta::new(
+            request.material(),
+            request.request_fingerprint().clone(),
+            created_at,
+        )
+        .unwrap(),
+        JobStatus::accepted(created_at).unwrap(),
+    )
+    .unwrap()
+}
+
+#[derive(Default)]
+struct StepResolutionRuntime {
+    now: Mutex<Duration>,
+    sleeps: Mutex<Vec<Duration>>,
+}
+
+impl StepResolutionRuntime {
+    fn sleeps(&self) -> Vec<Duration> {
+        self.sleeps.lock().unwrap().clone()
+    }
+}
+
+impl ResolutionRuntime for StepResolutionRuntime {
+    fn monotonic_now(&self) -> Duration {
+        *self.now.lock().unwrap()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.sleeps.lock().unwrap().push(duration);
+        *self.now.lock().unwrap() += duration;
+    }
+}
+
+struct JumpResolutionRuntime {
+    now: Mutex<Duration>,
+}
+
+impl JumpResolutionRuntime {
+    fn new() -> Self {
+        Self {
+            now: Mutex::new(Duration::ZERO),
+        }
+    }
+}
+
+impl ResolutionRuntime for JumpResolutionRuntime {
+    fn monotonic_now(&self) -> Duration {
+        *self.now.lock().unwrap()
+    }
+
+    fn sleep(&self, _duration: Duration) {
+        *self.now.lock().unwrap() = Duration::from_secs(30);
     }
 }
 
@@ -443,6 +529,8 @@ fn ssh_json_request_rejects_manual_overflow_utf8_json_and_trailing_data() {
             br#"{"accepted":true}{"accepted":false}"#.to_vec(),
             "INVALID_RESPONSE",
         ),
+        (br#" {"accepted":true}"#.to_vec(), "INVALID_RESPONSE"),
+        (br#"{"accepted": true}"#.to_vec(), "INVALID_RESPONSE"),
     ];
 
     for (stdout, expected_code) in cases {
@@ -1817,4 +1905,552 @@ impl ProcessRunner for NoProcess {
     fn run(&self, _request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
         panic!("hidden rsync receiver must not invoke the control ProcessRunner")
     }
+}
+
+#[test]
+fn query_operations_use_only_the_three_fixed_commands_and_compact_requests() {
+    // Break caught: a query operation accepts a caller-controlled command or
+    // silently inherits the submission operation's argv/deadline.
+    let submit = remote_submit(80_000);
+    let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let status_response = accepted_status(&submit, 10);
+    let log_response =
+        LogChunkResponse::new(LogChunk::new(LogStream::Stdout, 7, b"x".to_vec()).unwrap()).unwrap();
+    let resolve_response = ResolveOrAbandonResponse::abandoned();
+    let cases = [
+        (
+            HostOperation::Status,
+            serde_json::to_vec(&mac_worker::job::StatusRequest::new(resolve.job_id())).unwrap(),
+            canonical_line(&status_response),
+            "~/.local/bin/worker host status",
+        ),
+        (
+            HostOperation::LogChunk,
+            serde_json::to_vec(&mac_worker::job::LogChunkRequest::new(
+                resolve.job_id(),
+                LogStream::Stdout,
+                7,
+                99,
+            ))
+            .unwrap(),
+            canonical_line(&log_response),
+            "~/.local/bin/worker host log-chunk",
+        ),
+        (
+            HostOperation::ResolveOrAbandon,
+            serde_json::to_vec(&resolve).unwrap(),
+            canonical_line(&resolve_response),
+            "~/.local/bin/worker host resolve-or-abandon",
+        ),
+    ];
+
+    for (operation, stdin, stdout, expected_command) in cases {
+        let runner = RecordingRunner::returning(vec![Ok(result(status(0), &stdout, b""))]);
+        let request_policy = ProcessPolicy {
+            stdout_limit: 1024 * 1024,
+            stderr_limit: 64 * 1024,
+            deadline: Duration::from_secs(9),
+        };
+        match operation {
+            HostOperation::Status => {
+                SshJsonTransport::new(&runner)
+                    .request::<_, StatusResponse>(
+                        &worker(),
+                        operation,
+                        &mac_worker::job::StatusRequest::new(resolve.job_id()),
+                        request_policy,
+                    )
+                    .unwrap();
+            }
+            HostOperation::LogChunk => {
+                SshJsonTransport::new(&runner)
+                    .request::<_, LogChunkResponse>(
+                        &worker(),
+                        operation,
+                        &mac_worker::job::LogChunkRequest::new(
+                            resolve.job_id(),
+                            LogStream::Stdout,
+                            7,
+                            99,
+                        ),
+                        request_policy,
+                    )
+                    .unwrap();
+            }
+            HostOperation::ResolveOrAbandon => {
+                SshJsonTransport::new(&runner)
+                    .request::<_, ResolveOrAbandonResponse>(
+                        &worker(),
+                        operation,
+                        &resolve,
+                        request_policy,
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let recorded = runner.requests();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].args.last().unwrap(), expected_command);
+        assert_eq!(recorded[0].stdin.as_deref(), Some(stdin.as_slice()));
+        assert!(recorded[0].environment.is_empty());
+        assert!(recorded[0].environment_remove.is_empty());
+        assert_eq!(recorded[0].policy, request_policy);
+    }
+}
+
+#[test]
+fn typed_nonzero_host_errors_are_authoritative_only_when_strict_and_versioned() {
+    // Break caught: a valid host JOB_ID_CONFLICT is collapsed into a generic
+    // transport failure, or planted/noncanonical output becomes diagnostic.
+    let request = LiteralRequest {
+        alpha: 7,
+        beta: "fixed",
+    };
+    let authoritative = HostControlError::new(
+        "JOB_ID_CONFLICT",
+        "job ID conflicts with durable host state",
+    )
+    .unwrap();
+    let valid = canonical_line(&authoritative);
+    let runner = RecordingRunner::returning(vec![Ok(result(
+        status(23),
+        &valid,
+        b"PLANTED-REMOTE-SECRET",
+    ))]);
+    let error = SshJsonTransport::new(&runner)
+        .request::<_, LiteralResponse>(&worker(), HostOperation::Status, &request, policy())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Protocol(ref message)
+            if message == "JOB_ID_CONFLICT: job ID conflicts with durable host state"
+    ));
+    assert!(!error.to_string().contains("PLANTED"));
+
+    let mut wrong_version = serde_json::to_value(&authoritative).unwrap();
+    wrong_version["protocol_version"] = serde_json::json!(999);
+    let mut duplicate = valid.clone();
+    duplicate.splice(1..1, b"\"protocol_version\":2,".iter().copied());
+    let mut oversized = vec![b' '; policy().stdout_limit + 1];
+    oversized[0] = b'{';
+    let invalid = vec![
+        Vec::new(),
+        serde_json::to_vec(&authoritative).unwrap(),
+        b"not-json\n".to_vec(),
+        canonical_line(&wrong_version),
+        duplicate,
+        [valid.as_slice(), b"{}"].concat(),
+        [b" ".as_slice(), valid.as_slice()].concat(),
+        oversized,
+    ];
+    for stdout in invalid {
+        let runner = RecordingRunner::returning(vec![Ok(result(
+            status(23),
+            &stdout,
+            b"PLANTED-REMOTE-SECRET",
+        ))]);
+        let error = SshJsonTransport::new(&runner)
+            .request::<_, LiteralResponse>(&worker(), HostOperation::Status, &request, policy())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("HOST_REQUEST_FAILED")
+                || error.to_string().contains("SSH_RESPONSE_TOO_LARGE"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("PLANTED"));
+    }
+
+    let runner = RecordingRunner::returning(vec![Ok(result(
+        status(255),
+        &valid,
+        b"PLANTED-REMOTE-SECRET",
+    ))]);
+    let error = SshJsonTransport::new(&runner)
+        .request::<_, LiteralResponse>(&worker(), HostOperation::Status, &request, policy())
+        .unwrap_err();
+    assert!(error.to_string().contains("SSH_UNAVAILABLE"), "{error}");
+    assert!(!error.to_string().contains("JOB_ID_CONFLICT"));
+    assert!(!error.to_string().contains("PLANTED"));
+}
+
+#[test]
+fn remote_status_and_log_bind_the_selected_worker_job_stream_and_offset() {
+    // Break caught: a valid response for another job/worker/log cursor is
+    // trusted as if it answered the selected request.
+    let submit = remote_submit(81_000);
+    let requested = submit.material().job_id();
+    let wrong_job = accepted_status(&remote_submit(81_100), 10);
+    let mut wrong_worker = serde_json::to_value(accepted_status(&submit, 10)).unwrap();
+    wrong_worker["meta"]["worker_name"] = serde_json::json!("mini-2");
+    let wrong_worker: StatusResponse = serde_json::from_value(wrong_worker).unwrap();
+    for response in [wrong_job, wrong_worker] {
+        let runner = RecordingRunner::returning(vec![Ok(result(
+            status(0),
+            &canonical_line(&response),
+            b"",
+        ))]);
+        let error = RemoteJobClient::new(&runner)
+            .status(&worker(), requested)
+            .unwrap_err();
+        assert!(error.to_string().contains("INVALID_RESPONSE"), "{error}");
+    }
+
+    for chunk in [
+        LogChunk::new(LogStream::Stderr, 7, b"x".to_vec()).unwrap(),
+        LogChunk::new(LogStream::Stdout, 8, b"x".to_vec()).unwrap(),
+    ] {
+        let response = LogChunkResponse::new(chunk).unwrap();
+        let runner = RecordingRunner::returning(vec![Ok(result(
+            status(0),
+            &canonical_line(&response),
+            b"",
+        ))]);
+        let error = RemoteJobClient::new(&runner)
+            .log_chunk(&worker(), requested, LogStream::Stdout, 7, 64)
+            .unwrap_err();
+        assert!(error.to_string().contains("INVALID_RESPONSE"), "{error}");
+    }
+}
+
+#[test]
+fn remote_status_accepts_only_an_exact_positive_bounded_stage_deadline() {
+    // Break caught: downstream stages cannot pass their shrinking budget, or
+    // a zero/over-30-second policy reaches the runner.
+    let submit = remote_submit(81_500);
+    let response = accepted_status(&submit, 10);
+    let runner =
+        RecordingRunner::returning(vec![Ok(result(status(0), &canonical_line(&response), b""))]);
+    RemoteJobClient::new(&runner)
+        .status_with_deadline(
+            &worker(),
+            submit.material().job_id(),
+            Duration::from_secs(7),
+        )
+        .unwrap();
+    assert_eq!(runner.requests()[0].policy.deadline, Duration::from_secs(7));
+
+    for invalid in [Duration::ZERO, Duration::from_secs(31)] {
+        let runner = RecordingRunner::returning(Vec::new());
+        let error = RemoteJobClient::new(&runner)
+            .status_with_deadline(&worker(), submit.material().job_id(), invalid)
+            .unwrap_err();
+        assert!(error.to_string().contains("INVALID_REQUEST"), "{error}");
+        assert!(runner.requests().is_empty());
+    }
+}
+
+#[test]
+fn resolution_rejects_each_changed_remote_immutable_but_not_remote_created_at() {
+    // Break caught: accepted resolution checks only job/worker identity and
+    // ignores one of the request-bound immutables, or compares host/local time.
+    let submit = remote_submit(82_000);
+    let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let baseline = serde_json::to_value(accepted_status(&submit, 10)).unwrap();
+    let mutations: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "job_id",
+            serde_json::json!(JobId::new(uuid::Uuid::from_u128(82_999)).to_string()),
+        ),
+        (
+            "client_id",
+            serde_json::json!(ClientId::new(uuid::Uuid::from_u128(82_998)).to_string()),
+        ),
+        ("worker_name", serde_json::json!("mini-2")),
+        ("project_id", serde_json::json!("d".repeat(64))),
+        ("worktree_id", serde_json::json!("e".repeat(64))),
+        ("manifest_digest", serde_json::json!("f".repeat(64))),
+        ("request_fingerprint", serde_json::json!("1".repeat(64))),
+        ("relative_working_dir", serde_json::json!("other/path")),
+        ("timeout_millis", serde_json::json!(31_000)),
+        ("resource_class", serde_json::json!("light")),
+        (
+            "command_summary",
+            serde_json::json!({"mode":"argv","arg_count":3}),
+        ),
+    ];
+    for (field, replacement) in mutations {
+        let mut value = baseline.clone();
+        value["meta"][field] = replacement;
+        let response: StatusResponse = serde_json::from_value(value).unwrap();
+        let resolved = ResolveOrAbandonResponse::accepted(response).unwrap();
+        let runner = RecordingRunner::returning(vec![
+            Err(ProcessError::DeadlineExceeded {
+                deadline: Duration::from_secs(30),
+            }
+            .into()),
+            Ok(result(status(0), &canonical_line(&resolved), b"")),
+        ]);
+        let runtime = JumpResolutionRuntime::new();
+        let disposition = RemoteJobClient::new_with_runtime(&runner, &runtime)
+            .resolve_preacceptance(&worker(), &resolve)
+            .unwrap();
+        assert!(
+            matches!(
+                disposition,
+                PreacceptanceDisposition::UnknownRemote { ref code } if code == "UNKNOWN_REMOTE"
+            ),
+            "{field}: {disposition:?}"
+        );
+    }
+
+    let mut different_time = baseline;
+    different_time["meta"]["created_at_millis"] = serde_json::json!(999);
+    different_time["status"]["updated_at_millis"] = serde_json::json!(999);
+    let response: StatusResponse = serde_json::from_value(different_time).unwrap();
+    let runner =
+        RecordingRunner::returning(vec![Ok(result(status(0), &canonical_line(&response), b""))]);
+    let disposition = RemoteJobClient::new(&runner)
+        .resolve_preacceptance(&worker(), &resolve)
+        .unwrap();
+    assert!(matches!(disposition, PreacceptanceDisposition::Accepted(_)));
+}
+
+#[test]
+fn direct_accepted_is_fully_bound_and_existing_is_authoritatively_refreshed() {
+    // Break caught: submit success is trusted without request binding, or an
+    // Existing response is returned without the required same-ID status call.
+    let submit = remote_submit(83_000);
+    let authoritative = accepted_status(&submit, 20);
+    let stale = JobStatus::accepted(10).unwrap();
+    let runner = RecordingRunner::returning(vec![Ok(result(
+        status(0),
+        &canonical_line(&authoritative),
+        b"",
+    ))]);
+    let refreshed = RemoteJobClient::new(&runner)
+        .resolve_submission(
+            &worker(),
+            &submit,
+            Ok(SubmitResponse::Existing { status: stale }),
+        )
+        .unwrap();
+    assert!(matches!(
+        refreshed,
+        SubmitResponse::Existing { ref status } if status == authoritative.status()
+    ));
+    assert_eq!(runner.requests().len(), 1);
+    assert_eq!(
+        runner.requests()[0].args.last().unwrap(),
+        "~/.local/bin/worker host status"
+    );
+
+    let wrong = accepted_status(&remote_submit(83_100), 20);
+    let runner = RecordingRunner::returning(Vec::new());
+    let error = RemoteJobClient::new(&runner)
+        .resolve_submission(
+            &worker(),
+            &submit,
+            Ok(SubmitResponse::Accepted {
+                meta: Box::new(wrong.meta().clone()),
+                status: wrong.status().clone(),
+            }),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("INVALID_RESPONSE"), "{error}");
+    assert!(runner.requests().is_empty());
+}
+
+#[test]
+fn resolution_polls_with_exact_remaining_deadlines_then_resolves_once_separately() {
+    // Break caught: polling calls at zero, resets the total budget, sleeps for
+    // wall time in tests, or applies the rsync deadline to final resolution.
+    let submit = remote_submit(84_000);
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let mut scripted = (0..30)
+        .map(|_| {
+            Err(ProcessError::DeadlineExceeded {
+                deadline: Duration::from_secs(30),
+            }
+            .into())
+        })
+        .collect::<Vec<_>>();
+    scripted.push(Ok(result(
+        status(0),
+        &canonical_line(&ResolveOrAbandonResponse::abandoned()),
+        b"",
+    )));
+    let runner = RecordingRunner::returning(scripted);
+    let runtime = StepResolutionRuntime::default();
+
+    let disposition = RemoteJobClient::new_with_runtime(&runner, &runtime)
+        .resolve_preacceptance(&worker(), &request)
+        .unwrap();
+
+    assert!(matches!(disposition, PreacceptanceDisposition::Abandoned));
+    assert_eq!(runtime.sleeps(), vec![Duration::from_secs(1); 30]);
+    let recorded = runner.requests();
+    assert_eq!(recorded.len(), 31);
+    assert_eq!(
+        recorded[..30]
+            .iter()
+            .map(|request| request.policy.deadline.as_secs())
+            .collect::<Vec<_>>(),
+        (1..=30).rev().collect::<Vec<_>>()
+    );
+    assert!(
+        recorded[..30]
+            .iter()
+            .all(|call| call.args.last().unwrap() == "~/.local/bin/worker host status")
+    );
+    assert_eq!(recorded[30].policy.deadline, Duration::from_secs(30));
+    assert_eq!(
+        recorded[30].args.last().unwrap(),
+        "~/.local/bin/worker host resolve-or-abandon"
+    );
+    assert_eq!(
+        recorded[30].stdin,
+        Some(serde_json::to_vec(&request).unwrap())
+    );
+}
+
+#[test]
+fn last_positive_budget_status_success_wins_without_a_resolve_call() {
+    // Break caught: the final one-second attempt is skipped or a successful
+    // last response is overwritten by resolve-or-abandon.
+    let submit = remote_submit(85_000);
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let response = accepted_status(&submit, 10);
+    let mut scripted = (0..29)
+        .map(|_| {
+            Err(ProcessError::DeadlineExceeded {
+                deadline: Duration::from_secs(30),
+            }
+            .into())
+        })
+        .collect::<Vec<_>>();
+    scripted.push(Ok(result(status(0), &canonical_line(&response), b"")));
+    let runner = RecordingRunner::returning(scripted);
+    let runtime = StepResolutionRuntime::default();
+
+    let disposition = RemoteJobClient::new_with_runtime(&runner, &runtime)
+        .resolve_preacceptance(&worker(), &request)
+        .unwrap();
+
+    assert!(matches!(disposition, PreacceptanceDisposition::Accepted(_)));
+    assert_eq!(runtime.sleeps(), vec![Duration::from_secs(1); 29]);
+    let recorded = runner.requests();
+    assert_eq!(recorded.len(), 30);
+    assert_eq!(
+        recorded.last().unwrap().policy.deadline,
+        Duration::from_secs(1)
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|call| call.args.last().unwrap() == "~/.local/bin/worker host status")
+    );
+}
+
+#[test]
+fn resolution_outcomes_keep_host_authority_and_submission_error_rules_exact() {
+    // Break caught: cleanup/unknown are conflated, a versioned conflict is
+    // rewritten, or resolve_submission returns the original error too broadly.
+    let submit = remote_submit(86_000);
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let outcomes = [
+        ResolveOrAbandonResponse::accepted(accepted_status(&submit, 10)).unwrap(),
+        ResolveOrAbandonResponse::abandoned(),
+        ResolveOrAbandonResponse::cleanup_pending("MUTABLE_CLEANUP_FAILED").unwrap(),
+        ResolveOrAbandonResponse::cleanup_pending("LEASE_RELEASE_FAILED").unwrap(),
+    ];
+    for response in outcomes {
+        let runner = RecordingRunner::returning(vec![
+            Err(ProcessError::DeadlineExceeded {
+                deadline: Duration::from_secs(30),
+            }
+            .into()),
+            Ok(result(status(0), &canonical_line(&response), b"")),
+        ]);
+        let runtime = JumpResolutionRuntime::new();
+        let disposition = RemoteJobClient::new_with_runtime(&runner, &runtime)
+            .resolve_preacceptance(&worker(), &request)
+            .unwrap();
+        match response.outcome() {
+            ResolveOrAbandonOutcome::Accepted { .. } => {
+                assert!(matches!(disposition, PreacceptanceDisposition::Accepted(_)))
+            }
+            ResolveOrAbandonOutcome::Abandoned => {
+                assert!(matches!(disposition, PreacceptanceDisposition::Abandoned))
+            }
+            ResolveOrAbandonOutcome::CleanupPending { code } => assert!(matches!(
+                disposition,
+                PreacceptanceDisposition::CleanupPending { code: actual } if &actual == code
+            )),
+        }
+    }
+
+    let runner = RecordingRunner::returning(vec![
+        Err(ProcessError::DeadlineExceeded {
+            deadline: Duration::from_secs(30),
+        }
+        .into()),
+        Ok(result(status(0), b"invalid-response", b"PLANTED")),
+    ]);
+    let runtime = JumpResolutionRuntime::new();
+    assert!(matches!(
+        RemoteJobClient::new_with_runtime(&runner, &runtime)
+            .resolve_preacceptance(&worker(), &request)
+            .unwrap(),
+        PreacceptanceDisposition::UnknownRemote { ref code } if code == "UNKNOWN_REMOTE"
+    ));
+
+    let conflict = canonical_line(
+        &HostControlError::new("JOB_ID_CONFLICT", "exact authoritative conflict").unwrap(),
+    );
+    for submission in [false, true] {
+        let runner = RecordingRunner::returning(vec![Ok(result(status(23), &conflict, b""))]);
+        let runtime = JumpResolutionRuntime::new();
+        let client = RemoteJobClient::new_with_runtime(&runner, &runtime);
+        let error = if submission {
+            client
+                .resolve_submission(
+                    &worker(),
+                    &submit,
+                    Err(WorkerError::Protocol(
+                        "ORIGINAL: preacceptance failed".into(),
+                    )),
+                )
+                .unwrap_err()
+        } else {
+            client
+                .resolve_preacceptance(&worker(), &request)
+                .unwrap_err()
+        };
+        assert!(matches!(
+            error,
+            WorkerError::Protocol(ref message)
+                if message == "JOB_ID_CONFLICT: exact authoritative conflict"
+        ));
+    }
+
+    let runner = RecordingRunner::returning(vec![
+        Err(ProcessError::DeadlineExceeded {
+            deadline: Duration::from_secs(30),
+        }
+        .into()),
+        Ok(result(
+            status(0),
+            &canonical_line(&ResolveOrAbandonResponse::abandoned()),
+            b"",
+        )),
+    ]);
+    let runtime = JumpResolutionRuntime::new();
+    let error = RemoteJobClient::new_with_runtime(&runner, &runtime)
+        .resolve_submission(
+            &worker(),
+            &submit,
+            Err(WorkerError::Capacity {
+                code: "CAPACITY_BUSY",
+                message: "original typed error".into(),
+            }),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            ..
+        }
+    ));
 }

@@ -1,22 +1,29 @@
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     fs,
     os::unix::{
         ffi::OsStringExt,
         fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
+        process::ExitStatusExt,
     },
     path::{Path, PathBuf},
-    sync::{Arc, Barrier, mpsc},
+    sync::{Arc, Barrier, Mutex, mpsc},
     thread,
     time::Duration,
 };
 
 use mac_worker::{
     client_state::{ClientStateCreationRacePoint, ClientStateStore, ClientStateWritePoint},
+    config::WorkerEntry,
+    error::{ProcessError, WorkerError},
     job::{
         ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseToken, LocalJobRecord,
-        ProcessIdentity, RemoteUncertainty, RequestFingerprintMaterial,
+        PreacceptanceDisposition, ProcessIdentity, RemoteUncertainty, RequestFingerprintMaterial,
+        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusResponse, SubmitRequest,
     },
+    process::{ProcessRequest, ProcessResult, ProcessRunner},
+    transfer::{RemoteJobClient, ResolutionRuntime},
 };
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1412,6 +1419,215 @@ fn terminal_observation_allows_only_cleanup_error_enrichment() {
             .update_observation(original.meta().job_id(), changed_lengths)
             .is_err()
     );
+}
+
+fn remote_worker() -> WorkerEntry {
+    WorkerEntry {
+        name: "mini-1".into(),
+        ssh: "mac1".into(),
+        slots: 1,
+        capabilities: vec!["darwin-arm64".into()],
+        remote_binary: "~/.local/bin/worker".into(),
+    }
+}
+
+fn response_line(value: &impl serde::Serialize) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+struct BlockingStatusRunner {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    response: Vec<u8>,
+}
+
+impl ProcessRunner for BlockingStatusRunner {
+    fn run(&self, _request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.entered.send(()).unwrap();
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocked runner was not released");
+        Ok(ProcessResult {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: self.response.clone(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+struct ScriptedClientRunner {
+    results: Mutex<VecDeque<Result<ProcessResult, WorkerError>>>,
+}
+
+impl ProcessRunner for ScriptedClientRunner {
+    fn run(&self, _request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected remote call")
+    }
+}
+
+struct BlockingRetryRuntime {
+    now: Mutex<Duration>,
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl ResolutionRuntime for BlockingRetryRuntime {
+    fn monotonic_now(&self) -> Duration {
+        *self.now.lock().unwrap()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        assert_eq!(duration, Duration::from_secs(1));
+        self.entered.send(()).unwrap();
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocked retry sleep was not released");
+        *self.now.lock().unwrap() = Duration::from_secs(30);
+    }
+}
+
+#[test]
+fn remote_status_call_holds_no_local_client_state_lock() {
+    // Break caught: the caller keeps jobs.lock around SSH, preventing a fresh
+    // observation update while the process runner is blocked.
+    let fixture = tempfile::tempdir().unwrap();
+    let store = Arc::new(ClientStateStore::open(&temp_root(&fixture).join("state")).unwrap());
+    let record = fresh_record(&store);
+    store.create_job(record.clone()).unwrap();
+    let response =
+        StatusResponse::new(record.meta().clone(), JobStatus::accepted(2_000).unwrap()).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let runner = Arc::new(BlockingStatusRunner {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        response: response_line(&response),
+    });
+    let job_id = record.meta().job_id();
+    let client_runner = Arc::clone(&runner);
+    let remote = thread::spawn(move || {
+        RemoteJobClient::new(client_runner.as_ref()).status(&remote_worker(), job_id)
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("remote runner did not block");
+
+    let contention = store.observe_next_lock_contention();
+    let updater = Arc::clone(&store);
+    let (updated_tx, updated_rx) = mpsc::channel();
+    let update = thread::spawn(move || {
+        updated_tx
+            .send(updater.update_observation(job_id, JobStatus::accepted(2_000).unwrap()))
+            .unwrap();
+    });
+    let updated = updated_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("local update blocked behind remote call")
+        .unwrap();
+    assert_eq!(updated.last_status(), Some(response.status()));
+    assert!(!contention.confirmed_within(Duration::ZERO));
+    release_tx.send(()).unwrap();
+    remote.join().unwrap().unwrap();
+    update.join().unwrap();
+}
+
+#[test]
+fn remote_retry_sleep_holds_no_local_client_state_lock() {
+    // Break caught: the 30-second resolver owns jobs.lock across retry sleep,
+    // blocking an independent uncertainty update.
+    let fixture = tempfile::tempdir().unwrap();
+    let store = Arc::new(ClientStateStore::open(&temp_root(&fixture).join("state")).unwrap());
+    let record = fresh_record(&store);
+    store.create_job(record.clone()).unwrap();
+    let material = RequestFingerprintMaterial::new(
+        record.meta().job_id(),
+        store.client_id(),
+        record.lease_token(),
+        record.meta().worker_name().into(),
+        record.meta().project_id().into(),
+        record.meta().worktree_id().into(),
+        record.meta().manifest_digest().into(),
+        record.meta().relative_working_dir().into(),
+        record.meta().timeout_millis(),
+        record.meta().resource_class().into(),
+        CommandSpec::argv(vec!["tool".into(), COMMAND_SECRET.into()]).unwrap(),
+    )
+    .unwrap();
+    let submit = SubmitRequest::new(material);
+    assert_eq!(
+        submit.request_fingerprint(),
+        record.meta().request_fingerprint()
+    );
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let runner = Arc::new(ScriptedClientRunner {
+        results: Mutex::new(
+            vec![
+                Err(ProcessError::DeadlineExceeded {
+                    deadline: Duration::from_secs(30),
+                }
+                .into()),
+                Ok(ProcessResult {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: response_line(&ResolveOrAbandonResponse::abandoned()),
+                    stderr: Vec::new(),
+                }),
+            ]
+            .into(),
+        ),
+    });
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let runtime = Arc::new(BlockingRetryRuntime {
+        now: Mutex::new(Duration::ZERO),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let client_runner = Arc::clone(&runner);
+    let client_runtime = Arc::clone(&runtime);
+    let remote = thread::spawn(move || {
+        RemoteJobClient::new_with_runtime(client_runner.as_ref(), client_runtime.as_ref())
+            .resolve_preacceptance(&remote_worker(), &request)
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("retry runtime did not block");
+
+    let contention = store.observe_next_lock_contention();
+    let updater = Arc::clone(&store);
+    let (updated_tx, updated_rx) = mpsc::channel();
+    let update = thread::spawn(move || {
+        updated_tx
+            .send(updater.set_remote_uncertainty(
+                record.meta().job_id(),
+                RemoteUncertainty::unknown_remote("UNKNOWN_REMOTE").unwrap(),
+            ))
+            .unwrap();
+    });
+    let updated = updated_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("local uncertainty update blocked behind retry sleep")
+        .unwrap();
+    assert!(matches!(
+        updated.remote_uncertainty(),
+        RemoteUncertainty::UnknownRemote { code } if code == "UNKNOWN_REMOTE"
+    ));
+    assert!(!contention.confirmed_within(Duration::ZERO));
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        remote.join().unwrap().unwrap(),
+        PreacceptanceDisposition::Abandoned
+    ));
+    update.join().unwrap();
 }
 
 fn operation_tree_contains(root: &Path, expected: &[u8]) -> bool {

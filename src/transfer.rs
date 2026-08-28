@@ -6,10 +6,11 @@ use std::{
         process::{CommandExt, ExitStatusExt},
     },
     process::{Command, Stdio},
-    time::Duration,
+    sync::LazyLock,
+    time::{Duration, Instant},
 };
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -17,8 +18,10 @@ use crate::{
     error::{ProcessError, ProcessStream, WorkerError},
     host_store::{HostStore, JobDisposition},
     job::{
-        ClientId, JobId, LeaseAcquireRequest, LeaseRecord, LeaseToken, RequestFingerprint,
-        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, SubmitRequest,
+        ClientId, HostControlError, JobId, LeaseAcquireRequest, LeaseRecord, LeaseToken, LogChunk,
+        LogChunkRequest, LogChunkResponse, LogStream, PreacceptanceDisposition, RequestFingerprint,
+        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest,
+        StatusResponse, SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
@@ -46,6 +49,9 @@ pub enum HostOperation {
     LeaseAcquire,
     SnapshotVerify,
     Submit,
+    Status,
+    LogChunk,
+    ResolveOrAbandon,
 }
 
 impl HostOperation {
@@ -54,12 +60,41 @@ impl HostOperation {
             Self::LeaseAcquire => "~/.local/bin/worker host lease-acquire",
             Self::SnapshotVerify => "~/.local/bin/worker host snapshot-verify",
             Self::Submit => "~/.local/bin/worker host submit",
+            Self::Status => "~/.local/bin/worker host status",
+            Self::LogChunk => "~/.local/bin/worker host log-chunk",
+            Self::ResolveOrAbandon => "~/.local/bin/worker host resolve-or-abandon",
         }
     }
 }
 
 pub struct SshJsonTransport<'a> {
     runner: &'a dyn ProcessRunner,
+}
+
+pub trait ResolutionRuntime: Send + Sync {
+    fn monotonic_now(&self) -> Duration;
+    fn sleep(&self, duration: Duration);
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemResolutionRuntime;
+
+static RESOLUTION_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+static SYSTEM_RESOLUTION_RUNTIME: SystemResolutionRuntime = SystemResolutionRuntime;
+
+impl ResolutionRuntime for SystemResolutionRuntime {
+    fn monotonic_now(&self) -> Duration {
+        RESOLUTION_EPOCH.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+pub struct RemoteJobClient<'a> {
+    transport: SshJsonTransport<'a>,
+    retry: &'a dyn ResolutionRuntime,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -422,7 +457,7 @@ impl<'a> SshJsonTransport<'a> {
         Self { runner }
     }
 
-    pub fn request<Req: Serialize, Res: DeserializeOwned>(
+    pub fn request<Req: Serialize, Res: DeserializeOwned + Serialize>(
         &self,
         worker: &WorkerEntry,
         operation: HostOperation,
@@ -454,6 +489,19 @@ impl<'a> SshJsonTransport<'a> {
             policy,
         };
         let result = self.runner.run(&request).map_err(map_control_failure)?;
+        if !result.status.success() {
+            if result.status.code() == Some(255) {
+                return Err(transport_error(
+                    "SSH_UNAVAILABLE",
+                    "SSH control request failed",
+                ));
+            }
+            return Err(
+                decode_host_control_error(&result.stdout).unwrap_or_else(|| {
+                    transport_error("HOST_REQUEST_FAILED", "SSH control request failed")
+                }),
+            );
+        }
         if result.stdout.len() > policy.stdout_limit {
             return Err(transport_error(
                 "SSH_RESPONSE_TOO_LARGE",
@@ -466,14 +514,6 @@ impl<'a> SshJsonTransport<'a> {
                 "SSH control diagnostic exceeded its limit",
             ));
         }
-        if !result.status.success() {
-            let code = if result.status.code() == Some(255) {
-                "SSH_UNAVAILABLE"
-            } else {
-                "HOST_REQUEST_FAILED"
-            };
-            return Err(transport_error(code, "SSH control request failed"));
-        }
 
         let mut deserializer = serde_json::Deserializer::from_slice(&result.stdout);
         let response = Res::deserialize(&mut deserializer)
@@ -481,8 +521,233 @@ impl<'a> SshJsonTransport<'a> {
         deserializer
             .end()
             .map_err(|_| transport_error("INVALID_RESPONSE", "host response was invalid"))?;
+        let canonical = serde_json::to_vec(&response)
+            .map_err(|_| transport_error("INVALID_RESPONSE", "host response was invalid"))?;
+        if result.stdout != canonical && result.stdout != [canonical.as_slice(), b"\n"].concat() {
+            return Err(transport_error(
+                "INVALID_RESPONSE",
+                "host response was invalid",
+            ));
+        }
         Ok(response)
     }
+}
+
+impl<'a> RemoteJobClient<'a> {
+    pub fn new(runner: &'a dyn ProcessRunner) -> Self {
+        Self::new_with_runtime(runner, &SYSTEM_RESOLUTION_RUNTIME)
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_runtime(
+        runner: &'a dyn ProcessRunner,
+        retry: &'a dyn ResolutionRuntime,
+    ) -> Self {
+        Self {
+            transport: SshJsonTransport::new(runner),
+            retry,
+        }
+    }
+
+    pub fn status(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+    ) -> Result<StatusResponse, WorkerError> {
+        self.status_with_deadline(worker, job_id, MAX_CONTROL_DEADLINE)
+    }
+
+    pub fn log_chunk(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+        stream: LogStream,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LogChunk, WorkerError> {
+        let response: LogChunkResponse = self.transport.request(
+            worker,
+            HostOperation::LogChunk,
+            &LogChunkRequest::new(job_id, stream, offset, limit),
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        let chunk = response.into_chunk();
+        if chunk.stream() != stream || chunk.offset() != offset {
+            return Err(invalid_remote_response());
+        }
+        Ok(chunk)
+    }
+
+    pub fn resolve_preacceptance(
+        &self,
+        worker: &WorkerEntry,
+        request: &ResolveOrAbandonRequest,
+    ) -> Result<PreacceptanceDisposition, WorkerError> {
+        request.validate()?;
+        let start = self.retry.monotonic_now();
+        while let Some(remaining) = remaining_resolution_budget(start, self.retry.monotonic_now()) {
+            match self.status_with_deadline(worker, request.job_id(), remaining) {
+                Ok(response) => {
+                    if validate_resolution_response(worker, request, &response).is_ok() {
+                        return Ok(PreacceptanceDisposition::Accepted(response));
+                    }
+                }
+                Err(error @ WorkerError::Protocol(_)) => return Err(error),
+                Err(_) => {}
+            }
+            let Some(remaining) = remaining_resolution_budget(start, self.retry.monotonic_now())
+            else {
+                break;
+            };
+            self.retry.sleep(remaining.min(Duration::from_secs(1)));
+        }
+
+        let response = match self.transport.request::<_, ResolveOrAbandonResponse>(
+            worker,
+            HostOperation::ResolveOrAbandon,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        ) {
+            Ok(response) => response,
+            Err(error @ WorkerError::Protocol(_)) => return Err(error),
+            Err(_) => return PreacceptanceDisposition::unknown_remote("UNKNOWN_REMOTE"),
+        };
+        match response.outcome() {
+            ResolveOrAbandonOutcome::Accepted { response } => {
+                if validate_resolution_response(worker, request, response).is_err() {
+                    return PreacceptanceDisposition::unknown_remote("UNKNOWN_REMOTE");
+                }
+                Ok(PreacceptanceDisposition::Accepted(response.clone()))
+            }
+            ResolveOrAbandonOutcome::Abandoned => Ok(PreacceptanceDisposition::Abandoned),
+            ResolveOrAbandonOutcome::CleanupPending { code } => {
+                PreacceptanceDisposition::cleanup_pending(code.clone())
+            }
+        }
+    }
+
+    pub fn resolve_submission(
+        &self,
+        worker: &WorkerEntry,
+        request: &SubmitRequest,
+        submit_result: Result<SubmitResponse, WorkerError>,
+    ) -> Result<SubmitResponse, WorkerError> {
+        request.validate()?;
+        match submit_result {
+            Ok(response @ SubmitResponse::Accepted { .. }) => {
+                let SubmitResponse::Accepted { meta, status } = &response else {
+                    unreachable!()
+                };
+                let status_response = StatusResponse::new((**meta).clone(), status.clone())?;
+                let resolution = ResolveOrAbandonRequest::from_submit_request(request)?;
+                validate_resolution_response(worker, &resolution, &status_response)?;
+                Ok(response)
+            }
+            Ok(SubmitResponse::Existing { .. }) => {
+                let status = self.status(worker, request.material().job_id())?;
+                let resolution = ResolveOrAbandonRequest::from_submit_request(request)?;
+                validate_resolution_response(worker, &resolution, &status)?;
+                Ok(SubmitResponse::Existing {
+                    status: status.status().clone(),
+                })
+            }
+            Err(original) => {
+                let resolution = ResolveOrAbandonRequest::from_submit_request(request)?;
+                match self.resolve_preacceptance(worker, &resolution)? {
+                    PreacceptanceDisposition::Accepted(response) => Ok(SubmitResponse::Accepted {
+                        meta: Box::new(response.meta().clone()),
+                        status: response.status().clone(),
+                    }),
+                    PreacceptanceDisposition::Abandoned => Err(original),
+                    PreacceptanceDisposition::CleanupPending { code } => Err(
+                        WorkerError::Protocol(format!("{code}: remote cleanup is pending")),
+                    ),
+                    PreacceptanceDisposition::UnknownRemote { code } => Err(WorkerError::Protocol(
+                        format!("{code}: remote job state is unknown"),
+                    )),
+                }
+            }
+        }
+    }
+
+    pub fn status_with_deadline(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+        deadline: Duration,
+    ) -> Result<StatusResponse, WorkerError> {
+        let response: StatusResponse = self.transport.request(
+            worker,
+            HostOperation::Status,
+            &StatusRequest::new(job_id),
+            control_policy(deadline),
+        )?;
+        if response.meta().job_id() != job_id || response.meta().worker_name() != worker.name {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
+    }
+}
+
+fn control_policy(deadline: Duration) -> ProcessPolicy {
+    ProcessPolicy {
+        stdout_limit: MAX_CONTROL_STDOUT_BYTES,
+        stderr_limit: MAX_CONTROL_STDERR_BYTES,
+        deadline,
+    }
+}
+
+fn remaining_resolution_budget(start: Duration, now: Duration) -> Option<Duration> {
+    let elapsed = now.checked_sub(start)?;
+    let remaining = MAX_CONTROL_DEADLINE.checked_sub(elapsed)?;
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+fn validate_resolution_response(
+    worker: &WorkerEntry,
+    request: &ResolveOrAbandonRequest,
+    response: &StatusResponse,
+) -> Result<(), WorkerError> {
+    response.validate().map_err(|_| invalid_remote_response())?;
+    let meta = response.meta();
+    if meta.job_id() != request.job_id()
+        || meta.client_id() != request.client_id()
+        || meta.worker_name() != worker.name
+        || meta.worker_name() != request.worker_name()
+        || meta.project_id() != request.project_id()
+        || meta.worktree_id() != request.worktree_id()
+        || meta.manifest_digest() != request.manifest_digest()
+        || meta.request_fingerprint() != request.request_fingerprint()
+        || meta.relative_working_dir() != request.relative_working_dir()
+        || meta.timeout_millis() != request.timeout_millis()
+        || meta.resource_class() != request.resource_class()
+        || meta.command_summary() != request.command_summary()
+    {
+        return Err(invalid_remote_response());
+    }
+    Ok(())
+}
+
+fn decode_host_control_error(bytes: &[u8]) -> Option<WorkerError> {
+    let body = bytes.strip_suffix(b"\n")?;
+    if body.is_empty() || body.contains(&b'\n') || body.contains(&b'\r') {
+        return None;
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let error = HostControlError::deserialize(&mut deserializer).ok()?;
+    deserializer.end().ok()?;
+    if serde_json::to_vec(&error).ok()?.as_slice() != body {
+        return None;
+    }
+    Some(WorkerError::Protocol(format!(
+        "{}: {}",
+        error.error().code(),
+        error.error().message()
+    )))
+}
+
+fn invalid_remote_response() -> WorkerError {
+    transport_error("INVALID_RESPONSE", "host response was invalid")
 }
 
 fn validate_control_policy(policy: ProcessPolicy) -> Result<(), WorkerError> {

@@ -11,7 +11,10 @@ use doctor::{DoctorRequest, DoctorService};
 use error::WorkerError;
 use host_store::HostStore;
 use install::Installer;
-use job::{LeaseAcquireRequest, SubmitRequest};
+use job::{
+    HostControlError, LeaseAcquireRequest, LogChunkRequest, LogChunkResponse,
+    ResolveOrAbandonRequest, StatusRequest, SubmitRequest,
+};
 use job_service::JobService;
 use lease::{AdmissionFacts, LeaseService};
 use output::CommandOutput;
@@ -20,7 +23,7 @@ use probe::ProbeCollector;
 use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport};
 use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnapshotResponse};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use supervisor::{
     SUPERVISOR_LOCK_FD, Supervisor, SystemProcessInspector, SystemSupervisorLauncher,
     validate_detached_supervisor_context,
@@ -168,6 +171,21 @@ fn execute_with_context(
             "host lease-acquire requires the stdio execution boundary".into(),
         )),
         Command::Host {
+            command: HostCommand::Status,
+        } => Err(WorkerError::Protocol(
+            "host status requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::LogChunk,
+        } => Err(WorkerError::Protocol(
+            "host log-chunk requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::ResolveOrAbandon,
+        } => Err(WorkerError::Protocol(
+            "host resolve-or-abandon requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
             command: HostCommand::SnapshotVerify,
         } => Err(WorkerError::Protocol(
             "host snapshot-verify requires the stdio execution boundary".into(),
@@ -283,6 +301,30 @@ pub fn run_with_rsync_executor_in_context(
     ) {
         return run_host_snapshot_verify(cli.config, runtime, stdin, stdout);
     }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::Status
+        }
+    ) {
+        return run_host_status(cli.config, runtime, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::LogChunk
+        }
+    ) {
+        return run_host_log_chunk(cli.config, runtime, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::ResolveOrAbandon
+        }
+    ) {
+        return run_host_resolve_or_abandon(cli.config, runtime, stdin, stdout);
+    }
     if let Command::Host {
         command:
             HostCommand::RsyncReceive {
@@ -385,6 +427,130 @@ fn run_host_submit(
         return crate::error::ExitKind::Io as u8;
     }
     exit
+}
+
+fn run_host_status(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_control_endpoint(
+        config_override,
+        runtime,
+        stdin,
+        stdout,
+        |request: StatusRequest, store, launcher| {
+            JobService::new(store, launcher).status(request.job_id())
+        },
+    )
+}
+
+fn run_host_log_chunk(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_control_endpoint(
+        config_override,
+        runtime,
+        stdin,
+        stdout,
+        |request: LogChunkRequest, store, launcher| {
+            let chunk = JobService::new(store, launcher).read_log(
+                request.job_id(),
+                request.stream(),
+                request.offset(),
+                request.limit(),
+            )?;
+            LogChunkResponse::new(chunk)
+        },
+    )
+}
+
+fn run_host_resolve_or_abandon(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_control_endpoint(
+        config_override,
+        runtime,
+        stdin,
+        stdout,
+        |request: ResolveOrAbandonRequest, store, launcher| {
+            JobService::new(store, launcher).resolve_or_abandon(request)
+        },
+    )
+}
+
+fn run_host_control_endpoint<Req, Res>(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    operation: impl FnOnce(Req, &HostStore, &SystemSupervisorLauncher) -> Result<Res, WorkerError>,
+) -> u8
+where
+    Req: DeserializeOwned + Serialize,
+    Res: Serialize,
+{
+    const LIMIT: usize = 1024 * 1024;
+    let result = (|| -> Result<Res, WorkerError> {
+        let mut bytes = Vec::new();
+        stdin.take((LIMIT + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > LIMIT {
+            return Err(WorkerError::Protocol(
+                "host control request exceeded 1 MiB".into(),
+            ));
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let request = Req::deserialize(&mut deserializer)
+            .map_err(|_| WorkerError::Protocol("invalid host control request".into()))?;
+        deserializer
+            .end()
+            .map_err(|_| WorkerError::Protocol("invalid host control request".into()))?;
+        if serde_json::to_vec(&request)
+            .map_err(|_| WorkerError::Protocol("invalid host control request".into()))?
+            != bytes
+        {
+            return Err(WorkerError::Protocol(
+                "host control request was not canonical JSON".into(),
+            ));
+        }
+        let paths = discover_paths(config_override, runtime)?;
+        let store = HostStore::open(&paths.host_state_root())?;
+        let launcher = SystemSupervisorLauncher::new()?;
+        operation(request, &store, &launcher)
+    })();
+
+    let exit = result.as_ref().map_or_else(WorkerError::exit_code, |_| 0);
+    let write_result = match result {
+        Ok(response) => serde_json::to_writer(&mut *stdout, &response),
+        Err(error) => serde_json::to_writer(&mut *stdout, &versioned_host_error(&error)),
+    };
+    if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
+        return crate::error::ExitKind::Io as u8;
+    }
+    exit
+}
+
+fn versioned_host_error(error: &WorkerError) -> HostControlError {
+    if let WorkerError::Protocol(message) = error
+        && let Some((code, detail)) = message.split_once(": ")
+        && let Ok(error) = HostControlError::new(code, detail)
+    {
+        return error;
+    }
+    let (code, message) = match error {
+        WorkerError::Capacity { code, .. } => (*code, "worker admission rejected"),
+        WorkerError::Snapshot { code, .. } => (*code, "snapshot operation failed"),
+        WorkerError::Io(_) => ("HOST_IO", "host state operation failed"),
+        _ => ("INVALID_REQUEST", "host request was invalid"),
+    };
+    HostControlError::new(code, message).expect("fixed host error is valid")
 }
 
 fn run_host_supervise(

@@ -39,6 +39,11 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum HostCommand {
     Probe,
+    Status,
+    #[command(name = "log-chunk")]
+    LogChunk,
+    #[command(name = "resolve-or-abandon")]
+    ResolveOrAbandon,
     Submit,
     Supervise {
         job_id: HiddenComponent,

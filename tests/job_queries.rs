@@ -1,7 +1,7 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs::{self, File, OpenOptions},
-    io::Write as _,
+    io::{Cursor, Write as _},
     os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
@@ -14,18 +14,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+use clap::Parser;
 use mac_worker::{
+    RuntimeContext,
+    cli::Cli,
     host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
     job::{
-        ClientId, CommandSpec, JobId, JobState, JobStatus, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk, LogCursor, LogStream,
-        ProcessIdentity, RequestFingerprintMaterial, ResolveOrAbandonOutcome,
-        ResolveOrAbandonRequest, StatusResponse, SubmitRequest, TerminalLogDrain,
+        ClientId, CommandSpec, HostControlError, JobId, JobState, JobStatus, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse,
+        LogCursor, LogStream, ProcessIdentity, RequestFingerprintMaterial, ResolveOrAbandonOutcome,
+        ResolveOrAbandonRequest, StatusRequest, StatusResponse, SubmitRequest, TerminalLogDrain,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
+    paths::PathLayout,
+    process::SystemProcessRunner,
     protocol::MemoryPressure,
     remote_snapshot::RemoteSnapshotService,
+    run_with_stdio_in_context,
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
         ReconciliationRuntime, Supervisor, SystemProcessInspector,
@@ -2993,6 +2999,212 @@ fn payload_and_log_binding_failures_preserve_evidence_and_the_exact_lease() {
             "{failure}"
         );
     }
+}
+
+fn endpoint_runtime_and_completed_job(
+    temp: &tempfile::TempDir,
+) -> (RuntimeContext, SubmitRequest, StatusResponse) {
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let environment = BTreeMap::from([("HOME".into(), home.as_os_str().to_os_string())]);
+    let paths = PathLayout::discover(None, &environment, &home).unwrap();
+    let (store, _lease, submit) = prepared_host_with_command(
+        &paths.host_state_root(),
+        CommandSpec::argv(vec!["/usr/bin/printf".into(), "endpoint-log".into()]).unwrap(),
+    );
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let completed = JobService::new(&store, &launcher)
+        .submit_at(submit.clone(), 10)
+        .unwrap();
+    let response = StatusResponse::new(
+        match &completed {
+            mac_worker::job::SubmitResponse::Accepted { meta, .. } => (**meta).clone(),
+            mac_worker::job::SubmitResponse::Existing { .. } => unreachable!(),
+        },
+        completed.status().clone(),
+    )
+    .unwrap();
+    (
+        RuntimeContext::isolated(environment, home, temp.path().to_path_buf()),
+        submit,
+        response,
+    )
+}
+
+fn run_query_endpoint(
+    runtime: &RuntimeContext,
+    command: &str,
+    input: Vec<u8>,
+) -> (u8, Vec<u8>, Vec<u8>) {
+    let cli = Cli::try_parse_from([
+        "worker",
+        "--config",
+        "/definitely/missing/inventory.toml",
+        "host",
+        command,
+    ])
+    .unwrap();
+    let mut stdin = Cursor::new(input);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_stdio_in_context(
+        cli,
+        &SystemProcessRunner,
+        runtime,
+        &mut stdin,
+        &mut stdout,
+        &mut stderr,
+    );
+    (exit, stdout, stderr)
+}
+
+#[test]
+fn hidden_query_endpoints_are_argument_free_and_return_one_canonical_typed_line() {
+    // Break caught: a query endpoint loads the missing inventory, accepts a
+    // positional identity, emits stderr, or returns an unversioned envelope.
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, submit, expected_status) = endpoint_runtime_and_completed_job(&temp);
+    let job_id = submit.material().job_id();
+    let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let expected_log = LogChunkResponse::new(
+        LogChunk::new(LogStream::Stdout, 0, b"endpoint-log".to_vec()).unwrap(),
+    )
+    .unwrap();
+    let expected_resolve =
+        mac_worker::job::ResolveOrAbandonResponse::accepted(expected_status.clone()).unwrap();
+    let cases = [
+        (
+            "status",
+            serde_json::to_vec(&StatusRequest::new(job_id)).unwrap(),
+            serde_json::to_vec(&expected_status).unwrap(),
+        ),
+        (
+            "log-chunk",
+            serde_json::to_vec(&LogChunkRequest::new(job_id, LogStream::Stdout, 0, 64)).unwrap(),
+            serde_json::to_vec(&expected_log).unwrap(),
+        ),
+        (
+            "resolve-or-abandon",
+            serde_json::to_vec(&resolve).unwrap(),
+            serde_json::to_vec(&expected_resolve).unwrap(),
+        ),
+    ];
+
+    for (command, input, expected) in cases {
+        assert!(Cli::try_parse_from(["worker", "host", command]).is_ok());
+        assert!(Cli::try_parse_from(["worker", "host", command, "planted-argument"]).is_err());
+        let (exit, stdout, stderr) = run_query_endpoint(&runtime, command, input);
+        assert_eq!(exit, 0, "{command}: {}", String::from_utf8_lossy(&stdout));
+        assert!(stderr.is_empty(), "{command}");
+        assert_eq!(stdout.last(), Some(&b'\n'), "{command}");
+        assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let mut expected = expected;
+        expected.push(b'\n');
+        assert_eq!(stdout, expected, "{command}");
+    }
+}
+
+#[test]
+fn every_query_endpoint_rejects_noncanonical_or_unbounded_input_with_typed_stdout_only() {
+    // Break caught: one endpoint accepts a duplicate/unknown/version/trailing
+    // request shape or reflects malformed/oversized input through stderr.
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, submit, _) = endpoint_runtime_and_completed_job(&temp);
+    let job_id = submit.material().job_id();
+    let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let valid = [
+        (
+            "status",
+            serde_json::to_vec(&StatusRequest::new(job_id)).unwrap(),
+        ),
+        (
+            "log-chunk",
+            serde_json::to_vec(&LogChunkRequest::new(job_id, LogStream::Stdout, 0, 64)).unwrap(),
+        ),
+        ("resolve-or-abandon", serde_json::to_vec(&resolve).unwrap()),
+    ];
+    for (command, valid) in valid {
+        let mut wrong_version: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+        wrong_version["protocol_version"] = serde_json::json!(999);
+        let mut unknown: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+        unknown["unknown"] = serde_json::json!(true);
+        let mut duplicate = valid.clone();
+        duplicate.splice(1..1, b"\"protocol_version\":2,".iter().copied());
+        let invalid = vec![
+            Vec::new(),
+            b"{".to_vec(),
+            b"[]".to_vec(),
+            serde_json::to_vec(&wrong_version).unwrap(),
+            serde_json::to_vec(&unknown).unwrap(),
+            duplicate,
+            [valid.as_slice(), b"{}"].concat(),
+            [b" ".as_slice(), valid.as_slice()].concat(),
+            vec![b'x'; 1024 * 1024 + 1],
+        ];
+        for input in invalid {
+            let (exit, stdout, stderr) = run_query_endpoint(&runtime, command, input);
+            assert_ne!(exit, 0, "{command}");
+            assert!(stderr.is_empty(), "{command}: stderr was not empty");
+            assert_eq!(stdout.last(), Some(&b'\n'), "{command}");
+            assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+            let error: HostControlError = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(error.error().code(), "INVALID_REQUEST", "{command}");
+            let mut canonical = serde_json::to_vec(&error).unwrap();
+            canonical.push(b'\n');
+            assert_eq!(stdout, canonical, "{command}");
+        }
+    }
+}
+
+#[test]
+fn query_endpoint_service_errors_are_versioned_and_broken_stdout_is_io_exit_74() {
+    // Break caught: stable host authority is hidden behind INVALID_REQUEST or
+    // a broken stdout incorrectly reports the underlying service result.
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, submit, _) = endpoint_runtime_and_completed_job(&temp);
+    let missing = JobId::new(uuid::Uuid::from_u128(999_999));
+    let (exit, stdout, stderr) = run_query_endpoint(
+        &runtime,
+        "status",
+        serde_json::to_vec(&StatusRequest::new(missing)).unwrap(),
+    );
+    assert_ne!(exit, 0);
+    assert!(stderr.is_empty());
+    let error: HostControlError = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(error.error().code(), "JOB_NOT_FOUND");
+
+    struct BrokenStdout;
+    impl std::io::Write for BrokenStdout {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "planted broken stdout",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "planted broken stdout",
+            ))
+        }
+    }
+    let cli = Cli::try_parse_from(["worker", "host", "status"]).unwrap();
+    let mut stdin =
+        Cursor::new(serde_json::to_vec(&StatusRequest::new(submit.material().job_id())).unwrap());
+    let mut stdout = BrokenStdout;
+    let mut stderr = Vec::new();
+    let exit = run_with_stdio_in_context(
+        cli,
+        &SystemProcessRunner,
+        &runtime,
+        &mut stdin,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 74);
+    assert!(stderr.is_empty());
 }
 
 fn lease_request() -> LeaseAcquireRequest {
