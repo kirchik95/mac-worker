@@ -748,6 +748,244 @@ fn read_log_returns_bounded_binary_chunks_from_independent_fixed_streams() {
 }
 
 #[test]
+fn read_log_rejects_a_whole_job_directory_swap_and_preserves_all_evidence() {
+    // Catches resolving status against one durable job directory and then
+    // reopening the textual job path for the log read after that path has
+    // been replaced by a different directory.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("whole-job-log-swap");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launcher = HoldingRecordingLauncher {
+        launches,
+        job_path: job.clone(),
+        identity: identity(51_102),
+        guard: Mutex::new(None),
+    };
+    JobService::new(&store, &launcher)
+        .status(lease.job_id())
+        .unwrap();
+
+    let original_stdout = b"original-private-stdout\n";
+    let original_stderr = b"original-private-stderr\n";
+    fs::write(job.join("stdout.log"), original_stdout).unwrap();
+    fs::write(job.join("stderr.log"), original_stderr).unwrap();
+    let original_meta = fs::read(job.join("meta.json")).unwrap();
+    let original_status = fs::read(job.join("status.json")).unwrap();
+    let unrelated = root.join("unrelated-query-evidence");
+    fs::write(&unrelated, b"unrelated-state-must-survive").unwrap();
+
+    let parent = job.parent().unwrap().to_path_buf();
+    let replacement = parent.join(".replacement-job-directory");
+    fs::create_dir(&replacement).unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        replacement.join("stdout.log"),
+        b"replacement-private-stdout\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        replacement.join("stdout.log"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let detached = parent.join(".detached-authoritative-job");
+    let swaps = Arc::new(AtomicUsize::new(0));
+    let hook_job = job.clone();
+    let hook_replacement = replacement.clone();
+    let hook_detached = detached.clone();
+    let hook_parent = parent.clone();
+    let hook_swaps = Arc::clone(&swaps);
+    let service = JobService::new_with_log_read_boundary(
+        &store,
+        &launcher,
+        Arc::new(move || {
+            assert_eq!(hook_swaps.fetch_add(1, Ordering::SeqCst), 0);
+            fs::rename(&hook_job, &hook_detached).unwrap();
+            fs::rename(&hook_replacement, &hook_job).unwrap();
+            File::open(&hook_parent).unwrap().sync_all().unwrap();
+        }),
+    );
+
+    let error = service
+        .read_log(lease.job_id(), LogStream::Stdout, 0, 65_536)
+        .unwrap_err();
+
+    assert_eq!(swaps.load(Ordering::SeqCst), 1);
+    let rendered = error.to_string();
+    assert!(rendered.len() <= 512, "unbounded diagnostic: {rendered}");
+    for secret in [
+        "original-private-stdout",
+        "original-private-stderr",
+        "replacement-private-stdout",
+        "unrelated-state-must-survive",
+    ] {
+        assert!(!rendered.contains(secret), "diagnostic leaked {secret}");
+    }
+    assert_eq!(fs::read(detached.join("meta.json")).unwrap(), original_meta);
+    assert_eq!(
+        fs::read(detached.join("status.json")).unwrap(),
+        original_status
+    );
+    assert_eq!(
+        fs::read(detached.join("stdout.log")).unwrap(),
+        original_stdout
+    );
+    assert_eq!(
+        fs::read(detached.join("stderr.log")).unwrap(),
+        original_stderr
+    );
+    assert_eq!(
+        fs::read(job.join("stdout.log")).unwrap(),
+        b"replacement-private-stdout\n"
+    );
+    assert_eq!(
+        fs::read(&unrelated).unwrap(),
+        b"unrelated-state-must-survive"
+    );
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
+    drop(launcher.guard.lock().unwrap().take());
+}
+
+#[test]
+fn read_log_leaf_failures_preserve_job_evidence_unrelated_state_and_the_exact_lease() {
+    for mutation in ["symlink", "replacement", "shrink"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(format!("log-leaf-{mutation}"));
+        let (store, lease, _request) = indexed_identityless_job(&root);
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        let launcher = HoldingRecordingLauncher {
+            launches: Arc::new(AtomicUsize::new(0)),
+            job_path: job.clone(),
+            identity: identity(51_103),
+            guard: Mutex::new(None),
+        };
+        JobService::new(&store, &launcher)
+            .status(lease.job_id())
+            .unwrap();
+
+        let original_stdout = b"0123456789-original-private-stdout";
+        let original_stderr = b"preserved-private-stderr";
+        fs::write(job.join("stdout.log"), original_stdout).unwrap();
+        fs::write(job.join("stderr.log"), original_stderr).unwrap();
+        let original_meta = fs::read(job.join("meta.json")).unwrap();
+        let original_status = fs::read(job.join("status.json")).unwrap();
+        let unrelated = temp.path().join("unrelated-log-target");
+        fs::write(&unrelated, b"unrelated-private-state").unwrap();
+        let retained = job.join(".retained-stdout");
+        let replacement = job.join(".unsafe-log-replacement");
+        if mutation == "replacement" {
+            fs::write(&replacement, b"replacement-private-bytes").unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let hook_job = job.clone();
+        let hook_unrelated = unrelated.clone();
+        let hook_retained = retained.clone();
+        let hook_replacement = replacement.clone();
+        let service = JobService::new_with_log_read_boundary(
+            &store,
+            &launcher,
+            Arc::new(move || {
+                let stdout = hook_job.join("stdout.log");
+                match mutation {
+                    "symlink" => {
+                        fs::rename(&stdout, &hook_retained).unwrap();
+                        symlink(&hook_unrelated, &stdout).unwrap();
+                    }
+                    "replacement" => {
+                        fs::rename(&stdout, &hook_retained).unwrap();
+                        fs::rename(&hook_replacement, &stdout).unwrap();
+                    }
+                    "shrink" => {
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .truncate(true)
+                            .open(&stdout)
+                            .unwrap();
+                        file.write_all(b"tiny").unwrap();
+                        file.sync_all().unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                File::open(&hook_job).unwrap().sync_all().unwrap();
+            }),
+        );
+
+        let error = service
+            .read_log(
+                lease.job_id(),
+                LogStream::Stdout,
+                if mutation == "shrink" { 8 } else { 0 },
+                65_536,
+            )
+            .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.len() <= 512,
+            "{mutation} produced an unbounded diagnostic: {rendered}"
+        );
+        for secret in [
+            "original-private-stdout",
+            "preserved-private-stderr",
+            "replacement-private-bytes",
+            "unrelated-private-state",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "{mutation} diagnostic leaked {secret}"
+            );
+        }
+        assert_eq!(fs::read(job.join("meta.json")).unwrap(), original_meta);
+        assert_eq!(fs::read(job.join("status.json")).unwrap(), original_status);
+        assert_eq!(
+            fs::read(job.join("stderr.log")).unwrap(),
+            original_stderr,
+            "{mutation}"
+        );
+        assert_eq!(
+            fs::read(&unrelated).unwrap(),
+            b"unrelated-private-state",
+            "{mutation}"
+        );
+        match mutation {
+            "symlink" => {
+                assert!(
+                    fs::symlink_metadata(job.join("stdout.log"))
+                        .unwrap()
+                        .is_symlink()
+                );
+                assert_eq!(fs::read(&retained).unwrap(), original_stdout);
+            }
+            "replacement" => {
+                assert_eq!(
+                    fs::read(job.join("stdout.log")).unwrap(),
+                    b"replacement-private-bytes"
+                );
+                assert_eq!(fs::read(&retained).unwrap(), original_stdout);
+            }
+            "shrink" => assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"tiny"),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            LeaseService::new(&store).load().unwrap(),
+            Some(lease.clone()),
+            "{mutation}"
+        );
+        drop(launcher.guard.lock().unwrap().take());
+    }
+}
+
+#[test]
 fn terminal_log_drain_requires_both_exact_eofs_and_unchanged_status_revalidation() {
     // Catches stopping on an empty preterminal read, coupling stdout/stderr
     // offsets, stopping at the recorded length without the extra EOF probes,

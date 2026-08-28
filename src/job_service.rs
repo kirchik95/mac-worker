@@ -146,12 +146,40 @@ pub trait SupervisorLauncher: Send + Sync {
     -> Result<LaunchCandidate, WorkerError>;
 }
 
+struct AuthoritativeJob {
+    response: StatusResponse,
+    directory: RootedDir,
+}
+
+impl AuthoritativeJob {
+    fn new(directory: RootedDir, meta: JobMeta, status: JobStatus) -> Result<Self, WorkerError> {
+        let response = StatusResponse::new(meta, status)
+            .map_err(|_| job_state_invalid("job status response is inconsistent"))?;
+        Ok(Self {
+            response,
+            directory,
+        })
+    }
+
+    fn from_response(directory: RootedDir, response: StatusResponse) -> Self {
+        Self {
+            response,
+            directory,
+        }
+    }
+
+    fn into_response(self) -> StatusResponse {
+        self.response
+    }
+}
+
 pub struct JobService<'a> {
     store: &'a HostStore,
     leases: LeaseService<'a>,
     snapshots: RemoteSnapshotService<'a>,
     launcher: &'a dyn SupervisorLauncher,
     reconciliation: Arc<dyn ReconciliationRuntime>,
+    log_read_boundary: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<'a> JobService<'a> {
@@ -162,6 +190,7 @@ impl<'a> JobService<'a> {
             snapshots: RemoteSnapshotService::new(store),
             launcher,
             reconciliation: Arc::new(SystemReconciliationRuntime::new()),
+            log_read_boundary: None,
         }
     }
 
@@ -177,6 +206,23 @@ impl<'a> JobService<'a> {
             snapshots: RemoteSnapshotService::new(store),
             launcher,
             reconciliation,
+            log_read_boundary: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_log_read_boundary(
+        store: &'a HostStore,
+        launcher: &'a dyn SupervisorLauncher,
+        log_read_boundary: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            store,
+            leases: LeaseService::new(store),
+            snapshots: RemoteSnapshotService::new(store),
+            launcher,
+            reconciliation: Arc::new(SystemReconciliationRuntime::new()),
+            log_read_boundary: Some(log_read_boundary),
         }
     }
 
@@ -193,7 +239,8 @@ impl<'a> JobService<'a> {
     }
 
     pub fn status(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
-        self.status_with_supervisor_ensure(job_id, true)
+        self.authoritative_job_with_supervisor_ensure(job_id, true)
+            .map(AuthoritativeJob::into_response)
     }
 
     pub fn read_log(
@@ -203,25 +250,16 @@ impl<'a> JobService<'a> {
         offset: u64,
         limit: u32,
     ) -> Result<LogChunk, WorkerError> {
-        let authoritative = self.status(job_id)?;
-        let meta = authoritative.meta();
-        let job = self
-            .store
-            .open_directory(
-                &format!(
-                    "jobs/{}/{}/{}",
-                    meta.project_id(),
-                    meta.worktree_id(),
-                    meta.job_id()
-                ),
-                false,
-            )
-            .map_err(|_| job_state_invalid("authoritative job directory is absent or unsafe"))?;
+        let authoritative = self.authoritative_job_with_supervisor_ensure(job_id, true)?;
+        if let Some(boundary) = &self.log_read_boundary {
+            boundary();
+        }
         let name = match stream {
             LogStream::Stdout => "stdout.log",
             LogStream::Stderr => "stderr.log",
         };
-        let bytes = job
+        let bytes = authoritative
+            .directory
             .read_private_regular_chunk(
                 name,
                 offset,
@@ -241,14 +279,15 @@ impl<'a> JobService<'a> {
     }
 
     pub fn reconcile_job(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
-        self.status_with_supervisor_ensure(job_id, true)
+        self.authoritative_job_with_supervisor_ensure(job_id, true)
+            .map(AuthoritativeJob::into_response)
     }
 
-    fn status_with_supervisor_ensure(
+    fn authoritative_job_with_supervisor_ensure(
         &self,
         job_id: JobId,
         ensure_supervisor: bool,
-    ) -> Result<StatusResponse, WorkerError> {
+    ) -> Result<AuthoritativeJob, WorkerError> {
         let admission = self.store.admission_lock(job_id)?;
         match self.store.disposition(job_id).map_err(|error| {
             if matches!(&error, WorkerError::Protocol(message) if message.starts_with("JOB_ID_CONFLICT:")) {
@@ -275,7 +314,7 @@ impl<'a> JobService<'a> {
         admission: AdmissionGuard,
         job_id: JobId,
         ensure_supervisor: bool,
-    ) -> Result<StatusResponse, WorkerError> {
+    ) -> Result<AuthoritativeJob, WorkerError> {
         admission.validate_for(job_id)?;
         let Some(lease) = self
             .leases
@@ -346,7 +385,7 @@ impl<'a> JobService<'a> {
             meta.created_at_millis(),
         )?;
         drop(published);
-        self.status_with_supervisor_ensure(job_id, ensure_supervisor)
+        self.authoritative_job_with_supervisor_ensure(job_id, ensure_supervisor)
     }
 
     fn status_from_accepted_after(
@@ -354,7 +393,7 @@ impl<'a> JobService<'a> {
         admission: AdmissionGuard,
         disposition: JobDisposition,
         ensure_supervisor: bool,
-    ) -> Result<StatusResponse, WorkerError> {
+    ) -> Result<AuthoritativeJob, WorkerError> {
         let JobDisposition::Accepted {
             job_id,
             client_id,
@@ -420,7 +459,7 @@ impl<'a> JobService<'a> {
 
         if !ensure_supervisor {
             drop(admission);
-            return Ok(response);
+            return Ok(AuthoritativeJob::from_response(job, response));
         }
 
         let identityless_accepted = status.state() == JobState::Accepted
@@ -428,14 +467,14 @@ impl<'a> JobService<'a> {
             && status.child_identity().is_none();
         let Some(lease) = lease else {
             drop(admission);
-            return Ok(response);
+            return Ok(AuthoritativeJob::from_response(job, response));
         };
         let supervisor = self
             .store
             .supervisor_lock_after(&admission, job_id, false)?;
         let Some(mut supervisor) = supervisor else {
             drop(admission);
-            return Ok(response);
+            return Ok(AuthoritativeJob::from_response(job, response));
         };
         let (current_bytes, current): (Vec<u8>, JobStatus) =
             read_mutable_canonical_json_with_bytes(&job, "status.json")
@@ -444,15 +483,14 @@ impl<'a> JobService<'a> {
         if current != status {
             drop(supervisor);
             drop(admission);
-            return self.status_with_supervisor_ensure(job_id, false);
+            return self.authoritative_job_with_supervisor_ensure(job_id, false);
         }
         if !identityless_accepted {
             if current.state().is_terminal() {
                 drop(admission);
                 drop(supervisor);
                 self.cleanup_and_release_reconciled(&lease, &job, &current)?;
-                return StatusResponse::new(meta, current)
-                    .map_err(|_| job_state_invalid("job status response is inconsistent"));
+                return AuthoritativeJob::new(job, meta, current);
             }
             let supervisor_identity = current.supervisor_identity().ok_or_else(|| {
                 job_state_invalid("nonterminal supervised job has no supervisor identity")
@@ -489,8 +527,7 @@ impl<'a> JobService<'a> {
             )?;
             drop(supervisor);
             self.cleanup_and_release_reconciled(&lease, &job, &lost)?;
-            return StatusResponse::new(meta, lost)
-                .map_err(|_| job_state_invalid("job status response is inconsistent"));
+            return AuthoritativeJob::new(job, meta, lost);
         }
 
         validate_empty_prelaunch_private_directories(&job)?;
@@ -502,10 +539,12 @@ impl<'a> JobService<'a> {
         )?;
         drop(admission);
         match self.launch_after_election(job_id, supervisor, &request, &lease, &verified, false) {
-            Ok(_) => self.status_with_supervisor_ensure(job_id, false),
+            Ok(_) => self.authoritative_job_with_supervisor_ensure(job_id, false),
             Err(error) if matches!(&error, WorkerError::Protocol(message) if message.starts_with("SUPERVISOR_PRELAUNCH_FAILED:")) => {
-                match self.status_with_supervisor_ensure(job_id, false) {
-                    Ok(authoritative) if authoritative.status() != &status => Ok(authoritative),
+                match self.authoritative_job_with_supervisor_ensure(job_id, false) {
+                    Ok(authoritative) if authoritative.response.status() != &status => {
+                        Ok(authoritative)
+                    }
                     Ok(_) => Err(error),
                     Err(authority_error) => Err(authority_error),
                 }
