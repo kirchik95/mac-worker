@@ -6311,7 +6311,7 @@ fn json_stream_errors_use_stdout_only_and_writer_failure_is_74() {
         } => {
             assert_eq!(*protocol_version, PROTOCOL_VERSION);
             assert_eq!(code, "SSH_UNAVAILABLE");
-            assert_eq!(message, "SSH control request failed");
+            assert_eq!(message, "transport error");
         }
         other => panic!("JSON stream error must be one error event, got {other:?}"),
     }
@@ -6937,4 +6937,314 @@ fn full_public_forms_execute_without_exposing_hidden_host_commands() {
         0
     );
     assert_no_hidden_host_leak(&stdout, &stderr);
+}
+
+enum ScriptedIo {
+    Write(io::Result<usize>),
+    Flush(io::Result<()>),
+}
+
+struct ScriptedWriter {
+    script: VecDeque<ScriptedIo>,
+    writes: usize,
+    flushes: usize,
+    bytes: Vec<u8>,
+}
+
+impl ScriptedWriter {
+    fn scripted(script: Vec<ScriptedIo>) -> Self {
+        Self {
+            script: script.into(),
+            writes: 0,
+            flushes: 0,
+            bytes: Vec::new(),
+        }
+    }
+
+    fn contains_json_error_event(&self) -> bool {
+        self.bytes
+            .windows(b"\"event\":\"error\"".len())
+            .any(|window| window == b"\"event\":\"error\"")
+    }
+}
+
+impl Write for ScriptedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writes += 1;
+        match self.script.pop_front() {
+            Some(ScriptedIo::Write(Ok(n))) => {
+                let n = n.min(buf.len());
+                self.bytes.extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+            Some(ScriptedIo::Write(Err(error))) => Err(error),
+            Some(ScriptedIo::Flush(_)) => {
+                panic!("scripted writer expected a write, but the next scripted step was flush")
+            }
+            None => {
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushes += 1;
+        match self.script.pop_front() {
+            Some(ScriptedIo::Flush(result)) => result,
+            Some(ScriptedIo::Write(_)) => {
+                panic!("scripted writer expected a flush, but the next scripted step was write")
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+fn planted_live_stdout_error() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "planted live stdout failure")
+}
+
+fn dispatch_json_logs_to(
+    stdout: &mut dyn Write,
+) -> (u8, Vec<u8>, tempfile::TempDir, PublicRuntime) {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = public_runtime(temp.path(), temp.path());
+    let record = persist_public_job(&runtime.state, Some(JobStatus::accepted(101).unwrap()));
+    let mut stderr = Vec::new();
+    let exit = dispatch(
+        public_cli(
+            runtime.config.clone(),
+            true,
+            WorkerCommand::Logs {
+                follow: false,
+                job_id: record.meta().job_id(),
+            },
+        ),
+        &RecordingRunner::returning(terminal_log_script(
+            &record,
+            JobStatus::succeeded(110, 0, 0).unwrap(),
+        )),
+        &runtime.context,
+        stdout,
+        &mut stderr,
+    );
+    (exit, stderr, temp, runtime)
+}
+
+fn assert_no_second_json_error(stdout: &ScriptedWriter, stderr: &[u8]) {
+    assert!(
+        stderr.is_empty(),
+        "stderr must stay empty: {}",
+        String::from_utf8_lossy(stderr)
+    );
+    assert!(
+        !stdout.contains_json_error_event(),
+        "failed live stdout must not emit a JSON error event: {}",
+        String::from_utf8_lossy(&stdout.bytes)
+    );
+}
+
+#[test]
+fn public_diag_json_live_stdout_fail_once_recovering_is_74() {
+    // Break caught: a failed accepted/log write is retried as a JSON error
+    // event on the same recovering stdout.
+    let mut stdout =
+        ScriptedWriter::scripted(vec![ScriptedIo::Write(Err(planted_live_stdout_error()))]);
+    let (exit, stderr, _temp, _runtime) = dispatch_json_logs_to(&mut stdout);
+    assert_eq!(exit, 74);
+    assert_eq!(stdout.writes, 1);
+    assert_eq!(stdout.flushes, 0);
+    assert_no_second_json_error(&stdout, &stderr);
+}
+
+#[test]
+fn public_diag_json_live_stdout_partial_then_error_is_74() {
+    // Break caught: write_all partial success plus a later error is treated
+    // as a recoverable service failure and retried as an error event.
+    let mut stdout = ScriptedWriter::scripted(vec![
+        ScriptedIo::Write(Ok(8)),
+        ScriptedIo::Write(Err(planted_live_stdout_error())),
+    ]);
+    let (exit, stderr, _temp, _runtime) = dispatch_json_logs_to(&mut stdout);
+    assert_eq!(exit, 74);
+    assert_eq!(stdout.writes, 2);
+    assert_eq!(stdout.flushes, 0);
+    assert_no_second_json_error(&stdout, &stderr);
+}
+
+#[test]
+fn public_diag_json_live_stdout_zero_write_is_74() {
+    // Break caught: write_all Ok(0) on a nonempty buffer is not treated as a
+    // live-writer failure, so the dispatcher retries an error event.
+    let mut stdout = ScriptedWriter::scripted(vec![ScriptedIo::Write(Ok(0))]);
+    let (exit, stderr, _temp, _runtime) = dispatch_json_logs_to(&mut stdout);
+    assert_eq!(exit, 74);
+    assert_eq!(stdout.writes, 1);
+    assert_eq!(stdout.flushes, 0);
+    assert_no_second_json_error(&stdout, &stderr);
+}
+
+#[test]
+fn public_diag_json_live_stdout_flush_failure_is_74() {
+    // Break caught: a failed live flush is followed by a second write of a
+    // JSON error event once later writes/flushes recover.
+    let mut stdout = ScriptedWriter::scripted(vec![
+        ScriptedIo::Write(Ok(usize::MAX)),
+        ScriptedIo::Write(Ok(usize::MAX)),
+        ScriptedIo::Flush(Err(planted_live_stdout_error())),
+    ]);
+    let (exit, stderr, _temp, _runtime) = dispatch_json_logs_to(&mut stdout);
+    assert_eq!(exit, 74);
+    assert_eq!(stdout.writes, 2);
+    assert_eq!(stdout.flushes, 1);
+    assert_no_second_json_error(&stdout, &stderr);
+}
+
+#[test]
+fn public_diag_json_error_keeps_exit_and_rejects_oversized_internal_payload() {
+    // Break caught: Protocol/Capacity detail is copied into JsonEvent::Error
+    // and can leak paths/argv/secrets or exceed the 4096-byte bound.
+    let planted_path = "/Users/alice/PLANTED_PUBLIC_PATH";
+    let planted_secret = "PLANTED_PUBLIC_SECRET";
+    let planted_argv = "printf TASK9_COMMAND_SECRET";
+    let planted = format!(
+        "{} {planted_path} {planted_secret} {planted_argv} {CLIENT_ID} {LEASE_TOKEN}",
+        "X".repeat(3900)
+    );
+    assert!(planted.len() <= 4096);
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = public_runtime(temp.path(), temp.path());
+    let record = persist_public_job(&runtime.state, Some(JobStatus::accepted(101).unwrap()));
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = dispatch(
+        public_cli(
+            runtime.config,
+            true,
+            WorkerCommand::Logs {
+                follow: false,
+                job_id: record.meta().job_id(),
+            },
+        ),
+        &RecordingRunner::returning(vec![authoritative_protocol_failure(
+            "INVALID_REQUEST",
+            &planted,
+        )]),
+        &runtime.context,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 70);
+    assert!(stderr.is_empty());
+    let events = parse_json_events(&stdout);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        JsonEvent::Error {
+            protocol_version,
+            code,
+            message,
+        } => {
+            assert_eq!(*protocol_version, PROTOCOL_VERSION);
+            assert_eq!(code, "INVALID_REQUEST");
+            assert_eq!(message, "protocol error");
+        }
+        other => panic!("expected one JSON error event, got {other:?}"),
+    }
+    let text = String::from_utf8_lossy(&stdout);
+    for planted in [
+        planted_path,
+        planted_secret,
+        planted_argv,
+        CLIENT_ID,
+        LEASE_TOKEN,
+        &"X".repeat(32),
+    ] {
+        assert!(!text.contains(planted), "JSON error leaked {planted}");
+    }
+}
+
+#[test]
+fn public_diag_missing_config_is_sanitized_for_human_and_json() {
+    // Break caught: public run/logs/status render WorkerError::Display, so a
+    // missing --config prints its absolute path and planted secret.
+    let planted_secret = "PLANTED_PUBLIC_SECRET";
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = public_runtime(temp.path(), temp.path());
+    let missing = runtime
+        .config
+        .parent()
+        .unwrap()
+        .join(planted_secret)
+        .join("missing-config.toml");
+    assert!(missing.is_absolute());
+    let planted_path = missing.to_string_lossy().into_owned();
+    let job_id = JOB_ID.parse().unwrap();
+    let command_kinds = ["run", "logs", "status"];
+
+    for kind in command_kinds {
+        let is_status = kind == "status";
+        for json in [false, true] {
+            let command = match kind {
+                "run" => WorkerCommand::Run {
+                    worker: "mini-1".into(),
+                    project: None,
+                    includes: Vec::new(),
+                    timeout: None,
+                    shell: None,
+                    argv: vec!["true".into()],
+                },
+                "logs" => WorkerCommand::Logs {
+                    follow: false,
+                    job_id,
+                },
+                _ => WorkerCommand::Status {
+                    job_id: Some(job_id),
+                },
+            };
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = dispatch(
+                public_cli(missing.clone(), json, command),
+                &RecordingRunner::returning(Vec::new()),
+                &runtime.context,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(exit, 64, "json={json} command={kind}");
+            let combined = [stdout.as_slice(), stderr.as_slice()].concat();
+            let text = String::from_utf8_lossy(&combined);
+            assert!(
+                !text.contains(&planted_path),
+                "json={json} leaked path {planted_path}: {text}"
+            );
+            assert!(
+                !text.contains(planted_secret),
+                "json={json} leaked secret: {text}"
+            );
+            if json && !is_status {
+                assert!(stderr.is_empty(), "JSON stream stderr: {text}");
+                let events = parse_json_events(&stdout);
+                assert_eq!(events.len(), 1, "{text}");
+                match &events[0] {
+                    JsonEvent::Error {
+                        protocol_version,
+                        code,
+                        message,
+                    } => {
+                        assert_eq!(*protocol_version, PROTOCOL_VERSION);
+                        assert_eq!(code, "CONFIG");
+                        assert_eq!(message, "configuration error");
+                    }
+                    other => panic!("JSON run/logs must emit JsonEvent::Error, got {other:?}"),
+                }
+            } else {
+                assert!(stdout.is_empty(), "human/status stdout: {text}");
+                assert_eq!(
+                    String::from_utf8_lossy(&stderr),
+                    "CONFIG: configuration error\n",
+                    "json={json} command={kind}"
+                );
+            }
+        }
+    }
 }

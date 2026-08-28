@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    io::{Cursor, Read, Write},
+    io::{self, Cursor, Read, Write},
     path::PathBuf,
 };
 
@@ -261,84 +261,137 @@ fn run_public_streaming_command(
     stderr: &mut dyn Write,
 ) -> u8 {
     let json = cli.json;
-    let result = (|| -> Result<u8, WorkerError> {
-        let paths = discover_paths(cli.config, runtime)?;
-        let config = Config::load(&paths.config)?;
-        let client_state = ClientStateStore::open(&paths.state)?;
-        let remote = RemoteJobClient::new(runner);
-        let follow_runtime = SystemFollowRuntime;
-        let logs = LogsService {
-            config: &config,
-            client_state: &client_state,
-            remote: &remote,
-            runtime: &follow_runtime,
+    if json {
+        let mut live = LiveJsonStdout::new(stdout);
+        return match run_public_streaming_body(cli, runner, runtime, &mut live, stderr) {
+            Ok(code) => code,
+            Err(_) if live.failed => crate::error::ExitKind::Io as u8,
+            Err(error) => match write_json_error_event(live.inner, &error) {
+                Ok(()) => error.exit_code(),
+                Err(_) => crate::error::ExitKind::Io as u8,
+            },
         };
-        match cli.command {
-            Command::Run {
-                worker,
-                project,
-                includes,
-                timeout,
-                shell,
-                argv,
-            } => {
-                let project = match project {
-                    Some(project) => project,
-                    None => runtime.current_dir()?,
-                };
-                let command = match shell {
-                    Some(shell) => CommandSpec::shell(shell)?,
-                    None => CommandSpec::argv(argv)?,
-                };
-                let service =
-                    RunService::with_follower(runner, &config, &paths, &client_state, &logs);
-                let completion = service.submit_and_follow(
-                    RunRequest {
-                        worker,
-                        project,
-                        cli_includes: includes,
-                        timeout,
-                        command,
-                    },
-                    json,
-                    stdout,
-                    stderr,
-                )?;
-                Ok(completion.exit_code)
-            }
-            Command::Logs { follow, job_id } => {
-                let response = logs.stream(job_id, follow, json, stdout, stderr)?;
-                if response.status().state().is_terminal() {
-                    terminal_exit_code(response.status())
-                } else {
-                    Ok(0)
-                }
-            }
-            _ => Err(WorkerError::Protocol(
-                "public streaming dispatcher received a non-streaming command".into(),
-            )),
-        }
-    })();
-    match result {
+    }
+    match run_public_streaming_body(cli, runner, runtime, stdout, stderr) {
         Ok(code) => code,
-        Err(error) => write_public_stream_error(json, stdout, stderr, &error),
+        Err(error) => {
+            write_public_diagnostic(stderr, &error);
+            error.exit_code()
+        }
     }
 }
 
-fn write_public_stream_error(
-    json: bool,
+fn run_public_streaming_body(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    runtime: &RuntimeContext,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-    error: &WorkerError,
-) -> u8 {
-    if json {
-        match write_json_error_event(stdout, error) {
-            Ok(()) => error.exit_code(),
-            Err(_) => crate::error::ExitKind::Io as u8,
+) -> Result<u8, WorkerError> {
+    let json = cli.json;
+    let paths = discover_paths(cli.config, runtime)?;
+    let config = Config::load(&paths.config)?;
+    let client_state = ClientStateStore::open(&paths.state)?;
+    let remote = RemoteJobClient::new(runner);
+    let follow_runtime = SystemFollowRuntime;
+    let logs = LogsService {
+        config: &config,
+        client_state: &client_state,
+        remote: &remote,
+        runtime: &follow_runtime,
+    };
+    match cli.command {
+        Command::Run {
+            worker,
+            project,
+            includes,
+            timeout,
+            shell,
+            argv,
+        } => {
+            let project = match project {
+                Some(project) => project,
+                None => runtime.current_dir()?,
+            };
+            let command = match shell {
+                Some(shell) => CommandSpec::shell(shell)?,
+                None => CommandSpec::argv(argv)?,
+            };
+            let service = RunService::with_follower(runner, &config, &paths, &client_state, &logs);
+            let completion = service.submit_and_follow(
+                RunRequest {
+                    worker,
+                    project,
+                    cli_includes: includes,
+                    timeout,
+                    command,
+                },
+                json,
+                stdout,
+                stderr,
+            )?;
+            Ok(completion.exit_code)
         }
-    } else {
-        write_error(stderr, error);
-        error.exit_code()
+        Command::Logs { follow, job_id } => {
+            let response = logs.stream(job_id, follow, json, stdout, stderr)?;
+            if response.status().state().is_terminal() {
+                terminal_exit_code(response.status())
+            } else {
+                Ok(0)
+            }
+        }
+        _ => Err(WorkerError::Protocol(
+            "public streaming dispatcher received a non-streaming command".into(),
+        )),
+    }
+}
+
+struct LiveJsonStdout<'a> {
+    inner: &'a mut dyn Write,
+    failed: bool,
+}
+
+impl<'a> LiveJsonStdout<'a> {
+    fn new(inner: &'a mut dyn Write) -> Self {
+        Self {
+            inner,
+            failed: false,
+        }
+    }
+}
+
+impl Write for LiveJsonStdout<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(io::Error::other("live JSON stdout already failed"));
+        }
+        match self.inner.write(buf) {
+            Ok(0) if !buf.is_empty() => {
+                self.failed = true;
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "live JSON stdout wrote zero bytes",
+                ))
+            }
+            Ok(n) => Ok(n),
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::other("live JSON stdout already failed"));
+        }
+        match self.inner.flush() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -348,12 +401,21 @@ fn write_json_error_event(stdout: &mut dyn Write, error: &WorkerError) -> Result
         code: error.public_code(),
         message: error.public_message(),
     };
-    let encoded = serde_json::to_vec(&event)
+    let mut encoded = serde_json::to_vec(&event)
         .map_err(|error| WorkerError::Io(std::io::Error::other(error)))?;
+    encoded.push(b'\n');
     stdout.write_all(&encoded)?;
-    stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())
+}
+
+fn write_public_diagnostic(stderr: &mut dyn Write, error: &WorkerError) {
+    let _ = writeln!(
+        stderr,
+        "{}: {}",
+        error.public_code(),
+        error.public_message()
+    );
 }
 
 #[doc(hidden)]
@@ -479,6 +541,7 @@ pub fn run_with_rsync_executor_in_context(
         );
     }
     let json = cli.json;
+    let public_status = matches!(cli.command, Command::Status { .. });
     let raw_probe = matches!(
         &cli.command,
         Command::Host {
@@ -492,15 +555,23 @@ pub fn run_with_rsync_executor_in_context(
             match output.write_to(stdout, json, raw_probe) {
                 Ok(()) => exit,
                 Err(error) => {
-                    write_error(stderr, &error);
+                    write_command_diagnostic(public_status, stderr, &error);
                     error.exit_code()
                 }
             }
         }
         Err(error) => {
-            write_error(stderr, &error);
+            write_command_diagnostic(public_status, stderr, &error);
             error.exit_code()
         }
+    }
+}
+
+fn write_command_diagnostic(public_status: bool, stderr: &mut dyn Write, error: &WorkerError) {
+    if public_status {
+        write_public_diagnostic(stderr, error);
+    } else {
+        write_error(stderr, error);
     }
 }
 
@@ -1041,6 +1112,44 @@ mod tests {
 
         assert_eq!(config.worker("mini-2").unwrap().ssh, "mac2");
         assert!(config.worker("not-configured").is_none());
+    }
+
+    #[test]
+    fn public_diag_json_error_event_keeps_exit_and_rejects_oversized_internal_payload() {
+        let planted_path = "/Users/alice/PLANTED_PUBLIC_PATH";
+        let planted_secret = "PLANTED_PUBLIC_SECRET";
+        let error = WorkerError::Protocol(format!(
+            "REMOTE_OUTCOME_INVALID: {}\0{planted_path} {planted_secret}",
+            "X".repeat(5000)
+        ));
+        assert_eq!(error.exit_code(), 70);
+
+        let mut stdout = Vec::new();
+        super::write_json_error_event(&mut stdout, &error)
+            .expect("oversized internal detail must not become an I/O write failure");
+        assert_eq!(stdout.last().copied(), Some(b'\n'));
+        assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+
+        let event: crate::job::JsonEvent =
+            serde_json::from_slice(stdout.strip_suffix(b"\n").unwrap()).unwrap();
+        match event {
+            crate::job::JsonEvent::Error {
+                protocol_version,
+                code,
+                message,
+            } => {
+                assert_eq!(protocol_version, crate::protocol::PROTOCOL_VERSION);
+                assert_eq!(code, "REMOTE_OUTCOME_INVALID");
+                assert_eq!(message, "protocol error");
+            }
+            other => panic!("expected a JSON error event, got {other:?}"),
+        }
+
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(!text.contains(&"X".repeat(32)));
+        assert!(!text.contains(planted_path));
+        assert!(!text.contains(planted_secret));
+        assert!(!text.as_bytes().contains(&0));
     }
 
     #[test]

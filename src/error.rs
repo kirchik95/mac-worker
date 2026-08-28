@@ -81,10 +81,10 @@ impl WorkerError {
 
     pub fn public_code(&self) -> String {
         match self {
-            Self::Project { code, .. }
-            | Self::Snapshot { code, .. }
-            | Self::Capacity { code, .. }
-            | Self::Transport { code, .. } => (*code).to_owned(),
+            Self::Project { code, .. } => stable_public_code(code, "PROJECT"),
+            Self::Snapshot { code, .. } => stable_public_code(code, "SNAPSHOT"),
+            Self::Capacity { code, .. } => stable_public_code(code, "CAPACITY"),
+            Self::Transport { code, .. } => stable_public_code(code, "TRANSPORT"),
             Self::Config(message) => coded_prefix(message).unwrap_or("CONFIG").to_owned(),
             Self::Unavailable(message) => coded_prefix(message).unwrap_or("UNAVAILABLE").to_owned(),
             Self::Protocol(message) => coded_prefix(message).unwrap_or("PROTOCOL").to_owned(),
@@ -96,20 +96,14 @@ impl WorkerError {
 
     pub fn public_message(&self) -> String {
         match self {
-            Self::Project { message, .. }
-            | Self::Snapshot { message, .. }
-            | Self::Capacity { message, .. }
-            | Self::Transport { message, .. } => message.clone(),
-            Self::Config(message) => coded_suffix(message)
-                .map(str::to_owned)
-                .unwrap_or_else(|| "configuration error".into()),
-            Self::Unavailable(message) => coded_suffix(message)
-                .map(str::to_owned)
-                .unwrap_or_else(|| "worker unavailable".into()),
-            Self::Protocol(message) => coded_suffix(message)
-                .map(str::to_owned)
-                .unwrap_or_else(|| "protocol error".into()),
-            Self::CommandExit { code } => format!("command exited with status {code}"),
+            Self::Project { .. } => "project error".into(),
+            Self::Snapshot { .. } => "snapshot error".into(),
+            Self::Capacity { .. } => "capacity error".into(),
+            Self::Transport { .. } => "transport error".into(),
+            Self::Config(_) => "configuration error".into(),
+            Self::Unavailable(_) => "worker unavailable".into(),
+            Self::Protocol(_) => "protocol error".into(),
+            Self::CommandExit { .. } => "command exited".into(),
             Self::Io(_) => "I/O error".into(),
             Self::Process(_) => "process error".into(),
         }
@@ -117,26 +111,25 @@ impl WorkerError {
 }
 
 fn coded_prefix(message: &str) -> Option<&str> {
-    coded_parts(message).map(|(code, _)| code)
+    let (code, _) = message.split_once(": ")?;
+    is_stable_public_code(code).then_some(code)
 }
 
-fn coded_suffix(message: &str) -> Option<&str> {
-    coded_parts(message).map(|(_, detail)| detail)
+fn stable_public_code(code: &str, fallback: &'static str) -> String {
+    if is_stable_public_code(code) {
+        code.to_owned()
+    } else {
+        fallback.to_owned()
+    }
 }
 
-fn coded_parts(message: &str) -> Option<(&str, &str)> {
-    let (code, detail) = message.split_once(": ")?;
-    if !code.is_empty()
+fn is_stable_public_code(code: &str) -> bool {
+    !code.is_empty()
         && code.len() <= 128
         && code.starts_with(|byte: char| byte.is_ascii_uppercase())
         && code
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        Some((code, detail))
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -199,6 +192,183 @@ mod tests {
         assert_eq!(WorkerError::CommandExit { code: 7 }.exit_code(), 7);
         assert_eq!(WorkerError::CommandExit { code: 143 }.exit_code(), 143);
     }
+
+    #[test]
+    fn public_diag_helpers_are_bounded_content_free_for_every_variant() {
+        let planted_path = "/Users/alice/PLANTED_PUBLIC_PATH/secret.toml";
+        let planted_secret = "PLANTED_PUBLIC_SECRET";
+        let planted_argv = "printf TASK9_COMMAND_SECRET";
+        let planted_nul = format!("CODE: leak\0{planted_path}");
+        let oversized = format!("CODE: {}{planted_secret}", "X".repeat(4096));
+        let cases = [
+            (
+                WorkerError::Config(format!("failed to read {planted_path}: missing")),
+                "CONFIG",
+                "configuration error",
+            ),
+            (
+                WorkerError::Config(format!(
+                    "JOB_NOT_FOUND: no local job at {planted_path} with {planted_secret}"
+                )),
+                "JOB_NOT_FOUND",
+                "configuration error",
+            ),
+            (
+                WorkerError::Config("not-a-code: leaked suffix".into()),
+                "CONFIG",
+                "configuration error",
+            ),
+            (
+                WorkerError::Config(format!("{}: {}", "A".repeat(129), planted_secret)),
+                "CONFIG",
+                "configuration error",
+            ),
+            (
+                WorkerError::Unavailable(format!("WORKER_UNAVAILABLE: offline at {planted_path}")),
+                "WORKER_UNAVAILABLE",
+                "worker unavailable",
+            ),
+            (
+                WorkerError::Unavailable(format!("offline {planted_secret}")),
+                "UNAVAILABLE",
+                "worker unavailable",
+            ),
+            (
+                WorkerError::Protocol(oversized.clone()),
+                "CODE",
+                "protocol error",
+            ),
+            (WorkerError::Protocol(planted_nul), "CODE", "protocol error"),
+            (
+                WorkerError::Protocol(format!("bad-code: {planted_argv}")),
+                "PROTOCOL",
+                "protocol error",
+            ),
+            (
+                WorkerError::Project {
+                    code: "ARTIFACTS_UNSUPPORTED",
+                    message: format!("include {planted_path} {planted_secret}"),
+                },
+                "ARTIFACTS_UNSUPPORTED",
+                "project error",
+            ),
+            (
+                WorkerError::Project {
+                    code: "bad-code",
+                    message: planted_secret.into(),
+                },
+                "PROJECT",
+                "project error",
+            ),
+            (
+                WorkerError::Snapshot {
+                    code: "SNAPSHOT_WRITE_FAILED",
+                    message: planted_path.into(),
+                },
+                "SNAPSHOT_WRITE_FAILED",
+                "snapshot error",
+            ),
+            (
+                WorkerError::Snapshot {
+                    code: "snap",
+                    message: planted_secret.into(),
+                },
+                "SNAPSHOT",
+                "snapshot error",
+            ),
+            (
+                WorkerError::Capacity {
+                    code: "CAPACITY_BUSY",
+                    message: format!("busy lease {CLIENT_ID} {LEASE_TOKEN}",),
+                },
+                "CAPACITY_BUSY",
+                "capacity error",
+            ),
+            (
+                WorkerError::Capacity {
+                    code: "busy!",
+                    message: planted_secret.into(),
+                },
+                "CAPACITY",
+                "capacity error",
+            ),
+            (
+                WorkerError::Transport {
+                    code: "SSH_UNAVAILABLE",
+                    message: format!("ssh {planted_path} {planted_argv}"),
+                },
+                "SSH_UNAVAILABLE",
+                "transport error",
+            ),
+            (
+                WorkerError::Transport {
+                    code: "ssh-unavailable",
+                    message: planted_secret.into(),
+                },
+                "TRANSPORT",
+                "transport error",
+            ),
+            (
+                WorkerError::CommandExit { code: 64 },
+                "COMMAND_EXIT",
+                "command exited",
+            ),
+            (
+                WorkerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    planted_path,
+                )),
+                "IO",
+                "I/O error",
+            ),
+            (
+                WorkerError::Process(super::ProcessError::OutputLimitExceeded {
+                    stream: super::ProcessStream::Stdout,
+                    limit: 8,
+                }),
+                "PROCESS",
+                "process error",
+            ),
+            (
+                WorkerError::Process(super::ProcessError::DeadlineExceeded {
+                    deadline: std::time::Duration::from_secs(1),
+                }),
+                "PROCESS",
+                "process error",
+            ),
+        ];
+
+        for (error, code, message) in cases {
+            assert_eq!(error.public_code(), code, "{error}");
+            assert_eq!(error.public_message(), message, "{error}");
+            assert!(error.public_message().len() <= 4096);
+            assert!(!error.public_code().as_bytes().contains(&0));
+            assert!(!error.public_message().as_bytes().contains(&0));
+            for planted in [
+                planted_path,
+                planted_secret,
+                planted_argv,
+                "018f0f4a",
+                CLIENT_ID,
+                LEASE_TOKEN,
+            ] {
+                assert!(
+                    !error.public_message().contains(planted),
+                    "{error} leaked {planted}"
+                );
+            }
+            assert_eq!(
+                error.exit_code(),
+                match &error {
+                    WorkerError::CommandExit { code } => *code,
+                    other => other.exit_kind() as u8,
+                }
+            );
+        }
+    }
+
+    const CLIENT_ID: &str = "102f0f4a6b5c7d8e9f00112233445566";
+    const LEASE_TOKEN: &str = "202f0f4a6b5c7d8e9f00112233445566";
 
     #[test]
     fn coded_project_and_snapshot_errors_keep_their_public_codes() {
