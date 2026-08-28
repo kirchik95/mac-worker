@@ -3,7 +3,7 @@ use std::{path::PathBuf, time::Duration};
 use serde::Serialize;
 
 use crate::{
-    client_state::ClientStateStore,
+    client_state::{ClientStateStore, ConditionalStatusUpdate},
     config::{Config, WorkerEntry},
     error::WorkerError,
     inputs::RelativePath,
@@ -174,6 +174,10 @@ impl StatusService<'_> {
             );
             let response = match response {
                 Ok(response) => response,
+                Err(error @ WorkerError::Protocol(_)) => {
+                    self.load_same_immutable(record)?;
+                    return Err(error);
+                }
                 Err(_) => {
                     *record = self.load_same_immutable(record)?;
                     continue;
@@ -299,43 +303,49 @@ impl StatusService<'_> {
         status: JobStatus,
     ) -> Result<StatusApply, WorkerError> {
         let before = self.load_same_immutable(expected)?;
-        match observation_relation(&before, &status) {
-            ObservationRelation::CurrentAtLeastRemote => {
-                return self
-                    .client_state
-                    .set_remote_uncertainty_if_same_immutable(expected, RemoteUncertainty::None)
-                    .map(StatusApply::Applied);
-            }
+        let selected = match observation_relation(&before, &status) {
+            ObservationRelation::CurrentAtLeastRemote => before
+                .last_status()
+                .expect("a current-at-least-remote relation requires an observation")
+                .clone(),
             ObservationRelation::Conflict => {
                 return Ok(StatusApply::ConcurrentConflict(before));
             }
-            ObservationRelation::RemoteAdvances => {}
-        }
-        match self
+            ObservationRelation::RemoteAdvances => status.clone(),
+        };
+        let published = match self
             .client_state
-            .update_observation_if_same_immutable(expected, status.clone())
+            .update_authoritative_status_if_unchanged(&before, selected)
         {
-            Ok(_) => {}
-            Err(error @ WorkerError::Protocol(_)) => {
-                let current = self.load_same_immutable(expected)?;
-                if current.last_status() == before.last_status() {
-                    return Err(error);
+            Ok(ConditionalStatusUpdate::Applied(published)) => published,
+            Ok(ConditionalStatusUpdate::Conflict(current)) => {
+                if !same_immutable(&current, expected) {
+                    return Err(job_id_conflict());
                 }
-                return match observation_relation(&current, &status) {
-                    ObservationRelation::CurrentAtLeastRemote => self
-                        .client_state
-                        .set_remote_uncertainty_if_same_immutable(expected, RemoteUncertainty::None)
-                        .map(StatusApply::Applied),
-                    ObservationRelation::RemoteAdvances | ObservationRelation::Conflict => {
-                        Ok(StatusApply::ConcurrentConflict(current))
-                    }
-                };
+                if matches!(current.remote_uncertainty(), RemoteUncertainty::None)
+                    && matches!(
+                        observation_relation(&current, &status),
+                        ObservationRelation::CurrentAtLeastRemote
+                    )
+                {
+                    return Ok(StatusApply::Applied(current));
+                }
+                return Ok(StatusApply::ConcurrentConflict(current));
             }
             Err(error) => return Err(error),
+        };
+        let current = self.load_same_immutable(expected)?;
+        if current == published
+            || matches!(current.remote_uncertainty(), RemoteUncertainty::None)
+                && matches!(
+                    observation_relation(&current, &status),
+                    ObservationRelation::CurrentAtLeastRemote
+                )
+        {
+            Ok(StatusApply::Applied(current))
+        } else {
+            Ok(StatusApply::ConcurrentConflict(current))
         }
-        self.client_state
-            .set_remote_uncertainty_if_same_immutable(expected, RemoteUncertainty::None)
-            .map(StatusApply::Applied)
     }
 
     fn load_same_immutable(
@@ -368,12 +378,17 @@ fn local_status_conflict() -> WorkerError {
 }
 
 fn accepted_enrichment_is_transitively_forward(previous: &JobStatus, observed: &JobStatus) -> bool {
-    previous.state() == JobState::Accepted
-        && previous.supervisor_identity().is_none()
-        && previous.child_identity().is_none()
-        && observed.supervisor_identity().is_some()
-        && observed.child_identity().is_some()
-        && observed.updated_at_millis() >= previous.updated_at_millis()
+    let Some(supervisor) = observed.supervisor_identity() else {
+        return false;
+    };
+    if observed.child_identity().is_none() {
+        return false;
+    }
+    let Ok(intermediate) = previous.with_supervisor(supervisor, observed.updated_at_millis())
+    else {
+        return false;
+    };
+    intermediate.transition(observed.clone()).is_ok()
 }
 
 fn observation_relation(current: &LocalJobRecord, remote: &JobStatus) -> ObservationRelation {

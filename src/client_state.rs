@@ -78,6 +78,11 @@ pub struct ClientStateStore {
     inner: Arc<ClientStateInner>,
 }
 
+pub(crate) enum ConditionalStatusUpdate {
+    Applied(LocalJobRecord),
+    Conflict(LocalJobRecord),
+}
+
 struct ClientStateInner {
     root: OwnedFd,
     jobs: OwnedFd,
@@ -363,7 +368,7 @@ impl ClientStateStore {
                 ));
             }
             require_forward_observation(existing.last_status(), replacement.last_status())?;
-            Ok(replacement)
+            Ok(Some(replacement))
         })
         .map(|_| ())
     }
@@ -382,27 +387,38 @@ impl ClientStateStore {
                 Some(status),
                 existing.remote_uncertainty().clone(),
             )
+            .map(Some)
         })
     }
 
-    pub(crate) fn update_observation_if_same_immutable(
+    pub(crate) fn update_authoritative_status_if_unchanged(
         &self,
         expected: &LocalJobRecord,
         status: JobStatus,
-    ) -> Result<LocalJobRecord, WorkerError> {
+    ) -> Result<ConditionalStatusUpdate, WorkerError> {
         expected.validate()?;
         self.require_local_client(expected)?;
         status.validate()?;
         let job_id = expected.meta().job_id();
-        self.update_locked(job_id, move |existing| {
-            require_same_immutable(existing, expected)?;
+        let mut matched = false;
+        let current = self.update_locked(job_id, |existing| {
+            if existing != expected {
+                return Ok(None);
+            }
+            matched = true;
             require_forward_observation(existing.last_status(), Some(&status))?;
             LocalJobRecord::new(
                 existing.meta().clone(),
                 existing.lease_token(),
                 Some(status),
-                existing.remote_uncertainty().clone(),
+                RemoteUncertainty::None,
             )
+            .map(Some)
+        })?;
+        Ok(if matched {
+            ConditionalStatusUpdate::Applied(current)
+        } else {
+            ConditionalStatusUpdate::Conflict(current)
         })
     }
 
@@ -419,6 +435,7 @@ impl ClientStateStore {
                 existing.last_status().cloned(),
                 uncertainty,
             )
+            .map(Some)
         })
     }
 
@@ -439,6 +456,7 @@ impl ClientStateStore {
                 existing.last_status().cloned(),
                 uncertainty,
             )
+            .map(Some)
         })
     }
 
@@ -545,7 +563,7 @@ impl ClientStateStore {
 
     fn update_locked<F>(&self, job_id: JobId, update: F) -> Result<LocalJobRecord, WorkerError>
     where
-        F: FnOnce(&LocalJobRecord) -> Result<LocalJobRecord, WorkerError>,
+        F: FnOnce(&LocalJobRecord) -> Result<Option<LocalJobRecord>, WorkerError>,
     {
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let name = job_file_name(job_id)?;
@@ -554,7 +572,10 @@ impl ClientStateStore {
             return Err(invalid_state("job filename and record identity differ"));
         }
         self.require_local_client(&existing)?;
-        let replacement = update(&existing)?;
+        let replacement = match update(&existing)? {
+            Some(replacement) => replacement,
+            None => return Ok(existing),
+        };
         replacement.validate()?;
         self.require_local_client(&replacement)?;
         require_same_immutable(&existing, &replacement)?;

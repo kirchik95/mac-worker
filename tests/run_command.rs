@@ -9,6 +9,7 @@ use std::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
     time::Duration,
 };
 
@@ -20,9 +21,9 @@ use mac_worker::{
     config::{Config, WorkerEntry},
     error::WorkerError,
     job::{
-        ClientId, CommandSpec, JobId, JobMeta, JobStatus, LeaseToken, LocalJobRecord,
-        ProcessIdentity, RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
-        ResolveOrAbandonResponse, StatusRequest, StatusResponse,
+        ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobState, JobStatus, LeaseToken,
+        LocalJobRecord, ProcessIdentity, RemoteUncertainty, RequestFingerprintMaterial,
+        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest, StatusResponse,
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner},
     protocol::PROTOCOL_VERSION,
@@ -177,6 +178,16 @@ fn transport_failure() -> Result<ProcessResult, WorkerError> {
     Ok(ProcessResult {
         status: ExitStatus::from_raw(255 << 8),
         stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
+}
+
+fn authoritative_protocol_failure(code: &str, message: &str) -> Result<ProcessResult, WorkerError> {
+    let mut stdout = serde_json::to_vec(&HostControlError::new(code, message).unwrap()).unwrap();
+    stdout.push(b'\n');
+    Ok(ProcessResult {
+        status: ExitStatus::from_raw(23 << 8),
+        stdout,
         stderr: Vec::new(),
     })
 }
@@ -1687,4 +1698,218 @@ fn status_list_missing_workers_do_not_consume_the_remote_refresh_budget() {
     }
     assert!(report.jobs[..17].iter().all(|row| row.status.is_none()));
     assert!(report.jobs[17..].iter().all(|row| row.status.is_some()));
+}
+
+#[test]
+fn status_list_surfaces_each_authoritative_host_protocol_error_after_local_revalidation() {
+    // Break caught: list mode classifies a canonical nonzero host error as
+    // tolerable transport ambiguity and silently returns the persisted row.
+    for (index, (code, message)) in [
+        ("JOB_NOT_FOUND", "the exact remote job does not exist"),
+        ("JOB_ID_CONFLICT", "the remote job identity conflicts"),
+        (
+            "REMOTE_PROTOCOL_FAILURE",
+            "the host rejected the status request",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let store = state_store(&temp);
+        let record = test_record(
+            &store,
+            3_000 + index as u128,
+            100,
+            Some(JobStatus::accepted(101).unwrap()),
+            RemoteUncertainty::None,
+        );
+        store.create_job(record.clone()).unwrap();
+        let runner =
+            RecordingRunner::returning(vec![authoritative_protocol_failure(code, message)]);
+        let remote = RemoteJobClient::new(&runner);
+        let config = config();
+
+        let error = service(&config, &store, &remote).inspect(None).unwrap_err();
+
+        assert!(
+            matches!(error, WorkerError::Protocol(ref actual) if actual == &format!("{code}: {message}")),
+            "{code}: {error}"
+        );
+        assert_eq!(store.load_job(record.meta().job_id()).unwrap(), record);
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1, "{code}");
+        assert_status_call(&requests[0], Duration::from_secs(5), record.meta().job_id());
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let original = test_record(
+        &store,
+        3_099,
+        100,
+        Some(JobStatus::accepted(101).unwrap()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(original.clone()).unwrap();
+    let replacement = record_with_meta_parts(
+        original.meta().job_id(),
+        store.client_id(),
+        "mini-1",
+        &"d".repeat(64),
+        &"b".repeat(64),
+        &"c".repeat(64),
+        "packages/app",
+        30_000,
+        "heavy",
+        CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+        100,
+        None,
+        original.last_status().cloned(),
+        RemoteUncertainty::None,
+    );
+    let replacement_bytes = canonical_job_bytes(&replacement);
+    let path = job_file(&temp, original.meta().job_id());
+    let runner = RecordingRunner::with_hook(
+        vec![authoritative_protocol_failure(
+            "REMOTE_PROTOCOL_FAILURE",
+            "the host rejected the status request",
+        )],
+        move |_| fs::write(&path, &replacement_bytes).unwrap(),
+    );
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let error = service(&config, &store, &remote).inspect(None).unwrap_err();
+
+    assert!(
+        matches!(error, WorkerError::Protocol(ref message) if message.starts_with("JOB_ID_CONFLICT:")),
+        "{error}"
+    );
+    assert_eq!(
+        store.load_job(original.meta().job_id()).unwrap(),
+        replacement
+    );
+}
+
+#[test]
+fn status_exact_never_clears_or_accepts_a_divergent_record_in_the_old_two_write_window() {
+    // Break caught: observation publication succeeds, a divergent same-binding
+    // record lands during its cleanup pause, then the separate uncertainty
+    // write clears that replacement and exact mode reports success.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let original = test_record(
+        &store,
+        3_100,
+        100,
+        Some(JobStatus::accepted(101).unwrap()),
+        RemoteUncertainty::unknown_remote("ORIGINAL_AMBIGUITY").unwrap(),
+    );
+    store.create_job(original.clone()).unwrap();
+    let remote_status = JobStatus::running(200, 11, 12, 13, 14).unwrap();
+    let response = StatusResponse::new(original.meta().clone(), remote_status).unwrap();
+    let concurrent = LocalJobRecord::new(
+        original.meta().clone(),
+        original.lease_token(),
+        Some(JobStatus::failed(300, 7, 3, 4).unwrap()),
+        RemoteUncertainty::cleanup_pending("CONCURRENT_CLEANUP").unwrap(),
+    )
+    .unwrap();
+    let concurrent_bytes = canonical_job_bytes(&concurrent);
+    let path = job_file(&temp, original.meta().job_id());
+    let pause = store.pause_cleanup_after_move_once();
+    let status_store = store.clone();
+    let job_id = original.meta().job_id();
+    let status_thread = thread::spawn(move || {
+        let runner = RecordingRunner::returning(vec![status_result(&response)]);
+        let retry = ImmediateResolution::new();
+        let remote = RemoteJobClient::new_with_runtime(&runner, &retry);
+        let config = config();
+        let result = service(&config, &status_store, &remote).inspect(Some(job_id));
+        (result, runner.requests())
+    });
+    pause.wait_until_paused();
+    fs::write(path, concurrent_bytes).unwrap();
+    pause.resume();
+
+    let (result, requests) = status_thread.join().unwrap();
+    let error = result.unwrap_err();
+
+    assert!(
+        matches!(error, WorkerError::Protocol(ref message) if message.starts_with("LOCAL_STATUS_CONFLICT:")),
+        "{error}"
+    );
+    assert_eq!(store.load_job(job_id).unwrap(), concurrent);
+    assert_eq!(requests.len(), 1);
+    assert_status_call(&requests[0], Duration::from_secs(30), job_id);
+}
+
+#[test]
+fn status_transitive_accepted_enrichment_rejects_divergent_non_identity_fields() {
+    // Break caught: the transitive Accepted shortcut checks only identities
+    // and time, so two individually valid statuses with different error codes
+    // are incorrectly treated as a valid two-hop enrichment.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let remote_bare = JobStatus::new(
+        JobState::Accepted,
+        101,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("REMOTE_ACCEPTED_DETAIL".into()),
+        None,
+    )
+    .unwrap();
+    let local_enriched = JobStatus::new(
+        JobState::Accepted,
+        200,
+        Some(11),
+        Some(12),
+        Some(13),
+        Some(14),
+        None,
+        None,
+        None,
+        None,
+        Some("DIVERGENT_LOCAL_DETAIL".into()),
+        None,
+    )
+    .unwrap();
+    let record = test_record(
+        &store,
+        3_200,
+        100,
+        Some(local_enriched),
+        RemoteUncertainty::unknown_remote("IDENTITY_AMBIGUITY").unwrap(),
+    );
+    store.create_job(record.clone()).unwrap();
+    let response = StatusResponse::new(record.meta().clone(), remote_bare).unwrap();
+    let runner = RecordingRunner::returning(vec![status_result(&response)]);
+    let retry = ImmediateResolution::new();
+    let remote = RemoteJobClient::new_with_runtime(&runner, &retry);
+    let config = config();
+
+    let error = service(&config, &store, &remote)
+        .inspect(Some(record.meta().job_id()))
+        .unwrap_err();
+
+    assert!(
+        matches!(error, WorkerError::Protocol(ref message) if message.starts_with("LOCAL_STATUS_CONFLICT:")),
+        "{error}"
+    );
+    assert_eq!(store.load_job(record.meta().job_id()).unwrap(), record);
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 1);
+    assert_status_call(
+        &requests[0],
+        Duration::from_secs(30),
+        record.meta().job_id(),
+    );
 }
