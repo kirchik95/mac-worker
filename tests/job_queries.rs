@@ -3,7 +3,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Cursor, Write as _},
     os::fd::AsRawFd,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt, symlink},
+        process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
     sync::{
         Arc, Barrier, Mutex,
@@ -18,17 +21,20 @@ use clap::Parser;
 use mac_worker::{
     RuntimeContext,
     cli::Cli,
+    config::WorkerEntry,
+    error::WorkerError,
     host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
     job::{
         ClientId, CommandSpec, HostControlError, JobId, JobState, JobStatus, LeaseAcquireRequest,
         LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse,
         LogCursor, LogStream, ProcessIdentity, RequestFingerprintMaterial, ResolveOrAbandonOutcome,
-        ResolveOrAbandonRequest, StatusRequest, StatusResponse, SubmitRequest, TerminalLogDrain,
+        ResolveOrAbandonRequest, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
+        TerminalLogDrain,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
     paths::PathLayout,
-    process::SystemProcessRunner,
+    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::MemoryPressure,
     remote_snapshot::RemoteSnapshotService,
     run_with_stdio_in_context,
@@ -36,7 +42,10 @@ use mac_worker::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
         ReconciliationRuntime, Supervisor, SystemProcessInspector,
     },
-    transfer::HostTransferService,
+    transfer::{
+        HostOperation, HostTransferService, RemoteJobClient, ResolutionRuntime,
+        RsyncServerExecutor, RsyncServerInvocation, SshJsonTransport, TransferIdentity,
+    },
 };
 use sha2::{Digest, Sha256};
 
@@ -3205,6 +3214,678 @@ fn query_endpoint_service_errors_are_versioned_and_broken_stdout_is_io_exit_74()
     );
     assert_eq!(exit, 74);
     assert!(stderr.is_empty());
+}
+
+/// A loopback SSH runner: it feeds the exact bytes that the client would send
+/// to the hidden endpoint, records them, and can drop a response only after the
+/// real endpoint has produced it.  This keeps the disconnect seam outside the
+/// host implementation.
+struct MatrixEndpointRunner {
+    runtime: RuntimeContext,
+    requests: Mutex<Vec<(String, Vec<u8>)>>,
+    lose_success_responses: AtomicUsize,
+}
+
+impl MatrixEndpointRunner {
+    fn new(runtime: RuntimeContext) -> Self {
+        Self {
+            runtime,
+            requests: Mutex::new(Vec::new()),
+            lose_success_responses: AtomicUsize::new(0),
+        }
+    }
+
+    fn requests(&self) -> Vec<(String, Vec<u8>)> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl ProcessRunner for MatrixEndpointRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let command = request
+            .args
+            .last()
+            .and_then(|argument| argument.to_str())
+            .and_then(|argument| argument.strip_prefix("~/.local/bin/worker host "))
+            .expect("matrix runner received a fixed hidden host command")
+            .to_owned();
+        let input = request.stdin.clone().expect("matrix request has stdin");
+        let (exit, stdout, stderr) = run_query_endpoint(&self.runtime, &command, input.clone());
+        self.requests.lock().unwrap().push((command, input));
+        if exit == 0
+            && self
+                .lose_success_responses
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(WorkerError::Transport {
+                code: "MATRIX_RESPONSE_LOST",
+                message: "the test runner dropped a real host response".into(),
+            });
+        }
+        Ok(ProcessResult {
+            status: std::process::ExitStatus::from_raw((exit as i32) << 8),
+            stdout,
+            stderr,
+        })
+    }
+}
+
+#[derive(Default)]
+struct MatrixResolutionRuntime {
+    now: Mutex<Duration>,
+}
+
+impl ResolutionRuntime for MatrixResolutionRuntime {
+    fn monotonic_now(&self) -> Duration {
+        *self.now.lock().unwrap()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        *self.now.lock().unwrap() += duration;
+    }
+}
+
+struct MatrixInlineLauncher {
+    store: HostStore,
+    launches: Arc<AtomicUsize>,
+}
+
+struct MatrixRejectedReceiver(AtomicUsize);
+
+impl RsyncServerExecutor for MatrixRejectedReceiver {
+    fn execute(&self, _invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        panic!("a delayed receiver must be fenced before opening its sink")
+    }
+}
+
+impl SupervisorLauncher for MatrixInlineLauncher {
+    fn launch(
+        &self,
+        job_id: JobId,
+        guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, WorkerError> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        let inspector = SystemProcessInspector;
+        let identity = inspector.identity_for_pid(std::process::id())?;
+        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Ok(LaunchCandidate::new(identity))
+    }
+}
+
+fn matrix_worker() -> WorkerEntry {
+    WorkerEntry {
+        name: "mini-1".into(),
+        ssh: "matrix-host".into(),
+        slots: 1,
+        capabilities: vec!["darwin-arm64".into()],
+        remote_binary: "~/.local/bin/worker".into(),
+    }
+}
+
+fn matrix_command(marker: &Path) -> CommandSpec {
+    let marker = marker.to_string_lossy().replace('\'', "'\\\"'\\\"'");
+    CommandSpec::shell(format!("/usr/bin/printf x >> '{marker}'")).unwrap()
+}
+
+fn matrix_acquired_host(
+    root: &Path,
+    command: CommandSpec,
+) -> (HostStore, LeaseRecord, SubmitRequest, Vec<u8>) {
+    let store = HostStore::open(root).unwrap();
+    let (acquire, submit, manifest) = matrix_request(command);
+    let lease = match LeaseService::new(&store)
+        .acquire(&acquire, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    (store, lease, submit, manifest)
+}
+
+fn matrix_request(command: CommandSpec) -> (LeaseAcquireRequest, SubmitRequest, Vec<u8>) {
+    let manifest = valid_manifest_bytes();
+    let digest = format!("{:x}", Sha256::digest(&manifest));
+    let acquire = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            JOB_ID.parse().unwrap(),
+            CLIENT_ID.parse().unwrap(),
+            LEASE_TOKEN.parse().unwrap(),
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            digest,
+            String::new(),
+            30_000,
+            "heavy".into(),
+            command,
+        )
+        .unwrap(),
+    );
+    (
+        acquire.clone(),
+        SubmitRequest::new(acquire.material().clone()),
+        manifest,
+    )
+}
+
+fn matrix_receive_before_verification(store: &HostStore, lease: &LeaseRecord, manifest: &[u8]) {
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    fs::create_dir_all(incoming.join("tree")).unwrap();
+    for private in [
+        incoming.parent().unwrap().parent().unwrap(),
+        incoming.parent().unwrap(),
+        incoming.as_path(),
+    ] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(incoming.join("manifest.json"), manifest).unwrap();
+    fs::write(incoming.join("tree/payload.txt"), b"payload").unwrap();
+    fs::set_permissions(
+        incoming.join("manifest.json"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(
+        incoming.join("tree/payload.txt"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
+}
+
+fn matrix_runtime(temp: &tempfile::TempDir) -> (RuntimeContext, PathBuf) {
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let environment = BTreeMap::from([("HOME".into(), home.as_os_str().to_os_string())]);
+    let paths = PathLayout::discover(None, &environment, &home).unwrap();
+    (
+        RuntimeContext::isolated(environment, home, temp.path().to_path_buf()),
+        paths.host_state_root(),
+    )
+}
+
+fn matrix_remote_resolve(
+    runner: &MatrixEndpointRunner,
+    request: &ResolveOrAbandonRequest,
+) -> mac_worker::job::ResolveOrAbandonResponse {
+    SshJsonTransport::new(runner)
+        .request(
+            &matrix_worker(),
+            HostOperation::ResolveOrAbandon,
+            request,
+            ProcessPolicy {
+                stdout_limit: 1024 * 1024,
+                stderr_limit: 64 * 1024,
+                deadline: Duration::from_secs(30),
+            },
+        )
+        .unwrap()
+}
+
+fn matrix_assert_original_identity(submit: &SubmitRequest) {
+    submit.validate().unwrap();
+    assert_eq!(submit.material().job_id().to_string(), JOB_ID);
+    assert_eq!(submit.material().client_id().to_string(), CLIENT_ID);
+    assert_eq!(submit.material().lease_token().to_string(), LEASE_TOKEN);
+    assert_eq!(submit.material().worker_name(), "mini-1");
+    assert_eq!(submit.material().project_id(), PROJECT_ID);
+    assert_eq!(submit.material().worktree_id(), WORKTREE_ID);
+    assert_eq!(submit.material().relative_working_dir(), "");
+    assert_eq!(submit.material().timeout_millis(), 30_000);
+    assert_eq!(submit.material().resource_class(), "heavy");
+    assert_eq!(
+        submit.material().fingerprint(),
+        submit.request_fingerprint().clone()
+    );
+    submit
+        .material()
+        .command()
+        .summary()
+        .unwrap()
+        .validate()
+        .unwrap();
+}
+
+fn matrix_assert_abandoned_fences(
+    store: &HostStore,
+    lease: Option<&LeaseRecord>,
+    submit: &SubmitRequest,
+) {
+    let acquire = LeaseAcquireRequest::new(submit.material().clone());
+    let retry = LeaseService::new(store)
+        .acquire(&acquire, &healthy(), 9)
+        .unwrap_err();
+    assert!(retry.to_string().contains("JOB_ABANDONED"), "{retry}");
+    let receiver = MatrixRejectedReceiver(AtomicUsize::new(0));
+    let receiver_error = HostTransferService::new(store).receive(
+        &TransferIdentity::from_acquire_request(&acquire).unwrap(),
+        &[
+            "--server".into(),
+            "--delete-before".into(),
+            "-l".into(),
+            "-p".into(),
+            "-D".into(),
+            "-r".into(),
+            "-t".into(),
+            "--dirs".into(),
+            ".".into(),
+            "incoming".into(),
+        ],
+        &receiver,
+    );
+    assert!(
+        receiver_error.is_err(),
+        "delayed receiver resurrected abandoned work"
+    );
+    assert_eq!(receiver.0.load(Ordering::SeqCst), 0);
+    if let Some(lease) = lease {
+        let verify = RemoteSnapshotService::new(store).verify_and_promote_at(
+            lease,
+            lease.manifest_digest(),
+            10,
+        );
+        assert!(verify.is_err(), "delayed verify resurrected abandoned work");
+    }
+    let launches = Arc::new(AtomicUsize::new(0));
+    let submit_result = JobService::new(
+        store,
+        &CountingRejectLauncher {
+            launches: Arc::clone(&launches),
+        },
+    )
+    .submit_at(submit.clone(), 11);
+    assert!(
+        submit_result.is_err(),
+        "delayed submit resurrected abandoned work"
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
+fn matrix_assert_recorded_endpoint_identity(command: &str, bytes: &[u8], submit: &SubmitRequest) {
+    match command {
+        "status" => {
+            let request: StatusRequest = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(request.job_id(), submit.material().job_id());
+        }
+        "submit" => {
+            let request: SubmitRequest = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(request, *submit);
+        }
+        "resolve-or-abandon" => {
+            let request: ResolveOrAbandonRequest = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(request.job_id(), submit.material().job_id());
+            assert_eq!(request.client_id(), submit.material().client_id());
+            assert_eq!(request.lease_token(), submit.material().lease_token());
+            assert_eq!(request.request_fingerprint(), submit.request_fingerprint());
+            assert_eq!(request.worker_name(), submit.material().worker_name());
+            assert_eq!(request.project_id(), submit.material().project_id());
+            assert_eq!(request.worktree_id(), submit.material().worktree_id());
+            assert_eq!(
+                request.manifest_digest(),
+                submit.material().manifest_digest()
+            );
+            assert_eq!(
+                request.relative_working_dir(),
+                submit.material().relative_working_dir()
+            );
+            assert_eq!(request.timeout_millis(), submit.material().timeout_millis());
+            assert_eq!(request.resource_class(), submit.material().resource_class());
+            assert_eq!(
+                request.command_summary(),
+                &submit.material().command().summary().unwrap()
+            );
+        }
+        unexpected => panic!("unexpected matrix host endpoint {unexpected}"),
+    }
+}
+
+#[test]
+fn acceptance_disconnect_matrix_100() {
+    // This is deliberately a single 100-row integration characterization.  It
+    // uses real rooted host state, hidden endpoint parsing, a loopback
+    // RemoteJobClient transport, the two host-store write boundaries, and an
+    // actual child-owned marker.  Channels/barriers control the delayed mutator
+    // schedules; no row depends on elapsed time or scheduler luck.
+    let mut boundary_counts = [0usize; 6];
+    let mut accepted = 0usize;
+    let mut abandoned = 0usize;
+    let mut execution_markers = 0usize;
+    let mut launcher_total = 0usize;
+
+    for case_index in 0usize..100 {
+        let boundary = case_index % 6;
+        let schedule = (case_index / 6) % 4;
+        boundary_counts[boundary] += 1;
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, root) = matrix_runtime(&temp);
+        let marker = temp.path().join("actual-child-marker");
+        let command = matrix_command(&marker);
+        let (mut store, lease, submit, manifest) = if boundary == 0 {
+            let (acquire, submit, manifest) = matrix_request(command);
+            drop(acquire); // Resolver starts before host receipt or a live lease.
+            (HostStore::open(&root).unwrap(), None, submit, manifest)
+        } else {
+            let (store, lease, submit, manifest) = matrix_acquired_host(&root, command);
+            (store, Some(lease), submit, manifest)
+        };
+        let launches = Arc::new(AtomicUsize::new(0));
+        let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+        matrix_assert_original_identity(&submit);
+
+        // A real hidden endpoint is used for each remote result.  The runner
+        // records the canonical bytes before any intentional response loss.
+        let runner = MatrixEndpointRunner::new(runtime);
+        let resolution_runtime = MatrixResolutionRuntime::default();
+
+        if boundary == 1 {
+            matrix_receive_before_verification(&store, lease.as_ref().unwrap(), &manifest);
+        } else if boundary >= 2 {
+            matrix_receive_before_verification(&store, lease.as_ref().unwrap(), &manifest);
+            RemoteSnapshotService::new(&store)
+                .verify_and_promote_at(
+                    lease.as_ref().unwrap(),
+                    lease.as_ref().unwrap().manifest_digest(),
+                    2,
+                )
+                .unwrap();
+        }
+
+        if schedule == 1 && boundary < 2 {
+            // Delayed mutator first, resolution second.  The barrier makes the
+            // order explicit without a wall-clock wait.
+            let gate = Arc::new(Barrier::new(2));
+            let delayed_store = store.clone();
+            let delayed_submit = submit.clone();
+            let delayed_gate = Arc::clone(&gate);
+            let delayed = thread::spawn(move || {
+                delayed_gate.wait();
+                JobService::new(&delayed_store, &RejectLauncher).submit_at(delayed_submit, 3)
+            });
+            gate.wait();
+            let _ = delayed.join().unwrap();
+        }
+
+        if schedule == 3 && boundary < 2 {
+            // The first authoritative resolution runs to a durable outcome,
+            // then only its response is lost.  The next exact request below
+            // observes that same outcome.
+            runner.lose_success_responses.store(1, Ordering::SeqCst);
+            let lost = SshJsonTransport::new(&runner)
+                .request::<_, mac_worker::job::ResolveOrAbandonResponse>(
+                    &matrix_worker(),
+                    HostOperation::ResolveOrAbandon,
+                    &resolve,
+                    ProcessPolicy {
+                        stdout_limit: 1024 * 1024,
+                        stderr_limit: 64 * 1024,
+                        deadline: Duration::from_secs(30),
+                    },
+                );
+            assert!(
+                lost.is_err(),
+                "case {case_index} did not lose its first resolution response"
+            );
+        }
+
+        let first = match boundary {
+            0 | 1 => matrix_remote_resolve(&runner, &resolve),
+            2 => {
+                drop(store);
+                let faulted =
+                    HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobMetaWrite)
+                        .unwrap();
+                assert!(
+                    JobService::new(&faulted, &RejectLauncher)
+                        .submit_at(submit.clone(), 4)
+                        .is_err()
+                );
+                drop(faulted);
+                store = HostStore::open(&root).unwrap();
+                if schedule == 3 {
+                    runner.lose_success_responses.store(1, Ordering::SeqCst);
+                    let lost = SshJsonTransport::new(&runner)
+                        .request::<_, mac_worker::job::ResolveOrAbandonResponse>(
+                        &matrix_worker(),
+                        HostOperation::ResolveOrAbandon,
+                        &resolve,
+                        ProcessPolicy {
+                            stdout_limit: 1024 * 1024,
+                            stderr_limit: 64 * 1024,
+                            deadline: Duration::from_secs(30),
+                        },
+                    );
+                    assert!(
+                        lost.is_err(),
+                        "case {case_index} did not lose post-meta resolution"
+                    );
+                }
+                matrix_remote_resolve(&runner, &resolve)
+            }
+            3 => {
+                drop(store);
+                let faulted = HostStore::open_with_write_fault(
+                    &root,
+                    HostStoreWritePoint::AfterJobIndexParentSync,
+                )
+                .unwrap();
+                assert!(
+                    JobService::new(&faulted, &RejectLauncher)
+                        .submit_at(submit.clone(), 5)
+                        .is_err()
+                );
+                drop(faulted);
+                store = HostStore::open(&root).unwrap();
+                let launcher = MatrixInlineLauncher {
+                    store: store.clone(),
+                    launches: Arc::clone(&launches),
+                };
+                JobService::new(&store, &launcher)
+                    .resolve_or_abandon(resolve.clone())
+                    .unwrap()
+            }
+            4 => {
+                let launcher = MatrixInlineLauncher {
+                    store: store.clone(),
+                    launches: Arc::clone(&launches),
+                };
+                let submitted = JobService::new(&store, &launcher)
+                    .submit_at(submit.clone(), 6)
+                    .unwrap();
+                // The command has completed, while the caller loses the submit result.
+                RemoteJobClient::new_with_runtime(&runner, &resolution_runtime)
+                    .resolve_submission(
+                        &matrix_worker(),
+                        &submit,
+                        Err(WorkerError::Transport {
+                            code: "MATRIX_SUBMIT_RESPONSE_LOST",
+                            message: "submit result was lost after launch".into(),
+                        }),
+                    )
+                    .map(|response| {
+                        mac_worker::job::ResolveOrAbandonResponse::accepted(
+                            StatusResponse::new(
+                                match response {
+                                    mac_worker::job::SubmitResponse::Accepted { meta, .. } => *meta,
+                                    mac_worker::job::SubmitResponse::Existing { .. } => {
+                                        panic!("matrix expected accepted")
+                                    }
+                                },
+                                submitted.status().clone(),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap()
+                    })
+                    .unwrap()
+            }
+            5 => {
+                let launcher = MatrixInlineLauncher {
+                    store: store.clone(),
+                    launches: Arc::clone(&launches),
+                };
+                let submitted = JobService::new(&store, &launcher)
+                    .submit_at(submit.clone(), 7)
+                    .unwrap();
+                runner.lose_success_responses.store(1, Ordering::SeqCst);
+                let lost = SshJsonTransport::new(&runner).request::<_, SubmitResponse>(
+                    &matrix_worker(),
+                    HostOperation::Submit,
+                    &submit,
+                    ProcessPolicy {
+                        stdout_limit: 1024 * 1024,
+                        stderr_limit: 64 * 1024,
+                        deadline: Duration::from_secs(30),
+                    },
+                );
+                assert!(
+                    lost.is_err(),
+                    "success bytes were not lost at the client boundary"
+                );
+                RemoteJobClient::new_with_runtime(&runner, &resolution_runtime)
+                    .resolve_submission(
+                        &matrix_worker(),
+                        &submit,
+                        Err(WorkerError::Transport {
+                            code: "MATRIX_SSH_SUCCESS_LOST",
+                            message: "canonical success bytes were produced then lost".into(),
+                        }),
+                    )
+                    .map(|response| {
+                        mac_worker::job::ResolveOrAbandonResponse::accepted(
+                            StatusResponse::new(
+                                match response {
+                                    mac_worker::job::SubmitResponse::Accepted { meta, .. } => *meta,
+                                    mac_worker::job::SubmitResponse::Existing { .. } => {
+                                        panic!("matrix expected accepted")
+                                    }
+                                },
+                                submitted.status().clone(),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap()
+                    })
+                    .unwrap()
+            }
+            _ => unreachable!(),
+        };
+
+        let first_bytes = serde_json::to_vec(&first).unwrap();
+        if boundary >= 3 {
+            let remote_status = RemoteJobClient::new_with_runtime(&runner, &resolution_runtime)
+                .status(&matrix_worker(), submit.material().job_id())
+                .unwrap();
+            assert_eq!(remote_status.meta().job_id(), submit.material().job_id());
+        }
+        let durable = fs::read(store.job_index(submit.material().job_id()).unwrap()).unwrap();
+        let durable_text = std::str::from_utf8(&durable).unwrap();
+        match (
+            boundary < 3,
+            durable_text.contains("\"disposition\":\"abandoned\""),
+            first.outcome(),
+        ) {
+            (true, true, ResolveOrAbandonOutcome::Abandoned) => {
+                abandoned += 1;
+                matrix_assert_abandoned_fences(&store, lease.as_ref(), &submit);
+                assert!(!marker.exists(), "abandoned row {case_index} executed");
+                assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+                if let Some(lease) = lease.as_ref() {
+                    assert!(
+                        !store
+                            .incoming_job(lease.job_id(), lease.lease_token())
+                            .unwrap()
+                            .exists(),
+                        "case {case_index} retained incoming receiver state"
+                    );
+                    assert!(
+                        !store.verified_receipt(lease.job_id()).unwrap().exists(),
+                        "case {case_index} retained verified receipt"
+                    );
+                }
+                if boundary == 2 {
+                    assert_mutable_job_scopes_absent(&store, lease.as_ref().unwrap());
+                }
+            }
+            (false, false, ResolveOrAbandonOutcome::Accepted { response }) => {
+                accepted += 1;
+                assert_eq!(response.meta().job_id(), submit.material().job_id());
+                assert_eq!(response.meta().client_id(), submit.material().client_id());
+                assert_eq!(
+                    response.meta().request_fingerprint(),
+                    submit.request_fingerprint()
+                );
+                let bytes = fs::read(&marker).unwrap_or_default();
+                assert_eq!(bytes, b"x", "accepted row {case_index} marker cardinality");
+                execution_markers += 1;
+            }
+            _ => panic!("case {case_index} selected an invalid durable authority: {first:?}"),
+        }
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            usize::from(boundary >= 3),
+            "case {case_index}"
+        );
+        launcher_total += launches.load(Ordering::SeqCst);
+
+        // Repeat the exact same resolution after the first durable result.  It
+        // must preserve both the authority bytes and both cardinalities.
+        let repeated = matrix_remote_resolve(&runner, &resolve);
+        assert_eq!(
+            serde_json::to_vec(&repeated).unwrap(),
+            first_bytes,
+            "case {case_index}"
+        );
+        assert_eq!(
+            fs::read(store.job_index(submit.material().job_id()).unwrap()).unwrap(),
+            durable
+        );
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            usize::from(boundary >= 3),
+            "case {case_index} duplicated launch"
+        );
+        if boundary >= 3 {
+            let second_repeat = matrix_remote_resolve(&runner, &resolve);
+            assert_eq!(
+                serde_json::to_vec(&second_repeat).unwrap(),
+                first_bytes,
+                "case {case_index} accepted second repeat"
+            );
+        }
+        let request_ids = runner.requests();
+        assert!(
+            !request_ids.is_empty(),
+            "case {case_index} made no host request"
+        );
+        assert_eq!(
+            request_ids
+                .iter()
+                .filter(|(command, _)| command == "resolve-or-abandon")
+                .count(),
+            if boundary < 3 {
+                2 + usize::from(schedule == 3)
+            } else {
+                2
+            },
+            "case {case_index} omitted or duplicated its exact repeated resolution"
+        );
+        for (command, bytes) in request_ids {
+            matrix_assert_recorded_endpoint_identity(&command, &bytes, &submit);
+        }
+    }
+
+    assert_eq!(boundary_counts, [17, 17, 17, 17, 16, 16]);
+    assert_eq!(
+        (accepted, abandoned, execution_markers, launcher_total),
+        (49, 51, 49, 49)
+    );
 }
 
 fn lease_request() -> LeaseAcquireRequest {
