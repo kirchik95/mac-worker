@@ -2322,6 +2322,7 @@ fn terminal_accepted_submit_retry_ignores_an_unrelated_live_lease() {
         LeaseAcquireResponse::Acquired { lease } => lease,
         LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
     };
+    let unrelated_lease_bytes = fs::read(root.join("leases/heavy/lease.json")).unwrap();
 
     let retry = JobService::new(&store, &RejectLauncher)
         .submit_at(request, 12)
@@ -2334,6 +2335,10 @@ fn terminal_accepted_submit_retry_ignores_an_unrelated_live_lease() {
         LeaseService::new(&store).load().unwrap(),
         Some(unrelated_lease)
     );
+    assert_eq!(
+        fs::read(root.join("leases/heavy/lease.json")).unwrap(),
+        unrelated_lease_bytes
+    );
 }
 
 #[test]
@@ -2342,7 +2347,8 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
     // matching lease and reported as an immutable identity conflict.
     let temp = tempfile::tempdir().unwrap();
     let request = SubmitRequest::new(lease_request().material().clone());
-    let unrelated_store = HostStore::open(&temp.path().join("unrelated")).unwrap();
+    let unrelated_root = temp.path().join("unrelated");
+    let unrelated_store = HostStore::open(&unrelated_root).unwrap();
     let unrelated = lease_request_with_identity(
         &request,
         JobId::new(uuid::Uuid::from_u128(93_001)),
@@ -2356,6 +2362,7 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
         LeaseAcquireResponse::Acquired { lease } => lease,
         LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
     };
+    let unrelated_lease_bytes = fs::read(unrelated_root.join("leases/heavy/lease.json")).unwrap();
 
     let error = JobService::new(&unrelated_store, &RejectLauncher)
         .submit_at(request.clone(), 2)
@@ -2366,10 +2373,15 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
         LeaseService::new(&unrelated_store).load().unwrap(),
         Some(unrelated_lease)
     );
+    assert_eq!(
+        fs::read(unrelated_root.join("leases/heavy/lease.json")).unwrap(),
+        unrelated_lease_bytes
+    );
 
     // A live lease for the submitted job is still authoritative for immutable
     // identity comparison and must not be filtered out.
-    let same_job_store = HostStore::open(&temp.path().join("same-job")).unwrap();
+    let same_job_root = temp.path().join("same-job");
+    let same_job_store = HostStore::open(&same_job_root).unwrap();
     let same_job_lease = match LeaseService::new(&same_job_store)
         .acquire(&lease_request(), &healthy(), 3)
         .unwrap()
@@ -2377,6 +2389,7 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
         LeaseAcquireResponse::Acquired { lease } => lease,
         LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
     };
+    let same_job_lease_bytes = fs::read(same_job_root.join("leases/heavy/lease.json")).unwrap();
     let changed = SubmitRequest::new(
         lease_request_with_identity(
             &request,
@@ -2396,6 +2409,10 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
     assert_eq!(
         LeaseService::new(&same_job_store).load().unwrap(),
         Some(same_job_lease)
+    );
+    assert_eq!(
+        fs::read(same_job_root.join("leases/heavy/lease.json")).unwrap(),
+        same_job_lease_bytes
     );
 }
 
