@@ -294,6 +294,7 @@ fn request_for_digest(digest: &str) -> LeaseAcquireRequest {
             JobId::new(uuid::Uuid::from_u128(1)),
             ClientId::new(uuid::Uuid::from_u128(2)),
             LeaseToken::new(uuid::Uuid::from_u128(3)),
+            1,
             "mini-1".into(),
             PROJECT_ID.into(),
             WORKTREE_ID.into(),

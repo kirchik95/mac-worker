@@ -150,12 +150,13 @@ fn canonical_line(value: &impl serde::Serialize) -> Vec<u8> {
     bytes
 }
 
-fn remote_submit(seed: u128) -> SubmitRequest {
+fn remote_submit(seed: u128, created_at_millis: u64) -> SubmitRequest {
     SubmitRequest::new(
         RequestFingerprintMaterial::new(
             JobId::new(uuid::Uuid::from_u128(seed)),
             ClientId::new(uuid::Uuid::from_u128(seed + 1)),
             LeaseToken::new(uuid::Uuid::from_u128(seed + 2)),
+            created_at_millis,
             "mini-1".into(),
             "a".repeat(64),
             "b".repeat(64),
@@ -171,12 +172,7 @@ fn remote_submit(seed: u128) -> SubmitRequest {
 
 fn accepted_status(request: &SubmitRequest, created_at: u64) -> StatusResponse {
     StatusResponse::new(
-        JobMeta::new(
-            request.material(),
-            request.request_fingerprint().clone(),
-            created_at,
-        )
-        .unwrap(),
+        JobMeta::new(request.material(), request.request_fingerprint().clone()).unwrap(),
         JobStatus::accepted(created_at).unwrap(),
     )
     .unwrap()
@@ -242,6 +238,7 @@ fn acquire_request(seed: u128) -> LeaseAcquireRequest {
             JobId::new(uuid::Uuid::from_u128(seed)),
             ClientId::new(uuid::Uuid::from_u128(seed + 1)),
             LeaseToken::new(uuid::Uuid::from_u128(seed + 2)),
+            1,
             "mini-1".into(),
             "a".repeat(64),
             "b".repeat(64),
@@ -1184,6 +1181,7 @@ fn post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_tran
         request.material().job_id(),
         ClientId::new(uuid::Uuid::from_u128(35_901)),
         LeaseToken::new(uuid::Uuid::from_u128(35_902)),
+        request.material().created_at_millis(),
         request.material().worker_name().into(),
         request.material().project_id().into(),
         request.material().worktree_id().into(),
@@ -1911,7 +1909,7 @@ impl ProcessRunner for NoProcess {
 fn query_operations_use_only_the_three_fixed_commands_and_compact_requests() {
     // Break caught: a query operation accepts a caller-controlled command or
     // silently inherits the submission operation's argv/deadline.
-    let submit = remote_submit(80_000);
+    let submit = remote_submit(80_000, 10);
     let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
     let status_response = accepted_status(&submit, 10);
     let log_response =
@@ -2266,9 +2264,9 @@ fn legacy_or_wrong_version_host_errors_are_not_authoritative() {
 fn remote_status_and_log_bind_the_selected_worker_job_stream_and_offset() {
     // Break caught: a valid response for another job/worker/log cursor is
     // trusted as if it answered the selected request.
-    let submit = remote_submit(81_000);
+    let submit = remote_submit(81_000, 10);
     let requested = submit.material().job_id();
-    let wrong_job = accepted_status(&remote_submit(81_100), 10);
+    let wrong_job = accepted_status(&remote_submit(81_100, 10), 10);
     let mut wrong_worker = serde_json::to_value(accepted_status(&submit, 10)).unwrap();
     wrong_worker["meta"]["worker_name"] = serde_json::json!("mini-2");
     let wrong_worker: StatusResponse = serde_json::from_value(wrong_worker).unwrap();
@@ -2305,7 +2303,7 @@ fn remote_status_and_log_bind_the_selected_worker_job_stream_and_offset() {
 fn remote_log_chunk_enforces_the_callers_effective_requested_limit() {
     // Break caught: the client trusts any protocol-valid chunk up to 64 KiB,
     // even when it exceeds the smaller limit in this exact request.
-    let submit = remote_submit(81_250);
+    let submit = remote_submit(81_250, 10);
     let job_id = submit.material().job_id();
     let cases = [
         ("zero accepts empty", 0, 0usize, true),
@@ -2374,7 +2372,7 @@ fn remote_log_chunk_enforces_the_callers_effective_requested_limit() {
 fn remote_status_accepts_only_an_exact_positive_bounded_stage_deadline() {
     // Break caught: downstream stages cannot pass their shrinking budget, or
     // a zero/over-30-second policy reaches the runner.
-    let submit = remote_submit(81_500);
+    let submit = remote_submit(81_500, 10);
     let response = accepted_status(&submit, 10);
     let runner =
         RecordingRunner::returning(vec![Ok(result(status(0), &canonical_line(&response), b""))]);
@@ -2398,10 +2396,10 @@ fn remote_status_accepts_only_an_exact_positive_bounded_stage_deadline() {
 }
 
 #[test]
-fn resolution_rejects_each_changed_remote_immutable_but_not_remote_created_at() {
+fn resolution_rejects_each_changed_remote_immutable_including_created_at() {
     // Break caught: accepted resolution checks only job/worker identity and
-    // ignores one of the request-bound immutables, or compares host/local time.
-    let submit = remote_submit(82_000);
+    // ignores one of the request-bound immutables, including creation time.
+    let submit = remote_submit(82_000, 10);
     let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
     let baseline = serde_json::to_value(accepted_status(&submit, 10)).unwrap();
     let mutations: Vec<(&str, serde_json::Value)> = vec![
@@ -2455,19 +2453,29 @@ fn resolution_rejects_each_changed_remote_immutable_but_not_remote_created_at() 
     different_time["meta"]["created_at_millis"] = serde_json::json!(999);
     different_time["status"]["updated_at_millis"] = serde_json::json!(999);
     let response: StatusResponse = serde_json::from_value(different_time).unwrap();
-    let runner =
-        RecordingRunner::returning(vec![Ok(result(status(0), &canonical_line(&response), b""))]);
-    let disposition = RemoteJobClient::new(&runner)
+    let resolved = ResolveOrAbandonResponse::accepted(response).unwrap();
+    let runner = RecordingRunner::returning(vec![
+        Err(ProcessError::DeadlineExceeded {
+            deadline: Duration::from_secs(30),
+        }
+        .into()),
+        Ok(result(status(0), &canonical_line(&resolved), b"")),
+    ]);
+    let runtime = JumpResolutionRuntime::new();
+    let disposition = RemoteJobClient::new_with_runtime(&runner, &runtime)
         .resolve_preacceptance(&worker(), &resolve)
         .unwrap();
-    assert!(matches!(disposition, PreacceptanceDisposition::Accepted(_)));
+    assert!(matches!(
+        disposition,
+        PreacceptanceDisposition::UnknownRemote { ref code } if code == "UNKNOWN_REMOTE"
+    ));
 }
 
 #[test]
 fn direct_accepted_is_fully_bound_and_existing_is_authoritatively_refreshed() {
     // Break caught: submit success is trusted without request binding, or an
     // Existing response is returned without the required same-ID status call.
-    let submit = remote_submit(83_000);
+    let submit = remote_submit(83_000, 20);
     let authoritative = accepted_status(&submit, 20);
     let stale = JobStatus::accepted(10).unwrap();
     let runner = RecordingRunner::returning(vec![Ok(result(
@@ -2492,7 +2500,7 @@ fn direct_accepted_is_fully_bound_and_existing_is_authoritatively_refreshed() {
         "~/.local/bin/worker host status"
     );
 
-    let wrong = accepted_status(&remote_submit(83_100), 20);
+    let wrong = accepted_status(&remote_submit(83_100, 20), 20);
     let runner = RecordingRunner::returning(Vec::new());
     let error = RemoteJobClient::new(&runner)
         .resolve_submission(
@@ -2512,7 +2520,7 @@ fn direct_accepted_is_fully_bound_and_existing_is_authoritatively_refreshed() {
 fn resolution_polls_with_exact_remaining_deadlines_then_resolves_once_separately() {
     // Break caught: polling calls at zero, resets the total budget, sleeps for
     // wall time in tests, or applies the rsync deadline to final resolution.
-    let submit = remote_submit(84_000);
+    let submit = remote_submit(84_000, 10);
     let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
     let mut scripted = (0..30)
         .map(|_| {
@@ -2565,7 +2573,7 @@ fn resolution_polls_with_exact_remaining_deadlines_then_resolves_once_separately
 fn last_positive_budget_status_success_wins_without_a_resolve_call() {
     // Break caught: the final one-second attempt is skipped or a successful
     // last response is overwritten by resolve-or-abandon.
-    let submit = remote_submit(85_000);
+    let submit = remote_submit(85_000, 10);
     let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
     let response = accepted_status(&submit, 10);
     let mut scripted = (0..29)
@@ -2603,7 +2611,7 @@ fn last_positive_budget_status_success_wins_without_a_resolve_call() {
 fn resolution_outcomes_keep_host_authority_and_submission_error_rules_exact() {
     // Break caught: cleanup/unknown are conflated, a versioned conflict is
     // rewritten, or resolve_submission returns the original error too broadly.
-    let submit = remote_submit(86_000);
+    let submit = remote_submit(86_000, 10);
     let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
     let outcomes = [
         ResolveOrAbandonResponse::accepted(accepted_status(&submit, 10)).unwrap(),

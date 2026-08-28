@@ -939,6 +939,7 @@ fn mismatched_tombstone_retry_is_a_conflict_and_preserves_the_winner() {
             original.material().job_id(),
             ClientId::new(uuid::Uuid::from_u128(77_001)),
             LeaseToken::new(uuid::Uuid::from_u128(77_002)),
+            original.material().created_at_millis(),
             original.material().worker_name().into(),
             original.material().project_id().into(),
             original.material().worktree_id().into(),
@@ -1999,6 +2000,68 @@ fn status_rejects_index_meta_lease_and_initial_status_disagreement() {
 }
 
 #[test]
+fn submit_uses_request_creation_time_while_lease_uses_the_host_clock() {
+    // Break caught: submit regenerates the job timestamp from host_now, or
+    // lease TTL accidentally starts from the client-bound job timestamp.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("request-and-lease-clocks");
+    let (store, lease, request) = prepared_host(&root);
+    assert_eq!(request.material().created_at_millis(), 10);
+    assert_eq!(lease.created_at_millis(), 1);
+    assert_eq!(lease.expires_at_millis(), 30_001);
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobIndexParentSync)
+            .unwrap();
+    let error = JobService::new(&faulted, &RejectLauncher)
+        .submit_at(request, 999)
+        .unwrap_err();
+    assert!(error.to_string().contains("injected"), "{error}");
+
+    let job = faulted
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let meta: JobMeta = serde_json::from_slice(&fs::read(job.join("meta.json")).unwrap()).unwrap();
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(meta.created_at_millis(), 10);
+    assert_eq!(status, JobStatus::accepted(10).unwrap());
+}
+
+#[test]
+fn durable_execution_payload_reconstruction_binds_creation_time() {
+    // Break caught: recovery recomputes the execution fingerprint without the
+    // bound timestamp and accepts self-consistent metadata/status tampering.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("payload-created-at-binding");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    replace_ascii_once(
+        &job.join("meta.json"),
+        "\"created_at_millis\":10",
+        "\"created_at_millis\":11",
+    );
+    replace_ascii_once(
+        &job.join("status.json"),
+        "\"updated_at_millis\":10",
+        "\"updated_at_millis\":11",
+    );
+    replace_ascii_once(
+        &store.job_index(lease.job_id()).unwrap(),
+        "\"updated_at_millis\":10",
+        "\"updated_at_millis\":11",
+    );
+
+    let error = JobService::new(&store, &RejectLauncher)
+        .status(lease.job_id())
+        .unwrap_err();
+    assert_error_code(error, "JOB_ID_CONFLICT", "creation time fingerprint");
+}
+
+#[test]
 fn status_binds_every_accepted_index_identity_to_canonical_metadata() {
     for (index, mutation) in [
         "index-job",
@@ -2156,7 +2219,16 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
     );
 
     for mutation in [
-        "client", "token", "worker", "project", "worktree", "digest", "cwd", "timeout", "resource",
+        "client",
+        "token",
+        "created_at",
+        "worker",
+        "project",
+        "worktree",
+        "digest",
+        "cwd",
+        "timeout",
+        "resource",
         "command",
     ] {
         let material = request.material();
@@ -2172,6 +2244,11 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
                     LeaseToken::new(uuid::Uuid::from_u128(91_002))
                 } else {
                     material.lease_token()
+                },
+                if mutation == "created_at" {
+                    material.created_at_millis() + 1
+                } else {
+                    material.created_at_millis()
                 },
                 if mutation == "worker" {
                     "mini-2".into()
@@ -3865,6 +3942,7 @@ fn matrix_request(command: CommandSpec) -> (LeaseAcquireRequest, SubmitRequest, 
             JOB_ID.parse().unwrap(),
             CLIENT_ID.parse().unwrap(),
             LEASE_TOKEN.parse().unwrap(),
+            10,
             "mini-1".into(),
             PROJECT_ID.into(),
             WORKTREE_ID.into(),
@@ -5306,6 +5384,7 @@ fn lease_request() -> LeaseAcquireRequest {
             JOB_ID.parse().unwrap(),
             CLIENT_ID.parse().unwrap(),
             LEASE_TOKEN.parse().unwrap(),
+            10,
             "mini-1".into(),
             PROJECT_ID.into(),
             WORKTREE_ID.into(),
@@ -5331,6 +5410,7 @@ fn lease_request_with_identity(
             job_id,
             client_id,
             lease_token,
+            material.created_at_millis(),
             material.worker_name().into(),
             material.project_id().into(),
             material.worktree_id().into(),
@@ -5387,6 +5467,7 @@ fn prepared_host_with_command(
             JOB_ID.parse().unwrap(),
             CLIENT_ID.parse().unwrap(),
             LEASE_TOKEN.parse().unwrap(),
+            10,
             "mini-1".into(),
             PROJECT_ID.into(),
             WORKTREE_ID.into(),

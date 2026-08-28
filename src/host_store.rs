@@ -635,6 +635,7 @@ pub(crate) struct ResolutionIdentity {
     job_id: JobId,
     client_id: ClientId,
     lease_token: LeaseToken,
+    created_at_millis: u64,
     request_fingerprint: RequestFingerprint,
     worker_name: String,
     project_id: String,
@@ -652,6 +653,7 @@ impl fmt::Debug for ResolutionIdentity {
             .debug_struct("ResolutionIdentity")
             .field("job_id", &self.job_id)
             .field("client_id", &self.client_id)
+            .field("created_at_millis", &self.created_at_millis)
             .field("request_fingerprint", &self.request_fingerprint)
             .finish_non_exhaustive()
     }
@@ -664,6 +666,7 @@ impl ResolutionIdentity {
             job_id: request.job_id(),
             client_id: request.client_id(),
             lease_token: request.lease_token(),
+            created_at_millis: request.created_at_millis(),
             request_fingerprint: request.request_fingerprint().clone(),
             worker_name: request.worker_name().into(),
             project_id: request.project_id().into(),
@@ -684,6 +687,9 @@ impl ResolutionIdentity {
     }
     pub(crate) fn lease_token(&self) -> LeaseToken {
         self.lease_token
+    }
+    pub(crate) fn created_at_millis(&self) -> u64 {
+        self.created_at_millis
     }
     pub(crate) fn request_fingerprint(&self) -> &RequestFingerprint {
         &self.request_fingerprint
@@ -3620,6 +3626,7 @@ mod review_regression_tests {
             JobId::new(uuid::Uuid::from_u128(seed)),
             ClientId::new(uuid::Uuid::from_u128(seed + 10_000)),
             LeaseToken::new(uuid::Uuid::from_u128(seed + 20_000)),
+            2,
             "mini-1".into(),
             "a".repeat(64),
             "b".repeat(64),

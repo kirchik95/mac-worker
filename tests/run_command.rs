@@ -59,6 +59,7 @@ fn local_record(relative_working_dir: &str) -> LocalJobRecord {
         JOB_ID.parse().unwrap(),
         CLIENT_ID.parse().unwrap(),
         LEASE_TOKEN.parse().unwrap(),
+        100,
         "mini-1".into(),
         PROJECT_ID.into(),
         WORKTREE_ID.into(),
@@ -69,7 +70,7 @@ fn local_record(relative_working_dir: &str) -> LocalJobRecord {
         CommandSpec::shell("printf TASK9_COMMAND_SECRET".into()).unwrap(),
     )
     .unwrap();
-    let meta = JobMeta::new(&material, material.fingerprint(), 100).unwrap();
+    let meta = JobMeta::new(&material, material.fingerprint()).unwrap();
     LocalJobRecord::new(
         meta,
         LEASE_TOKEN.parse().unwrap(),
@@ -242,6 +243,7 @@ fn record_with_meta_parts(
         job_id,
         client_id,
         lease_token,
+        created_at_millis,
         worker.into(),
         project_id.into(),
         worktree_id.into(),
@@ -252,7 +254,7 @@ fn record_with_meta_parts(
         command,
     )
     .unwrap();
-    let meta = JobMeta::new(&material, material.fingerprint(), created_at_millis).unwrap();
+    let meta = JobMeta::new(&material, material.fingerprint()).unwrap();
     LocalJobRecord::new(meta, material.lease_token(), status, uncertainty).unwrap()
 }
 
@@ -538,6 +540,7 @@ fn status_row_serialization_omits_private_identity_and_payload() {
         JOB_ID.parse().unwrap(),
         CLIENT_ID.parse().unwrap(),
         LEASE_TOKEN.parse().unwrap(),
+        100,
         "mini-1".into(),
         PROJECT_ID.into(),
         WORKTREE_ID.into(),
@@ -548,7 +551,7 @@ fn status_row_serialization_omits_private_identity_and_payload() {
         CommandSpec::shell(command_secret.into()).unwrap(),
     )
     .unwrap();
-    let meta = JobMeta::new(&material, material.fingerprint(), 100).unwrap();
+    let meta = JobMeta::new(&material, material.fingerprint()).unwrap();
     let status = JobStatus::accepted(101).unwrap();
     let record = LocalJobRecord::new(
         meta,

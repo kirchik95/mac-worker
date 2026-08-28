@@ -3941,6 +3941,7 @@ mod tests {
             "018f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
             "102f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
             "202f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
+            100,
             "mini-1".into(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),

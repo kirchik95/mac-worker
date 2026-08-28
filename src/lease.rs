@@ -398,6 +398,7 @@ mod lifecycle_tests {
             JobId::new(uuid::Uuid::from_u128(seed)),
             ClientId::new(uuid::Uuid::from_u128(seed + 10_000)),
             LeaseToken::new(uuid::Uuid::from_u128(seed + 20_000)),
+            2,
             "mini-1".into(),
             "a".repeat(64),
             "b".repeat(64),
@@ -445,8 +446,7 @@ mod lifecycle_tests {
                 lease.manifest_digest(),
             )
             .unwrap();
-        let meta =
-            JobMeta::new(request.material(), request.request_fingerprint().clone(), 2).unwrap();
+        let meta = JobMeta::new(request.material(), request.request_fingerprint().clone()).unwrap();
         let meta_file = staged
             .rooted_dir()
             .write_new_private_file("meta.json", &serde_json::to_vec(&meta).unwrap())
@@ -582,7 +582,6 @@ mod lifecycle_tests {
         let conflicting_meta = JobMeta::new(
             conflicting_request.material(),
             conflicting_request.request_fingerprint().clone(),
-            2,
         )
         .unwrap();
         fs::write(

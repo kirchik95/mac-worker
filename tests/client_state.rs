@@ -52,6 +52,7 @@ fn make_record(
         job_id,
         client_id,
         lease_token,
+        1_000,
         "mini-1".into(),
         PROJECT_ID.into(),
         WORKTREE_ID.into(),
@@ -63,7 +64,7 @@ fn make_record(
     )
     .unwrap();
     let fingerprint = material.fingerprint();
-    let meta = JobMeta::new(&material, fingerprint, 1_000).unwrap();
+    let meta = JobMeta::new(&material, fingerprint).unwrap();
     let uncertainty = if cleanup_pending {
         RemoteUncertainty::cleanup_pending("CLEANUP_INCOMPLETE").unwrap()
     } else {
@@ -1553,6 +1554,7 @@ fn remote_retry_sleep_holds_no_local_client_state_lock() {
         record.meta().job_id(),
         store.client_id(),
         record.lease_token(),
+        record.meta().created_at_millis(),
         record.meta().worker_name().into(),
         record.meta().project_id().into(),
         record.meta().worktree_id().into(),

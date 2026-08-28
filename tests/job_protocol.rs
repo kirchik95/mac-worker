@@ -23,6 +23,7 @@ fn material(command: CommandSpec) -> RequestFingerprintMaterial {
         JOB_ID.parse().unwrap(),
         CLIENT_ID.parse().unwrap(),
         LEASE_TOKEN.parse().unwrap(),
+        100,
         "mini-1".into(),
         PROJECT_ID.into(),
         WORKTREE_ID.into(),
@@ -33,6 +34,15 @@ fn material(command: CommandSpec) -> RequestFingerprintMaterial {
         command,
     )
     .unwrap()
+}
+
+fn material_with_creation_time(
+    command: CommandSpec,
+    created_at_millis: u64,
+) -> RequestFingerprintMaterial {
+    let mut value = serde_json::to_value(material(command)).unwrap();
+    value["created_at_millis"] = serde_json::json!(created_at_millis);
+    serde_json::from_value(value).unwrap()
 }
 
 fn meta_json() -> serde_json::Value {
@@ -79,12 +89,7 @@ fn submit_request() -> SubmitRequest {
 
 fn status_response(updated_at_millis: u64) -> StatusResponse {
     let request = submit_request();
-    let meta = JobMeta::new(
-        request.material(),
-        request.request_fingerprint().clone(),
-        100,
-    )
-    .unwrap();
+    let meta = JobMeta::new(request.material(), request.request_fingerprint().clone()).unwrap();
     StatusResponse::new(meta, JobStatus::accepted(updated_at_millis).unwrap()).unwrap()
 }
 
@@ -295,13 +300,107 @@ fn fingerprint_uses_the_canonical_material_in_fixed_field_order() {
     assert_eq!(
         serde_json::to_string(&material).unwrap(),
         format!(
-            r#"{{"protocol_version":2,"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","lease_token":"{LEASE_TOKEN}","worker_name":"mini-1","project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","manifest_digest":"{MANIFEST_DIGEST}","relative_working_dir":"packages/app","timeout_millis":30000,"resource_class":"heavy","command":{{"mode":"argv","argv":["npm","test"]}}}}"#
+            r#"{{"protocol_version":2,"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","lease_token":"{LEASE_TOKEN}","created_at_millis":100,"worker_name":"mini-1","project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","manifest_digest":"{MANIFEST_DIGEST}","relative_working_dir":"packages/app","timeout_millis":30000,"resource_class":"heavy","command":{{"mode":"argv","argv":["npm","test"]}}}}"#
         )
     );
     assert_eq!(
         material.fingerprint().to_string(),
-        "0c582832035740179241a519e91943fea5e8e58341646026f82897e3a0946a78"
+        "ca427c9aea26b6d46bc926dc412f0b9f00e01ceeb853157d73e52e36ad4d8da7"
     );
+}
+
+#[test]
+fn creation_time_is_required_strict_canonical_fingerprint_material() {
+    // Break caught: job creation time is omitted from the immutable material,
+    // defaulted during decode, or excluded from the request fingerprint.
+    let first = material_with_creation_time(
+        CommandSpec::argv(vec!["npm".into(), "test".into()]).unwrap(),
+        100,
+    );
+    let second = material_with_creation_time(
+        CommandSpec::argv(vec!["npm".into(), "test".into()]).unwrap(),
+        101,
+    );
+    assert_ne!(first, second);
+    assert_ne!(first.fingerprint(), second.fingerprint());
+
+    let canonical = serde_json::to_string(&first).unwrap();
+    assert!(canonical.contains(r#""created_at_millis":100"#));
+
+    let mut missing = serde_json::to_value(&first).unwrap();
+    missing.as_object_mut().unwrap().remove("created_at_millis");
+    assert!(serde_json::from_value::<RequestFingerprintMaterial>(missing).is_err());
+
+    let duplicate = canonical.replacen(
+        r#""created_at_millis":100"#,
+        r#""created_at_millis":100,"created_at_millis":100"#,
+        1,
+    );
+    assert!(serde_json::from_str::<RequestFingerprintMaterial>(&duplicate).is_err());
+
+    let mut unknown = serde_json::to_value(&first).unwrap();
+    unknown["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<RequestFingerprintMaterial>(unknown).is_err());
+}
+
+#[test]
+fn job_meta_uses_the_creation_time_bound_into_its_material() {
+    // Break caught: the host selects JobMeta creation time independently from
+    // the timestamp already committed by the request fingerprint.
+    let material = material_with_creation_time(CommandSpec::shell("true".into()).unwrap(), 100);
+    let meta = JobMeta::new(&material, material.fingerprint()).unwrap();
+    assert_eq!(meta.created_at_millis(), 100);
+}
+
+#[test]
+fn recovery_requests_round_trip_the_bound_creation_time() {
+    // Break caught: recovery reconstructed from either submission intent or a
+    // durable local record silently drops the fingerprint-bound timestamp.
+    let submit = SubmitRequest::new(material_with_creation_time(
+        CommandSpec::shell("true".into()).unwrap(),
+        100,
+    ));
+    let from_submit = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let meta = JobMeta::new(submit.material(), submit.request_fingerprint().clone()).unwrap();
+    let record = LocalJobRecord::new(
+        meta,
+        submit.material().lease_token(),
+        Some(JobStatus::accepted(100).unwrap()),
+        RemoteUncertainty::None,
+    )
+    .unwrap();
+    let from_record = ResolveOrAbandonRequest::from_local_record(&record).unwrap();
+
+    assert_eq!(from_submit.created_at_millis(), 100);
+    assert_eq!(
+        serde_json::to_value(&from_submit).unwrap()["created_at_millis"],
+        100
+    );
+    let debug = format!("{from_submit:?}");
+    assert!(debug.contains("created_at_millis: 100"), "{debug}");
+    assert!(!debug.contains(LEASE_TOKEN), "{debug}");
+    assert_eq!(from_record, from_submit);
+    assert_eq!(
+        serde_json::from_value::<ResolveOrAbandonRequest>(
+            serde_json::to_value(&from_submit).unwrap()
+        )
+        .unwrap(),
+        from_submit
+    );
+
+    let mut missing = serde_json::to_value(&from_submit).unwrap();
+    missing.as_object_mut().unwrap().remove("created_at_millis");
+    assert!(serde_json::from_value::<ResolveOrAbandonRequest>(missing).is_err());
+    let canonical = serde_json::to_string(&from_submit).unwrap();
+    let duplicate = canonical.replacen(
+        r#""created_at_millis":100"#,
+        r#""created_at_millis":100,"created_at_millis":100"#,
+        1,
+    );
+    assert!(serde_json::from_str::<ResolveOrAbandonRequest>(&duplicate).is_err());
+    let mut unknown = serde_json::to_value(&from_submit).unwrap();
+    unknown["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<ResolveOrAbandonRequest>(unknown).is_err());
 }
 
 #[test]
@@ -311,6 +410,7 @@ fn material_rejects_noncanonical_identifiers_and_duplicate_json_fields() {
             JOB_ID.parse().unwrap(),
             CLIENT_ID.parse().unwrap(),
             LEASE_TOKEN.parse().unwrap(),
+            1,
             "mini-1".into(),
             "A".repeat(64),
             WORKTREE_ID.into(),

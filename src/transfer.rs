@@ -733,6 +733,7 @@ fn validate_resolution_response(
         || meta.project_id() != request.project_id()
         || meta.worktree_id() != request.worktree_id()
         || meta.manifest_digest() != request.manifest_digest()
+        || meta.created_at_millis() != request.created_at_millis()
         || meta.request_fingerprint() != request.request_fingerprint()
         || meta.relative_working_dir() != request.relative_working_dir()
         || meta.timeout_millis() != request.timeout_millis()
@@ -1178,6 +1179,7 @@ mod exec_inheritance_tests {
                 JobId::new(uuid::Uuid::from_u128(901)),
                 ClientId::new(uuid::Uuid::from_u128(902)),
                 LeaseToken::new(uuid::Uuid::from_u128(903)),
+                1,
                 "mini-1".into(),
                 "a".repeat(64),
                 "b".repeat(64),

@@ -411,6 +411,7 @@ pub struct RequestFingerprintMaterial {
     job_id: JobId,
     client_id: ClientId,
     lease_token: LeaseToken,
+    created_at_millis: u64,
     worker_name: String,
     project_id: String,
     worktree_id: String,
@@ -428,6 +429,7 @@ impl fmt::Debug for RequestFingerprintMaterial {
             .field("protocol_version", &self.protocol_version)
             .field("job_id", &self.job_id)
             .field("client_id", &self.client_id)
+            .field("created_at_millis", &self.created_at_millis)
             .field("worker_name", &self.worker_name)
             .field("project_id", &self.project_id)
             .field("worktree_id", &self.worktree_id)
@@ -445,6 +447,7 @@ impl RequestFingerprintMaterial {
         job_id: JobId,
         client_id: ClientId,
         lease_token: LeaseToken,
+        created_at_millis: u64,
         worker_name: String,
         project_id: String,
         worktree_id: String,
@@ -459,6 +462,7 @@ impl RequestFingerprintMaterial {
             job_id,
             client_id,
             lease_token,
+            created_at_millis,
             worker_name,
             project_id,
             worktree_id,
@@ -508,6 +512,9 @@ impl RequestFingerprintMaterial {
     pub fn lease_token(&self) -> LeaseToken {
         self.lease_token
     }
+    pub fn created_at_millis(&self) -> u64 {
+        self.created_at_millis
+    }
     pub fn worker_name(&self) -> &str {
         &self.worker_name
     }
@@ -537,11 +544,12 @@ impl RequestFingerprintMaterial {
 impl Serialize for RequestFingerprintMaterial {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("RequestFingerprintMaterial", 12)?;
+        let mut record = serializer.serialize_struct("RequestFingerprintMaterial", 13)?;
         record.serialize_field("protocol_version", &self.protocol_version)?;
         record.serialize_field("job_id", &self.job_id)?;
         record.serialize_field("client_id", &self.client_id)?;
         record.serialize_field("lease_token", &self.lease_token)?;
+        record.serialize_field("created_at_millis", &self.created_at_millis)?;
         record.serialize_field("worker_name", &self.worker_name)?;
         record.serialize_field("project_id", &self.project_id)?;
         record.serialize_field("worktree_id", &self.worktree_id)?;
@@ -563,6 +571,7 @@ impl<'de> Deserialize<'de> for RequestFingerprintMaterial {
             job_id: JobId,
             client_id: ClientId,
             lease_token: LeaseToken,
+            created_at_millis: u64,
             worker_name: String,
             project_id: String,
             worktree_id: String,
@@ -579,6 +588,7 @@ impl<'de> Deserialize<'de> for RequestFingerprintMaterial {
             job_id: raw.job_id,
             client_id: raw.client_id,
             lease_token: raw.lease_token,
+            created_at_millis: raw.created_at_millis,
             worker_name: raw.worker_name,
             project_id: raw.project_id,
             worktree_id: raw.worktree_id,
@@ -1231,7 +1241,6 @@ impl JobMeta {
     pub fn new(
         material: &RequestFingerprintMaterial,
         request_fingerprint: RequestFingerprint,
-        created_at_millis: u64,
     ) -> Result<Self, WorkerError> {
         if material.fingerprint() != request_fingerprint {
             return Err(protocol_error(
@@ -1251,7 +1260,7 @@ impl JobMeta {
             relative_working_dir: material.relative_working_dir.clone(),
             timeout_millis: material.timeout_millis,
             resource_class: material.resource_class.clone(),
-            created_at_millis,
+            created_at_millis: material.created_at_millis,
         };
         meta.validate()?;
         Ok(meta)
@@ -1885,6 +1894,7 @@ pub struct ResolveOrAbandonRequest {
     job_id: JobId,
     client_id: ClientId,
     lease_token: LeaseToken,
+    created_at_millis: u64,
     request_fingerprint: RequestFingerprint,
     worker_name: String,
     project_id: String,
@@ -1904,6 +1914,7 @@ impl fmt::Debug for ResolveOrAbandonRequest {
             .field("job_id", &self.job_id)
             .field("client_id", &self.client_id)
             .field("lease_token", &"[REDACTED]")
+            .field("created_at_millis", &self.created_at_millis)
             .field("request_fingerprint", &self.request_fingerprint)
             .field("worker_name", &self.worker_name)
             .field("project_id", &self.project_id)
@@ -1925,6 +1936,7 @@ impl ResolveOrAbandonRequest {
             material.job_id(),
             material.client_id(),
             material.lease_token(),
+            material.created_at_millis(),
             request.request_fingerprint().clone(),
             material.worker_name().into(),
             material.project_id().into(),
@@ -1944,6 +1956,7 @@ impl ResolveOrAbandonRequest {
             meta.job_id(),
             meta.client_id(),
             record.lease_token(),
+            meta.created_at_millis(),
             meta.request_fingerprint().clone(),
             meta.worker_name().into(),
             meta.project_id().into(),
@@ -1961,6 +1974,7 @@ impl ResolveOrAbandonRequest {
         job_id: JobId,
         client_id: ClientId,
         lease_token: LeaseToken,
+        created_at_millis: u64,
         request_fingerprint: RequestFingerprint,
         worker_name: String,
         project_id: String,
@@ -1976,6 +1990,7 @@ impl ResolveOrAbandonRequest {
             job_id,
             client_id,
             lease_token,
+            created_at_millis,
             request_fingerprint,
             worker_name,
             project_id,
@@ -2028,6 +2043,9 @@ impl ResolveOrAbandonRequest {
     pub fn lease_token(&self) -> LeaseToken {
         self.lease_token
     }
+    pub fn created_at_millis(&self) -> u64 {
+        self.created_at_millis
+    }
     pub fn request_fingerprint(&self) -> &RequestFingerprint {
         &self.request_fingerprint
     }
@@ -2076,11 +2094,12 @@ impl TryFrom<&LocalJobRecord> for ResolveOrAbandonRequest {
 impl Serialize for ResolveOrAbandonRequest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("ResolveOrAbandonRequest", 13)?;
+        let mut record = serializer.serialize_struct("ResolveOrAbandonRequest", 14)?;
         record.serialize_field("protocol_version", &self.protocol_version)?;
         record.serialize_field("job_id", &self.job_id)?;
         record.serialize_field("client_id", &self.client_id)?;
         record.serialize_field("lease_token", &self.lease_token)?;
+        record.serialize_field("created_at_millis", &self.created_at_millis)?;
         record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
         record.serialize_field("worker_name", &self.worker_name)?;
         record.serialize_field("project_id", &self.project_id)?;
@@ -2103,6 +2122,7 @@ impl<'de> Deserialize<'de> for ResolveOrAbandonRequest {
             job_id: JobId,
             client_id: ClientId,
             lease_token: LeaseToken,
+            created_at_millis: u64,
             request_fingerprint: RequestFingerprint,
             worker_name: String,
             project_id: String,
@@ -2119,6 +2139,7 @@ impl<'de> Deserialize<'de> for ResolveOrAbandonRequest {
             job_id: wire.job_id,
             client_id: wire.client_id,
             lease_token: wire.lease_token,
+            created_at_millis: wire.created_at_millis,
             request_fingerprint: wire.request_fingerprint,
             worker_name: wire.worker_name,
             project_id: wire.project_id,

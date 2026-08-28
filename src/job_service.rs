@@ -95,6 +95,7 @@ impl ExecutionPayload {
             self.job_id,
             self.client_id,
             self.lease_token,
+            meta.created_at_millis(),
             meta.worker_name().into(),
             meta.project_id().into(),
             meta.worktree_id().into(),
@@ -134,6 +135,7 @@ impl ExecutionPayload {
             self.job_id,
             self.client_id,
             self.lease_token,
+            identity.created_at_millis(),
             identity.worker_name().into(),
             identity.project_id().into(),
             identity.worktree_id().into(),
@@ -1172,12 +1174,8 @@ impl<'a> JobService<'a> {
             .open_child_directory(&relative("workspace")?, false)?;
         self.snapshots
             .validate_materialized_workspace(&verified, &staged_workspace)?;
-        let meta = JobMeta::new(
-            request.material(),
-            request.request_fingerprint().clone(),
-            now,
-        )?;
-        let initial_status = JobStatus::accepted(now)?;
+        let meta = JobMeta::new(request.material(), request.request_fingerprint().clone())?;
+        let initial_status = JobStatus::accepted(request.material().created_at_millis())?;
         materialize_control_files(
             self.store,
             staged.rooted_dir(),
@@ -1858,6 +1856,7 @@ fn reconstruct_submit_request(
         meta.job_id(),
         meta.client_id(),
         lease.lease_token(),
+        meta.created_at_millis(),
         meta.worker_name().into(),
         meta.project_id().into(),
         meta.worktree_id().into(),
@@ -1973,6 +1972,7 @@ fn require_exact_meta(
         || meta.project_id() != material.project_id()
         || meta.worktree_id() != material.worktree_id()
         || meta.manifest_digest() != material.manifest_digest()
+        || meta.created_at_millis() != material.created_at_millis()
         || meta.relative_working_dir() != material.relative_working_dir()
         || meta.timeout_millis() != material.timeout_millis()
         || meta.resource_class() != material.resource_class()
@@ -2014,6 +2014,7 @@ fn require_resolution_meta(
         && meta.project_id() == identity.project_id()
         && meta.worktree_id() == identity.worktree_id()
         && meta.manifest_digest() == identity.manifest_digest()
+        && meta.created_at_millis() == identity.created_at_millis()
         && meta.relative_working_dir() == identity.relative_working_dir()
         && meta.timeout_millis() == identity.timeout_millis()
         && meta.resource_class() == identity.resource_class()
