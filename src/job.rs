@@ -2525,6 +2525,199 @@ impl<'de> Deserialize<'de> for LogChunk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogCursor {
+    stream: LogStream,
+    next_offset: u64,
+    limit: u32,
+    terminal_target: Option<u64>,
+    eof_confirmed: bool,
+}
+
+impl LogCursor {
+    pub fn new(stream: LogStream, next_offset: u64, limit: u32) -> Result<Self, WorkerError> {
+        let cursor = Self {
+            stream,
+            next_offset,
+            limit,
+            terminal_target: None,
+            eof_confirmed: false,
+        };
+        cursor.validate()?;
+        Ok(cursor)
+    }
+
+    fn validate(&self) -> Result<(), WorkerError> {
+        if self
+            .terminal_target
+            .is_some_and(|target| target < self.next_offset)
+            || (self.eof_confirmed && self.terminal_target != Some(self.next_offset))
+        {
+            return Err(protocol_error("log cursor state is inconsistent"));
+        }
+        Ok(())
+    }
+
+    pub fn request(&self, job_id: JobId) -> LogChunkRequest {
+        LogChunkRequest::new(job_id, self.stream, self.next_offset, self.limit)
+    }
+
+    pub fn observe_chunk(&mut self, chunk: &LogChunk) -> Result<(), WorkerError> {
+        chunk.validate()?;
+        if chunk.stream() != self.stream {
+            return Err(protocol_error("log chunk stream does not match cursor"));
+        }
+        if chunk.offset() != self.next_offset {
+            return Err(protocol_error("log chunk offset does not match cursor"));
+        }
+        if self
+            .terminal_target
+            .is_some_and(|target| chunk.next_offset() > target)
+        {
+            return Err(protocol_error("log chunk crosses terminal byte length"));
+        }
+        let empty = chunk.next_offset() == chunk.offset();
+        self.next_offset = chunk.next_offset();
+        self.eof_confirmed = empty && self.terminal_target == Some(self.next_offset);
+        self.validate()
+    }
+
+    pub fn set_terminal_target(&mut self, bytes: u64) -> Result<(), WorkerError> {
+        if bytes < self.next_offset {
+            return Err(protocol_error(
+                "terminal log byte length precedes the cursor",
+            ));
+        }
+        if self.terminal_target.is_some_and(|current| current != bytes) {
+            self.eof_confirmed = false;
+            return Err(protocol_error("terminal log byte length changed"));
+        }
+        self.terminal_target = Some(bytes);
+        self.eof_confirmed = false;
+        self.validate()
+    }
+
+    pub fn stream(&self) -> LogStream {
+        self.stream
+    }
+
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    pub fn terminal_target(&self) -> Option<u64> {
+        self.terminal_target
+    }
+
+    pub fn is_drained(&self) -> bool {
+        self.eof_confirmed && self.terminal_target == Some(self.next_offset)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalLogDrain {
+    stdout: LogCursor,
+    stderr: LogCursor,
+    terminal: Option<StatusResponse>,
+    status_revalidated: bool,
+}
+
+impl TerminalLogDrain {
+    pub fn new(stdout: LogCursor, stderr: LogCursor) -> Result<Self, WorkerError> {
+        stdout.validate()?;
+        stderr.validate()?;
+        if stdout.stream() != LogStream::Stdout || stderr.stream() != LogStream::Stderr {
+            return Err(protocol_error(
+                "terminal log drain requires stdout and stderr cursors",
+            ));
+        }
+        Ok(Self {
+            stdout,
+            stderr,
+            terminal: None,
+            status_revalidated: false,
+        })
+    }
+
+    pub fn cursor(&self, stream: LogStream) -> &LogCursor {
+        match stream {
+            LogStream::Stdout => &self.stdout,
+            LogStream::Stderr => &self.stderr,
+        }
+    }
+
+    pub fn observe_chunk(&mut self, chunk: &LogChunk) -> Result<(), WorkerError> {
+        match chunk.stream() {
+            LogStream::Stdout => self.stdout.observe_chunk(chunk)?,
+            LogStream::Stderr => self.stderr.observe_chunk(chunk)?,
+        }
+        self.status_revalidated = false;
+        Ok(())
+    }
+
+    pub fn set_terminal_status(&mut self, response: &StatusResponse) -> Result<(), WorkerError> {
+        response.validate()?;
+        if !response.status().state().is_terminal() {
+            return Err(protocol_error("log drain status is not terminal"));
+        }
+        if self
+            .terminal
+            .as_ref()
+            .is_some_and(|current| current != response)
+        {
+            self.status_revalidated = false;
+            return Err(protocol_error("terminal log status changed"));
+        }
+        let stdout_target = response
+            .status()
+            .final_stdout_bytes()
+            .expect("validated terminal status has stdout bytes");
+        let stderr_target = response
+            .status()
+            .final_stderr_bytes()
+            .expect("validated terminal status has stderr bytes");
+        let mut stdout = self.stdout.clone();
+        let mut stderr = self.stderr.clone();
+        stdout.set_terminal_target(stdout_target)?;
+        stderr.set_terminal_target(stderr_target)?;
+        self.stdout = stdout;
+        self.stderr = stderr;
+        self.terminal = Some(response.clone());
+        self.status_revalidated = false;
+        Ok(())
+    }
+
+    pub fn revalidate_terminal_status(
+        &mut self,
+        response: &StatusResponse,
+    ) -> Result<(), WorkerError> {
+        self.status_revalidated = false;
+        if !self.stdout.is_drained() || !self.stderr.is_drained() {
+            return Err(protocol_error(
+                "terminal logs are not both confirmed at EOF",
+            ));
+        }
+        response.validate()?;
+        let expected = self
+            .terminal
+            .as_ref()
+            .ok_or_else(|| protocol_error("terminal log status is absent"))?;
+        if expected != response {
+            return Err(protocol_error("terminal log status changed"));
+        }
+        self.status_revalidated = true;
+        Ok(())
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.stdout.is_drained() && self.stderr.is_drained() && self.status_revalidated
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogChunkResponse {
     protocol_version: u32,
     chunk: LogChunk,

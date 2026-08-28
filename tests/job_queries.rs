@@ -18,7 +18,8 @@ use mac_worker::{
     host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
     job::{
         CommandSpec, JobId, JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseRecord, ProcessIdentity, RequestFingerprintMaterial, SubmitRequest,
+        LeaseRecord, LogChunk, LogCursor, LogStream, ProcessIdentity, RequestFingerprintMaterial,
+        StatusResponse, SubmitRequest, TerminalLogDrain,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
@@ -646,6 +647,229 @@ fn post_release_success_binds_nonempty_stdout_to_the_recorded_length() {
         .unwrap(),
         b"hello"
     );
+}
+
+#[test]
+fn read_log_returns_bounded_binary_chunks_from_independent_fixed_streams() {
+    // Catches using a caller-controlled pathname, shared seek state between
+    // streams, allocating the raw request limit, or treating arbitrary bytes
+    // as text rather than preserving them through LogChunk base64.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("bounded-log-reads");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launcher = HoldingRecordingLauncher {
+        launches,
+        job_path: store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap(),
+        identity: identity(51_101),
+        guard: Mutex::new(None),
+    };
+    let service = JobService::new(&store, &launcher);
+    service.status(lease.job_id()).unwrap();
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let stdout_bytes = [
+        "hello, 世界\n".as_bytes(),
+        b"\0\xff\x80binary\n".as_slice(),
+        &vec![b'x'; 65_537],
+    ]
+    .concat();
+    let stderr_bytes = b"stderr\0\xfe\n".to_vec();
+    OpenOptions::new()
+        .append(true)
+        .open(job.join("stdout.log"))
+        .unwrap()
+        .write_all(&stdout_bytes)
+        .unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(job.join("stderr.log"))
+        .unwrap()
+        .write_all(&stderr_bytes)
+        .unwrap();
+
+    let empty = service
+        .read_log(lease.job_id(), LogStream::Stdout, 0, 0)
+        .unwrap();
+    assert_eq!(empty.decoded_bytes().unwrap(), b"");
+    assert_eq!(empty.next_offset(), 0);
+
+    for (limit, expected) in [
+        (65_535, 65_535usize),
+        (65_536, 65_536usize),
+        (65_537, 65_536usize),
+    ] {
+        let chunk = service
+            .read_log(lease.job_id(), LogStream::Stdout, 0, limit)
+            .unwrap();
+        assert_eq!(chunk.stream(), LogStream::Stdout);
+        assert_eq!(chunk.offset(), 0);
+        assert_eq!(chunk.next_offset(), expected as u64);
+        assert_eq!(chunk.decoded_bytes().unwrap(), stdout_bytes[..expected]);
+    }
+
+    let stderr = service
+        .read_log(lease.job_id(), LogStream::Stderr, 0, 65_537)
+        .unwrap();
+    assert_eq!(stderr.stream(), LogStream::Stderr);
+    assert_eq!(stderr.decoded_bytes().unwrap(), stderr_bytes);
+    let stdout_tail = service
+        .read_log(lease.job_id(), LogStream::Stdout, 65_536, 65_537)
+        .unwrap();
+    assert_eq!(stdout_tail.decoded_bytes().unwrap(), stdout_bytes[65_536..]);
+
+    let eof = service
+        .read_log(
+            lease.job_id(),
+            LogStream::Stdout,
+            stdout_bytes.len() as u64,
+            65_536,
+        )
+        .unwrap();
+    assert_eq!(eof.decoded_bytes().unwrap(), b"");
+    assert_eq!(eof.next_offset(), stdout_bytes.len() as u64);
+    for offset in [stdout_bytes.len() as u64 + 1, u64::MAX] {
+        let error = service
+            .read_log(lease.job_id(), LogStream::Stdout, offset, 65_536)
+            .unwrap_err();
+        assert_error_code(error, "LOG_OFFSET_BEYOND_EOF", "beyond EOF");
+    }
+
+    assert_eq!(fs::read(job.join("stdout.log")).unwrap(), stdout_bytes);
+    assert_eq!(fs::read(job.join("stderr.log")).unwrap(), stderr_bytes);
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
+    drop(launcher.guard.lock().unwrap().take());
+}
+
+#[test]
+fn terminal_log_drain_requires_both_exact_eofs_and_unchanged_status_revalidation() {
+    // Catches stopping on an empty preterminal read, coupling stdout/stderr
+    // offsets, stopping at the recorded length without the extra EOF probes,
+    // or accepting a changed terminal status during final revalidation.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("terminal-log-drain");
+    let stdout_length = 65_536 + 17;
+    let stderr_length = 65_536 + 9;
+    let command = CommandSpec::shell(format!(
+        "/usr/bin/head -c {stdout_length} /dev/zero; /usr/bin/head -c {stderr_length} /dev/zero >&2"
+    ))
+    .unwrap();
+    let (store, lease, request) = prepared_host_with_command(&root, command);
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let service = JobService::new(&store, &launcher);
+    service.submit_at(request, 10).unwrap();
+    let terminal = service.status(lease.job_id()).unwrap();
+    assert_eq!(terminal.status().final_stdout_bytes(), Some(stdout_length));
+    assert_eq!(terminal.status().final_stderr_bytes(), Some(stderr_length));
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+
+    let stdout = LogCursor::new(LogStream::Stdout, 0, 65_537).unwrap();
+    let stderr = LogCursor::new(LogStream::Stderr, 0, 65_537).unwrap();
+    let mut drain = TerminalLogDrain::new(stdout, stderr).unwrap();
+
+    let preterminal_empty = LogChunk::new(LogStream::Stdout, 0, Vec::new()).unwrap();
+    drain.observe_chunk(&preterminal_empty).unwrap();
+    assert!(!drain.cursor(LogStream::Stdout).is_drained());
+    drain.set_terminal_status(&terminal).unwrap();
+
+    let mut observed_stdout = Vec::new();
+    let mut observed_stderr = Vec::new();
+    for (stream, observed) in [
+        (LogStream::Stdout, &mut observed_stdout),
+        (LogStream::Stderr, &mut observed_stderr),
+    ] {
+        while !drain.cursor(stream).is_drained() {
+            let request = drain.cursor(stream).request(lease.job_id());
+            let chunk = service
+                .read_log(
+                    request.job_id(),
+                    request.stream(),
+                    request.offset(),
+                    request.limit(),
+                )
+                .unwrap();
+            observed.extend_from_slice(&chunk.decoded_bytes().unwrap());
+            drain.observe_chunk(&chunk).unwrap();
+        }
+    }
+    assert_eq!(observed_stdout, vec![0; stdout_length as usize]);
+    assert_eq!(observed_stderr, vec![0; stderr_length as usize]);
+    assert_eq!(drain.cursor(LogStream::Stdout).next_offset(), stdout_length);
+    assert_eq!(drain.cursor(LogStream::Stderr).next_offset(), stderr_length);
+    assert!(!drain.is_complete());
+
+    let changed = StatusResponse::new(
+        terminal.meta().clone(),
+        terminal
+            .status()
+            .clone()
+            .with_cleanup_error(
+                "LATE_CLEANUP_ERROR".into(),
+                terminal.status().updated_at_millis() + 1,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(drain.revalidate_terminal_status(&changed).is_err());
+    assert!(!drain.is_complete());
+    drain.revalidate_terminal_status(&terminal).unwrap();
+    assert!(drain.is_complete());
+}
+
+#[test]
+fn log_cursors_reject_wrong_stream_out_of_order_duplicate_crossing_and_changed_targets() {
+    // Catches a cursor accepting any chunk that happens to contain bytes,
+    // advancing on rejected input, or treating arrival at a terminal target
+    // as EOF without the required empty confirmation.
+    let job_id: JobId = JOB_ID.parse().unwrap();
+    let mut cursor = LogCursor::new(LogStream::Stdout, 4, 65_537).unwrap();
+    assert_eq!(cursor.stream(), LogStream::Stdout);
+    assert_eq!(cursor.next_offset(), 4);
+    assert_eq!(cursor.request(job_id).limit(), 65_537);
+    cursor.set_terminal_target(7).unwrap();
+
+    assert!(
+        cursor
+            .observe_chunk(&LogChunk::new(LogStream::Stderr, 4, b"a".to_vec()).unwrap())
+            .is_err()
+    );
+    assert!(
+        cursor
+            .observe_chunk(&LogChunk::new(LogStream::Stdout, 5, b"a".to_vec()).unwrap())
+            .is_err()
+    );
+    assert!(
+        cursor
+            .observe_chunk(&LogChunk::new(LogStream::Stdout, 4, b"abcd".to_vec()).unwrap())
+            .is_err()
+    );
+    assert_eq!(cursor.next_offset(), 4);
+
+    let accepted = LogChunk::new(LogStream::Stdout, 4, b"abc".to_vec()).unwrap();
+    cursor.observe_chunk(&accepted).unwrap();
+    assert_eq!(cursor.next_offset(), 7);
+    assert!(!cursor.is_drained());
+    assert!(cursor.observe_chunk(&accepted).is_err());
+    assert!(cursor.set_terminal_target(8).is_err());
+    cursor
+        .observe_chunk(&LogChunk::new(LogStream::Stdout, 7, Vec::new()).unwrap())
+        .unwrap();
+    assert!(cursor.is_drained());
+    assert!(
+        LogCursor::new(LogStream::Stderr, 5, 1)
+            .unwrap()
+            .set_terminal_target(4)
+            .is_err()
+    );
+    assert!(LogChunk::new(LogStream::Stdout, u64::MAX, vec![1]).is_err());
 }
 
 #[test]

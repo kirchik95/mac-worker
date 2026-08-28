@@ -1,19 +1,20 @@
 use std::{
     collections::BTreeSet,
     ffi::{CStr, CString},
+    fmt,
     fs::File,
     io::{self, Read, Write},
     mem::MaybeUninit,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
-        unix::ffi::OsStrExt,
+        unix::{ffi::OsStrExt, fs::FileExt},
     },
     path::{Component, Path, PathBuf},
 };
 
 use sha2::{Digest, Sha256};
 
-use crate::inputs::RelativePath;
+use crate::{inputs::RelativePath, job::MAX_LOG_CHUNK_BYTES};
 
 const DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
@@ -419,6 +420,24 @@ struct DirectoryBinding {
     owner: u32,
     mode: u32,
     security_device: Option<u64>,
+}
+
+#[derive(Debug)]
+struct LogOffsetBeyondEof;
+
+impl fmt::Display for LogOffsetBeyondEof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("log offset is beyond EOF")
+    }
+}
+
+impl std::error::Error for LogOffsetBeyondEof {}
+
+pub(crate) fn is_log_offset_beyond_eof(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<LogOffsetBeyondEof>())
+        .is_some()
 }
 
 impl PrivateEntryIdentity {
@@ -858,6 +877,105 @@ impl RootedDir {
 
     pub(crate) fn read_private_regular(&self, name: &str, maximum: u64) -> io::Result<Vec<u8>> {
         self.read_private_regular_with_hook(name, maximum, || {})
+    }
+
+    pub(crate) fn read_private_regular_chunk(
+        &self,
+        name: &str,
+        offset: u64,
+        limit: usize,
+    ) -> io::Result<Vec<u8>> {
+        self.read_private_regular_chunk_with_hooks(name, offset, limit, || {}, || {}, || {})
+    }
+
+    fn read_private_regular_chunk_with_hooks(
+        &self,
+        name: &str,
+        offset: u64,
+        limit: usize,
+        after_path_stat: impl FnOnce(),
+        after_initial_validation: impl FnOnce(),
+        after_read: impl FnOnce(),
+    ) -> io::Result<Vec<u8>> {
+        self.verify_root_name()?;
+        let expected_device = self.security_device.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "log directory is not bound to a host device",
+            )
+        })?;
+        let name = private_leaf_name(name)?;
+        let path_stat = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular_on_device(&path_stat, expected_device)?;
+        after_path_stat();
+
+        let descriptor = open_regular_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(descriptor.as_raw_fd())?;
+        if let Err(error) = require_private_regular_opened_on_device(&opened, expected_device) {
+            if error.raw_os_error() == Some(libc::ESTALE) {
+                let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+                require_private_regular_on_device(&rebound, expected_device)?;
+            }
+            return Err(error);
+        }
+        if !same_file(&path_stat, &opened) || !private_regular_policy_stable(&path_stat, &opened) {
+            let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+            require_private_regular_on_device(&rebound, expected_device)?;
+            return Err(os_error(libc::ESTALE));
+        }
+        if opened.st_size < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "log length is invalid",
+            ));
+        }
+        let initial_length = opened.st_size as u64;
+        if offset > initial_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                LogOffsetBeyondEof,
+            ));
+        }
+        after_initial_validation();
+
+        let requested = limit.min(MAX_LOG_CHUNK_BYTES);
+        let mut bytes = vec![0; requested];
+        let file = File::from(descriptor);
+        let read = file.read_at(&mut bytes, offset)?;
+        bytes.truncate(read);
+        let next_offset = offset
+            .checked_add(u64::try_from(read).expect("usize fits in u64"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "log offset overflow"))?;
+        after_read();
+
+        let after = stat_fd(file.as_raw_fd())?;
+        let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular_on_device(&rebound, expected_device)?;
+        require_private_regular_opened_on_device(&after, expected_device)?;
+        if !private_regular_policy_stable(&opened, &after)
+            || !private_regular_policy_stable(&opened, &rebound)
+            || !same_file(&opened, &after)
+            || !same_file(&opened, &rebound)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        if after.st_size < 0 || rebound.st_size < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "log length is invalid",
+            ));
+        }
+        let after_length = after.st_size as u64;
+        let rebound_length = rebound.st_size as u64;
+        if after_length < initial_length
+            || rebound_length < initial_length
+            || after_length < next_offset
+            || rebound_length < next_offset
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        self.verify_root_name()?;
+        Ok(bytes)
     }
 
     fn read_private_regular_with_hook(
@@ -2598,6 +2716,16 @@ fn stat_fd(descriptor: RawFd) -> io::Result<libc::stat> {
     }
 }
 
+fn private_leaf_name(name: &str) -> io::Result<CString> {
+    if name.is_empty() || name == "." || name == ".." || name.as_bytes().contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private file name is not a single component",
+        ));
+    }
+    CString::new(name).map_err(interior_nul_error)
+}
+
 fn require_private_regular(metadata: &libc::stat) -> io::Result<()> {
     if file_type(metadata.st_mode) != libc::S_IFREG
         || metadata.st_uid != unsafe { libc::geteuid() }
@@ -2612,6 +2740,17 @@ fn require_private_regular(metadata: &libc::stat) -> io::Result<()> {
     Ok(())
 }
 
+fn require_private_regular_on_device(
+    metadata: &libc::stat,
+    expected_device: u64,
+) -> io::Result<()> {
+    require_private_regular(metadata)?;
+    if metadata.st_dev as u64 != expected_device {
+        return Err(os_error(libc::EXDEV));
+    }
+    Ok(())
+}
+
 fn require_private_regular_opened(metadata: &libc::stat) -> io::Result<()> {
     if metadata.st_nlink == 0
         && file_type(metadata.st_mode) == libc::S_IFREG
@@ -2621,6 +2760,25 @@ fn require_private_regular_opened(metadata: &libc::stat) -> io::Result<()> {
         return Err(os_error(libc::ESTALE));
     }
     require_private_regular(metadata)
+}
+
+fn require_private_regular_opened_on_device(
+    metadata: &libc::stat,
+    expected_device: u64,
+) -> io::Result<()> {
+    require_private_regular_opened(metadata)?;
+    if metadata.st_dev as u64 != expected_device {
+        return Err(os_error(libc::EXDEV));
+    }
+    Ok(())
+}
+
+fn private_regular_policy_stable(left: &libc::stat, right: &libc::stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode == right.st_mode
+        && left.st_uid == right.st_uid
+        && left.st_nlink == right.st_nlink
 }
 
 fn require_private_directory(metadata: &libc::stat) -> io::Result<()> {
@@ -4389,7 +4547,7 @@ mod tests {
         os::{
             fd::AsRawFd,
             unix::ffi::OsStrExt,
-            unix::fs::{MetadataExt, PermissionsExt},
+            unix::fs::{MetadataExt, PermissionsExt, symlink},
         },
         path::Path,
     };
@@ -5897,6 +6055,231 @@ mod tests {
             let error = root.read_private_regular(name, 1024).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{name}");
         }
+    }
+
+    #[test]
+    fn log_chunk_read_clamps_limits_preserves_bytes_and_allows_exact_growth() {
+        // Catches allocating or reading the raw request limit, using shared
+        // seek state, rejecting exact EOF, losing binary bytes, or freezing
+        // the readable range at the initial descriptor length.
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("private");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut root = RootedDir::open(&root_path).unwrap();
+        let device = root.root_metadata().unwrap().st_dev as u64;
+        root.bind_host_device(device).unwrap();
+        let bytes = [
+            b"utf8:\xe4\xb8\x96\xe7\x95\x8c\0\xff\x80".as_slice(),
+            &vec![b'x'; 65_537],
+        ]
+        .concat();
+        root.write_private_atomic_no_replace("stdout.log", &bytes)
+            .unwrap();
+
+        assert_eq!(
+            root.read_private_regular_chunk("stdout.log", 0, 0).unwrap(),
+            b""
+        );
+        for (limit, expected) in [
+            (65_535usize, 65_535usize),
+            (65_536usize, 65_536usize),
+            (65_537usize, 65_536usize),
+            (usize::MAX, 65_536usize),
+        ] {
+            assert_eq!(
+                root.read_private_regular_chunk("stdout.log", 0, limit)
+                    .unwrap(),
+                bytes[..expected],
+                "limit {limit}"
+            );
+        }
+        assert_eq!(
+            root.read_private_regular_chunk("stdout.log", bytes.len() as u64, 1)
+                .unwrap(),
+            b""
+        );
+        for offset in [bytes.len() as u64 + 1, u64::MAX] {
+            let error = root
+                .read_private_regular_chunk("stdout.log", offset, usize::MAX)
+                .unwrap_err();
+            assert!(super::is_log_offset_beyond_eof(&error), "{error:?}");
+        }
+
+        root.write_private_atomic_no_replace("stderr.log", b"abc")
+            .unwrap();
+        let grown = root
+            .read_private_regular_chunk_with_hooks(
+                "stderr.log",
+                3,
+                65_537,
+                || {},
+                || {
+                    let mut file = fs::OpenOptions::new()
+                        .append(true)
+                        .open(root_path.join("stderr.log"))
+                        .unwrap();
+                    file.write_all(b"\0\xffgrown").unwrap();
+                    file.sync_all().unwrap();
+                },
+                || {},
+            )
+            .unwrap();
+        assert_eq!(grown, b"\0\xffgrown");
+    }
+
+    #[test]
+    fn log_chunk_read_fails_closed_on_shrink_replacement_or_metadata_drift() {
+        // Catches validating only before pread, accepting a net-shorter file,
+        // or continuing after the trusted name stops naming the opened inode.
+        fn bound_root(root_path: &Path, bytes: &[u8]) -> RootedDir {
+            fs::create_dir(root_path).unwrap();
+            fs::set_permissions(root_path, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut root = RootedDir::open(root_path).unwrap();
+            let device = root.root_metadata().unwrap().st_dev as u64;
+            root.bind_host_device(device).unwrap();
+            root.write_private_atomic_no_replace("stdout.log", bytes)
+                .unwrap();
+            root
+        }
+
+        for boundary in ["before_read", "after_read"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root_path = fixture.path().join(boundary);
+            let root = bound_root(&root_path, b"0123456789");
+            let truncate = || {
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .open(root_path.join("stdout.log"))
+                    .unwrap();
+                file.set_len(2).unwrap();
+                file.sync_all().unwrap();
+            };
+            let error = if boundary == "before_read" {
+                root.read_private_regular_chunk_with_hooks(
+                    "stdout.log",
+                    4,
+                    4,
+                    || {},
+                    truncate,
+                    || {},
+                )
+            } else {
+                root.read_private_regular_chunk_with_hooks(
+                    "stdout.log",
+                    4,
+                    4,
+                    || {},
+                    || {},
+                    truncate,
+                )
+            }
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::ESTALE), "{boundary}");
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("open-race");
+        let root = bound_root(&root_path, b"owned");
+        let error = root
+            .read_private_regular_chunk_with_hooks(
+                "stdout.log",
+                0,
+                5,
+                || {
+                    fs::rename(root_path.join("stdout.log"), root_path.join("detached.log"))
+                        .unwrap();
+                    fs::write(root_path.join("stdout.log"), b"other").unwrap();
+                    fs::set_permissions(
+                        root_path.join("stdout.log"),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                },
+                || {},
+                || {},
+            )
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("final-replacement");
+        let root = bound_root(&root_path, b"owned");
+        let error = root
+            .read_private_regular_chunk_with_hooks(
+                "stdout.log",
+                0,
+                5,
+                || {},
+                || {},
+                || {
+                    fs::rename(root_path.join("stdout.log"), root_path.join("detached.log"))
+                        .unwrap();
+                    fs::write(root_path.join("stdout.log"), b"other").unwrap();
+                    fs::set_permissions(
+                        root_path.join("stdout.log"),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+
+        for drift in ["mode", "hardlink"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root_path = fixture.path().join(drift);
+            let root = bound_root(&root_path, b"owned");
+            let error = root
+                .read_private_regular_chunk_with_hooks(
+                    "stdout.log",
+                    0,
+                    5,
+                    || {},
+                    || {},
+                    || {
+                        if drift == "mode" {
+                            fs::set_permissions(
+                                root_path.join("stdout.log"),
+                                fs::Permissions::from_mode(0o644),
+                            )
+                            .unwrap();
+                        } else {
+                            fs::hard_link(
+                                root_path.join("stdout.log"),
+                                root_path.join("alias.log"),
+                            )
+                            .unwrap();
+                        }
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{drift}"
+            );
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("wrong-device");
+        let mut root = bound_root(&root_path, b"owned");
+        root.security_device = Some(root.root_metadata().unwrap().st_dev as u64 + 1);
+        assert_eq!(
+            root.read_private_regular_chunk("stdout.log", 0, 5)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("wrong-types");
+        let mut root = bound_root(&root_path, b"owned");
+        let device = root.root_metadata().unwrap().st_dev as u64;
+        fs::rename(root_path.join("stdout.log"), root_path.join("target.log")).unwrap();
+        symlink(root_path.join("target.log"), root_path.join("stdout.log")).unwrap();
+        root.security_device = Some(device);
+        assert!(root.read_private_regular_chunk("stdout.log", 0, 5).is_err());
     }
 
     #[test]

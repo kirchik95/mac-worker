@@ -12,12 +12,12 @@ use crate::{
     inputs::RelativePath,
     job::{
         ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseRecord, LeaseToken,
-        ProcessIdentity, RequestFingerprint, RequestFingerprintMaterial, StatusResponse,
-        SubmitRequest, SubmitResponse,
+        LogChunk, LogStream, ProcessIdentity, RequestFingerprint, RequestFingerprintMaterial,
+        StatusResponse, SubmitRequest, SubmitResponse,
     },
     lease::LeaseService,
     remote_snapshot::{RemoteSnapshotService, VerifiedRemoteSnapshot},
-    rooted_fs::RootedDir,
+    rooted_fs::{RootedDir, is_log_offset_beyond_eof},
     supervisor::{ReconciliationRuntime, SystemReconciliationRuntime, reconcile_orphan_processes},
 };
 
@@ -194,6 +194,50 @@ impl<'a> JobService<'a> {
 
     pub fn status(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
         self.status_with_supervisor_ensure(job_id, true)
+    }
+
+    pub fn read_log(
+        &self,
+        job_id: JobId,
+        stream: LogStream,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LogChunk, WorkerError> {
+        let authoritative = self.status(job_id)?;
+        let meta = authoritative.meta();
+        let job = self
+            .store
+            .open_directory(
+                &format!(
+                    "jobs/{}/{}/{}",
+                    meta.project_id(),
+                    meta.worktree_id(),
+                    meta.job_id()
+                ),
+                false,
+            )
+            .map_err(|_| job_state_invalid("authoritative job directory is absent or unsafe"))?;
+        let name = match stream {
+            LogStream::Stdout => "stdout.log",
+            LogStream::Stderr => "stderr.log",
+        };
+        let bytes = job
+            .read_private_regular_chunk(
+                name,
+                offset,
+                usize::try_from(limit).expect("u32 fits in usize on supported hosts"),
+            )
+            .map_err(|error| {
+                if is_log_offset_beyond_eof(&error) {
+                    protocol_code(
+                        "LOG_OFFSET_BEYOND_EOF",
+                        "requested log offset is beyond EOF",
+                    )
+                } else {
+                    WorkerError::Io(error)
+                }
+            })?;
+        LogChunk::new(stream, offset, bytes)
     }
 
     pub fn reconcile_job(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
