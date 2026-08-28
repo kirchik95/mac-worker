@@ -33,6 +33,13 @@ pub struct PreparedProject {
     pub snapshot: Snapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectPreparationStage {
+    StableReload,
+    SnapshotCaptured,
+    SnapshotCleanup,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectPreparationError {
     #[error(transparent)]
@@ -76,11 +83,22 @@ impl ProjectState {
         request: ProjectPreparationRequest,
         probed: &Self,
     ) -> Result<PreparedProject, ProjectPreparationError> {
+        Self::prepare_observed(runner, cache, request, probed, &|_| Ok(()))
+    }
+
+    pub(crate) fn prepare_observed(
+        runner: &dyn ProcessRunner,
+        cache: &Path,
+        request: ProjectPreparationRequest,
+        probed: &Self,
+        observer: &dyn Fn(ProjectPreparationStage) -> Result<(), WorkerError>,
+    ) -> Result<PreparedProject, ProjectPreparationError> {
         let before_capture = Self::load(runner, &request.project, &request.cli_includes)
             .map_err(ProjectPreparationError::worker)?;
         if &before_capture != probed {
             return Err(ProjectPreparationError::worker(state_changed_error()));
         }
+        observer(ProjectPreparationStage::StableReload).map_err(ProjectPreparationError::worker)?;
 
         let selection = InputSelector::new(runner)
             .select(&before_capture.context, &before_capture.settings.snapshot)
@@ -96,11 +114,23 @@ impl ProjectState {
                 error,
                 selection_warnings: selection_warnings.clone(),
             })?;
+        if let Err(error) = observer(ProjectPreparationStage::SnapshotCaptured) {
+            return match cleanup_snapshot_observed(snapshot, observer) {
+                Ok(()) => Err(ProjectPreparationError::Worker {
+                    error,
+                    selection_warnings,
+                }),
+                Err(cleanup_error) => Err(ProjectPreparationError::Worker {
+                    error: cleanup_error,
+                    selection_warnings,
+                }),
+            };
+        }
 
         let after_capture = match Self::load(runner, &request.project, &request.cli_includes) {
             Ok(state) => state,
             Err(error) => {
-                return match snapshot.cleanup() {
+                return match cleanup_snapshot_observed(snapshot, observer) {
                     Ok(()) => Err(ProjectPreparationError::Worker {
                         error,
                         selection_warnings,
@@ -113,7 +143,7 @@ impl ProjectState {
             }
         };
         if after_capture != before_capture {
-            return match snapshot.cleanup() {
+            return match cleanup_snapshot_observed(snapshot, observer) {
                 Ok(()) => Err(ProjectPreparationError::Worker {
                     error: state_changed_error(),
                     selection_warnings,
@@ -135,7 +165,26 @@ impl ProjectState {
 
 impl PreparedProject {
     pub fn cleanup(self) -> Result<(), WorkerError> {
-        self.snapshot.cleanup()
+        self.cleanup_observed(&|_| Ok(()))
+    }
+
+    pub(crate) fn cleanup_observed(
+        self,
+        observer: &dyn Fn(ProjectPreparationStage) -> Result<(), WorkerError>,
+    ) -> Result<(), WorkerError> {
+        cleanup_snapshot_observed(self.snapshot, observer)
+    }
+}
+
+fn cleanup_snapshot_observed(
+    snapshot: Snapshot,
+    observer: &dyn Fn(ProjectPreparationStage) -> Result<(), WorkerError>,
+) -> Result<(), WorkerError> {
+    let cleanup_result = snapshot.cleanup();
+    let observer_result = observer(ProjectPreparationStage::SnapshotCleanup);
+    match cleanup_result {
+        Ok(()) => observer_result,
+        Err(cleanup_error) => Err(cleanup_error),
     }
 }
 

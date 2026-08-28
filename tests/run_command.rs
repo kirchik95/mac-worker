@@ -36,8 +36,9 @@ use mac_worker::{
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     run::{
-        JobFollower, RunCompletion, RunReport, RunRequest, RunService, STATUS_LIST_LIMIT,
-        STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT, StatusReport, StatusRow, StatusService,
+        JobFollower, RunCompletion, RunObserver, RunReport, RunRequest, RunService, RunStage,
+        STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT, StatusReport, StatusRow,
+        StatusService,
     },
     transfer::{HostOperation, RemoteJobClient, ResolutionRuntime},
 };
@@ -2212,6 +2213,10 @@ impl RunScriptRunner {
         self.state.lock().unwrap().events.clone()
     }
 
+    fn remaining_steps(&self) -> Vec<RunScriptStep> {
+        self.state.lock().unwrap().steps.iter().copied().collect()
+    }
+
     fn assert_consumed(&self) {
         assert!(
             self.state.lock().unwrap().steps.is_empty(),
@@ -2863,6 +2868,72 @@ struct ConcurrentTerminalFollower {
     store: ClientStateStore,
 }
 
+struct FinalPersistenceFailureFollower {
+    store: ClientStateStore,
+}
+
+impl JobFollower for FinalPersistenceFailureFollower {
+    fn follow(
+        &self,
+        record: &LocalJobRecord,
+        _json: bool,
+        _stdout: &mut dyn Write,
+        _stderr: &mut dyn Write,
+    ) -> Result<StatusResponse, WorkerError> {
+        self.store
+            .inject_write_failure_once(ClientStateWritePoint::BeforePublish);
+        StatusResponse::new(
+            record.meta().clone(),
+            JobStatus::succeeded(record.meta().created_at_millis() + 2, 0, 0).unwrap(),
+        )
+    }
+}
+
+struct RecordingRunObserver {
+    stages: Mutex<Vec<RunStage>>,
+    fail_at: Option<RunStage>,
+}
+
+impl RecordingRunObserver {
+    fn recording() -> Self {
+        Self {
+            stages: Mutex::new(Vec::new()),
+            fail_at: None,
+        }
+    }
+
+    fn failing_at(stage: RunStage) -> Self {
+        Self {
+            stages: Mutex::new(Vec::new()),
+            fail_at: Some(stage),
+        }
+    }
+
+    fn stages(&self) -> Vec<RunStage> {
+        self.stages.lock().unwrap().clone()
+    }
+
+    fn cleanup_count(&self) -> usize {
+        self.stages()
+            .into_iter()
+            .filter(|stage| *stage == RunStage::SnapshotCleanup)
+            .count()
+    }
+}
+
+impl RunObserver for RecordingRunObserver {
+    fn observe(&self, stage: RunStage) -> Result<(), WorkerError> {
+        self.stages.lock().unwrap().push(stage);
+        if self.fail_at == Some(stage) {
+            Err(WorkerError::Protocol(format!(
+                "INJECTED_RUN_STAGE_FAILURE: {stage:?}"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl JobFollower for ConcurrentTerminalFollower {
     fn follow(
         &self,
@@ -2985,6 +3056,55 @@ fn run_with_script(
     (result, runner, store)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_with_script_and_observer(
+    repo: &GitRepo,
+    temp: &tempfile::TempDir,
+    steps: impl IntoIterator<Item = RunScriptStep>,
+    follower: &dyn JobFollower,
+    runtime: Option<&dyn ResolutionRuntime>,
+    observer: &dyn RunObserver,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> (
+    Result<RunCompletion, WorkerError>,
+    RunScriptRunner,
+    ClientStateStore,
+) {
+    let paths = run_paths(temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(paths.state.clone(), steps);
+    let config = run_config();
+    let service = if let Some(runtime) = runtime {
+        RunService::with_follower_and_resolution_runtime(
+            &runner, &config, &paths, &store, follower, runtime,
+        )
+    } else {
+        RunService::with_follower(&runner, &config, &paths, &store, follower)
+    }
+    .with_observer(observer);
+    let result = service.submit_and_follow(orchestration_request(repo), json, stdout, stderr);
+    (result, runner, store)
+}
+
+fn all_run_stages() -> [RunStage; 12] {
+    [
+        RunStage::InitialProjectInspection,
+        RunStage::ExplicitWorkerProbe,
+        RunStage::StableProjectReload,
+        RunStage::SnapshotSelectionAndCapture,
+        RunStage::LocalRecordPublication,
+        RunStage::LeaseAcquire,
+        RunStage::SnapshotUpload,
+        RunStage::SnapshotVerification,
+        RunStage::JobSubmission,
+        RunStage::AcceptedOutputFlush,
+        RunStage::JobFollower,
+        RunStage::SnapshotCleanup,
+    ]
+}
+
 #[test]
 fn run_performs_the_exact_twelve_stage_order_against_one_worker() {
     // Break caught: any remote effect precedes durable identity, any stage is
@@ -3039,6 +3159,398 @@ fn run_performs_the_exact_twelve_stage_order_against_one_worker() {
     assert!(stderr.is_empty());
     runner.assert_consumed();
     assert_no_run_capture(&run_paths(&temp).cache);
+}
+
+#[test]
+fn run_observer_records_the_exact_twelve_effect_boundaries() {
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let observer = RecordingRunObserver::recording();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let (result, runner, _) = run_with_script_and_observer(
+        &repo,
+        &temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &follower,
+        None,
+        &observer,
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(result.unwrap().exit_code, 0);
+    assert_eq!(observer.stages(), all_run_stages());
+    assert_eq!(observer.cleanup_count(), 1);
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
+    runner.assert_consumed();
+    assert_no_run_capture(&run_paths(&temp).cache);
+}
+
+#[test]
+fn default_run_observer_is_behaviorally_noop() {
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let (result, runner, store) = run_with_script(
+        &repo,
+        &temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &follower,
+        None,
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    let completion = result.unwrap();
+    assert_eq!(completion.exit_code, 0);
+    assert!(
+        store
+            .load_job(completion.report.job_id)
+            .unwrap()
+            .last_status()
+            .unwrap()
+            .state()
+            .is_terminal()
+    );
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
+    runner.assert_consumed();
+    assert_no_run_capture(&run_paths(&temp).cache);
+}
+
+#[test]
+fn poisoned_run_boundary_stops_later_effects_and_cleans_each_owned_snapshot_once() {
+    let stages = all_run_stages();
+    let success_steps = [
+        RunScriptStep::ProbeReady,
+        RunScriptStep::Acquire,
+        RunScriptStep::Upload,
+        RunScriptStep::Verify,
+        RunScriptStep::SubmitAccepted,
+    ];
+
+    for (index, failed_stage) in stages.iter().copied().enumerate() {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let observer = RecordingRunObserver::failing_at(failed_stage);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let (result, runner, store) = run_with_script_and_observer(
+            &repo,
+            &temp,
+            success_steps,
+            &follower,
+            None,
+            &observer,
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, WorkerError::Protocol(message) if message.contains("INJECTED_RUN_STAGE_FAILURE")),
+            "unexpected error for {failed_stage:?}: {error:?}"
+        );
+        let mut expected_trace = stages[..=index].to_vec();
+        if matches!(
+            failed_stage,
+            RunStage::SnapshotSelectionAndCapture
+                | RunStage::LocalRecordPublication
+                | RunStage::LeaseAcquire
+                | RunStage::SnapshotUpload
+                | RunStage::SnapshotVerification
+                | RunStage::JobSubmission
+                | RunStage::AcceptedOutputFlush
+                | RunStage::JobFollower
+        ) {
+            expected_trace.push(RunStage::SnapshotCleanup);
+        }
+        assert_eq!(
+            observer.stages(),
+            expected_trace,
+            "failed at {failed_stage:?}"
+        );
+
+        let expected_remaining = match failed_stage {
+            RunStage::InitialProjectInspection => 5,
+            RunStage::ExplicitWorkerProbe
+            | RunStage::StableProjectReload
+            | RunStage::SnapshotSelectionAndCapture
+            | RunStage::LocalRecordPublication => 4,
+            RunStage::LeaseAcquire => 3,
+            RunStage::SnapshotUpload => 2,
+            RunStage::SnapshotVerification => 1,
+            RunStage::JobSubmission
+            | RunStage::AcceptedOutputFlush
+            | RunStage::JobFollower
+            | RunStage::SnapshotCleanup => 0,
+        };
+        assert_eq!(
+            runner.remaining_steps().len(),
+            expected_remaining,
+            "failed at {failed_stage:?}"
+        );
+        assert_eq!(
+            follower.calls.load(Ordering::SeqCst),
+            usize::from(matches!(
+                failed_stage,
+                RunStage::JobFollower | RunStage::SnapshotCleanup
+            )),
+            "failed at {failed_stage:?}"
+        );
+        assert_eq!(
+            store.list_jobs().unwrap().len(),
+            usize::from(index >= 4),
+            "failed at {failed_stage:?}"
+        );
+        assert_eq!(
+            observer.cleanup_count(),
+            usize::from(index >= 3),
+            "failed at {failed_stage:?}"
+        );
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+}
+
+#[test]
+fn actual_snapshot_cleanup_runs_once_on_representative_prepared_paths() {
+    let success_steps = [
+        RunScriptStep::ProbeReady,
+        RunScriptStep::Acquire,
+        RunScriptStep::Upload,
+        RunScriptStep::Verify,
+        RunScriptStep::SubmitAccepted,
+    ];
+
+    // Success.
+    {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let observer = RecordingRunObserver::recording();
+        let (result, runner, _) = run_with_script_and_observer(
+            &repo,
+            &temp,
+            success_steps,
+            &follower,
+            None,
+            &observer,
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(result.is_ok());
+        assert_eq!(observer.cleanup_count(), 1);
+        runner.assert_consumed();
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+
+    // Remote preacceptance failure resolved as abandoned.
+    {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let observer = RecordingRunObserver::recording();
+        let (result, runner, _) = run_with_script_and_observer(
+            &repo,
+            &temp,
+            [
+                RunScriptStep::ProbeReady,
+                RunScriptStep::TransportFailure(HostOperation::LeaseAcquire),
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveAbandoned,
+            ],
+            &follower,
+            Some(&runtime),
+            &observer,
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(result.is_err());
+        assert_eq!(observer.cleanup_count(), 1);
+        runner.assert_consumed();
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+
+    // Typed recovery persists cleanup-pending uncertainty.
+    {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let observer = RecordingRunObserver::recording();
+        let (result, runner, store) = run_with_script_and_observer(
+            &repo,
+            &temp,
+            [
+                RunScriptStep::ProbeReady,
+                RunScriptStep::Acquire,
+                RunScriptStep::Upload,
+                RunScriptStep::Verify,
+                RunScriptStep::TransportFailure(HostOperation::Submit),
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveCleanupPending,
+            ],
+            &follower,
+            Some(&runtime),
+            &observer,
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(result.is_err());
+        assert!(matches!(
+            store.list_jobs().unwrap()[0].remote_uncertainty(),
+            RemoteUncertainty::CleanupPending { .. }
+        ));
+        assert_eq!(observer.cleanup_count(), 1);
+        runner.assert_consumed();
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+
+    // Structurally valid but mismatched remote identity.
+    {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let runtime = ImmediateResolution::new();
+        let observer = RecordingRunObserver::recording();
+        let (result, runner, _) = run_with_script_and_observer(
+            &repo,
+            &temp,
+            [
+                RunScriptStep::ProbeReady,
+                RunScriptStep::AcquireMismatch(LeaseMismatch::ProjectId),
+                RunScriptStep::StatusTransportFailure,
+                RunScriptStep::ResolveAbandoned,
+            ],
+            &follower,
+            Some(&runtime),
+            &observer,
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(result.is_err());
+        assert_eq!(observer.cleanup_count(), 1);
+        runner.assert_consumed();
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+
+    // Accepted output failure.
+    {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let follower = RecordingFollower::succeeding(0);
+        let observer = RecordingRunObserver::recording();
+        let output = Arc::new(Mutex::new(OutputState::default()));
+        let mut stdout = RecordingWriter::failing(output);
+        let (result, runner, _) = run_with_script_and_observer(
+            &repo,
+            &temp,
+            success_steps,
+            &follower,
+            None,
+            &observer,
+            false,
+            &mut stdout,
+            &mut Vec::new(),
+        );
+        assert!(matches!(result.unwrap_err(), WorkerError::Io(_)));
+        assert_eq!(observer.cleanup_count(), 1);
+        runner.assert_consumed();
+        assert_no_run_capture(&run_paths(&temp).cache);
+    }
+
+    // Final terminal persistence failure.
+    {
+        let repo = run_repo(b"version = 1\n");
+        let temp = tempfile::tempdir().unwrap();
+        let paths = run_paths(&temp);
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let runner = RunScriptRunner::new(paths.state.clone(), success_steps);
+        let config = run_config();
+        let follower = FinalPersistenceFailureFollower {
+            store: store.clone(),
+        };
+        let observer = RecordingRunObserver::recording();
+        let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+            .with_observer(&observer);
+
+        let result = service.submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+
+        assert!(matches!(result.unwrap_err(), WorkerError::Io(_)));
+        assert_eq!(observer.cleanup_count(), 1);
+        runner.assert_consumed();
+        assert_no_run_capture(&paths.cache);
+    }
+}
+
+#[test]
+fn real_cleanup_failure_precedes_cleanup_observer_failure_without_double_cleanup() {
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let follower = RecordingFollower::failing_with_cleanup_sabotage(paths.cache.clone());
+    let observer = RecordingRunObserver::failing_at(RunStage::SnapshotCleanup);
+    let (result, runner, _) = run_with_script_and_observer(
+        &repo,
+        &temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &follower,
+        None,
+        &observer,
+        false,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+
+    assert!(matches!(result.unwrap_err(), WorkerError::Io(_)));
+    assert_eq!(observer.cleanup_count(), 1);
+    assert_eq!(
+        observer
+            .stages()
+            .iter()
+            .filter(|stage| **stage == RunStage::SnapshotCleanup)
+            .count(),
+        1
+    );
+    runner.assert_consumed();
 }
 
 #[test]

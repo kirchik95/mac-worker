@@ -24,7 +24,8 @@ use crate::{
     process::{ProcessPolicy, ProcessRunner},
     project_config::ResourceClass,
     project_state::{
-        PreparedProject, ProjectPreparationError, ProjectPreparationRequest, ProjectState,
+        PreparedProject, ProjectPreparationError, ProjectPreparationRequest,
+        ProjectPreparationStage, ProjectState,
     },
     protocol::PROTOCOL_VERSION,
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
@@ -147,6 +148,38 @@ pub trait JobFollower {
     ) -> Result<StatusResponse, WorkerError>;
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStage {
+    InitialProjectInspection,
+    ExplicitWorkerProbe,
+    StableProjectReload,
+    SnapshotSelectionAndCapture,
+    LocalRecordPublication,
+    LeaseAcquire,
+    SnapshotUpload,
+    SnapshotVerification,
+    JobSubmission,
+    AcceptedOutputFlush,
+    JobFollower,
+    SnapshotCleanup,
+}
+
+#[doc(hidden)]
+pub trait RunObserver {
+    fn observe(&self, stage: RunStage) -> Result<(), WorkerError>;
+}
+
+struct NoopRunObserver;
+
+impl RunObserver for NoopRunObserver {
+    fn observe(&self, _stage: RunStage) -> Result<(), WorkerError> {
+        Ok(())
+    }
+}
+
+static NOOP_RUN_OBSERVER: NoopRunObserver = NoopRunObserver;
+
 pub struct RunService<'a> {
     pub runner: &'a dyn ProcessRunner,
     pub config: &'a Config,
@@ -154,6 +187,7 @@ pub struct RunService<'a> {
     pub client_state: &'a ClientStateStore,
     follower: &'a dyn JobFollower,
     resolution_runtime: Option<&'a dyn ResolutionRuntime>,
+    observer: &'a dyn RunObserver,
 }
 
 impl<'a> RunService<'a> {
@@ -172,6 +206,7 @@ impl<'a> RunService<'a> {
             client_state,
             follower,
             resolution_runtime: None,
+            observer: &NOOP_RUN_OBSERVER,
         }
     }
 
@@ -191,7 +226,14 @@ impl<'a> RunService<'a> {
             client_state,
             follower,
             resolution_runtime: Some(resolution_runtime),
+            observer: &NOOP_RUN_OBSERVER,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_observer(mut self, observer: &'a dyn RunObserver) -> Self {
+        self.observer = observer;
+        self
     }
 
     pub fn submit_and_follow(
@@ -202,6 +244,7 @@ impl<'a> RunService<'a> {
         stderr: &mut dyn Write,
     ) -> Result<RunCompletion, WorkerError> {
         let initial = ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
+        self.observer.observe(RunStage::InitialProjectInspection)?;
         if !initial.settings.artifacts.include.is_empty()
             || initial.settings.artifacts.max_total_bytes.is_some()
         {
@@ -219,8 +262,9 @@ impl<'a> RunService<'a> {
             })?
             .clone();
         self.require_eligible_worker(&worker, &initial.requirements)?;
+        self.observer.observe(RunStage::ExplicitWorkerProbe)?;
 
-        let prepared = ProjectState::prepare(
+        let prepared = ProjectState::prepare_observed(
             self.runner,
             &self.paths.cache,
             ProjectPreparationRequest {
@@ -228,11 +272,23 @@ impl<'a> RunService<'a> {
                 cli_includes: request.cli_includes.clone(),
             },
             &initial,
+            &|stage| {
+                self.observer.observe(match stage {
+                    ProjectPreparationStage::StableReload => RunStage::StableProjectReload,
+                    ProjectPreparationStage::SnapshotCaptured => {
+                        RunStage::SnapshotSelectionAndCapture
+                    }
+                    ProjectPreparationStage::SnapshotCleanup => RunStage::SnapshotCleanup,
+                })
+            },
         )
         .map_err(project_preparation_error)?;
 
         let primary = self.submit_prepared(request, worker, &prepared, json, stdout, stderr);
-        match prepared.cleanup() {
+        match prepared.cleanup_observed(&|stage| {
+            debug_assert_eq!(stage, ProjectPreparationStage::SnapshotCleanup);
+            self.observer.observe(RunStage::SnapshotCleanup)
+        }) {
             Ok(()) => primary,
             Err(cleanup_error) => Err(cleanup_error),
         }
@@ -316,6 +372,7 @@ impl<'a> RunService<'a> {
             RemoteUncertainty::None,
         )?;
         self.client_state.create_job(record.clone())?;
+        self.observer.observe(RunStage::LocalRecordPublication)?;
 
         let transport = SshJsonTransport::new(self.runner);
         let remote = match self.resolution_runtime {
@@ -343,6 +400,7 @@ impl<'a> RunService<'a> {
                 if let Err(error) = require_exact_lease(&material, &lease) {
                     self.resolve_after_error(&remote, &worker, &record, error)?
                 } else {
+                    self.observer.observe(RunStage::LeaseAcquire)?;
                     let identity = TransferIdentity::from_acquire_request(&acquire)?;
                     if let Err(error) = RsyncTransport::new(self.runner).upload(
                         &worker,
@@ -351,6 +409,7 @@ impl<'a> RunService<'a> {
                     ) {
                         self.resolve_after_error(&remote, &worker, &record, error)?
                     } else {
+                        self.observer.observe(RunStage::SnapshotUpload)?;
                         let verify = SnapshotVerifyRequest::new(
                             material.job_id(),
                             material.client_id(),
@@ -376,6 +435,7 @@ impl<'a> RunService<'a> {
                                 {
                                     self.resolve_after_error(&remote, &worker, &record, error)?
                                 } else {
+                                    self.observer.observe(RunStage::SnapshotVerification)?;
                                     let submit = SubmitRequest::new(material.clone());
                                     let raw: Result<SubmitResponse, WorkerError> = transport
                                         .request(
@@ -386,6 +446,7 @@ impl<'a> RunService<'a> {
                                         );
                                     match raw {
                                         Ok(response) => {
+                                            self.observer.observe(RunStage::JobSubmission)?;
                                             match remote.resolve_submission(
                                                 &worker,
                                                 &submit,
@@ -430,10 +491,12 @@ impl<'a> RunService<'a> {
         };
         let accepted_record = persist_authoritative(self.client_state, &record, accepted_status)?;
         write_accepted(&accepted_record, json, stdout)?;
+        self.observer.observe(RunStage::AcceptedOutputFlush)?;
 
         let terminal = self
             .follower
             .follow(&accepted_record, json, stdout, stderr)?;
+        self.observer.observe(RunStage::JobFollower)?;
         let terminal_status = normalize_authoritative_status(&accepted_record, terminal)
             .map_err(|_| inconsistent_terminal_outcome())?;
         if !terminal_status.state().is_terminal() {
