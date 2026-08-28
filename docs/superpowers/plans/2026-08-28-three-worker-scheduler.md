@@ -59,6 +59,7 @@ README.md                       Phase 4 usage and explicit remaining boundary
 
 **Files:**
 - Create: `src/scheduler.rs`
+- Modify: `src/lib.rs`
 - Create: `tests/scheduler_policy.rs`
 
 **Interfaces:**
@@ -101,7 +102,7 @@ Expected: FAIL because scheduler-owned observation and policy types do not exist
 
 - [ ] **Step 3: Implement the pure policy**
 
-Create `src/scheduler.rs`; it must not import `protocol`, `probe`, `transport`, `Config`, or `WorkerEntry`:
+Create `src/scheduler.rs`; it must not import `protocol`, `probe`, `transport`, `Config`, or `WorkerEntry`. Add exactly `pub mod scheduler;` to `src/lib.rs`; this is Task 1's only start-now shared-file edit and is an isolated one-line rebase conflict with later module-export work:
 
 ```rust
 pub enum CandidateSlot { Idle, Busy }
@@ -133,7 +134,7 @@ Expected: PASS; this deliverable compiles/runs without any Phase 3, host-probe, 
 - [ ] **Step 5: Commit the independent policy**
 
 ```bash
-git add src/scheduler.rs tests/scheduler_policy.rs
+git add src/lib.rs src/scheduler.rs tests/scheduler_policy.rs
 git commit -m "feat: rank compatible scheduler candidates"
 ```
 
@@ -175,7 +176,7 @@ fn protocol_v2_probe_is_ineligible_after_the_single_v3_bump() {
 }
 ```
 
-Test canonical protocol-v3 fixtures in workers/Doctor/setup/job-protocol suites; valid/missing memory; valid CPU tick counters; counter overflow; malformed `vm_stat` and `host_processor_info`; inventory/health name or SSH mismatch; and the absence of a probe. Assert that both new fact groups are added by one version change, never two.
+Test canonical protocol-v3 fixtures in workers/Doctor/setup/job-protocol suites; valid/missing memory; valid CPU tick counters; counter overflow; malformed `vm_stat` and `host_statistics64(HOST_CPU_LOAD_INFO)` results; inventory/health name or SSH mismatch; and the absence of a probe. Assert that both new fact groups are added by one version change, never two.
 
 - [ ] **Step 2: Run adapter tests to verify RED**
 
@@ -196,7 +197,7 @@ pub struct ProbeResponse {
 }
 ```
 
-Use `#[serde(default)]` only for field decoding; protocol-2 helpers remain ineligible because the version field is now `3`. In `probe.rs`, compute available memory from bounded `vm_stat` `(Pages free + Pages speculative) * page_size`; collect cumulative CPU ticks with a bounded macOS `host_processor_info` call; return `None` for unavailable/invalid facts and never fabricate a zero. Update every literal probe/setup/Doctor fixture to protocol 3.
+Use `#[serde(default)]` only for field decoding; protocol-2 helpers remain ineligible because the version field is now `3`. In `probe.rs`, compute available memory from bounded `vm_stat` `(Pages free + Pages speculative) * page_size`; collect cumulative user/system/idle/nice CPU ticks with bounded macOS `host_statistics64(HOST_CPU_LOAD_INFO)`; return `None` for unavailable/invalid facts, never fabricate a zero, and never sleep to obtain a sample. Update every literal probe/setup/Doctor fixture to protocol 3.
 
 The later Phase 4.5 dashboard consumes `CpuCounters` through this adapter and computes deltas locally; it must not modify `ProbeResponse`, `PROTOCOL_VERSION`, or host probe collection. This task is the only planned version bump for both scheduler memory and dashboard CPU facts.
 
