@@ -2159,6 +2159,29 @@ impl HostStore {
         transfer.validate()
     }
 
+    pub(crate) fn validate_resolution_cleanup_marker_after(
+        &self,
+        admission: &AdmissionGuard,
+        transfer: &TransferGuard,
+        identity: &ResolutionIdentity,
+    ) -> Result<(), WorkerError> {
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()?;
+        let proof_dir = self.open_directory(&format!("locks/jobs/{}", identity.job_id()), false)?;
+        if proof_dir.entry_exists("cleanup-complete.json")? {
+            let marker: CleanupMarker = read_json_strict_at(&proof_dir, "cleanup-complete.json")
+                .map_err(|_| {
+                    protocol_code(
+                        "JOB_ID_CONFLICT",
+                        "cleanup marker is malformed or noncanonical",
+                    )
+                })?;
+            require_resolution_marker(&marker, identity)?;
+        }
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()
+    }
+
     pub(crate) fn resolution_cleanup_receipt(
         &self,
         identity: &ResolutionIdentity,

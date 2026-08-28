@@ -27,12 +27,14 @@ use mac_worker::{
     cli::Cli,
     config::WorkerEntry,
     error::{ProcessError, ProcessStream, WorkerError},
-    host_store::{HostStore, HostStoreWritePoint},
+    host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
     inputs::RelativePath,
     job::{
         ClientId, CommandSpec, JobId, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseToken, RequestFingerprint, RequestFingerprintMaterial,
+        LeaseRecord, LeaseToken, RequestFingerprint, RequestFingerprintMaterial,
+        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, SubmitRequest,
     },
+    job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
@@ -51,6 +53,18 @@ use sha2::Digest;
 use support::GitRepo;
 
 static HOST_FD_STRESS_LOCK: Mutex<()> = Mutex::new(());
+
+struct NeverLaunchResolution;
+
+impl SupervisorLauncher for NeverLaunchResolution {
+    fn launch(
+        &self,
+        _job_id: JobId,
+        _guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, WorkerError> {
+        panic!("invalid accepted authority must never launch")
+    }
+}
 
 #[derive(serde::Serialize)]
 struct LiteralRequest<'a> {
@@ -977,27 +991,39 @@ fn receiver_first_blocks_abandon_then_tombstone_fences_every_delayed_receiver() 
     let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
     let (resolved_tx, resolved_rx) = mpsc::channel();
+    let (classified_tx, classified_rx) = mpsc::channel();
     let resolver_store = HostStore::open(&root).unwrap();
-    let resolver_request = request.clone();
+    let resolver_request = ResolveOrAbandonRequest::from_submit_request(&SubmitRequest::new(
+        request.material().clone(),
+    ))
+    .unwrap();
     let resolver = std::thread::spawn(move || {
+        let service = JobService::new_with_resolution_before_transfer(
+            &resolver_store,
+            &NeverLaunchResolution,
+            Arc::new(move || classified_tx.send(()).unwrap()),
+        );
         resolved_tx
-            .send(HostTransferService::new(&resolver_store).abandon(&resolver_request, 2))
+            .send(service.resolve_or_abandon(resolver_request))
             .unwrap();
     });
-    assert!(
-        resolved_rx
-            .recv_timeout(Duration::from_millis(100))
-            .is_err()
-    );
+    classified_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("resolver did not reach the held transfer lock");
+    assert!(matches!(
+        resolved_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
     release.send(()).unwrap();
     receiver.join().unwrap().unwrap();
-    assert_eq!(
-        resolved_rx
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap(),
-        AbandonTransferResult::Abandoned
-    );
+    let resolved = resolved_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        resolved.outcome(),
+        ResolveOrAbandonOutcome::Abandoned
+    ));
     resolver.join().unwrap();
 
     let sink = store
@@ -1014,6 +1040,94 @@ fn receiver_first_blocks_abandon_then_tombstone_fences_every_delayed_receiver() 
     assert!(error.to_string().contains("JOB_ABANDONED"));
     assert_eq!(delayed.0.load(Ordering::SeqCst), 0);
     assert!(!sink.exists());
+}
+
+#[test]
+fn post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_transfer() {
+    // Break caught: resolution trusts its pre-transfer lease observation and
+    // tombstones/cleans after the receiver releases even though live authority
+    // changed while it was blocked on the shared transfer lock.
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, request, identity) = leased_store(&root, 35);
+    let (receiver_entered_tx, receiver_entered_rx) = mpsc::channel();
+    let executor = Arc::new(GateExecutor {
+        entered: receiver_entered_tx,
+        calls: AtomicUsize::new(0),
+    });
+    let receiver_store = store.clone();
+    let receiver_identity = identity.clone();
+    let receiver_executor = Arc::clone(&executor);
+    let receiver = std::thread::spawn(move || {
+        HostTransferService::new(&receiver_store).receive(
+            &receiver_identity,
+            &stock_server_args(),
+            receiver_executor.as_ref(),
+        )
+    });
+    let release_receiver = receiver_entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+
+    let submit = SubmitRequest::new(request.material().clone());
+    let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let (classified_tx, classified_rx) = mpsc::channel();
+    let resolver_store = HostStore::open(&root).unwrap();
+    let (resolved_tx, resolved_rx) = mpsc::channel();
+    let resolver = std::thread::spawn(move || {
+        let service = JobService::new_with_resolution_before_transfer(
+            &resolver_store,
+            &NeverLaunchResolution,
+            Arc::new(move || classified_tx.send(()).unwrap()),
+        );
+        resolved_tx
+            .send(service.resolve_or_abandon(resolve))
+            .unwrap();
+    });
+    classified_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("resolver did not complete initial authority classification");
+    assert!(matches!(
+        resolved_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    let changed_material = RequestFingerprintMaterial::new(
+        request.material().job_id(),
+        ClientId::new(uuid::Uuid::from_u128(35_901)),
+        LeaseToken::new(uuid::Uuid::from_u128(35_902)),
+        request.material().worker_name().into(),
+        request.material().project_id().into(),
+        request.material().worktree_id().into(),
+        request.material().manifest_digest().into(),
+        request.material().relative_working_dir().into(),
+        request.material().timeout_millis(),
+        request.material().resource_class().into(),
+        request.material().command().clone(),
+    )
+    .unwrap();
+    let changed =
+        LeaseRecord::new(&changed_material, changed_material.fingerprint(), 2, 60_002).unwrap();
+    let changed_bytes = serde_json::to_vec(&changed).unwrap();
+    let live_path = root.join("leases/heavy/lease.json");
+    fs::write(&live_path, &changed_bytes).unwrap();
+    release_receiver.send(()).unwrap();
+    receiver.join().unwrap().unwrap();
+
+    let error = resolved_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap_err();
+    resolver.join().unwrap();
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
+    assert!(
+        !store
+            .job_index(request.material().job_id())
+            .unwrap()
+            .exists()
+    );
+    assert_eq!(fs::read(live_path).unwrap(), changed_bytes);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1044,7 +1158,9 @@ fn tombstone_first_refuses_before_opening_or_recreating_the_sink() {
 }
 
 #[test]
-fn exact_accepted_disposition_fences_receiver_and_abandon_as_accepted() {
+fn index_only_accepted_fences_receiver_but_both_resolution_entries_fail_closed() {
+    // Break caught: the legacy transfer entry returns JOB_ACCEPTED from the
+    // index alone while the canonical resolver rejects the missing final job.
     let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
     let fixture = tempfile::tempdir().unwrap();
     let (store, request, identity) = leased_store(&fixture.path().join("host"), 41);
@@ -1058,11 +1174,16 @@ fn exact_accepted_disposition_fences_receiver_and_abandon_as_accepted() {
             &CountingExecutor::default(),
         )
         .unwrap_err();
+    let submit = SubmitRequest::new(request.material().clone());
+    let direct_error = JobService::new(&store, &NeverLaunchResolution)
+        .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&submit).unwrap())
+        .unwrap_err();
     let abandon_error = HostTransferService::new(&store)
         .abandon(&request, 3)
         .unwrap_err();
     assert!(receiver_error.to_string().contains("JOB_ACCEPTED"));
-    assert!(abandon_error.to_string().contains("JOB_ACCEPTED"));
+    assert!(direct_error.to_string().contains("JOB_ID_CONFLICT"));
+    assert_eq!(abandon_error.to_string(), direct_error.to_string());
 }
 
 #[test]

@@ -1733,10 +1733,27 @@ mod tests {
 
     use super::*;
     use crate::{
-        job::{CommandSpec, LeaseAcquireRequest, LeaseAcquireResponse, RequestFingerprintMaterial},
+        host_store::SupervisorGuard,
+        job::{
+            CommandSpec, LeaseAcquireRequest, LeaseAcquireResponse, RequestFingerprintMaterial,
+            ResolveOrAbandonOutcome, ResolveOrAbandonRequest, SubmitRequest,
+        },
+        job_service::{JobService, LaunchCandidate, SupervisorLauncher},
         lease::{AdmissionFacts, LeaseService},
         protocol::MemoryPressure,
     };
+
+    struct NeverLaunchResolution;
+
+    impl SupervisorLauncher for NeverLaunchResolution {
+        fn launch(
+            &self,
+            _job_id: JobId,
+            _guard: SupervisorGuard,
+        ) -> Result<LaunchCandidate, WorkerError> {
+            panic!("verifier-first abandonment must never launch")
+        }
+    }
 
     const PROJECT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const WORKTREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1996,10 +2013,16 @@ mod tests {
         let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
         let (resolved_tx, resolved_rx) = mpsc::channel();
-        let resolver_request = request.clone();
+        let resolver_request = ResolveOrAbandonRequest::from_submit_request(&SubmitRequest::new(
+            request.material().clone(),
+        ))
+        .unwrap();
         let resolver = thread::spawn(move || {
             resolved_tx
-                .send(resolver_store.record_abandoned(&resolver_request, 2))
+                .send(
+                    JobService::new(&resolver_store, &NeverLaunchResolution)
+                        .resolve_or_abandon(resolver_request),
+                )
                 .unwrap();
         });
         assert!(
@@ -2019,10 +2042,21 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
-        resolved_rx
+        let resolved = resolved_rx
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
+        assert!(matches!(
+            resolved.outcome(),
+            ResolveOrAbandonOutcome::Abandoned
+        ));
+        assert!(
+            !HostStore::open(&host_root)
+                .unwrap()
+                .verified_receipt(lease.job_id())
+                .unwrap()
+                .exists()
+        );
         verifier.join().unwrap();
         resolver.join().unwrap();
     }

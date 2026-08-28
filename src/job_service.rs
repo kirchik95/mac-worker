@@ -219,6 +219,7 @@ pub struct JobService<'a> {
     launcher: &'a dyn SupervisorLauncher,
     reconciliation: Arc<dyn ReconciliationRuntime>,
     log_read_boundary: Option<Arc<dyn Fn() + Send + Sync>>,
+    resolution_before_transfer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<'a> JobService<'a> {
@@ -230,6 +231,7 @@ impl<'a> JobService<'a> {
             launcher,
             reconciliation: Arc::new(SystemReconciliationRuntime::new()),
             log_read_boundary: None,
+            resolution_before_transfer: None,
         }
     }
 
@@ -246,6 +248,7 @@ impl<'a> JobService<'a> {
             launcher,
             reconciliation,
             log_read_boundary: None,
+            resolution_before_transfer: None,
         }
     }
 
@@ -262,6 +265,24 @@ impl<'a> JobService<'a> {
             launcher,
             reconciliation: Arc::new(SystemReconciliationRuntime::new()),
             log_read_boundary: Some(log_read_boundary),
+            resolution_before_transfer: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_resolution_before_transfer(
+        store: &'a HostStore,
+        launcher: &'a dyn SupervisorLauncher,
+        resolution_before_transfer: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            store,
+            leases: LeaseService::new(store),
+            snapshots: RemoteSnapshotService::new(store),
+            launcher,
+            reconciliation: Arc::new(SystemReconciliationRuntime::new()),
+            log_read_boundary: None,
+            resolution_before_transfer: Some(resolution_before_transfer),
         }
     }
 
@@ -384,6 +405,9 @@ impl<'a> JobService<'a> {
             return ResolveOrAbandonResponse::accepted(authoritative.into_response());
         }
 
+        if let Some(boundary) = &self.resolution_before_transfer {
+            boundary();
+        }
         let transfer = self
             .store
             .transfer_lock_after(&admission, identity.job_id())?;
@@ -443,6 +467,8 @@ impl<'a> JobService<'a> {
             None => None,
         };
 
+        self.store
+            .validate_resolution_cleanup_marker_after(&admission, &transfer, &identity)?;
         self.snapshots
             .validate_resolution_evidence_after(&admission, &transfer, &identity)?;
         if disposition.is_none()

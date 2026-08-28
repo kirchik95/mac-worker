@@ -321,28 +321,6 @@ impl<'a> HostTransferService<'a> {
         now: u64,
     ) -> Result<AbandonTransferResult, WorkerError> {
         request.validate()?;
-        if let Some(disposition) = self.store.disposition(request.material().job_id())? {
-            match disposition {
-                JobDisposition::Accepted {
-                    client_id,
-                    project_id,
-                    worktree_id,
-                    request_fingerprint,
-                    ..
-                } if client_id == request.material().client_id()
-                    && project_id == request.material().project_id()
-                    && worktree_id == request.material().worktree_id()
-                    && request_fingerprint == *request.request_fingerprint() =>
-                {
-                    return Err(host_transfer_error(
-                        "JOB_ACCEPTED",
-                        "job ID was already accepted",
-                    ));
-                }
-                JobDisposition::Accepted { .. } => return Err(job_id_conflict()),
-                JobDisposition::Abandoned { .. } => {}
-            }
-        }
         let submit = SubmitRequest::new(request.material().clone());
         let resolve = ResolveOrAbandonRequest::from_submit_request(&submit)?;
         let response = JobService::new(self.store, &TransferResolutionLauncher)

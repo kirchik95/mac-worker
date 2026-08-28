@@ -30,6 +30,7 @@ use mac_worker::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
         ReconciliationRuntime, Supervisor, SystemProcessInspector,
     },
+    transfer::HostTransferService,
 };
 use sha2::{Digest, Sha256};
 
@@ -393,14 +394,80 @@ fn resolve_without_a_live_lease_fences_delayed_acquire_and_executes_nothing() {
     // Break caught: resolution treats status/lease absence as an ordinary miss
     // instead of durably fencing the same immutable request before returning.
     let temp = tempfile::tempdir().unwrap();
-    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
     let acquire = lease_request();
     let submit = SubmitRequest::new(acquire.material().clone());
     let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
-
-    let response = JobService::new(&store, &RejectLauncher)
+    let synthetic = LeaseRecord::new(
+        acquire.material(),
+        acquire.request_fingerprint().clone(),
+        1,
+        30_001,
+    )
+    .unwrap();
+    let (classified_tx, classified_rx) = mpsc::channel();
+    let (continue_tx, continue_rx) = mpsc::channel();
+    let continue_rx = Arc::new(Mutex::new(continue_rx));
+    let resolver_store = store.clone();
+    let resolver_continue = Arc::clone(&continue_rx);
+    let resolver = thread::spawn(move || {
+        JobService::new_with_resolution_before_transfer(
+            &resolver_store,
+            &RejectLauncher,
+            Arc::new(move || {
+                classified_tx.send(()).unwrap();
+                resolver_continue.lock().unwrap().recv().unwrap();
+            }),
+        )
         .resolve_or_abandon(request)
-        .unwrap();
+    });
+    classified_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("resolver did not reach its pre-transfer decision boundary");
+    let (attempting_tx, attempting_rx) = mpsc::channel();
+    let acquire_store = store.clone();
+    let delayed_request = acquire.clone();
+    let acquire_attempting = attempting_tx.clone();
+    let delayed = thread::spawn(move || {
+        acquire_attempting.send("acquire").unwrap();
+        LeaseService::new(&acquire_store).acquire(&delayed_request, &healthy(), 2)
+    });
+    let verify_store = store.clone();
+    let verify_attempting = attempting_tx.clone();
+    let delayed_verify = thread::spawn(move || {
+        verify_attempting.send("verify").unwrap();
+        RemoteSnapshotService::new(&verify_store).verify_and_promote_at(
+            &synthetic,
+            synthetic.manifest_digest(),
+            3,
+        )
+    });
+    let submit_store = store.clone();
+    let submit_attempting = attempting_tx.clone();
+    let submit_request = submit.clone();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let delayed_launches = Arc::clone(&launches);
+    let delayed_submit = thread::spawn(move || {
+        submit_attempting.send("submit").unwrap();
+        JobService::new(
+            &submit_store,
+            &CountingRejectLauncher {
+                launches: delayed_launches,
+            },
+        )
+        .submit_at(submit_request, 4)
+    });
+    drop(attempting_tx);
+    let attempted = (0..3)
+        .map(|_| attempting_rx.recv().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        attempted,
+        ["acquire", "submit", "verify"].into_iter().collect()
+    );
+    continue_tx.send(()).unwrap();
+    let response = resolver.join().unwrap().unwrap();
 
     assert!(
         matches!(response.outcome(), ResolveOrAbandonOutcome::Abandoned),
@@ -412,10 +479,17 @@ fn resolve_without_a_live_lease_fences_delayed_acquire_and_executes_nothing() {
             .unwrap()
             .is_file()
     );
-    let delayed = LeaseService::new(&store)
-        .acquire(&acquire, &healthy(), 2)
-        .unwrap_err();
+    let delayed = delayed.join().unwrap().unwrap_err();
     assert!(delayed.to_string().contains("JOB_ABANDONED"), "{delayed}");
+    let verify_error = delayed_verify.join().unwrap().unwrap_err();
+    assert!(
+        verify_error.to_string().contains("JOB_ABANDONED")
+            || verify_error.to_string().contains("live lease"),
+        "{verify_error}"
+    );
+    let submit_error = delayed_submit.join().unwrap().unwrap_err();
+    assert!(submit_error.to_string().contains("LEASE_MISSING"));
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
     assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 }
 
@@ -535,6 +609,64 @@ fn complete_preindex_accepted_job_wins_resolution_and_repairs_the_index() {
 }
 
 #[test]
+fn submit_and_supervisor_launch_first_make_resolution_accept_without_second_launch() {
+    // Break caught: resolution ignores an accepted submit whose elected
+    // supervisor is still launching, deletes its final job, or elects a second
+    // launcher instead of returning the authoritative Accepted outcome.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, submit) = prepared_host(&root);
+    let job_path = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let launcher = Arc::new(BlockingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: job_path.clone(),
+        identity: identity(49_101),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let submit_store = store.clone();
+    let submit_request = submit.clone();
+    let submit_launcher = Arc::clone(&launcher);
+    let submit_thread = thread::spawn(move || {
+        JobService::new(&submit_store, submit_launcher.as_ref()).submit_at(submit_request, 10)
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("submit did not enter its elected supervisor launch");
+
+    let resolver_launches = Arc::new(AtomicUsize::new(0));
+    let resolution = JobService::new(
+        &store,
+        &CountingRejectLauncher {
+            launches: Arc::clone(&resolver_launches),
+        },
+    )
+    .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&submit).unwrap())
+    .unwrap();
+
+    assert!(matches!(
+        resolution.outcome(),
+        ResolveOrAbandonOutcome::Accepted { .. }
+    ));
+    assert_eq!(resolver_launches.load(Ordering::SeqCst), 0);
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert!(job_path.join("meta.json").is_file());
+    let disposition = fs::read_to_string(store.job_index(lease.job_id()).unwrap()).unwrap();
+    assert!(disposition.contains("\"disposition\":\"accepted\""));
+    assert!(!disposition.contains("\"disposition\":\"abandoned\""));
+
+    release_tx.send(()).unwrap();
+    submit_thread.join().unwrap().unwrap();
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert!(job_path.join("meta.json").is_file());
+}
+
+#[test]
 fn exact_identity_bearing_incomplete_final_is_cleaned_before_release() {
     // Break caught: every incomplete final is treated as a conflict even when
     // its durable identity records positively bind it to this exact request.
@@ -611,7 +743,41 @@ fn every_resolution_cleanup_boundary_is_retryable_and_keeps_the_exact_lease() {
         let root = temp.path().join(format!("host-{}", point as u8));
         let sentinel = temp.path().join("unrelated");
         fs::write(&sentinel, b"preserve").unwrap();
-        let (store, lease, submit) = prepared_host(&root);
+        let (store, lease, submit) = unindexed_identityless_job(&root);
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        remove_and_sync(&job.join("status.json"));
+        let execution = job.join("execution.json");
+        let mutable = [job.join("workspace"), job.join("home"), job.join("tmp")];
+        let incoming = store
+            .incoming_job(lease.job_id(), lease.lease_token())
+            .unwrap();
+        fs::create_dir_all(&incoming).unwrap();
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).unwrap();
+        let cache_loser = incoming.join("task-6-cache-loser-retained-leaf");
+        fs::write(&cache_loser, b"retained-cache-loser").unwrap();
+        fs::set_permissions(&cache_loser, fs::Permissions::from_mode(0o600)).unwrap();
+        let receipt = store.verified_receipt(lease.job_id()).unwrap();
+        let pending = receipt
+            .parent()
+            .unwrap()
+            .join(format!(".verify-{}.json.pending", lease.job_id()));
+        fs::copy(&receipt, &pending).unwrap();
+        fs::set_permissions(&pending, fs::Permissions::from_mode(0o600)).unwrap();
+        File::open(receipt.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let job_stage =
+            root.join("leases")
+                .join(format!(".job-{}-{}", lease.job_id(), "1".repeat(32)));
+        fs::create_dir(&job_stage).unwrap();
+        fs::set_permissions(&job_stage, fs::Permissions::from_mode(0o700)).unwrap();
+        let stage_payload = job_stage.join("retained-stage");
+        fs::write(&stage_payload, b"job-stage").unwrap();
+        fs::set_permissions(&stage_payload, fs::Permissions::from_mode(0o600)).unwrap();
+        File::open(root.join("leases")).unwrap().sync_all().unwrap();
         let cache = store
             .snapshot(
                 lease.project_id(),
@@ -622,8 +788,12 @@ fn every_resolution_cleanup_boundary_is_retryable_and_keeps_the_exact_lease() {
         drop(store);
         let faulted = HostStore::open_with_write_fault(&root, point).unwrap();
         let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launcher = CountingRejectLauncher {
+            launches: Arc::clone(&launches),
+        };
 
-        let pending = JobService::new(&faulted, &RejectLauncher)
+        let pending_response = JobService::new(&faulted, &launcher)
             .resolve_or_abandon(request.clone())
             .unwrap();
         let expected = if point == HostStoreWritePoint::BeforeResolutionLeaseRelease {
@@ -633,17 +803,42 @@ fn every_resolution_cleanup_boundary_is_retryable_and_keeps_the_exact_lease() {
         };
         assert!(
             matches!(
-                pending.outcome(),
+                pending_response.outcome(),
                 ResolveOrAbandonOutcome::CleanupPending { code } if code == expected
             ),
-            "{point:?}: {pending:?}"
+            "{point:?}: {pending_response:?}"
         );
+        let disposition = fs::read_to_string(faulted.job_index(lease.job_id()).unwrap()).unwrap();
+        assert!(disposition.contains("\"disposition\":\"abandoned\""));
+        assert!(!disposition.contains("\"disposition\":\"accepted\""));
         assert!(faulted.job_index(lease.job_id()).unwrap().is_file());
         assert_eq!(
             LeaseService::new(&faulted).load().unwrap(),
             Some(lease.clone()),
             "{point:?}"
         );
+        assert_eq!(launches.load(Ordering::SeqCst), 0, "{point:?}");
+        assert!(job.join("meta.json").is_file(), "{point:?}");
+        if (point as u8) >= (HostStoreWritePoint::AfterResolutionExecutionRemoval as u8) {
+            assert!(!execution.exists(), "{point:?}: execution survived");
+        }
+        if (point as u8) >= (HostStoreWritePoint::AfterResolutionIncomingRemoval as u8) {
+            assert!(!incoming.exists(), "{point:?}: cache loser survived");
+        }
+        if (point as u8) >= (HostStoreWritePoint::AfterResolutionVerifiedReceiptRemoval as u8) {
+            assert!(!receipt.exists(), "{point:?}: receipt survived");
+        }
+        if (point as u8) >= (HostStoreWritePoint::AfterResolutionVerificationStageRemoval as u8) {
+            assert!(!pending.exists(), "{point:?}: pending receipt survived");
+        }
+        if (point as u8) >= (HostStoreWritePoint::AfterResolutionJobMutableRemoval as u8) {
+            for path in &mutable {
+                assert!(!path.exists(), "{point:?}: {} survived", path.display());
+            }
+        }
+        if (point as u8) >= (HostStoreWritePoint::AfterResolutionJobStageRemoval as u8) {
+            assert!(!job_stage.exists(), "{point:?}: job stage survived");
+        }
         assert!(cache.is_dir(), "{point:?}");
         assert_eq!(fs::read(&sentinel).unwrap(), b"preserve", "{point:?}");
         drop(faulted);
@@ -657,6 +852,15 @@ fn every_resolution_cleanup_boundary_is_retryable_and_keeps_the_exact_lease() {
             "{point:?}: {completed:?}"
         );
         assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+        assert!(!execution.exists(), "{point:?}");
+        assert!(!incoming.exists(), "{point:?}");
+        assert!(!receipt.exists(), "{point:?}");
+        assert!(!pending.exists(), "{point:?}");
+        assert!(!job_stage.exists(), "{point:?}");
+        for path in &mutable {
+            assert!(!path.exists(), "{point:?}: {} resurrected", path.display());
+        }
+        assert!(job.join("meta.json").is_file(), "{point:?}");
         assert!(cache.is_dir(), "{point:?}");
         assert_eq!(fs::read(&sentinel).unwrap(), b"preserve", "{point:?}");
     }
@@ -738,6 +942,98 @@ fn mismatched_tombstone_retry_is_a_conflict_and_preserves_the_winner() {
             .unwrap()
             .is_file()
     );
+}
+
+#[test]
+fn transfer_resolution_keeps_valid_authoritative_accepted_evidence() {
+    // Break caught: removing the transfer fast path accidentally converts a
+    // fully validated accepted job into abandonment or launches it again.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, submit) = indexed_identityless_job(&root);
+    let acquire = LeaseAcquireRequest::new(submit.material().clone());
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let meta = fs::read(job.join("meta.json")).unwrap();
+    let status = fs::read(job.join("status.json")).unwrap();
+
+    let error = HostTransferService::new(&store)
+        .abandon(&acquire, 30)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("JOB_ACCEPTED"), "{error}");
+    assert_eq!(fs::read(job.join("meta.json")).unwrap(), meta);
+    assert_eq!(fs::read(job.join("status.json")).unwrap(), status);
+    assert!(store.job_index(lease.job_id()).unwrap().is_file());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+}
+
+#[test]
+fn mismatched_cleanup_marker_conflicts_before_tombstone_or_mutation() {
+    // Break caught: cleanup discovers a foreign durable marker only after
+    // publishing Abandoned and removing exact mutable state, then hides the
+    // authority conflict behind MUTABLE_CLEANUP_FAILED.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let acquire = lease_request();
+    let lease = match LeaseService::new(&store)
+        .acquire(&acquire, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    fs::create_dir_all(&incoming).unwrap();
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(incoming.join("sentinel"), b"preserve-exact-state").unwrap();
+    fs::set_permissions(incoming.join("sentinel"), fs::Permissions::from_mode(0o600)).unwrap();
+    let marker_dir = root.join("locks/jobs").join(lease.job_id().to_string());
+    let marker = marker_dir.join("cleanup-complete.json");
+    let token_hash = format!(
+        "{:x}",
+        Sha256::digest(lease.lease_token().to_string().as_bytes())
+    );
+    let bytes = format!(
+        concat!(
+            r#"{{"job_id":"{}","client_id":"{}","project_id":"{}","#,
+            r#""worktree_id":"{}","manifest_digest":"{}","#,
+            r#""request_fingerprint":"{}","lease_token_sha256":"{}","#,
+            r#""terminal_or_abandoned":true}}"#
+        ),
+        lease.job_id(),
+        ClientId::new(uuid::Uuid::from_u128(99_001)),
+        lease.project_id(),
+        lease.worktree_id(),
+        lease.manifest_digest(),
+        lease.request_fingerprint(),
+        token_hash,
+    )
+    .into_bytes();
+    fs::write(&marker, &bytes).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    File::open(&marker_dir).unwrap().sync_all().unwrap();
+    let request = ResolveOrAbandonRequest::from_submit_request(&SubmitRequest::new(
+        acquire.material().clone(),
+    ))
+    .unwrap();
+
+    let error = JobService::new(&store, &RejectLauncher)
+        .resolve_or_abandon(request)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
+    assert_eq!(fs::read(&marker).unwrap(), bytes);
+    assert_eq!(
+        fs::read(incoming.join("sentinel")).unwrap(),
+        b"preserve-exact-state"
+    );
+    assert!(!store.job_index(lease.job_id()).unwrap().exists());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
 }
 
 #[test]
