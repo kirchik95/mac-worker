@@ -4459,9 +4459,8 @@ struct MatrixDurableSnapshot {
     incoming: MatrixPathSnapshot,
     verified_receipt: MatrixPathSnapshot,
     verified_stage: MatrixPathSnapshot,
-    transfer_fence: MatrixPathSnapshot,
     snapshot_cache: MatrixPathSnapshot,
-    cleanup_marker: MatrixPathSnapshot,
+    job_locks: MatrixPathSnapshot,
     marker: MatrixPathSnapshot,
 }
 
@@ -4483,9 +4482,6 @@ fn matrix_durable_snapshot(
                 .join("verified")
                 .join(format!(".verify-{}.json.pending", material.job_id())),
         ),
-        transfer_fence: matrix_snapshot_path(
-            &root.join("transfers").join(material.job_id().to_string()),
-        ),
         snapshot_cache: matrix_snapshot_path(
             &store
                 .snapshot(
@@ -4495,9 +4491,7 @@ fn matrix_durable_snapshot(
                 )
                 .unwrap(),
         ),
-        cleanup_marker: matrix_snapshot_path(
-            &root.join("locks/jobs").join(material.job_id().to_string()),
-        ),
+        job_locks: matrix_snapshot_path(&root.join("locks/jobs")),
         marker: matrix_snapshot_path(marker),
     }
 }
