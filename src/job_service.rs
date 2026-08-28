@@ -1121,6 +1121,7 @@ impl<'a> JobService<'a> {
             drop(admission);
             let authoritative = self.status(job_id)?;
             require_resolution_response(&identity, &authoritative)?;
+            reject_prelaunch_terminal(authoritative.status())?;
             return Ok(SubmitResponse::Existing {
                 status: authoritative.status().clone(),
             });

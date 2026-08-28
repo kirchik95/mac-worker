@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write as _,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -13,10 +14,11 @@ use std::{
 };
 
 use mac_worker::{
+    error::WorkerError,
     host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
     job::{
         CommandSpec, JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
-        ProcessIdentity, RequestFingerprintMaterial, SubmitRequest,
+        ProcessIdentity, RequestFingerprintMaterial, SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
@@ -342,6 +344,12 @@ struct CountingInlineSupervisorLauncher {
     launches: Arc<AtomicUsize>,
 }
 
+struct MarkingInlineSupervisorLauncher {
+    store: HostStore,
+    launches: Arc<AtomicUsize>,
+    marker: PathBuf,
+}
+
 impl SupervisorLauncher for FailingLauncher {
     fn launch(
         &self,
@@ -376,6 +384,21 @@ impl SupervisorLauncher for CountingInlineSupervisorLauncher {
         guard: SupervisorGuard,
     ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
+        let inspector = SystemProcessInspector;
+        let identity = inspector.identity_for_pid(std::process::id())?;
+        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Ok(LaunchCandidate::new(identity))
+    }
+}
+
+impl SupervisorLauncher for MarkingInlineSupervisorLauncher {
+    fn launch(
+        &self,
+        job_id: mac_worker::job::JobId,
+        guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, WorkerError> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        fs::write(&self.marker, b"launched")?;
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
         Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
@@ -434,6 +457,70 @@ impl SupervisorLauncher for RecordingLauncher {
         File::open(&self.job_path)?.sync_all()?;
         drop(guard);
         Ok(LaunchCandidate::new(self.identity))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DurableTreeEntry {
+    Directory { mode: u32 },
+    File { mode: u32, bytes: Vec<u8> },
+    Symlink { target: PathBuf },
+}
+
+fn durable_tree(root: &Path) -> BTreeMap<PathBuf, DurableTreeEntry> {
+    fn walk(root: &Path, directory: &Path, entries: &mut BTreeMap<PathBuf, DurableTreeEntry>) {
+        let mut children = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for path in children {
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                entries.insert(
+                    relative,
+                    DurableTreeEntry::Symlink {
+                        target: fs::read_link(&path).unwrap(),
+                    },
+                );
+            } else if file_type.is_dir() {
+                entries.insert(
+                    relative,
+                    DurableTreeEntry::Directory {
+                        mode: metadata.permissions().mode() & 0o7777,
+                    },
+                );
+                walk(root, &path, entries);
+            } else if file_type.is_file() {
+                entries.insert(
+                    relative,
+                    DurableTreeEntry::File {
+                        mode: metadata.permissions().mode() & 0o7777,
+                        bytes: fs::read(&path).unwrap(),
+                    },
+                );
+            } else {
+                panic!("unexpected durable entry type at {}", path.display());
+            }
+        }
+    }
+
+    let mut entries = BTreeMap::new();
+    walk(root, root, &mut entries);
+    entries
+}
+
+fn assert_protocol_code(error: WorkerError, expected: &str) {
+    match error {
+        WorkerError::Protocol(message) => {
+            let actual = message
+                .split_once(':')
+                .map_or(message.as_str(), |(code, _)| code);
+            assert_eq!(actual, expected, "unexpected protocol error: {message}");
+        }
+        other => panic!("expected protocol error {expected}, got {other}"),
     }
 }
 
@@ -668,6 +755,115 @@ fn fast_prelaunch_terminal_with_child_identity_is_not_acknowledged_as_accepted()
             .contains("SUPERVISOR_PRELAUNCH_FAILED"),
         "{retry_error}"
     );
+}
+
+#[test]
+fn retired_prelaunch_terminal_retry_repeats_the_typed_failure_without_relaunching() {
+    // Break caught: the Accepted-without-a-live-lease retry path turns a real
+    // prelaunch terminal into Existing even though no child ever launched.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("retired-prelaunch-terminal");
+    let retry_marker = temp.path().join("retry-launch-marker");
+    let (store, lease, request) = prepared_host_with_command(
+        &root,
+        CommandSpec::argv(vec!["/definitely/not/a/program".into()]).unwrap(),
+    );
+    let first_launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let first_error = JobService::new(&store, &first_launcher)
+        .submit_at(request.clone(), 10)
+        .unwrap_err();
+
+    assert!(
+        first_error.to_string().contains("EXECUTABLE_NOT_FOUND"),
+        "{first_error}"
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let terminal: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(terminal.state(), JobState::Lost);
+    assert_eq!(terminal.error_code(), Some("EXECUTABLE_NOT_FOUND"));
+    assert!(terminal.supervisor_identity().is_some());
+    assert_eq!(terminal.child_identity(), None);
+    assert!(!job.join("execution.json").exists());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    let durable_before = durable_tree(&root);
+    let retry_launches = Arc::new(AtomicUsize::new(0));
+    let retry_launcher = MarkingInlineSupervisorLauncher {
+        store: store.clone(),
+        launches: Arc::clone(&retry_launches),
+        marker: retry_marker.clone(),
+    };
+
+    let retry_error = JobService::new(&store, &retry_launcher)
+        .submit_at(request, 11)
+        .unwrap_err();
+
+    assert_protocol_code(retry_error, "SUPERVISOR_PRELAUNCH_FAILED");
+    assert_eq!(retry_launches.load(Ordering::SeqCst), 0);
+    assert!(!retry_marker.exists());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert!(!job.join("execution.json").exists());
+    let terminal_after: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(terminal_after, terminal);
+    assert_eq!(durable_tree(&root), durable_before);
+}
+
+#[test]
+fn retired_child_terminal_retries_remain_existing_without_relaunching() {
+    // Break caught: applying the prelaunch retry rejection to every terminal
+    // would reject legitimate completed commands after lease retirement.
+    for (label, program, expected_state, expected_exit) in [
+        ("succeeded", "/usr/bin/true", JobState::Succeeded, 0),
+        ("failed", "/usr/bin/false", JobState::Failed, 1),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(label);
+        let retry_marker = temp.path().join(format!("{label}-retry-launch-marker"));
+        let (store, lease, request) =
+            prepared_host_with_command(&root, CommandSpec::argv(vec![program.into()]).unwrap());
+        let first_launcher = InlineSupervisorLauncher {
+            store: store.clone(),
+        };
+
+        let first = JobService::new(&store, &first_launcher)
+            .submit_at(request.clone(), 20)
+            .unwrap();
+
+        assert_eq!(first.status().state(), expected_state, "{label}");
+        assert_eq!(first.status().exit_code(), Some(expected_exit), "{label}");
+        assert!(first.status().supervisor_identity().is_some(), "{label}");
+        assert!(first.status().child_identity().is_some(), "{label}");
+        assert_eq!(LeaseService::new(&store).load().unwrap(), None, "{label}");
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        assert!(!job.join("execution.json").exists(), "{label}");
+        let durable_before = durable_tree(&root);
+        let retry_launches = Arc::new(AtomicUsize::new(0));
+        let retry_launcher = MarkingInlineSupervisorLauncher {
+            store: store.clone(),
+            launches: Arc::clone(&retry_launches),
+            marker: retry_marker.clone(),
+        };
+
+        let retry = JobService::new(&store, &retry_launcher)
+            .submit_at(request, 21)
+            .unwrap();
+
+        assert!(matches!(retry, SubmitResponse::Existing { .. }), "{label}");
+        assert_eq!(retry.status(), first.status(), "{label}");
+        assert_eq!(retry_launches.load(Ordering::SeqCst), 0, "{label}");
+        assert!(!retry_marker.exists(), "{label}");
+        assert_eq!(LeaseService::new(&store).load().unwrap(), None, "{label}");
+        assert!(!job.join("execution.json").exists(), "{label}");
+        assert_eq!(durable_tree(&root), durable_before, "{label}");
+    }
 }
 
 #[test]
