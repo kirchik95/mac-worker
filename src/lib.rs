@@ -69,6 +69,7 @@ pub mod remote_snapshot;
 pub mod requirements;
 pub mod rooted_fs;
 pub mod run;
+pub mod scheduler;
 pub mod snapshot;
 pub mod supervisor;
 pub mod task;
