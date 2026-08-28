@@ -800,7 +800,7 @@ impl RemoteJobClient<'_> {
         &self,
         worker: &WorkerEntry,
         request: &ResolveOrAbandonRequest,
-    ) -> PreacceptanceDisposition;
+    ) -> Result<PreacceptanceDisposition, WorkerError>;
     pub fn resolve_submission(
         &self,
         worker: &WorkerEntry,
@@ -817,6 +817,8 @@ Log reads use `pread` on an opened regular no-follow file and return at most `mi
 Ambiguous submit resolution performs bounded status queries for the same ID for up to 30 seconds, then invokes atomic `resolve-or-abandon` with the same job/client/lease-token/fingerprint. Under the same admission lock used by acquire/verify/submit, the host returns the durable accepted state if a matching accepted disposition/job exists. A complete matching accepted job directory from the crash window before index publication also wins: validate it and repair the accepted disposition before returning. Only when neither accepted proof exists does it acquire the same per-job transfer lock held by `rsync-receive`, publish and fsync an abandonment disposition, remove matching token-scoped `incoming`/verified-receipt/incomplete-workspace state, delete/fsync any transient execution payload, and release the exact lease through the internal cleanup-proof API. Cleanup failure leaves the tombstone and lease intact for an idempotent retry. The response is idempotently `Accepted`, `Abandoned`, or `CleanupPending`; status absence alone never decides, and `Abandoned` proves no delayed receiver can still write. An unreachable host returns `UNKNOWN_REMOTE` with the same job ID and recovery commands.
 
 Lease-acquire, upload, and verify failures cannot have started a command. `resolve_preacceptance` nevertheless invokes the same atomic `resolve-or-abandon` with the original token/fingerprint because a response or delayed request may still be in flight. It returns `PreacceptanceDisposition::{Abandoned, Accepted(StatusResponse), CleanupPending { code }}` with bounded content-free diagnostics. The caller preserves the original typed failure only for `Abandoned`; `Accepted` switches to same-ID status/log following, and `CleanupPending` records that marker locally with the job ID plus recovery command. A later `worker status <id>` retries the exact resolution before reporting the local record.
+
+`resolve_preacceptance` returns `Result` because a valid nonzero versioned host error is authoritative, not network ambiguity: preserve its validated code/message as the existing coded `WorkerError::Protocol` form. Only transport timeout/unavailability or an invalid/missing response becomes `PreacceptanceDisposition::UnknownRemote { code: "UNKNOWN_REMOTE" }`; a valid `JOB_ID_CONFLICT` must never be rewritten as unknown, cleanup-pending, or the original submit error.
 
 - [ ] **Step 4: Run query, supervisor, and transport tests**
 
