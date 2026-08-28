@@ -151,6 +151,7 @@ struct HostStoreInner {
     root_identity: HostRootIdentity,
     layout: HostLayoutIdentity,
     fault: AtomicU8,
+    secondary_fault: AtomicU8,
 }
 
 #[derive(Clone)]
@@ -689,6 +690,20 @@ impl HostStore {
             .ok_or_else(|| WorkerError::Protocol("host installation was not initialized".into()))
     }
 
+    #[doc(hidden)]
+    pub fn open_with_write_faults(
+        root: &Path,
+        first: HostStoreWritePoint,
+        second: HostStoreWritePoint,
+    ) -> Result<Self, WorkerError> {
+        let store = Self::open_with_write_fault(root, first)?;
+        store
+            .inner
+            .secondary_fault
+            .store(second as u8, Ordering::SeqCst);
+        Ok(store)
+    }
+
     fn open_inner(
         root: &Path,
         point: Option<HostStoreWritePoint>,
@@ -914,6 +929,7 @@ impl HostStore {
                 root_identity,
                 layout,
                 fault: AtomicU8::new(point.map_or(0, |point| point as u8)),
+                secondary_fault: AtomicU8::new(0),
             }),
         };
         store.validate_layout()?;
@@ -2048,8 +2064,16 @@ impl HostStore {
     }
 
     pub(crate) fn consume_fault(&self, point: HostStoreWritePoint) -> bool {
-        self.inner
+        if self
+            .inner
             .fault
+            .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+        self.inner
+            .secondary_fault
             .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }

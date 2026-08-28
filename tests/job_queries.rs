@@ -1679,6 +1679,82 @@ fn cleanup_and_release_failures_return_promptly_under_enrichment_contention() {
     }
 }
 
+fn assert_primary_error_survives_uncontended_typed_enrichment_failure(
+    label: &str,
+    primary_fault: HostStoreWritePoint,
+    expected_primary: &str,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp
+        .path()
+        .join(format!("primary-error-enrichment-{label}"));
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(87_201), 11)
+        .unwrap()
+        .with_child(identity(87_202), 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap()
+        .into_succeeded(14, 0, 0)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    drop(store);
+    let faulted = HostStore::open_with_write_faults(
+        &root,
+        primary_fault,
+        HostStoreWritePoint::BeforeJobStatusReplace,
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    let error = JobService::new_with_reconciliation(
+        &faulted,
+        &RejectLauncher,
+        Arc::new(ScriptedReconciliation::new([], [])),
+    )
+    .status(lease.job_id())
+    .unwrap_err();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{label} primary failure did not return within the bound"
+    );
+    let rendered = error.to_string();
+    assert_eq!(rendered.as_bytes(), expected_primary.as_bytes(), "{label}");
+    assert_eq!(error.exit_code(), 74, "{label}");
+    assert!(
+        !rendered.contains("injected status replacement failure"),
+        "{label} enrichment error replaced the primary error"
+    );
+    assert_eq!(read_job_status(&faulted, &lease), status, "{label}");
+    assert_mutable_job_scopes_absent(&faulted, &lease);
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease),
+        "{label}"
+    );
+}
+
+#[test]
+fn cleanup_primary_error_survives_uncontended_typed_enrichment_failure() {
+    assert_primary_error_survives_uncontended_typed_enrichment_failure(
+        "cleanup",
+        HostStoreWritePoint::AfterJobCleanupProof,
+        "I/O error: injected cleanup-proof crash boundary",
+    );
+}
+
+#[test]
+fn release_primary_error_survives_uncontended_typed_enrichment_failure() {
+    assert_primary_error_survives_uncontended_typed_enrichment_failure(
+        "release",
+        HostStoreWritePoint::BeforeJobLeaseRetirement,
+        "I/O error: injected lease retirement failure",
+    );
+}
+
 #[test]
 fn reconciliation_status_publication_failure_retains_the_lease_and_unmodified_status() {
     let temp = tempfile::tempdir().unwrap();
