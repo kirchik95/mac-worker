@@ -2292,6 +2292,114 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
 }
 
 #[test]
+fn terminal_accepted_submit_retry_ignores_an_unrelated_live_lease() {
+    // Break caught: the singleton live lease is treated as belonging to this
+    // terminal job, so an exact retry conflicts instead of using its durable
+    // Accepted authority.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("terminal-retry-unrelated-lease");
+    let marker = temp.path().join("terminal-retry-unrelated-marker");
+    let (store, _lease, request) = prepared_host_with_command(&root, matrix_command(&marker));
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let original = JobService::new(&store, &launcher)
+        .submit_at(request.clone(), 10)
+        .unwrap();
+    assert!(original.status().state().is_terminal());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+
+    let unrelated = lease_request_with_identity(
+        &request,
+        JobId::new(uuid::Uuid::from_u128(92_001)),
+        ClientId::new(uuid::Uuid::from_u128(92_002)),
+        LeaseToken::new(uuid::Uuid::from_u128(92_003)),
+    );
+    let unrelated_lease = match LeaseService::new(&store)
+        .acquire(&unrelated, &healthy(), 11)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+
+    let retry = JobService::new(&store, &RejectLauncher)
+        .submit_at(request, 12)
+        .unwrap();
+
+    assert!(matches!(retry, SubmitResponse::Existing { .. }));
+    assert_eq!(retry.status(), original.status());
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(unrelated_lease)
+    );
+}
+
+#[test]
+fn submit_requires_a_matching_live_lease_without_a_disposition() {
+    // Break caught: singleton occupancy by another job is mistaken for a
+    // matching lease and reported as an immutable identity conflict.
+    let temp = tempfile::tempdir().unwrap();
+    let request = SubmitRequest::new(lease_request().material().clone());
+    let unrelated_store = HostStore::open(&temp.path().join("unrelated")).unwrap();
+    let unrelated = lease_request_with_identity(
+        &request,
+        JobId::new(uuid::Uuid::from_u128(93_001)),
+        ClientId::new(uuid::Uuid::from_u128(93_002)),
+        LeaseToken::new(uuid::Uuid::from_u128(93_003)),
+    );
+    let unrelated_lease = match LeaseService::new(&unrelated_store)
+        .acquire(&unrelated, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+
+    let error = JobService::new(&unrelated_store, &RejectLauncher)
+        .submit_at(request.clone(), 2)
+        .unwrap_err();
+
+    assert_error_code(error, "LEASE_MISSING", "unrelated live lease");
+    assert_eq!(
+        LeaseService::new(&unrelated_store).load().unwrap(),
+        Some(unrelated_lease)
+    );
+
+    // A live lease for the submitted job is still authoritative for immutable
+    // identity comparison and must not be filtered out.
+    let same_job_store = HostStore::open(&temp.path().join("same-job")).unwrap();
+    let same_job_lease = match LeaseService::new(&same_job_store)
+        .acquire(&lease_request(), &healthy(), 3)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    let changed = SubmitRequest::new(
+        lease_request_with_identity(
+            &request,
+            request.material().job_id(),
+            ClientId::new(uuid::Uuid::from_u128(93_004)),
+            LeaseToken::new(uuid::Uuid::from_u128(93_005)),
+        )
+        .material()
+        .clone(),
+    );
+
+    let error = JobService::new(&same_job_store, &RejectLauncher)
+        .submit_at(changed, 4)
+        .unwrap_err();
+
+    assert_error_code(error, "JOB_ID_CONFLICT", "same-job lease identity");
+    assert_eq!(
+        LeaseService::new(&same_job_store).load().unwrap(),
+        Some(same_job_lease)
+    );
+}
+
+#[test]
 fn conflicting_preindex_final_is_preserved_without_index_or_launch() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("preindex-conflict");
@@ -4113,6 +4221,31 @@ fn lease_request() -> LeaseAcquireRequest {
             30_000,
             "heavy".into(),
             CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+        )
+        .unwrap(),
+    )
+}
+
+fn lease_request_with_identity(
+    request: &SubmitRequest,
+    job_id: JobId,
+    client_id: ClientId,
+    lease_token: LeaseToken,
+) -> LeaseAcquireRequest {
+    let material = request.material();
+    LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            job_id,
+            client_id,
+            lease_token,
+            material.worker_name().into(),
+            material.project_id().into(),
+            material.worktree_id().into(),
+            material.manifest_digest().into(),
+            material.relative_working_dir().into(),
+            material.timeout_millis(),
+            material.resource_class().into(),
+            material.command().clone(),
         )
         .unwrap(),
     )

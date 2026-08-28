@@ -1076,7 +1076,11 @@ impl<'a> JobService<'a> {
         let admission = self.store.admission_lock(job_id)?;
         if let Some(disposition) = self.store.disposition(job_id)? {
             require_matching_accepted(&disposition, &request)?;
-            if let Some(lease) = self.leases.load_after(&admission, job_id)? {
+            if let Some(lease) = self
+                .leases
+                .load_after(&admission, job_id)?
+                .filter(|lease| lease.job_id() == job_id)
+            {
                 require_exact_lease(&lease, &request)?;
                 let (_, authoritative) = self.read_exact_job(&request, &lease)?;
                 self.store.repair_indexed_publication_after(
@@ -1124,6 +1128,7 @@ impl<'a> JobService<'a> {
         let lease = self
             .leases
             .load_after(&admission, job_id)?
+            .filter(|lease| lease.job_id() == job_id)
             .ok_or_else(|| protocol_code("LEASE_MISSING", "matching live lease is absent"))?;
         require_exact_lease(&lease, &request)?;
 
