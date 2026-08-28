@@ -796,6 +796,17 @@ impl JobService<'_> {
 }
 
 impl RemoteJobClient<'_> {
+    pub fn status(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+    ) -> Result<StatusResponse, WorkerError>;
+    pub fn status_with_deadline(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+        deadline: Duration,
+    ) -> Result<StatusResponse, WorkerError>;
     pub fn resolve_preacceptance(
         &self,
         worker: &WorkerEntry,
@@ -809,6 +820,12 @@ impl RemoteJobClient<'_> {
     ) -> Result<SubmitResponse, WorkerError>;
 }
 ```
+
+`status` uses the fixed 30-second control bound. The compatible stage-budget
+seam `status_with_deadline` accepts only `0 < deadline <= 30s`, passes the exact
+value to the same fixed status operation, and rejects invalid values before the
+runner is called. Resolution polling reuses that path with its recomputed
+remaining budget. Logs and resolve-or-abandon gain no caller-supplied deadline.
 
 Status resolves job ID through the validated global disposition index (or, during a pre-index crash window, the exact matching live lease), then reads immutable meta and mutable status through descriptors and validates their shared identifiers/digest. Before replying, the host runs narrowly scoped reconciliation for that exact job. A complete accepted job that has never recorded a supervisor identity calls idempotent `ensure_supervisor`; the exclusive supervisor lock elects at most one executor. Once an identity was recorded, it is never re-executed. If that supervisor identity is proven absent but the recorded command process group remains, reconciliation takes ownership of the same targeted timeout path: TERM, ten-second wait, KILL if needed, then proof the exact group is absent. Only after both supervisor and command group are proven absent may it mark `lost`, remove the transient execution payload plus that job's mutable workspace/home/tmp, fsync, and release only its exact matching lease through the internal cleanup-proof API. Ambiguous or reused identities retain the lease and return infrastructure failure. This is lifecycle repair required to keep the single worker usable after a supervisor death or reboot; Phase 4 will add fleet-wide discovery and scheduling around the same primitive.
 
