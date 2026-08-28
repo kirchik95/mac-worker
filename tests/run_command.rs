@@ -28,17 +28,18 @@ use mac_worker::{
     job::{
         ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobState, JobStatus, JsonEvent,
         LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LocalJobRecord,
-        ProcessIdentity, RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
-        ResolveOrAbandonResponse, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
+        LogChunk, LogChunkRequest, LogChunkResponse, LogStream, ProcessIdentity, RemoteUncertainty,
+        RequestFingerprintMaterial, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
+        StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
     },
     paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     run::{
-        JobFollower, RunCompletion, RunObserver, RunReport, RunRequest, RunService, RunStage,
-        STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT, StatusReport, StatusRow,
-        StatusService,
+        FollowRuntime, JobFollower, LogsService, RunCompletion, RunObserver, RunReport, RunRequest,
+        RunService, RunStage, STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT,
+        StatusReport, StatusRow, StatusService, SystemFollowRuntime,
     },
     transfer::{HostOperation, RemoteJobClient, ResolutionRuntime},
 };
@@ -2660,6 +2661,7 @@ struct OutputState {
 struct RecordingWriter {
     state: Arc<Mutex<OutputState>>,
     fail_write: bool,
+    fail_flush: bool,
 }
 
 impl RecordingWriter {
@@ -2667,6 +2669,7 @@ impl RecordingWriter {
         Self {
             state,
             fail_write: false,
+            fail_flush: false,
         }
     }
 
@@ -2674,6 +2677,15 @@ impl RecordingWriter {
         Self {
             state,
             fail_write: true,
+            fail_flush: false,
+        }
+    }
+
+    fn failing_flush(state: Arc<Mutex<OutputState>>) -> Self {
+        Self {
+            state,
+            fail_write: false,
+            fail_flush: true,
         }
     }
 }
@@ -2691,6 +2703,12 @@ impl Write for RecordingWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if self.fail_flush {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "planted flush failure",
+            ));
+        }
         self.state.lock().unwrap().flushes += 1;
         Ok(())
     }
@@ -4670,4 +4688,1105 @@ fn operational_git_selection_failures_remain_snapshot_infrastructure_errors() {
     assert!(store.list_jobs().unwrap().is_empty());
     assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
     runner.assert_consumed();
+}
+
+const LOG_CHUNK_LIMIT: u32 = 65_536;
+const PLANTED_STDOUT_TEXT: &[u8] = b"PLANTED_STDOUT_SECRET";
+const PLANTED_STDERR_TEXT: &[u8] = b"PLANTED_STDERR_SECRET";
+
+struct PanicFollowRuntime;
+
+impl FollowRuntime for PanicFollowRuntime {
+    fn sleep(&self, _duration: Duration) {
+        panic!("non-follow logs must not sleep");
+    }
+}
+
+struct RecordingFollowRuntime {
+    sleeps: Mutex<Vec<Duration>>,
+}
+
+impl RecordingFollowRuntime {
+    fn new() -> Self {
+        Self {
+            sleeps: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn sleeps(&self) -> Vec<Duration> {
+        self.sleeps.lock().unwrap().clone()
+    }
+}
+
+impl FollowRuntime for RecordingFollowRuntime {
+    fn sleep(&self, duration: Duration) {
+        self.sleeps.lock().unwrap().push(duration);
+    }
+}
+
+fn logs_service<'a>(
+    config: &'a Config,
+    store: &'a ClientStateStore,
+    remote: &'a RemoteJobClient<'a>,
+    runtime: &'a dyn FollowRuntime,
+) -> LogsService<'a> {
+    LogsService {
+        config,
+        client_state: store,
+        remote,
+        runtime,
+    }
+}
+
+fn persist_log_job(store: &ClientStateStore, status: Option<JobStatus>) -> LocalJobRecord {
+    let record = test_record(store, 1, 100, status, RemoteUncertainty::None);
+    store.create_job(record.clone()).unwrap();
+    record
+}
+
+fn log_status_response(record: &LocalJobRecord, status: JobStatus) -> StatusResponse {
+    StatusResponse::new(record.meta().clone(), status).unwrap()
+}
+
+fn log_chunk_result(
+    stream: LogStream,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<ProcessResult, WorkerError> {
+    status_result(
+        &LogChunkResponse::new(LogChunk::new(stream, offset, bytes.to_vec()).unwrap()).unwrap(),
+    )
+}
+
+fn running_status(updated_at_millis: u64) -> JobStatus {
+    JobStatus::running(updated_at_millis, 42, 1_000, 43, 1_001).unwrap()
+}
+
+fn signal_status(updated_at_millis: u64, signal: u32, stdout: u64, stderr: u64) -> JobStatus {
+    JobStatus::new(
+        JobState::Failed,
+        updated_at_millis,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(signal),
+        Some(stdout),
+        Some(stderr),
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+fn assert_status_query(request: &ProcessRequest, job_id: JobId) {
+    assert_status_call(request, Duration::from_secs(30), job_id);
+}
+
+fn is_status_operation(request: &ProcessRequest) -> bool {
+    request.args.last().and_then(|argument| argument.to_str())
+        == Some(HostOperation::Status.command())
+}
+
+fn assert_log_chunk_call(request: &ProcessRequest, job_id: JobId, stream: LogStream, offset: u64) {
+    assert_control_call(request, HostOperation::LogChunk, Duration::from_secs(30));
+    let parsed: LogChunkRequest =
+        serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+    assert_eq!(parsed.job_id(), job_id);
+    assert_eq!(parsed.stream(), stream);
+    assert_eq!(parsed.offset(), offset);
+    assert_eq!(parsed.limit(), LOG_CHUNK_LIMIT);
+}
+
+fn assert_no_mutating_control(requests: &[ProcessRequest]) {
+    for request in requests {
+        let command = request.args.last().and_then(|argument| argument.to_str());
+        assert_ne!(command, Some(HostOperation::LeaseAcquire.command()));
+        assert_ne!(command, Some(HostOperation::SnapshotVerify.command()));
+        assert_ne!(command, Some(HostOperation::Submit.command()));
+        assert_ne!(command, Some(HostOperation::ResolveOrAbandon.command()));
+        assert!(command.is_none_or(|value| !value.contains("cancel") && !value.contains("signal")));
+    }
+}
+
+fn parse_json_events(bytes: &[u8]) -> Vec<JsonEvent> {
+    let text = std::str::from_utf8(bytes).unwrap();
+    text.split_inclusive('\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            assert!(line.ends_with('\n'), "JSON log events must be NDJSON");
+            serde_json::from_str::<JsonEvent>(line.trim_end()).unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn human_logs_preserve_raw_stdout_and_stderr_bytes() {
+    // Catches UTF-8 conversion, prefixes, extra newlines, or mixing the two
+    // streams when the remote payload contains arbitrary non-text bytes.
+    let raw_stdout = [0xff, 0xfe, 0x00, b'\n', 0x80, b'A'];
+    let raw_stderr = [0xc0, 0x00, b'\r', 0x81];
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let runner = RecordingRunner::returning(vec![
+        status_result(&log_status_response(
+            &record,
+            JobStatus::accepted(101).unwrap(),
+        )),
+        log_chunk_result(LogStream::Stdout, 0, &raw_stdout),
+        log_chunk_result(LogStream::Stderr, 0, &raw_stderr),
+    ]);
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+    let runtime = PanicFollowRuntime;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let response = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+    assert_eq!(stdout, raw_stdout);
+    assert_eq!(stderr, raw_stderr);
+    assert_eq!(response.status().state(), JobState::Accepted);
+    assert_no_mutating_control(&runner.requests());
+}
+
+#[test]
+fn json_logs_emit_only_versioned_base64_ndjson_on_stdout() {
+    // Catches emitting application bytes, leaking planted plaintext before
+    // base64 decode, writing diagnostics to stderr, or pretty-printing events.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let terminal = JobStatus::succeeded(
+        110,
+        PLANTED_STDOUT_TEXT.len() as u64,
+        PLANTED_STDERR_TEXT.len() as u64,
+    )
+    .unwrap();
+    let expected = log_status_response(&record, terminal);
+    let runner = RecordingRunner::returning(vec![
+        status_result(&expected),
+        log_chunk_result(LogStream::Stdout, 0, PLANTED_STDOUT_TEXT),
+        log_chunk_result(LogStream::Stderr, 0, PLANTED_STDERR_TEXT),
+    ]);
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+    let runtime = PanicFollowRuntime;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let response = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            false,
+            true,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+    assert!(stderr.is_empty());
+    let raw = std::str::from_utf8(&stdout).unwrap();
+    assert!(!raw.contains("PLANTED_STDOUT_SECRET"));
+    assert!(!raw.contains("PLANTED_STDERR_SECRET"));
+    let events = parse_json_events(&stdout);
+    assert_eq!(events.len(), 3);
+    match &events[0] {
+        JsonEvent::Log {
+            protocol_version,
+            chunk,
+        } => {
+            assert_eq!(*protocol_version, PROTOCOL_VERSION);
+            assert_eq!(chunk.stream(), LogStream::Stdout);
+            assert_eq!(chunk.offset(), 0);
+            assert_eq!(chunk.next_offset(), PLANTED_STDOUT_TEXT.len() as u64);
+            assert_eq!(chunk.decoded_bytes().unwrap(), PLANTED_STDOUT_TEXT);
+        }
+        other => panic!("first JSON event must be a log chunk, got {other:?}"),
+    }
+    match &events[1] {
+        JsonEvent::Log {
+            protocol_version,
+            chunk,
+        } => {
+            assert_eq!(*protocol_version, PROTOCOL_VERSION);
+            assert_eq!(chunk.stream(), LogStream::Stderr);
+            assert_eq!(chunk.decoded_bytes().unwrap(), PLANTED_STDERR_TEXT);
+        }
+        other => panic!("second JSON event must be a log chunk, got {other:?}"),
+    }
+    match &events[2] {
+        JsonEvent::Status {
+            protocol_version,
+            response: status,
+        } => {
+            assert_eq!(*protocol_version, PROTOCOL_VERSION);
+            assert_eq!(status.as_ref(), &expected);
+        }
+        other => panic!("final JSON event must be the original status, got {other:?}"),
+    }
+    assert_eq!(response, expected);
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn non_follow_logs_make_one_status_and_one_query_per_stream_without_sleeping() {
+    // Catches extra polls, implicit follow, sleeping, or coupling the two
+    // stream offsets on a one-shot snapshot.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let expected = log_status_response(&record, JobStatus::accepted(101).unwrap());
+    let runner = RecordingRunner::returning(vec![
+        status_result(&expected),
+        log_chunk_result(LogStream::Stdout, 0, b""),
+        log_chunk_result(LogStream::Stderr, 0, b""),
+    ]);
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+    let runtime = PanicFollowRuntime;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let response = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+    assert_eq!(response, expected);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 3);
+    assert_status_query(&requests[0], record.meta().job_id());
+    assert_log_chunk_call(&requests[1], record.meta().job_id(), LogStream::Stdout, 0);
+    assert_log_chunk_call(&requests[2], record.meta().job_id(), LogStream::Stderr, 0);
+    assert_no_mutating_control(&requests);
+    assert_eq!(
+        store
+            .load_job(record.meta().job_id())
+            .unwrap()
+            .last_status()
+            .unwrap()
+            .updated_at_millis(),
+        101
+    );
+
+    let zero_temp = tempfile::tempdir().unwrap();
+    let zero_store = state_store(&zero_temp);
+    let zero_record = persist_log_job(&zero_store, Some(JobStatus::accepted(101).unwrap()));
+    let zero_terminal = log_status_response(&zero_record, JobStatus::succeeded(140, 0, 0).unwrap());
+    let zero_runner = RecordingRunner::returning(vec![
+        status_result(&zero_terminal),
+        log_chunk_result(LogStream::Stdout, 0, b""),
+        log_chunk_result(LogStream::Stderr, 0, b""),
+    ]);
+    let zero_remote = RemoteJobClient::new(&zero_runner);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let response = logs_service(&config, &zero_store, &zero_remote, &runtime)
+        .stream(
+            zero_record.meta().job_id(),
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+    assert_eq!(response, zero_terminal);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    let requests = zero_runner.requests();
+    assert_eq!(requests.len(), 3);
+    assert_status_query(&requests[0], zero_record.meta().job_id());
+    assert_log_chunk_call(
+        &requests[1],
+        zero_record.meta().job_id(),
+        LogStream::Stdout,
+        0,
+    );
+    assert_log_chunk_call(
+        &requests[2],
+        zero_record.meta().job_id(),
+        LogStream::Stderr,
+        0,
+    );
+    assert_no_mutating_control(&requests);
+}
+
+#[test]
+fn follow_uses_independent_offsets_and_one_second_empty_polling() {
+    // Catches shared offsets, sleeping after asymmetric progress, or skipping
+    // status-first polling while either stream is still live.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let live = log_status_response(&record, JobStatus::accepted(101).unwrap());
+    let terminal = log_status_response(&record, JobStatus::succeeded(120, 3, 2).unwrap());
+    let runner = RecordingRunner::returning(vec![
+        status_result(&live),
+        log_chunk_result(LogStream::Stdout, 0, b""),
+        log_chunk_result(LogStream::Stderr, 0, b""),
+        status_result(&live),
+        log_chunk_result(LogStream::Stdout, 0, b"abc"),
+        log_chunk_result(LogStream::Stderr, 0, b""),
+        status_result(&live),
+        log_chunk_result(LogStream::Stdout, 3, b""),
+        log_chunk_result(LogStream::Stderr, 0, b"de"),
+        status_result(&terminal),
+        log_chunk_result(LogStream::Stdout, 3, b""),
+        log_chunk_result(LogStream::Stderr, 2, b""),
+        status_result(&terminal),
+    ]);
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+    let runtime = RecordingFollowRuntime::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let response = JobFollower::follow(
+        &logs_service(&config, &store, &remote, &runtime),
+        &record,
+        false,
+        &mut stdout,
+        &mut stderr,
+    )
+    .unwrap();
+
+    assert_eq!(stdout, b"abc");
+    assert_eq!(stderr, b"de");
+    assert_eq!(response, terminal);
+    assert_eq!(runtime.sleeps(), [Duration::from_secs(1)]);
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 13);
+    assert_status_query(&requests[0], record.meta().job_id());
+    assert_log_chunk_call(&requests[1], record.meta().job_id(), LogStream::Stdout, 0);
+    assert_log_chunk_call(&requests[2], record.meta().job_id(), LogStream::Stderr, 0);
+    assert_status_query(&requests[3], record.meta().job_id());
+    assert_log_chunk_call(&requests[4], record.meta().job_id(), LogStream::Stdout, 0);
+    assert_log_chunk_call(&requests[5], record.meta().job_id(), LogStream::Stderr, 0);
+    assert_status_query(&requests[6], record.meta().job_id());
+    assert_log_chunk_call(&requests[7], record.meta().job_id(), LogStream::Stdout, 3);
+    assert_log_chunk_call(&requests[8], record.meta().job_id(), LogStream::Stderr, 0);
+    assert_status_query(&requests[9], record.meta().job_id());
+    assert_log_chunk_call(&requests[10], record.meta().job_id(), LogStream::Stdout, 3);
+    assert_log_chunk_call(&requests[11], record.meta().job_id(), LogStream::Stderr, 2);
+    assert_status_query(&requests[12], record.meta().job_id());
+    assert_no_mutating_control(&requests);
+}
+
+#[test]
+fn terminal_follow_drains_to_exact_lengths_confirms_both_eofs_and_revalidates_status() {
+    // Catches stopping at the recorded length without the extra empty EOF
+    // probes, querying a drained stream again, or reconstructing status.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let terminal = log_status_response(&record, JobStatus::succeeded(140, 5, 3).unwrap());
+    let runner = RecordingRunner::returning(vec![
+        status_result(&terminal),
+        log_chunk_result(LogStream::Stdout, 0, b"hello"),
+        log_chunk_result(LogStream::Stderr, 0, b"err"),
+        log_chunk_result(LogStream::Stdout, 5, b""),
+        log_chunk_result(LogStream::Stderr, 3, b""),
+        status_result(&terminal),
+    ]);
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+    let runtime = RecordingFollowRuntime::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let response = logs_service(&config, &store, &remote, &runtime)
+        .stream(record.meta().job_id(), true, true, &mut stdout, &mut stderr)
+        .unwrap();
+
+    assert!(runtime.sleeps().is_empty());
+    assert_eq!(response, terminal);
+    let events = parse_json_events(&stdout);
+    assert_eq!(events.len(), 5);
+    assert!(matches!(
+        &events[0],
+        JsonEvent::Log { chunk, .. } if chunk.stream() == LogStream::Stdout && chunk.next_offset() == 5
+    ));
+    assert!(matches!(
+        &events[1],
+        JsonEvent::Log { chunk, .. } if chunk.stream() == LogStream::Stderr && chunk.next_offset() == 3
+    ));
+    assert!(matches!(
+        &events[2],
+        JsonEvent::Log { chunk, .. } if chunk.stream() == LogStream::Stdout && chunk.offset() == 5 && chunk.next_offset() == 5
+    ));
+    assert!(matches!(
+        &events[3],
+        JsonEvent::Log { chunk, .. } if chunk.stream() == LogStream::Stderr && chunk.offset() == 3 && chunk.next_offset() == 3
+    ));
+    match &events[4] {
+        JsonEvent::Status { response, .. } => assert_eq!(response.as_ref(), &terminal),
+        other => panic!("final event must be the original terminal status, got {other:?}"),
+    }
+    assert!(stderr.is_empty());
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 6);
+    assert_status_query(&requests[0], record.meta().job_id());
+    assert_log_chunk_call(&requests[1], record.meta().job_id(), LogStream::Stdout, 0);
+    assert_log_chunk_call(&requests[2], record.meta().job_id(), LogStream::Stderr, 0);
+    assert_log_chunk_call(&requests[3], record.meta().job_id(), LogStream::Stdout, 5);
+    assert_log_chunk_call(&requests[4], record.meta().job_id(), LogStream::Stderr, 3);
+    assert_status_query(&requests[5], record.meta().job_id());
+    assert_no_mutating_control(&requests);
+}
+
+#[test]
+fn terminal_status_meta_or_lengths_cannot_change_during_drain() {
+    // Catches accepting a mutated terminal status after EOF, or leaking
+    // crossing bytes when a chunk exceeds the bound authoritative length.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let terminal = log_status_response(&record, JobStatus::succeeded(150, 3, 0).unwrap());
+    let crossing = RecordingRunner::returning(vec![
+        status_result(&terminal),
+        log_chunk_result(LogStream::Stdout, 0, b"abcd"),
+    ]);
+    let remote = RemoteJobClient::new(&crossing);
+    let config = config();
+    let runtime = RecordingFollowRuntime::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            true,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 70);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert_no_mutating_control(&crossing.requests());
+
+    let mutated = record_with_meta_parts(
+        record.meta().job_id(),
+        store.client_id(),
+        "mini-1",
+        &"a".repeat(64),
+        &"b".repeat(64),
+        &"d".repeat(64),
+        "packages/app",
+        30_000,
+        "heavy",
+        CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+        100,
+        Some(record.lease_token()),
+        Some(JobStatus::succeeded(150, 3, 0).unwrap()),
+        RemoteUncertainty::None,
+    );
+    assert_ne!(mutated.meta(), record.meta());
+    let changed = StatusResponse::new(
+        mutated.meta().clone(),
+        JobStatus::succeeded(150, 3, 0).unwrap(),
+    )
+    .unwrap();
+    let revalidate = RecordingRunner::returning(vec![
+        status_result(&terminal),
+        log_chunk_result(LogStream::Stdout, 0, b"abc"),
+        log_chunk_result(LogStream::Stderr, 0, b""),
+        log_chunk_result(LogStream::Stdout, 3, b""),
+        status_result(&changed),
+    ]);
+    let remote = RemoteJobClient::new(&revalidate);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            true,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 70);
+    assert_eq!(stdout, b"abc");
+    assert!(stderr.is_empty());
+    let requests = revalidate.requests();
+    assert_eq!(requests.len(), 5);
+    assert_log_chunk_call(&requests[1], record.meta().job_id(), LogStream::Stdout, 0);
+    assert_log_chunk_call(&requests[2], record.meta().job_id(), LogStream::Stderr, 0);
+    assert_log_chunk_call(&requests[3], record.meta().job_id(), LogStream::Stdout, 3);
+    assert_status_query(&requests[4], record.meta().job_id());
+    assert_no_mutating_control(&requests);
+}
+
+#[test]
+fn initial_compatible_concurrent_forward_binds_and_emits_winner() {
+    // Catches binding/emitting the in-flight remote snapshot when lock-internal
+    // reconciliation already selected a compatible concurrent-forward winner.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let remote_live = log_status_response(&record, running_status(110));
+    let winner_status = running_status(110).into_succeeded(120, 3, 0).unwrap();
+    let hook_store = store.clone();
+    let hook_status = winner_status.clone();
+    let job_id = record.meta().job_id();
+    let crossing = RecordingRunner::with_hook(
+        vec![
+            status_result(&remote_live),
+            log_chunk_result(LogStream::Stdout, 0, b"abcd"),
+        ],
+        move |request| {
+            if !is_status_operation(request) {
+                return;
+            }
+            hook_store
+                .update_observation(job_id, hook_status.clone())
+                .unwrap();
+        },
+    );
+    let remote = RemoteJobClient::new(&crossing);
+    let config = config();
+    let runtime = PanicFollowRuntime;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(job_id, false, false, &mut stdout, &mut stderr)
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 70);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(
+        store.load_job(job_id).unwrap().last_status(),
+        Some(&winner_status)
+    );
+    assert_eq!(crossing.requests().len(), 2);
+    assert_log_chunk_call(&crossing.requests()[1], job_id, LogStream::Stdout, 0);
+    assert_no_mutating_control(&crossing.requests());
+
+    let emit_temp = tempfile::tempdir().unwrap();
+    let emit_store = state_store(&emit_temp);
+    let emit_record = persist_log_job(&emit_store, Some(JobStatus::accepted(101).unwrap()));
+    let emit_live = log_status_response(&emit_record, running_status(110));
+    let emit_winner_status = running_status(110).into_succeeded(120, 3, 0).unwrap();
+    let emit_winner = log_status_response(&emit_record, emit_winner_status.clone());
+    let hook_store = emit_store.clone();
+    let hook_status = emit_winner_status.clone();
+    let emit_id = emit_record.meta().job_id();
+    let emit = RecordingRunner::with_hook(
+        vec![
+            status_result(&emit_live),
+            log_chunk_result(LogStream::Stdout, 0, b"abc"),
+            log_chunk_result(LogStream::Stderr, 0, b""),
+        ],
+        move |request| {
+            if !is_status_operation(request) {
+                return;
+            }
+            hook_store
+                .update_observation(emit_id, hook_status.clone())
+                .unwrap();
+        },
+    );
+    let remote = RemoteJobClient::new(&emit);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let response = logs_service(&config, &emit_store, &remote, &runtime)
+        .stream(emit_id, false, true, &mut stdout, &mut stderr)
+        .unwrap();
+    assert_eq!(response, emit_winner);
+    assert_eq!(
+        emit_store.load_job(emit_id).unwrap().last_status(),
+        Some(&emit_winner_status)
+    );
+    assert!(stderr.is_empty());
+    let events = parse_json_events(&stdout);
+    assert_eq!(events.len(), 3);
+    match &events[2] {
+        JsonEvent::Status {
+            response: status, ..
+        } => assert_eq!(status.as_ref(), &emit_winner),
+        other => panic!("final JSON event must be the concurrent-forward winner, got {other:?}"),
+    }
+    let requests = emit.requests();
+    assert_eq!(requests.len(), 3);
+    assert_log_chunk_call(&requests[1], emit_id, LogStream::Stdout, 0);
+    assert_log_chunk_call(&requests[2], emit_id, LogStream::Stderr, 0);
+    assert_no_mutating_control(&requests);
+}
+
+#[test]
+fn final_compatible_concurrent_forward_revalidates_actual_winner() {
+    // Catches revalidating/emitting the stale final remote snapshot when
+    // reconciliation selected a compatible cleanup-enriched winner.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let terminal_status = JobStatus::succeeded(150, 3, 0).unwrap();
+    let terminal = log_status_response(&record, terminal_status.clone());
+    let enriched_status = terminal_status
+        .with_cleanup_error("LATE_CLEANUP_ERROR".into(), 151)
+        .unwrap();
+    let job_id = record.meta().job_id();
+    let hook_store = store.clone();
+    let hook_status = enriched_status.clone();
+    let status_calls = AtomicUsize::new(0);
+    let runner = RecordingRunner::with_hook(
+        vec![
+            status_result(&terminal),
+            log_chunk_result(LogStream::Stdout, 0, b"abc"),
+            log_chunk_result(LogStream::Stderr, 0, b""),
+            log_chunk_result(LogStream::Stdout, 3, b""),
+            status_result(&terminal),
+        ],
+        move |request| {
+            if !is_status_operation(request) {
+                return;
+            }
+            if status_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                hook_store
+                    .update_observation(job_id, hook_status.clone())
+                    .unwrap();
+            }
+        },
+    );
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+    let runtime = RecordingFollowRuntime::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(job_id, true, false, &mut stdout, &mut stderr)
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 70);
+    assert_eq!(stdout, b"abc");
+    assert!(stderr.is_empty());
+    assert_eq!(
+        store.load_job(job_id).unwrap().last_status(),
+        Some(&enriched_status)
+    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 5);
+    assert_status_query(&requests[0], job_id);
+    assert_log_chunk_call(&requests[1], job_id, LogStream::Stdout, 0);
+    assert_log_chunk_call(&requests[2], job_id, LogStream::Stderr, 0);
+    assert_log_chunk_call(&requests[3], job_id, LogStream::Stdout, 3);
+    assert_status_query(&requests[4], job_id);
+    assert_no_mutating_control(&requests);
+}
+
+#[test]
+fn broken_stdout_or_stderr_is_io_74_and_never_cancels() {
+    // Catches treating a local writer failure as a remote mutation, or
+    // committing a cursor after a failed flush.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let expected = log_status_response(&record, JobStatus::accepted(101).unwrap());
+    let before = store.load_job(record.meta().job_id()).unwrap();
+
+    let write_fail = RecordingRunner::returning(vec![
+        status_result(&expected),
+        log_chunk_result(LogStream::Stdout, 0, b"hello"),
+    ]);
+    let remote = RemoteJobClient::new(&write_fail);
+    let config = config();
+    let runtime = PanicFollowRuntime;
+    let output = Arc::new(Mutex::new(OutputState::default()));
+    let mut stdout = RecordingWriter::failing(Arc::clone(&output));
+    let mut stderr = Vec::new();
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 74);
+    assert!(output.lock().unwrap().bytes.is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(write_fail.requests().len(), 2);
+    assert_no_mutating_control(&write_fail.requests());
+    let after_write_fail = store.load_job(record.meta().job_id()).unwrap();
+    assert_eq!(after_write_fail.meta(), before.meta());
+    assert_eq!(after_write_fail.lease_token(), before.lease_token());
+    assert_eq!(
+        after_write_fail.remote_uncertainty(),
+        before.remote_uncertainty()
+    );
+
+    let flush_fail = RecordingRunner::returning(vec![
+        status_result(&expected),
+        log_chunk_result(LogStream::Stdout, 0, b"hello"),
+    ]);
+    let remote = RemoteJobClient::new(&flush_fail);
+    let output = Arc::new(Mutex::new(OutputState::default()));
+    let mut stdout = RecordingWriter::failing_flush(Arc::clone(&output));
+    let mut stderr = Vec::new();
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 74);
+    assert!(matches!(
+        error,
+        WorkerError::Io(ref io) if io.kind() == io::ErrorKind::BrokenPipe
+    ));
+    assert_eq!(output.lock().unwrap().bytes, b"hello");
+    assert_eq!(flush_fail.requests().len(), 2);
+    assert_log_chunk_call(
+        &flush_fail.requests()[1],
+        record.meta().job_id(),
+        LogStream::Stdout,
+        0,
+    );
+    assert_no_mutating_control(&flush_fail.requests());
+    let after_flush_fail = store.load_job(record.meta().job_id()).unwrap();
+    assert_eq!(after_flush_fail.meta(), before.meta());
+    assert_eq!(after_flush_fail.lease_token(), before.lease_token());
+    assert_eq!(
+        after_flush_fail.remote_uncertainty(),
+        before.remote_uncertainty()
+    );
+
+    let retry = RecordingRunner::returning(vec![
+        status_result(&expected),
+        log_chunk_result(LogStream::Stdout, 0, b"hello"),
+        log_chunk_result(LogStream::Stderr, 0, b""),
+    ]);
+    let remote = RemoteJobClient::new(&retry);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+    assert_eq!(stdout, b"hello");
+    assert!(stderr.is_empty());
+    assert_log_chunk_call(
+        &retry.requests()[1],
+        record.meta().job_id(),
+        LogStream::Stdout,
+        0,
+    );
+    assert_log_chunk_call(
+        &retry.requests()[2],
+        record.meta().job_id(),
+        LogStream::Stderr,
+        0,
+    );
+
+    let eof_temp = tempfile::tempdir().unwrap();
+    let eof_store = state_store(&eof_temp);
+    let eof_record = persist_log_job(&eof_store, Some(JobStatus::accepted(101).unwrap()));
+    let eof_flush = RecordingRunner::returning(vec![
+        status_result(&log_status_response(
+            &eof_record,
+            JobStatus::succeeded(180, 0, 0).unwrap(),
+        )),
+        log_chunk_result(LogStream::Stdout, 0, b""),
+    ]);
+    let remote = RemoteJobClient::new(&eof_flush);
+    let output = Arc::new(Mutex::new(OutputState::default()));
+    let mut stdout = RecordingWriter::failing_flush(Arc::clone(&output));
+    let mut stderr = Vec::new();
+    let error = logs_service(&config, &eof_store, &remote, &runtime)
+        .stream(
+            eof_record.meta().job_id(),
+            true,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 74);
+    assert!(matches!(
+        error,
+        WorkerError::Io(ref io) if io.kind() == io::ErrorKind::BrokenPipe
+    ));
+    assert!(output.lock().unwrap().bytes.is_empty());
+    assert_eq!(eof_flush.requests().len(), 2);
+    assert_log_chunk_call(
+        &eof_flush.requests()[1],
+        eof_record.meta().job_id(),
+        LogStream::Stdout,
+        0,
+    );
+    assert_no_mutating_control(&eof_flush.requests());
+
+    let json_write_fail = RecordingRunner::returning(vec![
+        status_result(&expected),
+        log_chunk_result(LogStream::Stdout, 0, b"hello"),
+    ]);
+    let remote = RemoteJobClient::new(&json_write_fail);
+    let output = Arc::new(Mutex::new(OutputState::default()));
+    let mut stdout = RecordingWriter::failing(Arc::clone(&output));
+    let mut stderr = Vec::new();
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            false,
+            true,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 74);
+    assert!(matches!(
+        error,
+        WorkerError::Io(ref io) if io.kind() == io::ErrorKind::BrokenPipe
+    ));
+    assert!(output.lock().unwrap().bytes.is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(json_write_fail.requests().len(), 2);
+    assert_no_mutating_control(&json_write_fail.requests());
+
+    let json_flush_fail = RecordingRunner::returning(vec![
+        status_result(&expected),
+        log_chunk_result(LogStream::Stdout, 0, b"hello"),
+    ]);
+    let remote = RemoteJobClient::new(&json_flush_fail);
+    let output = Arc::new(Mutex::new(OutputState::default()));
+    let mut stdout = RecordingWriter::failing_flush(Arc::clone(&output));
+    let mut stderr = Vec::new();
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            false,
+            true,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 74);
+    assert!(matches!(
+        error,
+        WorkerError::Io(ref io) if io.kind() == io::ErrorKind::BrokenPipe
+    ));
+    let json_bytes = output.lock().unwrap().bytes.clone();
+    assert!(json_bytes.ends_with(b"\n"));
+    assert!(matches!(
+        serde_json::from_slice::<JsonEvent>(json_bytes.strip_suffix(b"\n").unwrap()).unwrap(),
+        JsonEvent::Log { .. }
+    ));
+    assert!(stderr.is_empty());
+    assert_eq!(json_flush_fail.requests().len(), 2);
+
+    let stderr_fail = RecordingRunner::returning(vec![
+        status_result(&expected),
+        log_chunk_result(LogStream::Stdout, 0, b"ok"),
+        log_chunk_result(LogStream::Stderr, 0, b"nope"),
+    ]);
+    let remote = RemoteJobClient::new(&stderr_fail);
+    let mut stdout = Vec::new();
+    let output = Arc::new(Mutex::new(OutputState::default()));
+    let mut stderr = RecordingWriter::failing(Arc::clone(&output));
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 74);
+    assert_eq!(stdout, b"ok");
+    assert!(output.lock().unwrap().bytes.is_empty());
+    assert_eq!(stderr_fail.requests().len(), 3);
+    assert_no_mutating_control(&stderr_fail.requests());
+}
+
+#[test]
+fn terminal_exit_codes_0_7_64_and_signal_143_are_exact() {
+    // Catches remapping established command bytes through ExitKind or losing
+    // an exact code when cleanup enrichment is present.
+    let cases = [
+        (JobStatus::succeeded(160, 0, 0).unwrap(), Ok(0)),
+        (
+            JobStatus::failed(161, 7, 0, 0)
+                .unwrap()
+                .with_cleanup_error("REMOTE_CLEANUP_FAILED".into(), 162)
+                .unwrap(),
+            Ok(7),
+        ),
+        (JobStatus::failed(163, 64, 0, 0).unwrap(), Ok(64)),
+        (JobStatus::failed(164, 255, 0, 0).unwrap(), Ok(255)),
+        (signal_status(165, 15, 0, 0), Ok(143)),
+        (
+            JobStatus::succeeded(166, 0, 0)
+                .unwrap()
+                .with_cleanup_error("REMOTE_CLEANUP_FAILED".into(), 167)
+                .unwrap(),
+            Ok(0),
+        ),
+        (signal_status(168, 128, 0, 0), Err(70)),
+    ];
+
+    for (status, _expected) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let store = state_store(&temp);
+        let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+        let response = log_status_response(&record, status.clone());
+        let runner = RecordingRunner::returning(vec![
+            status_result(&response),
+            log_chunk_result(LogStream::Stdout, 0, b""),
+            log_chunk_result(LogStream::Stderr, 0, b""),
+        ]);
+        let remote = RemoteJobClient::new(&runner);
+        let config = config();
+        let runtime = PanicFollowRuntime;
+        let streamed = logs_service(&config, &store, &remote, &runtime)
+            .stream(
+                record.meta().job_id(),
+                false,
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(streamed.status(), &status);
+        assert_no_mutating_control(&runner.requests());
+    }
+}
+
+#[test]
+fn disconnect_and_default_sigint_require_no_cancel_or_signal_dependency() {
+    // Catches inventing cancellation, installing a signal hook, or treating a
+    // transport disconnect as a remote state change. Executable SIGINT belongs
+    // to Slice 9.5; this slice proves the service boundary only.
+    let _system_runtime = SystemFollowRuntime;
+    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/run.rs"));
+    assert!(!source.contains("SIGINT"));
+    assert!(!source.contains("sigaction"));
+    assert!(!source.contains("signal_hook"));
+    assert!(!source.contains("ctrlc"));
+    let cargo = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+    assert!(!cargo.contains("signal-hook"));
+    assert!(!cargo.contains("ctrlc"));
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let before = store.load_job(record.meta().job_id()).unwrap();
+    let runner = RecordingRunner::returning(vec![
+        status_result(&log_status_response(&record, running_status(111))),
+        log_chunk_result(LogStream::Stdout, 0, b"partial"),
+        transport_failure(),
+    ]);
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+    let runtime = RecordingFollowRuntime::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            true,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.exit_code(), 69);
+    assert_eq!(stdout, b"partial");
+    assert!(stderr.is_empty());
+    assert!(runtime.sleeps().is_empty());
+    assert_no_mutating_control(&runner.requests());
+    let persisted = store.load_job(record.meta().job_id()).unwrap();
+    assert_eq!(persisted.meta(), before.meta());
+    assert_eq!(persisted.lease_token(), before.lease_token());
+    assert_eq!(persisted.remote_uncertainty(), before.remote_uncertainty());
+    assert_ne!(persisted.last_status(), before.last_status());
+}
+
+#[test]
+fn logs_requires_the_exact_local_job_and_never_falls_back() {
+    // Catches implicit newest-job selection, following a different local
+    // identity, or probing a worker that is not the recorded one.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let newest = test_record(
+        &store,
+        2,
+        200,
+        Some(JobStatus::succeeded(200, 0, 0).unwrap()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(newest.clone()).unwrap();
+    let runner = RecordingRunner::returning(Vec::new());
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+    let runtime = PanicFollowRuntime;
+    let missing = JobId::new(uuid::Uuid::from_u128(99));
+    let error = logs_service(&config, &store, &remote, &runtime)
+        .stream(missing, false, false, &mut Vec::new(), &mut Vec::new())
+        .unwrap_err();
+    assert!(matches!(error, WorkerError::Config(message) if message.contains("JOB_NOT_FOUND")));
+    assert!(runner.requests().is_empty());
+
+    let target = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let empty_config = Config {
+        version: 1,
+        workers: Vec::new(),
+    };
+    let error = logs_service(&empty_config, &store, &remote, &runtime)
+        .stream(
+            target.meta().job_id(),
+            false,
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, WorkerError::Config(message) if message.contains("WORKER_NOT_FOUND")));
+    assert!(runner.requests().is_empty());
+
+    let mismatched = LocalJobRecord::new(
+        target.meta().clone(),
+        LeaseToken::new(uuid::Uuid::from_u128(99_999)),
+        target.last_status().cloned(),
+        RemoteUncertainty::None,
+    )
+    .unwrap();
+    let error = JobFollower::follow(
+        &logs_service(&config, &store, &remote, &runtime),
+        &mismatched,
+        false,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, WorkerError::Protocol(message) if message.contains("JOB_ID_CONFLICT")));
+    assert!(runner.requests().is_empty());
 }

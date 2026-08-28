@@ -17,8 +17,9 @@ use crate::{
     job::{
         CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus, JsonEvent,
         LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LocalJobRecord,
-        PreacceptanceDisposition, RemoteUncertainty, RequestFingerprintMaterial,
-        ResolveOrAbandonRequest, StatusResponse, SubmitRequest, SubmitResponse,
+        LogChunk, LogCursor, LogStream, PreacceptanceDisposition, RemoteUncertainty,
+        RequestFingerprintMaterial, ResolveOrAbandonRequest, StatusResponse, SubmitRequest,
+        SubmitResponse, TerminalLogDrain,
     },
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRunner},
@@ -179,6 +180,28 @@ impl RunObserver for NoopRunObserver {
 }
 
 static NOOP_RUN_OBSERVER: NoopRunObserver = NoopRunObserver;
+
+const LOG_CHUNK_LIMIT: u32 = 65_536;
+const FOLLOW_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+pub trait FollowRuntime: Send + Sync {
+    fn sleep(&self, duration: Duration);
+}
+
+pub struct SystemFollowRuntime;
+
+impl FollowRuntime for SystemFollowRuntime {
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+pub struct LogsService<'a> {
+    pub config: &'a Config,
+    pub client_state: &'a ClientStateStore,
+    pub remote: &'a RemoteJobClient<'a>,
+    pub runtime: &'a dyn FollowRuntime,
+}
 
 pub struct RunService<'a> {
     pub runner: &'a dyn ProcessRunner,
@@ -701,16 +724,16 @@ fn write_accepted(
         .cloned()
         .ok_or_else(invalid_status_response)?;
     if json {
-        let event = JsonEvent::Accepted {
-            protocol_version: PROTOCOL_VERSION,
-            response: SubmitResponse::Accepted {
-                meta: Box::new(record.meta().clone()),
-                status,
+        write_json_event(
+            stdout,
+            &JsonEvent::Accepted {
+                protocol_version: PROTOCOL_VERSION,
+                response: SubmitResponse::Accepted {
+                    meta: Box::new(record.meta().clone()),
+                    status,
+                },
             },
-        };
-        serde_json::to_writer(&mut *stdout, &event)
-            .map_err(|error| WorkerError::Io(std::io::Error::other(error)))?;
-        stdout.write_all(b"\n")?;
+        )?;
     } else {
         writeln!(
             stdout,
@@ -718,8 +741,8 @@ fn write_accepted(
             record.meta().job_id(),
             record.meta().worker_name()
         )?;
+        stdout.flush()?;
     }
-    stdout.flush()?;
     Ok(())
 }
 
@@ -938,25 +961,11 @@ impl StatusService<'_> {
     }
 
     fn load_exact(&self, job_id: JobId) -> Result<LocalJobRecord, WorkerError> {
-        match self.client_state.load_job(job_id) {
-            Ok(record) => Ok(record),
-            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(WorkerError::Config(
-                    "JOB_NOT_FOUND: no local job record exists for the requested ID".into(),
-                ))
-            }
-            Err(error) => Err(error),
-        }
+        load_exact_job(self.client_state, job_id)
     }
 
     fn worker_for<'a>(&'a self, record: &LocalJobRecord) -> Result<&'a WorkerEntry, WorkerError> {
-        self.config
-            .worker(record.meta().worker_name())
-            .ok_or_else(|| {
-                WorkerError::Config(
-                    "WORKER_NOT_FOUND: the recorded worker is not configured".into(),
-                )
-            })
+        configured_worker(self.config, record)
     }
 
     fn apply_authoritative_status(
@@ -1001,6 +1010,27 @@ impl StatusService<'_> {
     }
 }
 
+fn load_exact_job(store: &ClientStateStore, job_id: JobId) -> Result<LocalJobRecord, WorkerError> {
+    match store.load_job(job_id) {
+        Ok(record) => Ok(record),
+        Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(WorkerError::Config(
+                "JOB_NOT_FOUND: no local job record exists for the requested ID".into(),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn configured_worker<'a>(
+    config: &'a Config,
+    record: &LocalJobRecord,
+) -> Result<&'a WorkerEntry, WorkerError> {
+    config.worker(record.meta().worker_name()).ok_or_else(|| {
+        WorkerError::Config("WORKER_NOT_FOUND: the recorded worker is not configured".into())
+    })
+}
+
 fn same_immutable(left: &LocalJobRecord, right: &LocalJobRecord) -> bool {
     left.meta() == right.meta() && left.lease_token() == right.lease_token()
 }
@@ -1039,5 +1069,383 @@ fn invalid_status_response() -> WorkerError {
     WorkerError::Transport {
         code: "INVALID_RESPONSE",
         message: "host response was invalid".into(),
+    }
+}
+
+impl LogsService<'_> {
+    pub fn stream(
+        &self,
+        job_id: JobId,
+        follow: bool,
+        json: bool,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> Result<StatusResponse, WorkerError> {
+        let record = load_exact_job(self.client_state, job_id)?;
+        self.stream_record(&record, follow, json, stdout, stderr)
+    }
+
+    fn stream_record(
+        &self,
+        record: &LocalJobRecord,
+        follow: bool,
+        json: bool,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> Result<StatusResponse, WorkerError> {
+        let worker = configured_worker(self.config, record)?;
+        let mut drain = TerminalLogDrain::new(
+            LogCursor::new(LogStream::Stdout, 0, LOG_CHUNK_LIMIT)?,
+            LogCursor::new(LogStream::Stderr, 0, LOG_CHUNK_LIMIT)?,
+        )?;
+        let mut last_response = None;
+        let mut terminal_bound = false;
+
+        loop {
+            if !terminal_bound {
+                let response = self.fetch_and_persist(worker, record)?;
+                if response.status().state().is_terminal() {
+                    drain.set_terminal_status(&response)?;
+                    terminal_bound = true;
+                }
+                last_response = Some(response);
+            }
+
+            let mut progressed = false;
+            for stream in [LogStream::Stdout, LogStream::Stderr] {
+                if drain.cursor(stream).is_drained() {
+                    continue;
+                }
+                let cursor = drain.cursor(stream);
+                let chunk = self.remote.log_chunk(
+                    worker,
+                    record.meta().job_id(),
+                    stream,
+                    cursor.next_offset(),
+                    cursor.limit(),
+                )?;
+                let before_offset = drain.cursor(stream).next_offset();
+                commit_observed_chunk(&mut drain, &chunk, json, stdout, stderr)?;
+                let advanced = drain.cursor(stream).next_offset() > before_offset;
+                let became_drained = drain.cursor(stream).is_drained();
+                if advanced || became_drained {
+                    progressed = true;
+                }
+            }
+
+            if !follow {
+                let response = last_response.expect("status is fetched before any log query");
+                write_final_status(&response, json, stdout)?;
+                return Ok(response);
+            }
+
+            if drain.cursor(LogStream::Stdout).is_drained()
+                && drain.cursor(LogStream::Stderr).is_drained()
+            {
+                let response = self.fetch_and_persist(worker, record)?;
+                drain.revalidate_terminal_status(&response)?;
+                write_final_status(&response, json, stdout)?;
+                return Ok(response);
+            }
+
+            if !progressed {
+                self.runtime.sleep(FOLLOW_POLL_INTERVAL);
+            }
+        }
+    }
+
+    fn fetch_and_persist(
+        &self,
+        worker: &WorkerEntry,
+        record: &LocalJobRecord,
+    ) -> Result<StatusResponse, WorkerError> {
+        let response = self.remote.status(worker, record.meta().job_id())?;
+        let status = normalize_authoritative_status(record, response)
+            .map_err(|_| inconsistent_terminal_outcome())?;
+        let winner = persist_authoritative(self.client_state, record, status)?;
+        let status = winner
+            .last_status()
+            .cloned()
+            .ok_or_else(inconsistent_terminal_outcome)?;
+        StatusResponse::new(winner.meta().clone(), status)
+            .map_err(|_| inconsistent_terminal_outcome())
+    }
+}
+
+impl JobFollower for LogsService<'_> {
+    fn follow(
+        &self,
+        record: &LocalJobRecord,
+        json: bool,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> Result<StatusResponse, WorkerError> {
+        let current = load_exact_job(self.client_state, record.meta().job_id())?;
+        if !same_immutable(&current, record) {
+            return Err(job_id_conflict());
+        }
+        self.stream_record(&current, true, json, stdout, stderr)
+    }
+}
+
+fn commit_observed_chunk(
+    drain: &mut TerminalLogDrain,
+    chunk: &LogChunk,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    let mut next = drain.clone();
+    next.observe_chunk(chunk)?;
+    write_log_chunk(chunk, json, stdout, stderr)?;
+    *drain = next;
+    Ok(())
+}
+
+fn write_log_chunk(
+    chunk: &LogChunk,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        return write_json_event(
+            stdout,
+            &JsonEvent::Log {
+                protocol_version: PROTOCOL_VERSION,
+                chunk: chunk.clone(),
+            },
+        );
+    }
+    let bytes = chunk.decoded_bytes()?;
+    let writer: &mut dyn Write = match chunk.stream() {
+        LogStream::Stdout => stdout,
+        LogStream::Stderr => stderr,
+    };
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_final_status(
+    response: &StatusResponse,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if !json {
+        return Ok(());
+    }
+    write_json_event(
+        stdout,
+        &JsonEvent::Status {
+            protocol_version: PROTOCOL_VERSION,
+            response: Box::new(response.clone()),
+        },
+    )
+}
+
+fn write_json_event(stdout: &mut dyn Write, event: &JsonEvent) -> Result<(), WorkerError> {
+    let encoded =
+        serde_json::to_vec(event).map_err(|error| WorkerError::Io(std::io::Error::other(error)))?;
+    stdout.write_all(&encoded)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Write};
+
+    use crate::{
+        error::WorkerError,
+        job::{
+            ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus, JsonEvent, LeaseToken,
+            LocalJobRecord, LogChunk, LogCursor, LogStream, RemoteUncertainty,
+            RequestFingerprintMaterial, StatusResponse, SubmitResponse, TerminalLogDrain,
+        },
+    };
+
+    use super::{
+        LOG_CHUNK_LIMIT, commit_observed_chunk, terminal_exit_code, write_accepted,
+        write_json_event,
+    };
+
+    struct FailWrite {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FailWrite {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "planted writer failure",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailFlush {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FailFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "planted flush failure",
+            ))
+        }
+    }
+
+    fn sample_record() -> LocalJobRecord {
+        let material = RequestFingerprintMaterial::new(
+            JobId::new(uuid::Uuid::from_u128(1)),
+            ClientId::new(uuid::Uuid::from_u128(2)),
+            LeaseToken::new(uuid::Uuid::from_u128(3)),
+            100,
+            "mini-1".into(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            String::new(),
+            30_000,
+            "heavy".into(),
+            CommandSpec::argv(vec!["true".into()]).unwrap(),
+        )
+        .unwrap();
+        let meta = JobMeta::new(&material, material.fingerprint()).unwrap();
+        LocalJobRecord::new(
+            meta,
+            material.lease_token(),
+            Some(JobStatus::accepted(101).unwrap()),
+            RemoteUncertainty::None,
+        )
+        .unwrap()
+    }
+
+    fn signal_status(updated_at_millis: u64, signal: u32) -> JobStatus {
+        JobStatus::new(
+            JobState::Failed,
+            updated_at_millis,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(signal),
+            Some(0),
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn terminal_exit_codes_0_7_64_and_signal_143_are_exact() {
+        let cases = [
+            (JobStatus::succeeded(160, 0, 0).unwrap(), Ok(0)),
+            (
+                JobStatus::failed(161, 7, 0, 0)
+                    .unwrap()
+                    .with_cleanup_error("REMOTE_CLEANUP_FAILED".into(), 162)
+                    .unwrap(),
+                Ok(7),
+            ),
+            (JobStatus::failed(163, 64, 0, 0).unwrap(), Ok(64)),
+            (JobStatus::failed(164, 255, 0, 0).unwrap(), Ok(255)),
+            (signal_status(165, 15), Ok(143)),
+            (
+                JobStatus::succeeded(166, 0, 0)
+                    .unwrap()
+                    .with_cleanup_error("REMOTE_CLEANUP_FAILED".into(), 167)
+                    .unwrap(),
+                Ok(0),
+            ),
+            (signal_status(168, 128), Err(70)),
+        ];
+        for (status, expected) in cases {
+            match expected {
+                Ok(code) => assert_eq!(terminal_exit_code(&status).unwrap(), code),
+                Err(code) => {
+                    assert_eq!(terminal_exit_code(&status).unwrap_err().exit_code(), code)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn json_event_serialization_failure_leaves_writer_untouched() {
+        let record = sample_record();
+        let status = record.last_status().cloned().unwrap();
+        let events = [
+            JsonEvent::Accepted {
+                protocol_version: 0,
+                response: SubmitResponse::Accepted {
+                    meta: Box::new(record.meta().clone()),
+                    status: status.clone(),
+                },
+            },
+            JsonEvent::Log {
+                protocol_version: 0,
+                chunk: LogChunk::new(LogStream::Stdout, 0, b"hello".to_vec()).unwrap(),
+            },
+            JsonEvent::Status {
+                protocol_version: 0,
+                response: Box::new(StatusResponse::new(record.meta().clone(), status).unwrap()),
+            },
+        ];
+        for event in events {
+            let mut writer = vec![b'!'];
+            let error = write_json_event(&mut writer, &event).unwrap_err();
+            assert_eq!(error.exit_code(), 74);
+            assert_eq!(writer, [b'!']);
+        }
+    }
+
+    #[test]
+    fn json_writer_failure_preserves_io_kind_after_complete_serialize() {
+        let record = sample_record();
+        let mut writer = FailWrite { bytes: Vec::new() };
+        let error = write_accepted(&record, true, &mut writer).unwrap_err();
+        assert_eq!(error.exit_code(), 74);
+        assert!(matches!(
+            error,
+            WorkerError::Io(ref io) if io.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert!(writer.bytes.is_empty());
+    }
+
+    #[test]
+    fn flush_failure_leaves_drain_and_cursor_uncommitted() {
+        let mut drain = TerminalLogDrain::new(
+            LogCursor::new(LogStream::Stdout, 0, LOG_CHUNK_LIMIT).unwrap(),
+            LogCursor::new(LogStream::Stderr, 0, LOG_CHUNK_LIMIT).unwrap(),
+        )
+        .unwrap();
+        let chunk = LogChunk::new(LogStream::Stdout, 0, b"hello".to_vec()).unwrap();
+        let mut stdout = FailFlush { bytes: Vec::new() };
+        let mut stderr = Vec::new();
+        let error =
+            commit_observed_chunk(&mut drain, &chunk, false, &mut stdout, &mut stderr).unwrap_err();
+        assert_eq!(error.exit_code(), 74);
+        assert!(matches!(
+            error,
+            WorkerError::Io(ref io) if io.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert_eq!(stdout.bytes, b"hello");
+        assert!(stderr.is_empty());
+        assert_eq!(drain.cursor(LogStream::Stdout).next_offset(), 0);
+        assert!(!drain.cursor(LogStream::Stdout).is_drained());
+        assert_eq!(drain.cursor(LogStream::Stderr).next_offset(), 0);
     }
 }
