@@ -4,6 +4,7 @@ use assert_cmd::Command;
 use clap::Parser;
 use mac_worker::{
     cli::{Cli, Command as WorkerCommand},
+    error::WorkerError,
     job::{
         CommandSpec, JobMeta, JobStatus, LocalJobRecord, RemoteUncertainty,
         RequestFingerprintMaterial,
@@ -29,6 +30,31 @@ fn assert_usage(arguments: &[&str]) {
         .code(64)
         .stdout(predicates::str::is_empty())
         .stderr(predicates::str::is_empty().not());
+}
+
+fn local_record(relative_working_dir: &str) -> LocalJobRecord {
+    let material = RequestFingerprintMaterial::new(
+        JOB_ID.parse().unwrap(),
+        CLIENT_ID.parse().unwrap(),
+        LEASE_TOKEN.parse().unwrap(),
+        "mini-1".into(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        MANIFEST_DIGEST.into(),
+        relative_working_dir.into(),
+        30_000,
+        "heavy".into(),
+        CommandSpec::shell("printf TASK9_COMMAND_SECRET".into()).unwrap(),
+    )
+    .unwrap();
+    let meta = JobMeta::new(&material, material.fingerprint(), 100).unwrap();
+    LocalJobRecord::new(
+        meta,
+        LEASE_TOKEN.parse().unwrap(),
+        Some(JobStatus::accepted(101).unwrap()),
+        RemoteUncertainty::None,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -334,4 +360,42 @@ fn status_row_serialization_omits_private_identity_and_payload() {
     assert_eq!(report.omitted, 3);
     let report_value: Value = serde_json::to_value(report).unwrap();
     assert_eq!(report_value["protocol_version"], PROTOCOL_VERSION);
+}
+
+#[test]
+fn status_row_rejects_unsafe_relative_working_directories_without_echoing_them() {
+    // Catches a valid persistent record exposing a full or traversal path at
+    // the narrower public-report boundary.
+    let unsafe_paths = [
+        "/Users/alice/secret-project",
+        "../../secret",
+        "packages/./secret",
+        "packages//secret",
+        "packages\\secret",
+        ".git/config",
+    ];
+    let mut leaked = Vec::new();
+
+    for planted_path in unsafe_paths {
+        match StatusRow::try_from_record(&local_record(planted_path)) {
+            Err(WorkerError::Protocol(message)) => {
+                assert!(message.contains("INVALID_LOCAL_RECORD"));
+                assert!(!message.contains(planted_path));
+            }
+            Err(error) => panic!("unsafe local path returned the wrong error: {error}"),
+            Ok(row) => leaked.push(row.relative_working_dir),
+        }
+    }
+
+    assert!(
+        leaked.is_empty(),
+        "unsafe paths reached the public status row: {leaked:?}"
+    );
+}
+
+#[test]
+fn status_row_allows_an_empty_root_relative_working_directory() {
+    // Catches treating the canonical project root as an unsafe empty path.
+    let row = StatusRow::try_from_record(&local_record("")).unwrap();
+    assert_eq!(row.relative_working_dir, "");
 }
