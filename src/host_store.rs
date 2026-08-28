@@ -20,8 +20,9 @@ use crate::{
     error::WorkerError,
     inputs::RelativePath,
     job::{
-        ClientId, JobId, JobMeta, JobStatus, LeaseAcquireRequest, LeaseRecord, LeaseToken,
-        RequestFingerprint, RequestFingerprintMaterial, SubmitRequest,
+        ClientId, CommandSummary, JobId, JobMeta, JobStatus, LeaseAcquireRequest, LeaseRecord,
+        LeaseToken, RequestFingerprint, RequestFingerprintMaterial, ResolveOrAbandonRequest,
+        SubmitRequest,
     },
     rooted_fs::{PrivateEntryIdentity, RootedDir},
 };
@@ -101,6 +102,16 @@ pub enum HostStoreWritePoint {
     AfterJobLeaseRetirement = 47,
     BeforeJobStatusReplace = 48,
     BeforeJobLeaseRetirement = 49,
+    AfterResolutionTombstone = 50,
+    AfterResolutionExecutionRemoval = 51,
+    AfterResolutionIncomingRemoval = 52,
+    AfterResolutionVerifiedReceiptRemoval = 53,
+    AfterResolutionVerificationStageRemoval = 54,
+    AfterResolutionJobMutableRemoval = 55,
+    AfterResolutionJobStageRemoval = 56,
+    AfterResolutionAbsenceProof = 57,
+    AfterResolutionCleanupMarker = 58,
+    BeforeResolutionLeaseRelease = 59,
 }
 
 impl LayoutEntry {
@@ -619,6 +630,146 @@ pub struct CleanupReceipt {
     proof: CleanupProof,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ResolutionIdentity {
+    job_id: JobId,
+    client_id: ClientId,
+    lease_token: LeaseToken,
+    request_fingerprint: RequestFingerprint,
+    worker_name: String,
+    project_id: String,
+    worktree_id: String,
+    manifest_digest: String,
+    relative_working_dir: String,
+    timeout_millis: u64,
+    resource_class: String,
+    command_summary: CommandSummary,
+}
+
+impl fmt::Debug for ResolutionIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolutionIdentity")
+            .field("job_id", &self.job_id)
+            .field("client_id", &self.client_id)
+            .field("request_fingerprint", &self.request_fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolutionIdentity {
+    pub(crate) fn from_request(request: &ResolveOrAbandonRequest) -> Result<Self, WorkerError> {
+        request.validate()?;
+        Ok(Self {
+            job_id: request.job_id(),
+            client_id: request.client_id(),
+            lease_token: request.lease_token(),
+            request_fingerprint: request.request_fingerprint().clone(),
+            worker_name: request.worker_name().into(),
+            project_id: request.project_id().into(),
+            worktree_id: request.worktree_id().into(),
+            manifest_digest: request.manifest_digest().into(),
+            relative_working_dir: request.relative_working_dir().into(),
+            timeout_millis: request.timeout_millis(),
+            resource_class: request.resource_class().into(),
+            command_summary: request.command_summary().clone(),
+        })
+    }
+
+    pub(crate) fn job_id(&self) -> JobId {
+        self.job_id
+    }
+    pub(crate) fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+    pub(crate) fn lease_token(&self) -> LeaseToken {
+        self.lease_token
+    }
+    pub(crate) fn request_fingerprint(&self) -> &RequestFingerprint {
+        &self.request_fingerprint
+    }
+    pub(crate) fn worker_name(&self) -> &str {
+        &self.worker_name
+    }
+    pub(crate) fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub(crate) fn worktree_id(&self) -> &str {
+        &self.worktree_id
+    }
+    pub(crate) fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+    pub(crate) fn relative_working_dir(&self) -> &str {
+        &self.relative_working_dir
+    }
+    pub(crate) fn timeout_millis(&self) -> u64 {
+        self.timeout_millis
+    }
+    pub(crate) fn resource_class(&self) -> &str {
+        &self.resource_class
+    }
+    pub(crate) fn command_summary(&self) -> &CommandSummary {
+        &self.command_summary
+    }
+
+    pub(crate) fn token_hash(&self) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(self.lease_token.to_string().as_bytes())
+        )
+    }
+
+    pub(crate) fn matches_lease(&self, lease: &LeaseRecord) -> bool {
+        lease.job_id() == self.job_id
+            && lease.client_id() == self.client_id
+            && lease.lease_token() == self.lease_token
+            && lease.request_fingerprint() == &self.request_fingerprint
+            && lease.worker_name() == self.worker_name
+            && lease.project_id() == self.project_id
+            && lease.worktree_id() == self.worktree_id
+            && lease.manifest_digest() == self.manifest_digest
+            && lease.timeout_millis() == self.timeout_millis
+            && lease.resource_class() == self.resource_class
+            && lease.command_summary() == &self.command_summary
+    }
+
+    pub(crate) fn matches_disposition(&self, disposition: &JobDisposition) -> bool {
+        match disposition {
+            JobDisposition::Accepted {
+                job_id,
+                client_id,
+                project_id,
+                worktree_id,
+                request_fingerprint,
+                ..
+            } => {
+                *job_id == self.job_id
+                    && *client_id == self.client_id
+                    && project_id == &self.project_id
+                    && worktree_id == &self.worktree_id
+                    && request_fingerprint == &self.request_fingerprint
+            }
+            JobDisposition::Abandoned {
+                job_id,
+                client_id,
+                project_id,
+                worktree_id,
+                request_fingerprint,
+                lease_token_sha256,
+                ..
+            } => {
+                *job_id == self.job_id
+                    && *client_id == self.client_id
+                    && project_id == &self.project_id
+                    && worktree_id == &self.worktree_id
+                    && request_fingerprint == &self.request_fingerprint
+                    && lease_token_sha256 == &self.token_hash()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum CleanupProof {
     Terminal,
@@ -667,7 +818,11 @@ impl fmt::Debug for CleanupReceipt {
 struct CleanupMarker {
     job_id: JobId,
     client_id: ClientId,
+    project_id: String,
+    worktree_id: String,
+    manifest_digest: String,
     request_fingerprint: RequestFingerprint,
+    lease_token_sha256: String,
     terminal_or_abandoned: bool,
 }
 
@@ -1835,6 +1990,228 @@ impl HostStore {
         self.write_new_disposition(&disposition)
     }
 
+    pub(crate) fn record_resolution_abandoned_after(
+        &self,
+        guard: &AdmissionGuard,
+        identity: &ResolutionIdentity,
+        now: u64,
+    ) -> Result<(), WorkerError> {
+        guard.validate_for(identity.job_id())?;
+        let disposition = JobDisposition::Abandoned {
+            job_id: identity.job_id(),
+            client_id: identity.client_id(),
+            project_id: identity.project_id().into(),
+            worktree_id: identity.worktree_id().into(),
+            request_fingerprint: identity.request_fingerprint().clone(),
+            lease_token_sha256: identity.token_hash(),
+            recorded_at_millis: now,
+        };
+        self.write_new_disposition(&disposition)?;
+        if self.consume_fault(HostStoreWritePoint::AfterResolutionTombstone) {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected resolution tombstone interruption",
+            )));
+        }
+        guard.validate_for(identity.job_id())
+    }
+
+    pub(crate) fn remove_resolution_execution_after(
+        &self,
+        admission: &AdmissionGuard,
+        transfer: &TransferGuard,
+        identity: &ResolutionIdentity,
+        job: Option<&RootedDir>,
+    ) -> Result<(), WorkerError> {
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()?;
+        if let Some(job) = job {
+            job.verify_bound()?;
+            if job.entry_exists("execution.json")? {
+                job.remove_owned_regular("execution.json")?;
+                job.sync_root()?;
+            }
+        }
+        if self.consume_fault(HostStoreWritePoint::AfterResolutionExecutionRemoval) {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected resolution execution cleanup interruption",
+            )));
+        }
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()
+    }
+
+    pub(crate) fn remove_resolution_job_mutable_after(
+        &self,
+        admission: &AdmissionGuard,
+        transfer: &TransferGuard,
+        identity: &ResolutionIdentity,
+        job: Option<&RootedDir>,
+    ) -> Result<(), WorkerError> {
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()?;
+        if let Some(job) = job {
+            job.verify_bound()?;
+            for name in ["workspace", "home", "tmp"] {
+                if job.entry_exists(name)? {
+                    job.remove_owned_child(name)?;
+                }
+            }
+            job.sync_root()?;
+        }
+        if self.consume_fault(HostStoreWritePoint::AfterResolutionJobMutableRemoval) {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected resolution job cleanup interruption",
+            )));
+        }
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()
+    }
+
+    pub(crate) fn remove_resolution_staging_after(
+        &self,
+        admission: &AdmissionGuard,
+        transfer: &TransferGuard,
+        identity: &ResolutionIdentity,
+    ) -> Result<(), WorkerError> {
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()?;
+        let leases = self.open_directory("leases", false)?;
+        let stage_prefix = format!(".job-{}-", identity.job_id());
+        let exact_acquire = format!(".acquire-{}", identity.job_id());
+        let exact_released = format!(".released-{}", identity.job_id());
+        for name in leases.list_names()? {
+            let name = std::str::from_utf8(&name).map_err(|_| {
+                WorkerError::Protocol("lease namespace contains a non-UTF-8 entry".into())
+            })?;
+            let owned = if let Some(suffix) = name.strip_prefix(&stage_prefix) {
+                if !is_lower_hex(suffix, 32) {
+                    return Err(WorkerError::Protocol(
+                        "unsafe job-owned staging replacement".into(),
+                    ));
+                }
+                true
+            } else {
+                name == exact_acquire || name == exact_released
+            };
+            if owned {
+                leases.remove_owned_child(name)?;
+            }
+        }
+        leases.sync_root()?;
+        if self.consume_fault(HostStoreWritePoint::AfterResolutionJobStageRemoval) {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected resolution staging cleanup interruption",
+            )));
+        }
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()
+    }
+
+    pub(crate) fn record_resolution_cleanup_after(
+        &self,
+        admission: &AdmissionGuard,
+        transfer: &TransferGuard,
+        identity: &ResolutionIdentity,
+        job: Option<&RootedDir>,
+    ) -> Result<(), WorkerError> {
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()?;
+        let incoming = self.open_directory("incoming", false)?;
+        if incoming.entry_exists(&identity.job_id().to_string())? {
+            let job_incoming =
+                incoming.open_child_directory(&relative(&identity.job_id().to_string())?, false)?;
+            if job_incoming.entry_exists(&identity.lease_token().to_string())? {
+                return Err(WorkerError::Protocol(
+                    "exact incoming scope remains after resolution cleanup".into(),
+                ));
+            }
+        }
+        if let Some(job) = job {
+            job.verify_bound()?;
+            for name in ["workspace", "home", "tmp", "execution.json"] {
+                if job.entry_exists(name)? {
+                    return Err(WorkerError::Protocol(format!(
+                        "mutable resolution scope {name} remains"
+                    )));
+                }
+            }
+        }
+        let leases = self.open_directory("leases", false)?;
+        let stage_prefix = format!(".job-{}-", identity.job_id());
+        let exact_acquire = format!(".acquire-{}", identity.job_id());
+        let exact_released = format!(".released-{}", identity.job_id());
+        for name in leases.list_names()? {
+            let name = std::str::from_utf8(&name).map_err(|_| {
+                WorkerError::Protocol("lease namespace contains a non-UTF-8 entry".into())
+            })?;
+            if name.starts_with(&stage_prefix) || name == exact_acquire || name == exact_released {
+                return Err(WorkerError::Protocol(
+                    "resolution staging residue remains".into(),
+                ));
+            }
+        }
+        if self.consume_fault(HostStoreWritePoint::AfterResolutionAbsenceProof) {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected resolution absence proof interruption",
+            )));
+        }
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()
+    }
+
+    pub(crate) fn resolution_cleanup_receipt(
+        &self,
+        identity: &ResolutionIdentity,
+        lease: Option<&LeaseRecord>,
+    ) -> Result<Option<CleanupReceipt>, WorkerError> {
+        if let Some(lease) = lease
+            && !identity.matches_lease(lease)
+        {
+            return Err(protocol_code(
+                "JOB_ID_CONFLICT",
+                "live lease does not match resolution identity",
+            ));
+        }
+        let admission = self.admission_lock(identity.job_id())?;
+        let capacity = self.capacity_lock_after(&admission)?;
+        admission.validate_for(identity.job_id())?;
+        capacity.validate()?;
+        self.verify_resolution_identity_scopes_absent(identity)?;
+        let proof_dir = self.open_directory(&format!("locks/jobs/{}", identity.job_id()), true)?;
+        write_json_once(
+            &proof_dir,
+            "cleanup-complete.json",
+            &CleanupMarker {
+                job_id: identity.job_id(),
+                client_id: identity.client_id(),
+                project_id: identity.project_id().into(),
+                worktree_id: identity.worktree_id().into(),
+                manifest_digest: identity.manifest_digest().into(),
+                request_fingerprint: identity.request_fingerprint().clone(),
+                lease_token_sha256: identity.token_hash(),
+                terminal_or_abandoned: true,
+            },
+            "cleanup marker",
+        )?;
+        let marker: CleanupMarker = read_json_strict_at(&proof_dir, "cleanup-complete.json")?;
+        require_resolution_marker(&marker, identity)?;
+        if self.consume_fault(HostStoreWritePoint::AfterResolutionCleanupMarker) {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected resolution cleanup marker interruption",
+            )));
+        }
+        let Some(lease) = lease else {
+            return Ok(None);
+        };
+        Ok(Some(CleanupReceipt {
+            root_identity: self.root_identity()?,
+            job_id: lease.job_id(),
+            client_id: lease.client_id(),
+            lease_token: lease.lease_token(),
+            proof: CleanupProof::Abandoned,
+        }))
+    }
+
     pub(crate) fn remove_incoming_after(
         &self,
         admission: &AdmissionGuard,
@@ -1857,6 +2234,11 @@ impl HostStore {
                 incoming.remove_owned_child(&token)?;
                 incoming.sync_root()?;
             }
+        }
+        if self.consume_fault(HostStoreWritePoint::AfterResolutionIncomingRemoval) {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected resolution incoming cleanup interruption",
+            )));
         }
         admission.validate()?;
         transfer.validate()?;
@@ -2044,7 +2426,14 @@ impl HostStore {
             &CleanupMarker {
                 job_id: lease.job_id(),
                 client_id: lease.client_id(),
+                project_id: lease.project_id().into(),
+                worktree_id: lease.worktree_id().into(),
+                manifest_digest: lease.manifest_digest().into(),
                 request_fingerprint: lease.request_fingerprint().clone(),
+                lease_token_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(lease.lease_token().to_string().as_bytes())
+                ),
                 terminal_or_abandoned: true,
             },
             "cleanup marker",
@@ -2299,6 +2688,93 @@ impl HostStore {
         let stage_prefix = format!(".job-{}-", lease.job_id());
         let exact_acquire = format!(".acquire-{}", lease.job_id());
         let exact_released = format!(".released-{}", lease.job_id());
+        for name in leases.list_names()? {
+            let name = std::str::from_utf8(&name).map_err(|_| {
+                WorkerError::Protocol("lease namespace contains a non-UTF-8 entry".into())
+            })?;
+            if name.starts_with(&stage_prefix) || name == exact_acquire || name == exact_released {
+                return Err(WorkerError::Protocol(
+                    "operation-owned residue remains after cleanup".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_resolution_scopes_absent(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
+        let incoming = self.open_directory("incoming", false)?;
+        if incoming.entry_exists(&lease.job_id().to_string())? {
+            let job_incoming =
+                incoming.open_child_directory(&relative(&lease.job_id().to_string())?, false)?;
+            if job_incoming.entry_exists(&lease.lease_token().to_string())? {
+                return Err(WorkerError::Protocol(
+                    "exact incoming scope remains after cleanup".into(),
+                ));
+            }
+        }
+        if let Some(job) = self.open_optional_directory(&format!(
+            "jobs/{}/{}/{}",
+            lease.project_id(),
+            lease.worktree_id(),
+            lease.job_id()
+        ))? {
+            for name in ["workspace", "home", "tmp", "execution.json"] {
+                if job.entry_exists(name)? {
+                    return Err(WorkerError::Protocol(format!(
+                        "mutable job scope {name} remains after cleanup"
+                    )));
+                }
+            }
+        }
+        let leases = self.open_directory("leases", false)?;
+        let stage_prefix = format!(".job-{}-", lease.job_id());
+        let exact_acquire = format!(".acquire-{}", lease.job_id());
+        let exact_released = format!(".released-{}", lease.job_id());
+        for name in leases.list_names()? {
+            let name = std::str::from_utf8(&name).map_err(|_| {
+                WorkerError::Protocol("lease namespace contains a non-UTF-8 entry".into())
+            })?;
+            if name.starts_with(&stage_prefix) || name == exact_acquire || name == exact_released {
+                return Err(WorkerError::Protocol(
+                    "operation-owned residue remains after cleanup".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_resolution_identity_scopes_absent(
+        &self,
+        identity: &ResolutionIdentity,
+    ) -> Result<(), WorkerError> {
+        let incoming = self.open_directory("incoming", false)?;
+        if incoming.entry_exists(&identity.job_id().to_string())? {
+            let job_incoming =
+                incoming.open_child_directory(&relative(&identity.job_id().to_string())?, false)?;
+            if job_incoming.entry_exists(&identity.lease_token().to_string())? {
+                return Err(WorkerError::Protocol(
+                    "exact incoming scope remains after cleanup".into(),
+                ));
+            }
+        }
+        if let Some(job) = self.open_optional_directory(&format!(
+            "jobs/{}/{}/{}",
+            identity.project_id(),
+            identity.worktree_id(),
+            identity.job_id()
+        ))? {
+            for name in ["workspace", "home", "tmp", "execution.json"] {
+                if job.entry_exists(name)? {
+                    return Err(WorkerError::Protocol(format!(
+                        "mutable job scope {name} remains after cleanup"
+                    )));
+                }
+            }
+        }
+        let leases = self.open_directory("leases", false)?;
+        let stage_prefix = format!(".job-{}-", identity.job_id());
+        let exact_acquire = format!(".acquire-{}", identity.job_id());
+        let exact_released = format!(".released-{}", identity.job_id());
         for name in leases.list_names()? {
             let name = std::str::from_utf8(&name).map_err(|_| {
                 WorkerError::Protocol("lease namespace contains a non-UTF-8 entry".into())
@@ -2636,6 +3112,28 @@ fn disposition_job_id(disposition: &JobDisposition) -> JobId {
     }
 }
 
+fn require_resolution_marker(
+    marker: &CleanupMarker,
+    identity: &ResolutionIdentity,
+) -> Result<(), WorkerError> {
+    if marker.terminal_or_abandoned
+        && marker.job_id == identity.job_id()
+        && marker.client_id == identity.client_id()
+        && marker.project_id == identity.project_id()
+        && marker.worktree_id == identity.worktree_id()
+        && marker.manifest_digest == identity.manifest_digest()
+        && marker.request_fingerprint == *identity.request_fingerprint()
+        && marker.lease_token_sha256 == identity.token_hash()
+    {
+        Ok(())
+    } else {
+        Err(protocol_code(
+            "JOB_ID_CONFLICT",
+            "cleanup marker belongs to another immutable request",
+        ))
+    }
+}
+
 fn relative(path: &str) -> Result<RelativePath, WorkerError> {
     RelativePath::parse(path.as_bytes()).map_err(|error| WorkerError::Protocol(error.to_string()))
 }
@@ -2868,13 +3366,20 @@ impl CleanupReceipt {
                 "cleanup receipt belongs to another host root".into(),
             ));
         }
-        store.verify_job_mutable_scopes_absent(lease)?;
         let proof_dir = store.open_directory(&format!("locks/jobs/{}", lease.job_id()), false)?;
         let marker: CleanupMarker = read_json_strict_at(&proof_dir, "cleanup-complete.json")?;
+        let token_hash = format!(
+            "{:x}",
+            Sha256::digest(lease.lease_token().to_string().as_bytes())
+        );
         if !marker.terminal_or_abandoned
             || marker.job_id != lease.job_id()
             || marker.client_id != lease.client_id()
+            || marker.project_id != lease.project_id()
+            || marker.worktree_id != lease.worktree_id()
+            || marker.manifest_digest != lease.manifest_digest()
             || marker.request_fingerprint != *lease.request_fingerprint()
+            || marker.lease_token_sha256 != token_hash
         {
             return Err(WorkerError::Protocol(
                 "cleanup receipt is not durably valid".into(),
@@ -2882,6 +3387,7 @@ impl CleanupReceipt {
         }
         match &self.proof {
             CleanupProof::Terminal => {
+                store.verify_job_mutable_scopes_absent(lease)?;
                 let job_dir = store.open_directory(
                     &format!(
                         "jobs/{}/{}/{}",
@@ -2894,6 +3400,7 @@ impl CleanupReceipt {
                 validate_terminal_job_basis(store, &job_dir, lease, true)?;
             }
             CleanupProof::Abandoned => {
+                store.verify_resolution_scopes_absent(lease)?;
                 let disposition = store
                     .disposition(lease.job_id())?
                     .ok_or_else(|| WorkerError::Protocol("abandonment proof is absent".into()))?;

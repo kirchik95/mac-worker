@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     error::WorkerError,
     host_store::{
-        AdmissionGuard, HostStore, HostStoreWritePoint, JobDisposition, StagedJob, WorkspaceReceipt,
+        AdmissionGuard, HostStore, HostStoreWritePoint, JobDisposition, ResolutionIdentity,
+        StagedJob, TransferGuard, WorkspaceReceipt,
     },
     inputs::RelativePath,
     job::{ClientId, JobId, LeaseRecord, LeaseToken, RequestFingerprint},
@@ -318,6 +319,91 @@ impl<'a> RemoteSnapshotService<'a> {
         let snapshot = self.open_and_validate_cache(&live, receipt.verified_at_millis(), true)?;
         admission.validate_for(lease.job_id())?;
         Ok(snapshot)
+    }
+
+    pub(crate) fn validate_resolution_evidence_after(
+        &self,
+        admission: &AdmissionGuard,
+        transfer: &TransferGuard,
+        identity: &ResolutionIdentity,
+    ) -> Result<(), WorkerError> {
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()?;
+        let directory = self.store.open_directory("verified", false)?;
+        for name in [
+            format!("{}.json", identity.job_id()),
+            format!(".verify-{}.json.pending", identity.job_id()),
+        ] {
+            if directory.entry_exists(&name)? {
+                let bytes = directory
+                    .read_private_regular(&name, 1024 * 1024)
+                    .map_err(|_| unsafe_remote_snapshot())?;
+                let receipt: VerifiedReceipt = decode_canonical_json(&bytes, "verified receipt")?;
+                require_resolution_receipt(&receipt, identity)?;
+            }
+        }
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()
+    }
+
+    pub(crate) fn remove_resolution_evidence_after(
+        &self,
+        admission: &AdmissionGuard,
+        transfer: &TransferGuard,
+        identity: &ResolutionIdentity,
+    ) -> Result<(), WorkerError> {
+        self.validate_resolution_evidence_after(admission, transfer, identity)?;
+        let directory = self.store.open_directory("verified", false)?;
+        let receipt = format!("{}.json", identity.job_id());
+        if directory.entry_exists(&receipt)? {
+            directory.remove_owned_regular(&receipt)?;
+            directory.sync_root()?;
+        }
+        if self
+            .store
+            .consume_fault(HostStoreWritePoint::AfterResolutionVerifiedReceiptRemoval)
+        {
+            return Err(WorkerError::Io(io::Error::other(
+                "injected resolution verified-receipt cleanup interruption",
+            )));
+        }
+        let staging = format!(".verify-{}.json.pending", identity.job_id());
+        if directory.entry_exists(&staging)? {
+            directory.remove_owned_regular(&staging)?;
+            directory.sync_root()?;
+        }
+        if self
+            .store
+            .consume_fault(HostStoreWritePoint::AfterResolutionVerificationStageRemoval)
+        {
+            return Err(WorkerError::Io(io::Error::other(
+                "injected resolution verification-stage cleanup interruption",
+            )));
+        }
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()
+    }
+
+    pub(crate) fn resolution_evidence_absent_after(
+        &self,
+        admission: &AdmissionGuard,
+        transfer: &TransferGuard,
+        identity: &ResolutionIdentity,
+    ) -> Result<(), WorkerError> {
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()?;
+        let directory = self.store.open_directory("verified", false)?;
+        for name in [
+            format!("{}.json", identity.job_id()),
+            format!(".verify-{}.json.pending", identity.job_id()),
+        ] {
+            if directory.entry_exists(&name)? {
+                return Err(WorkerError::Protocol(
+                    "exact verified state remains after resolution cleanup".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn materialize_workspace(
@@ -1024,6 +1110,27 @@ fn validate_receipt_identity(
         return Err(lease_identity_mismatch());
     }
     Ok(())
+}
+
+fn require_resolution_receipt(
+    receipt: &VerifiedReceipt,
+    identity: &ResolutionIdentity,
+) -> Result<(), WorkerError> {
+    receipt.validate()?;
+    if receipt.job_id() == identity.job_id()
+        && receipt.client_id() == identity.client_id()
+        && receipt.lease_token_sha256() == identity.token_hash()
+        && receipt.request_fingerprint() == identity.request_fingerprint()
+        && receipt.cache_key().project_id() == identity.project_id()
+        && receipt.cache_key().worktree_id() == identity.worktree_id()
+        && receipt.cache_key().manifest_digest() == identity.manifest_digest()
+    {
+        Ok(())
+    } else {
+        Err(WorkerError::Protocol(
+            "JOB_ID_CONFLICT: verified state belongs to another immutable request".into(),
+        ))
+    }
 }
 
 fn receipt_identity_equal(left: &VerifiedReceipt, right: &VerifiedReceipt) -> bool {

@@ -8,12 +8,16 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     error::WorkerError,
-    host_store::{AdmissionGuard, HostStore, JobDisposition, SupervisorGuard},
+    host_store::{
+        AdmissionGuard, HostStore, HostStoreWritePoint, JobDisposition, ResolutionIdentity,
+        SupervisorGuard,
+    },
     inputs::RelativePath,
     job::{
         ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseRecord, LeaseToken,
         LogChunk, LogStream, ProcessIdentity, RequestFingerprint, RequestFingerprintMaterial,
-        StatusResponse, SubmitRequest, SubmitResponse,
+        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusResponse, SubmitRequest,
+        SubmitResponse,
     },
     lease::LeaseService,
     remote_snapshot::{RemoteSnapshotService, VerifiedRemoteSnapshot},
@@ -124,6 +128,36 @@ impl ExecutionPayload {
     pub(crate) fn command(&self) -> &CommandSpec {
         &self.command
     }
+
+    fn validate_for_resolution(&self, identity: &ResolutionIdentity) -> Result<(), WorkerError> {
+        let material = RequestFingerprintMaterial::new(
+            self.job_id,
+            self.client_id,
+            self.lease_token,
+            identity.worker_name().into(),
+            identity.project_id().into(),
+            identity.worktree_id().into(),
+            identity.manifest_digest().into(),
+            identity.relative_working_dir().into(),
+            identity.timeout_millis(),
+            identity.resource_class().into(),
+            self.command.clone(),
+        )?;
+        if self.version == EXECUTION_PAYLOAD_VERSION
+            && self.job_id == identity.job_id()
+            && self.client_id == identity.client_id()
+            && self.lease_token == identity.lease_token()
+            && self.request_fingerprint == *identity.request_fingerprint()
+            && material.fingerprint() == self.request_fingerprint
+            && self.command.summary()? == *identity.command_summary()
+        {
+            Ok(())
+        } else {
+            Err(job_id_conflict(
+                "incomplete execution payload belongs to another immutable request",
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +183,11 @@ pub trait SupervisorLauncher: Send + Sync {
 struct AuthoritativeJob {
     response: StatusResponse,
     directory: RootedDir,
+}
+
+enum ResolutionFinal {
+    Complete,
+    Incomplete(RootedDir),
 }
 
 impl AuthoritativeJob {
@@ -281,6 +320,375 @@ impl<'a> JobService<'a> {
     pub fn reconcile_job(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
         self.authoritative_job_with_supervisor_ensure(job_id, true)
             .map(AuthoritativeJob::into_response)
+    }
+
+    pub fn resolve_or_abandon(
+        &self,
+        request: ResolveOrAbandonRequest,
+    ) -> Result<ResolveOrAbandonResponse, WorkerError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| WorkerError::Protocol("system clock precedes the Unix epoch".into()))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| {
+                WorkerError::Protocol("system clock is outside the supported range".into())
+            })?;
+        self.resolve_or_abandon_at(request, now, true)
+    }
+
+    pub(crate) fn resolve_or_abandon_at(
+        &self,
+        request: ResolveOrAbandonRequest,
+        now: u64,
+        ensure_supervisor: bool,
+    ) -> Result<ResolveOrAbandonResponse, WorkerError> {
+        request.validate()?;
+        let identity = ResolutionIdentity::from_request(&request)?;
+        self.store.validate_layout()?;
+        let admission = self.store.admission_lock(identity.job_id())?;
+        admission.validate_for(identity.job_id())?;
+
+        let disposition = self.store.disposition(identity.job_id())?;
+        if let Some(disposition @ JobDisposition::Accepted { .. }) = disposition {
+            self.require_resolution_accepted_after(&admission, &identity, &disposition)?;
+            let authoritative =
+                self.status_from_accepted_after(admission, disposition, ensure_supervisor)?;
+            require_resolution_response(&identity, &authoritative.response)?;
+            return ResolveOrAbandonResponse::accepted(authoritative.into_response());
+        }
+        if let Some(disposition @ JobDisposition::Abandoned { .. }) = disposition.as_ref()
+            && !identity.matches_disposition(disposition)
+        {
+            return Err(job_id_conflict(
+                "abandonment belongs to another immutable request",
+            ));
+        }
+
+        let live = self.resolution_live_after(&admission, &identity)?;
+        if matches!(
+            self.classify_resolution_final(&identity)?,
+            Some(ResolutionFinal::Complete)
+        ) {
+            if disposition.is_some() || live.is_none() {
+                return Err(job_id_conflict(
+                    "complete accepted evidence conflicts with abandonment state",
+                ));
+            }
+            let authoritative = self.status_without_disposition_after(
+                admission,
+                identity.job_id(),
+                ensure_supervisor,
+            )?;
+            require_resolution_response(&identity, &authoritative.response)?;
+            return ResolveOrAbandonResponse::accepted(authoritative.into_response());
+        }
+
+        let transfer = self
+            .store
+            .transfer_lock_after(&admission, identity.job_id())?;
+        admission.validate_for(identity.job_id())?;
+        transfer.validate()?;
+
+        let disposition = self.store.disposition(identity.job_id())?;
+        if let Some(disposition @ JobDisposition::Accepted { .. }) = disposition {
+            self.require_resolution_accepted_after(&admission, &identity, &disposition)?;
+            drop(transfer);
+            let authoritative =
+                self.status_from_accepted_after(admission, disposition, ensure_supervisor)?;
+            require_resolution_response(&identity, &authoritative.response)?;
+            return ResolveOrAbandonResponse::accepted(authoritative.into_response());
+        }
+        if let Some(disposition @ JobDisposition::Abandoned { .. }) = disposition.as_ref()
+            && !identity.matches_disposition(disposition)
+        {
+            return Err(job_id_conflict(
+                "abandonment belongs to another immutable request",
+            ));
+        }
+        let live_after_wait = self.resolution_live_after(&admission, &identity)?;
+        let live = match (live, live_after_wait) {
+            (Some(before), Some(after)) if before == after => Some(after),
+            (None, Some(after)) => Some(after),
+            (Some(_), None) => {
+                return Err(job_id_conflict(
+                    "exact live lease disappeared before abandonment selection",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(job_id_conflict(
+                    "live lease changed before abandonment selection",
+                ));
+            }
+            (None, None) => None,
+        };
+
+        let final_job = match self.classify_resolution_final(&identity)? {
+            Some(ResolutionFinal::Complete) => {
+                if disposition.is_some() || live.is_none() {
+                    return Err(job_id_conflict(
+                        "complete accepted evidence conflicts with abandonment state",
+                    ));
+                }
+                drop(transfer);
+                let authoritative = self.status_without_disposition_after(
+                    admission,
+                    identity.job_id(),
+                    ensure_supervisor,
+                )?;
+                require_resolution_response(&identity, &authoritative.response)?;
+                return ResolveOrAbandonResponse::accepted(authoritative.into_response());
+            }
+            Some(ResolutionFinal::Incomplete(job)) => Some(job),
+            None => None,
+        };
+
+        self.snapshots
+            .validate_resolution_evidence_after(&admission, &transfer, &identity)?;
+        if disposition.is_none()
+            && let Err(error) = self
+                .store
+                .record_resolution_abandoned_after(&admission, &identity, now)
+        {
+            return match self.store.disposition(identity.job_id()) {
+                Ok(Some(disposition)) if identity.matches_disposition(&disposition) => {
+                    ResolveOrAbandonResponse::cleanup_pending("MUTABLE_CLEANUP_FAILED")
+                }
+                _ => Err(error),
+            };
+        }
+
+        let cleanup = (|| {
+            self.store.remove_resolution_execution_after(
+                &admission,
+                &transfer,
+                &identity,
+                final_job.as_ref(),
+            )?;
+            self.store.remove_incoming_after(
+                &admission,
+                &transfer,
+                identity.job_id(),
+                identity.lease_token(),
+            )?;
+            self.snapshots
+                .remove_resolution_evidence_after(&admission, &transfer, &identity)?;
+            self.store.remove_resolution_job_mutable_after(
+                &admission,
+                &transfer,
+                &identity,
+                final_job.as_ref(),
+            )?;
+            self.store
+                .remove_resolution_staging_after(&admission, &transfer, &identity)?;
+            self.snapshots
+                .resolution_evidence_absent_after(&admission, &transfer, &identity)?;
+            self.store.record_resolution_cleanup_after(
+                &admission,
+                &transfer,
+                &identity,
+                final_job.as_ref(),
+            )
+        })();
+        if cleanup.is_err() {
+            return ResolveOrAbandonResponse::cleanup_pending("MUTABLE_CLEANUP_FAILED");
+        }
+        drop(transfer);
+        drop(admission);
+
+        let receipt = match self
+            .store
+            .resolution_cleanup_receipt(&identity, live.as_ref())
+        {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                return ResolveOrAbandonResponse::cleanup_pending("MUTABLE_CLEANUP_FAILED");
+            }
+        };
+        if let (Some(lease), Some(receipt)) = (live, receipt) {
+            if self
+                .store
+                .consume_fault(HostStoreWritePoint::BeforeResolutionLeaseRelease)
+            {
+                return ResolveOrAbandonResponse::cleanup_pending("LEASE_RELEASE_FAILED");
+            }
+            if self.leases.release_after_cleanup(&lease, &receipt).is_err() {
+                return ResolveOrAbandonResponse::cleanup_pending("LEASE_RELEASE_FAILED");
+            }
+        }
+        Ok(ResolveOrAbandonResponse::abandoned())
+    }
+
+    fn resolution_live_after(
+        &self,
+        admission: &AdmissionGuard,
+        identity: &ResolutionIdentity,
+    ) -> Result<Option<LeaseRecord>, WorkerError> {
+        let Some(live) = self.leases.load_after(admission, identity.job_id())? else {
+            return Ok(None);
+        };
+        if live.job_id() == identity.job_id() {
+            if identity.matches_lease(&live) {
+                Ok(Some(live))
+            } else {
+                Err(job_id_conflict(
+                    "live lease belongs to another immutable request",
+                ))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn classify_resolution_final(
+        &self,
+        identity: &ResolutionIdentity,
+    ) -> Result<Option<ResolutionFinal>, WorkerError> {
+        let job = match self.store.open_directory(
+            &format!(
+                "jobs/{}/{}/{}",
+                identity.project_id(),
+                identity.worktree_id(),
+                identity.job_id()
+            ),
+            false,
+        ) {
+            Ok(job) => job,
+            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(_) => return Err(job_id_conflict("final job evidence is unsafe")),
+        };
+        let names = job
+            .list_names()
+            .map_err(|_| job_id_conflict("final job layout is unsafe"))?
+            .into_iter()
+            .map(|name| {
+                String::from_utf8(name)
+                    .map_err(|_| job_id_conflict("final job has a non-UTF-8 entry"))
+            })
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        let allowed = [
+            ".mac-worker-rooted-fs",
+            "execution.json",
+            "home",
+            "meta.json",
+            "status.json",
+            "stderr.log",
+            "stdout.log",
+            "tmp",
+            "workspace",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<std::collections::BTreeSet<_>>();
+        if !names.is_subset(&allowed) {
+            return Err(job_id_conflict("final job contains unrelated evidence"));
+        }
+
+        let meta = if job.entry_exists("meta.json")? {
+            let meta: JobMeta = read_canonical_json(&job, "meta.json")
+                .map_err(|_| job_id_conflict("incomplete final metadata is invalid"))?;
+            require_resolution_meta(identity, &meta)?;
+            Some(meta)
+        } else {
+            None
+        };
+        let payload_present = job.entry_exists("execution.json")?;
+        if payload_present {
+            let payload: ExecutionPayload = read_canonical_json(&job, "execution.json")
+                .map_err(|_| job_id_conflict("incomplete execution payload is invalid"))?;
+            payload.validate_for_resolution(identity)?;
+        }
+        let status_present = job.entry_exists("status.json")?;
+        if status_present {
+            let status: JobStatus = read_canonical_json(&job, "status.json")
+                .map_err(|_| job_id_conflict("incomplete final status is invalid"))?;
+            let meta = meta.as_ref().ok_or_else(|| {
+                job_id_conflict("status without exact metadata cannot prove final ownership")
+            })?;
+            let expected = JobStatus::accepted(meta.created_at_millis())
+                .map_err(|_| job_id_conflict("incomplete acceptance timestamp is invalid"))?;
+            if status != expected {
+                return Err(job_id_conflict(
+                    "started or terminal final evidence cannot be abandoned",
+                ));
+            }
+        }
+        if meta.is_none() && !payload_present {
+            return Err(job_id_conflict(
+                "final job has no positive immutable ownership proof",
+            ));
+        }
+        for directory in ["home", "tmp", "workspace"] {
+            if job.entry_exists(directory)? {
+                job.open_child_directory(&relative(directory)?, false)
+                    .map_err(|_| job_id_conflict("final mutable directory is unsafe"))?;
+            }
+        }
+        for log in ["stdout.log", "stderr.log"] {
+            if job.entry_exists(log)? {
+                let file = job
+                    .open_private_append(log)
+                    .map_err(|_| job_id_conflict("final log is unsafe"))?;
+                if job
+                    .validate_private_append_binding(log, &file)
+                    .map_err(|_| job_id_conflict("final log binding is unsafe"))?
+                    != 0
+                {
+                    return Err(job_id_conflict(
+                        "nonempty unindexed logs are possible launch evidence",
+                    ));
+                }
+            }
+        }
+        let complete = [
+            "execution.json",
+            "home",
+            "meta.json",
+            "status.json",
+            "stderr.log",
+            "stdout.log",
+            "tmp",
+            "workspace",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<std::collections::BTreeSet<_>>();
+        Ok(Some(if names == complete {
+            ResolutionFinal::Complete
+        } else {
+            ResolutionFinal::Incomplete(job)
+        }))
+    }
+
+    fn require_resolution_accepted_after(
+        &self,
+        admission: &AdmissionGuard,
+        identity: &ResolutionIdentity,
+        disposition: &JobDisposition,
+    ) -> Result<(), WorkerError> {
+        admission.validate_for(identity.job_id())?;
+        if !identity.matches_disposition(disposition) {
+            return Err(job_id_conflict(
+                "accepted disposition belongs to another immutable request",
+            ));
+        }
+        let job = self
+            .store
+            .open_directory(
+                &format!(
+                    "jobs/{}/{}/{}",
+                    identity.project_id(),
+                    identity.worktree_id(),
+                    identity.job_id()
+                ),
+                false,
+            )
+            .map_err(|_| job_id_conflict("accepted final job is absent or unsafe"))?;
+        let meta: JobMeta = read_canonical_json(&job, "meta.json")
+            .map_err(|_| job_id_conflict("accepted metadata is invalid"))?;
+        require_resolution_meta(identity, &meta)
     }
 
     fn authoritative_job_with_supervisor_ensure(
@@ -1544,6 +1952,43 @@ fn relative(path: &str) -> Result<RelativePath, WorkerError> {
 
 fn protocol_code(code: &'static str, message: &str) -> WorkerError {
     WorkerError::Protocol(format!("{code}: {message}"))
+}
+
+fn job_id_conflict(message: &str) -> WorkerError {
+    protocol_code("JOB_ID_CONFLICT", message)
+}
+
+fn require_resolution_meta(
+    identity: &ResolutionIdentity,
+    meta: &JobMeta,
+) -> Result<(), WorkerError> {
+    meta.validate()?;
+    if meta.job_id() == identity.job_id()
+        && meta.client_id() == identity.client_id()
+        && meta.request_fingerprint() == identity.request_fingerprint()
+        && meta.worker_name() == identity.worker_name()
+        && meta.project_id() == identity.project_id()
+        && meta.worktree_id() == identity.worktree_id()
+        && meta.manifest_digest() == identity.manifest_digest()
+        && meta.relative_working_dir() == identity.relative_working_dir()
+        && meta.timeout_millis() == identity.timeout_millis()
+        && meta.resource_class() == identity.resource_class()
+        && meta.command_summary() == identity.command_summary()
+    {
+        Ok(())
+    } else {
+        Err(job_id_conflict(
+            "accepted metadata belongs to another immutable request",
+        ))
+    }
+}
+
+fn require_resolution_response(
+    identity: &ResolutionIdentity,
+    response: &StatusResponse,
+) -> Result<(), WorkerError> {
+    response.validate()?;
+    require_resolution_meta(identity, response.meta())
 }
 
 fn job_state_invalid(message: &str) -> WorkerError {

@@ -16,7 +16,11 @@ use crate::{
     config::WorkerEntry,
     error::{ProcessError, ProcessStream, WorkerError},
     host_store::{HostStore, JobDisposition},
-    job::{ClientId, JobId, LeaseAcquireRequest, LeaseRecord, LeaseToken, RequestFingerprint},
+    job::{
+        ClientId, JobId, LeaseAcquireRequest, LeaseRecord, LeaseToken, RequestFingerprint,
+        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, SubmitRequest,
+    },
+    job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     rooted_fs::RootedDir,
     snapshot::Snapshot,
@@ -249,6 +253,21 @@ pub struct HostTransferService<'a> {
     store: &'a HostStore,
 }
 
+struct TransferResolutionLauncher;
+
+impl SupervisorLauncher for TransferResolutionLauncher {
+    fn launch(
+        &self,
+        _job_id: JobId,
+        _guard: crate::host_store::SupervisorGuard,
+    ) -> Result<LaunchCandidate, WorkerError> {
+        Err(host_transfer_error(
+            "JOB_ACCEPTED",
+            "accepted resolution cannot launch through transfer cleanup",
+        ))
+    }
+}
+
 impl<'a> HostTransferService<'a> {
     pub fn new(store: &'a HostStore) -> Self {
         Self { store }
@@ -265,6 +284,12 @@ impl<'a> HostTransferService<'a> {
         self.store.validate_layout()?;
         let admission = self.store.admission_lock(identity.job_id)?;
         admission.validate()?;
+        if crate::lease::LeaseService::new(self.store)
+            .load()?
+            .is_none()
+        {
+            require_receivable_identity_disposition(self.store, identity)?;
+        }
         let live = require_live_identity(self.store, identity)?;
         require_receivable_disposition(self.store, &live)?;
         let transfer = self
@@ -296,32 +321,43 @@ impl<'a> HostTransferService<'a> {
         now: u64,
     ) -> Result<AbandonTransferResult, WorkerError> {
         request.validate()?;
-        let identity = TransferIdentity::from_acquire_request(request)?;
-        self.store.validate_layout()?;
-        let admission = self.store.admission_lock(identity.job_id)?;
-        admission.validate()?;
-        let live = require_live_identity(self.store, &identity)?;
-        require_abandonable_disposition(self.store, &live)?;
-        let transfer = self
-            .store
-            .transfer_lock_after(&admission, identity.job_id)?;
-        admission.validate()?;
-        transfer.validate()?;
-        let live = require_live_identity(self.store, &identity)?;
-        let existing = require_abandonable_disposition(self.store, &live)?;
-        if !existing {
-            self.store
-                .record_abandoned_after(&admission, request, now)?;
+        if let Some(disposition) = self.store.disposition(request.material().job_id())? {
+            match disposition {
+                JobDisposition::Accepted {
+                    client_id,
+                    project_id,
+                    worktree_id,
+                    request_fingerprint,
+                    ..
+                } if client_id == request.material().client_id()
+                    && project_id == request.material().project_id()
+                    && worktree_id == request.material().worktree_id()
+                    && request_fingerprint == *request.request_fingerprint() =>
+                {
+                    return Err(host_transfer_error(
+                        "JOB_ACCEPTED",
+                        "job ID was already accepted",
+                    ));
+                }
+                JobDisposition::Accepted { .. } => return Err(job_id_conflict()),
+                JobDisposition::Abandoned { .. } => {}
+            }
         }
-        admission.validate()?;
-        transfer.validate()?;
-        self.store.remove_incoming_after(
-            &admission,
-            &transfer,
-            identity.job_id,
-            identity.lease_token,
-        )?;
-        Ok(AbandonTransferResult::Abandoned)
+        let submit = SubmitRequest::new(request.material().clone());
+        let resolve = ResolveOrAbandonRequest::from_submit_request(&submit)?;
+        let response = JobService::new(self.store, &TransferResolutionLauncher)
+            .resolve_or_abandon_at(resolve, now, false)?;
+        match response.outcome() {
+            ResolveOrAbandonOutcome::Abandoned => Ok(AbandonTransferResult::Abandoned),
+            ResolveOrAbandonOutcome::Accepted { .. } => Err(host_transfer_error(
+                "JOB_ACCEPTED",
+                "job ID was already accepted",
+            )),
+            ResolveOrAbandonOutcome::CleanupPending { .. } => Err(host_transfer_error(
+                "CLEANUP_PENDING",
+                "exact abandonment cleanup is pending",
+            )),
+        }
     }
 }
 
@@ -572,29 +608,51 @@ fn require_receivable_disposition(
     }
 }
 
-fn require_abandonable_disposition(
+fn require_receivable_identity_disposition(
     store: &HostStore,
-    live: &LeaseRecord,
-) -> Result<bool, WorkerError> {
-    match store.disposition(live.job_id())? {
-        None => Ok(false),
-        Some(disposition @ JobDisposition::Abandoned { .. }) => {
-            if disposition_matches_live_lease(&disposition, live) {
-                Ok(true)
-            } else {
-                Err(job_id_conflict())
-            }
-        }
-        Some(disposition @ JobDisposition::Accepted { .. }) => {
-            if disposition_matches_live_lease(&disposition, live) {
+    identity: &TransferIdentity,
+) -> Result<(), WorkerError> {
+    match store.disposition(identity.job_id())? {
+        None => Ok(()),
+        Some(JobDisposition::Abandoned {
+            job_id,
+            client_id,
+            request_fingerprint,
+            lease_token_sha256,
+            ..
+        }) => {
+            let token_hash = format!(
+                "{:x}",
+                Sha256::digest(identity.lease_token.to_string().as_bytes())
+            );
+            if job_id == identity.job_id
+                && client_id == identity.client_id
+                && request_fingerprint == identity.request_fingerprint
+                && lease_token_sha256 == token_hash
+            {
                 Err(host_transfer_error(
-                    "JOB_ACCEPTED",
-                    "job ID was already accepted",
+                    "JOB_ABANDONED",
+                    "job ID was permanently abandoned",
                 ))
             } else {
                 Err(job_id_conflict())
             }
         }
+        Some(JobDisposition::Accepted {
+            job_id,
+            client_id,
+            request_fingerprint,
+            ..
+        }) if job_id == identity.job_id
+            && client_id == identity.client_id
+            && request_fingerprint == identity.request_fingerprint =>
+        {
+            Err(host_transfer_error(
+                "JOB_ACCEPTED",
+                "job ID was already accepted",
+            ))
+        }
+        Some(JobDisposition::Accepted { .. }) => Err(job_id_conflict()),
     }
 }
 

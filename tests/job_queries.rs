@@ -17,9 +17,10 @@ use std::{
 use mac_worker::{
     host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
     job::{
-        CommandSpec, JobId, JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseRecord, LogChunk, LogCursor, LogStream, ProcessIdentity, RequestFingerprintMaterial,
-        StatusResponse, SubmitRequest, TerminalLogDrain,
+        ClientId, CommandSpec, JobId, JobState, JobStatus, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk, LogCursor, LogStream,
+        ProcessIdentity, RequestFingerprintMaterial, ResolveOrAbandonOutcome,
+        ResolveOrAbandonRequest, StatusResponse, SubmitRequest, TerminalLogDrain,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
@@ -385,6 +386,358 @@ fn status_reports_a_permanently_abandoned_job() {
         .unwrap_err();
 
     assert!(error.to_string().contains("JOB_ABANDONED"), "{error}");
+}
+
+#[test]
+fn resolve_without_a_live_lease_fences_delayed_acquire_and_executes_nothing() {
+    // Break caught: resolution treats status/lease absence as an ordinary miss
+    // instead of durably fencing the same immutable request before returning.
+    let temp = tempfile::tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let acquire = lease_request();
+    let submit = SubmitRequest::new(acquire.material().clone());
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+
+    let response = JobService::new(&store, &RejectLauncher)
+        .resolve_or_abandon(request)
+        .unwrap();
+
+    assert!(
+        matches!(response.outcome(), ResolveOrAbandonOutcome::Abandoned),
+        "{response:?}"
+    );
+    assert!(
+        store
+            .job_index(acquire.material().job_id())
+            .unwrap()
+            .is_file()
+    );
+    let delayed = LeaseService::new(&store)
+        .acquire(&acquire, &healthy(), 2)
+        .unwrap_err();
+    assert!(delayed.to_string().contains("JOB_ABANDONED"), "{delayed}");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
+fn resolve_removes_exact_verified_state_keeps_cache_and_retires_the_lease() {
+    // Break caught: abandonment proves only incoming cleanup, leaving the
+    // exact verified receipt/staging or a live heavy lease behind.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, submit) = prepared_host(&root);
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let receipt = store.verified_receipt(lease.job_id()).unwrap();
+    let cache = store
+        .snapshot(
+            lease.project_id(),
+            lease.worktree_id(),
+            lease.manifest_digest(),
+        )
+        .unwrap();
+    assert!(receipt.is_file());
+    assert!(cache.is_dir());
+
+    let response = JobService::new(&store, &RejectLauncher)
+        .resolve_or_abandon(request.clone())
+        .unwrap();
+
+    assert!(
+        matches!(response.outcome(), ResolveOrAbandonOutcome::Abandoned),
+        "{response:?}"
+    );
+    assert!(!receipt.exists());
+    assert!(cache.is_dir(), "immutable cache must survive abandonment");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    let retry = JobService::new(&store, &RejectLauncher)
+        .resolve_or_abandon(request)
+        .unwrap();
+    assert!(matches!(
+        retry.outcome(),
+        ResolveOrAbandonOutcome::Abandoned
+    ));
+}
+
+#[test]
+fn resolve_release_failure_is_cleanup_pending_and_exact_retry_finishes() {
+    // Break caught: a post-proof release failure is reported as abandonment,
+    // drops the lease, or cannot resume from the durable tombstone.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let acquire = lease_request();
+    LeaseService::new(&store)
+        .acquire(&acquire, &healthy(), 1)
+        .unwrap();
+    let submit = SubmitRequest::new(acquire.material().clone());
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    drop(store);
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::BeforeJobLeaseRetirement)
+            .unwrap();
+
+    let pending = JobService::new(&faulted, &RejectLauncher)
+        .resolve_or_abandon(request.clone())
+        .unwrap();
+    assert!(matches!(
+        pending.outcome(),
+        ResolveOrAbandonOutcome::CleanupPending { code }
+            if code == "LEASE_RELEASE_FAILED"
+    ));
+    assert!(
+        faulted
+            .job_index(acquire.material().job_id())
+            .unwrap()
+            .is_file()
+    );
+    assert!(LeaseService::new(&faulted).load().unwrap().is_some());
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let completed = JobService::new(&reopened, &RejectLauncher)
+        .resolve_or_abandon(request)
+        .unwrap();
+    assert!(matches!(
+        completed.outcome(),
+        ResolveOrAbandonOutcome::Abandoned
+    ));
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+}
+
+#[test]
+fn complete_preindex_accepted_job_wins_resolution_and_repairs_the_index() {
+    // Break caught: a resolver deletes a complete accepted crash-window job
+    // or tombstones it instead of repairing its permanent accepted locator.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, submit) = unindexed_identityless_job(&root);
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launcher = HoldingRecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap(),
+        identity: identity(49_001),
+        guard: Mutex::new(None),
+    };
+
+    let response = JobService::new(&store, &launcher)
+        .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&submit).unwrap())
+        .unwrap();
+
+    assert!(
+        matches!(response.outcome(), ResolveOrAbandonOutcome::Accepted { .. }),
+        "{response:?}"
+    );
+    assert!(store.job_index(lease.job_id()).unwrap().is_file());
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    drop(launcher.guard.lock().unwrap().take());
+}
+
+#[test]
+fn exact_identity_bearing_incomplete_final_is_cleaned_before_release() {
+    // Break caught: every incomplete final is treated as a conflict even when
+    // its durable identity records positively bind it to this exact request.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, submit) = unindexed_identityless_job(&root);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    remove_and_sync(&job.join("status.json"));
+
+    let response = JobService::new(&store, &RejectLauncher)
+        .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&submit).unwrap())
+        .unwrap();
+
+    assert!(matches!(
+        response.outcome(),
+        ResolveOrAbandonOutcome::Abandoned
+    ));
+    for name in ["execution.json", "workspace", "home", "tmp"] {
+        assert!(!job.join(name).exists(), "{name} survived exact cleanup");
+    }
+    assert!(job.join("meta.json").is_file());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
+fn conflicting_incomplete_final_is_preserved_without_a_tombstone() {
+    // Break caught: final-job path ownership is inferred from its name and a
+    // resolver deletes mutable state belonging to a conflicting request.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, submit) = unindexed_identityless_job(&root);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    remove_and_sync(&job.join("status.json"));
+    let original_meta = fs::read(job.join("meta.json")).unwrap();
+    let conflicting = String::from_utf8(original_meta.clone())
+        .unwrap()
+        .replace(CLIENT_ID, "302f0f4a6b5c7d8e9f00112233445566")
+        .into_bytes();
+    replace_bytes(&job.join("meta.json"), &conflicting).unwrap();
+
+    let error = JobService::new(&store, &RejectLauncher)
+        .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&submit).unwrap())
+        .unwrap_err();
+
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
+    assert_eq!(fs::read(job.join("meta.json")).unwrap(), conflicting);
+    assert!(job.join("workspace").is_dir());
+    assert!(job.join("execution.json").is_file());
+    assert!(!store.job_index(lease.job_id()).unwrap().exists());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+}
+
+#[test]
+fn every_resolution_cleanup_boundary_is_retryable_and_keeps_the_exact_lease() {
+    // Break caught: any durable cleanup boundary retires capacity too early or
+    // loses the tombstone needed for an exact idempotent retry.
+    for point in [
+        HostStoreWritePoint::AfterResolutionTombstone,
+        HostStoreWritePoint::AfterResolutionExecutionRemoval,
+        HostStoreWritePoint::AfterResolutionIncomingRemoval,
+        HostStoreWritePoint::AfterResolutionVerifiedReceiptRemoval,
+        HostStoreWritePoint::AfterResolutionVerificationStageRemoval,
+        HostStoreWritePoint::AfterResolutionJobMutableRemoval,
+        HostStoreWritePoint::AfterResolutionJobStageRemoval,
+        HostStoreWritePoint::AfterResolutionAbsenceProof,
+        HostStoreWritePoint::AfterResolutionCleanupMarker,
+        HostStoreWritePoint::BeforeResolutionLeaseRelease,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(format!("host-{}", point as u8));
+        let sentinel = temp.path().join("unrelated");
+        fs::write(&sentinel, b"preserve").unwrap();
+        let (store, lease, submit) = prepared_host(&root);
+        let cache = store
+            .snapshot(
+                lease.project_id(),
+                lease.worktree_id(),
+                lease.manifest_digest(),
+            )
+            .unwrap();
+        drop(store);
+        let faulted = HostStore::open_with_write_fault(&root, point).unwrap();
+        let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+
+        let pending = JobService::new(&faulted, &RejectLauncher)
+            .resolve_or_abandon(request.clone())
+            .unwrap();
+        let expected = if point == HostStoreWritePoint::BeforeResolutionLeaseRelease {
+            "LEASE_RELEASE_FAILED"
+        } else {
+            "MUTABLE_CLEANUP_FAILED"
+        };
+        assert!(
+            matches!(
+                pending.outcome(),
+                ResolveOrAbandonOutcome::CleanupPending { code } if code == expected
+            ),
+            "{point:?}: {pending:?}"
+        );
+        assert!(faulted.job_index(lease.job_id()).unwrap().is_file());
+        assert_eq!(
+            LeaseService::new(&faulted).load().unwrap(),
+            Some(lease.clone()),
+            "{point:?}"
+        );
+        assert!(cache.is_dir(), "{point:?}");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve", "{point:?}");
+        drop(faulted);
+
+        let reopened = HostStore::open(&root).unwrap();
+        let completed = JobService::new(&reopened, &RejectLauncher)
+            .resolve_or_abandon(request)
+            .unwrap();
+        assert!(
+            matches!(completed.outcome(), ResolveOrAbandonOutcome::Abandoned),
+            "{point:?}: {completed:?}"
+        );
+        assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+        assert!(cache.is_dir(), "{point:?}");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve", "{point:?}");
+    }
+}
+
+#[test]
+fn response_loss_after_durable_retirement_retries_abandoned_without_resurrection() {
+    // Break caught: the post-retirement crash seam recreates or wedges the
+    // heavy slot, or a retry cannot recognize completed abandonment.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, _lease, submit) = prepared_host(&root);
+    drop(store);
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobLeaseRetirement)
+            .unwrap();
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+
+    let first = JobService::new(&faulted, &RejectLauncher)
+        .resolve_or_abandon(request.clone())
+        .unwrap();
+    assert!(matches!(
+        first.outcome(),
+        ResolveOrAbandonOutcome::Abandoned
+    ));
+    assert_eq!(LeaseService::new(&faulted).load().unwrap(), None);
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let retry = JobService::new(&reopened, &RejectLauncher)
+        .resolve_or_abandon(request)
+        .unwrap();
+    assert!(matches!(
+        retry.outcome(),
+        ResolveOrAbandonOutcome::Abandoned
+    ));
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+}
+
+#[test]
+fn mismatched_tombstone_retry_is_a_conflict_and_preserves_the_winner() {
+    // Break caught: an existing tombstone is treated as job-ID-only authority
+    // and a different immutable request receives idempotent abandonment.
+    let temp = tempfile::tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let original = lease_request();
+    let original_submit = SubmitRequest::new(original.material().clone());
+    let original_resolve = ResolveOrAbandonRequest::from_submit_request(&original_submit).unwrap();
+    JobService::new(&store, &RejectLauncher)
+        .resolve_or_abandon(original_resolve)
+        .unwrap();
+    let changed = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            original.material().job_id(),
+            ClientId::new(uuid::Uuid::from_u128(77_001)),
+            LeaseToken::new(uuid::Uuid::from_u128(77_002)),
+            original.material().worker_name().into(),
+            original.material().project_id().into(),
+            original.material().worktree_id().into(),
+            original.material().manifest_digest().into(),
+            original.material().relative_working_dir().into(),
+            original.material().timeout_millis(),
+            original.material().resource_class().into(),
+            original.material().command().clone(),
+        )
+        .unwrap(),
+    );
+    let changed_submit = SubmitRequest::new(changed.material().clone());
+
+    let error = JobService::new(&store, &RejectLauncher)
+        .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&changed_submit).unwrap())
+        .unwrap_err();
+
+    assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert!(
+        store
+            .job_index(original.material().job_id())
+            .unwrap()
+            .is_file()
+    );
 }
 
 #[test]
