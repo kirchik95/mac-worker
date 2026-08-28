@@ -1,7 +1,8 @@
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::Write as _,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::{
         Arc, Barrier, Mutex,
@@ -22,7 +23,10 @@ use mac_worker::{
     lease::{AdmissionFacts, LeaseService},
     protocol::MemoryPressure,
     remote_snapshot::RemoteSnapshotService,
-    supervisor::{Supervisor, SystemProcessInspector},
+    supervisor::{
+        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        ReconciliationRuntime, Supervisor, SystemProcessInspector,
+    },
 };
 use sha2::{Digest, Sha256};
 
@@ -35,10 +39,11 @@ const MANIFEST_DIGEST: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccc
 
 struct RejectLauncher;
 
-struct RecordingLauncher {
+struct HoldingRecordingLauncher {
     launches: Arc<AtomicUsize>,
     job_path: PathBuf,
     identity: ProcessIdentity,
+    guard: Mutex<Option<SupervisorGuard>>,
 }
 
 struct InlineSupervisorLauncher {
@@ -67,6 +72,99 @@ struct SpoofedPrelaunchFailureLauncher {
     launches: Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
+struct ScriptedReconciliation {
+    inner: Arc<ScriptedReconciliationInner>,
+}
+
+struct ScriptedReconciliationInner {
+    process: Mutex<VecDeque<ProcessObservation>>,
+    groups: Mutex<VecDeque<ProcessGroupObservation>>,
+    signals: Mutex<Vec<(u32, i32)>>,
+    sleeps: Mutex<Vec<Duration>>,
+    now: Mutex<Duration>,
+}
+
+impl ScriptedReconciliation {
+    fn new(
+        process: impl IntoIterator<Item = ProcessObservation>,
+        groups: impl IntoIterator<Item = ProcessGroupObservation>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ScriptedReconciliationInner {
+                process: Mutex::new(process.into_iter().collect()),
+                groups: Mutex::new(groups.into_iter().collect()),
+                signals: Mutex::new(Vec::new()),
+                sleeps: Mutex::new(Vec::new()),
+                now: Mutex::new(Duration::ZERO),
+            }),
+        }
+    }
+
+    fn signals(&self) -> Vec<(u32, i32)> {
+        self.inner.signals.lock().unwrap().clone()
+    }
+
+    fn sleeps(&self) -> Vec<Duration> {
+        self.inner.sleeps.lock().unwrap().clone()
+    }
+}
+
+impl ProcessInspector for ScriptedReconciliation {
+    fn identity_for_pid(
+        &self,
+        _pid: u32,
+    ) -> Result<ProcessIdentity, mac_worker::error::WorkerError> {
+        panic!("orphan reconciliation must never derive a new process identity")
+    }
+
+    fn observe(&self, _expected: ProcessIdentity) -> ProcessObservation {
+        self.inner
+            .process
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected process observation")
+    }
+
+    fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
+        self.inner
+            .groups
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected process-group observation")
+    }
+
+    fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
+        panic!("parent-independent reconciliation must not use parent wait anchors")
+    }
+}
+
+impl ReconciliationRuntime for ScriptedReconciliation {
+    fn signal_process_group(
+        &self,
+        process_group: u32,
+        signal: i32,
+    ) -> Result<(), mac_worker::error::WorkerError> {
+        self.inner
+            .signals
+            .lock()
+            .unwrap()
+            .push((process_group, signal));
+        Ok(())
+    }
+
+    fn monotonic_now(&self) -> Duration {
+        *self.inner.now.lock().unwrap()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleeps.lock().unwrap().push(duration);
+        *self.inner.now.lock().unwrap() += duration;
+    }
+}
+
 impl SupervisorLauncher for RejectLauncher {
     fn launch(
         &self,
@@ -77,7 +175,7 @@ impl SupervisorLauncher for RejectLauncher {
     }
 }
 
-impl SupervisorLauncher for RecordingLauncher {
+impl SupervisorLauncher for HoldingRecordingLauncher {
     fn launch(
         &self,
         _job_id: JobId,
@@ -89,7 +187,7 @@ impl SupervisorLauncher for RecordingLauncher {
                 .map_err(|error| mac_worker::error::WorkerError::Protocol(error.to_string()))?;
         let enriched = current.with_supervisor(self.identity, current.updated_at_millis() + 1)?;
         replace_json(&self.job_path.join("status.json"), &enriched)?;
-        drop(guard);
+        *self.guard.lock().unwrap() = Some(guard);
         Ok(LaunchCandidate::new(self.identity))
     }
 }
@@ -158,6 +256,7 @@ impl SupervisorLauncher for PrelaunchLostLauncher {
                 0,
                 "PRELAUNCH_FAILED".into(),
             )?;
+        remove_and_sync(&self.job_path.join("execution.json"));
         replace_json(&self.job_path.join("status.json"), &lost)?;
         drop(guard);
         Ok(LaunchCandidate::new(self.identity))
@@ -217,12 +316,13 @@ fn status_launches_an_identityless_accepted_job_once_and_returns_mutable_status(
     let (store, lease, _request) = indexed_identityless_job(&root);
     let launches = Arc::new(AtomicUsize::new(0));
     let supervisor = identity(41_001);
-    let launcher = RecordingLauncher {
+    let launcher = HoldingRecordingLauncher {
         launches: Arc::clone(&launches),
         job_path: store
             .job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap(),
         identity: supervisor,
+        guard: Mutex::new(None),
     };
     let service = JobService::new(&store, &launcher);
 
@@ -234,6 +334,7 @@ fn status_launches_an_identityless_accepted_job_once_and_returns_mutable_status(
     assert_eq!(first.status().supervisor_identity(), Some(supervisor));
     assert_eq!(second.status(), first.status());
     assert_eq!(launches.load(Ordering::SeqCst), 1);
+    drop(launcher.guard.lock().unwrap().take());
 }
 
 #[test]
@@ -243,12 +344,13 @@ fn status_repairs_an_exact_preindex_final_job_and_launches_it_once() {
     let (store, lease, _request) = unindexed_identityless_job(&root);
     let launches = Arc::new(AtomicUsize::new(0));
     let supervisor = identity(41_002);
-    let launcher = RecordingLauncher {
+    let launcher = HoldingRecordingLauncher {
         launches: Arc::clone(&launches),
         job_path: store
             .job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap(),
         identity: supervisor,
+        guard: Mutex::new(None),
     };
     let service = JobService::new(&store, &launcher);
 
@@ -262,6 +364,7 @@ fn status_repairs_an_exact_preindex_final_job_and_launches_it_once() {
         response.status()
     );
     assert_eq!(launches.load(Ordering::SeqCst), 1);
+    drop(launcher.guard.lock().unwrap().take());
 }
 
 #[test]
@@ -347,6 +450,15 @@ fn status_returns_authoritative_nonterminal_states_without_relaunching() {
         let job = store
             .job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap();
+        let launcher = HoldingRecordingLauncher {
+            launches: Arc::new(AtomicUsize::new(0)),
+            job_path: job.clone(),
+            identity: supervisor,
+            guard: Mutex::new(None),
+        };
+        JobService::new(&store, &launcher)
+            .status(lease.job_id())
+            .unwrap();
         replace_json(&job.join("status.json"), &expected).unwrap();
 
         let response = JobService::new(&store, &RejectLauncher)
@@ -355,6 +467,7 @@ fn status_returns_authoritative_nonterminal_states_without_relaunching() {
 
         assert_eq!(response.status(), &expected, "state row {index}");
         assert_eq!(response.meta().job_id(), lease.job_id());
+        drop(launcher.guard.lock().unwrap().take());
     }
 }
 
@@ -473,6 +586,7 @@ fn prelaunch_lost_with_only_a_durable_supervisor_identity_is_queryable() {
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
     replace_json(&job.join("status.json"), &expected).unwrap();
+    remove_and_sync(&job.join("execution.json"));
 
     let response = JobService::new(&store, &RejectLauncher)
         .status(lease.job_id())
@@ -930,12 +1044,13 @@ fn concurrent_identityless_status_queries_elect_exactly_one_supervisor() {
     let (store, lease, _request) = indexed_identityless_job(&root);
     let launches = Arc::new(AtomicUsize::new(0));
     let supervisor = identity(72_001);
-    let launcher = Arc::new(RecordingLauncher {
+    let launcher = Arc::new(HoldingRecordingLauncher {
         launches: Arc::clone(&launches),
         job_path: store
             .job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap(),
         identity: supervisor,
+        guard: Mutex::new(None),
     });
     let job_id = lease.job_id();
     let barrier = Arc::new(Barrier::new(CONTENDERS));
@@ -963,6 +1078,412 @@ fn concurrent_identityless_status_queries_elect_exactly_one_supervisor() {
         Some(supervisor)
     );
     assert_eq!(launches.load(Ordering::SeqCst), 1);
+    drop(launcher.guard.lock().unwrap().take());
+}
+
+#[test]
+fn reconciliation_fails_closed_for_live_reused_or_ambiguous_supervisor_identity() {
+    let observations = [
+        ProcessObservation::Matching {
+            process_group: 81_001,
+        },
+        ProcessObservation::Reused,
+        ProcessObservation::Ambiguous,
+    ];
+
+    for (index, observation) in observations.into_iter().enumerate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(format!("supervisor-identity-{index}"));
+        let (store, lease, _request) = indexed_identityless_job(&root);
+        let status = JobStatus::accepted(10)
+            .unwrap()
+            .with_supervisor(identity(81_001), 11)
+            .unwrap();
+        install_job_status(&store, &lease, &status, false);
+        let runtime = ScriptedReconciliation::new([observation], []);
+
+        let error =
+            JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+                .status(lease.job_id())
+                .unwrap_err();
+
+        assert_error_code(error, "RECONCILIATION_AMBIGUOUS", "supervisor identity");
+        assert_eq!(
+            LeaseService::new(&store).load().unwrap(),
+            Some(lease.clone())
+        );
+        assert_eq!(runtime.signals(), Vec::<(u32, i32)>::new());
+        assert_eq!(read_job_status(&store, &lease), status);
+    }
+}
+
+#[test]
+fn absent_supervisor_without_child_erases_payload_marks_lost_then_cleans_and_releases() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("absent-supervisor-no-child");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(82_001), 11)
+        .unwrap();
+    install_job_status(&store, &lease, &status, false);
+    let runtime = ScriptedReconciliation::new([ProcessObservation::Absent], []);
+
+    let response =
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+            .status(lease.job_id())
+            .unwrap();
+
+    assert_eq!(response.status().state(), JobState::Lost);
+    assert_eq!(response.status().error_code(), Some("SUPERVISOR_LOST"));
+    assert_eq!(response.status().child_identity(), None);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert_eq!(runtime.signals(), Vec::<(u32, i32)>::new());
+    assert_mutable_job_scopes_absent(&store, &lease);
+}
+
+#[test]
+fn surviving_child_gets_exact_term_full_grace_kill_and_absence_proof_before_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("orphan-term-kill");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let supervisor = identity(83_001);
+    let child = identity(83_002);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(supervisor, 11)
+        .unwrap()
+        .with_child(child, 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    let runtime = ScriptedReconciliation::new(
+        [
+            ProcessObservation::Absent,
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Absent,
+        ],
+        [ProcessGroupObservation::Absent],
+    );
+
+    let response =
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+            .status(lease.job_id())
+            .unwrap();
+
+    assert_eq!(response.status().state(), JobState::Lost);
+    assert_eq!(
+        runtime.signals(),
+        vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+    );
+    assert_eq!(runtime.sleeps(), vec![Duration::from_secs(10)]);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert_mutable_job_scopes_absent(&store, &lease);
+}
+
+#[test]
+fn term_disappearance_still_waits_full_grace_and_skips_kill_only_after_exact_absence() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("orphan-term-only");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let supervisor = identity(84_001);
+    let child = identity(84_002);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(supervisor, 11)
+        .unwrap()
+        .with_child(child, 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    let runtime = ScriptedReconciliation::new(
+        [
+            ProcessObservation::Absent,
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Absent,
+        ],
+        [ProcessGroupObservation::Absent],
+    );
+
+    JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+        .status(lease.job_id())
+        .unwrap();
+
+    assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+    assert_eq!(runtime.sleeps(), vec![Duration::from_secs(10)]);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
+fn child_identity_or_group_ambiguity_never_signals_cleans_or_releases() {
+    let cases = [
+        (
+            "wrong-pgid",
+            ProcessObservation::Matching {
+                process_group: 99_999,
+            },
+            None,
+        ),
+        ("reused", ProcessObservation::Reused, None),
+        ("ambiguous", ProcessObservation::Ambiguous, None),
+        (
+            "leader-absent-group-present",
+            ProcessObservation::Absent,
+            Some(ProcessGroupObservation::Present),
+        ),
+        (
+            "leader-absent-group-ambiguous",
+            ProcessObservation::Absent,
+            Some(ProcessGroupObservation::Ambiguous),
+        ),
+    ];
+
+    for (index, (label, child_observation, group_observation)) in cases.into_iter().enumerate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(format!("child-ambiguity-{index}"));
+        let (store, lease, _request) = indexed_identityless_job(&root);
+        let supervisor = identity(85_001);
+        let child = identity(85_002);
+        let status = JobStatus::accepted(10)
+            .unwrap()
+            .with_supervisor(supervisor, 11)
+            .unwrap()
+            .with_child(child, 12)
+            .unwrap()
+            .into_running(13)
+            .unwrap();
+        install_job_status(&store, &lease, &status, true);
+        let runtime = ScriptedReconciliation::new(
+            [ProcessObservation::Absent, child_observation],
+            group_observation,
+        );
+
+        let error =
+            JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+                .status(lease.job_id())
+                .unwrap_err();
+
+        assert_error_code(error, "RECONCILIATION_AMBIGUOUS", label);
+        assert_eq!(runtime.signals(), Vec::<(u32, i32)>::new(), "{label}");
+        assert_eq!(
+            LeaseService::new(&store).load().unwrap(),
+            Some(lease.clone())
+        );
+        assert_eq!(read_job_status(&store, &lease), status);
+        assert!(
+            store
+                .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                .unwrap()
+                .join("workspace")
+                .is_dir(),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn terminal_status_with_a_retained_exact_lease_resumes_cleanup_without_signalling() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("terminal-cleanup-resume");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(86_001), 11)
+        .unwrap()
+        .with_child(identity(86_002), 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap()
+        .into_succeeded(14, 0, 0)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    let runtime = ScriptedReconciliation::new([], []);
+
+    let response =
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+            .status(lease.job_id())
+            .unwrap();
+
+    assert_eq!(response.status(), &status);
+    assert_eq!(runtime.signals(), Vec::<(u32, i32)>::new());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert_mutable_job_scopes_absent(&store, &lease);
+}
+
+#[test]
+fn cleanup_proof_failure_keeps_the_exact_lease_for_idempotent_terminal_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cleanup-proof-failure");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(87_001), 11)
+        .unwrap();
+    install_job_status(&store, &lease, &status, false);
+    drop(store);
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobCleanupProof).unwrap();
+    let runtime = ScriptedReconciliation::new([ProcessObservation::Absent], []);
+
+    let error = JobService::new_with_reconciliation(&faulted, &RejectLauncher, Arc::new(runtime))
+        .status(lease.job_id())
+        .unwrap_err();
+
+    assert!(error.to_string().contains("cleanup-proof"), "{error}");
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert_eq!(read_job_status(&faulted, &lease).state(), JobState::Lost);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let response = JobService::new_with_reconciliation(
+        &reopened,
+        &RejectLauncher,
+        Arc::new(ScriptedReconciliation::new([], [])),
+    )
+    .status(lease.job_id())
+    .unwrap();
+    assert_eq!(response.status().state(), JobState::Lost);
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+}
+
+#[test]
+fn reconciliation_status_publication_failure_retains_the_lease_and_unmodified_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("status-publication-failure");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(88_001), 11)
+        .unwrap();
+    install_job_status(&store, &lease, &status, false);
+    drop(store);
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::BeforeJobStatusReplace)
+            .unwrap();
+    let runtime = ScriptedReconciliation::new([ProcessObservation::Absent], []);
+
+    let error = JobService::new_with_reconciliation(&faulted, &RejectLauncher, Arc::new(runtime))
+        .status(lease.job_id())
+        .unwrap_err();
+
+    assert!(error.to_string().contains("status replacement"), "{error}");
+    assert_eq!(read_job_status(&faulted, &lease), status);
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+}
+
+#[test]
+fn lease_retirement_failure_happens_after_exact_mutable_cleanup_and_retains_the_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("lease-retirement-failure");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(89_001), 11)
+        .unwrap()
+        .with_child(identity(89_002), 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap()
+        .into_succeeded(14, 0, 0)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    drop(store);
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::BeforeJobLeaseRetirement)
+            .unwrap();
+
+    let error = JobService::new_with_reconciliation(
+        &faulted,
+        &RejectLauncher,
+        Arc::new(ScriptedReconciliation::new([], [])),
+    )
+    .status(lease.job_id())
+    .unwrap_err();
+
+    assert!(error.to_string().contains("lease retirement"), "{error}");
+    assert_mutable_job_scopes_absent(&faulted, &lease);
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert_eq!(
+        read_job_status(&faulted, &lease).cleanup_error_code(),
+        Some("LEASE_RELEASE_FAILED")
+    );
+}
+
+#[test]
+fn payload_and_log_binding_failures_preserve_evidence_and_the_exact_lease() {
+    for failure in ["payload", "stdout"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(format!("binding-failure-{failure}"));
+        let (store, lease, _request) = indexed_identityless_job(&root);
+        let supervisor = identity(90_001);
+        let child = identity(90_002);
+        let status = if failure == "payload" {
+            JobStatus::accepted(10)
+                .unwrap()
+                .with_supervisor(supervisor, 11)
+                .unwrap()
+        } else {
+            JobStatus::accepted(10)
+                .unwrap()
+                .with_supervisor(supervisor, 11)
+                .unwrap()
+                .with_child(child, 12)
+                .unwrap()
+                .into_running(13)
+                .unwrap()
+        };
+        install_job_status(&store, &lease, &status, failure == "stdout");
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        let attacked = job.join(if failure == "payload" {
+            "execution.json"
+        } else {
+            "stdout.log"
+        });
+        remove_and_sync(&attacked);
+        let outside = temp.path().join(format!("outside-{failure}"));
+        fs::write(&outside, b"preserve").unwrap();
+        symlink(&outside, &attacked).unwrap();
+        File::open(&job).unwrap().sync_all().unwrap();
+        let runtime = if failure == "payload" {
+            ScriptedReconciliation::new([ProcessObservation::Absent], [])
+        } else {
+            ScriptedReconciliation::new(
+                [ProcessObservation::Absent, ProcessObservation::Absent],
+                [ProcessGroupObservation::Absent],
+            )
+        };
+
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime))
+            .status(lease.job_id())
+            .unwrap_err();
+
+        assert_eq!(fs::read(&outside).unwrap(), b"preserve", "{failure}");
+        assert_eq!(read_job_status(&store, &lease), status, "{failure}");
+        assert_eq!(
+            LeaseService::new(&store).load().unwrap(),
+            Some(lease.clone()),
+            "{failure}"
+        );
+    }
 }
 
 fn lease_request() -> LeaseAcquireRequest {
@@ -1104,6 +1625,37 @@ fn unindexed_identityless_job(root: &Path) -> (HostStore, LeaseRecord, SubmitReq
     );
     drop(faulted);
     (HostStore::open(root).unwrap(), lease, request)
+}
+
+fn install_job_status(
+    store: &HostStore,
+    lease: &LeaseRecord,
+    status: &JobStatus,
+    erase_payload: bool,
+) {
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    replace_json(&job.join("status.json"), status).unwrap();
+    if erase_payload {
+        remove_and_sync(&job.join("execution.json"));
+    }
+}
+
+fn read_job_status(store: &HostStore, lease: &LeaseRecord) -> JobStatus {
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap()
+}
+
+fn assert_mutable_job_scopes_absent(store: &HostStore, lease: &LeaseRecord) {
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    for name in ["workspace", "home", "tmp", "execution.json"] {
+        assert!(!job.join(name).exists(), "mutable scope {name} remains");
+    }
 }
 
 fn replace_json<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {

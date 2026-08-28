@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,6 +18,7 @@ use crate::{
     lease::LeaseService,
     remote_snapshot::{RemoteSnapshotService, VerifiedRemoteSnapshot},
     rooted_fs::RootedDir,
+    supervisor::{ReconciliationRuntime, SystemReconciliationRuntime, reconcile_orphan_processes},
 };
 
 const EXECUTION_PAYLOAD_VERSION: u32 = 1;
@@ -149,6 +151,7 @@ pub struct JobService<'a> {
     leases: LeaseService<'a>,
     snapshots: RemoteSnapshotService<'a>,
     launcher: &'a dyn SupervisorLauncher,
+    reconciliation: Arc<dyn ReconciliationRuntime>,
 }
 
 impl<'a> JobService<'a> {
@@ -158,6 +161,22 @@ impl<'a> JobService<'a> {
             leases: LeaseService::new(store),
             snapshots: RemoteSnapshotService::new(store),
             launcher,
+            reconciliation: Arc::new(SystemReconciliationRuntime::new()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_reconciliation(
+        store: &'a HostStore,
+        launcher: &'a dyn SupervisorLauncher,
+        reconciliation: Arc<dyn ReconciliationRuntime>,
+    ) -> Self {
+        Self {
+            store,
+            leases: LeaseService::new(store),
+            snapshots: RemoteSnapshotService::new(store),
+            launcher,
+            reconciliation,
         }
     }
 
@@ -174,6 +193,10 @@ impl<'a> JobService<'a> {
     }
 
     pub fn status(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
+        self.status_with_supervisor_ensure(job_id, true)
+    }
+
+    pub fn reconcile_job(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
         self.status_with_supervisor_ensure(job_id, true)
     }
 
@@ -329,14 +352,21 @@ impl<'a> JobService<'a> {
             .map_err(|_| job_state_invalid("canonical mutable job status is invalid"))?;
         validate_queryable_status(&meta, &status)?;
 
+        let loaded_lease = self
+            .leases
+            .load_after(&admission, job_id)
+            .map_err(|_| job_state_invalid("live lease is invalid"))?;
         let lease = if status.state().is_terminal() {
             validate_terminal_log_lengths(&job, &status)?;
-            None
+            match loaded_lease {
+                Some(lease) if lease.job_id() == job_id => {
+                    require_meta_matches_live_lease(&meta, &lease)?;
+                    Some(lease)
+                }
+                Some(_) | None => None,
+            }
         } else {
-            let lease = self
-                .leases
-                .load_after(&admission, job_id)
-                .map_err(|_| job_state_invalid("live lease is invalid"))?
+            let lease = loaded_lease
                 .ok_or_else(|| job_state_invalid("nonterminal job has no live lease"))?;
             require_meta_matches_live_lease(&meta, &lease)?;
             Some(lease)
@@ -344,31 +374,81 @@ impl<'a> JobService<'a> {
         let response = StatusResponse::new(meta.clone(), status.clone())
             .map_err(|_| job_state_invalid("job status response is inconsistent"))?;
 
-        if status.state() != JobState::Accepted
-            || status.supervisor_identity().is_some()
-            || status.child_identity().is_some()
-            || !ensure_supervisor
-        {
+        if !ensure_supervisor {
             drop(admission);
             return Ok(response);
         }
 
-        let lease = lease.expect("validated identityless Accepted status has a live lease");
-        let supervisor = self
-            .store
-            .supervisor_lock_after(&admission, job_id, false)?;
-        let Some(supervisor) = supervisor else {
+        let identityless_accepted = status.state() == JobState::Accepted
+            && status.supervisor_identity().is_none()
+            && status.child_identity().is_none();
+        let Some(lease) = lease else {
             drop(admission);
             return Ok(response);
         };
-        let current: JobStatus = read_mutable_canonical_json(&job, "status.json")
-            .map_err(|_| job_state_invalid("canonical mutable job status is invalid"))?;
+        let supervisor = self
+            .store
+            .supervisor_lock_after(&admission, job_id, false)?;
+        let Some(mut supervisor) = supervisor else {
+            drop(admission);
+            return Ok(response);
+        };
+        let (current_bytes, current): (Vec<u8>, JobStatus) =
+            read_mutable_canonical_json_with_bytes(&job, "status.json")
+                .map_err(|_| job_state_invalid("canonical mutable job status is invalid"))?;
         validate_queryable_status(&meta, &current)?;
         if current != status {
             drop(supervisor);
             drop(admission);
             return self.status_with_supervisor_ensure(job_id, false);
         }
+        if !identityless_accepted {
+            if current.state().is_terminal() {
+                drop(admission);
+                drop(supervisor);
+                self.cleanup_and_release_reconciled(&lease, &job, &current)?;
+                return StatusResponse::new(meta, current)
+                    .map_err(|_| job_state_invalid("job status response is inconsistent"));
+            }
+            let supervisor_identity = current.supervisor_identity().ok_or_else(|| {
+                job_state_invalid("nonterminal supervised job has no supervisor identity")
+            })?;
+            drop(admission);
+            reconcile_orphan_processes(
+                self.reconciliation.as_ref(),
+                supervisor_identity,
+                current.child_identity(),
+            )?;
+            if job.entry_exists("execution.json")? {
+                job.remove_owned_regular("execution.json")?;
+            }
+            let stdout = job.open_private_append("stdout.log")?;
+            let stderr = job.open_private_append("stderr.log")?;
+            stdout.sync_all()?;
+            stderr.sync_all()?;
+            let stdout_length = job.validate_private_append_binding("stdout.log", &stdout)?;
+            let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
+            let lost = current.into_infrastructure_terminal(
+                JobState::Lost,
+                reconciliation_timestamp(current.updated_at_millis())?,
+                stdout_length,
+                stderr_length,
+                "SUPERVISOR_LOST".into(),
+            )?;
+            self.store.replace_job_status_after(
+                &mut supervisor,
+                &lease,
+                &job,
+                &current_bytes,
+                &current,
+                &lost,
+            )?;
+            drop(supervisor);
+            self.cleanup_and_release_reconciled(&lease, &job, &lost)?;
+            return StatusResponse::new(meta, lost)
+                .map_err(|_| job_state_invalid("job status response is inconsistent"));
+        }
+
         validate_empty_prelaunch_private_directories(&job)?;
         let request = reconstruct_submit_request(&job, &meta, &lease)?;
         let verified = self.snapshots.load_verified_for_accepted_after(
@@ -378,7 +458,7 @@ impl<'a> JobService<'a> {
         )?;
         drop(admission);
         match self.launch_after_election(job_id, supervisor, &request, &lease, &verified, false) {
-            Ok(_) => self.status(job_id),
+            Ok(_) => self.status_with_supervisor_ensure(job_id, false),
             Err(error) if matches!(&error, WorkerError::Protocol(message) if message.starts_with("SUPERVISOR_PRELAUNCH_FAILED:")) => {
                 match self.status_with_supervisor_ensure(job_id, false) {
                     Ok(authoritative) if authoritative.status() != &status => Ok(authoritative),
@@ -388,6 +468,80 @@ impl<'a> JobService<'a> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn cleanup_and_release_reconciled(
+        &self,
+        lease: &LeaseRecord,
+        job: &RootedDir,
+        terminal: &JobStatus,
+    ) -> Result<(), WorkerError> {
+        match self.store.cleanup_job_owned(lease) {
+            Ok(receipt) => {
+                if let Err(error) = self.leases.release_after_cleanup(lease, &receipt) {
+                    self.enrich_reconciliation_cleanup_error(
+                        lease,
+                        job,
+                        terminal,
+                        "LEASE_RELEASE_FAILED",
+                    )?;
+                    return Err(error);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.enrich_reconciliation_cleanup_error(
+                    lease,
+                    job,
+                    terminal,
+                    "MUTABLE_CLEANUP_FAILED",
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn enrich_reconciliation_cleanup_error(
+        &self,
+        lease: &LeaseRecord,
+        job: &RootedDir,
+        terminal: &JobStatus,
+        code: &str,
+    ) -> Result<(), WorkerError> {
+        if terminal.cleanup_error_code().is_some() {
+            return Ok(());
+        }
+        let admission = self.store.admission_lock(lease.job_id())?;
+        let mut supervisor = self
+            .store
+            .supervisor_lock_after(&admission, lease.job_id(), true)?
+            .ok_or_else(|| {
+                protocol_code(
+                    "RECONCILIATION_AMBIGUOUS",
+                    "status capability remained busy during cleanup enrichment",
+                )
+            })?;
+        drop(admission);
+        let (bytes, current): (Vec<u8>, JobStatus) =
+            read_mutable_canonical_json_with_bytes(job, "status.json")?;
+        if current != *terminal {
+            return Err(protocol_code(
+                "STATUS_CHANGED",
+                "terminal status changed before cleanup enrichment",
+            ));
+        }
+        let enriched = current.with_cleanup_error(
+            code.into(),
+            reconciliation_timestamp(current.updated_at_millis())?,
+        )?;
+        self.store.replace_job_status_after(
+            &mut supervisor,
+            lease,
+            job,
+            &bytes,
+            &current,
+            &enriched,
+        )
     }
 
     #[doc(hidden)]
@@ -1000,6 +1154,52 @@ where
         }
     }
     unreachable!("bounded mutable JSON retry always returns")
+}
+
+fn read_mutable_canonical_json_with_bytes<T>(
+    directory: &RootedDir,
+    name: &str,
+) -> Result<(Vec<u8>, T), WorkerError>
+where
+    T: DeserializeOwned + Serialize,
+{
+    for attempt in 0..32 {
+        let bytes = match directory.read_private_regular(name, MAX_HOST_JSON_BYTES) {
+            Err(error) if error.raw_os_error() == Some(libc::ESTALE) => {
+                if attempt == 31 {
+                    return Err(WorkerError::Io(error));
+                }
+                std::thread::yield_now();
+                continue;
+            }
+            result => result?,
+        };
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let value = T::deserialize(&mut deserializer)
+            .map_err(|_| WorkerError::Protocol("canonical job JSON is invalid".into()))?;
+        deserializer
+            .end()
+            .map_err(|_| WorkerError::Protocol("canonical job JSON has trailing data".into()))?;
+        let canonical = serde_json::to_vec(&value)
+            .map_err(|_| WorkerError::Protocol("host JSON serialization failed".into()))?;
+        if canonical != bytes {
+            return Err(WorkerError::Protocol(
+                "canonical job JSON has a non-canonical encoding".into(),
+            ));
+        }
+        return Ok((bytes, value));
+    }
+    unreachable!("bounded mutable JSON retry always returns")
+}
+
+fn reconciliation_timestamp(previous: u64) -> Result<u64, WorkerError> {
+    let now: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| WorkerError::Protocol("system clock precedes the Unix epoch".into()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| WorkerError::Protocol("system clock is outside the supported range".into()))?;
+    Ok(now.max(previous))
 }
 
 fn validate_queryable_status(meta: &JobMeta, status: &JobStatus) -> Result<(), WorkerError> {

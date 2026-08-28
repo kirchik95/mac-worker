@@ -99,6 +99,8 @@ pub enum HostStoreWritePoint {
     AfterJobIndexParentSync = 45,
     AfterJobCleanupProof = 46,
     AfterJobLeaseRetirement = 47,
+    BeforeJobStatusReplace = 48,
+    BeforeJobLeaseRetirement = 49,
 }
 
 impl LayoutEntry {
@@ -1525,6 +1527,11 @@ impl HostStore {
                 "STATUS_CAPABILITY_MISMATCH",
                 "status capability belongs to another job",
             ));
+        }
+        if self.consume_fault(HostStoreWritePoint::BeforeJobStatusReplace) {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected status replacement failure",
+            )));
         }
         let canonical_expected = serde_json::to_vec(expected).map_err(|error| {
             WorkerError::Protocol(format!("failed to serialize job status: {error}"))

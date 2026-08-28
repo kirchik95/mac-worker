@@ -176,6 +176,14 @@ impl<'a> LeaseService<'a> {
         receipt.validate_durable(self.store, &live)?;
         guard.validate()?;
         capacity.validate()?;
+        if self
+            .store
+            .consume_fault(HostStoreWritePoint::BeforeJobLeaseRetirement)
+        {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected lease retirement failure",
+            )));
+        }
         let leases = self.store.open_directory("leases", false)?;
         let retired = format!(".released-{}", live.job_id());
         if leases.entry_exists(&retired)? {

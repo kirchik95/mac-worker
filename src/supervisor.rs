@@ -125,6 +125,182 @@ pub trait ProcessInspector: Send + Sync {
     fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership;
 }
 
+#[doc(hidden)]
+pub trait ReconciliationRuntime: ProcessInspector + Send + Sync {
+    fn signal_process_group(&self, process_group: u32, signal: i32) -> Result<(), WorkerError>;
+    fn monotonic_now(&self) -> Duration;
+    fn sleep(&self, duration: Duration);
+}
+
+pub(crate) struct SystemReconciliationRuntime {
+    started: Instant,
+    inspector: SystemProcessInspector,
+}
+
+impl SystemReconciliationRuntime {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            inspector: SystemProcessInspector,
+        }
+    }
+}
+
+impl ProcessInspector for SystemReconciliationRuntime {
+    fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+        self.inspector.identity_for_pid(pid)
+    }
+
+    fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+        self.inspector.observe(expected)
+    }
+
+    fn observe_group(&self, process_group: u32) -> ProcessGroupObservation {
+        self.inspector.observe_group(process_group)
+    }
+
+    fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership {
+        self.inspector.observe_group_members(leader)
+    }
+}
+
+impl ReconciliationRuntime for SystemReconciliationRuntime {
+    fn signal_process_group(&self, process_group: u32, signal: i32) -> Result<(), WorkerError> {
+        if !matches!(signal, libc::SIGTERM | libc::SIGKILL) {
+            return Err(protocol_code(
+                "RECONCILIATION_SIGNAL_INVALID",
+                "reconciliation signal is not permitted",
+            ));
+        }
+        let process_group = i32::try_from(process_group).map_err(|_| {
+            protocol_code(
+                "RECONCILIATION_IDENTITY_INVALID",
+                "process-group identity is outside the supported range",
+            )
+        })?;
+        if process_group <= 0 {
+            return Err(protocol_code(
+                "RECONCILIATION_IDENTITY_INVALID",
+                "process-group identity must be positive",
+            ));
+        }
+        if unsafe { libc::kill(-process_group, signal) } == 0 {
+            Ok(())
+        } else {
+            Err(WorkerError::Io(io::Error::last_os_error()))
+        }
+    }
+
+    fn monotonic_now(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+pub(crate) fn reconcile_orphan_processes(
+    runtime: &dyn ReconciliationRuntime,
+    supervisor: ProcessIdentity,
+    child: Option<ProcessIdentity>,
+) -> Result<(), WorkerError> {
+    if runtime.observe(supervisor) != ProcessObservation::Absent {
+        return Err(reconciliation_ambiguous(
+            "recorded supervisor identity is live, reused, or ambiguous",
+        ));
+    }
+    let Some(child) = child else {
+        return Ok(());
+    };
+
+    match runtime.observe(child) {
+        ProcessObservation::Matching { process_group } if process_group == child.pid() => {}
+        ProcessObservation::Absent => {
+            return require_absent_group(runtime, child.pid());
+        }
+        ProcessObservation::Matching { .. }
+        | ProcessObservation::Reused
+        | ProcessObservation::Ambiguous => {
+            return Err(reconciliation_ambiguous(
+                "recorded child identity is reused, has the wrong process group, or is ambiguous",
+            ));
+        }
+    }
+
+    runtime.signal_process_group(child.pid(), libc::SIGTERM)?;
+    wait_full_reconciliation_grace(runtime)?;
+    match runtime.observe(child) {
+        ProcessObservation::Absent => require_absent_group(runtime, child.pid()),
+        ProcessObservation::Matching { process_group } if process_group == child.pid() => {
+            runtime.signal_process_group(child.pid(), libc::SIGKILL)?;
+            prove_killed_group_absent(runtime, child)
+        }
+        ProcessObservation::Matching { .. }
+        | ProcessObservation::Reused
+        | ProcessObservation::Ambiguous => Err(reconciliation_ambiguous(
+            "child identity changed or became ambiguous during the TERM grace period",
+        )),
+    }
+}
+
+fn wait_full_reconciliation_grace(runtime: &dyn ReconciliationRuntime) -> Result<(), WorkerError> {
+    let deadline = runtime
+        .monotonic_now()
+        .checked_add(TERM_GRACE)
+        .ok_or_else(|| reconciliation_ambiguous("TERM grace deadline overflowed"))?;
+    loop {
+        let now = runtime.monotonic_now();
+        if now >= deadline {
+            return Ok(());
+        }
+        runtime.sleep(deadline - now);
+    }
+}
+
+fn require_absent_group(
+    runtime: &dyn ReconciliationRuntime,
+    process_group: u32,
+) -> Result<(), WorkerError> {
+    if runtime.observe_group(process_group) == ProcessGroupObservation::Absent {
+        Ok(())
+    } else {
+        Err(reconciliation_ambiguous(
+            "child leader is absent but its exact process group is not proven absent",
+        ))
+    }
+}
+
+fn prove_killed_group_absent(
+    runtime: &dyn ReconciliationRuntime,
+    child: ProcessIdentity,
+) -> Result<(), WorkerError> {
+    let deadline = runtime
+        .monotonic_now()
+        .checked_add(TERM_GRACE)
+        .ok_or_else(|| reconciliation_ambiguous("KILL proof deadline overflowed"))?;
+    loop {
+        match (runtime.observe(child), runtime.observe_group(child.pid())) {
+            (ProcessObservation::Absent, ProcessGroupObservation::Absent) => return Ok(()),
+            (ProcessObservation::Matching { process_group }, ProcessGroupObservation::Present)
+                if process_group == child.pid() && runtime.monotonic_now() < deadline =>
+            {
+                let remaining = deadline - runtime.monotonic_now();
+                runtime.sleep(POLL_INTERVAL.min(remaining));
+            }
+            _ => {
+                return Err(reconciliation_ambiguous(
+                    "targeted child leader and process group were not both proven absent",
+                ));
+            }
+        }
+    }
+}
+
+fn reconciliation_ambiguous(message: &str) -> WorkerError {
+    protocol_code("RECONCILIATION_AMBIGUOUS", message)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemProcessInspector;
 
