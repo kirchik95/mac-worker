@@ -1152,6 +1152,7 @@ mod exec_inheritance_tests {
         io::{Read, Write},
         os::fd::{AsRawFd, RawFd},
         os::unix::ffi::OsStrExt,
+        os::unix::fs::MetadataExt,
         path::{Path, PathBuf},
         process::Stdio,
         sync::mpsc,
@@ -1172,6 +1173,11 @@ mod exec_inheritance_tests {
     const SENTINEL_FD_ENV: &str = "MAC_WORKER_TEST_SENTINEL_FD";
     const READY_FIFO_ENV: &str = "MAC_WORKER_TEST_READY_FIFO";
     const RELEASE_FIFO_ENV: &str = "MAC_WORKER_TEST_RELEASE_FIFO";
+    const TRANSFER_LOCK_PATH_ENV: &str = "MAC_WORKER_TEST_TRANSFER_LOCK_PATH";
+    const INTERMEDIARY_PID_FIFO_ENV: &str = "MAC_WORKER_TEST_INTERMEDIARY_PID_FIFO";
+    const LEAF_PID_FIFO_ENV: &str = "MAC_WORKER_TEST_LEAF_PID_FIFO";
+    const INTERMEDIARY_PARK_FIFO_ENV: &str = "MAC_WORKER_TEST_INTERMEDIARY_PARK_FIFO";
+    const LEAF_EXIT_FIFO_ENV: &str = "MAC_WORKER_TEST_LEAF_EXIT_FIFO";
 
     fn request() -> LeaseAcquireRequest {
         LeaseAcquireRequest::new(
@@ -1245,6 +1251,39 @@ mod exec_inheritance_tests {
         }
     }
 
+    struct IntermediaryExecProbe {
+        intermediary_pid_fifo: PathBuf,
+        leaf_pid_fifo: PathBuf,
+        park_fifo: PathBuf,
+        ready_fifo: PathBuf,
+        release_fifo: PathBuf,
+        exit_fifo: PathBuf,
+        lock_path: PathBuf,
+    }
+
+    impl RsyncServerExecutor for IntermediaryExecProbe {
+        fn execute(&self, invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
+            let transfer_fd = invocation.transfer_guard.raw_lock_fd_for_exec()?;
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .arg("--exact")
+                .arg("transfer::exec_inheritance_tests::production_exec_intermediary_probe")
+                .arg("--nocapture")
+                .env(CHILD_FD_ENV, transfer_fd.to_string())
+                .env(INTERMEDIARY_PID_FIFO_ENV, &self.intermediary_pid_fifo)
+                .env(LEAF_PID_FIFO_ENV, &self.leaf_pid_fifo)
+                .env(INTERMEDIARY_PARK_FIFO_ENV, &self.park_fifo)
+                .env(READY_FIFO_ENV, &self.ready_fifo)
+                .env(RELEASE_FIFO_ENV, &self.release_fifo)
+                .env(LEAF_EXIT_FIFO_ENV, &self.exit_fifo)
+                .env(TRANSFER_LOCK_PATH_ENV, &self.lock_path)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            execute_server_child(&mut command, invocation)
+        }
+    }
+
     struct FailedExec;
 
     impl RsyncServerExecutor for FailedExec {
@@ -1281,15 +1320,27 @@ mod exec_inheritance_tests {
         };
         let release_fifo = std::env::var(RELEASE_FIFO_ENV).unwrap();
         let transfer_fd: RawFd = std::env::var(CHILD_FD_ENV).unwrap().parse().unwrap();
-        let sentinel_fd: RawFd = std::env::var(SENTINEL_FD_ENV).unwrap().parse().unwrap();
         let transfer_flags = unsafe { libc::fcntl(transfer_fd, libc::F_GETFD) };
         assert_ne!(transfer_flags, -1, "transfer fd must survive exec");
         assert_eq!(transfer_flags & libc::FD_CLOEXEC, 0);
-        assert_eq!(
-            unsafe { libc::fcntl(sentinel_fd, libc::F_GETFD) },
-            -1,
-            "unrelated inheritable fd survived exec"
-        );
+        if let Ok(sentinel_fd) = std::env::var(SENTINEL_FD_ENV) {
+            let sentinel_fd: RawFd = sentinel_fd.parse().unwrap();
+            assert_eq!(
+                unsafe { libc::fcntl(sentinel_fd, libc::F_GETFD) },
+                -1,
+                "unrelated inheritable fd survived exec"
+            );
+        }
+        if let Ok(lock_path) = std::env::var(TRANSFER_LOCK_PATH_ENV) {
+            // Prove the inherited descriptor is the exact transfer lock, not
+            // merely a same-numbered descriptor pointing elsewhere: fstat the
+            // canonical lock path independently and compare device/inode.
+            let path_metadata = std::fs::metadata(&lock_path).unwrap();
+            let mut fd_stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(transfer_fd, &mut fd_stat) }, 0);
+            assert_eq!(u64::from(fd_stat.st_dev as u32), path_metadata.dev());
+            assert_eq!(fd_stat.st_ino, path_metadata.ino());
+        }
         OpenOptions::new()
             .write(true)
             .open(ready_fifo)
@@ -1304,6 +1355,69 @@ mod exec_inheritance_tests {
             .read_exact(&mut release)
             .unwrap();
         assert_eq!(release, *b"X");
+        if let Ok(exit_fifo) = std::env::var(LEAF_EXIT_FIFO_ENV) {
+            OpenOptions::new()
+                .write(true)
+                .open(exit_fifo)
+                .unwrap()
+                .write_all(b"E")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn production_exec_intermediary_probe() {
+        let Ok(own_pid_fifo) = std::env::var(INTERMEDIARY_PID_FIFO_ENV) else {
+            return;
+        };
+        let leaf_pid_fifo = std::env::var(LEAF_PID_FIFO_ENV).unwrap();
+        let park_fifo = std::env::var(INTERMEDIARY_PARK_FIFO_ENV).unwrap();
+        let transfer_fd = std::env::var(CHILD_FD_ENV).unwrap();
+        let ready_fifo = std::env::var(READY_FIFO_ENV).unwrap();
+        let release_fifo = std::env::var(RELEASE_FIFO_ENV).unwrap();
+        let exit_fifo = std::env::var(LEAF_EXIT_FIFO_ENV).unwrap();
+        let lock_path = std::env::var(TRANSFER_LOCK_PATH_ENV).unwrap();
+
+        // Report our own PID first so the harness can terminate this exact
+        // intermediary by PID once the leaf below reports READY.
+        OpenOptions::new()
+            .write(true)
+            .open(&own_pid_fifo)
+            .unwrap()
+            .write_all(std::process::id().to_string().as_bytes())
+            .unwrap();
+
+        let leaf = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("transfer::exec_inheritance_tests::production_exec_child_probe")
+            .arg("--nocapture")
+            .env(CHILD_FD_ENV, &transfer_fd)
+            .env(READY_FIFO_ENV, &ready_fifo)
+            .env(RELEASE_FIFO_ENV, &release_fifo)
+            .env(LEAF_EXIT_FIFO_ENV, &exit_fifo)
+            .env(TRANSFER_LOCK_PATH_ENV, &lock_path)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+
+        OpenOptions::new()
+            .write(true)
+            .open(&leaf_pid_fifo)
+            .unwrap()
+            .write_all(leaf.id().to_string().as_bytes())
+            .unwrap();
+
+        // Park on a FIFO nobody writes to: the harness terminates this exact
+        // intermediary PID once the leaf reports READY. This process never
+        // reaps, signals, or otherwise influences the leaf itself.
+        let mut sink = [0_u8; 1];
+        let _ = OpenOptions::new()
+            .read(true)
+            .open(&park_fifo)
+            .unwrap()
+            .read(&mut sink);
     }
 
     fn create_fifo(path: &Path) {
@@ -1400,6 +1514,195 @@ mod exec_inheritance_tests {
             .write_all(b"X")
             .unwrap();
         receiver.join().unwrap().unwrap();
+        assert_eq!(
+            resolved_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            AbandonTransferResult::Abandoned
+        );
+        resolver.join().unwrap();
+    }
+
+    #[test]
+    fn transfer_lock_inheritance_survives_intermediary_sigkill_and_fences_resolver_until_leaf_release()
+     {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request();
+        LeaseService::new(&store)
+            .acquire(&request, &healthy(), 1)
+            .unwrap();
+        let identity = TransferIdentity::from_acquire_request(&request).unwrap();
+        let lock_path = root
+            .join("locks/jobs")
+            .join(request.material().job_id().to_string())
+            .join("transfer/transfer.lock");
+
+        let ready_fifo = fixture.path().join("ready.fifo");
+        let release_fifo = fixture.path().join("release.fifo");
+        let exit_fifo = fixture.path().join("exit.fifo");
+        let intermediary_pid_fifo = fixture.path().join("intermediary-pid.fifo");
+        let leaf_pid_fifo = fixture.path().join("leaf-pid.fifo");
+        let park_fifo = fixture.path().join("park.fifo");
+        for fifo in [
+            &ready_fifo,
+            &release_fifo,
+            &exit_fifo,
+            &intermediary_pid_fifo,
+            &leaf_pid_fifo,
+            &park_fifo,
+        ] {
+            create_fifo(fifo);
+        }
+
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let ready_reader = ready_fifo.clone();
+        let acceptor = thread::spawn(move || {
+            let result = (|| -> std::io::Result<u8> {
+                let mut ready = [0_u8; 1];
+                OpenOptions::new()
+                    .read(true)
+                    .open(ready_reader)?
+                    .read_exact(&mut ready)?;
+                Ok(ready[0])
+            })();
+            accepted_tx.send(result).unwrap();
+        });
+
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let exit_reader = exit_fifo.clone();
+        let exit_thread = thread::spawn(move || {
+            let result = (|| -> std::io::Result<u8> {
+                let mut exited = [0_u8; 1];
+                OpenOptions::new()
+                    .read(true)
+                    .open(exit_reader)?
+                    .read_exact(&mut exited)?;
+                Ok(exited[0])
+            })();
+            exit_tx.send(result).unwrap();
+        });
+
+        let (intermediary_pid_tx, intermediary_pid_rx) = mpsc::channel();
+        let intermediary_pid_reader = intermediary_pid_fifo.clone();
+        let intermediary_pid_thread = thread::spawn(move || {
+            let mut buffer = String::new();
+            OpenOptions::new()
+                .read(true)
+                .open(intermediary_pid_reader)
+                .unwrap()
+                .read_to_string(&mut buffer)
+                .unwrap();
+            intermediary_pid_tx
+                .send(buffer.trim().parse::<libc::pid_t>().unwrap())
+                .unwrap();
+        });
+
+        let (leaf_pid_tx, leaf_pid_rx) = mpsc::channel();
+        let leaf_pid_reader = leaf_pid_fifo.clone();
+        let leaf_pid_thread = thread::spawn(move || {
+            let mut buffer = String::new();
+            OpenOptions::new()
+                .read(true)
+                .open(leaf_pid_reader)
+                .unwrap()
+                .read_to_string(&mut buffer)
+                .unwrap();
+            leaf_pid_tx
+                .send(buffer.trim().parse::<libc::pid_t>().unwrap())
+                .unwrap();
+        });
+
+        let receiver_store = store.clone();
+        let receiver_identity = identity.clone();
+        let probe_release_fifo = release_fifo.clone();
+        let probe_exit_fifo = exit_fifo;
+        let receiver = thread::spawn(move || {
+            HostTransferService::new(&receiver_store).receive(
+                &receiver_identity,
+                &stock_server_args(),
+                &IntermediaryExecProbe {
+                    intermediary_pid_fifo,
+                    leaf_pid_fifo,
+                    park_fifo,
+                    ready_fifo,
+                    release_fifo: probe_release_fifo,
+                    exit_fifo: probe_exit_fifo,
+                    lock_path,
+                },
+            )
+        });
+
+        let intermediary_pid = intermediary_pid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        intermediary_pid_thread.join().unwrap();
+        let leaf_pid = leaf_pid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        leaf_pid_thread.join().unwrap();
+        let ready = accepted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        acceptor.join().unwrap();
+        assert_eq!(
+            ready, b'R',
+            "leaf must independently verify and report readiness across two exec hops"
+        );
+
+        // Terminate the exact intermediary PID only; the leaf below is a
+        // distinct process and is never targeted or signaled.
+        assert_eq!(
+            unsafe { libc::kill(intermediary_pid, libc::SIGKILL) },
+            0,
+            "must be able to signal the exact intermediary pid"
+        );
+        let receiver_outcome = receiver.join().unwrap();
+        assert!(
+            matches!(
+                receiver_outcome,
+                Err(WorkerError::CommandExit { code: 137 })
+            ),
+            "intermediary's exec-child slot must report the SIGKILL exit status, got {receiver_outcome:?}"
+        );
+
+        assert_eq!(
+            unsafe { libc::kill(leaf_pid, 0) },
+            0,
+            "leaf must still be running after the intermediary is killed and reaped"
+        );
+
+        let resolver_store = HostStore::open(&root).unwrap();
+        let resolver_request = request.clone();
+        let (resolved_tx, resolved_rx) = mpsc::channel();
+        let resolver = thread::spawn(move || {
+            resolved_tx
+                .send(HostTransferService::new(&resolver_store).abandon(&resolver_request, 2))
+                .unwrap();
+        });
+        assert!(
+            resolved_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "resolver must remain fenced by the orphaned leaf's inherited transfer lock"
+        );
+
+        OpenOptions::new()
+            .write(true)
+            .open(&release_fifo)
+            .unwrap()
+            .write_all(b"X")
+            .unwrap();
+        assert_eq!(
+            exit_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            b'E',
+            "leaf must acknowledge its explicit release before exiting"
+        );
+        exit_thread.join().unwrap();
         assert_eq!(
             resolved_rx
                 .recv_timeout(Duration::from_secs(5))

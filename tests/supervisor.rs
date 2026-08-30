@@ -1,8 +1,12 @@
 use std::{
     collections::BTreeMap,
+    ffi::CString,
     fs::{self, File, OpenOptions},
-    io::Write as _,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    io::{BufRead, BufReader, Read as _, Write as _},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -18,7 +22,8 @@ use mac_worker::{
     host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
     job::{
         CommandSpec, JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
-        ProcessIdentity, RequestFingerprintMaterial, SubmitRequest, SubmitResponse,
+        LogChunkRequest, LogChunkResponse, LogStream, ProcessIdentity, RequestFingerprintMaterial,
+        StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
@@ -241,6 +246,213 @@ fn prepared_host_with_nested_cwd(
         .verify_and_promote_at(&lease, &digest, 2)
         .unwrap();
     (store, lease, SubmitRequest::new(request.material().clone()))
+}
+
+fn prepared_host_with_empty_nested_cwd(
+    root: &Path,
+    command: CommandSpec,
+) -> (HostStore, LeaseRecord, SubmitRequest) {
+    let store = HostStore::open(root).unwrap();
+    let manifest = format!(
+        concat!(
+            r#"{{"version":1,"project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
+            r#""head":null,"branch":null,"dirty":false,"relative_working_dir":"nested","#,
+            r#""entries":[{{"path":"nested","kind":"directory","mode":493,"size":0,"#,
+            r#""sha256":"4b66bf93b3932a9539880b2421e35019af9daf84363a0246280ffcac173b2678","#,
+            r#""symlink_target":null}}],"tracked_deletions":[]}}"#,
+        ),
+        PROJECT_ID = PROJECT_ID,
+        WORKTREE_ID = WORKTREE_ID,
+    )
+    .into_bytes();
+    let digest = format!("{:x}", Sha256::digest(&manifest));
+    let request = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            JOB_ID.parse().unwrap(),
+            CLIENT_ID.parse().unwrap(),
+            LEASE_TOKEN.parse().unwrap(),
+            3,
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            digest.clone(),
+            "nested".into(),
+            30_000,
+            "heavy".into(),
+            command,
+        )
+        .unwrap(),
+    );
+    let lease = match LeaseService::new(&store)
+        .acquire(&request, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    fs::create_dir_all(incoming.join("tree/nested")).unwrap();
+    for private in [
+        incoming.parent().unwrap().parent().unwrap(),
+        incoming.parent().unwrap(),
+        incoming.as_path(),
+    ] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(incoming.join("manifest.json"), manifest).unwrap();
+    fs::set_permissions(
+        incoming.join("manifest.json"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(
+        incoming.join("tree/nested"),
+        fs::Permissions::from_mode(0o555),
+    )
+    .unwrap();
+    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
+    RemoteSnapshotService::new(&store)
+        .verify_and_promote_at(&lease, &digest, 2)
+        .unwrap();
+    (store, lease, SubmitRequest::new(request.material().clone()))
+}
+
+fn prepared_host_with_argv_reflector_script(
+    root: &Path,
+    command: CommandSpec,
+) -> (HostStore, LeaseRecord, SubmitRequest) {
+    let store = HostStore::open(root).unwrap();
+    let script_name = "run-argv;literal";
+    let script =
+        b"#!/bin/sh\nprintf '%s\\000' \"$0\"; for value in \"$@\"; do printf '%s\\000' \"$value\"; done\n";
+    let script_digest = format!("{:x}", Sha256::digest(script));
+    let manifest = format!(
+        concat!(
+            r#"{{"version":1,"project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
+            r#""head":null,"branch":null,"dirty":false,"relative_working_dir":"","#,
+            r#""entries":[{{"path":"{SCRIPT_NAME}","kind":"file","mode":493,"size":{SCRIPT_SIZE},"#,
+            r#""sha256":"{SCRIPT_DIGEST}","symlink_target":null}}],"tracked_deletions":[]}}"#,
+        ),
+        PROJECT_ID = PROJECT_ID,
+        WORKTREE_ID = WORKTREE_ID,
+        SCRIPT_NAME = script_name,
+        SCRIPT_SIZE = script.len(),
+        SCRIPT_DIGEST = script_digest,
+    )
+    .into_bytes();
+    let digest = format!("{:x}", Sha256::digest(&manifest));
+    let request = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            JOB_ID.parse().unwrap(),
+            CLIENT_ID.parse().unwrap(),
+            LEASE_TOKEN.parse().unwrap(),
+            3,
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            digest.clone(),
+            String::new(),
+            30_000,
+            "heavy".into(),
+            command,
+        )
+        .unwrap(),
+    );
+    let lease = match LeaseService::new(&store)
+        .acquire(&request, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    fs::create_dir_all(incoming.join("tree")).unwrap();
+    for private in [
+        incoming.parent().unwrap().parent().unwrap(),
+        incoming.parent().unwrap(),
+        incoming.as_path(),
+    ] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(incoming.join("manifest.json"), manifest).unwrap();
+    fs::write(incoming.join("tree").join(script_name), script).unwrap();
+    fs::set_permissions(
+        incoming.join("manifest.json"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(
+        incoming.join("tree").join(script_name),
+        fs::Permissions::from_mode(0o555),
+    )
+    .unwrap();
+    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
+    RemoteSnapshotService::new(&store)
+        .verify_and_promote_at(&lease, &digest, 2)
+        .unwrap();
+    (store, lease, SubmitRequest::new(request.material().clone()))
+}
+
+fn create_fifo(path: &Path) {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+fn host_control<Request, Response>(
+    home: &Path,
+    data: &Path,
+    operation: &str,
+    request: &Request,
+) -> Response
+where
+    Request: serde::Serialize,
+    Response: serde::de::DeserializeOwned,
+{
+    try_host_control(home, data, operation, request)
+        .unwrap_or_else(|error| panic!("{operation}: {error}"))
+}
+
+fn try_host_control<Request, Response>(
+    home: &Path,
+    data: &Path,
+    operation: &str,
+    request: &Request,
+) -> Result<Response, String>
+where
+    Request: serde::Serialize,
+    Response: serde::de::DeserializeOwned,
+{
+    let mut child = Command::new(env!("CARGO_BIN_EXE_worker"))
+        .env_clear()
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", data)
+        .args(["host", operation])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "host stdin was not piped".to_owned())?
+        .write_all(&serde_json::to_vec(request).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
 }
 
 struct InlineSupervisorLauncher {
@@ -1527,7 +1739,7 @@ fn unsafe_preexisting_final_evidence_is_preserved_and_never_indexed_or_launched(
 }
 
 #[test]
-fn sixty_four_concurrent_identical_submits_publish_and_launch_exactly_once() {
+fn one_hundred_concurrent_identical_submits_publish_and_launch_exactly_once() {
     let temp = tempfile::tempdir().unwrap();
     let (store, lease, request) = prepared_host(&temp.path().join("host"));
     let job_path = store
@@ -1540,10 +1752,10 @@ fn sixty_four_concurrent_identical_submits_publish_and_launch_exactly_once() {
         identity: ProcessIdentity::new(41_006, 4_100_006).unwrap(),
     };
     let service = JobService::new(&store, &launcher);
-    let barrier = Arc::new(Barrier::new(64));
+    let barrier = Arc::new(Barrier::new(100));
 
     std::thread::scope(|scope| {
-        let handles = (0..64)
+        let handles = (0..100)
             .map(|_| {
                 let barrier = Arc::clone(&barrier);
                 let request = request.clone();
@@ -1690,6 +1902,77 @@ fn real_gated_argv_execution_is_literal_terminal_and_releases_only_its_lease() {
         "job-owned incoming namespace was not cleaned"
     );
     assert!(LeaseService::new(&store).load().unwrap().is_none());
+}
+
+#[test]
+fn argv_at_the_two_hundred_fifty_six_boundary_executes_every_unique_metacharacter_value_literally()
+{
+    // CommandSpec::argv counts the program itself, so the metacharacter-bearing
+    // script pathname is also reflected as argv[0]. Together with the 255
+    // arguments below, this proves exactly 256 unique literal argv values.
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("must-not-exist");
+    let metacharacters = [
+        "$(", ")", "`", ";", "&", "|", "<", ">", "*", "?", "~", "!", "#", "'", "\"", "\\",
+    ];
+    let literal_args: Vec<String> = (0..255)
+        .map(|index| {
+            format!(
+                "arg-{index:03}-{}-$(touch {})-`touch {}`-ünicode-\n-\t-{index}",
+                metacharacters[index % metacharacters.len()],
+                marker.display(),
+                marker.display(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        literal_args
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        255,
+        "all 255 literal values must be unique"
+    );
+    let mut argv = vec!["./run-argv;literal".to_string()];
+    argv.extend(literal_args.iter().cloned());
+    assert_eq!(
+        argv.len(),
+        256,
+        "must exercise the exact MAX_ARG_COUNT boundary"
+    );
+    assert_eq!(
+        argv.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        256,
+        "all 256 literal argv values must be unique"
+    );
+    let command = CommandSpec::argv(argv.clone()).unwrap();
+    let (store, lease, request) =
+        prepared_host_with_argv_reflector_script(&temp.path().join("host"), command);
+    let job_path = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert_eq!(response.status().exit_code(), Some(0));
+    let stdout = fs::read(job_path.join("stdout.log")).unwrap();
+    let mut received: Vec<&[u8]> = stdout.split(|byte| *byte == 0).collect();
+    assert_eq!(received.pop(), Some(&[][..]));
+    assert_eq!(received.len(), 256);
+    for (actual, expected) in received.iter().zip(argv.iter()) {
+        assert_eq!(*actual, expected.as_bytes());
+    }
+    assert_eq!(fs::read(job_path.join("stderr.log")).unwrap(), b"");
+    assert!(
+        !marker.exists(),
+        "metacharacters inside argv values must never be interpreted by a shell"
+    );
 }
 
 #[test]
@@ -2065,6 +2348,56 @@ fn payload_erase_failure_closes_the_gate_before_any_user_byte_and_retains_lease(
 }
 
 #[test]
+fn transient_command_payload_is_placed_owner_only_before_child_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("must-not-run");
+    let command = CommandSpec::argv(vec![
+        "/usr/bin/touch".into(),
+        marker.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let (store, lease, request) =
+        prepared_host_with_command(&temp.path().join("payload-permission"), command);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launcher = FailingLauncher {
+        launches: Arc::clone(&launches),
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("injected launcher failure"),
+        "{error}"
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    let payload_path = job.join("execution.json");
+    let metadata = fs::metadata(&payload_path).unwrap();
+    assert_eq!(
+        metadata.permissions().mode() & 0o777,
+        0o600,
+        "the transient execution payload must be owner-only while it exists"
+    );
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    let payload_bytes = fs::read(&payload_path).unwrap();
+    let marker_bytes = marker.to_string_lossy().into_owned().into_bytes();
+    assert!(
+        payload_bytes
+            .windows(marker_bytes.len())
+            .any(|window| window == marker_bytes.as_slice()),
+        "the transient payload must hold the exact owner-scoped command it will launch"
+    );
+    assert!(
+        !marker.exists(),
+        "gated user command executed before launch"
+    );
+}
+
+#[test]
 fn pre_go_child_status_failure_erases_payload_but_abort_ambiguity_retains_lease() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("must-not-run");
@@ -2281,6 +2614,40 @@ fn nested_manifest_cwd_and_bare_executable_use_descriptor_root_and_fixed_path() 
 }
 
 #[test]
+fn empty_nested_relative_working_directory_is_materialized_and_used_as_cwd() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host_with_empty_nested_cwd(
+        &temp.path().join("empty-nested-cwd"),
+        CommandSpec::argv(vec!["pwd".into()]).unwrap(),
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+
+    let physical_job = if let Ok(suffix) = job.strip_prefix("/var") {
+        Path::new("/private/var").join(suffix)
+    } else {
+        job.clone()
+    };
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert_eq!(response.status().exit_code(), Some(0));
+    assert_eq!(
+        fs::read(job.join("stdout.log")).unwrap(),
+        format!("{}\n", physical_job.join("workspace/tree/nested").display()).as_bytes()
+    );
+    for removed in ["workspace", "home", "tmp"] {
+        assert!(!job.join(removed).exists());
+    }
+}
+
+#[test]
 fn relative_slash_argv_executes_exact_script_from_descriptor_bound_cwd() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("must-not-exist");
@@ -2431,4 +2798,168 @@ fn hidden_submit_detaches_the_same_worker_and_inherited_lock_runs_supervisor() {
         .output()
         .unwrap();
     assert!(!rejected.status.success());
+}
+
+#[test]
+fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_and_status_reconnect()
+ {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let data = temp.path().join("data");
+    fs::create_dir_all(&home).unwrap();
+    let ready_fifo = temp.path().join("command-ready.fifo");
+    let release_fifo = temp.path().join("command-release.fifo");
+    create_fifo(&ready_fifo);
+    create_fifo(&release_fifo);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let ready_reader = ready_fifo.clone();
+    let ready_thread = std::thread::spawn(move || {
+        let result = (|| -> std::io::Result<u8> {
+            let mut ready = [0_u8; 1];
+            OpenOptions::new()
+                .read(true)
+                .open(ready_reader)?
+                .read_exact(&mut ready)?;
+            Ok(ready[0])
+        })();
+        ready_tx.send(result).unwrap();
+    });
+
+    let host_root = data.join("mac-worker/host");
+    let (store, lease, request) = prepared_host_with_command(
+        &host_root,
+        CommandSpec::argv(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            concat!(
+                "printf R > \"$1\"; ",
+                "IFS= read -r release < \"$2\"; ",
+                "[ \"$release\" = X ] || exit 9; ",
+                "printf reconnected"
+            )
+            .into(),
+            "disconnect-probe".into(),
+            ready_fifo.to_string_lossy().into_owned(),
+            release_fifo.to_string_lossy().into_owned(),
+        ])
+        .unwrap(),
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    drop(store);
+
+    let mut submit_client = Command::new(env!("CARGO_BIN_EXE_worker"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &data)
+        .args(["host", "submit"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    submit_client
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&request).unwrap())
+        .unwrap();
+    let mut ack_line = String::new();
+    BufReader::new(submit_client.stdout.take().unwrap())
+        .read_line(&mut ack_line)
+        .unwrap();
+    let accepted: SubmitResponse = serde_json::from_str(ack_line.trim_end()).unwrap();
+    assert!(accepted.status().supervisor_identity().is_some());
+
+    // Simulate a hard client disconnect right after the accepted-client
+    // handshake: terminate the exact submitting process by its own PID. The
+    // detached supervisor was already handed off before this ack was
+    // written, so its lifetime must not depend on this process surviving.
+    let submit_client_pid = submit_client.id() as libc::pid_t;
+    assert_eq!(
+        unsafe { libc::kill(submit_client_pid, libc::SIGKILL) },
+        0,
+        "exact-PID kill of the disconnecting client must succeed"
+    );
+    let _ = submit_client.wait();
+
+    assert_eq!(
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        b'R',
+        "the detached child must reach its post-disconnect handshake"
+    );
+    ready_thread.join().unwrap();
+
+    let reconnect_deadline = Instant::now() + Duration::from_secs(5);
+    let running: StatusResponse = loop {
+        match try_host_control(&home, &data, "status", &StatusRequest::new(lease.job_id())) {
+            Ok(response) => break response,
+            Err(_) => assert!(
+                Instant::now() < reconnect_deadline,
+                "status reconnect never crossed the detached-supervisor handoff"
+            ),
+        }
+    };
+    assert_eq!(
+        running.status().supervisor_identity(),
+        accepted.status().supervisor_identity()
+    );
+    assert_eq!(running.status().state(), JobState::Running);
+
+    let reconnected_log: LogChunkResponse = host_control(
+        &home,
+        &data,
+        "log-chunk",
+        &LogChunkRequest::new(lease.job_id(), LogStream::Stdout, 0, 1024),
+    );
+    assert_eq!(reconnected_log.chunk().stream(), LogStream::Stdout);
+    assert_eq!(reconnected_log.chunk().offset(), 0);
+    assert_eq!(reconnected_log.chunk().decoded_bytes().unwrap(), b"");
+
+    OpenOptions::new()
+        .write(true)
+        .open(&release_fifo)
+        .unwrap()
+        .write_all(b"X\n")
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let terminal = loop {
+        let response: StatusResponse =
+            host_control(&home, &data, "status", &StatusRequest::new(lease.job_id()));
+        assert_eq!(
+            response.status().supervisor_identity(),
+            accepted.status().supervisor_identity()
+        );
+        if response.status().state().is_terminal() {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reconnected status polling never observed a terminal outcome"
+        );
+    };
+
+    assert_eq!(terminal.status().state(), JobState::Succeeded);
+    assert_eq!(terminal.status().exit_code(), Some(0));
+    assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"reconnected");
+    assert!(!job.join("execution.json").exists());
+
+    loop {
+        if LeaseService::new(&HostStore::open(&host_root).unwrap())
+            .load()
+            .unwrap()
+            .is_none()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached cleanup did not release the lease after the client disconnect"
+        );
+    }
 }
