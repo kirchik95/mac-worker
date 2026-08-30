@@ -8,7 +8,7 @@ use std::{
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -319,87 +319,117 @@ fn prepared_host_with_empty_nested_cwd(
     (store, lease, SubmitRequest::new(request.material().clone()))
 }
 
-fn prepared_host_with_argv_reflector_script(
-    root: &Path,
-    command: CommandSpec,
-) -> (HostStore, LeaseRecord, SubmitRequest) {
-    let store = HostStore::open(root).unwrap();
-    let script_name = "run-argv;literal";
-    let script =
-        b"#!/bin/sh\nprintf '%s\\000' \"$0\"; for value in \"$@\"; do printf '%s\\000' \"$value\"; done\n";
-    let script_digest = format!("{:x}", Sha256::digest(script));
-    let manifest = format!(
+fn compile_native_argv_reflector(directory: &Path) -> PathBuf {
+    let source = directory.join("argv-reflector.c");
+    let executable = directory.join("native argv[0];$()`'\" literal");
+    fs::write(
+        &source,
         concat!(
-            r#"{{"version":1,"project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
-            r#""head":null,"branch":null,"dirty":false,"relative_working_dir":"","#,
-            r#""entries":[{{"path":"{SCRIPT_NAME}","kind":"file","mode":493,"size":{SCRIPT_SIZE},"#,
-            r#""sha256":"{SCRIPT_DIGEST}","symlink_target":null}}],"tracked_deletions":[]}}"#,
+            "#include <stdio.h>\n",
+            "#include <string.h>\n",
+            "int main(int argc, char **argv) {\n",
+            "  for (int i = 0; i < argc; ++i) {\n",
+            "    size_t length = strlen(argv[i]);\n",
+            "    if (fwrite(argv[i], 1, length, stdout) != length || fputc(0, stdout) == EOF) return 2;\n",
+            "  }\n",
+            "  return fflush(stdout) == 0 ? 0 : 3;\n",
+            "}\n",
         ),
-        PROJECT_ID = PROJECT_ID,
-        WORKTREE_ID = WORKTREE_ID,
-        SCRIPT_NAME = script_name,
-        SCRIPT_SIZE = script.len(),
-        SCRIPT_DIGEST = script_digest,
     )
-    .into_bytes();
-    let digest = format!("{:x}", Sha256::digest(&manifest));
-    let request = LeaseAcquireRequest::new(
-        RequestFingerprintMaterial::new(
-            JOB_ID.parse().unwrap(),
-            CLIENT_ID.parse().unwrap(),
-            LEASE_TOKEN.parse().unwrap(),
-            3,
-            "mini-1".into(),
-            PROJECT_ID.into(),
-            WORKTREE_ID.into(),
-            digest.clone(),
-            String::new(),
-            30_000,
-            "heavy".into(),
-            command,
-        )
-        .unwrap(),
+    .unwrap();
+    let output = Command::new("/usr/bin/cc")
+        .args(["-o"])
+        .arg(&executable)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "failed to compile native argv reflector: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let lease = match LeaseService::new(&store)
-        .acquire(&request, &healthy(), 1)
-        .unwrap()
-    {
-        LeaseAcquireResponse::Acquired { lease } => lease,
-        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
-    };
-    let incoming = store
-        .incoming_job(lease.job_id(), lease.lease_token())
-        .unwrap();
-    fs::create_dir_all(incoming.join("tree")).unwrap();
-    for private in [
-        incoming.parent().unwrap().parent().unwrap(),
-        incoming.parent().unwrap(),
-        incoming.as_path(),
-    ] {
-        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    fs::write(incoming.join("manifest.json"), manifest).unwrap();
-    fs::write(incoming.join("tree").join(script_name), script).unwrap();
-    fs::set_permissions(
-        incoming.join("manifest.json"),
-        fs::Permissions::from_mode(0o444),
-    )
-    .unwrap();
-    fs::set_permissions(
-        incoming.join("tree").join(script_name),
-        fs::Permissions::from_mode(0o555),
-    )
-    .unwrap();
-    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
-    RemoteSnapshotService::new(&store)
-        .verify_and_promote_at(&lease, &digest, 2)
-        .unwrap();
-    (store, lease, SubmitRequest::new(request.material().clone()))
+    executable
 }
 
 fn create_fifo(path: &Path) {
     let path = CString::new(path.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+struct DirectChildCleanup {
+    child: Option<Child>,
+}
+
+impl DirectChildCleanup {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().unwrap()
+    }
+
+    fn kill_and_reap(&mut self) {
+        let child = self.child.as_mut().unwrap();
+        let pid = child.id() as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGKILL) },
+            0,
+            "exact-PID kill of the disconnecting client must succeed"
+        );
+        child.wait().unwrap();
+        self.child = None;
+    }
+}
+
+impl Drop for DirectChildCleanup {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+struct DetachedJobCleanup {
+    job: PathBuf,
+    armed: bool,
+}
+
+impl DetachedJobCleanup {
+    fn new(job: PathBuf) -> Self {
+        Self { job, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DetachedJobCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(bytes) = fs::read(self.job.join("status.json")) else {
+            return;
+        };
+        let Ok(status) = serde_json::from_slice::<JobStatus>(&bytes) else {
+            return;
+        };
+        let inspector = SystemProcessInspector;
+        for identity in [status.child_identity(), status.supervisor_identity()]
+            .into_iter()
+            .flatten()
+        {
+            if matches!(
+                inspector.observe(identity),
+                mac_worker::supervisor::ProcessObservation::Matching { .. }
+            ) {
+                let _ = unsafe { libc::kill(identity.pid() as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+    }
 }
 
 fn host_control<Request, Response>(
@@ -1907,11 +1937,12 @@ fn real_gated_argv_execution_is_literal_terminal_and_releases_only_its_lease() {
 #[test]
 fn argv_at_the_two_hundred_fifty_six_boundary_executes_every_unique_metacharacter_value_literally()
 {
-    // CommandSpec::argv counts the program itself, so the metacharacter-bearing
-    // script pathname is also reflected as argv[0]. Together with the 255
-    // arguments below, this proves exactly 256 unique literal argv values.
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("must-not-exist");
+    // A native reflector observes the execve argv vector directly. In
+    // particular, its first NUL-delimited value is the delivered argv[0], not a
+    // shebang interpreter's reconstructed script path.
+    let reflector = compile_native_argv_reflector(temp.path());
     let metacharacters = [
         "$(", ")", "`", ";", "&", "|", "<", ">", "*", "?", "~", "!", "#", "'", "\"", "\\",
     ];
@@ -1933,7 +1964,7 @@ fn argv_at_the_two_hundred_fifty_six_boundary_executes_every_unique_metacharacte
         255,
         "all 255 literal values must be unique"
     );
-    let mut argv = vec!["./run-argv;literal".to_string()];
+    let mut argv = vec![reflector.to_string_lossy().into_owned()];
     argv.extend(literal_args.iter().cloned());
     assert_eq!(
         argv.len(),
@@ -1946,8 +1977,7 @@ fn argv_at_the_two_hundred_fifty_six_boundary_executes_every_unique_metacharacte
         "all 256 literal argv values must be unique"
     );
     let command = CommandSpec::argv(argv.clone()).unwrap();
-    let (store, lease, request) =
-        prepared_host_with_argv_reflector_script(&temp.path().join("host"), command);
+    let (store, lease, request) = prepared_host_with_command(&temp.path().join("host"), command);
     let job_path = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -1965,6 +1995,11 @@ fn argv_at_the_two_hundred_fifty_six_boundary_executes_every_unique_metacharacte
     let mut received: Vec<&[u8]> = stdout.split(|byte| *byte == 0).collect();
     assert_eq!(received.pop(), Some(&[][..]));
     assert_eq!(received.len(), 256);
+    assert_eq!(
+        received[0],
+        argv[0].as_bytes(),
+        "native helper did not observe the literal delivered argv[0]"
+    );
     for (actual, expected) in received.iter().zip(argv.iter()) {
         assert_eq!(*actual, expected.as_bytes());
     }
@@ -2395,6 +2430,22 @@ fn transient_command_payload_is_placed_owner_only_before_child_launch() {
         !marker.exists(),
         "gated user command executed before launch"
     );
+
+    // A fresh authoritative status request must recover the identityless
+    // Accepted job, launch it once, and erase the exact payload afterward.
+    let recovery = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let recovered = JobService::new(&store, &recovery)
+        .status(lease.job_id())
+        .unwrap();
+    assert_eq!(recovered.status().state(), JobState::Succeeded);
+    assert!(marker.is_file(), "recovered command did not execute");
+    assert!(
+        !payload_path.exists(),
+        "recovery left the exact execution payload durable"
+    );
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 }
 
 #[test]
@@ -2847,42 +2898,34 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
+    let mut detached_cleanup = DetachedJobCleanup::new(job.clone());
     drop(store);
 
-    let mut submit_client = Command::new(env!("CARGO_BIN_EXE_worker"))
-        .env_clear()
-        .env("HOME", &home)
-        .env("XDG_DATA_HOME", &data)
-        .args(["host", "submit"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut submit_client = DirectChildCleanup::new(
+        Command::new(env!("CARGO_BIN_EXE_worker"))
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &data)
+            .args(["host", "submit"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     submit_client
+        .child_mut()
         .stdin
         .take()
         .unwrap()
         .write_all(&serde_json::to_vec(&request).unwrap())
         .unwrap();
     let mut ack_line = String::new();
-    BufReader::new(submit_client.stdout.take().unwrap())
+    BufReader::new(submit_client.child_mut().stdout.take().unwrap())
         .read_line(&mut ack_line)
         .unwrap();
     let accepted: SubmitResponse = serde_json::from_str(ack_line.trim_end()).unwrap();
     assert!(accepted.status().supervisor_identity().is_some());
-
-    // Simulate a hard client disconnect right after the accepted-client
-    // handshake: terminate the exact submitting process by its own PID. The
-    // detached supervisor was already handed off before this ack was
-    // written, so its lifetime must not depend on this process surviving.
-    let submit_client_pid = submit_client.id() as libc::pid_t;
-    assert_eq!(
-        unsafe { libc::kill(submit_client_pid, libc::SIGKILL) },
-        0,
-        "exact-PID kill of the disconnecting client must succeed"
-    );
-    let _ = submit_client.wait();
 
     assert_eq!(
         ready_rx
@@ -2890,18 +2933,38 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
             .unwrap()
             .unwrap(),
         b'R',
-        "the detached child must reach its post-disconnect handshake"
+        "the command must be FIFO-parked before the client is disconnected"
     );
     ready_thread.join().unwrap();
 
+    // Simulate a hard client disconnect right after the accepted-client
+    // handshake: terminate the exact submitting process by its own PID. The
+    // detached supervisor was already handed off before this ack was
+    // written, so its lifetime must not depend on this process surviving.
+    submit_client.kill_and_reap();
+
     let reconnect_deadline = Instant::now() + Duration::from_secs(5);
     let running: StatusResponse = loop {
-        match try_host_control(&home, &data, "status", &StatusRequest::new(lease.job_id())) {
-            Ok(response) => break response,
-            Err(_) => assert!(
-                Instant::now() < reconnect_deadline,
-                "status reconnect never crossed the detached-supervisor handoff"
-            ),
+        match try_host_control::<StatusRequest, StatusResponse>(
+            &home,
+            &data,
+            "status",
+            &StatusRequest::new(lease.job_id()),
+        ) {
+            Ok(response) if response.status().state() == JobState::Running => break response,
+            Ok(response) if response.status().state().is_terminal() => {
+                panic!(
+                    "FIFO-parked command became terminal before release: {:?}",
+                    response.status().state()
+                )
+            }
+            Ok(_) | Err(_) => {
+                assert!(
+                    Instant::now() < reconnect_deadline,
+                    "status reconnect never crossed the detached-supervisor handoff"
+                );
+                std::thread::yield_now();
+            }
         }
     };
     assert_eq!(
@@ -2909,16 +2972,6 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
         accepted.status().supervisor_identity()
     );
     assert_eq!(running.status().state(), JobState::Running);
-
-    let reconnected_log: LogChunkResponse = host_control(
-        &home,
-        &data,
-        "log-chunk",
-        &LogChunkRequest::new(lease.job_id(), LogStream::Stdout, 0, 1024),
-    );
-    assert_eq!(reconnected_log.chunk().stream(), LogStream::Stdout);
-    assert_eq!(reconnected_log.chunk().offset(), 0);
-    assert_eq!(reconnected_log.chunk().decoded_bytes().unwrap(), b"");
 
     OpenOptions::new()
         .write(true)
@@ -2942,13 +2995,27 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
             Instant::now() < deadline,
             "reconnected status polling never observed a terminal outcome"
         );
+        std::thread::yield_now();
     };
 
     assert_eq!(terminal.status().state(), JobState::Succeeded);
     assert_eq!(terminal.status().exit_code(), Some(0));
     assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"reconnected");
+    let reconnected_log: LogChunkResponse = host_control(
+        &home,
+        &data,
+        "log-chunk",
+        &LogChunkRequest::new(lease.job_id(), LogStream::Stdout, 0, 1024),
+    );
+    assert_eq!(reconnected_log.chunk().stream(), LogStream::Stdout);
+    assert_eq!(reconnected_log.chunk().offset(), 0);
+    assert_eq!(
+        reconnected_log.chunk().decoded_bytes().unwrap(),
+        b"reconnected"
+    );
     assert!(!job.join("execution.json").exists());
 
+    let release_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if LeaseService::new(&HostStore::open(&host_root).unwrap())
             .load()
@@ -2958,8 +3025,10 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            Instant::now() < release_deadline,
             "detached cleanup did not release the lease after the client disconnect"
         );
+        std::thread::yield_now();
     }
+    detached_cleanup.disarm();
 }
