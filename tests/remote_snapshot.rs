@@ -489,7 +489,16 @@ fn make_owned_tree_writable(path: &Path) {
 }
 
 fn assert_no_workspace_entry(path: &Path, row: usize) {
-    for entry in fs::read_dir(path).unwrap() {
+    let mode = fs::symlink_metadata(path).unwrap().permissions().mode();
+    if mode & 0o500 != 0o500 {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o500)).unwrap();
+    }
+    for entry in fs::read_dir(path).unwrap_or_else(|error| {
+        panic!(
+            "row {row} could not inspect {} for workspaces: {error}",
+            path.display()
+        )
+    }) {
         let entry = entry.unwrap();
         let entry_path = entry.path();
         assert_ne!(
@@ -581,13 +590,17 @@ fn semantic_manifest_and_live_tree_mutation_matrix_100_never_publishes() {
         let sentinel_bytes = format!("outside-content-{marker}").into_bytes();
         fs::write(&sentinel, &sentinel_bytes).unwrap();
 
-        let path = format!("payload-{row:03}-{marker}.txt");
+        let path = if row < 50 {
+            "payload.txt".to_owned()
+        } else {
+            format!("payload-{row:03}-{marker}.txt")
+        };
         let mut manifest = SnapshotManifest {
             version: 1,
             project_id: PROJECT_ID.into(),
             worktree_id: WORKTREE_ID.into(),
             head: None,
-            branch: Some("main".into()),
+            branch: Some(marker.clone()),
             dirty: true,
             relative_working_dir: String::new(),
             entries: vec![file_entry(&path, b"payload", false)],
@@ -597,18 +610,97 @@ fn semantic_manifest_and_live_tree_mutation_matrix_100_never_publishes() {
         if row < 50 {
             let slot = row % 5;
             match row / 5 {
-                0 => manifest.version = 2 + slot as u32,
-                1 => manifest.head = Some(format!("{marker}-{slot}")),
-                2 => manifest.branch = Some(format!("{marker}\0{slot}")),
-                3 => manifest.entries[0].path = format!("../{marker}-{slot}"),
+                0 => manifest.version = [0, 2, 3, 42, u32::MAX][slot],
+                1 => {
+                    manifest.head = Some(match slot {
+                        0 => String::new(),
+                        1 => "0".repeat(39),
+                        2 => "0".repeat(41),
+                        3 => "A".repeat(40),
+                        4 => "g".repeat(64),
+                        _ => unreachable!(),
+                    })
+                }
+                2 => {
+                    manifest.branch = Some(match slot {
+                        0 => String::new(),
+                        1 => "\0".into(),
+                        2 => format!("{marker}\0suffix"),
+                        3 => format!("prefix\0{marker}"),
+                        4 => marker.repeat(4_682),
+                        _ => unreachable!(),
+                    })
+                }
+                3 => {
+                    manifest.entries[0].path = match slot {
+                        0 => format!("/{marker}"),
+                        1 => format!("../{marker}"),
+                        2 => format!("nested/../../{marker}"),
+                        3 => format!("nested/./{marker}"),
+                        4 => format!("nested\\{marker}"),
+                        _ => unreachable!(),
+                    }
+                }
                 4 => manifest.entries[0].mode = [0, 0o600, 0o700, 0o744, 0o777][slot],
-                5 => manifest.entries[0].sha256 = format!("{marker}-{slot}"),
-                6 => manifest.entries[0].symlink_target = Some(format!("{marker}-{slot}")),
-                7 => manifest.entries.push(manifest.entries[0].clone()),
-                8 => manifest
-                    .tracked_deletions
-                    .push(manifest.entries[0].path.clone()),
-                9 => manifest.relative_working_dir = format!("missing-{marker}-{slot}"),
+                5 => {
+                    let wrong_bytes = format!("valid-lower-hex-digest-mismatch-{slot}-{marker}");
+                    let wrong_digest = format!("{:x}", Sha256::digest(wrong_bytes));
+                    assert_eq!(wrong_digest.len(), 64);
+                    assert!(
+                        wrong_digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    );
+                    assert_ne!(wrong_digest, manifest.entries[0].sha256);
+                    manifest.entries[0].sha256 = wrong_digest;
+                }
+                6 => match slot {
+                    0 => manifest.entries[0].symlink_target = Some(String::new()),
+                    1 => manifest.entries[0].symlink_target = Some(marker.clone()),
+                    2 => {
+                        manifest.entries[0].mode = 0o755;
+                        manifest.entries[0].symlink_target = Some(format!("../{marker}"));
+                    }
+                    3 => {
+                        manifest.entries[0].size = 0;
+                        manifest.entries[0].symlink_target = Some(format!("{marker}\0target"));
+                    }
+                    4 => {
+                        manifest.entries[0].sha256 =
+                            format!("{:x}", Sha256::digest(marker.as_bytes()));
+                        manifest.entries[0].symlink_target = Some(marker.repeat(2_341));
+                    }
+                    _ => unreachable!(),
+                },
+                7 => {
+                    let duplicate = manifest.entries[0].clone();
+                    manifest
+                        .entries
+                        .extend(std::iter::repeat_n(duplicate, slot + 1));
+                }
+                8 => {
+                    manifest.entries[0].path = match slot {
+                        0 => "payload.txt".into(),
+                        1 => "nested/payload.txt".into(),
+                        2 => "β/payload.txt".into(),
+                        3 => "space name/payload.txt".into(),
+                        4 => "line\nbreak/payload.txt".into(),
+                        _ => unreachable!(),
+                    };
+                    manifest
+                        .tracked_deletions
+                        .push(manifest.entries[0].path.clone());
+                }
+                9 => {
+                    manifest.relative_working_dir = match slot {
+                        0 => format!("missing-{marker}"),
+                        1 => "payload.txt".into(),
+                        2 => format!("/{marker}"),
+                        3 => format!("./{marker}"),
+                        4 => format!(".git/{marker}"),
+                        _ => unreachable!(),
+                    }
+                }
                 _ => unreachable!(),
             }
             let bytes = serde_json::to_vec(&manifest).unwrap();
@@ -624,6 +716,11 @@ fn semantic_manifest_and_live_tree_mutation_matrix_100_never_publishes() {
                 row,
             );
         } else {
+            let live_class = (row - 50) / 5;
+            let slot = (row - 50) % 5;
+            if live_class == 9 && slot >= 2 {
+                manifest.entries[0].mode = 0o755;
+            }
             let bytes = manifest.canonical_bytes().unwrap();
             let (store, lease, digest) = acquired_bundle_bytes(&host_root, bytes);
             let incoming = store
@@ -637,52 +734,146 @@ fn semantic_manifest_and_live_tree_mutation_matrix_100_never_publishes() {
             fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
             fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
 
-            let slot = (row - 50) % 5;
-            match (row - 50) / 5 {
-                0 => replace_read_only_file(&target, marker.as_bytes()),
+            match live_class {
+                0 => {
+                    let changed = match slot {
+                        0 => Vec::new(),
+                        1 => b"payloae".to_vec(),
+                        2 => b"payload-with-trailing-bytes".to_vec(),
+                        3 => vec![0, 0xff, b'\n', b'\r', 0x80],
+                        4 => marker.repeat(257).into_bytes(),
+                        _ => unreachable!(),
+                    };
+                    replace_read_only_file(&target, &changed);
+                }
                 1 => {
                     fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
-                    fs::remove_file(&target).unwrap();
+                    match slot {
+                        0 => fs::remove_file(&target).unwrap(),
+                        1 => fs::rename(&target, tree.join(format!("renamed-{marker}"))).unwrap(),
+                        2 => {
+                            fs::remove_file(&target).unwrap();
+                            fs::create_dir(tree.join(format!("empty-{marker}"))).unwrap();
+                        }
+                        3 => {
+                            fs::remove_file(&target).unwrap();
+                            fs::write(tree.join(format!("replacement-{marker}")), b"replacement")
+                                .unwrap();
+                        }
+                        4 => {
+                            fs::remove_file(&target).unwrap();
+                            symlink(&sentinel, tree.join(format!("replacement-{marker}"))).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
                     fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
                 }
                 2 => {
-                    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+                    fs::set_permissions(
+                        &target,
+                        fs::Permissions::from_mode([0o200, 0o600, 0o640, 0o644, 0o700][slot]),
+                    )
+                    .unwrap();
                 }
                 3 => {
                     let extra = tree.join(format!("extra-{slot}-{marker}"));
                     fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
-                    fs::write(&extra, marker.as_bytes()).unwrap();
-                    fs::set_permissions(&extra, fs::Permissions::from_mode(0o444)).unwrap();
+                    match slot {
+                        0 => {
+                            fs::write(&extra, marker.as_bytes()).unwrap();
+                            fs::set_permissions(&extra, fs::Permissions::from_mode(0o444)).unwrap();
+                        }
+                        1 => {
+                            fs::create_dir(&extra).unwrap();
+                            fs::set_permissions(&extra, fs::Permissions::from_mode(0o555)).unwrap();
+                        }
+                        2 => symlink(&sentinel, &extra).unwrap(),
+                        3 => {
+                            let fifo = CString::new(extra.as_os_str().as_encoded_bytes()).unwrap();
+                            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o444) }, 0);
+                        }
+                        4 => {
+                            fs::create_dir(&extra).unwrap();
+                            fs::write(extra.join("nested"), marker.as_bytes()).unwrap();
+                            fs::set_permissions(
+                                extra.join("nested"),
+                                fs::Permissions::from_mode(0o444),
+                            )
+                            .unwrap();
+                            fs::set_permissions(&extra, fs::Permissions::from_mode(0o555)).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
                     fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
                 }
                 4 => {
                     fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
                     fs::remove_file(&target).unwrap();
-                    fs::create_dir(&target).unwrap();
-                    fs::set_permissions(&target, fs::Permissions::from_mode(0o555)).unwrap();
+                    match slot {
+                        0 => {
+                            fs::create_dir(&target).unwrap();
+                            fs::set_permissions(&target, fs::Permissions::from_mode(0o555))
+                                .unwrap();
+                        }
+                        1 => symlink(&sentinel, &target).unwrap(),
+                        2 => symlink(fixture.path().join("missing"), &target).unwrap(),
+                        3 => {
+                            let fifo = CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
+                            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o444) }, 0);
+                        }
+                        4 => symlink(".", &target).unwrap(),
+                        _ => unreachable!(),
+                    }
                     fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
                 }
                 5 => {
-                    fs::hard_link(&target, fixture.path().join(format!("alias-{slot}"))).unwrap();
+                    for alias in 0..=slot {
+                        fs::hard_link(
+                            &target,
+                            fixture.path().join(format!("alias-{slot}-{alias}")),
+                        )
+                        .unwrap();
+                    }
                 }
                 6 => {
                     fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
                     fs::remove_file(&target).unwrap();
-                    symlink(&sentinel, &target).unwrap();
+                    let link_target = match slot {
+                        0 => sentinel.clone(),
+                        1 => fixture.path().to_path_buf(),
+                        2 => fixture.path().join(format!("missing-{marker}")),
+                        3 => Path::new("../..").join(format!("outside-{marker}")),
+                        4 => Path::new(&path).to_path_buf(),
+                        _ => unreachable!(),
+                    };
+                    symlink(link_target, &target).unwrap();
                     fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
                 }
                 7 => {
                     fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
                     fs::remove_file(&target).unwrap();
                     let fifo = CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
-                    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o444) }, 0);
+                    assert_eq!(
+                        unsafe {
+                            libc::mkfifo(fifo.as_ptr(), [0o400, 0o440, 0o444, 0o500, 0o555][slot])
+                        },
+                        0
+                    );
                     fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
                 }
                 8 => {
-                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
+                    fs::set_permissions(
+                        &tree,
+                        fs::Permissions::from_mode([0o600, 0o700, 0o711, 0o755, 0o777][slot]),
+                    )
+                    .unwrap();
                 }
                 9 => {
-                    fs::set_permissions(&target, fs::Permissions::from_mode(0o555)).unwrap();
+                    fs::set_permissions(
+                        &target,
+                        fs::Permissions::from_mode([0o500, 0o555, 0o400, 0o444, 0o455][slot]),
+                    )
+                    .unwrap();
                 }
                 _ => unreachable!(),
             }
