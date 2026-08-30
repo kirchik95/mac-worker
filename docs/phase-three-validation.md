@@ -4,22 +4,19 @@ Phase 3 implements one explicitly selected worker per `worker run` invocation. I
 
 ## Automated local and fake-transport evidence
 
-The committed Task 10 slice reports record these focused commands and results. They exercise local helpers, isolated filesystem fixtures, and fake or injected transport boundaries as applicable; none is evidence of a configured live worker.
+The committed Task 10 slice reports record these focused commands and results at the revisions shown below. Those revisions are ancestors of this document's branch, so each command can be reproduced against its named revision. They exercise local helpers, isolated filesystem fixtures, and fake or injected transport boundaries as applicable; none is evidence of a configured live worker.
 
-| Command | Recorded result |
+| Command | Revision measured | Recorded result |
 | --- | --- |
-| `cargo test --locked --test remote_snapshot -- --nocapture` | 21 passed, 0 failed |
-| `cargo test --locked --test job_queries -- --nocapture` | 63 passed, 0 failed |
-| `cargo test --locked --test run_command -- --nocapture` | 84 passed, 0 failed |
-| `cargo test --locked --test supervisor -- --nocapture` | 44 passed, 0 failed |
-| `cargo test --locked --lib transfer::exec_inheritance_tests -- --nocapture` | 7 passed, 0 failed |
-| `cargo fmt --all --check` | passed in the focused slice checks |
-| Focused Clippy checks reported by the slices | passed with no warnings |
-| `git diff --check` | passed in the focused slice checks |
+| `cargo test --locked --test remote_snapshot -- --nocapture` | `4f6125f` | 21 passed, 0 failed |
+| `cargo test --locked --test run_command -- --nocapture` | `1dee62e` | 84 passed, 0 failed |
+| `cargo test --locked --test job_queries -- --nocapture` | `0d7c341` | 63 passed, 0 failed |
+| `cargo test --locked --test supervisor -- --nocapture` | `f7cb2b1` | 44 passed, 0 failed |
+| `cargo test --locked --lib transfer::exec_inheritance_tests -- --nocapture` | `f7cb2b1` | 7 passed, 0 failed |
 
-The recorded automated coverage includes a deterministic 100-row disconnect/reconciliation matrix, a 100-row remote snapshot mutation matrix, binary log handling, artifact preflight rejection, and exact literal argument-vector handling. It does not replace live-host acceptance.
+The recorded automated coverage includes a deterministic 100-row disconnect/reconciliation matrix, a 100-row remote snapshot mutation matrix, binary log handling, artifact preflight rejection, and exact literal argument-vector handling. These are separate focused measurements, not one combined invocation or final gate. They do not replace live-host acceptance.
 
-No controller-wide or full-gate result is claimed here: no such final result is recorded in this validation document. Do not infer live acceptance, fleet behavior, or a final release revision from the focused automated results.
+The combined all-target test result and final gate are **PENDING**. No controller-wide or final-gate result is claimed here, and no final release revision is recorded. Do not infer live acceptance, fleet behavior, or a final release revision from the focused automated results.
 
 ## Live single-host acceptance — PENDING
 
@@ -30,13 +27,16 @@ No sanitized live single-host acceptance run is recorded yet. Populate every fie
 | Software commit | **PENDING** |
 | Worker protocol version | **PENDING** |
 | Selected worker name | **PENDING** |
-| Successful command outcome | **PENDING** — shortened job ID, terminal state, exit result, and sanitized duration only |
-| Non-zero command outcome | **PENDING** — shortened job ID, terminal state, exit result, and sanitized duration only |
-| Disconnect and reconnect | **PENDING** — the follower disconnected, `status` and `logs` reconnected using the same original shortened job ID, and execution occurred once |
-| Capacity | **PENDING** — concurrent submission returned `CAPACITY_BUSY` and did not execute |
-| Cleanup and lease | **PENDING** — terminal cleanup completed before the one-slot lease became available |
-| Worker namespace fingerprints | **PENDING** — before/after fingerprints of mac-worker-owned namespaces only |
-| Original isolated clone | **PENDING** — unchanged after remote execution |
+| Sanitized command categories | **PENDING** — record setup; the operator-selected shell sleep/reconnect job; `logs -f` reconnect; and the operator-selected literal-argv non-zero `/bin/sh -c 'exit 7'` case |
+| Successful command outcome | **PENDING** — record shortened job ID, terminal state, exit result, and sanitized duration only |
+| Non-zero command outcome | **PENDING** — record shortened job ID, terminal state, exit result, and sanitized duration only |
+| Disconnect and reconnect | **PENDING** — record a follower disconnect, then `status` and `logs` reconnecting by the same original shortened job ID, with one execution |
+| Capacity | **PENDING** — record a concurrent submission returning `CAPACITY_BUSY` with no execution |
+| Cleanup and lease | **PENDING** — record terminal cleanup completing before the one-slot lease becomes available |
+| Retained metadata and logs | **PENDING** — record inspection confirming no local complete paths or planted values |
+| Worker namespace fingerprints | **PENDING** — record before/after fingerprints of mac-worker-owned namespaces only |
+| Unrelated remote entries | **PENDING** — record that no unrelated remote entries changed |
+| Original isolated clone | **PENDING** — record that the original isolated clone remains unchanged after remote execution |
 
 The live record must also state whether the validated helper and client revisions matched, without recording installation locations or connection details. Record only sanitized command categories and outcomes; application output is not safe evidence by default because it may contain application-emitted secrets.
 

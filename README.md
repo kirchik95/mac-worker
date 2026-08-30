@@ -11,17 +11,18 @@ cargo test --all-targets
 cargo build --release
 mkdir -p ~/.config/mac-worker
 cp config.example.toml ~/.config/mac-worker/config.toml
-./target/release/worker workers
 ./target/release/worker setup mini-1
+./target/release/worker workers
 ./target/release/worker --json workers | jq .
 ```
 
-`worker workers` lists the configured workers; in Phase 3, `worker run` requires one of those worker names explicitly. `worker setup mini-1` installs the current helper for that configured worker.
+`worker setup mini-1` installs the current helper for that configured worker. `worker workers` lists configured workers and performs bounded read-only SSH health probes; it may report a worker unavailable before setup. In Phase 3, `worker run` requires one of those worker names explicitly.
 
 Run trusted, non-interactive batch commands from a Git worktree:
 
 ```bash
 ./target/release/worker run --worker mini-1 -- /usr/bin/printf 'hello\n'
+./target/release/worker status
 ./target/release/worker status <job-id>
 ./target/release/worker logs -f <job-id>
 ```
@@ -32,7 +33,7 @@ Before submission, the client captures a verified immutable snapshot rather than
 
 Human log streaming writes raw application bytes to stdout or stderr. With `--json`, `run` and `logs` emit versioned NDJSON events; log chunks are base64-encoded instead of appearing as raw bytes. mac-worker avoids adding secret values to its own diagnostics, but application logs can contain secrets emitted by the application.
 
-Phase 3 deliberately does not provide automatic scheduling or queueing, cancellation, artifact transfer, package caches, Docker profiles, safe garbage collection, or a dashboard. Any configured artifact collection causes `worker run` to reject the job during preflight with `ARTIFACTS_UNSUPPORTED`; it never runs the command and silently discards requested outputs.
+Phase 3 deliberately does not provide automatic scheduling or queueing, cancellation, artifact transfer, package caches, Docker profiles, safe garbage collection, or a dashboard. Any configured artifact collection causes `worker run` to reject the job during preflight with `ARTIFACTS_UNSUPPORTED`, rather than running the command and silently discarding requested outputs.
 
 ## Validate a project locally
 
@@ -49,5 +50,3 @@ cargo build --release
 Doctor inspects the Git worktree, probes configured workers read-only, creates a unique local snapshot, verifies the selected source a second time, and deletes that exact snapshot before a successful return. It does not upload project data or start a user command. A cleanup failure is an I/O failure, never a ready result.
 
 `UNTRACKED_INPUT` means local inputs are not covered by an explicit policy. Commit them, ignore or remove them when appropriate, or include only the exact file or narrow project-owned subtree needed by the command. Do not use a catch-all include. `SENSITIVE_PATH` means a conventional credential path is selected: remove it from the project input and use a documented example file or separately provisioned worker configuration. If the name is intentionally non-secret, review it and add only that exact relative path to `snapshot.allow_sensitive` in `.worker.toml`; Doctor will emit a content-free warning.
-
-Doctor remains read-only: it does not upload project data or start a user command.
