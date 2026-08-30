@@ -207,6 +207,28 @@ fn authoritative_protocol_failure(code: &str, message: &str) -> Result<ProcessRe
     })
 }
 
+fn oversized_authoritative_protocol_failure(
+    code: &str,
+    secret: &str,
+) -> Result<ProcessResult, WorkerError> {
+    // Bypasses HostControlError::new's own 4096-byte bound so the wire
+    // envelope itself carries a message far past MAX_CONTROL_MESSAGE_BYTES.
+    // Built as a raw canonical literal (rather than via serde_json::Value,
+    // whose default map reorders keys) so it round-trips exactly like the
+    // real type's derived Serialize output.
+    let oversized_message = format!("{}{secret}", "X".repeat(200_000));
+    let mut stdout = format!(
+        r#"{{"protocol_version":{PROTOCOL_VERSION},"error":{{"code":"{code}","message":"{oversized_message}"}}}}"#
+    )
+    .into_bytes();
+    stdout.push(b'\n');
+    Ok(ProcessResult {
+        status: ExitStatus::from_raw(23 << 8),
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
 fn test_record(
     store: &ClientStateStore,
     seed: u128,
@@ -4750,6 +4772,155 @@ fn operational_git_selection_failures_remain_snapshot_infrastructure_errors() {
     runner.assert_consumed();
 }
 
+fn run_worktree_git(directory: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("/usr/bin/git")
+        .current_dir(directory)
+        .env("HOME", home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .args(args)
+        .output()
+        .expect("run isolated git fixture command in the linked worktree")
+}
+
+#[test]
+fn linked_worktrees_submit_distinct_immutable_snapshots_under_the_same_project_id() {
+    // Catches collapsing two linked worktrees of one project onto a shared
+    // snapshot identity, or letting one worktree's captured content leak
+    // into the other worktree's manifest or job.
+    let repo = run_repo(b"version = 1\n");
+    let home = repo.root().join("home");
+    let linked_root = tempfile::tempdir().unwrap();
+    let linked_path = linked_root.path().join("linked-worktree");
+    assert!(
+        repo.git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            linked_path.to_str().unwrap(),
+            "-b",
+            "linked-branch",
+        ])
+        .status
+        .success()
+    );
+    fs::write(
+        linked_path.join("linked-only.txt"),
+        b"linked worktree contents\n",
+    )
+    .unwrap();
+    assert!(
+        run_worktree_git(&linked_path, &home, &["add", "--all"])
+            .status
+            .success()
+    );
+    assert!(
+        run_worktree_git(
+            &linked_path,
+            &home,
+            &["commit", "-m", "linked worktree fixture"],
+        )
+        .status
+        .success()
+    );
+
+    let primary_temp = tempfile::tempdir().unwrap();
+    let linked_temp = tempfile::tempdir().unwrap();
+    let primary_follower = RecordingFollower::succeeding(0);
+    let linked_follower = RecordingFollower::succeeding(0);
+    let mut primary_stdout = Vec::new();
+    let mut primary_stderr = Vec::new();
+    let mut linked_stdout = Vec::new();
+    let mut linked_stderr = Vec::new();
+
+    let (primary_result, primary_runner, primary_store) = run_with_script(
+        &repo,
+        &primary_temp,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &primary_follower,
+        None,
+        false,
+        &mut primary_stdout,
+        &mut primary_stderr,
+    );
+
+    let linked_paths = run_paths(&linked_temp);
+    let linked_store = ClientStateStore::open(&linked_paths.state).unwrap();
+    let linked_config = run_config();
+    let linked_runner = RunScriptRunner::new(
+        linked_paths.state.clone(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+    );
+    let linked_service = RunService::with_follower(
+        &linked_runner,
+        &linked_config,
+        &linked_paths,
+        &linked_store,
+        &linked_follower,
+    );
+    let linked_result = linked_service.submit_and_follow(
+        RunRequest {
+            worker: "mini-1".into(),
+            project: linked_path.clone(),
+            cli_includes: Vec::new(),
+            timeout: None,
+            command: CommandSpec::argv(vec!["printf".into(), "linked".into()]).unwrap(),
+        },
+        false,
+        &mut linked_stdout,
+        &mut linked_stderr,
+    );
+
+    let primary_completion = primary_result.unwrap();
+    let linked_completion = linked_result.unwrap();
+    assert_eq!(primary_completion.exit_code, 0);
+    assert_eq!(linked_completion.exit_code, 0);
+    assert_eq!(primary_follower.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(linked_follower.calls.load(Ordering::SeqCst), 1);
+
+    let primary_material = primary_runner.material();
+    let linked_material = linked_runner.material();
+    assert_eq!(primary_material.project_id(), linked_material.project_id());
+    assert_ne!(
+        primary_material.worktree_id(),
+        linked_material.worktree_id()
+    );
+    assert_ne!(
+        primary_material.manifest_digest(),
+        linked_material.manifest_digest()
+    );
+    assert_ne!(primary_material.job_id(), linked_material.job_id());
+
+    assert_eq!(primary_store.list_jobs().unwrap().len(), 1);
+    assert_eq!(linked_store.list_jobs().unwrap().len(), 1);
+    primary_runner.assert_consumed();
+    linked_runner.assert_consumed();
+    assert_no_run_capture(&run_paths(&primary_temp).cache);
+    assert_no_run_capture(&run_paths(&linked_temp).cache);
+}
+
 const LOG_CHUNK_LIMIT: u32 = 65_536;
 const PLANTED_STDOUT_TEXT: &[u8] = b"PLANTED_STDOUT_SECRET";
 const PLANTED_STDERR_TEXT: &[u8] = b"PLANTED_STDERR_SECRET";
@@ -5293,6 +5464,197 @@ fn terminal_status_meta_or_lengths_cannot_change_during_drain() {
     assert_log_chunk_call(&requests[2], record.meta().job_id(), LogStream::Stderr, 0);
     assert_log_chunk_call(&requests[3], record.meta().job_id(), LogStream::Stdout, 3);
     assert_status_query(&requests[4], record.meta().job_id());
+    assert_no_mutating_control(&requests);
+}
+
+#[test]
+fn terminal_binary_non_utf8_multi_chunk_logs_drain_to_exact_lengths_in_human_mode() {
+    // Catches losing bytes across a multi-chunk boundary, corrupting a
+    // non-UTF-8 payload, or stopping before the recorded terminal length.
+    let stdout_chunk_a: &[u8] = &[0xc3, 0x28, 0x00, 0xfe, b'A'];
+    let stdout_chunk_b: &[u8] = &[0x80, 0x81, b'B', 0xed, 0xa0, 0x80];
+    let stderr_chunk_a: &[u8] = &[0xff, 0x00, b'C'];
+    let stderr_chunk_b: &[u8] = &[0x80, b'D', 0x00, 0xc0, 0xaf];
+    let stdout_total = (stdout_chunk_a.len() + stdout_chunk_b.len()) as u64;
+    let stderr_total = (stderr_chunk_a.len() + stderr_chunk_b.len()) as u64;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let terminal = log_status_response(
+        &record,
+        JobStatus::succeeded(140, stdout_total, stderr_total).unwrap(),
+    );
+    let runner = RecordingRunner::returning(vec![
+        status_result(&terminal),
+        log_chunk_result(LogStream::Stdout, 0, stdout_chunk_a),
+        log_chunk_result(LogStream::Stderr, 0, stderr_chunk_a),
+        log_chunk_result(
+            LogStream::Stdout,
+            stdout_chunk_a.len() as u64,
+            stdout_chunk_b,
+        ),
+        log_chunk_result(
+            LogStream::Stderr,
+            stderr_chunk_a.len() as u64,
+            stderr_chunk_b,
+        ),
+        log_chunk_result(LogStream::Stdout, stdout_total, b""),
+        log_chunk_result(LogStream::Stderr, stderr_total, b""),
+        status_result(&terminal),
+    ]);
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+    let runtime = RecordingFollowRuntime::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let response = logs_service(&config, &store, &remote, &runtime)
+        .stream(
+            record.meta().job_id(),
+            true,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+    assert!(runtime.sleeps().is_empty());
+    assert_eq!(response, terminal);
+    let mut expected_stdout = stdout_chunk_a.to_vec();
+    expected_stdout.extend_from_slice(stdout_chunk_b);
+    let mut expected_stderr = stderr_chunk_a.to_vec();
+    expected_stderr.extend_from_slice(stderr_chunk_b);
+    assert_eq!(stdout, expected_stdout);
+    assert_eq!(stderr, expected_stderr);
+    assert!(std::str::from_utf8(&stdout).is_err());
+    assert!(std::str::from_utf8(&stderr).is_err());
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 8);
+    assert_status_query(&requests[0], record.meta().job_id());
+    assert_log_chunk_call(&requests[1], record.meta().job_id(), LogStream::Stdout, 0);
+    assert_log_chunk_call(&requests[2], record.meta().job_id(), LogStream::Stderr, 0);
+    assert_log_chunk_call(
+        &requests[3],
+        record.meta().job_id(),
+        LogStream::Stdout,
+        stdout_chunk_a.len() as u64,
+    );
+    assert_log_chunk_call(
+        &requests[4],
+        record.meta().job_id(),
+        LogStream::Stderr,
+        stderr_chunk_a.len() as u64,
+    );
+    assert_log_chunk_call(
+        &requests[5],
+        record.meta().job_id(),
+        LogStream::Stdout,
+        stdout_total,
+    );
+    assert_log_chunk_call(
+        &requests[6],
+        record.meta().job_id(),
+        LogStream::Stderr,
+        stderr_total,
+    );
+    assert_status_query(&requests[7], record.meta().job_id());
+    assert_no_mutating_control(&requests);
+}
+
+#[test]
+fn terminal_binary_non_utf8_multi_chunk_logs_emit_ndjson_base64_events_in_json_mode() {
+    // Catches losing bytes across a multi-chunk boundary, corrupting the
+    // base64 payload, or emitting anything besides versioned NDJSON stdout.
+    let stdout_chunk_a: &[u8] = &[0xff, 0x00, 0x80, b'Q'];
+    let stdout_chunk_b: &[u8] = &[0xed, 0xa0, 0x80, 0x00, b'R', 0xfe];
+    let stderr_chunk_a: &[u8] = &[0xc0, 0xaf, b'S'];
+    let stderr_chunk_b: &[u8] = &[0x00, 0x81, b'T', 0xff];
+    let stdout_total = (stdout_chunk_a.len() + stdout_chunk_b.len()) as u64;
+    let stderr_total = (stderr_chunk_a.len() + stderr_chunk_b.len()) as u64;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
+    let terminal = log_status_response(
+        &record,
+        JobStatus::succeeded(150, stdout_total, stderr_total).unwrap(),
+    );
+    let runner = RecordingRunner::returning(vec![
+        status_result(&terminal),
+        log_chunk_result(LogStream::Stdout, 0, stdout_chunk_a),
+        log_chunk_result(LogStream::Stderr, 0, stderr_chunk_a),
+        log_chunk_result(
+            LogStream::Stdout,
+            stdout_chunk_a.len() as u64,
+            stdout_chunk_b,
+        ),
+        log_chunk_result(
+            LogStream::Stderr,
+            stderr_chunk_a.len() as u64,
+            stderr_chunk_b,
+        ),
+        log_chunk_result(LogStream::Stdout, stdout_total, b""),
+        log_chunk_result(LogStream::Stderr, stderr_total, b""),
+        status_result(&terminal),
+    ]);
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+    let runtime = RecordingFollowRuntime::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let response = logs_service(&config, &store, &remote, &runtime)
+        .stream(record.meta().job_id(), true, true, &mut stdout, &mut stderr)
+        .unwrap();
+
+    assert!(runtime.sleeps().is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(response, terminal);
+    let raw = std::str::from_utf8(&stdout).expect("NDJSON stdout must remain valid UTF-8 text");
+    assert!(!raw.contains('\u{fffd}'));
+    let events = parse_json_events(&stdout);
+    assert_eq!(events.len(), 7);
+
+    let mut decoded_stdout = Vec::new();
+    let mut decoded_stderr = Vec::new();
+    for event in &events[..6] {
+        match event {
+            JsonEvent::Log {
+                protocol_version,
+                chunk,
+            } => {
+                assert_eq!(*protocol_version, PROTOCOL_VERSION);
+                match chunk.stream() {
+                    LogStream::Stdout => {
+                        decoded_stdout.extend_from_slice(&chunk.decoded_bytes().unwrap());
+                    }
+                    LogStream::Stderr => {
+                        decoded_stderr.extend_from_slice(&chunk.decoded_bytes().unwrap());
+                    }
+                }
+            }
+            other => panic!("expected a log chunk event, got {other:?}"),
+        }
+    }
+    let mut expected_stdout = stdout_chunk_a.to_vec();
+    expected_stdout.extend_from_slice(stdout_chunk_b);
+    let mut expected_stderr = stderr_chunk_a.to_vec();
+    expected_stderr.extend_from_slice(stderr_chunk_b);
+    assert_eq!(decoded_stdout, expected_stdout);
+    assert_eq!(decoded_stderr, expected_stderr);
+    match &events[6] {
+        JsonEvent::Status {
+            protocol_version,
+            response: status,
+        } => {
+            assert_eq!(*protocol_version, PROTOCOL_VERSION);
+            assert_eq!(status.as_ref(), &terminal);
+        }
+        other => panic!("final event must be the terminal status, got {other:?}"),
+    }
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 8);
     assert_no_mutating_control(&requests);
 }
 
@@ -7247,4 +7609,169 @@ fn public_diag_missing_config_is_sanitized_for_human_and_json() {
             }
         }
     }
+}
+
+#[test]
+fn public_diag_oversized_authoritative_host_envelope_stays_sanitized_and_preserves_persisted_state()
+{
+    // Break caught: an over-limit host-authoritative error is echoed,
+    // treated as an authoritative Protocol/Capacity classification instead
+    // of a generic transport failure, skips human-mode sanitization, or a
+    // read-only status/logs failure mutates the persisted job record.
+    //
+    // HostControlErrorDetail::serialize re-validates its 4096-byte bound, so
+    // an oversized envelope can never round-trip through
+    // decode_host_control_error and always degrades to the same generic
+    // HOST_REQUEST_FAILED transport classification (exit 69), regardless of
+    // the code/message the host actually planted on the wire.
+    let planted_code = "OVERSIZED_HOST_ENVELOPE";
+    let secret = "PLANTED_OVERSIZED_SECRET";
+    let filler_sample = "X".repeat(64);
+    let expected_code = "HOST_REQUEST_FAILED";
+    let expected_message = "transport error";
+
+    for (kind, json) in [
+        ("status", false),
+        ("status", true),
+        ("logs", false),
+        ("logs", true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = public_runtime(temp.path(), temp.path());
+        let record = persist_public_job(&runtime.state, Some(JobStatus::accepted(101).unwrap()));
+        let job_id = record.meta().job_id();
+        let job_path = runtime.state.join("jobs").join(format!("{job_id}.json"));
+        let before = fs::read(&job_path).unwrap();
+
+        let command = match kind {
+            "status" => WorkerCommand::Status {
+                job_id: Some(job_id),
+            },
+            _ => WorkerCommand::Logs {
+                follow: false,
+                job_id,
+            },
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = dispatch(
+            public_cli(runtime.config.clone(), json, command),
+            &RecordingRunner::returning(vec![oversized_authoritative_protocol_failure(
+                planted_code,
+                secret,
+            )]),
+            &runtime.context,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, 69, "kind={kind} json={json}");
+        let combined = [stdout.as_slice(), stderr.as_slice()].concat();
+        let text = String::from_utf8_lossy(&combined);
+        assert!(
+            !text.contains(secret),
+            "kind={kind} json={json} leaked the planted secret: {text}"
+        );
+        assert!(
+            !text.contains(&filler_sample),
+            "kind={kind} json={json} leaked the oversized filler: {text}"
+        );
+        assert!(
+            !text.contains(planted_code),
+            "kind={kind} json={json} leaked the planted host code: {text}"
+        );
+        assert!(
+            text.len() < 1_000,
+            "kind={kind} json={json} diagnostic was not bounded: {} bytes",
+            text.len()
+        );
+
+        if kind == "logs" && json {
+            assert!(stderr.is_empty(), "kind={kind} json={json}: {text}");
+            let events = parse_json_events(&stdout);
+            assert_eq!(events.len(), 1, "kind={kind} json={json}: {text}");
+            match &events[0] {
+                JsonEvent::Error {
+                    protocol_version,
+                    code: actual_code,
+                    message,
+                } => {
+                    assert_eq!(*protocol_version, PROTOCOL_VERSION);
+                    assert_eq!(actual_code, expected_code);
+                    assert_eq!(message, expected_message);
+                }
+                other => {
+                    panic!("kind={kind} json={json}: expected a JSON error event, got {other:?}")
+                }
+            }
+        } else {
+            assert!(stdout.is_empty(), "kind={kind} json={json} stdout: {text}");
+            assert_eq!(
+                String::from_utf8_lossy(&stderr),
+                format!("{expected_code}: {expected_message}\n"),
+                "kind={kind} json={json}"
+            );
+        }
+
+        let after = fs::read(&job_path).unwrap();
+        assert_eq!(
+            before, after,
+            "kind={kind} json={json}: persisted job record changed on a read-only failure"
+        );
+    }
+}
+
+#[test]
+fn public_diag_non_utf8_config_path_stays_sanitized_and_the_persisted_job_record_is_unchanged() {
+    // Break caught: a non-UTF-8 local config path panics, or its raw bytes
+    // (lossily rendered) leak into a public diagnostic instead of the
+    // generic sanitized message.
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = public_runtime(temp.path(), temp.path());
+    let record = persist_public_job(&runtime.state, Some(JobStatus::accepted(101).unwrap()));
+    let job_id = record.meta().job_id();
+    let job_path = runtime.state.join("jobs").join(format!("{job_id}.json"));
+    let before = fs::read(&job_path).unwrap();
+
+    let non_utf8_segment = OsString::from_vec(b"non-utf8-\xffconfig-dir".to_vec());
+    let non_utf8_config = runtime
+        .config
+        .parent()
+        .unwrap()
+        .join(PathBuf::from(non_utf8_segment))
+        .join("missing.toml");
+    assert!(std::str::from_utf8(non_utf8_config.as_os_str().as_bytes()).is_err());
+
+    for json in [false, true] {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = dispatch(
+            public_cli(
+                non_utf8_config.clone(),
+                json,
+                WorkerCommand::Status {
+                    job_id: Some(job_id),
+                },
+            ),
+            &RecordingRunner::returning(Vec::new()),
+            &runtime.context,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(exit, 64, "json={json}");
+        assert!(stdout.is_empty(), "json={json}");
+        assert_eq!(
+            String::from_utf8(stderr.clone()).expect("diagnostic must stay valid UTF-8"),
+            "CONFIG: configuration error\n",
+            "json={json}"
+        );
+    }
+
+    let after = fs::read(&job_path).unwrap();
+    assert_eq!(
+        before, after,
+        "persisted job record changed after a non-UTF-8 config path failure"
+    );
 }
