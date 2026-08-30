@@ -488,6 +488,220 @@ fn make_owned_tree_writable(path: &Path) {
     }
 }
 
+fn assert_no_workspace_entry(path: &Path, row: usize) {
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let entry_path = entry.path();
+        assert_ne!(
+            entry.file_name(),
+            OsString::from("workspace"),
+            "row {row} created a workspace at {}",
+            entry_path.display()
+        );
+        if fs::symlink_metadata(&entry_path).unwrap().is_dir() {
+            assert_no_workspace_entry(&entry_path, row);
+        }
+    }
+}
+
+fn assert_matrix_row_rejected(
+    store: &HostStore,
+    lease: &LeaseRecord,
+    digest: &str,
+    host_root: &Path,
+    sentinel: &Path,
+    sentinel_bytes: &[u8],
+    marker: &str,
+    row: usize,
+) {
+    let error = mac_worker::remote_snapshot::RemoteSnapshotService::new(store)
+        .verify_and_promote_at(lease, digest, 42)
+        .unwrap_err();
+    let diagnostic = error.to_string();
+    assert!(
+        [
+            "snapshot error [MANIFEST_MISMATCH]: remote snapshot does not match its canonical manifest",
+            "snapshot error [UNSAFE_REMOTE_SNAPSHOT]: remote snapshot filesystem state is unsafe",
+        ]
+        .contains(&diagnostic.as_str()),
+        "row {row}: {diagnostic}"
+    );
+    assert!(
+        !store
+            .snapshot(PROJECT_ID, WORKTREE_ID, digest)
+            .unwrap()
+            .exists(),
+        "row {row} published a cache"
+    );
+    assert!(
+        !store.verified_receipt(lease.job_id()).unwrap().exists(),
+        "row {row} published a verified receipt"
+    );
+    assert!(
+        !store.job_index(lease.job_id()).unwrap().exists(),
+        "row {row} published an Accepted index"
+    );
+    assert!(
+        !store
+            .job(PROJECT_ID, WORKTREE_ID, lease.job_id())
+            .unwrap()
+            .exists(),
+        "row {row} published a final job"
+    );
+    assert_no_workspace_entry(host_root, row);
+    assert_eq!(
+        fs::read(sentinel).unwrap(),
+        sentinel_bytes,
+        "row {row} changed the external sentinel"
+    );
+    for private in [
+        marker,
+        LEASE_TOKEN,
+        host_root.to_string_lossy().as_ref(),
+        sentinel.to_string_lossy().as_ref(),
+    ] {
+        assert!(
+            !diagnostic.contains(private),
+            "row {row} emitted content-bearing diagnostic material"
+        );
+    }
+}
+
+#[test]
+fn semantic_manifest_and_live_tree_mutation_matrix_100_never_publishes() {
+    use std::ffi::CString;
+    use std::os::unix::fs::symlink;
+
+    let mut executed_rows = 0;
+    for row in 0..100 {
+        let fixture = tempfile::tempdir().unwrap();
+        let host_root = fixture.path().join("host");
+        let marker = format!("PLANTED-REMOTE-SNAPSHOT-ROW-{row:03}");
+        let sentinel = fixture.path().join(format!("outside-sentinel-{row:03}"));
+        let sentinel_bytes = format!("outside-content-{marker}").into_bytes();
+        fs::write(&sentinel, &sentinel_bytes).unwrap();
+
+        let path = format!("payload-{row:03}-{marker}.txt");
+        let mut manifest = SnapshotManifest {
+            version: 1,
+            project_id: PROJECT_ID.into(),
+            worktree_id: WORKTREE_ID.into(),
+            head: None,
+            branch: Some("main".into()),
+            dirty: true,
+            relative_working_dir: String::new(),
+            entries: vec![file_entry(&path, b"payload", false)],
+            tracked_deletions: Vec::new(),
+        };
+
+        if row < 50 {
+            let slot = row % 5;
+            match row / 5 {
+                0 => manifest.version = 2 + slot as u32,
+                1 => manifest.head = Some(format!("{marker}-{slot}")),
+                2 => manifest.branch = Some(format!("{marker}\0{slot}")),
+                3 => manifest.entries[0].path = format!("../{marker}-{slot}"),
+                4 => manifest.entries[0].mode = [0, 0o600, 0o700, 0o744, 0o777][slot],
+                5 => manifest.entries[0].sha256 = format!("{marker}-{slot}"),
+                6 => manifest.entries[0].symlink_target = Some(format!("{marker}-{slot}")),
+                7 => manifest.entries.push(manifest.entries[0].clone()),
+                8 => manifest
+                    .tracked_deletions
+                    .push(manifest.entries[0].path.clone()),
+                9 => manifest.relative_working_dir = format!("missing-{marker}-{slot}"),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            let (store, lease, digest) = acquired_bundle_bytes(&host_root, bytes);
+            assert_matrix_row_rejected(
+                &store,
+                &lease,
+                &digest,
+                &host_root,
+                &sentinel,
+                &sentinel_bytes,
+                &marker,
+                row,
+            );
+        } else {
+            let bytes = manifest.canonical_bytes().unwrap();
+            let (store, lease, digest) = acquired_bundle_bytes(&host_root, bytes);
+            let incoming = store
+                .incoming_job(lease.job_id(), lease.lease_token())
+                .unwrap();
+            let tree = incoming.join("tree");
+            let target = tree.join(&path);
+            fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::remove_file(tree.join("payload.txt")).unwrap();
+            fs::write(&target, b"payload").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+            fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
+
+            let slot = (row - 50) % 5;
+            match (row - 50) / 5 {
+                0 => replace_read_only_file(&target, marker.as_bytes()),
+                1 => {
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
+                    fs::remove_file(&target).unwrap();
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
+                }
+                2 => {
+                    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                3 => {
+                    let extra = tree.join(format!("extra-{slot}-{marker}"));
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
+                    fs::write(&extra, marker.as_bytes()).unwrap();
+                    fs::set_permissions(&extra, fs::Permissions::from_mode(0o444)).unwrap();
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
+                }
+                4 => {
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
+                    fs::remove_file(&target).unwrap();
+                    fs::create_dir(&target).unwrap();
+                    fs::set_permissions(&target, fs::Permissions::from_mode(0o555)).unwrap();
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
+                }
+                5 => {
+                    fs::hard_link(&target, fixture.path().join(format!("alias-{slot}"))).unwrap();
+                }
+                6 => {
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
+                    fs::remove_file(&target).unwrap();
+                    symlink(&sentinel, &target).unwrap();
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
+                }
+                7 => {
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
+                    fs::remove_file(&target).unwrap();
+                    let fifo = CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o444) }, 0);
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o555)).unwrap();
+                }
+                8 => {
+                    fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                9 => {
+                    fs::set_permissions(&target, fs::Permissions::from_mode(0o555)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_matrix_row_rejected(
+                &store,
+                &lease,
+                &digest,
+                &host_root,
+                &sentinel,
+                &sentinel_bytes,
+                &marker,
+                row,
+            );
+        }
+        executed_rows += 1;
+    }
+    assert_eq!(executed_rows, 100);
+}
+
 #[test]
 fn canonical_exact_bundle_is_verified_and_promoted_owner_only() {
     // Break caught: verification trusts manifest text or paths without
