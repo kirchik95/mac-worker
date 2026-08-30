@@ -1967,7 +1967,8 @@ fn status_rejects_terminal_nul_and_oversized_durable_state_without_side_effects(
     // Break caught: a bounded canonical reader drops a terminal NUL, reads an
     // unbounded host record, or reaches supervisor launch after poisoned state.
     const MAX_HOST_JSON_BYTES: usize = 1024 * 1024;
-    const PLANTED: &[u8] = b"PLANTED_DURABLE_STATE_SECRET";
+    const PLANTED: &str = "PLANTED_DURABLE_STATE_SECRET";
+    const EXACT_ARGV_ELEMENT: &str = "/usr/bin/true";
 
     for (row, (record, mutation)) in [
         ("job-index", "terminal-nul"),
@@ -1997,27 +1998,55 @@ fn status_rejects_terminal_nul_and_oversized_durable_state_without_side_effects(
                 "job-index",
                 store.job_index(lease.job_id()).unwrap(),
                 "JOB_STATE_INVALID",
+                "protocol error: JOB_STATE_INVALID: job disposition is invalid",
             ),
             (
                 "lease",
                 root.join("leases/heavy/lease.json"),
                 "JOB_STATE_INVALID",
+                "protocol error: JOB_STATE_INVALID: live lease is invalid",
             ),
-            ("meta", job.join("meta.json"), "JOB_STATE_INVALID"),
-            ("status", job.join("status.json"), "JOB_STATE_INVALID"),
-            ("execution", job.join("execution.json"), "JOB_STATE_INVALID"),
+            (
+                "meta",
+                job.join("meta.json"),
+                "JOB_STATE_INVALID",
+                "protocol error: JOB_STATE_INVALID: canonical job metadata is invalid",
+            ),
+            (
+                "status",
+                job.join("status.json"),
+                "JOB_STATE_INVALID",
+                "protocol error: JOB_STATE_INVALID: canonical mutable job status is invalid",
+            ),
+            (
+                "execution",
+                job.join("execution.json"),
+                "JOB_STATE_INVALID",
+                "protocol error: JOB_STATE_INVALID: identityless accepted payload is invalid",
+            ),
             (
                 "verified-receipt",
                 store.verified_receipt(lease.job_id()).unwrap(),
                 "UNSAFE_REMOTE_SNAPSHOT",
+                "snapshot error [UNSAFE_REMOTE_SNAPSHOT]: remote snapshot filesystem state is unsafe",
             ),
         ];
-        let (_, target, expected_code) =
-            records.iter().find(|(name, _, _)| *name == record).unwrap();
+        let (_, target, expected_code, expected_diagnostic) = records
+            .iter()
+            .find(|(name, _, _, _)| *name == record)
+            .unwrap();
+        let execution_payload = fs::read(job.join("execution.json")).unwrap();
+        assert!(
+            execution_payload
+                .windows(EXACT_ARGV_ELEMENT.len())
+                .any(|window| window == EXACT_ARGV_ELEMENT.as_bytes()),
+            "row {row}: exact argv fixture is absent"
+        );
         let canonical = fs::read(target).unwrap();
         let poisoned = match mutation {
             "terminal-nul" => {
                 let mut bytes = canonical;
+                bytes.extend_from_slice(PLANTED.as_bytes());
                 bytes.push(0);
                 bytes
             }
@@ -2025,16 +2054,21 @@ fn status_rejects_terminal_nul_and_oversized_durable_state_without_side_effects(
                 let mut bytes = vec![b'x'; MAX_HOST_JSON_BYTES + 1];
                 bytes[..canonical.len()].copy_from_slice(&canonical);
                 let planted_at = bytes.len() - PLANTED.len();
-                bytes[planted_at..].copy_from_slice(PLANTED);
+                bytes[planted_at..].copy_from_slice(PLANTED.as_bytes());
                 bytes
             }
             _ => unreachable!(),
         };
+        if mutation == "terminal-nul" {
+            assert_eq!(poisoned.last(), Some(&0), "row {row}");
+        } else {
+            assert_eq!(poisoned.len(), MAX_HOST_JSON_BYTES + 1, "row {row}");
+        }
         replace_bytes(target, &poisoned).unwrap();
 
         let durable_before = records
             .iter()
-            .map(|(name, path, _)| (*name, matrix_snapshot_path(path)))
+            .map(|(name, path, _, _)| (*name, matrix_snapshot_path(path)))
             .collect::<Vec<_>>();
         let workspace_before = matrix_snapshot_path(&job.join("workspace"));
         let cache = store
@@ -2057,13 +2091,22 @@ fn status_rejects_terminal_nul_and_oversized_durable_state_without_side_effects(
             .unwrap_err();
 
         let rendered = error.to_string();
-        assert!(
-            rendered.contains(expected_code),
-            "row {row} {record} {mutation}: expected {expected_code}, got {rendered}"
+        assert_eq!(
+            error.public_code(),
+            *expected_code,
+            "row {row} {record} {mutation}: wrong public code for {rendered}"
+        );
+        assert_eq!(
+            rendered, *expected_diagnostic,
+            "row {row} {record} {mutation}: wrong durable read boundary"
         );
         assert!(
-            !rendered.contains(std::str::from_utf8(PLANTED).unwrap()),
-            "row {row} reflected poisoned durable content"
+            !rendered.contains(PLANTED),
+            "row {row} reflected planted durable content"
+        );
+        assert!(
+            !rendered.contains(EXACT_ARGV_ELEMENT),
+            "row {row} reflected exact argv fixture content"
         );
         assert_eq!(launches.load(Ordering::SeqCst), 0, "row {row}");
         assert_eq!(fs::read(target).unwrap(), poisoned, "row {row}");
@@ -2072,7 +2115,7 @@ fn status_rejects_terminal_nul_and_oversized_durable_state_without_side_effects(
             poisoned.len() as u64,
             "row {row}"
         );
-        for ((expected_name, expected), (name, path, _)) in
+        for ((expected_name, expected), (name, path, _, _)) in
             durable_before.iter().zip(records.iter())
         {
             assert_eq!(expected_name, name);
