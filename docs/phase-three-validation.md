@@ -4,19 +4,20 @@ Phase 3 implements one explicitly selected worker per `worker run` invocation. I
 
 ## Automated local and fake-transport evidence
 
-The committed Task 10 slice reports record these focused commands and results at the revisions shown below. Those revisions are ancestors of this document's branch, so each command can be reproduced against its named revision. They exercise local helpers, isolated filesystem fixtures, and fake or injected transport boundaries as applicable; none is evidence of a configured live worker.
+The committed Task 10 slice reports record these focused commands and results; each is reproducible at the revision shown below. Those revisions are ancestors of this document's branch. They exercise local helpers, isolated filesystem fixtures, and fake or injected transport boundaries as applicable; none is evidence of a configured live worker.
 
 | Command | Revision measured | Recorded result |
-| --- | --- |
+| --- | --- | --- |
 | `cargo test --locked --test remote_snapshot -- --nocapture` | `4f6125f` | 21 passed, 0 failed |
 | `cargo test --locked --test run_command -- --nocapture` | `1dee62e` | 84 passed, 0 failed |
 | `cargo test --locked --test job_queries -- --nocapture` | `0d7c341` | 63 passed, 0 failed |
 | `cargo test --locked --test supervisor -- --nocapture` | `f7cb2b1` | 44 passed, 0 failed |
 | `cargo test --locked --lib transfer::exec_inheritance_tests -- --nocapture` | `f7cb2b1` | 7 passed, 0 failed |
+| `cargo test --locked --test run_command --test job_queries --test remote_snapshot --test supervisor -- --nocapture` | `f7cb2b1` | 212 passed (84 run_command + 63 job_queries + 21 remote_snapshot + 44 supervisor), 0 failed, 0 ignored |
 
-The recorded automated coverage includes a deterministic 100-row disconnect/reconciliation matrix, a 100-row remote snapshot mutation matrix, binary log handling, artifact preflight rejection, and exact literal argument-vector handling. These are separate focused measurements, not one combined invocation or final gate. They do not replace live-host acceptance.
+The recorded automated coverage includes a deterministic 100-row disconnect/reconciliation matrix, a 100-row remote snapshot mutation matrix, binary log handling, artifact preflight rejection, and exact literal argument-vector handling. The combined Task 10 adversarial gate above is a deliberately scoped controller invocation, not an all-target test or final gate. It does not replace live-host acceptance.
 
-The combined all-target test result and final gate are **PENDING**. No controller-wide or final-gate result is claimed here, and no final release revision is recorded. Do not infer live acceptance, fleet behavior, or a final release revision from the focused automated results.
+The full all-target test, Clippy, release build, `git diff --check` final gate, and live acceptance are **PENDING**. The combined Task 10 adversarial gate is not `cargo test --locked --all-targets` and is not the final gate. No final software or release revision is recorded. Do not infer live acceptance, fleet behavior, or a final release revision from the automated results.
 
 ## Live single-host acceptance — PENDING
 
@@ -27,10 +28,10 @@ No sanitized live single-host acceptance run is recorded yet. Populate every fie
 | Software commit | **PENDING** |
 | Worker protocol version | **PENDING** |
 | Selected worker name | **PENDING** |
-| Sanitized command categories | **PENDING** — record setup; the operator-selected shell sleep/reconnect job; `logs -f` reconnect; and the operator-selected literal-argv non-zero `/bin/sh -c 'exit 7'` case |
+| Sanitized command categories | **PENDING** — record setup; successful literal-argv `printf`; shell sleep/reconnect; `status <job-id>`; non-follow `logs <job-id>`; `logs -f` reconnect; and the operator-selected literal-argv `/bin/sh -c 'exit 7'` case |
 | Successful command outcome | **PENDING** — record shortened job ID, terminal state, exit result, and sanitized duration only |
 | Non-zero command outcome | **PENDING** — record shortened job ID, terminal state, exit result, and sanitized duration only |
-| Disconnect and reconnect | **PENDING** — record a follower disconnect, then `status` and `logs` reconnecting by the same original shortened job ID, with one execution |
+| Disconnect and reconnect | **PENDING** — record a follower disconnect, then `status` and `logs` reconnecting by the same original shortened job ID, with one execution and byte-exact log continuation after reconnect |
 | Capacity | **PENDING** — record a concurrent submission returning `CAPACITY_BUSY` with no execution |
 | Cleanup and lease | **PENDING** — record terminal cleanup completing before the one-slot lease becomes available |
 | Retained metadata and logs | **PENDING** — record inspection confirming no local complete paths or planted values |
