@@ -1963,6 +1963,144 @@ fn status_rejects_corrupt_or_missing_indexed_authority_and_preserves_it() {
 }
 
 #[test]
+fn status_rejects_terminal_nul_and_oversized_durable_state_without_side_effects() {
+    // Break caught: a bounded canonical reader drops a terminal NUL, reads an
+    // unbounded host record, or reaches supervisor launch after poisoned state.
+    const MAX_HOST_JSON_BYTES: usize = 1024 * 1024;
+    const PLANTED: &[u8] = b"PLANTED_DURABLE_STATE_SECRET";
+
+    for (row, (record, mutation)) in [
+        ("job-index", "terminal-nul"),
+        ("job-index", "oversized"),
+        ("lease", "terminal-nul"),
+        ("lease", "oversized"),
+        ("meta", "terminal-nul"),
+        ("meta", "oversized"),
+        ("status", "terminal-nul"),
+        ("status", "oversized"),
+        ("execution", "terminal-nul"),
+        ("execution", "oversized"),
+        ("verified-receipt", "terminal-nul"),
+        ("verified-receipt", "oversized"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(format!("durable-state-{row}"));
+        let (store, lease, _request) = indexed_identityless_job(&root);
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        let records = [
+            (
+                "job-index",
+                store.job_index(lease.job_id()).unwrap(),
+                "JOB_STATE_INVALID",
+            ),
+            (
+                "lease",
+                root.join("leases/heavy/lease.json"),
+                "JOB_STATE_INVALID",
+            ),
+            ("meta", job.join("meta.json"), "JOB_STATE_INVALID"),
+            ("status", job.join("status.json"), "JOB_STATE_INVALID"),
+            ("execution", job.join("execution.json"), "JOB_STATE_INVALID"),
+            (
+                "verified-receipt",
+                store.verified_receipt(lease.job_id()).unwrap(),
+                "UNSAFE_REMOTE_SNAPSHOT",
+            ),
+        ];
+        let (_, target, expected_code) =
+            records.iter().find(|(name, _, _)| *name == record).unwrap();
+        let canonical = fs::read(target).unwrap();
+        let poisoned = match mutation {
+            "terminal-nul" => {
+                let mut bytes = canonical;
+                bytes.push(0);
+                bytes
+            }
+            "oversized" => {
+                let mut bytes = vec![b'x'; MAX_HOST_JSON_BYTES + 1];
+                bytes[..canonical.len()].copy_from_slice(&canonical);
+                let planted_at = bytes.len() - PLANTED.len();
+                bytes[planted_at..].copy_from_slice(PLANTED);
+                bytes
+            }
+            _ => unreachable!(),
+        };
+        replace_bytes(target, &poisoned).unwrap();
+
+        let durable_before = records
+            .iter()
+            .map(|(name, path, _)| (*name, matrix_snapshot_path(path)))
+            .collect::<Vec<_>>();
+        let workspace_before = matrix_snapshot_path(&job.join("workspace"));
+        let cache = store
+            .snapshot(
+                lease.project_id(),
+                lease.worktree_id(),
+                lease.manifest_digest(),
+            )
+            .unwrap();
+        let cache_before = matrix_snapshot_path(&cache);
+        let sentinel = temp.path().join("outside-sentinel");
+        fs::write(&sentinel, b"outside-state-must-survive").unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launcher = CountingRejectLauncher {
+            launches: Arc::clone(&launches),
+        };
+
+        let error = JobService::new(&store, &launcher)
+            .status(lease.job_id())
+            .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(expected_code),
+            "row {row} {record} {mutation}: expected {expected_code}, got {rendered}"
+        );
+        assert!(
+            !rendered.contains(std::str::from_utf8(PLANTED).unwrap()),
+            "row {row} reflected poisoned durable content"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0, "row {row}");
+        assert_eq!(fs::read(target).unwrap(), poisoned, "row {row}");
+        assert_eq!(
+            fs::metadata(target).unwrap().len(),
+            poisoned.len() as u64,
+            "row {row}"
+        );
+        for ((expected_name, expected), (name, path, _)) in
+            durable_before.iter().zip(records.iter())
+        {
+            assert_eq!(expected_name, name);
+            assert_eq!(
+                matrix_snapshot_path(path),
+                *expected,
+                "row {row} mutated {name}"
+            );
+        }
+        assert_eq!(
+            matrix_snapshot_path(&job.join("workspace")),
+            workspace_before,
+            "row {row} mutated workspace"
+        );
+        assert_eq!(
+            matrix_snapshot_path(&cache),
+            cache_before,
+            "row {row} mutated cache"
+        );
+        assert_eq!(
+            fs::read(&sentinel).unwrap(),
+            b"outside-state-must-survive",
+            "row {row}"
+        );
+    }
+}
+
+#[test]
 fn status_rejects_index_meta_lease_and_initial_status_disagreement() {
     for (index, mutation) in ["lease-client", "corrupt-lease", "index-initial"]
         .into_iter()
