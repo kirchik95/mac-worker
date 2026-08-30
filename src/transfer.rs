@@ -1410,7 +1410,7 @@ mod exec_inheritance_tests {
         let leaf_arm_fifo = std::env::var(LEAF_ARM_FIFO_ENV).unwrap();
         let park_fifo = std::env::var(INTERMEDIARY_PARK_FIFO_ENV).unwrap();
         let transfer_fd = std::env::var(CHILD_FD_ENV).unwrap();
-        let sentinel_fd = std::env::var(SENTINEL_FD_ENV).unwrap();
+        let sentinel_fd: RawFd = std::env::var(SENTINEL_FD_ENV).unwrap().parse().unwrap();
         let ready_fifo = std::env::var(READY_FIFO_ENV).unwrap();
         let release_fifo = std::env::var(RELEASE_FIFO_ENV).unwrap();
         let exit_fifo = std::env::var(LEAF_EXIT_FIFO_ENV).unwrap();
@@ -1429,6 +1429,11 @@ mod exec_inheritance_tests {
         assert_eq!(unsafe { libc::pipe(arm_pipe.as_mut_ptr()) }, 0);
         let arm_reader = unsafe { File::from_raw_fd(arm_pipe[0]) };
         let mut arm_writer = unsafe { File::from_raw_fd(arm_pipe[1]) };
+        assert_ne!(
+            arm_reader.as_raw_fd(),
+            sentinel_fd,
+            "inherited arm reader fd must not collide with the sentinel fd number"
+        );
         let writer_flags = unsafe { libc::fcntl(arm_writer.as_raw_fd(), libc::F_GETFD) };
         assert_ne!(writer_flags, -1);
         assert_eq!(
@@ -1448,7 +1453,7 @@ mod exec_inheritance_tests {
             .arg("--nocapture")
             .arg("--test-threads=1")
             .env(CHILD_FD_ENV, &transfer_fd)
-            .env(SENTINEL_FD_ENV, &sentinel_fd)
+            .env(SENTINEL_FD_ENV, sentinel_fd.to_string())
             .env(LEAF_PID_FIFO_ENV, &leaf_pid_fifo)
             .env(LEAF_PID_REPORTER_ENV, "intermediary")
             .env(LEAF_ARM_FD_ENV, arm_reader.as_raw_fd().to_string())
@@ -1676,7 +1681,7 @@ mod exec_inheritance_tests {
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
             matches!(resolved_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
-            "resolver completed before the exec child released the transfer lock"
+            "resolver completed while the transfer was still in flight"
         );
         OpenOptions::new()
             .write(true)

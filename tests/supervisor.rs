@@ -6,9 +6,10 @@ use std::{
     os::unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        process::ExitStatusExt,
     },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -402,7 +403,7 @@ impl DirectChildCleanup {
         self.child.as_mut().unwrap()
     }
 
-    fn kill_and_reap(&mut self) {
+    fn kill_and_reap(&mut self) -> ExitStatus {
         let child = self.child.as_mut().unwrap();
         let pid = child.id() as libc::pid_t;
         assert_eq!(
@@ -410,8 +411,9 @@ impl DirectChildCleanup {
             0,
             "exact-PID kill of the disconnecting client must succeed"
         );
-        child.wait().unwrap();
+        let status = child.wait().unwrap();
         self.child = None;
+        status
     }
 }
 
@@ -2944,10 +2946,21 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
         .unwrap()
         .write_all(&serde_json::to_vec(&request).unwrap())
         .unwrap();
-    let mut ack_line = String::new();
-    BufReader::new(submit_client.child_mut().stdout.take().unwrap())
-        .read_line(&mut ack_line)
+    let (ack_tx, ack_rx) = mpsc::channel();
+    let submit_stdout = submit_client.child_mut().stdout.take().unwrap();
+    let ack_thread = std::thread::spawn(move || {
+        let result = (|| -> std::io::Result<String> {
+            let mut ack_line = String::new();
+            BufReader::new(submit_stdout).read_line(&mut ack_line)?;
+            Ok(ack_line)
+        })();
+        let _ = ack_tx.send(result);
+    });
+    let ack_line = ack_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("accepted submit client did not emit its response within the deadline")
         .unwrap();
+    ack_thread.join().unwrap();
     let accepted: SubmitResponse = serde_json::from_str(ack_line.trim_end()).unwrap();
     assert!(accepted.status().supervisor_identity().is_some());
 
@@ -2961,15 +2974,20 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
     );
     ready_thread.join().unwrap();
 
-    // Simulate a hard client disconnect right after the accepted-client
-    // handshake: terminate the exact submitting process by its own PID. The
-    // detached supervisor was already handed off before this ack was
-    // written, so its lifetime must not depend on this process surviving.
+    // After the accepted response, prove the submitting process is still live
+    // and SIGKILL that exact PID. The detached supervisor was already handed
+    // off before the response was written, so its lifetime must not depend on
+    // this process surviving.
     assert!(
         submit_client.child_mut().try_wait().unwrap().is_none(),
         "accepted submit client must still be live immediately before SIGKILL"
     );
-    submit_client.kill_and_reap();
+    let submit_status = submit_client.kill_and_reap();
+    assert_eq!(
+        submit_status.signal(),
+        Some(libc::SIGKILL),
+        "accepted submit client must be reaped with SIGKILL status"
+    );
 
     let reconnect_deadline = Instant::now() + Duration::from_secs(5);
     let running: StatusResponse = loop {
@@ -3009,19 +3027,25 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_status_error = String::from("none observed");
     let terminal = loop {
-        let response: StatusResponse =
-            match try_host_control(&home, &data, "status", &StatusRequest::new(lease.job_id())) {
-                Ok(response) => response,
-                Err(_) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "reconnected status polling never recovered a valid response"
-                    );
-                    std::thread::yield_now();
-                    continue;
-                }
-            };
+        let response: StatusResponse = match try_host_control(
+            &home,
+            &data,
+            "status",
+            &StatusRequest::new(lease.job_id()),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                last_status_error = error;
+                assert!(
+                    Instant::now() < deadline,
+                    "reconnected status polling never recovered a valid response; last control error: {last_status_error}"
+                );
+                std::thread::yield_now();
+                continue;
+            }
+        };
         assert_eq!(
             response.status().supervisor_identity(),
             accepted.status().supervisor_identity()
@@ -3031,7 +3055,7 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
         }
         assert!(
             Instant::now() < deadline,
-            "reconnected status polling never observed a terminal outcome"
+            "reconnected status polling never observed a terminal outcome; last control error: {last_status_error}"
         );
         std::thread::yield_now();
     };
@@ -3048,10 +3072,10 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
             &LogChunkRequest::new(lease.job_id(), LogStream::Stdout, 0, 1024),
         ) {
             Ok(response) => break response,
-            Err(_) => {
+            Err(error) => {
                 assert!(
                     Instant::now() < log_deadline,
-                    "same-ID log reconnect never recovered a valid response"
+                    "same-ID log reconnect never recovered a valid response; last control error: {error}"
                 );
                 std::thread::yield_now();
             }
