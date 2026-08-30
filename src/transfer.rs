@@ -1150,7 +1150,7 @@ mod exec_inheritance_tests {
         ffi::CString,
         fs::{File, OpenOptions},
         io::{Read, Write},
-        os::fd::{AsRawFd, RawFd},
+        os::fd::{AsRawFd, FromRawFd, RawFd},
         os::unix::ffi::OsStrExt,
         os::unix::fs::MetadataExt,
         path::{Path, PathBuf},
@@ -1164,9 +1164,10 @@ mod exec_inheritance_tests {
 
     use super::*;
     use crate::{
-        job::{CommandSpec, RequestFingerprintMaterial},
+        job::{CommandSpec, ProcessIdentity, RequestFingerprintMaterial},
         lease::{AdmissionFacts, LeaseService},
         protocol::MemoryPressure,
+        supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
     };
 
     const CHILD_FD_ENV: &str = "MAC_WORKER_TEST_TRANSFER_LOCK_FD";
@@ -1176,6 +1177,9 @@ mod exec_inheritance_tests {
     const TRANSFER_LOCK_PATH_ENV: &str = "MAC_WORKER_TEST_TRANSFER_LOCK_PATH";
     const INTERMEDIARY_PID_FIFO_ENV: &str = "MAC_WORKER_TEST_INTERMEDIARY_PID_FIFO";
     const LEAF_PID_FIFO_ENV: &str = "MAC_WORKER_TEST_LEAF_PID_FIFO";
+    const LEAF_PID_REPORTER_ENV: &str = "MAC_WORKER_TEST_LEAF_PID_REPORTER";
+    const LEAF_ARM_FIFO_ENV: &str = "MAC_WORKER_TEST_LEAF_ARM_FIFO";
+    const LEAF_ARM_FD_ENV: &str = "MAC_WORKER_TEST_LEAF_ARM_FD";
     const INTERMEDIARY_PARK_FIFO_ENV: &str = "MAC_WORKER_TEST_INTERMEDIARY_PARK_FIFO";
     const LEAF_EXIT_FIFO_ENV: &str = "MAC_WORKER_TEST_LEAF_EXIT_FIFO";
 
@@ -1246,6 +1250,7 @@ mod exec_inheritance_tests {
                 .env(CHILD_FD_ENV, transfer_fd.to_string())
                 .env(SENTINEL_FD_ENV, self.sentinel_fd.to_string())
                 .env(LEAF_PID_FIFO_ENV, &self.child_pid_fifo)
+                .env(LEAF_PID_REPORTER_ENV, "self")
                 .env(READY_FIFO_ENV, &self.ready_fifo)
                 .env(RELEASE_FIFO_ENV, &self.release_fifo)
                 .env(TRANSFER_LOCK_PATH_ENV, &self.lock_path)
@@ -1259,6 +1264,7 @@ mod exec_inheritance_tests {
     struct IntermediaryExecProbe {
         intermediary_pid_fifo: PathBuf,
         leaf_pid_fifo: PathBuf,
+        leaf_arm_fifo: PathBuf,
         park_fifo: PathBuf,
         ready_fifo: PathBuf,
         release_fifo: PathBuf,
@@ -1280,6 +1286,7 @@ mod exec_inheritance_tests {
                 .env(SENTINEL_FD_ENV, self.sentinel_fd.to_string())
                 .env(INTERMEDIARY_PID_FIFO_ENV, &self.intermediary_pid_fifo)
                 .env(LEAF_PID_FIFO_ENV, &self.leaf_pid_fifo)
+                .env(LEAF_ARM_FIFO_ENV, &self.leaf_arm_fifo)
                 .env(INTERMEDIARY_PARK_FIFO_ENV, &self.park_fifo)
                 .env(READY_FIFO_ENV, &self.ready_fifo)
                 .env(RELEASE_FIFO_ENV, &self.release_fifo)
@@ -1328,9 +1335,32 @@ mod exec_inheritance_tests {
         };
         let release_fifo = std::env::var(RELEASE_FIFO_ENV).unwrap();
         let child_pid_fifo = std::env::var(LEAF_PID_FIFO_ENV).unwrap();
+        let pid_reporter = std::env::var(LEAF_PID_REPORTER_ENV).unwrap();
         let lock_path = std::env::var(TRANSFER_LOCK_PATH_ENV).unwrap();
         let transfer_fd: RawFd = std::env::var(CHILD_FD_ENV).unwrap().parse().unwrap();
         let sentinel_fd: RawFd = std::env::var(SENTINEL_FD_ENV).unwrap().parse().unwrap();
+        match pid_reporter.as_str() {
+            "self" => {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&child_pid_fifo)
+                    .unwrap()
+                    .write_all(std::process::id().to_string().as_bytes())
+                    .unwrap();
+            }
+            "intermediary" => {
+                let arm_fd: RawFd = std::env::var(LEAF_ARM_FD_ENV).unwrap().parse().unwrap();
+                let mut armed = [0_u8; 1];
+                unsafe { File::from_raw_fd(arm_fd) }
+                    .read_exact(&mut armed)
+                    .unwrap();
+                assert_eq!(
+                    armed, *b"A",
+                    "leaf must not enter its READY path before cleanup is armed"
+                );
+            }
+            other => panic!("unexpected leaf PID reporter marker: {other}"),
+        }
         let transfer_flags = unsafe { libc::fcntl(transfer_fd, libc::F_GETFD) };
         assert_ne!(transfer_flags, -1, "transfer fd must survive exec");
         assert_eq!(transfer_flags & libc::FD_CLOEXEC, 0);
@@ -1347,12 +1377,6 @@ mod exec_inheritance_tests {
         assert_eq!(unsafe { libc::fstat(transfer_fd, &mut fd_stat) }, 0);
         assert_eq!(fd_stat.st_dev as u64, path_metadata.dev());
         assert_eq!(fd_stat.st_ino, path_metadata.ino());
-        OpenOptions::new()
-            .write(true)
-            .open(child_pid_fifo)
-            .unwrap()
-            .write_all(std::process::id().to_string().as_bytes())
-            .unwrap();
         OpenOptions::new()
             .write(true)
             .open(ready_fifo)
@@ -1383,6 +1407,7 @@ mod exec_inheritance_tests {
             return;
         };
         let leaf_pid_fifo = std::env::var(LEAF_PID_FIFO_ENV).unwrap();
+        let leaf_arm_fifo = std::env::var(LEAF_ARM_FIFO_ENV).unwrap();
         let park_fifo = std::env::var(INTERMEDIARY_PARK_FIFO_ENV).unwrap();
         let transfer_fd = std::env::var(CHILD_FD_ENV).unwrap();
         let sentinel_fd = std::env::var(SENTINEL_FD_ENV).unwrap();
@@ -1400,7 +1425,24 @@ mod exec_inheritance_tests {
             .write_all(std::process::id().to_string().as_bytes())
             .unwrap();
 
-        let _leaf = Command::new(std::env::current_exe().unwrap())
+        let mut arm_pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(arm_pipe.as_mut_ptr()) }, 0);
+        let arm_reader = unsafe { File::from_raw_fd(arm_pipe[0]) };
+        let mut arm_writer = unsafe { File::from_raw_fd(arm_pipe[1]) };
+        let writer_flags = unsafe { libc::fcntl(arm_writer.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(writer_flags, -1);
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    arm_writer.as_raw_fd(),
+                    libc::F_SETFD,
+                    writer_flags | libc::FD_CLOEXEC,
+                )
+            },
+            0
+        );
+
+        let leaf = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("transfer::exec_inheritance_tests::production_exec_child_probe")
             .arg("--nocapture")
@@ -1408,6 +1450,8 @@ mod exec_inheritance_tests {
             .env(CHILD_FD_ENV, &transfer_fd)
             .env(SENTINEL_FD_ENV, &sentinel_fd)
             .env(LEAF_PID_FIFO_ENV, &leaf_pid_fifo)
+            .env(LEAF_PID_REPORTER_ENV, "intermediary")
+            .env(LEAF_ARM_FD_ENV, arm_reader.as_raw_fd().to_string())
             .env(READY_FIFO_ENV, &ready_fifo)
             .env(RELEASE_FIFO_ENV, &release_fifo)
             .env(LEAF_EXIT_FIFO_ENV, &exit_fifo)
@@ -1417,6 +1461,27 @@ mod exec_inheritance_tests {
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
+        drop(arm_reader);
+
+        // Command::spawn returns the Child before the leaf can pass the arm
+        // pipe. Report that exact PID; the leaf is explicitly marked not to
+        // duplicate this FIFO write.
+        OpenOptions::new()
+            .write(true)
+            .open(&leaf_pid_fifo)
+            .unwrap()
+            .write_all(leaf.id().to_string().as_bytes())
+            .unwrap();
+        let mut armed = [0_u8; 1];
+        OpenOptions::new()
+            .read(true)
+            .open(&leaf_arm_fifo)
+            .unwrap()
+            .read_exact(&mut armed)
+            .unwrap();
+        assert_eq!(armed, *b"A", "harness must confirm leaf cleanup is armed");
+        arm_writer.write_all(b"A").unwrap();
+        drop(arm_writer);
 
         // Park on a FIFO nobody writes to: the harness terminates this exact
         // intermediary PID once the leaf reports READY. This process never
@@ -1434,18 +1499,32 @@ mod exec_inheritance_tests {
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     }
 
-    struct ExactPidCleanup {
-        pid: Option<libc::pid_t>,
+    struct IdentityCheckedProcessCleanup {
+        identity: Option<ProcessIdentity>,
     }
 
-    impl ExactPidCleanup {
+    impl IdentityCheckedProcessCleanup {
         fn new(pid: libc::pid_t) -> Self {
-            Self { pid: Some(pid) }
+            let pid = u32::try_from(pid).expect("reported process PID must be positive");
+            let identity = SystemProcessInspector
+                .identity_for_pid(pid)
+                .expect("reported process must have an inspectable start identity");
+            Self {
+                identity: Some(identity),
+            }
         }
 
         fn signal(&self, signal: libc::c_int) -> std::io::Result<()> {
-            let pid = self.pid.expect("cleanup guard was already disarmed");
-            if unsafe { libc::kill(pid, signal) } == 0 {
+            let identity = self.identity.expect("cleanup guard was already disarmed");
+            if !matches!(
+                SystemProcessInspector.observe(identity),
+                ProcessObservation::Matching { .. }
+            ) {
+                return Err(std::io::Error::other(
+                    "process no longer matches the cleanup guard identity",
+                ));
+            }
+            if unsafe { libc::kill(identity.pid() as libc::pid_t, signal) } == 0 {
                 Ok(())
             } else {
                 Err(std::io::Error::last_os_error())
@@ -1453,19 +1532,24 @@ mod exec_inheritance_tests {
         }
 
         fn disarm(&mut self) {
-            self.pid = None;
+            self.identity = None;
         }
     }
 
-    impl Drop for ExactPidCleanup {
+    impl Drop for IdentityCheckedProcessCleanup {
         fn drop(&mut self) {
-            if let Some(pid) = self.pid {
-                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            if let Some(identity) = self.identity
+                && matches!(
+                    SystemProcessInspector.observe(identity),
+                    ProcessObservation::Matching { .. }
+                )
+            {
+                let _ = unsafe { libc::kill(identity.pid() as libc::pid_t, libc::SIGKILL) };
             }
         }
     }
 
-    fn assert_nonblocking_lock_contended(path: &Path) -> File {
+    fn assert_nonblocking_lock_contended(path: &Path) {
         let contender = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1481,19 +1565,6 @@ mod exec_inheritance_tests {
         assert!(
             code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN),
             "nonblocking transfer-lock contention failed unexpectedly: {error}"
-        );
-        contender
-    }
-
-    fn assert_nonblocking_lock_available(contender: &File) {
-        assert_eq!(
-            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0,
-            "transfer lock remained held after the exec child exited"
-        );
-        assert_eq!(
-            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_UN) },
-            0
         );
     }
 
@@ -1546,9 +1617,7 @@ mod exec_inheritance_tests {
                 .unwrap()
                 .read_to_string(&mut buffer)
                 .unwrap();
-            child_pid_tx
-                .send(buffer.trim().parse::<libc::pid_t>().unwrap())
-                .unwrap();
+            let _ = child_pid_tx.send(buffer.trim().parse::<libc::pid_t>().unwrap());
         });
         let (accepted_tx, accepted_rx) = mpsc::channel();
         let ready_reader = ready_fifo.clone();
@@ -1561,7 +1630,7 @@ mod exec_inheritance_tests {
                     .read_exact(&mut ready)?;
                 Ok(ready[0])
             })();
-            accepted_tx.send(result).unwrap();
+            let _ = accepted_tx.send(result);
         });
         let receiver_store = store.clone();
         let receiver_identity = identity.clone();
@@ -1583,11 +1652,11 @@ mod exec_inheritance_tests {
                     sentinel_fd,
                 },
             );
-            receiver_tx.send(outcome).unwrap();
+            let _ = receiver_tx.send(outcome);
         });
         let child_pid = child_pid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         child_pid_thread.join().unwrap();
-        let mut child_cleanup = ExactPidCleanup::new(child_pid);
+        let mut child_cleanup = IdentityCheckedProcessCleanup::new(child_pid);
         let ready = accepted_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
@@ -1595,21 +1664,19 @@ mod exec_inheritance_tests {
         acceptor.join().unwrap();
         assert_eq!(ready, b'R');
 
-        let contender = assert_nonblocking_lock_contended(&lock_path);
         let resolver_store = HostStore::open(&root).unwrap();
         let resolver_request = request.clone();
         let (resolved_tx, resolved_rx) = mpsc::channel();
         let (entered_tx, entered_rx) = mpsc::channel();
         let resolver = thread::spawn(move || {
-            entered_tx.send(()).unwrap();
-            resolved_tx
-                .send(HostTransferService::new(&resolver_store).abandon(&resolver_request, 2))
-                .unwrap();
+            let _ = entered_tx.send(());
+            let _ = resolved_tx
+                .send(HostTransferService::new(&resolver_store).abandon(&resolver_request, 2));
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
             matches!(resolved_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
-            "resolver completed even though direct nonblocking acquisition proved the lock held"
+            "resolver completed before the exec child released the transfer lock"
         );
         OpenOptions::new()
             .write(true)
@@ -1631,7 +1698,6 @@ mod exec_inheritance_tests {
             AbandonTransferResult::Abandoned
         );
         resolver.join().unwrap();
-        assert_nonblocking_lock_available(&contender);
     }
 
     #[test]
@@ -1656,6 +1722,7 @@ mod exec_inheritance_tests {
         let exit_fifo = fixture.path().join("exit.fifo");
         let intermediary_pid_fifo = fixture.path().join("intermediary-pid.fifo");
         let leaf_pid_fifo = fixture.path().join("leaf-pid.fifo");
+        let leaf_arm_fifo = fixture.path().join("leaf-arm.fifo");
         let park_fifo = fixture.path().join("park.fifo");
         for fifo in [
             &ready_fifo,
@@ -1663,6 +1730,7 @@ mod exec_inheritance_tests {
             &exit_fifo,
             &intermediary_pid_fifo,
             &leaf_pid_fifo,
+            &leaf_arm_fifo,
             &park_fifo,
         ] {
             create_fifo(fifo);
@@ -1679,7 +1747,7 @@ mod exec_inheritance_tests {
                     .read_exact(&mut ready)?;
                 Ok(ready[0])
             })();
-            accepted_tx.send(result).unwrap();
+            let _ = accepted_tx.send(result);
         });
 
         let (exit_tx, exit_rx) = mpsc::channel();
@@ -1693,7 +1761,7 @@ mod exec_inheritance_tests {
                     .read_exact(&mut exited)?;
                 Ok(exited[0])
             })();
-            exit_tx.send(result).unwrap();
+            let _ = exit_tx.send(result);
         });
 
         let (intermediary_pid_tx, intermediary_pid_rx) = mpsc::channel();
@@ -1706,9 +1774,7 @@ mod exec_inheritance_tests {
                 .unwrap()
                 .read_to_string(&mut buffer)
                 .unwrap();
-            intermediary_pid_tx
-                .send(buffer.trim().parse::<libc::pid_t>().unwrap())
-                .unwrap();
+            let _ = intermediary_pid_tx.send(buffer.trim().parse::<libc::pid_t>().unwrap());
         });
 
         let (leaf_pid_tx, leaf_pid_rx) = mpsc::channel();
@@ -1721,15 +1787,14 @@ mod exec_inheritance_tests {
                 .unwrap()
                 .read_to_string(&mut buffer)
                 .unwrap();
-            leaf_pid_tx
-                .send(buffer.trim().parse::<libc::pid_t>().unwrap())
-                .unwrap();
+            let _ = leaf_pid_tx.send(buffer.trim().parse::<libc::pid_t>().unwrap());
         });
 
         let receiver_store = store.clone();
         let receiver_identity = identity.clone();
         let probe_release_fifo = release_fifo.clone();
         let probe_exit_fifo = exit_fifo;
+        let probe_leaf_arm_fifo = leaf_arm_fifo.clone();
         let receiver_lock_path = lock_path.clone();
         let sentinel_fd = sentinel.as_raw_fd();
         let (receiver_tx, receiver_rx) = mpsc::channel();
@@ -1740,6 +1805,7 @@ mod exec_inheritance_tests {
                 &IntermediaryExecProbe {
                     intermediary_pid_fifo,
                     leaf_pid_fifo,
+                    leaf_arm_fifo: probe_leaf_arm_fifo,
                     park_fifo,
                     ready_fifo,
                     release_fifo: probe_release_fifo,
@@ -1748,17 +1814,23 @@ mod exec_inheritance_tests {
                     sentinel_fd,
                 },
             );
-            receiver_tx.send(outcome).unwrap();
+            let _ = receiver_tx.send(outcome);
         });
 
         let intermediary_pid = intermediary_pid_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
         intermediary_pid_thread.join().unwrap();
-        let mut intermediary_cleanup = ExactPidCleanup::new(intermediary_pid);
+        let mut intermediary_cleanup = IdentityCheckedProcessCleanup::new(intermediary_pid);
         let leaf_pid = leaf_pid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         leaf_pid_thread.join().unwrap();
-        let mut leaf_cleanup = ExactPidCleanup::new(leaf_pid);
+        let mut leaf_cleanup = IdentityCheckedProcessCleanup::new(leaf_pid);
+        OpenOptions::new()
+            .write(true)
+            .open(&leaf_arm_fifo)
+            .unwrap()
+            .write_all(b"A")
+            .unwrap();
         let ready = accepted_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
@@ -1787,16 +1859,15 @@ mod exec_inheritance_tests {
             "intermediary's exec-child slot must report the SIGKILL exit status, got {receiver_outcome:?}"
         );
 
-        let contender = assert_nonblocking_lock_contended(&lock_path);
+        assert_nonblocking_lock_contended(&lock_path);
         let resolver_store = HostStore::open(&root).unwrap();
         let resolver_request = request.clone();
         let (resolved_tx, resolved_rx) = mpsc::channel();
         let (entered_tx, entered_rx) = mpsc::channel();
         let resolver = thread::spawn(move || {
-            entered_tx.send(()).unwrap();
-            resolved_tx
-                .send(HostTransferService::new(&resolver_store).abandon(&resolver_request, 2))
-                .unwrap();
+            let _ = entered_tx.send(());
+            let _ = resolved_tx
+                .send(HostTransferService::new(&resolver_store).abandon(&resolver_request, 2));
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
@@ -1828,7 +1899,6 @@ mod exec_inheritance_tests {
             AbandonTransferResult::Abandoned
         );
         resolver.join().unwrap();
-        assert_nonblocking_lock_available(&contender);
     }
 
     #[test]

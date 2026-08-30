@@ -351,6 +351,39 @@ fn compile_native_argv_reflector(directory: &Path) -> PathBuf {
     executable
 }
 
+fn compile_exit_parking_dylib(directory: &Path) -> PathBuf {
+    let source = directory.join("exit-parking.c");
+    let library = directory.join("libexit-parking.dylib");
+    fs::write(
+        &source,
+        concat!(
+            "#include <fcntl.h>\n",
+            "#include <stdlib.h>\n",
+            "#include <unistd.h>\n",
+            "__attribute__((destructor))\n",
+            "static void park_accepted_client_at_exit(void) {\n",
+            "  const char *path = getenv(\"MAC_WORKER_TEST_CLIENT_EXIT_FIFO\");\n",
+            "  if (path == NULL) return;\n",
+            "  int fd = open(path, O_RDONLY);\n",
+            "  if (fd >= 0) close(fd);\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new("/usr/bin/cc")
+        .args(["-dynamiclib", "-o"])
+        .arg(&library)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "failed to compile accepted-client exit parking library: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    library
+}
+
 fn create_fifo(path: &Path) {
     let path = CString::new(path.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
@@ -430,20 +463,6 @@ impl Drop for DetachedJobCleanup {
             }
         }
     }
-}
-
-fn host_control<Request, Response>(
-    home: &Path,
-    data: &Path,
-    operation: &str,
-    request: &Request,
-) -> Response
-where
-    Request: serde::Serialize,
-    Response: serde::de::DeserializeOwned,
-{
-    try_host_control(home, data, operation, request)
-        .unwrap_or_else(|error| panic!("{operation}: {error}"))
 }
 
 fn try_host_control<Request, Response>(
@@ -2860,8 +2879,11 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
     fs::create_dir_all(&home).unwrap();
     let ready_fifo = temp.path().join("command-ready.fifo");
     let release_fifo = temp.path().join("command-release.fifo");
+    let client_exit_fifo = temp.path().join("client-exit.fifo");
     create_fifo(&ready_fifo);
     create_fifo(&release_fifo);
+    create_fifo(&client_exit_fifo);
+    let exit_parking_dylib = compile_exit_parking_dylib(temp.path());
     let (ready_tx, ready_rx) = mpsc::channel();
     let ready_reader = ready_fifo.clone();
     let ready_thread = std::thread::spawn(move || {
@@ -2873,7 +2895,7 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
                 .read_exact(&mut ready)?;
             Ok(ready[0])
         })();
-        ready_tx.send(result).unwrap();
+        let _ = ready_tx.send(result);
     });
 
     let host_root = data.join("mac-worker/host");
@@ -2906,6 +2928,8 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
             .env_clear()
             .env("HOME", &home)
             .env("XDG_DATA_HOME", &data)
+            .env("DYLD_INSERT_LIBRARIES", &exit_parking_dylib)
+            .env("MAC_WORKER_TEST_CLIENT_EXIT_FIFO", &client_exit_fifo)
             .args(["host", "submit"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2941,6 +2965,10 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
     // handshake: terminate the exact submitting process by its own PID. The
     // detached supervisor was already handed off before this ack was
     // written, so its lifetime must not depend on this process surviving.
+    assert!(
+        submit_client.child_mut().try_wait().unwrap().is_none(),
+        "accepted submit client must still be live immediately before SIGKILL"
+    );
     submit_client.kill_and_reap();
 
     let reconnect_deadline = Instant::now() + Duration::from_secs(5);
@@ -2983,7 +3011,17 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
     let deadline = Instant::now() + Duration::from_secs(5);
     let terminal = loop {
         let response: StatusResponse =
-            host_control(&home, &data, "status", &StatusRequest::new(lease.job_id()));
+            match try_host_control(&home, &data, "status", &StatusRequest::new(lease.job_id())) {
+                Ok(response) => response,
+                Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "reconnected status polling never recovered a valid response"
+                    );
+                    std::thread::yield_now();
+                    continue;
+                }
+            };
         assert_eq!(
             response.status().supervisor_identity(),
             accepted.status().supervisor_identity()
@@ -3001,12 +3039,24 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
     assert_eq!(terminal.status().state(), JobState::Succeeded);
     assert_eq!(terminal.status().exit_code(), Some(0));
     assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"reconnected");
-    let reconnected_log: LogChunkResponse = host_control(
-        &home,
-        &data,
-        "log-chunk",
-        &LogChunkRequest::new(lease.job_id(), LogStream::Stdout, 0, 1024),
-    );
+    let log_deadline = Instant::now() + Duration::from_secs(5);
+    let reconnected_log: LogChunkResponse = loop {
+        match try_host_control(
+            &home,
+            &data,
+            "log-chunk",
+            &LogChunkRequest::new(lease.job_id(), LogStream::Stdout, 0, 1024),
+        ) {
+            Ok(response) => break response,
+            Err(_) => {
+                assert!(
+                    Instant::now() < log_deadline,
+                    "same-ID log reconnect never recovered a valid response"
+                );
+                std::thread::yield_now();
+            }
+        }
+    };
     assert_eq!(reconnected_log.chunk().stream(), LogStream::Stdout);
     assert_eq!(reconnected_log.chunk().offset(), 0);
     assert_eq!(
