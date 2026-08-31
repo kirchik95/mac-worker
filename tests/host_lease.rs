@@ -873,13 +873,11 @@ fn assert_leftover_leaf_pin(leftover: &Path, leaf: &str, expected: &(u64, u64, V
     );
 }
 
-fn pin_tree(root: &Path) -> BTreeMap<Vec<u8>, (u64, u64, Option<Vec<u8>>)> {
-    let mut identities = BTreeMap::new();
-    fn walk(
-        dir: &Path,
-        prefix: &[u8],
-        identities: &mut BTreeMap<Vec<u8>, (u64, u64, Option<Vec<u8>>)>,
-    ) {
+type TreePin = BTreeMap<Vec<u8>, (u64, u64, Option<Vec<u8>>)>;
+
+fn pin_tree(root: &Path) -> TreePin {
+    let mut identities = TreePin::new();
+    fn walk(dir: &Path, prefix: &[u8], identities: &mut TreePin) {
         for entry in fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
             let mut key = prefix.to_vec();

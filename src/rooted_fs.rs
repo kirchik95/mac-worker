@@ -4930,11 +4930,11 @@ impl PrivateNamespace {
                 };
                 match Self::open_or_create_at(&parent, expected_device) {
                     Ok(namespace) => {
-                        if let Some(Some(expected)) = observed_cleanup {
-                            if namespace.created || namespace.identity != expected {
-                                namespace.remove_if_new_and_empty(parent.as_raw_fd());
-                                return Err(os_error(libc::ESTALE));
-                            }
+                        if let Some(Some(expected)) = observed_cleanup
+                            && (namespace.created || namespace.identity != expected)
+                        {
+                            namespace.remove_if_new_and_empty(parent.as_raw_fd());
+                            return Err(os_error(libc::ESTALE));
                         }
                         if namespace.is_disjoint_from(disallowed_roots)? {
                             if probe {
@@ -5603,18 +5603,18 @@ fn cleanup_hex_encode(bytes: &[u8]) -> String {
 }
 
 fn cleanup_hex_decode(encoded: &str) -> io::Result<Vec<u8>> {
-    if encoded.len() % 2 != 0 || encoded.is_empty() {
+    if !encoded.len().is_multiple_of(2) || encoded.is_empty() {
         return Err(cleanup_record_error());
     }
     let mut decoded = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.as_bytes().chunks_exact(2) {
+    for &[high_byte, low_byte] in encoded.as_bytes().as_chunks::<2>().0 {
         let nibble = |value: u8| match value {
             b'0'..=b'9' => Some(value - b'0'),
             b'a'..=b'f' => Some(value - b'a' + 10),
             _ => None,
         };
-        let high = nibble(pair[0]).ok_or_else(cleanup_record_error)?;
-        let low = nibble(pair[1]).ok_or_else(cleanup_record_error)?;
+        let high = nibble(high_byte).ok_or_else(cleanup_record_error)?;
+        let low = nibble(low_byte).ok_or_else(cleanup_record_error)?;
         decoded.push((high << 4) | low);
     }
     if decoded.is_empty()
@@ -5866,6 +5866,7 @@ fn cleanup_uuid_name_prefix(bytes: &[u8], kind: &str) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cleanup_intent_record(
     key: &str,
     component: &CStr,
@@ -5902,6 +5903,7 @@ fn cleanup_intent_record(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cleanup_truncated_intent_is_attributable(
     bytes: &[u8],
     key: &str,
@@ -7574,6 +7576,7 @@ fn resolve_bound_tree_cleanup(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_bound_cleanup(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
@@ -7757,6 +7760,7 @@ fn complete_bound_tree_cleanup(
     .map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn complete_bound_tree_cleanup_outcome(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
@@ -7783,6 +7787,7 @@ fn complete_bound_tree_cleanup_outcome(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn complete_bound_cleanup(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
@@ -8816,6 +8821,7 @@ fn prepare_cleanup_bootstrap_placeholder(
     Ok(FileIdentity::from_stat(&opened))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_cleanup_intent_stage(
     namespace: &PrivateNamespace,
     operation: &PrivateOperation<'_>,
@@ -9394,6 +9400,7 @@ fn cleanup_placeholder_only(
     remove_empty_cleanup_operation(namespace, operation)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resume_cleanup(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
@@ -9435,6 +9442,7 @@ fn resume_cleanup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resume_tree_cleanup(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
@@ -9737,6 +9745,7 @@ fn resume_tree_cleanup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resume_regular_cleanup(
     namespace: &PrivateNamespace,
     public_parent: RawFd,

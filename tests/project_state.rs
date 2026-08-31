@@ -613,7 +613,7 @@ fn failed_c_reload_cleanup_io_error_is_authoritative_and_crosses_no_boundary() {
             error: WorkerError::Io(error),
             ..
         } => {
-            assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+            assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
         }
         other => panic!("cleanup failure had wrong classification: {other}"),
     }

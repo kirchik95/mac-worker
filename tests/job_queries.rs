@@ -7121,12 +7121,12 @@ fn isolate_resolution_scopes_before_staging(job: &Path, store: &HostStore, lease
     let incoming = store
         .incoming_job(lease.job_id(), lease.lease_token())
         .unwrap();
-    if let Some(incoming_job) = incoming.parent() {
-        if incoming_job.exists() {
-            fs::remove_dir_all(incoming_job).unwrap();
-            if let Some(incoming_root) = incoming_job.parent() {
-                File::open(incoming_root).unwrap().sync_all().unwrap();
-            }
+    if let Some(incoming_job) = incoming.parent()
+        && incoming_job.exists()
+    {
+        fs::remove_dir_all(incoming_job).unwrap();
+        if let Some(incoming_root) = incoming_job.parent() {
+            File::open(incoming_root).unwrap().sync_all().unwrap();
         }
     }
 }

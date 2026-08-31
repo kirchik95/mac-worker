@@ -487,7 +487,7 @@ fn cleanup_refuses_a_root_path_replaced_by_a_symlink() {
 
     let error = destination.remove_owned_tree().unwrap_err();
 
-    assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+    assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
     assert!(moved.join("owned/empty").is_dir());
     fixture.assert_outside_unchanged();
 }
