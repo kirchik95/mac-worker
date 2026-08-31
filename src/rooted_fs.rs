@@ -10,7 +10,7 @@ use std::{
         unix::{ffi::OsStrExt, fs::FileExt},
     },
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
 };
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,17 @@ const CLEANUP_INTENT_STAGE_PREFIX: &str = "cleanup-intent-stage-v1-";
 const CLEANUP_DECISION_STAGE_PREFIX: &str = "cleanup-decision-stage-v1-";
 const CLEANUP_OPERATION_PREFIX: &str = "cleanup-op-v1-";
 const CLEANUP_PLACEHOLDER_NAME: &CStr = c"cleanup-placeholder-v1";
+const CLEANUP_CAPABILITY_PROBE_NAME: &CStr = c"cleanup-capability-probe-v1";
+const CLEANUP_CAPABILITY_PROBE_LEFT: &CStr = c"left-v1";
+const CLEANUP_CAPABILITY_PROBE_RIGHT: &CStr = c"right-v1";
+const CLEANUP_PROBE_REGULAR_SOURCE: &CStr = c"regular-no-replace-source-v1";
+const CLEANUP_PROBE_REGULAR_DESTINATION: &CStr = c"regular-no-replace-destination-v1";
+const CLEANUP_PROBE_DIRECTORY_SOURCE: &CStr = c"directory-no-replace-source-v1";
+const CLEANUP_PROBE_DIRECTORY_DESTINATION: &CStr = c"directory-no-replace-destination-v1";
+const CLEANUP_PROBE_EXCHANGE_LEFT: &CStr = c"directory-exchange-left-v1";
+const CLEANUP_PROBE_EXCHANGE_RIGHT: &CStr = c"directory-exchange-right-v1";
+
+static CLEANUP_PROCESS_JOURNAL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -212,6 +223,7 @@ pub(crate) struct SnapshotTreeInspection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AtomicRenameCapability {
     NoReplace,
+    NoExchange,
     Unsupported,
 }
 
@@ -244,6 +256,27 @@ thread_local! {
     };
     static TEST_CLEANUP_FAULT: std::cell::Cell<Option<CleanupFault>> = const {
         std::cell::Cell::new(None)
+    };
+    static TEST_CLEANUP_DECISION_FAULT: std::cell::Cell<Option<CleanupDecisionFault>> = const {
+        std::cell::Cell::new(None)
+    };
+    static TEST_CLEANUP_PROBE_INTERRUPTED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static TEST_CLEANUP_PROBE_TRANSITION: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_CLEANUP_INTENT_HANDOFF: std::cell::RefCell<Option<CleanupIntentHandoff>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static TEST_CLEANUP_BOOTSTRAP_HANDOFF: std::cell::RefCell<Option<CleanupBootstrapHandoff>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static TEST_CLEANUP_TERMINAL_HANDOFF: std::cell::RefCell<Option<CleanupTerminalHandoff>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static TEST_CLEANUP_DECISION_REWRITE_HANDOFF: std::cell::RefCell<Option<CleanupDecisionRewriteHandoff>> = const {
+        std::cell::RefCell::new(None)
     };
 }
 
@@ -327,12 +360,35 @@ impl Drop for CopyPrivateCleanupFailureOverride {
 enum CleanupFault {
     AfterAcquisitionValidation(libc::c_int),
     AfterCleanupBootstrap(libc::c_int),
+    DuringCleanupCapabilityProbe(usize, libc::c_int),
+    AfterCleanupCapabilityProbeSync(libc::c_int),
+    AfterCleanupPlaceholderObjectSync(libc::c_int),
     AfterCleanupPlaceholder(libc::c_int),
     DuringCleanupIntentWrite(libc::c_int),
+    AfterCleanupIntentWriteBeforeSync(libc::c_int),
+    AfterCleanupIntentAdoptionSync(libc::c_int),
     AfterCleanupIntentSync(libc::c_int),
+    BeforeBoundCompletion(libc::c_int),
     AfterTargetChmod(libc::c_int),
     AfterFirstRemoval(libc::c_int),
     BeforeFinalRootRemoval(libc::c_int),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupDecisionFault {
+    AfterStageSync(libc::c_int),
+    DuringWrite(libc::c_int),
+    AfterFullWriteBeforeSync(libc::c_int),
+    AfterCompleteAdoptionSync(libc::c_int),
+    BeforeRename(libc::c_int),
+    AfterRename(libc::c_int),
+    AfterDestinationSync(libc::c_int),
+    AfterSourceSync(libc::c_int),
+    DuringRestoreRollback(libc::c_int),
+    AfterRestoreSync(libc::c_int),
+    AfterDecisionRetire(libc::c_int),
+    AfterIntentRetire(libc::c_int),
 }
 
 #[cfg(test)]
@@ -341,6 +397,7 @@ struct CleanupFaultOverride(Option<CleanupFault>);
 #[cfg(test)]
 impl CleanupFaultOverride {
     fn set(fault: CleanupFault) -> Self {
+        TEST_CLEANUP_PROBE_TRANSITION.set(0);
         Self(TEST_CLEANUP_FAULT.replace(Some(fault)))
     }
 }
@@ -349,6 +406,136 @@ impl CleanupFaultOverride {
 impl Drop for CleanupFaultOverride {
     fn drop(&mut self) {
         TEST_CLEANUP_FAULT.set(self.0);
+        TEST_CLEANUP_PROBE_TRANSITION.set(0);
+    }
+}
+
+#[cfg(test)]
+struct CleanupIntentHandoff {
+    renamed: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct CleanupIntentHandoffOverride(Option<CleanupIntentHandoff>);
+
+#[cfg(test)]
+impl CleanupIntentHandoffOverride {
+    fn set(renamed: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>) -> Self {
+        Self(TEST_CLEANUP_INTENT_HANDOFF.replace(Some(CleanupIntentHandoff { renamed, release })))
+    }
+}
+
+#[cfg(test)]
+impl Drop for CleanupIntentHandoffOverride {
+    fn drop(&mut self) {
+        TEST_CLEANUP_INTENT_HANDOFF.replace(self.0.take());
+    }
+}
+
+#[cfg(test)]
+struct CleanupBootstrapHandoff {
+    stream: std::os::unix::net::UnixStream,
+}
+
+#[cfg(test)]
+struct CleanupBootstrapHandoffOverride(Option<CleanupBootstrapHandoff>);
+
+#[cfg(test)]
+impl CleanupBootstrapHandoffOverride {
+    fn set(stream: std::os::unix::net::UnixStream) -> Self {
+        Self(TEST_CLEANUP_BOOTSTRAP_HANDOFF.replace(Some(CleanupBootstrapHandoff { stream })))
+    }
+}
+
+#[cfg(test)]
+impl Drop for CleanupBootstrapHandoffOverride {
+    fn drop(&mut self) {
+        TEST_CLEANUP_BOOTSTRAP_HANDOFF.replace(self.0.take());
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupTerminalPhase {
+    Initial,
+    Final,
+}
+
+#[cfg(test)]
+struct CleanupTerminalHandoff {
+    phase: CleanupTerminalPhase,
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct CleanupTerminalHandoffOverride(Option<CleanupTerminalHandoff>);
+
+#[cfg(test)]
+impl CleanupTerminalHandoffOverride {
+    fn set(
+        phase: CleanupTerminalPhase,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self(
+            TEST_CLEANUP_TERMINAL_HANDOFF.replace(Some(CleanupTerminalHandoff {
+                phase,
+                reached,
+                release,
+            })),
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for CleanupTerminalHandoffOverride {
+    fn drop(&mut self) {
+        TEST_CLEANUP_TERMINAL_HANDOFF.replace(self.0.take());
+    }
+}
+
+#[cfg(test)]
+struct CleanupDecisionRewriteHandoff {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct CleanupDecisionRewriteHandoffOverride(Option<CleanupDecisionRewriteHandoff>);
+
+#[cfg(test)]
+impl CleanupDecisionRewriteHandoffOverride {
+    fn set(reached: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>) -> Self {
+        Self(
+            TEST_CLEANUP_DECISION_REWRITE_HANDOFF
+                .replace(Some(CleanupDecisionRewriteHandoff { reached, release })),
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for CleanupDecisionRewriteHandoffOverride {
+    fn drop(&mut self) {
+        TEST_CLEANUP_DECISION_REWRITE_HANDOFF.replace(self.0.take());
+    }
+}
+
+#[cfg(test)]
+struct CleanupDecisionFaultOverride(Option<CleanupDecisionFault>);
+
+#[cfg(test)]
+impl CleanupDecisionFaultOverride {
+    fn set(fault: CleanupDecisionFault) -> Self {
+        Self(TEST_CLEANUP_DECISION_FAULT.replace(Some(fault)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for CleanupDecisionFaultOverride {
+    fn drop(&mut self) {
+        TEST_CLEANUP_DECISION_FAULT.set(self.0);
     }
 }
 
@@ -1574,14 +1761,21 @@ impl RootedDir {
     }
 
     pub(crate) fn remove_owned_child(&self, name: &str) -> io::Result<()> {
+        let _process_journal = lock_cleanup_process_journal()?;
+        self.remove_owned_child_inner(name)
+    }
+
+    fn remove_owned_child_inner(&self, name: &str) -> io::Result<()> {
         let component = private_leaf_name(name)?;
         self.verify_root_name()?;
         let parent_metadata = stat_fd(self.root.as_raw_fd())?;
         require_private_directory(&parent_metadata)?;
         let parent = FileIdentity::from_stat(&parent_metadata);
-        let namespace =
-            PrivateNamespace::select(self.root.as_raw_fd(), parent_metadata.st_dev, &[])?;
-        validate_cleanup_namespace_evidence(&namespace, self.root.as_raw_fd(), parent)?;
+        let namespace = PrivateNamespace::select_for_cleanup(
+            self.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )?;
         let verify_parent = || {
             self.verify_root_name()?;
             let current = stat_fd(self.root.as_raw_fd())?;
@@ -1590,44 +1784,96 @@ impl RootedDir {
             }
             Ok(())
         };
-        if let Some(loaded) = find_cleanup_intent(&namespace, parent, component.to_bytes())? {
-            let target = FileIdentity::from(loaded.intent.target);
-            let original_mode = loaded.intent.original_mode;
-            let result = resume_tree_cleanup(
-                &namespace,
-                self.root.as_raw_fd(),
-                parent,
-                component.to_bytes(),
-                &loaded,
-                &verify_parent,
-                true,
-            );
-            return match result {
+        let mut bound = None;
+        let mut last_race = os_error(libc::ESTALE);
+        for _ in 0..32 {
+            match validate_cleanup_namespace_evidence(&namespace, self.root.as_raw_fd(), parent) {
+                Ok(()) => {}
                 Err(error)
                     if matches!(
                         error.raw_os_error(),
                         Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
                     ) =>
                 {
-                    drop(loaded);
-                    resolve_bound_tree_cleanup(
+                    last_race = error;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            match cleanup_exact_initial_snapshot(
+                &namespace,
+                self.root.as_raw_fd(),
+                parent,
+                &component,
+                None,
+                None,
+            ) {
+                Ok(CleanupInitialSnapshot::Absent) => return Ok(()),
+                Ok(CleanupInitialSnapshot::Bound {
+                    metadata,
+                    generation,
+                }) => {
+                    injected_cleanup_bootstrap_result()?;
+                    bound = Some((metadata, generation));
+                    break;
+                }
+                Ok(CleanupInitialSnapshot::Evidence) => {
+                    if let Some(loaded) =
+                        find_cleanup_intent(&namespace, parent, component.to_bytes())?
+                    {
+                        let target = FileIdentity::from(loaded.intent.target);
+                        let original_mode = loaded.intent.original_mode;
+                        let generation = cleanup_generation_from_loaded(
+                            &namespace,
+                            parent,
+                            component.to_bytes(),
+                            &loaded,
+                        )?;
+                        drop(loaded);
+                        return complete_bound_tree_cleanup(
+                            &namespace,
+                            self.root.as_raw_fd(),
+                            parent,
+                            component.to_bytes(),
+                            target,
+                            original_mode,
+                            Some(generation),
+                            &verify_parent,
+                            true,
+                        );
+                    }
+                    if let Some(candidate) = find_unpublished_cleanup_bootstrap(
                         &namespace,
                         self.root.as_raw_fd(),
                         parent,
                         component.to_bytes(),
-                        target,
-                        original_mode,
-                        &verify_parent,
-                        true,
-                    )
+                    )? {
+                        return complete_bound_tree_cleanup(
+                            &namespace,
+                            self.root.as_raw_fd(),
+                            parent,
+                            component.to_bytes(),
+                            candidate.target,
+                            candidate.original_mode,
+                            Some(candidate.generation),
+                            &verify_parent,
+                            true,
+                        );
+                    }
                 }
-                result => result,
-            };
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+                    ) =>
+                {
+                    last_race = error;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let before = match stat_at(self.root.as_raw_fd(), &component) {
-            Ok(before) => before,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
+        let Some((before, initial_generation)) = bound else {
+            return Err(last_race);
         };
         if file_type(before.st_mode) != libc::S_IFDIR
             || before.st_uid != effective_user_id()
@@ -1647,13 +1893,14 @@ impl RootedDir {
                     Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
                 ) =>
             {
-                return resolve_bound_tree_cleanup(
+                return complete_bound_tree_cleanup(
                     &namespace,
                     self.root.as_raw_fd(),
                     parent,
                     component.to_bytes(),
                     target_identity,
                     original_mode,
+                    Some(initial_generation.clone()),
                     &verify_parent,
                     true,
                 );
@@ -1666,13 +1913,14 @@ impl RootedDir {
             || opened.st_dev != parent_metadata.st_dev
             || opened.st_mode as u32 & 0o7777 != original_mode
         {
-            return resolve_bound_tree_cleanup(
+            return complete_bound_tree_cleanup(
                 &namespace,
                 self.root.as_raw_fd(),
                 parent,
                 component.to_bytes(),
                 target_identity,
                 original_mode,
+                Some(initial_generation.clone()),
                 &verify_parent,
                 true,
             );
@@ -1696,27 +1944,31 @@ impl RootedDir {
                 ) => {}
             Err(error) => return Err(error),
         }
-        resolve_bound_tree_cleanup(
+        complete_bound_tree_cleanup(
             &namespace,
             self.root.as_raw_fd(),
             parent,
             component.to_bytes(),
             target_identity,
             original_mode,
+            Some(initial_generation),
             &verify_parent,
             true,
         )
     }
 
     pub(crate) fn resume_pending_owned_child_cleanup(&self, name: &str) -> io::Result<bool> {
+        let _process_journal = lock_cleanup_process_journal()?;
         let component = private_leaf_name(name)?;
         self.verify_root_name()?;
         let parent_metadata = stat_fd(self.root.as_raw_fd())?;
         require_private_directory(&parent_metadata)?;
         let parent = FileIdentity::from_stat(&parent_metadata);
-        let namespace =
-            PrivateNamespace::select(self.root.as_raw_fd(), parent_metadata.st_dev, &[])?;
-        validate_cleanup_namespace_evidence(&namespace, self.root.as_raw_fd(), parent)?;
+        let namespace = PrivateNamespace::select_for_cleanup(
+            self.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )?;
         let verify_parent = || {
             self.verify_root_name()?;
             let current = stat_fd(self.root.as_raw_fd())?;
@@ -1725,18 +1977,9 @@ impl RootedDir {
             }
             Ok(())
         };
-        if let Some(loaded) = find_cleanup_intent(&namespace, parent, component.to_bytes())? {
-            let target = FileIdentity::from(loaded.intent.target);
-            let original_mode = loaded.intent.original_mode;
-            match resume_tree_cleanup(
-                &namespace,
-                self.root.as_raw_fd(),
-                parent,
-                component.to_bytes(),
-                &loaded,
-                &verify_parent,
-                false,
-            ) {
+        let mut last_race = os_error(libc::ESTALE);
+        for _ in 0..32 {
+            match validate_cleanup_namespace_evidence(&namespace, self.root.as_raw_fd(), parent) {
                 Ok(()) => {}
                 Err(error)
                     if matches!(
@@ -1744,57 +1987,91 @@ impl RootedDir {
                         Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
                     ) =>
                 {
-                    drop(loaded);
-                    resolve_bound_tree_cleanup(
-                        &namespace,
-                        self.root.as_raw_fd(),
-                        parent,
-                        component.to_bytes(),
-                        target,
-                        original_mode,
-                        &verify_parent,
-                        false,
-                    )?
+                    last_race = error;
+                    continue;
                 }
                 Err(error) => return Err(error),
             }
-            return Ok(true);
+            match cleanup_pending_snapshot(&namespace, parent, &component) {
+                Ok(false) => return Ok(false),
+                Ok(true) => {}
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+                    ) =>
+                {
+                    last_race = error;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            if let Some(loaded) = find_cleanup_intent(&namespace, parent, component.to_bytes())? {
+                let target = FileIdentity::from(loaded.intent.target);
+                let original_mode = loaded.intent.original_mode;
+                let generation = cleanup_generation_from_loaded(
+                    &namespace,
+                    parent,
+                    component.to_bytes(),
+                    &loaded,
+                )?;
+                drop(loaded);
+                let outcome = resolve_bound_tree_cleanup(
+                    &namespace,
+                    self.root.as_raw_fd(),
+                    parent,
+                    component.to_bytes(),
+                    target,
+                    original_mode,
+                    Some(&generation),
+                    &verify_parent,
+                    false,
+                )?;
+                return match outcome {
+                    TreeCleanupOutcome::Deleted | TreeCleanupOutcome::Restored(None) => Ok(true),
+                    TreeCleanupOutcome::Restored(Some(error)) => Err(error),
+                };
+            }
+            if let Some(candidate) = find_unpublished_cleanup_bootstrap(
+                &namespace,
+                self.root.as_raw_fd(),
+                parent,
+                component.to_bytes(),
+            )? {
+                let outcome = resolve_bound_tree_cleanup(
+                    &namespace,
+                    self.root.as_raw_fd(),
+                    parent,
+                    component.to_bytes(),
+                    candidate.target,
+                    candidate.original_mode,
+                    Some(&candidate.generation),
+                    &verify_parent,
+                    false,
+                )?;
+                return match outcome {
+                    TreeCleanupOutcome::Deleted | TreeCleanupOutcome::Restored(None) => Ok(true),
+                    TreeCleanupOutcome::Restored(Some(error)) => Err(error),
+                };
+            }
         }
-        let Some(candidate) = find_unpublished_cleanup_bootstrap(
-            &namespace,
-            self.root.as_raw_fd(),
-            parent,
-            component.to_bytes(),
-        )?
-        else {
-            return Ok(false);
-        };
-        resolve_bound_tree_cleanup(
-            &namespace,
-            self.root.as_raw_fd(),
-            parent,
-            component.to_bytes(),
-            candidate.target,
-            candidate.original_mode,
-            &verify_parent,
-            false,
-        )?;
-        Ok(true)
+        Err(last_race)
     }
 
     pub(crate) fn retry_pending_owned_children_matching(
         &self,
         mut predicate: impl FnMut(&[u8], PrivateEntryIdentity) -> bool,
     ) -> io::Result<usize> {
+        let _process_journal = lock_cleanup_process_journal()?;
         self.verify_root_name()?;
         let parent_metadata = stat_fd(self.root.as_raw_fd())?;
         require_private_directory(&parent_metadata)?;
         let parent = FileIdentity::from_stat(&parent_metadata);
-        let namespace =
-            PrivateNamespace::select(self.root.as_raw_fd(), parent_metadata.st_dev, &[])?;
-        validate_cleanup_namespace_evidence(&namespace, self.root.as_raw_fd(), parent)?;
-        let candidates =
-            collect_pending_tree_cleanup_candidates(&namespace, self.root.as_raw_fd(), parent)?;
+        let namespace = PrivateNamespace::select_for_cleanup(
+            self.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )?;
         let verify_parent = || {
             self.verify_root_name()?;
             let current = stat_fd(self.root.as_raw_fd())?;
@@ -1804,30 +2081,174 @@ impl RootedDir {
             Ok(())
         };
         let mut resumed = 0;
-        for candidate in candidates {
-            let target = PrivateEntryIdentity {
-                device: candidate.target.device,
-                inode: candidate.target.inode,
-                kind: libc::S_IFDIR as u32,
-                owner: effective_user_id(),
-                mode: candidate.original_mode & 0o777,
-            };
-            if !predicate(&candidate.component, target) {
-                continue;
+        let mut decisions = Vec::<(Vec<u8>, CleanupGenerationFence, bool)>::new();
+        let mut last_race = os_error(libc::ESTALE);
+        for _ in 0..64 {
+            match validate_cleanup_namespace_evidence(&namespace, self.root.as_raw_fd(), parent) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+                    ) =>
+                {
+                    last_race = error;
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
-            resolve_bound_tree_cleanup(
+            let candidates = match collect_pending_tree_cleanup_candidates(
                 &namespace,
                 self.root.as_raw_fd(),
                 parent,
-                &candidate.component,
-                candidate.target,
-                candidate.original_mode,
-                &verify_parent,
-                false,
-            )?;
-            resumed += 1;
+            ) {
+                Ok(candidates) => candidates,
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+                    ) =>
+                {
+                    last_race = error;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if candidates.is_empty() {
+                return Ok(resumed);
+            }
+            let mut invoked_predicate = false;
+            let mut retry = false;
+            for candidate in candidates {
+                let approval = decisions
+                    .iter()
+                    .find(|(component, generation, _)| {
+                        component.as_slice() == candidate.component.as_slice()
+                            && cleanup_generation_matches(generation, &candidate.generation)
+                    })
+                    .map(|(_, _, approval)| *approval);
+                let approved = match approval {
+                    Some(approved) => approved,
+                    None => {
+                        invoked_predicate = true;
+                        let target = PrivateEntryIdentity {
+                            device: candidate.target.device,
+                            inode: candidate.target.inode,
+                            kind: libc::S_IFDIR as u32,
+                            owner: effective_user_id(),
+                            mode: candidate.original_mode & 0o777,
+                        };
+                        let approved = predicate(&candidate.component, target);
+                        decisions.push((
+                            candidate.component.clone(),
+                            candidate.generation.clone(),
+                            approved,
+                        ));
+                        approved
+                    }
+                };
+                if !approved {
+                    continue;
+                }
+                let current = match collect_pending_tree_cleanup_candidates(
+                    &namespace,
+                    self.root.as_raw_fd(),
+                    parent,
+                ) {
+                    Ok(current) => current,
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+                        ) =>
+                    {
+                        last_race = error;
+                        retry = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if !current.iter().any(|current| {
+                    current.component == candidate.component
+                        && cleanup_generation_matches(&candidate.generation, &current.generation)
+                }) {
+                    last_race = os_error(libc::EAGAIN);
+                    retry = true;
+                    break;
+                }
+                match complete_bound_tree_cleanup_outcome(
+                    &namespace,
+                    self.root.as_raw_fd(),
+                    parent,
+                    &candidate.component,
+                    candidate.target,
+                    candidate.original_mode,
+                    Some(candidate.generation.clone()),
+                    &verify_parent,
+                    false,
+                ) {
+                    Ok(TreeCleanupOutcome::Deleted) => {
+                        resumed += 1;
+                        retry = true;
+                        break;
+                    }
+                    Ok(TreeCleanupOutcome::Restored(_)) => {
+                        last_race = os_error(libc::EAGAIN);
+                        retry = true;
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+                        ) =>
+                    {
+                        if error.raw_os_error() == Some(libc::ESTALE) {
+                            match collect_pending_tree_cleanup_candidates(
+                                &namespace,
+                                self.root.as_raw_fd(),
+                                parent,
+                            ) {
+                                Ok(current)
+                                    if current.iter().any(|current| {
+                                        current.component == candidate.component
+                                            && cleanup_generation_matches(
+                                                &candidate.generation,
+                                                &current.generation,
+                                            )
+                                    }) =>
+                                {
+                                    return Err(error);
+                                }
+                                Ok(_) => {}
+                                Err(snapshot_error)
+                                    if matches!(
+                                        snapshot_error.raw_os_error(),
+                                        Some(libc::EAGAIN)
+                                            | Some(libc::ENOENT)
+                                            | Some(libc::ESTALE)
+                                    ) =>
+                                {
+                                    last_race = snapshot_error;
+                                    retry = true;
+                                    break;
+                                }
+                                Err(snapshot_error) => return Err(snapshot_error),
+                            }
+                        }
+                        last_race = error;
+                        retry = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if retry || invoked_predicate {
+                continue;
+            }
+            return Ok(resumed);
         }
-        Ok(resumed)
+        Err(last_race)
     }
 
     pub(crate) fn remove_owned_regular(&self, name: &str) -> io::Result<()> {
@@ -2436,12 +2857,13 @@ impl RootedDir {
     }
 
     pub fn remove_owned_tree(&self) -> io::Result<()> {
+        let _process_journal = lock_cleanup_process_journal()?;
         let parent_metadata = stat_fd(self.parent.as_raw_fd())?;
         let parent = FileIdentity::from_stat(&parent_metadata);
         if self.root_identity.device != parent.device {
             return Err(os_error(libc::EXDEV));
         }
-        let namespace = PrivateNamespace::select(
+        let namespace = PrivateNamespace::select_for_cleanup(
             self.parent.as_raw_fd(),
             parent_metadata.st_dev,
             &[DirectoryIdentity {
@@ -2449,7 +2871,6 @@ impl RootedDir {
                 identity: self.root_identity,
             }],
         )?;
-        validate_cleanup_namespace_evidence(&namespace, self.parent.as_raw_fd(), parent)?;
         let verify_parent = || {
             let current = stat_fd(self.parent.as_raw_fd())?;
             if FileIdentity::from_stat(&current) != parent {
@@ -2457,55 +2878,108 @@ impl RootedDir {
             }
             verify_lineage(&self.lineage)
         };
-        if let Some(loaded) = find_cleanup_intent(&namespace, parent, self.root_name.to_bytes())? {
-            let target = FileIdentity::from(loaded.intent.target);
-            let original_mode = loaded.intent.original_mode;
-            let result = resume_tree_cleanup(
-                &namespace,
-                self.parent.as_raw_fd(),
-                parent,
-                self.root_name.to_bytes(),
-                &loaded,
-                &verify_parent,
-                true,
-            );
-            return match result {
+        let mut bound = None;
+        let mut last_race = os_error(libc::ESTALE);
+        for _ in 0..32 {
+            match validate_cleanup_namespace_evidence(&namespace, self.parent.as_raw_fd(), parent) {
+                Ok(()) => {}
                 Err(error)
                     if matches!(
                         error.raw_os_error(),
                         Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
                     ) =>
                 {
-                    drop(loaded);
-                    resolve_bound_tree_cleanup(
+                    last_race = error;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            match cleanup_exact_initial_snapshot(
+                &namespace,
+                self.parent.as_raw_fd(),
+                parent,
+                &self.root_name,
+                Some(self.root_identity),
+                None,
+            ) {
+                Ok(CleanupInitialSnapshot::Absent) => return Ok(()),
+                Ok(CleanupInitialSnapshot::Bound {
+                    metadata,
+                    generation,
+                }) => {
+                    injected_cleanup_bootstrap_result()?;
+                    bound = Some((metadata, generation));
+                    break;
+                }
+                Ok(CleanupInitialSnapshot::Evidence) => {
+                    if let Some(loaded) =
+                        find_cleanup_intent(&namespace, parent, self.root_name.to_bytes())?
+                    {
+                        let target = FileIdentity::from(loaded.intent.target);
+                        let original_mode = loaded.intent.original_mode;
+                        let generation = cleanup_generation_from_loaded(
+                            &namespace,
+                            parent,
+                            self.root_name.to_bytes(),
+                            &loaded,
+                        )?;
+                        drop(loaded);
+                        return complete_bound_tree_cleanup(
+                            &namespace,
+                            self.parent.as_raw_fd(),
+                            parent,
+                            self.root_name.to_bytes(),
+                            target,
+                            original_mode,
+                            Some(generation),
+                            &verify_parent,
+                            true,
+                        );
+                    }
+                    if let Some(candidate) = find_unpublished_cleanup_bootstrap(
                         &namespace,
                         self.parent.as_raw_fd(),
                         parent,
                         self.root_name.to_bytes(),
-                        target,
-                        original_mode,
-                        &verify_parent,
-                        true,
-                    )
+                    )? {
+                        return complete_bound_tree_cleanup(
+                            &namespace,
+                            self.parent.as_raw_fd(),
+                            parent,
+                            self.root_name.to_bytes(),
+                            candidate.target,
+                            candidate.original_mode,
+                            Some(candidate.generation),
+                            &verify_parent,
+                            true,
+                        );
+                    }
                 }
-                result => result,
-            };
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+                    ) =>
+                {
+                    last_race = error;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let current = match stat_at(self.parent.as_raw_fd(), &self.root_name) {
-            Ok(current) => current,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
+        let Some((current, initial_generation)) = bound else {
+            return Err(last_race);
         };
         let opened = stat_fd(self.root.as_raw_fd())?;
+        let original_mode = current.st_mode as u32 & 0o7777;
         if file_type(current.st_mode) != libc::S_IFDIR
             || current.st_uid != effective_user_id()
             || opened.st_uid != effective_user_id()
             || !same_file(&current, &opened)
             || FileIdentity::from_stat(&opened) != self.root_identity
+            || opened.st_mode as u32 & 0o7777 != original_mode
         {
             return Err(os_error(libc::ESTALE));
         }
-        let original_mode = opened.st_mode as u32 & 0o7777;
         match publish_tree_cleanup_intent(
             &namespace,
             self.parent.as_raw_fd(),
@@ -2525,13 +2999,14 @@ impl RootedDir {
                 ) => {}
             Err(error) => return Err(error),
         }
-        resolve_bound_tree_cleanup(
+        complete_bound_tree_cleanup(
             &namespace,
             self.parent.as_raw_fd(),
             parent,
             self.root_name.to_bytes(),
             self.root_identity,
             original_mode,
+            Some(initial_generation),
             &verify_parent,
             true,
         )
@@ -2930,6 +3405,12 @@ struct LoadedCleanupDecision {
     identity: FileIdentity,
 }
 
+#[derive(Debug)]
+enum TreeCleanupOutcome {
+    Deleted,
+    Restored(Option<io::Error>),
+}
+
 struct CleanupIntentBindings {
     component: CString,
     quarantine: CString,
@@ -2949,10 +3430,32 @@ struct CleanupBootstrapName {
     original_mode: u32,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct CleanupDecisionStageName {
+    key: String,
+    intent: FileIdentity,
+    decision: CleanupDecisionV1,
+}
+
 struct PendingTreeCleanupCandidate {
     component: Vec<u8>,
     target: FileIdentity,
     original_mode: u32,
+    generation: CleanupGenerationFence,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CleanupGenerationFence {
+    intent: Option<FileIdentity>,
+    operation: CString,
+    operation_identity: FileIdentity,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PendingCleanupEvidenceSnapshot {
+    key: String,
+    intent: Option<(CString, FileIdentity)>,
+    bootstrap: Option<(CString, CleanupBootstrapName, FileIdentity)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3923,6 +4426,23 @@ impl PrivateNamespace {
         expected_device: libc::dev_t,
         disallowed_roots: &[DirectoryIdentity],
     ) -> io::Result<Self> {
+        Self::select_with_probe(initial_parent, expected_device, disallowed_roots, true)
+    }
+
+    fn select_for_cleanup(
+        initial_parent: RawFd,
+        expected_device: libc::dev_t,
+        disallowed_roots: &[DirectoryIdentity],
+    ) -> io::Result<Self> {
+        Self::select_with_probe(initial_parent, expected_device, disallowed_roots, false)
+    }
+
+    fn select_with_probe(
+        initial_parent: RawFd,
+        expected_device: libc::dev_t,
+        disallowed_roots: &[DirectoryIdentity],
+        probe: bool,
+    ) -> io::Result<Self> {
         let mut parent = duplicate_fd(initial_parent)?;
         let mut last_error = os_error(libc::ENOTSUP);
         for _ in 0..256 {
@@ -3941,7 +4461,29 @@ impl PrivateNamespace {
                 match Self::open_or_create_at(&parent, expected_device) {
                     Ok(namespace) => {
                         if namespace.is_disjoint_from(disallowed_roots)? {
-                            namespace.probe_atomic_rename()?;
+                            if probe {
+                                namespace.probe_atomic_rename()?;
+                            } else {
+                                cvt(unsafe { libc::fsync(parent.as_raw_fd()) })?;
+                                let opened = stat_fd(namespace.directory.as_raw_fd())?;
+                                let rebound = stat_at(parent.as_raw_fd(), PRIVATE_NAMESPACE_NAME)?;
+                                require_private_directory_on_device(
+                                    &opened,
+                                    expected_device as u64,
+                                )?;
+                                require_private_directory_on_device(
+                                    &rebound,
+                                    expected_device as u64,
+                                )?;
+                                if opened.st_mode & 0o777 != 0o700
+                                    || rebound.st_mode & 0o777 != 0o700
+                                    || FileIdentity::from_stat(&opened) != namespace.identity
+                                    || FileIdentity::from_stat(&rebound) != namespace.identity
+                                    || !same_file(&opened, &rebound)
+                                {
+                                    return Err(os_error(libc::ESTALE));
+                                }
+                            }
                             return Ok(namespace);
                         }
                         namespace.remove_if_new_and_empty(parent.as_raw_fd());
@@ -4533,8 +5075,73 @@ fn cleanup_intent_stage_name(key: &str) -> io::Result<CString> {
     cleanup_record_name(CLEANUP_INTENT_STAGE_PREFIX, key)
 }
 
-fn cleanup_decision_stage_name(key: &str) -> io::Result<CString> {
-    cleanup_record_name(CLEANUP_DECISION_STAGE_PREFIX, key)
+fn cleanup_decision_stage_name(
+    key: &str,
+    intent: FileIdentity,
+    decision: CleanupDecisionV1,
+) -> io::Result<CString> {
+    cleanup_record_name("", key)?;
+    let decision = match decision {
+        CleanupDecisionV1::Delete => 1,
+        CleanupDecisionV1::Restore => 2,
+    };
+    CString::new(format!(
+        "{CLEANUP_DECISION_STAGE_PREFIX}{key}-d{:016x}-i{:016x}-c{decision:02x}",
+        intent.device, intent.inode
+    ))
+    .map_err(|_| cleanup_record_error())
+}
+
+fn parse_cleanup_decision_stage_name(name: &CStr) -> io::Result<Option<CleanupDecisionStageName>> {
+    let Some(encoded) = name
+        .to_bytes()
+        .strip_prefix(CLEANUP_DECISION_STAGE_PREFIX.as_bytes())
+    else {
+        return Ok(None);
+    };
+    let encoded = std::str::from_utf8(encoded).map_err(|_| cleanup_record_error())?;
+    let mut fields = encoded.split('-');
+    let key = fields.next().ok_or_else(cleanup_record_error)?;
+    let device = fields.next().ok_or_else(cleanup_record_error)?;
+    let inode = fields.next().ok_or_else(cleanup_record_error)?;
+    let decision = fields.next().ok_or_else(cleanup_record_error)?;
+    if fields.next().is_some()
+        || key.len() != 64
+        || device.len() != 17
+        || inode.len() != 17
+        || decision.len() != 3
+    {
+        return Err(cleanup_record_error());
+    }
+    cleanup_record_name("", key)?;
+    let intent = FileIdentity {
+        device: u64::from_str_radix(
+            device.strip_prefix('d').ok_or_else(cleanup_record_error)?,
+            16,
+        )
+        .map_err(|_| cleanup_record_error())?,
+        inode: u64::from_str_radix(
+            inode.strip_prefix('i').ok_or_else(cleanup_record_error)?,
+            16,
+        )
+        .map_err(|_| cleanup_record_error())?,
+    };
+    let decision = match decision {
+        "c01" => CleanupDecisionV1::Delete,
+        "c02" => CleanupDecisionV1::Restore,
+        _ => return Err(cleanup_record_error()),
+    };
+    let parsed = CleanupDecisionStageName {
+        key: key.to_owned(),
+        intent,
+        decision,
+    };
+    if cleanup_decision_stage_name(&parsed.key, parsed.intent, parsed.decision)?.as_bytes()
+        != name.to_bytes()
+    {
+        return Err(cleanup_record_error());
+    }
+    Ok(Some(parsed))
 }
 
 fn cleanup_bootstrap_name(
@@ -4627,6 +5234,150 @@ where
     Ok(value)
 }
 
+enum CleanupStageJson<T> {
+    Complete(T),
+    Truncated,
+}
+
+fn cleanup_parse_stage_json<T>(bytes: &[u8]) -> io::Result<CleanupStageJson<T>>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+{
+    if bytes.len() > CLEANUP_RECORD_MAX_BYTES {
+        return Err(os_error(libc::EFBIG));
+    }
+    match serde_json::from_slice(bytes) {
+        Ok(value) => {
+            if cleanup_canonical_json(&value)? != bytes {
+                return Err(cleanup_record_error());
+            }
+            Ok(CleanupStageJson::Complete(value))
+        }
+        Err(error) if error.is_eof() => Ok(CleanupStageJson::Truncated),
+        Err(_) => Err(cleanup_record_error()),
+    }
+}
+
+fn cleanup_uuid_name_prefix(bytes: &[u8], kind: &str) -> bool {
+    let mut prefix = kind.as_bytes().to_vec();
+    prefix.push(b'-');
+    if bytes.len() <= prefix.len() {
+        return prefix.starts_with(bytes);
+    }
+    if !bytes.starts_with(&prefix) {
+        return false;
+    }
+    let uuid = &bytes[prefix.len()..];
+    if uuid.len() > 36 {
+        return false;
+    }
+    uuid.iter().enumerate().all(|(index, byte)| match index {
+        8 | 13 | 18 | 23 => *byte == b'-',
+        14 => *byte == b'4',
+        19 => matches!(*byte, b'8' | b'9' | b'a' | b'b'),
+        _ => byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'),
+    })
+}
+
+fn cleanup_intent_record(
+    key: &str,
+    component: &CStr,
+    parent: FileIdentity,
+    namespace: &PrivateNamespace,
+    target: FileIdentity,
+    original_mode: u32,
+    quarantine: String,
+    operation_name: &CStr,
+    operation_identity: FileIdentity,
+    placeholder_identity: FileIdentity,
+) -> io::Result<CleanupIntentV1> {
+    Ok(CleanupIntentV1 {
+        version: 1,
+        kind: CleanupTargetKind::Tree,
+        key_sha256: key.to_owned(),
+        component_hex: cleanup_hex_encode(component.to_bytes()),
+        parent: parent.into(),
+        namespace: namespace.identity.into(),
+        target: target.into(),
+        original_mode,
+        quarantine,
+        operation: operation_name
+            .to_str()
+            .map_err(|_| cleanup_record_error())?
+            .to_owned(),
+        operation_identity: operation_identity.into(),
+        placeholder: CLEANUP_PLACEHOLDER_NAME
+            .to_str()
+            .map_err(|_| cleanup_record_error())?
+            .to_owned(),
+        placeholder_identity: placeholder_identity.into(),
+    })
+}
+
+fn cleanup_truncated_intent_is_attributable(
+    bytes: &[u8],
+    key: &str,
+    component: &CStr,
+    parent: FileIdentity,
+    namespace: &PrivateNamespace,
+    target: FileIdentity,
+    original_mode: u32,
+    operation_name: &CStr,
+    operation_identity: FileIdentity,
+    placeholder_identity: FileIdentity,
+) -> io::Result<bool> {
+    const QUARANTINE_FIELD: &[u8] = b"\"quarantine\":\"";
+    let template = cleanup_canonical_json(&cleanup_intent_record(
+        key,
+        component,
+        parent,
+        namespace,
+        target,
+        original_mode,
+        String::new(),
+        operation_name,
+        operation_identity,
+        placeholder_identity,
+    )?)?;
+    let field = template
+        .windows(QUARANTINE_FIELD.len())
+        .position(|window| window == QUARANTINE_FIELD)
+        .ok_or_else(cleanup_record_error)?;
+    let value_start = field + QUARANTINE_FIELD.len();
+    let prefix = &template[..value_start];
+    if bytes.len() <= prefix.len() {
+        return Ok(prefix.starts_with(bytes));
+    }
+    if !bytes.starts_with(prefix) {
+        return Ok(false);
+    }
+    let remainder = &bytes[value_start..];
+    let Some(value_end) = remainder.iter().position(|byte| *byte == b'"') else {
+        return Ok(cleanup_uuid_name_prefix(remainder, "cleanup-tree-v1"));
+    };
+    let quarantine = &remainder[..value_end];
+    let quarantine_name = CString::new(quarantine).map_err(|_| cleanup_record_error())?;
+    if !is_random_private_name(&quarantine_name, "cleanup-tree-v1") {
+        return Ok(false);
+    }
+    let quarantine = std::str::from_utf8(quarantine_name.to_bytes())
+        .map_err(|_| cleanup_record_error())?
+        .to_owned();
+    let expected = cleanup_canonical_json(&cleanup_intent_record(
+        key,
+        component,
+        parent,
+        namespace,
+        target,
+        original_mode,
+        quarantine,
+        operation_name,
+        operation_identity,
+        placeholder_identity,
+    )?)?;
+    Ok(expected.starts_with(bytes))
+}
+
 fn open_cleanup_record(
     parent: RawFd,
     name: &CStr,
@@ -4670,26 +5421,91 @@ fn require_cleanup_record_metadata(metadata: &libc::stat, expected_device: u64) 
     Ok(())
 }
 
-fn create_cleanup_record(
+fn revalidate_cleanup_record_binding(
     parent: RawFd,
     name: &CStr,
-    value: &impl Serialize,
-) -> io::Result<FileIdentity> {
-    let bytes = cleanup_canonical_json(value)?;
-    let descriptor = create_regular_at(parent, name)?;
-    let mut file = File::from(descriptor);
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = unlink_at(parent, name, 0);
-        return Err(error);
+    file: &File,
+    identity: FileIdentity,
+    expected_device: u64,
+) -> io::Result<libc::stat> {
+    let opened = stat_fd(file.as_raw_fd())?;
+    let rebound = stat_at(parent, name)?;
+    require_cleanup_record_metadata(&opened, expected_device)?;
+    require_cleanup_record_metadata(&rebound, expected_device)?;
+    if FileIdentity::from_stat(&opened) != identity
+        || FileIdentity::from_stat(&rebound) != identity
+        || !same_file(&opened, &rebound)
+    {
+        return Err(os_error(libc::ESTALE));
     }
-    let metadata = stat_fd(file.as_raw_fd())?;
-    require_cleanup_record_metadata(&metadata, metadata.st_dev as u64)?;
-    Ok(FileIdentity::from_stat(&metadata))
+    Ok(opened)
+}
+
+fn revalidate_cleanup_record_bytes(
+    parent: RawFd,
+    name: &CStr,
+    file: &File,
+    identity: FileIdentity,
+    expected_device: u64,
+    expected: &[u8],
+) -> io::Result<()> {
+    let before = revalidate_cleanup_record_binding(parent, name, file, identity, expected_device)?;
+    if before.st_size as usize != expected.len() {
+        return Err(cleanup_record_error());
+    }
+    let mut readback = vec![0; expected.len()];
+    let mut offset = 0;
+    while offset < readback.len() {
+        let read = file.read_at(&mut readback[offset..], offset as u64)?;
+        if read == 0 {
+            return Err(cleanup_record_error());
+        }
+        offset += read;
+    }
+    let after = revalidate_cleanup_record_binding(parent, name, file, identity, expected_device)?;
+    if readback != expected || !snapshot_metadata_stable(&before, &after) {
+        return Err(os_error(libc::ESTALE));
+    }
+    Ok(())
+}
+
+fn reopen_and_revalidate_cleanup_record_bytes(
+    parent: RawFd,
+    name: &CStr,
+    identity: FileIdentity,
+    expected_device: u64,
+    expected: &[u8],
+) -> io::Result<()> {
+    let verifier = File::from(open_regular_rw_at(parent, name)?);
+    revalidate_cleanup_record_bytes(parent, name, &verifier, identity, expected_device, expected)
 }
 
 fn cleanup_record_error() -> io::Error {
     os_error(libc::EINVAL)
+}
+
+fn lock_cleanup_process_journal() -> io::Result<MutexGuard<'static, ()>> {
+    Ok(match CLEANUP_PROCESS_JOURNAL_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    })
+}
+
+fn with_cleanup_namespace_lock<T>(
+    namespace: &PrivateNamespace,
+    action: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    // This lock protects only short, descriptor-relative namespace snapshots
+    // and same-key bootstrap publication. Callers must not wait for an intent
+    // or operation lock, recurse, or invoke user code from `action`.
+    cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_EX) })?;
+    let result = action();
+    let unlock = cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_UN) });
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(error)) => Err(error),
+    }
 }
 
 fn cleanup_optional_stat(parent: RawFd, name: &CStr) -> io::Result<Option<libc::stat>> {
@@ -4777,6 +5593,31 @@ fn load_cleanup_intent_at(
     })
 }
 
+fn cleanup_generation_from_loaded(
+    namespace: &PrivateNamespace,
+    parent: FileIdentity,
+    component: &[u8],
+    loaded: &LoadedCleanupIntent,
+) -> io::Result<CleanupGenerationFence> {
+    let bindings = validate_cleanup_intent(&loaded.intent, parent, component, namespace)?;
+    Ok(CleanupGenerationFence {
+        intent: Some(loaded.identity),
+        operation: bindings.operation,
+        operation_identity: bindings.operation_identity,
+    })
+}
+
+fn cleanup_generation_matches(
+    expected: &CleanupGenerationFence,
+    current: &CleanupGenerationFence,
+) -> bool {
+    expected.operation == current.operation
+        && expected.operation_identity == current.operation_identity
+        && expected
+            .intent
+            .is_none_or(|identity| current.intent == Some(identity))
+}
+
 fn find_cleanup_intent(
     namespace: &PrivateNamespace,
     parent: FileIdentity,
@@ -4804,72 +5645,200 @@ fn find_cleanup_intent(
     Err(os_error(libc::ESTALE))
 }
 
+fn pending_cleanup_evidence_snapshot(
+    namespace: &PrivateNamespace,
+) -> io::Result<Vec<PendingCleanupEvidenceSnapshot>> {
+    with_cleanup_namespace_lock(namespace, || {
+        let mut evidence = BTreeMap::<String, PendingCleanupEvidenceSnapshot>::new();
+        for name in directory_entries(namespace.directory.as_raw_fd())? {
+            if let Some(suffix) = name
+                .to_bytes()
+                .strip_prefix(CLEANUP_INTENT_PREFIX.as_bytes())
+            {
+                let key = std::str::from_utf8(suffix).map_err(|_| cleanup_record_error())?;
+                if cleanup_intent_name(key)?.as_bytes() != name.as_bytes() {
+                    return Err(cleanup_record_error());
+                }
+                let metadata = stat_at(namespace.directory.as_raw_fd(), &name)?;
+                require_cleanup_record_metadata(&metadata, namespace.identity.device)?;
+                let slot = evidence.entry(key.to_owned()).or_insert_with(|| {
+                    PendingCleanupEvidenceSnapshot {
+                        key: key.to_owned(),
+                        intent: None,
+                        bootstrap: None,
+                    }
+                });
+                if slot
+                    .intent
+                    .replace((name, FileIdentity::from_stat(&metadata)))
+                    .is_some()
+                {
+                    return Err(os_error(libc::ESTALE));
+                }
+                continue;
+            }
+            let Some(parsed) = parse_cleanup_bootstrap_name(&name)? else {
+                continue;
+            };
+            let metadata = stat_at(namespace.directory.as_raw_fd(), &name)?;
+            require_private_directory_on_device(&metadata, namespace.identity.device)?;
+            if metadata.st_mode & 0o777 != 0o700 {
+                return Err(os_error(libc::ESTALE));
+            }
+            let slot = evidence.entry(parsed.key.clone()).or_insert_with(|| {
+                PendingCleanupEvidenceSnapshot {
+                    key: parsed.key.clone(),
+                    intent: None,
+                    bootstrap: None,
+                }
+            });
+            if slot
+                .bootstrap
+                .replace((name, parsed, FileIdentity::from_stat(&metadata)))
+                .is_some()
+            {
+                return Err(os_error(libc::ESTALE));
+            }
+        }
+        Ok(evidence.into_values().collect())
+    })
+}
+
 fn collect_pending_tree_cleanup_candidates(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
     parent: FileIdentity,
 ) -> io::Result<Vec<PendingTreeCleanupCandidate>> {
-    let mut candidates = BTreeMap::new();
-    for name in directory_entries(namespace.directory.as_raw_fd())? {
-        let Some(suffix) = name
-            .to_bytes()
-            .strip_prefix(CLEANUP_INTENT_PREFIX.as_bytes())
-        else {
-            continue;
-        };
-        let key = std::str::from_utf8(suffix).map_err(|_| cleanup_record_error())?;
-        if cleanup_intent_name(key)?.as_bytes() != name.as_bytes() {
-            return Err(cleanup_record_error());
-        }
-        let (file, bytes, _identity) =
-            open_cleanup_record(namespace.directory.as_raw_fd(), &name, parent.device, false)?;
-        let intent: CleanupIntentV1 = cleanup_parse_canonical_json(&bytes)?;
-        drop(file);
-        if FileIdentity::from(intent.parent) != parent {
-            continue;
-        }
-        let component = cleanup_hex_decode(&intent.component_hex)?;
-        let bindings = validate_cleanup_intent(&intent, parent, &component, namespace)?;
-        if intent.key_sha256 != key
-            || candidates
-                .insert(
-                    component,
-                    PendingTreeCleanupCandidate {
-                        component: cleanup_hex_decode(&intent.component_hex)?,
-                        target: bindings.target,
-                        original_mode: bindings.original_mode,
+    let mut last_race = os_error(libc::ESTALE);
+    for _ in 0..32 {
+        let snapshot = pending_cleanup_evidence_snapshot(namespace)?;
+        let mut candidates = BTreeMap::new();
+        let mut drifted = false;
+        for evidence in &snapshot {
+            if let Some((intent_name, intent_identity)) = evidence.intent.as_ref() {
+                let (intent_file, bytes, opened_identity) = match open_cleanup_record(
+                    namespace.directory.as_raw_fd(),
+                    intent_name,
+                    parent.device,
+                    true,
+                ) {
+                    Ok(opened) => opened,
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+                        ) =>
+                    {
+                        last_race = error;
+                        drifted = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if opened_identity != *intent_identity {
+                    last_race = os_error(libc::ESTALE);
+                    drifted = true;
+                    break;
+                }
+                let intent: CleanupIntentV1 = cleanup_parse_canonical_json(&bytes)?;
+                if FileIdentity::from(intent.parent) != parent {
+                    continue;
+                }
+                let component = cleanup_hex_decode(&intent.component_hex)?;
+                let bindings = validate_cleanup_intent(&intent, parent, &component, namespace)?;
+                if intent.key_sha256 != evidence.key {
+                    return Err(os_error(libc::ESTALE));
+                }
+                if let Some((operation_name, parsed, operation_identity)) =
+                    evidence.bootstrap.as_ref()
+                    && (bindings.operation.as_bytes() != operation_name.as_bytes()
+                        || bindings.operation_identity != *operation_identity
+                        || bindings.target != parsed.target
+                        || bindings.original_mode != parsed.original_mode)
+                {
+                    return Err(os_error(libc::ESTALE));
+                }
+                let candidate = PendingTreeCleanupCandidate {
+                    component: component.clone(),
+                    target: bindings.target,
+                    original_mode: bindings.original_mode,
+                    generation: CleanupGenerationFence {
+                        intent: Some(opened_identity),
+                        operation: bindings.operation,
+                        operation_identity: bindings.operation_identity,
                     },
-                )
+                };
+                if candidates.insert(component, candidate).is_some() {
+                    return Err(os_error(libc::ESTALE));
+                }
+                drop(intent_file);
+                continue;
+            }
+            let Some((operation_name, parsed, operation_identity)) = evidence.bootstrap.as_ref()
+            else {
+                continue;
+            };
+            let (operation, opened_identity) =
+                match open_cleanup_bootstrap_directory(namespace, operation_name, parsed) {
+                    Ok(opened) => opened,
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+                        ) =>
+                    {
+                        last_race = error;
+                        drifted = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+            if opened_identity != *operation_identity {
+                last_race = os_error(libc::ESTALE);
+                drifted = true;
+                break;
+            }
+            cvt(unsafe { libc::flock(operation.as_raw_fd(), libc::LOCK_EX) })?;
+            let rebound = match stat_at(namespace.directory.as_raw_fd(), operation_name) {
+                Ok(rebound) => rebound,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    last_race = error;
+                    drifted = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if FileIdentity::from_stat(&rebound) != *operation_identity {
+                last_race = os_error(libc::ESTALE);
+                drifted = true;
+                break;
+            }
+            let candidate = validate_unpublished_cleanup_bootstrap_opened(
+                namespace,
+                public_parent,
+                parent,
+                operation_name,
+                parsed,
+                &operation,
+                *operation_identity,
+            )?;
+            if candidates
+                .insert(candidate.component.clone(), candidate)
                 .is_some()
-        {
-            return Err(os_error(libc::ESTALE));
+            {
+                return Err(os_error(libc::ESTALE));
+            }
         }
-    }
-    for operation_name in directory_entries(namespace.directory.as_raw_fd())? {
-        let Some(parsed) = parse_cleanup_bootstrap_name(&operation_name)? else {
-            continue;
-        };
-        if candidates
-            .values()
-            .any(|candidate| cleanup_key(parent, &candidate.component) == parsed.key)
-        {
+        if drifted {
             continue;
         }
-        let candidate = validate_unpublished_cleanup_bootstrap(
-            namespace,
-            public_parent,
-            parent,
-            &operation_name,
-            &parsed,
-        )?;
-        if candidates
-            .insert(candidate.component.clone(), candidate)
-            .is_some()
-        {
-            return Err(os_error(libc::ESTALE));
+        if pending_cleanup_evidence_snapshot(namespace)? != snapshot {
+            last_race = os_error(libc::EAGAIN);
+            continue;
         }
+        return Ok(candidates.into_values().collect());
     }
-    Ok(candidates.into_values().collect())
+    Err(last_race)
 }
 
 fn wait_for_live_private_operation(namespace: &PrivateNamespace, name: &CStr) -> io::Result<bool> {
@@ -4938,6 +5907,7 @@ fn validate_cleanup_namespace_evidence_once(
         return Err(os_error(libc::ESTALE));
     }
     let top_entries = directory_entries(namespace.directory.as_raw_fd())?;
+    let mut decision_keys = BTreeSet::new();
     for name in &top_entries {
         if is_random_private_name(name, "operation")
             && wait_for_live_private_operation(namespace, name)?
@@ -5136,6 +6106,7 @@ fn validate_cleanup_namespace_evidence_once(
             if record.version != 1
                 || record.key_sha256 != key
                 || FileIdentity::from(record.intent) != evidence.identity
+                || !decision_keys.insert(key.to_owned())
             {
                 return Err(os_error(libc::ESTALE));
             }
@@ -5152,6 +6123,7 @@ fn validate_cleanup_namespace_evidence_once(
         };
         let placeholder_name =
             CString::new(placeholder_name).map_err(|_| cleanup_record_error())?;
+        let mut decision_stage_seen = false;
         for name in directory_entries(operation.directory.as_raw_fd())? {
             if name.as_bytes() == placeholder_name.as_bytes() {
                 let metadata = stat_at(operation.directory.as_raw_fd(), &name)?;
@@ -5166,16 +6138,40 @@ fn validate_cleanup_namespace_evidence_once(
                 }
                 continue;
             }
-            if name.as_bytes() == cleanup_decision_stage_name(&key)?.as_bytes() {
+            if name
+                .to_bytes()
+                .starts_with(CLEANUP_DECISION_STAGE_PREFIX.as_bytes())
+            {
                 let evidence = intents.get(&key).ok_or_else(|| os_error(libc::ESTALE))?;
-                let (_file, bytes, _identity) =
-                    open_cleanup_record(operation.directory.as_raw_fd(), &name, device, false)?;
-                let record: CleanupDecisionRecordV1 = cleanup_parse_canonical_json(&bytes)?;
-                if record.version != 1
-                    || record.key_sha256 != key
-                    || FileIdentity::from(record.intent) != evidence.identity
+                let parsed =
+                    parse_cleanup_decision_stage_name(&name)?.ok_or_else(cleanup_record_error)?;
+                if decision_stage_seen
+                    || decision_keys.contains(&key)
+                    || parsed.key != key
+                    || parsed.intent != evidence.identity
                 {
                     return Err(os_error(libc::ESTALE));
+                }
+                decision_stage_seen = true;
+                let (_file, bytes, _identity) =
+                    open_cleanup_record(operation.directory.as_raw_fd(), &name, device, false)?;
+                let expected = CleanupDecisionRecordV1 {
+                    version: 1,
+                    key_sha256: key.clone(),
+                    intent: evidence.identity.into(),
+                    decision: parsed.decision,
+                };
+                match cleanup_parse_stage_json::<CleanupDecisionRecordV1>(&bytes)? {
+                    CleanupStageJson::Complete(record) => {
+                        if record != expected {
+                            return Err(os_error(libc::ESTALE));
+                        }
+                    }
+                    CleanupStageJson::Truncated => {
+                        if !cleanup_canonical_json(&expected)?.starts_with(&bytes) {
+                            return Err(cleanup_record_error());
+                        }
+                    }
                 }
                 continue;
             }
@@ -5192,34 +6188,27 @@ fn load_cleanup_decision(
 ) -> io::Result<Option<LoadedCleanupDecision>> {
     let key = &loaded.intent.key_sha256;
     let decision_name = cleanup_decision_name(key)?;
-    let stage_name = cleanup_decision_stage_name(key)?;
     let canonical_exists =
         cleanup_optional_stat(namespace.directory.as_raw_fd(), &decision_name)?.is_some();
-    let stage_exists = match operation {
-        Some(operation) => {
-            cleanup_optional_stat(operation.directory.as_raw_fd(), &stage_name)?.is_some()
-        }
-        None => false,
+    let stage = match operation {
+        Some(operation) => find_cleanup_decision_stage(operation, loaded)?,
+        None => None,
     };
-    if canonical_exists && stage_exists {
+    if canonical_exists && stage.is_some() {
         return Err(os_error(libc::ESTALE));
     }
-    if !canonical_exists && stage_exists {
+    if !canonical_exists && let Some((stage_name, parsed)) = stage {
         let operation = operation.ok_or_else(|| os_error(libc::ESTALE))?;
-        let staged = load_cleanup_decision_at(
-            operation.directory.as_raw_fd(),
-            &stage_name,
-            loaded,
-            namespace,
-        )?;
+        let staged =
+            load_cleanup_decision_stage_at(namespace, loaded, operation, &stage_name, &parsed)?;
         rename_no_replace(
             operation.directory.as_raw_fd(),
             &stage_name,
             namespace.directory.as_raw_fd(),
             &decision_name,
         )?;
-        cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
         cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })?;
+        cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
         let current = stat_at(namespace.directory.as_raw_fd(), &decision_name)?;
         if FileIdentity::from_stat(&current) != staged.identity {
             return Err(os_error(libc::ESTALE));
@@ -5237,6 +6226,119 @@ fn load_cleanup_decision(
     } else {
         Ok(None)
     }
+}
+
+fn cleanup_decision_record(
+    loaded: &LoadedCleanupIntent,
+    decision: CleanupDecisionV1,
+) -> CleanupDecisionRecordV1 {
+    CleanupDecisionRecordV1 {
+        version: 1,
+        key_sha256: loaded.intent.key_sha256.clone(),
+        intent: loaded.identity.into(),
+        decision,
+    }
+}
+
+fn find_cleanup_decision_stage(
+    operation: &PrivateOperation<'_>,
+    loaded: &LoadedCleanupIntent,
+) -> io::Result<Option<(CString, CleanupDecisionStageName)>> {
+    let mut found = None;
+    for name in directory_entries(operation.directory.as_raw_fd())? {
+        if !name
+            .to_bytes()
+            .starts_with(CLEANUP_DECISION_STAGE_PREFIX.as_bytes())
+        {
+            continue;
+        }
+        let parsed = parse_cleanup_decision_stage_name(&name)?.ok_or_else(cleanup_record_error)?;
+        if parsed.key != loaded.intent.key_sha256 || parsed.intent != loaded.identity {
+            return Err(os_error(libc::ESTALE));
+        }
+        if found.replace((name, parsed)).is_some() {
+            return Err(os_error(libc::ESTALE));
+        }
+    }
+    Ok(found)
+}
+
+fn load_cleanup_decision_stage_at(
+    namespace: &PrivateNamespace,
+    loaded: &LoadedCleanupIntent,
+    operation: &PrivateOperation<'_>,
+    name: &CStr,
+    parsed: &CleanupDecisionStageName,
+) -> io::Result<LoadedCleanupDecision> {
+    if parsed.key != loaded.intent.key_sha256 || parsed.intent != loaded.identity {
+        return Err(os_error(libc::ESTALE));
+    }
+    let expected = cleanup_decision_record(loaded, parsed.decision);
+    let expected_bytes = cleanup_canonical_json(&expected)?;
+    let (file, bytes, identity) = open_cleanup_record(
+        operation.directory.as_raw_fd(),
+        name,
+        namespace.identity.device,
+        false,
+    )?;
+    let record = match cleanup_parse_stage_json::<CleanupDecisionRecordV1>(&bytes)? {
+        CleanupStageJson::Complete(record) => {
+            if record != expected {
+                return Err(os_error(libc::ESTALE));
+            }
+            file.sync_all()?;
+            injected_cleanup_decision_adoption_sync_result()?;
+            revalidate_cleanup_record_bytes(
+                operation.directory.as_raw_fd(),
+                name,
+                &file,
+                identity,
+                namespace.identity.device,
+                &expected_bytes,
+            )?;
+            record
+        }
+        CleanupStageJson::Truncated => {
+            if !expected_bytes.starts_with(&bytes) {
+                return Err(cleanup_record_error());
+            }
+            rewrite_cleanup_decision_stage(
+                operation.directory.as_raw_fd(),
+                name,
+                &file,
+                identity,
+                namespace.identity.device,
+                &expected_bytes,
+            )?;
+            expected
+        }
+    };
+    Ok(LoadedCleanupDecision {
+        record,
+        file,
+        identity,
+    })
+}
+
+fn rewrite_cleanup_decision_stage(
+    parent: RawFd,
+    name: &CStr,
+    file: &File,
+    identity: FileIdentity,
+    expected_device: u64,
+    bytes: &[u8],
+) -> io::Result<()> {
+    injected_cleanup_decision_rewrite_handoff();
+    revalidate_cleanup_record_binding(parent, name, file, identity, expected_device)?;
+    cvt(unsafe { libc::ftruncate(file.as_raw_fd(), 0) })?;
+    let midpoint = bytes.len() / 2;
+    file.write_all_at(&bytes[..midpoint], 0)?;
+    file.sync_all()?;
+    injected_cleanup_decision_write_result()?;
+    file.write_all_at(&bytes[midpoint..], midpoint as u64)?;
+    injected_cleanup_decision_write_before_sync_result()?;
+    file.sync_all()?;
+    reopen_and_revalidate_cleanup_record_bytes(parent, name, identity, expected_device, bytes)
 }
 
 fn load_cleanup_decision_at(
@@ -5273,31 +6375,53 @@ fn publish_cleanup_decision(
         }
         return Ok(existing);
     }
-    let record = CleanupDecisionRecordV1 {
-        version: 1,
-        key_sha256: loaded.intent.key_sha256.clone(),
-        intent: loaded.identity.into(),
-        decision,
-    };
-    let stage_name = cleanup_decision_stage_name(&record.key_sha256)?;
+    let record = cleanup_decision_record(loaded, decision);
+    let stage_name = cleanup_decision_stage_name(&record.key_sha256, loaded.identity, decision)?;
     let decision_name = cleanup_decision_name(&record.key_sha256)?;
-    create_cleanup_record(operation.directory.as_raw_fd(), &stage_name, &record)?;
+    let descriptor = create_regular_at(operation.directory.as_raw_fd(), &stage_name)?;
+    let file = File::from(descriptor);
+    let opened = stat_fd(file.as_raw_fd())?;
+    let rebound = stat_at(operation.directory.as_raw_fd(), &stage_name)?;
+    require_cleanup_record_metadata(&opened, namespace.identity.device)?;
+    require_cleanup_record_metadata(&rebound, namespace.identity.device)?;
+    if !same_file(&opened, &rebound) {
+        return Err(os_error(libc::ESTALE));
+    }
+    let identity = FileIdentity::from_stat(&opened);
+    file.sync_all()?;
     cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
-    cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })?;
+    injected_cleanup_decision_stage_sync_result()?;
+    let bytes = cleanup_canonical_json(&record)?;
+    rewrite_cleanup_decision_stage(
+        operation.directory.as_raw_fd(),
+        &stage_name,
+        &file,
+        identity,
+        namespace.identity.device,
+        &bytes,
+    )?;
+    injected_cleanup_decision_before_rename_result()?;
     rename_no_replace(
         operation.directory.as_raw_fd(),
         &stage_name,
         namespace.directory.as_raw_fd(),
         &decision_name,
     )?;
-    cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
+    injected_cleanup_decision_after_rename_result()?;
     cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })?;
-    load_cleanup_decision_at(
+    injected_cleanup_decision_destination_sync_result()?;
+    cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
+    injected_cleanup_decision_source_sync_result()?;
+    let loaded = load_cleanup_decision_at(
         namespace.directory.as_raw_fd(),
         &decision_name,
         loaded,
         namespace,
-    )
+    )?;
+    if loaded.identity != identity {
+        return Err(os_error(libc::ESTALE));
+    }
+    Ok(loaded)
 }
 
 fn cleanup_bootstrap_slots(
@@ -5317,6 +6441,140 @@ fn cleanup_bootstrap_slots(
         }
     }
     Ok(slots)
+}
+
+enum CleanupInitialSnapshot {
+    Evidence,
+    Absent,
+    Bound {
+        metadata: libc::stat,
+        generation: CleanupGenerationFence,
+    },
+}
+
+enum CleanupTerminalSnapshot {
+    Evidence,
+    Absent,
+    Public(libc::stat),
+}
+
+fn cleanup_same_key_evidence(namespace: &PrivateNamespace, key: &str) -> io::Result<bool> {
+    let intent_name = cleanup_intent_name(key)?;
+    if cleanup_optional_stat(namespace.directory.as_raw_fd(), &intent_name)?.is_some() {
+        return Ok(true);
+    }
+    let slots = cleanup_bootstrap_slots(namespace, key)?;
+    if slots.len() > 1 {
+        return Err(os_error(libc::ESTALE));
+    }
+    Ok(!slots.is_empty())
+}
+
+fn cleanup_exact_initial_snapshot(
+    namespace: &PrivateNamespace,
+    public_parent: RawFd,
+    parent: FileIdentity,
+    component: &CStr,
+    expected_target: Option<FileIdentity>,
+    expected_mode: Option<u32>,
+) -> io::Result<CleanupInitialSnapshot> {
+    let key = cleanup_key(parent, component.to_bytes());
+    with_cleanup_namespace_lock(namespace, || {
+        if cleanup_same_key_evidence(namespace, &key)? {
+            return Ok(CleanupInitialSnapshot::Evidence);
+        }
+        let metadata = match stat_at(public_parent, component) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                injected_cleanup_initial_terminal_handoff();
+                return Ok(CleanupInitialSnapshot::Absent);
+            }
+            Err(error) => return Err(error),
+        };
+        if file_type(metadata.st_mode) != libc::S_IFDIR
+            || metadata.st_uid != effective_user_id()
+            || metadata.st_dev as u64 != parent.device
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        let target = FileIdentity::from_stat(&metadata);
+        let original_mode = metadata.st_mode as u32 & 0o7777;
+        if expected_target.is_some_and(|expected| expected != target)
+            || expected_mode.is_some_and(|expected| expected != original_mode)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        let operation_name = cleanup_bootstrap_name(&key, target, original_mode)?;
+        match mkdir_at(namespace.directory.as_raw_fd(), &operation_name, 0o700) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                return Err(os_error(libc::EAGAIN));
+            }
+            Err(error) => return Err(error),
+        }
+        cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })?;
+        let before = stat_at(namespace.directory.as_raw_fd(), &operation_name)?;
+        require_private_directory_on_device(&before, namespace.identity.device)?;
+        let operation = open_directory_at(namespace.directory.as_raw_fd(), &operation_name)?;
+        let opened = stat_fd(operation.as_raw_fd())?;
+        let rebound = stat_at(namespace.directory.as_raw_fd(), &operation_name)?;
+        require_private_directory_on_device(&opened, namespace.identity.device)?;
+        require_private_directory_on_device(&rebound, namespace.identity.device)?;
+        if before.st_mode & 0o777 != 0o700
+            || opened.st_mode & 0o777 != 0o700
+            || rebound.st_mode & 0o777 != 0o700
+            || !same_file(&before, &opened)
+            || !same_file(&opened, &rebound)
+            || !directory_entries(operation.as_raw_fd())?.is_empty()
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        Ok(CleanupInitialSnapshot::Bound {
+            metadata,
+            generation: CleanupGenerationFence {
+                intent: None,
+                operation: operation_name,
+                operation_identity: FileIdentity::from_stat(&opened),
+            },
+        })
+    })
+}
+
+fn cleanup_terminal_snapshot(
+    namespace: &PrivateNamespace,
+    public_parent: RawFd,
+    parent: FileIdentity,
+    component: &CStr,
+) -> io::Result<CleanupTerminalSnapshot> {
+    let key = cleanup_key(parent, component.to_bytes());
+    with_cleanup_namespace_lock(namespace, || {
+        if cleanup_same_key_evidence(namespace, &key)? {
+            return Ok(CleanupTerminalSnapshot::Evidence);
+        }
+        match stat_at(public_parent, component) {
+            Ok(metadata) => Ok(CleanupTerminalSnapshot::Public(metadata)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                injected_cleanup_final_terminal_handoff();
+                Ok(CleanupTerminalSnapshot::Absent)
+            }
+            Err(error) => Err(error),
+        }
+    })
+}
+
+fn cleanup_pending_snapshot(
+    namespace: &PrivateNamespace,
+    parent: FileIdentity,
+    component: &CStr,
+) -> io::Result<bool> {
+    let key = cleanup_key(parent, component.to_bytes());
+    with_cleanup_namespace_lock(namespace, || {
+        let pending = cleanup_same_key_evidence(namespace, &key)?;
+        if !pending {
+            injected_cleanup_initial_terminal_handoff();
+        }
+        Ok(pending)
+    })
 }
 
 fn open_cleanup_bootstrap_directory(
@@ -5381,15 +6639,18 @@ fn inspect_cleanup_bootstrap_placeholder(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    require_private_directory_on_device(&before, expected_device)?;
+    require_private_directory_on_device(&before, expected_device)
+        .map_err(|_| os_error(libc::ESTALE))?;
     if before.st_mode & 0o777 != 0o700 {
         return Err(os_error(libc::ESTALE));
     }
     let placeholder = open_directory_at(operation, CLEANUP_PLACEHOLDER_NAME)?;
     let opened = stat_fd(placeholder.as_raw_fd())?;
     let rebound = stat_at(operation, CLEANUP_PLACEHOLDER_NAME)?;
-    require_private_directory_on_device(&opened, expected_device)?;
-    require_private_directory_on_device(&rebound, expected_device)?;
+    require_private_directory_on_device(&opened, expected_device)
+        .map_err(|_| os_error(libc::ESTALE))?;
+    require_private_directory_on_device(&rebound, expected_device)
+        .map_err(|_| os_error(libc::ESTALE))?;
     if opened.st_mode & 0o777 != 0o700
         || rebound.st_mode & 0o777 != 0o700
         || !same_file(&before, &opened)
@@ -5436,6 +6697,22 @@ fn validate_unpublished_cleanup_bootstrap_opened(
     let component = find_cleanup_bootstrap_component(public_parent, parent, parsed)?;
     let stage_name = cleanup_intent_stage_name(&parsed.key)?;
     let entries = directory_entries(operation.as_raw_fd())?;
+    if entries.len() == 1 && entries[0].as_bytes() == CLEANUP_CAPABILITY_PROBE_NAME.to_bytes() {
+        drop(validate_cleanup_capability_probe(
+            operation.as_raw_fd(),
+            namespace.identity.device,
+        )?);
+        return Ok(PendingTreeCleanupCandidate {
+            component,
+            target: parsed.target,
+            original_mode: parsed.original_mode,
+            generation: CleanupGenerationFence {
+                intent: None,
+                operation: operation_name.to_owned(),
+                operation_identity,
+            },
+        });
+    }
     if entries.iter().any(|entry| {
         entry.as_bytes() != CLEANUP_PLACEHOLDER_NAME.to_bytes()
             && entry.as_bytes() != stage_name.to_bytes()
@@ -5452,18 +6729,39 @@ fn validate_unpublished_cleanup_bootstrap_opened(
             namespace.identity.device,
             false,
         )?;
-        if let Ok(intent) = cleanup_parse_canonical_json::<CleanupIntentV1>(&bytes) {
-            let bindings = validate_cleanup_intent(&intent, parent, &component, namespace)?;
-            if intent.key_sha256 != parsed.key
-                || bindings.operation.as_bytes() != operation_name.to_bytes()
-                || bindings.operation_identity != operation_identity
-                || bindings.target != parsed.target
-                || bindings.original_mode != parsed.original_mode
-                || placeholder != Some(bindings.placeholder_identity)
-                || cleanup_optional_stat(namespace.directory.as_raw_fd(), &bindings.quarantine)?
-                    .is_some()
-            {
-                return Err(os_error(libc::ESTALE));
+        match cleanup_parse_stage_json::<CleanupIntentV1>(&bytes)? {
+            CleanupStageJson::Complete(intent) => {
+                let bindings = validate_cleanup_intent(&intent, parent, &component, namespace)?;
+                if intent.key_sha256 != parsed.key
+                    || bindings.operation.as_bytes() != operation_name.to_bytes()
+                    || bindings.operation_identity != operation_identity
+                    || bindings.target != parsed.target
+                    || bindings.original_mode != parsed.original_mode
+                    || placeholder != Some(bindings.placeholder_identity)
+                    || cleanup_optional_stat(namespace.directory.as_raw_fd(), &bindings.quarantine)?
+                        .is_some()
+                {
+                    return Err(os_error(libc::ESTALE));
+                }
+            }
+            CleanupStageJson::Truncated => {
+                let placeholder = placeholder.ok_or_else(|| os_error(libc::ESTALE))?;
+                let component =
+                    CString::new(component.as_slice()).map_err(|_| cleanup_record_error())?;
+                if !cleanup_truncated_intent_is_attributable(
+                    &bytes,
+                    &parsed.key,
+                    &component,
+                    parent,
+                    namespace,
+                    parsed.target,
+                    parsed.original_mode,
+                    operation_name,
+                    operation_identity,
+                    placeholder,
+                )? {
+                    return Err(cleanup_record_error());
+                }
             }
         }
     }
@@ -5471,6 +6769,11 @@ fn validate_unpublished_cleanup_bootstrap_opened(
         component,
         target: parsed.target,
         original_mode: parsed.original_mode,
+        generation: CleanupGenerationFence {
+            intent: None,
+            operation: operation_name.to_owned(),
+            operation_identity,
+        },
     })
 }
 
@@ -5503,15 +6806,27 @@ fn resolve_bound_tree_cleanup(
     component: &[u8],
     target: FileIdentity,
     original_mode: u32,
+    generation: Option<&CleanupGenerationFence>,
     verify_parent: &impl Fn() -> io::Result<()>,
     allow_injected_validation: bool,
-) -> io::Result<()> {
+) -> io::Result<TreeCleanupOutcome> {
     let component_name = CString::new(component).map_err(|_| cleanup_record_error())?;
-    let key = cleanup_key(parent, component);
     let mut last_race = os_error(libc::ESTALE);
+    let mut pending_restore_error = None;
+    let mut restore_expected = false;
     for _ in 0..32 {
         validate_cleanup_namespace_evidence(namespace, public_parent, parent)?;
         if let Some(loaded) = find_cleanup_intent(namespace, parent, component)? {
+            let current_generation =
+                cleanup_generation_from_loaded(namespace, parent, component, &loaded)?;
+            if FileIdentity::from(loaded.intent.target) != target
+                || loaded.intent.original_mode != original_mode
+                || generation.is_some_and(|expected| {
+                    !cleanup_generation_matches(expected, &current_generation)
+                })
+            {
+                return Err(os_error(libc::ESTALE));
+            }
             let result = resume_tree_cleanup(
                 namespace,
                 public_parent,
@@ -5520,9 +6835,12 @@ fn resolve_bound_tree_cleanup(
                 &loaded,
                 verify_parent,
                 allow_injected_validation,
+                &mut pending_restore_error,
+                &mut restore_expected,
             );
             match result {
-                Ok(()) => return Ok(()),
+                Ok(TreeCleanupOutcome::Deleted) => continue,
+                Ok(outcome @ TreeCleanupOutcome::Restored(_)) => return Ok(outcome),
                 Err(error)
                     if matches!(
                         error.raw_os_error(),
@@ -5540,6 +6858,11 @@ fn resolve_bound_tree_cleanup(
             find_unpublished_cleanup_bootstrap(namespace, public_parent, parent, component)?
         {
             if candidate.target != target || candidate.original_mode != original_mode {
+                return Err(os_error(libc::ESTALE));
+            }
+            if generation.is_some_and(|expected| {
+                !cleanup_generation_matches(expected, &candidate.generation)
+            }) {
                 return Err(os_error(libc::ESTALE));
             }
             match publish_tree_cleanup_intent(
@@ -5571,19 +6894,149 @@ fn resolve_bound_tree_cleanup(
         // A bound call never starts over from a public name: only the same key
         // may resume, while a replacement remains untouched and fails closed.
         validate_cleanup_namespace_evidence(namespace, public_parent, parent)?;
-        if cleanup_optional_stat(namespace.directory.as_raw_fd(), &cleanup_intent_name(&key)?)?
-            .is_some()
-            || !cleanup_bootstrap_slots(namespace, &key)?.is_empty()
-        {
-            continue;
+        match cleanup_terminal_snapshot(namespace, public_parent, parent, &component_name)? {
+            CleanupTerminalSnapshot::Evidence => continue,
+            CleanupTerminalSnapshot::Absent if restore_expected => {
+                return Err(os_error(libc::ESTALE));
+            }
+            CleanupTerminalSnapshot::Absent => return Ok(TreeCleanupOutcome::Deleted),
+            CleanupTerminalSnapshot::Public(metadata) if restore_expected => {
+                if file_type(metadata.st_mode) != libc::S_IFDIR
+                    || metadata.st_uid != effective_user_id()
+                    || metadata.st_dev as u64 != parent.device
+                    || FileIdentity::from_stat(&metadata) != target
+                    || metadata.st_mode as u32 & 0o7777 != original_mode
+                {
+                    return Err(os_error(libc::ESTALE));
+                }
+                return match open_bound_cleanup_directory(
+                    public_parent,
+                    &component_name,
+                    target,
+                    parent.device,
+                    Some(original_mode),
+                ) {
+                    Ok(_) => Ok(TreeCleanupOutcome::Restored(pending_restore_error.take())),
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+                        ) =>
+                    {
+                        Err(os_error(libc::ESTALE))
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+            CleanupTerminalSnapshot::Public(_) => return Err(os_error(libc::ESTALE)),
         }
-        return match stat_at(public_parent, &component_name) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Ok(_) => Err(os_error(libc::ESTALE)),
-            Err(error) => Err(error),
-        };
     }
     Err(last_race)
+}
+
+fn complete_bound_tree_cleanup(
+    namespace: &PrivateNamespace,
+    public_parent: RawFd,
+    parent: FileIdentity,
+    component: &[u8],
+    target: FileIdentity,
+    original_mode: u32,
+    generation: Option<CleanupGenerationFence>,
+    verify_parent: &impl Fn() -> io::Result<()>,
+    allow_injected_validation: bool,
+) -> io::Result<()> {
+    complete_bound_tree_cleanup_outcome(
+        namespace,
+        public_parent,
+        parent,
+        component,
+        target,
+        original_mode,
+        generation,
+        verify_parent,
+        allow_injected_validation,
+    )
+    .map(|_| ())
+}
+
+fn complete_bound_tree_cleanup_outcome(
+    namespace: &PrivateNamespace,
+    public_parent: RawFd,
+    parent: FileIdentity,
+    component: &[u8],
+    target: FileIdentity,
+    original_mode: u32,
+    mut generation: Option<CleanupGenerationFence>,
+    verify_parent: &impl Fn() -> io::Result<()>,
+    allow_injected_validation: bool,
+) -> io::Result<TreeCleanupOutcome> {
+    injected_cleanup_before_bound_completion_result()?;
+    let component_name = CString::new(component).map_err(|_| cleanup_record_error())?;
+    for continuation in 0..2 {
+        match resolve_bound_tree_cleanup(
+            namespace,
+            public_parent,
+            parent,
+            component,
+            target,
+            original_mode,
+            generation.as_ref(),
+            verify_parent,
+            allow_injected_validation,
+        )? {
+            TreeCleanupOutcome::Deleted => return Ok(TreeCleanupOutcome::Deleted),
+            TreeCleanupOutcome::Restored(Some(error)) => return Err(error),
+            TreeCleanupOutcome::Restored(None) => {
+                if continuation != 0 {
+                    return Err(os_error(libc::ESTALE));
+                }
+                verify_parent()?;
+                validate_cleanup_namespace_evidence(namespace, public_parent, parent)?;
+                let next_generation = match cleanup_exact_initial_snapshot(
+                    namespace,
+                    public_parent,
+                    parent,
+                    &component_name,
+                    Some(target),
+                    Some(original_mode),
+                )? {
+                    CleanupInitialSnapshot::Bound { generation, .. } => generation,
+                    CleanupInitialSnapshot::Absent | CleanupInitialSnapshot::Evidence => {
+                        return Err(os_error(libc::ESTALE));
+                    }
+                };
+                injected_cleanup_bootstrap_result()?;
+                drop(open_bound_cleanup_directory(
+                    public_parent,
+                    &component_name,
+                    target,
+                    parent.device,
+                    Some(original_mode),
+                )?);
+                generation = Some(next_generation);
+                match publish_tree_cleanup_intent(
+                    namespace,
+                    public_parent,
+                    parent,
+                    &component_name,
+                    target,
+                    original_mode,
+                ) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EEXIST)
+                                | Some(libc::EAGAIN)
+                                | Some(libc::ENOENT)
+                                | Some(libc::ESTALE)
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Err(os_error(libc::ESTALE))
 }
 
 fn open_or_create_cleanup_bootstrap<'a>(
@@ -5738,6 +7191,554 @@ fn open_or_create_cleanup_bootstrap<'a>(
     Err(os_error(libc::ESTALE))
 }
 
+struct ValidatedCleanupProbeEntry {
+    name: CString,
+    identity: FileIdentity,
+    flags: libc::c_int,
+}
+
+struct ValidatedCleanupProbeSide {
+    name: &'static CStr,
+    directory: OwnedFd,
+    identity: FileIdentity,
+    entries: Vec<ValidatedCleanupProbeEntry>,
+}
+
+struct ValidatedCleanupProbe {
+    directory: OwnedFd,
+    identity: FileIdentity,
+    left: Option<ValidatedCleanupProbeSide>,
+    right: Option<ValidatedCleanupProbeSide>,
+}
+
+fn open_cleanup_probe_directory(
+    parent: RawFd,
+    name: &CStr,
+    expected_device: u64,
+) -> io::Result<(OwnedFd, FileIdentity)> {
+    let before = stat_at(parent, name)?;
+    require_private_directory_on_device(&before, expected_device)
+        .map_err(|_| os_error(libc::ESTALE))?;
+    if before.st_mode & 0o777 != 0o700 {
+        return Err(os_error(libc::ESTALE));
+    }
+    let directory = open_directory_at(parent, name)?;
+    let opened = stat_fd(directory.as_raw_fd())?;
+    let rebound = stat_at(parent, name)?;
+    require_private_directory_on_device(&opened, expected_device)
+        .map_err(|_| os_error(libc::ESTALE))?;
+    require_private_directory_on_device(&rebound, expected_device)
+        .map_err(|_| os_error(libc::ESTALE))?;
+    if opened.st_mode & 0o777 != 0o700
+        || rebound.st_mode & 0o777 != 0o700
+        || !same_file(&before, &opened)
+        || !same_file(&opened, &rebound)
+    {
+        return Err(os_error(libc::ESTALE));
+    }
+    Ok((directory, FileIdentity::from_stat(&opened)))
+}
+
+fn validate_cleanup_probe_side(
+    probe: RawFd,
+    name: &'static CStr,
+    expected_device: u64,
+    left: bool,
+) -> io::Result<ValidatedCleanupProbeSide> {
+    let (directory, identity) = open_cleanup_probe_directory(probe, name, expected_device)?;
+    let mut entries = Vec::new();
+    for entry in directory_entries(directory.as_raw_fd())? {
+        let directory_entry = if left {
+            entry.as_bytes() == CLEANUP_PROBE_DIRECTORY_SOURCE.to_bytes()
+                || entry.as_bytes() == CLEANUP_PROBE_EXCHANGE_LEFT.to_bytes()
+        } else {
+            entry.as_bytes() == CLEANUP_PROBE_DIRECTORY_DESTINATION.to_bytes()
+                || entry.as_bytes() == CLEANUP_PROBE_EXCHANGE_RIGHT.to_bytes()
+        };
+        let regular_entry = if left {
+            entry.as_bytes() == CLEANUP_PROBE_REGULAR_SOURCE.to_bytes()
+        } else {
+            entry.as_bytes() == CLEANUP_PROBE_REGULAR_DESTINATION.to_bytes()
+        };
+        if !directory_entry && !regular_entry {
+            return Err(os_error(libc::ESTALE));
+        }
+        let before = stat_at(directory.as_raw_fd(), &entry)?;
+        let entry_identity = FileIdentity::from_stat(&before);
+        if directory_entry {
+            let (opened, identity) =
+                open_cleanup_probe_directory(directory.as_raw_fd(), &entry, expected_device)?;
+            if identity != entry_identity || !directory_entries(opened.as_raw_fd())?.is_empty() {
+                return Err(os_error(libc::ESTALE));
+            }
+            entries.push(ValidatedCleanupProbeEntry {
+                name: entry,
+                identity,
+                flags: libc::AT_REMOVEDIR,
+            });
+        } else {
+            require_cleanup_record_metadata(&before, expected_device)
+                .map_err(|_| os_error(libc::ESTALE))?;
+            if before.st_size != 0 {
+                return Err(os_error(libc::ESTALE));
+            }
+            let file = File::from(open_regular_rw_at(directory.as_raw_fd(), &entry)?);
+            let opened = stat_fd(file.as_raw_fd())?;
+            let rebound = stat_at(directory.as_raw_fd(), &entry)?;
+            require_cleanup_record_metadata(&opened, expected_device)
+                .map_err(|_| os_error(libc::ESTALE))?;
+            require_cleanup_record_metadata(&rebound, expected_device)
+                .map_err(|_| os_error(libc::ESTALE))?;
+            if opened.st_size != 0
+                || rebound.st_size != 0
+                || !same_file(&before, &opened)
+                || !same_file(&opened, &rebound)
+            {
+                return Err(os_error(libc::ESTALE));
+            }
+            entries.push(ValidatedCleanupProbeEntry {
+                name: entry,
+                identity: entry_identity,
+                flags: 0,
+            });
+        }
+    }
+    Ok(ValidatedCleanupProbeSide {
+        name,
+        directory,
+        identity,
+        entries,
+    })
+}
+
+fn validate_cleanup_capability_probe(
+    operation: RawFd,
+    expected_device: u64,
+) -> io::Result<ValidatedCleanupProbe> {
+    let (directory, identity) =
+        open_cleanup_probe_directory(operation, CLEANUP_CAPABILITY_PROBE_NAME, expected_device)?;
+    let entries = directory_entries(directory.as_raw_fd())?;
+    if entries.iter().any(|entry| {
+        entry.as_bytes() != CLEANUP_CAPABILITY_PROBE_LEFT.to_bytes()
+            && entry.as_bytes() != CLEANUP_CAPABILITY_PROBE_RIGHT.to_bytes()
+    }) {
+        return Err(os_error(libc::ESTALE));
+    }
+    let has_left = entries
+        .iter()
+        .any(|entry| entry.as_bytes() == CLEANUP_CAPABILITY_PROBE_LEFT.to_bytes());
+    let has_right = entries
+        .iter()
+        .any(|entry| entry.as_bytes() == CLEANUP_CAPABILITY_PROBE_RIGHT.to_bytes());
+    if has_right && !has_left {
+        return Err(os_error(libc::ESTALE));
+    }
+    let left = has_left
+        .then(|| {
+            validate_cleanup_probe_side(
+                directory.as_raw_fd(),
+                CLEANUP_CAPABILITY_PROBE_LEFT,
+                expected_device,
+                true,
+            )
+        })
+        .transpose()?;
+    let right = has_right
+        .then(|| {
+            validate_cleanup_probe_side(
+                directory.as_raw_fd(),
+                CLEANUP_CAPABILITY_PROBE_RIGHT,
+                expected_device,
+                false,
+            )
+        })
+        .transpose()?;
+    Ok(ValidatedCleanupProbe {
+        directory,
+        identity,
+        left,
+        right,
+    })
+}
+
+fn remove_validated_cleanup_probe_entry(
+    parent: RawFd,
+    entry: &ValidatedCleanupProbeEntry,
+    expected_device: u64,
+) -> io::Result<()> {
+    let current = stat_at(parent, &entry.name)?;
+    if FileIdentity::from_stat(&current) != entry.identity {
+        return Err(os_error(libc::ESTALE));
+    }
+    if entry.flags == libc::AT_REMOVEDIR {
+        let (directory, identity) =
+            open_cleanup_probe_directory(parent, &entry.name, expected_device)?;
+        if identity != entry.identity || !directory_entries(directory.as_raw_fd())?.is_empty() {
+            return Err(os_error(libc::ESTALE));
+        }
+    } else {
+        require_cleanup_record_metadata(&current, expected_device)?;
+        if current.st_size != 0 {
+            return Err(os_error(libc::ESTALE));
+        }
+        let file = File::from(open_regular_rw_at(parent, &entry.name)?);
+        let opened = stat_fd(file.as_raw_fd())?;
+        if FileIdentity::from_stat(&opened) != entry.identity || !same_file(&current, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+    }
+    unlink_at(parent, &entry.name, entry.flags)?;
+    cvt(unsafe { libc::fsync(parent) })
+}
+
+fn remove_validated_cleanup_probe_side(
+    probe: RawFd,
+    side: ValidatedCleanupProbeSide,
+    expected_device: u64,
+) -> io::Result<()> {
+    for entry in &side.entries {
+        remove_validated_cleanup_probe_entry(side.directory.as_raw_fd(), entry, expected_device)?;
+    }
+    if !directory_entries(side.directory.as_raw_fd())?.is_empty() {
+        return Err(os_error(libc::ESTALE));
+    }
+    let opened = stat_fd(side.directory.as_raw_fd())?;
+    let rebound = stat_at(probe, side.name)?;
+    if FileIdentity::from_stat(&opened) != side.identity
+        || FileIdentity::from_stat(&rebound) != side.identity
+        || !same_file(&opened, &rebound)
+    {
+        return Err(os_error(libc::ESTALE));
+    }
+    unlink_at(probe, side.name, libc::AT_REMOVEDIR)?;
+    cvt(unsafe { libc::fsync(probe) })
+}
+
+fn reset_cleanup_capability_probe(
+    operation: &PrivateOperation<'_>,
+    expected_device: u64,
+    inject_transitions: bool,
+) -> io::Result<()> {
+    let validated =
+        validate_cleanup_capability_probe(operation.directory.as_raw_fd(), expected_device)?;
+    if let Some(right) = validated.right {
+        remove_validated_cleanup_probe_side(
+            validated.directory.as_raw_fd(),
+            right,
+            expected_device,
+        )?;
+        if inject_transitions {
+            injected_cleanup_probe_transition_result()?;
+        }
+    }
+    if let Some(left) = validated.left {
+        remove_validated_cleanup_probe_side(
+            validated.directory.as_raw_fd(),
+            left,
+            expected_device,
+        )?;
+        if inject_transitions {
+            injected_cleanup_probe_transition_result()?;
+        }
+    }
+    if !directory_entries(validated.directory.as_raw_fd())?.is_empty() {
+        return Err(os_error(libc::ESTALE));
+    }
+    let opened = stat_fd(validated.directory.as_raw_fd())?;
+    let rebound = stat_at(
+        operation.directory.as_raw_fd(),
+        CLEANUP_CAPABILITY_PROBE_NAME,
+    )?;
+    if FileIdentity::from_stat(&opened) != validated.identity
+        || FileIdentity::from_stat(&rebound) != validated.identity
+        || !same_file(&opened, &rebound)
+    {
+        return Err(os_error(libc::ESTALE));
+    }
+    unlink_at(
+        operation.directory.as_raw_fd(),
+        CLEANUP_CAPABILITY_PROBE_NAME,
+        libc::AT_REMOVEDIR,
+    )?;
+    cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
+    if inject_transitions {
+        injected_cleanup_probe_transition_result()?;
+    }
+    Ok(())
+}
+
+fn create_cleanup_probe_entry(
+    parent: RawFd,
+    name: &CStr,
+    directory: bool,
+    expected_device: u64,
+) -> io::Result<FileIdentity> {
+    if directory {
+        mkdir_at(parent, name, 0o700)?;
+        let (opened, identity) = open_cleanup_probe_directory(parent, name, expected_device)?;
+        cvt(unsafe { libc::fsync(opened.as_raw_fd()) })?;
+        cvt(unsafe { libc::fsync(parent) })?;
+        Ok(identity)
+    } else {
+        let file = File::from(create_regular_at(parent, name)?);
+        let opened = stat_fd(file.as_raw_fd())?;
+        let rebound = stat_at(parent, name)?;
+        require_cleanup_record_metadata(&opened, expected_device)?;
+        require_cleanup_record_metadata(&rebound, expected_device)?;
+        if opened.st_size != 0 || rebound.st_size != 0 || !same_file(&opened, &rebound) {
+            return Err(os_error(libc::ESTALE));
+        }
+        file.sync_all()?;
+        cvt(unsafe { libc::fsync(parent) })?;
+        Ok(FileIdentity::from_stat(&opened))
+    }
+}
+
+fn remove_cleanup_probe_entry(
+    parent: RawFd,
+    name: &CStr,
+    identity: FileIdentity,
+    directory: bool,
+    expected_device: u64,
+) -> io::Result<()> {
+    remove_validated_cleanup_probe_entry(
+        parent,
+        &ValidatedCleanupProbeEntry {
+            name: name.to_owned(),
+            identity,
+            flags: if directory { libc::AT_REMOVEDIR } else { 0 },
+        },
+        expected_device,
+    )
+}
+
+fn probe_cleanup_no_replace(
+    left: RawFd,
+    right: RawFd,
+    source: &CStr,
+    destination: &CStr,
+    directory: bool,
+    expected_device: u64,
+) -> io::Result<()> {
+    let source_identity = create_cleanup_probe_entry(left, source, directory, expected_device)?;
+    injected_cleanup_probe_transition_result()?;
+    let destination_identity =
+        create_cleanup_probe_entry(right, destination, directory, expected_device)?;
+    injected_cleanup_probe_transition_result()?;
+    match rename_no_replace(left, source, right, destination) {
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
+        Err(error) => return Err(error),
+        Ok(()) => return Err(os_error(libc::ENOTSUP)),
+    }
+    injected_cleanup_probe_transition_result()?;
+    let current_source = stat_at(left, source)?;
+    let current_destination = stat_at(right, destination)?;
+    if FileIdentity::from_stat(&current_source) != source_identity
+        || FileIdentity::from_stat(&current_destination) != destination_identity
+    {
+        return Err(os_error(libc::ESTALE));
+    }
+    remove_cleanup_probe_entry(
+        right,
+        destination,
+        destination_identity,
+        directory,
+        expected_device,
+    )?;
+    injected_cleanup_probe_transition_result()?;
+    rename_no_replace(left, source, right, destination)?;
+    cvt(unsafe { libc::fsync(left) })?;
+    cvt(unsafe { libc::fsync(right) })?;
+    injected_cleanup_probe_transition_result()?;
+    if FileIdentity::from_stat(&stat_at(right, destination)?) != source_identity {
+        return Err(os_error(libc::ESTALE));
+    }
+    remove_cleanup_probe_entry(
+        right,
+        destination,
+        source_identity,
+        directory,
+        expected_device,
+    )?;
+    injected_cleanup_probe_transition_result()
+}
+
+fn probe_cleanup_directory_exchange(
+    left: RawFd,
+    right: RawFd,
+    expected_device: u64,
+) -> io::Result<()> {
+    let left_identity =
+        create_cleanup_probe_entry(left, CLEANUP_PROBE_EXCHANGE_LEFT, true, expected_device)?;
+    injected_cleanup_probe_transition_result()?;
+    let right_identity =
+        create_cleanup_probe_entry(right, CLEANUP_PROBE_EXCHANGE_RIGHT, true, expected_device)?;
+    injected_cleanup_probe_transition_result()?;
+    exchange_entries(
+        left,
+        CLEANUP_PROBE_EXCHANGE_LEFT,
+        right,
+        CLEANUP_PROBE_EXCHANGE_RIGHT,
+    )?;
+    cvt(unsafe { libc::fsync(left) })?;
+    cvt(unsafe { libc::fsync(right) })?;
+    injected_cleanup_probe_transition_result()?;
+    if FileIdentity::from_stat(&stat_at(left, CLEANUP_PROBE_EXCHANGE_LEFT)?) != right_identity
+        || FileIdentity::from_stat(&stat_at(right, CLEANUP_PROBE_EXCHANGE_RIGHT)?) != left_identity
+    {
+        return Err(os_error(libc::ENOTSUP));
+    }
+    exchange_entries(
+        left,
+        CLEANUP_PROBE_EXCHANGE_LEFT,
+        right,
+        CLEANUP_PROBE_EXCHANGE_RIGHT,
+    )?;
+    cvt(unsafe { libc::fsync(left) })?;
+    cvt(unsafe { libc::fsync(right) })?;
+    injected_cleanup_probe_transition_result()?;
+    if FileIdentity::from_stat(&stat_at(left, CLEANUP_PROBE_EXCHANGE_LEFT)?) != left_identity
+        || FileIdentity::from_stat(&stat_at(right, CLEANUP_PROBE_EXCHANGE_RIGHT)?) != right_identity
+    {
+        return Err(os_error(libc::ENOTSUP));
+    }
+    remove_cleanup_probe_entry(
+        left,
+        CLEANUP_PROBE_EXCHANGE_LEFT,
+        left_identity,
+        true,
+        expected_device,
+    )?;
+    injected_cleanup_probe_transition_result()?;
+    remove_cleanup_probe_entry(
+        right,
+        CLEANUP_PROBE_EXCHANGE_RIGHT,
+        right_identity,
+        true,
+        expected_device,
+    )?;
+    injected_cleanup_probe_transition_result()
+}
+
+fn run_cleanup_capability_probe(
+    operation: &PrivateOperation<'_>,
+    expected_device: u64,
+) -> io::Result<()> {
+    mkdir_at(
+        operation.directory.as_raw_fd(),
+        CLEANUP_CAPABILITY_PROBE_NAME,
+        0o700,
+    )?;
+    cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
+    injected_cleanup_probe_transition_result()?;
+    let (probe, _) = open_cleanup_probe_directory(
+        operation.directory.as_raw_fd(),
+        CLEANUP_CAPABILITY_PROBE_NAME,
+        expected_device,
+    )?;
+    mkdir_at(probe.as_raw_fd(), CLEANUP_CAPABILITY_PROBE_LEFT, 0o700)?;
+    cvt(unsafe { libc::fsync(probe.as_raw_fd()) })?;
+    injected_cleanup_probe_transition_result()?;
+    mkdir_at(probe.as_raw_fd(), CLEANUP_CAPABILITY_PROBE_RIGHT, 0o700)?;
+    cvt(unsafe { libc::fsync(probe.as_raw_fd()) })?;
+    injected_cleanup_probe_transition_result()?;
+    let (left, _) = open_cleanup_probe_directory(
+        probe.as_raw_fd(),
+        CLEANUP_CAPABILITY_PROBE_LEFT,
+        expected_device,
+    )?;
+    let (right, _) = open_cleanup_probe_directory(
+        probe.as_raw_fd(),
+        CLEANUP_CAPABILITY_PROBE_RIGHT,
+        expected_device,
+    )?;
+    probe_cleanup_no_replace(
+        left.as_raw_fd(),
+        right.as_raw_fd(),
+        CLEANUP_PROBE_REGULAR_SOURCE,
+        CLEANUP_PROBE_REGULAR_DESTINATION,
+        false,
+        expected_device,
+    )?;
+    probe_cleanup_no_replace(
+        left.as_raw_fd(),
+        right.as_raw_fd(),
+        CLEANUP_PROBE_DIRECTORY_SOURCE,
+        CLEANUP_PROBE_DIRECTORY_DESTINATION,
+        true,
+        expected_device,
+    )?;
+    probe_cleanup_directory_exchange(left.as_raw_fd(), right.as_raw_fd(), expected_device)?;
+    reset_cleanup_capability_probe(operation, expected_device, true)
+}
+
+fn ensure_cleanup_tree_capabilities(
+    namespace: &PrivateNamespace,
+    operation: &mut PrivateOperation<'_>,
+    public_parent: RawFd,
+    component: &CStr,
+    target: FileIdentity,
+    original_mode: u32,
+    stage_name: &CStr,
+) -> io::Result<()> {
+    drop(open_bound_cleanup_directory(
+        public_parent,
+        component,
+        target,
+        namespace.identity.device,
+        Some(original_mode),
+    )?);
+    let entries = directory_entries(operation.directory.as_raw_fd())?;
+    let has_probe = entries
+        .iter()
+        .any(|entry| entry.as_bytes() == CLEANUP_CAPABILITY_PROBE_NAME.to_bytes());
+    let has_placeholder = entries
+        .iter()
+        .any(|entry| entry.as_bytes() == CLEANUP_PLACEHOLDER_NAME.to_bytes());
+    if has_placeholder {
+        if has_probe
+            || entries.len() > 2
+            || entries.iter().any(|entry| {
+                entry.as_bytes() != CLEANUP_PLACEHOLDER_NAME.to_bytes()
+                    && entry.as_bytes() != stage_name.to_bytes()
+            })
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        inspect_cleanup_bootstrap_placeholder(
+            operation.directory.as_raw_fd(),
+            namespace.identity.device,
+        )?
+        .ok_or_else(|| os_error(libc::ESTALE))?;
+        return Ok(());
+    }
+    if has_probe {
+        if entries.len() != 1 {
+            return Err(os_error(libc::ESTALE));
+        }
+        reset_cleanup_capability_probe(operation, namespace.identity.device, false)?;
+    } else if !entries.is_empty() {
+        return Err(os_error(libc::ESTALE));
+    }
+    drop(open_bound_cleanup_directory(
+        public_parent,
+        component,
+        target,
+        namespace.identity.device,
+        Some(original_mode),
+    )?);
+    match run_cleanup_capability_probe(operation, namespace.identity.device) {
+        Ok(()) => {}
+        Err(error) if cleanup_probe_was_interrupted() => return Err(error),
+        Err(error) => {
+            reset_cleanup_capability_probe(operation, namespace.identity.device, false)?;
+            remove_empty_cleanup_operation(namespace, operation)?;
+            return Err(error);
+        }
+    }
+    injected_cleanup_probe_final_sync_result()
+}
+
 fn prepare_cleanup_bootstrap_placeholder(
     operation: &PrivateOperation<'_>,
     expected_device: u64,
@@ -5784,6 +7785,8 @@ fn prepare_cleanup_bootstrap_placeholder(
         return Err(os_error(libc::ESTALE));
     }
     if created {
+        cvt(unsafe { libc::fsync(placeholder.as_raw_fd()) })?;
+        injected_cleanup_placeholder_object_sync_result()?;
         cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
         injected_cleanup_placeholder_result()?;
     }
@@ -5803,46 +7806,74 @@ fn prepare_cleanup_intent_stage(
 ) -> io::Result<CleanupIntentV1> {
     let key = cleanup_key(parent, component.to_bytes());
     if cleanup_optional_stat(operation.directory.as_raw_fd(), stage_name)?.is_some() {
-        let (file, bytes, _identity) = open_cleanup_record(
+        let (file, bytes, identity) = open_cleanup_record(
             operation.directory.as_raw_fd(),
             stage_name,
             namespace.identity.device,
             false,
         )?;
-        if let Ok(parsed) = cleanup_parse_canonical_json::<CleanupIntentV1>(&bytes) {
-            let bindings =
-                validate_cleanup_intent(&parsed, parent, component.to_bytes(), namespace)?;
-            let entries = directory_entries(operation.directory.as_raw_fd())?;
-            if parsed.key_sha256 != key
-                || bindings.operation.as_bytes() != operation.name.as_bytes()
-                || bindings.operation_identity != operation.identity
-                || bindings.target != target
-                || bindings.original_mode != original_mode
-                || bindings.placeholder_identity != placeholder_identity
-                || entries.len() != 2
-                || !entries
-                    .iter()
-                    .any(|entry| entry.as_bytes() == CLEANUP_PLACEHOLDER_NAME.to_bytes())
-                || !entries
-                    .iter()
-                    .any(|entry| entry.as_bytes() == stage_name.to_bytes())
-            {
-                return Err(os_error(libc::ESTALE));
+        match cleanup_parse_stage_json::<CleanupIntentV1>(&bytes)? {
+            CleanupStageJson::Complete(parsed) => {
+                let bindings =
+                    validate_cleanup_intent(&parsed, parent, component.to_bytes(), namespace)?;
+                let entries = directory_entries(operation.directory.as_raw_fd())?;
+                if parsed.key_sha256 != key
+                    || bindings.operation.as_bytes() != operation.name.as_bytes()
+                    || bindings.operation_identity != operation.identity
+                    || bindings.target != target
+                    || bindings.original_mode != original_mode
+                    || bindings.placeholder_identity != placeholder_identity
+                    || entries.len() != 2
+                    || !entries
+                        .iter()
+                        .any(|entry| entry.as_bytes() == CLEANUP_PLACEHOLDER_NAME.to_bytes())
+                    || !entries
+                        .iter()
+                        .any(|entry| entry.as_bytes() == stage_name.to_bytes())
+                {
+                    return Err(os_error(libc::ESTALE));
+                }
+                drop(open_bound_cleanup_directory(
+                    public_parent,
+                    component,
+                    target,
+                    namespace.identity.device,
+                    Some(original_mode),
+                )?);
+                if cleanup_optional_stat(namespace.directory.as_raw_fd(), &bindings.quarantine)?
+                    .is_some()
+                {
+                    return Err(os_error(libc::ESTALE));
+                }
+                file.sync_all()?;
+                injected_cleanup_intent_adoption_sync_result()?;
+                revalidate_cleanup_record_bytes(
+                    operation.directory.as_raw_fd(),
+                    stage_name,
+                    &file,
+                    identity,
+                    namespace.identity.device,
+                    &bytes,
+                )?;
+                drop(file);
+                return Ok(parsed);
             }
-            drop(open_bound_cleanup_directory(
-                public_parent,
-                component,
-                target,
-                namespace.identity.device,
-                Some(original_mode),
-            )?);
-            if cleanup_optional_stat(namespace.directory.as_raw_fd(), &bindings.quarantine)?
-                .is_some()
-            {
-                return Err(os_error(libc::ESTALE));
+            CleanupStageJson::Truncated => {
+                if !cleanup_truncated_intent_is_attributable(
+                    &bytes,
+                    &key,
+                    component,
+                    parent,
+                    namespace,
+                    target,
+                    original_mode,
+                    &operation.name,
+                    operation.identity,
+                    placeholder_identity,
+                )? {
+                    return Err(cleanup_record_error());
+                }
             }
-            drop(file);
-            return Ok(parsed);
         }
         // A partial deterministic stage is rebuildable only while the exact
         // public target is still in its recorded original mode and no
@@ -5870,44 +7901,48 @@ fn prepare_cleanup_intent_stage(
         cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
     }
     let quarantine = random_private_name("cleanup-tree-v1");
-    let intent = CleanupIntentV1 {
-        version: 1,
-        kind: CleanupTargetKind::Tree,
-        key_sha256: key,
-        component_hex: cleanup_hex_encode(component.to_bytes()),
-        parent: parent.into(),
-        namespace: namespace.identity.into(),
-        target: target.into(),
+    let intent = cleanup_intent_record(
+        &key,
+        component,
+        parent,
+        namespace,
+        target,
         original_mode,
-        quarantine: quarantine
+        quarantine
             .to_str()
             .map_err(|_| cleanup_record_error())?
             .to_owned(),
-        operation: operation
-            .name
-            .to_str()
-            .map_err(|_| cleanup_record_error())?
-            .to_owned(),
-        operation_identity: operation.identity.into(),
-        placeholder: CLEANUP_PLACEHOLDER_NAME
-            .to_str()
-            .map_err(|_| cleanup_record_error())?
-            .to_owned(),
-        placeholder_identity: placeholder_identity.into(),
-    };
+        &operation.name,
+        operation.identity,
+        placeholder_identity,
+    )?;
     validate_cleanup_intent(&intent, parent, component.to_bytes(), namespace)?;
     let bytes = cleanup_canonical_json(&intent)?;
     let descriptor = create_regular_at(operation.directory.as_raw_fd(), stage_name)?;
     let mut file = File::from(descriptor);
+    let opened = stat_fd(file.as_raw_fd())?;
+    let rebound = stat_at(operation.directory.as_raw_fd(), stage_name)?;
+    require_cleanup_record_metadata(&opened, namespace.identity.device)?;
+    require_cleanup_record_metadata(&rebound, namespace.identity.device)?;
+    if !same_file(&opened, &rebound) {
+        return Err(os_error(libc::ESTALE));
+    }
+    let identity = FileIdentity::from_stat(&opened);
     let midpoint = bytes.len() / 2;
     file.write_all(&bytes[..midpoint])?;
     file.sync_all()?;
     cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
     injected_cleanup_intent_write_result()?;
     file.write_all(&bytes[midpoint..])?;
+    injected_cleanup_intent_write_before_sync_result()?;
     file.sync_all()?;
-    let metadata = stat_fd(file.as_raw_fd())?;
-    require_cleanup_record_metadata(&metadata, namespace.identity.device)?;
+    reopen_and_revalidate_cleanup_record_bytes(
+        operation.directory.as_raw_fd(),
+        stage_name,
+        identity,
+        namespace.identity.device,
+        &bytes,
+    )?;
     Ok(intent)
 }
 
@@ -5932,6 +7967,15 @@ fn publish_tree_cleanup_intent(
         return Ok(());
     };
     let stage_name = cleanup_intent_stage_name(&key)?;
+    ensure_cleanup_tree_capabilities(
+        namespace,
+        &mut operation,
+        public_parent,
+        component,
+        target,
+        original_mode,
+        &stage_name,
+    )?;
     let stage_exists =
         cleanup_optional_stat(operation.directory.as_raw_fd(), &stage_name)?.is_some();
     let placeholder_identity = prepare_cleanup_bootstrap_placeholder(
@@ -5953,6 +7997,16 @@ fn publish_tree_cleanup_intent(
         &stage_name,
     )?;
     validate_cleanup_intent(&intent, parent, component.to_bytes(), namespace)?;
+    let (staged_file, staged_bytes, staged_identity) = open_cleanup_record(
+        operation.directory.as_raw_fd(),
+        &stage_name,
+        namespace.identity.device,
+        true,
+    )?;
+    let staged_intent: CleanupIntentV1 = cleanup_parse_canonical_json(&staged_bytes)?;
+    if staged_intent != intent {
+        return Err(os_error(libc::ESTALE));
+    }
     cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
     cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })?;
     injected_cleanup_intent_sync_result()?;
@@ -5966,8 +8020,17 @@ fn publish_tree_cleanup_intent(
         Err(error) if error.raw_os_error() == Some(libc::EEXIST) => return Err(error),
         Err(error) => return Err(error),
     }
-    cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
+    injected_cleanup_intent_after_rename_handoff();
     cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })?;
+    cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
+    revalidate_cleanup_record_bytes(
+        namespace.directory.as_raw_fd(),
+        &intent_name,
+        &staged_file,
+        staged_identity,
+        namespace.identity.device,
+        &staged_bytes,
+    )?;
     operation.cleaned = true;
     Ok(())
 }
@@ -6110,9 +8173,19 @@ fn remove_empty_cleanup_operation(
     namespace: &PrivateNamespace,
     operation: &mut PrivateOperation<'_>,
 ) -> io::Result<()> {
-    operation.remove_empty_owned()?;
-    operation.cleaned = true;
-    cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })
+    cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_EX) })?;
+    let removal = operation
+        .remove_empty_owned()
+        .and_then(|()| cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) }));
+    let unlock = cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_UN) });
+    match (removal, unlock) {
+        (Ok(()), Ok(())) => {
+            operation.cleaned = true;
+            Ok(())
+        }
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(error)) => Err(error),
+    }
 }
 
 fn remove_bound_cleanup_record(
@@ -6143,9 +8216,11 @@ fn finish_cleanup_records(
     if let Some(decision) = decision {
         let decision_name = cleanup_decision_name(&loaded.intent.key_sha256)?;
         remove_bound_cleanup_record(namespace, &decision_name, &decision.file, decision.identity)?;
+        injected_cleanup_after_decision_retire_result()?;
     }
     let intent_name = cleanup_intent_name(&loaded.intent.key_sha256)?;
-    remove_bound_cleanup_record(namespace, &intent_name, &loaded.file, loaded.identity)
+    remove_bound_cleanup_record(namespace, &intent_name, &loaded.file, loaded.identity)?;
+    injected_cleanup_after_intent_retire_result()
 }
 
 fn cleanup_placeholder_only(
@@ -6180,9 +8255,10 @@ fn resume_tree_cleanup(
     loaded: &LoadedCleanupIntent,
     verify_parent: &impl Fn() -> io::Result<()>,
     allow_injected_validation: bool,
-) -> io::Result<()> {
+    pending_restore_error: &mut Option<io::Error>,
+    restore_expected: &mut bool,
+) -> io::Result<TreeCleanupOutcome> {
     let bindings = validate_cleanup_intent(&loaded.intent, parent, component, namespace)?;
-    let mut return_after_restore = None;
     loop {
         let mut operation = PrivateOperation::open_bound(
             namespace,
@@ -6200,7 +8276,26 @@ fn resume_tree_cleanup(
                     && !slots.operation_exists
                 {
                     finish_cleanup_records(namespace, loaded, None)?;
-                    return Ok(());
+                    return Ok(TreeCleanupOutcome::Deleted);
+                }
+                if slots.public == CleanupSlot::Target
+                    && slots.quarantine == CleanupSlot::Missing
+                    && slots.operation == CleanupSlot::Missing
+                    && !slots.operation_exists
+                {
+                    *restore_expected = true;
+                    let target = open_bound_cleanup_directory(
+                        public_parent,
+                        &bindings.component,
+                        bindings.target,
+                        bindings.parent.device,
+                        Some(bindings.original_mode),
+                    )?;
+                    cvt(unsafe { libc::fsync(target.as_raw_fd()) })?;
+                    cvt(unsafe { libc::fsync(public_parent) })?;
+                    injected_cleanup_after_restore_sync_result()?;
+                    finish_cleanup_records(namespace, loaded, None)?;
+                    return Ok(TreeCleanupOutcome::Restored(pending_restore_error.take()));
                 }
                 let operation = operation.as_ref().ok_or_else(|| os_error(libc::ESTALE))?;
                 match (slots.public, slots.quarantine, slots.operation) {
@@ -6219,13 +8314,16 @@ fn resume_tree_cleanup(
                             injected_cleanup_after_target_chmod_result()?;
                         }
                         if let Err(error) = verify_parent() {
+                            *restore_expected = true;
+                            if pending_restore_error.is_none() {
+                                *pending_restore_error = Some(error);
+                            }
                             publish_cleanup_decision(
                                 namespace,
                                 loaded,
                                 operation,
                                 CleanupDecisionV1::Restore,
                             )?;
-                            return_after_restore = Some(error);
                             continue;
                         }
                         if let Err(error) = rename_no_replace(
@@ -6268,13 +8366,16 @@ fn resume_tree_cleanup(
                                 )?;
                             }
                             Err(error) => {
+                                *restore_expected = true;
+                                if pending_restore_error.is_none() {
+                                    *pending_restore_error = Some(error);
+                                }
                                 publish_cleanup_decision(
                                     namespace,
                                     loaded,
                                     operation,
                                     CleanupDecisionV1::Restore,
                                 )?;
-                                return_after_restore = Some(error);
                             }
                         }
                     }
@@ -6348,12 +8449,13 @@ fn resume_tree_cleanup(
                     }
                     (CleanupSlot::Missing, CleanupSlot::Missing, false) => {
                         finish_cleanup_records(namespace, loaded, decision.as_ref())?;
-                        return Ok(());
+                        return Ok(TreeCleanupOutcome::Deleted);
                     }
                     _ => return Err(os_error(libc::ESTALE)),
                 }
             }
             Some(CleanupDecisionV1::Restore) => {
+                *restore_expected = true;
                 if slots.public == CleanupSlot::Other {
                     return Err(os_error(libc::ESTALE));
                 }
@@ -6374,6 +8476,7 @@ fn resume_tree_cleanup(
                             bindings.target,
                             true,
                         )?;
+                        injected_cleanup_restore_rollback_result()?;
                     }
                     (CleanupSlot::Missing, CleanupSlot::Placeholder, CleanupSlot::Target, true) => {
                         let operation = operation.as_mut().ok_or_else(|| os_error(libc::ESTALE))?;
@@ -6414,21 +8517,22 @@ fn resume_tree_cleanup(
                         remove_empty_cleanup_operation(namespace, operation)?;
                     }
                     (CleanupSlot::Target, CleanupSlot::Missing, CleanupSlot::Missing, false) => {
-                        let target = open_bound_cleanup_directory(
+                        let target = open_bound_cleanup_directory_modes(
                             public_parent,
                             &bindings.component,
                             bindings.target,
                             bindings.parent.device,
-                            Some(0o700),
+                            &[bindings.original_mode, 0o700],
                         )?;
-                        chmod_fd(target.as_raw_fd(), bindings.original_mode as libc::mode_t)?;
+                        let current_mode = stat_fd(target.as_raw_fd())?.st_mode as u32 & 0o7777;
+                        if current_mode != bindings.original_mode {
+                            chmod_fd(target.as_raw_fd(), bindings.original_mode as libc::mode_t)?;
+                        }
                         cvt(unsafe { libc::fsync(target.as_raw_fd()) })?;
                         cvt(unsafe { libc::fsync(public_parent) })?;
+                        injected_cleanup_after_restore_sync_result()?;
                         finish_cleanup_records(namespace, loaded, decision.as_ref())?;
-                        if let Some(error) = return_after_restore.take() {
-                            return Err(error);
-                        }
-                        return Ok(());
+                        return Ok(TreeCleanupOutcome::Restored(pending_restore_error.take()));
                     }
                     _ => return Err(os_error(libc::ESTALE)),
                 }
@@ -6586,7 +8690,7 @@ fn exchange_entries(
     right_name: &CStr,
 ) -> io::Result<()> {
     #[cfg(test)]
-    if AtomicRenameCapability::current() == AtomicRenameCapability::Unsupported {
+    if AtomicRenameCapability::current() != AtomicRenameCapability::NoReplace {
         return Err(os_error(libc::ENOTSUP));
     }
     // SAFETY: both live directory descriptors and NUL-terminated components
@@ -6610,7 +8714,7 @@ fn exchange_entries(
     right_name: &CStr,
 ) -> io::Result<()> {
     #[cfg(test)]
-    if AtomicRenameCapability::current() == AtomicRenameCapability::Unsupported {
+    if AtomicRenameCapability::current() != AtomicRenameCapability::NoReplace {
         return Err(os_error(libc::ENOTSUP));
     }
     // SAFETY: both live directory descriptors and NUL-terminated components
@@ -6893,6 +8997,67 @@ fn injected_cleanup_bootstrap_result() -> io::Result<()> {
         TEST_CLEANUP_FAULT.set(None);
         return Err(os_error(errno));
     }
+    #[cfg(test)]
+    TEST_CLEANUP_BOOTSTRAP_HANDOFF.with(|handoff| -> io::Result<()> {
+        let Some(mut handoff) = handoff.borrow_mut().take() else {
+            return Ok(());
+        };
+        handoff.stream.write_all(b"H")?;
+        let mut release = [0];
+        handoff.stream.read_exact(&mut release)?;
+        if release != [b'R'] {
+            return Err(os_error(libc::EIO));
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn injected_cleanup_probe_transition_result() -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let transition = TEST_CLEANUP_PROBE_TRANSITION.get().saturating_add(1);
+        TEST_CLEANUP_PROBE_TRANSITION.set(transition);
+        if let Some(CleanupFault::DuringCleanupCapabilityProbe(expected, errno)) =
+            TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+            && transition == expected
+        {
+            TEST_CLEANUP_FAULT.set(None);
+            TEST_CLEANUP_PROBE_INTERRUPTED.set(true);
+            return Err(os_error(errno));
+        }
+    }
+    Ok(())
+}
+
+fn injected_cleanup_probe_final_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupCapabilityProbeSync(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn cleanup_probe_was_interrupted() -> bool {
+    #[cfg(test)]
+    {
+        return TEST_CLEANUP_PROBE_INTERRUPTED.replace(false);
+    }
+    #[cfg(not(test))]
+    false
+}
+
+fn injected_cleanup_placeholder_object_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupPlaceholderObjectSync(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
     Ok(())
 }
 
@@ -6918,12 +9083,222 @@ fn injected_cleanup_intent_write_result() -> io::Result<()> {
     Ok(())
 }
 
+fn injected_cleanup_intent_write_before_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupIntentWriteBeforeSync(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_intent_adoption_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupIntentAdoptionSync(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
 fn injected_cleanup_intent_sync_result() -> io::Result<()> {
     #[cfg(test)]
     if let Some(CleanupFault::AfterCleanupIntentSync(errno)) =
         TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
     {
         TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_before_bound_completion_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::BeforeBoundCompletion(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_intent_after_rename_handoff() {
+    #[cfg(test)]
+    TEST_CLEANUP_INTENT_HANDOFF.with(|handoff| {
+        let handoff = handoff.borrow();
+        if let Some(handoff) = handoff.as_ref() {
+            let _ = handoff.renamed.send(());
+            let _ = handoff.release.recv();
+        }
+    });
+}
+
+fn injected_cleanup_initial_terminal_handoff() {
+    #[cfg(test)]
+    injected_cleanup_terminal_handoff(CleanupTerminalPhase::Initial);
+}
+
+fn injected_cleanup_final_terminal_handoff() {
+    #[cfg(test)]
+    injected_cleanup_terminal_handoff(CleanupTerminalPhase::Final);
+}
+
+#[cfg(test)]
+fn injected_cleanup_terminal_handoff(phase: CleanupTerminalPhase) {
+    TEST_CLEANUP_TERMINAL_HANDOFF.with(|handoff| {
+        let handoff = handoff.borrow();
+        if let Some(handoff) = handoff.as_ref()
+            && handoff.phase == phase
+        {
+            let _ = handoff.reached.send(());
+            let _ = handoff.release.recv();
+        }
+    });
+}
+
+fn injected_cleanup_decision_stage_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::AfterStageSync(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_decision_write_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::DuringWrite(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_decision_rewrite_handoff() {
+    #[cfg(test)]
+    TEST_CLEANUP_DECISION_REWRITE_HANDOFF.with(|handoff| {
+        let handoff = handoff.borrow();
+        if let Some(handoff) = handoff.as_ref() {
+            let _ = handoff.reached.send(());
+            let _ = handoff.release.recv();
+        }
+    });
+}
+
+fn injected_cleanup_decision_write_before_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::AfterFullWriteBeforeSync(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_decision_adoption_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::AfterCompleteAdoptionSync(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_decision_before_rename_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::BeforeRename(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_decision_after_rename_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::AfterRename(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_decision_destination_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::AfterDestinationSync(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_decision_source_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::AfterSourceSync(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_restore_rollback_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::DuringRestoreRollback(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_after_restore_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::AfterRestoreSync(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_after_decision_retire_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::AfterDecisionRetire(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_after_intent_retire_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupDecisionFault::AfterIntentRetire(errno)) =
+        TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_DECISION_FAULT.set(None);
         return Err(os_error(errno));
     }
     Ok(())
@@ -7136,19 +9511,21 @@ fn current_errno() -> libc::c_int {
 mod tests {
     use std::{
         fs,
-        io::Write,
+        io::{Read, Write},
         os::{
-            fd::AsRawFd,
+            fd::{AsRawFd, FromRawFd},
             unix::ffi::OsStrExt,
             unix::fs::{MetadataExt, PermissionsExt, symlink},
         },
-        path::Path,
+        path::{Path, PathBuf},
     };
 
     use super::{
-        AtomicRenameCapability, AtomicRenameCapabilityOverride, CleanupFault, CleanupFaultOverride,
-        CleanupIntentV1, CopyPrivateCleanupFailureOverride, PrivateNamespace,
-        RenameNoReplaceOverride, RootedDir, copy_regular, copy_regular_with_clone,
+        AtomicRenameCapability, AtomicRenameCapabilityOverride, CleanupDecisionFault,
+        CleanupDecisionFaultOverride, CleanupDecisionRecordV1, CleanupDecisionV1, CleanupFault,
+        CleanupFaultOverride, CleanupIntentV1, CleanupTerminalPhase,
+        CopyPrivateCleanupFailureOverride, PrivateNamespace, RenameNoReplaceOverride, RootedDir,
+        cleanup_parse_canonical_json, copy_regular, copy_regular_with_clone,
         copy_regular_with_clone_and_publish, create_regular_at, link_at,
         make_regular_read_only_with_hook, open_directory_path, open_regular_at,
         open_verified_child_directory, publish_regular_with_link_ops, stat_at,
@@ -8214,6 +10591,996 @@ mod tests {
         );
     }
 
+    fn assert_cleanup_decision_publication_retry(
+        decision: CleanupDecisionV1,
+        decision_fault: CleanupDecisionFault,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let target = fs::metadata(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation_fault = (decision == CleanupDecisionV1::Restore).then(|| {
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::ESTALE))
+        });
+        let publication_fault = CleanupDecisionFaultOverride::set(decision_fault);
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error:?}");
+        drop(publication_fault);
+        drop(validation_fault);
+        drop(parent);
+        assert!(!root_path.exists());
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let mut canonical = Vec::new();
+        let mut staged = Vec::new();
+        for entry in fs::read_dir(&namespace).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .as_bytes()
+                .starts_with(b"cleanup-decision-v1-")
+            {
+                canonical.push(path);
+            } else if path.is_dir()
+                && path
+                    .file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-op-v1-")
+            {
+                staged.extend(
+                    fs::read_dir(path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .filter(|path| {
+                            path.file_name()
+                                .unwrap()
+                                .as_bytes()
+                                .starts_with(b"cleanup-decision-stage-v1-")
+                        }),
+                );
+            }
+        }
+        if matches!(
+            decision_fault,
+            CleanupDecisionFault::AfterRename(libc::EIO)
+                | CleanupDecisionFault::AfterDestinationSync(libc::EIO)
+                | CleanupDecisionFault::AfterSourceSync(libc::EIO)
+        ) {
+            assert_eq!(canonical.len(), 1);
+            assert!(staged.is_empty());
+        } else {
+            assert!(canonical.is_empty());
+            assert_eq!(staged.len(), 1);
+            let suffix = match decision {
+                CleanupDecisionV1::Delete => b"-c01".as_slice(),
+                CleanupDecisionV1::Restore => b"-c02".as_slice(),
+            };
+            assert!(staged[0].file_name().unwrap().as_bytes().ends_with(suffix));
+            if decision_fault == CleanupDecisionFault::AfterStageSync(libc::EIO) {
+                assert!(fs::read(&staged[0]).unwrap().is_empty());
+            }
+            if decision_fault == CleanupDecisionFault::DuringWrite(libc::EIO) {
+                let bytes = fs::read(&staged[0]).unwrap();
+                assert!(!bytes.is_empty());
+                assert!(serde_json::from_slice::<CleanupDecisionRecordV1>(&bytes).is_err());
+            }
+        }
+
+        let parent = RootedDir::open(&physical).unwrap();
+        match decision {
+            CleanupDecisionV1::Delete => {
+                parent.remove_owned_child("root").unwrap();
+                assert!(!root_path.exists());
+            }
+            CleanupDecisionV1::Restore => {
+                assert!(parent.resume_pending_owned_child_cleanup("root").unwrap());
+                let restored = fs::metadata(&root_path).unwrap();
+                assert_eq!(restored.dev(), target.dev());
+                assert_eq!(restored.ino(), target.ino());
+                assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+                assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+                assert!(!parent.resume_pending_owned_child_cleanup("root").unwrap());
+            }
+        }
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cleanup_decision_publication_delete_recovers_after_stage_sync() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Delete,
+            CleanupDecisionFault::AfterStageSync(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_delete_recovers_during_write() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Delete,
+            CleanupDecisionFault::DuringWrite(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_delete_recovers_before_rename() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Delete,
+            CleanupDecisionFault::BeforeRename(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_delete_recovers_after_rename() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Delete,
+            CleanupDecisionFault::AfterRename(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_delete_recovers_after_destination_sync() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Delete,
+            CleanupDecisionFault::AfterDestinationSync(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_delete_recovers_after_source_sync() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Delete,
+            CleanupDecisionFault::AfterSourceSync(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_restore_recovers_after_stage_sync() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Restore,
+            CleanupDecisionFault::AfterStageSync(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_restore_recovers_during_write() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Restore,
+            CleanupDecisionFault::DuringWrite(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_stage_repeated_eof_repair_keeps_inode_and_converges() {
+        // Catches replacing a bound decision stage, or refusing to repair the
+        // same canonical prefix after more than one interrupted rewrite.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+
+        let mut stage_path = None;
+        let mut first_prefix = None;
+        let mut first_inode = None;
+        for attempt in 0..2 {
+            let fault =
+                CleanupDecisionFaultOverride::set(CleanupDecisionFault::DuringWrite(libc::EIO));
+            let error = parent.remove_owned_child("root").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            drop(fault);
+
+            let current_stage = fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.is_dir()
+                        && path
+                            .file_name()
+                            .unwrap()
+                            .as_bytes()
+                            .starts_with(b"cleanup-op-v1-")
+                })
+                .and_then(|operation| {
+                    fs::read_dir(operation)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .find(|path| {
+                            path.file_name()
+                                .unwrap()
+                                .as_bytes()
+                                .starts_with(b"cleanup-decision-stage-v1-")
+                        })
+                })
+                .unwrap();
+            let prefix = fs::read(&current_stage).unwrap();
+            assert!(!prefix.is_empty());
+            assert!(serde_json::from_slice::<CleanupDecisionRecordV1>(&prefix).is_err());
+            let inode = fs::metadata(&current_stage).unwrap().ino();
+            if attempt == 0 {
+                stage_path = Some(current_stage);
+                first_prefix = Some(prefix);
+                first_inode = Some(inode);
+            } else {
+                assert_eq!(&current_stage, stage_path.as_ref().unwrap());
+                assert_eq!(&prefix, first_prefix.as_ref().unwrap());
+                assert_eq!(inode, first_inode.unwrap());
+            }
+        }
+
+        parent.remove_owned_child("root").unwrap();
+        assert!(!root_path.exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_restore_recovers_before_rename() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Restore,
+            CleanupDecisionFault::BeforeRename(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_restore_recovers_after_rename() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Restore,
+            CleanupDecisionFault::AfterRename(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_restore_recovers_after_destination_sync() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Restore,
+            CleanupDecisionFault::AfterDestinationSync(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_publication_restore_recovers_after_source_sync() {
+        assert_cleanup_decision_publication_retry(
+            CleanupDecisionV1::Restore,
+            CleanupDecisionFault::AfterSourceSync(libc::EIO),
+        );
+    }
+
+    fn assert_cleanup_decision_complete_stage_is_synced_before_adoption(
+        decision: CleanupDecisionV1,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let target = fs::metadata(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation_fault = (decision == CleanupDecisionV1::Restore).then(|| {
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::ESTALE))
+        });
+        let write_fault = CleanupDecisionFaultOverride::set(
+            CleanupDecisionFault::AfterFullWriteBeforeSync(libc::EIO),
+        );
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(write_fault);
+        drop(validation_fault);
+        drop(parent);
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let operation = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-op-v1-")
+            })
+            .unwrap();
+        let stage = fs::read_dir(&operation)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-decision-stage-v1-")
+            })
+            .unwrap();
+        let bytes = fs::read(&stage).unwrap();
+        assert!(
+            cleanup_parse_canonical_json::<CleanupDecisionRecordV1>(&bytes)
+                .unwrap()
+                .decision
+                == decision
+        );
+        let inode = fs::metadata(&stage).unwrap().ino();
+
+        let parent = RootedDir::open(&physical).unwrap();
+        let adoption_fault = CleanupDecisionFaultOverride::set(
+            CleanupDecisionFault::AfterCompleteAdoptionSync(libc::EIO),
+        );
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert_eq!(fs::read(&stage).unwrap(), bytes);
+        assert_eq!(fs::metadata(&stage).unwrap().ino(), inode);
+        drop(adoption_fault);
+        drop(parent);
+
+        let parent = RootedDir::open(&physical).unwrap();
+        match decision {
+            CleanupDecisionV1::Delete => {
+                parent.remove_owned_child("root").unwrap();
+                assert!(!root_path.exists());
+            }
+            CleanupDecisionV1::Restore => {
+                assert!(parent.resume_pending_owned_child_cleanup("root").unwrap());
+                let restored = fs::metadata(&root_path).unwrap();
+                assert_eq!(restored.dev(), target.dev());
+                assert_eq!(restored.ino(), target.ino());
+                assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+                assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+                assert!(!parent.resume_pending_owned_child_cleanup("root").unwrap());
+            }
+        }
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cleanup_decision_delete_complete_stage_is_synced_before_adoption() {
+        assert_cleanup_decision_complete_stage_is_synced_before_adoption(CleanupDecisionV1::Delete);
+    }
+
+    #[test]
+    fn cleanup_decision_restore_complete_stage_is_synced_before_adoption() {
+        assert_cleanup_decision_complete_stage_is_synced_before_adoption(
+            CleanupDecisionV1::Restore,
+        );
+    }
+
+    fn cleanup_decision_stage_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault =
+            CleanupDecisionFaultOverride::set(CleanupDecisionFault::BeforeRename(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(fault);
+        drop(parent);
+        assert!(!root_path.exists());
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let operation = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-op-v1-")
+            })
+            .unwrap();
+        let stage = fs::read_dir(&operation)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-decision-stage-v1-")
+            })
+            .unwrap();
+        (fixture, physical, operation, stage)
+    }
+
+    fn assert_cleanup_decision_evidence_preserved(
+        physical: &Path,
+        evidence: &[(PathBuf, Vec<u8>, u64)],
+    ) {
+        let error = RootedDir::open(physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap_err();
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ESTALE)
+        ));
+        assert!(!physical.join("root").exists());
+        for (path, bytes, inode) in evidence {
+            assert_eq!(&fs::read(path).unwrap(), bytes);
+            assert_eq!(fs::metadata(path).unwrap().ino(), *inode);
+        }
+    }
+
+    #[test]
+    fn cleanup_decision_stage_preserves_malformed_and_noncanonical_bytes() {
+        for replacement in [
+            b"{}".to_vec(),
+            br#"{"unknown":1}"#.to_vec(),
+            b"[".to_vec(),
+            br#"{"wrong":"#.to_vec(),
+        ] {
+            let (_fixture, physical, _operation, stage) = cleanup_decision_stage_fixture();
+            fs::write(&stage, &replacement).unwrap();
+            let inode = fs::metadata(&stage).unwrap().ino();
+            assert_cleanup_decision_evidence_preserved(&physical, &[(stage, replacement, inode)]);
+        }
+
+        let (_fixture, physical, _operation, stage) = cleanup_decision_stage_fixture();
+        let mut noncanonical = fs::read(&stage).unwrap();
+        noncanonical.push(b' ');
+        fs::write(&stage, &noncanonical).unwrap();
+        let inode = fs::metadata(&stage).unwrap().ino();
+        assert_cleanup_decision_evidence_preserved(&physical, &[(stage, noncanonical, inode)]);
+    }
+
+    #[test]
+    fn cleanup_decision_stage_preserves_opposite_choice_payload() {
+        let (_fixture, physical, _operation, stage) = cleanup_decision_stage_fixture();
+        let mut record: CleanupDecisionRecordV1 =
+            cleanup_parse_canonical_json(&fs::read(&stage).unwrap()).unwrap();
+        record.decision = CleanupDecisionV1::Restore;
+        let opposite = serde_json::to_vec(&record).unwrap();
+        fs::write(&stage, &opposite).unwrap();
+        let inode = fs::metadata(&stage).unwrap().ino();
+
+        assert_cleanup_decision_evidence_preserved(&physical, &[(stage, opposite, inode)]);
+    }
+
+    #[test]
+    fn cleanup_decision_stage_rejects_duplicate_choices() {
+        let (_fixture, physical, operation, stage) = cleanup_decision_stage_fixture();
+        let stage_name = std::ffi::CString::new(stage.file_name().unwrap().as_bytes()).unwrap();
+        let parsed = super::parse_cleanup_decision_stage_name(&stage_name)
+            .unwrap()
+            .unwrap();
+        let mut record: CleanupDecisionRecordV1 =
+            cleanup_parse_canonical_json(&fs::read(&stage).unwrap()).unwrap();
+        record.decision = CleanupDecisionV1::Restore;
+        let opposite = serde_json::to_vec(&record).unwrap();
+        let duplicate_name = super::cleanup_decision_stage_name(
+            &parsed.key,
+            parsed.intent,
+            CleanupDecisionV1::Restore,
+        )
+        .unwrap();
+        let duplicate = operation.join(std::ffi::OsStr::from_bytes(duplicate_name.to_bytes()));
+        fs::write(&duplicate, &opposite).unwrap();
+        fs::set_permissions(&duplicate, fs::Permissions::from_mode(0o600)).unwrap();
+        let original = fs::read(&stage).unwrap();
+        let evidence = vec![
+            (stage.clone(), original, fs::metadata(&stage).unwrap().ino()),
+            (
+                duplicate.clone(),
+                opposite,
+                fs::metadata(&duplicate).unwrap().ino(),
+            ),
+        ];
+
+        assert_cleanup_decision_evidence_preserved(&physical, &evidence);
+    }
+
+    #[test]
+    fn cleanup_decision_stage_rejects_canonical_conflict_and_stale_binding() {
+        let (_fixture, physical, _operation, stage) = cleanup_decision_stage_fixture();
+        let stage_name = std::ffi::CString::new(stage.file_name().unwrap().as_bytes()).unwrap();
+        let parsed = super::parse_cleanup_decision_stage_name(&stage_name)
+            .unwrap()
+            .unwrap();
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let canonical_name = super::cleanup_decision_name(&parsed.key).unwrap();
+        let canonical = namespace.join(std::ffi::OsStr::from_bytes(canonical_name.to_bytes()));
+        let bytes = fs::read(&stage).unwrap();
+        fs::write(&canonical, &bytes).unwrap();
+        fs::set_permissions(&canonical, fs::Permissions::from_mode(0o600)).unwrap();
+        let evidence = vec![
+            (
+                stage.clone(),
+                bytes.clone(),
+                fs::metadata(&stage).unwrap().ino(),
+            ),
+            (
+                canonical.clone(),
+                bytes,
+                fs::metadata(&canonical).unwrap().ino(),
+            ),
+        ];
+        assert_cleanup_decision_evidence_preserved(&physical, &evidence);
+
+        let (_fixture, physical, operation, stage) = cleanup_decision_stage_fixture();
+        let stage_name = std::ffi::CString::new(stage.file_name().unwrap().as_bytes()).unwrap();
+        let parsed = super::parse_cleanup_decision_stage_name(&stage_name)
+            .unwrap()
+            .unwrap();
+        let stale_name = super::cleanup_decision_stage_name(
+            &parsed.key,
+            super::FileIdentity {
+                device: parsed.intent.device,
+                inode: parsed.intent.inode.wrapping_add(1),
+            },
+            parsed.decision,
+        )
+        .unwrap();
+        let stale = operation.join(std::ffi::OsStr::from_bytes(stale_name.to_bytes()));
+        fs::rename(&stage, &stale).unwrap();
+        let bytes = fs::read(&stale).unwrap();
+        let inode = fs::metadata(&stale).unwrap().ino();
+        assert_cleanup_decision_evidence_preserved(&physical, &[(stale, bytes, inode)]);
+    }
+
+    #[test]
+    fn cleanup_decision_stage_rewrite_revalidates_binding_before_truncate() {
+        // Catches truncating the detached original descriptor after the
+        // deterministic stage name has been rebound to an unrelated inode.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault = CleanupDecisionFaultOverride::set(CleanupDecisionFault::DuringWrite(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(fault);
+        drop(parent);
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let operation = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .unwrap()
+                        .as_bytes()
+                        .starts_with(b"cleanup-op-v1-")
+            })
+            .unwrap();
+        let stage = fs::read_dir(&operation)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-decision-stage-v1-")
+            })
+            .unwrap();
+        let original_bytes = fs::read(&stage).unwrap();
+        let original_inode = fs::metadata(&stage).unwrap().ino();
+        let detached = operation.join("detached-decision-stage-v1");
+        let replacement_bytes = b"replacement-evidence".to_vec();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_physical = physical.clone();
+        let worker = std::thread::spawn(move || {
+            let _handoff =
+                super::CleanupDecisionRewriteHandoffOverride::set(reached_tx, release_rx);
+            RootedDir::open(&worker_physical)
+                .unwrap()
+                .remove_owned_child("root")
+        });
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        fs::rename(&stage, &detached).unwrap();
+        fs::write(&stage, &replacement_bytes).unwrap();
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement_inode = fs::metadata(&stage).unwrap().ino();
+        assert_ne!(original_inode, replacement_inode);
+        release_tx.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        // The first binding mismatch is retryable; the next fail-closed scan
+        // may report either stale binding or malformed ambiguous evidence,
+        // depending on directory iteration order. Preservation is the
+        // invariant that proves no pre-revalidation truncate occurred.
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ESTALE)
+        ));
+        assert_eq!(fs::read(&detached).unwrap(), original_bytes);
+        assert_eq!(fs::metadata(&detached).unwrap().ino(), original_inode);
+        assert_eq!(fs::read(&stage).unwrap(), replacement_bytes);
+        assert_eq!(fs::metadata(&stage).unwrap().ino(), replacement_inode);
+        assert!(!root_path.exists());
+    }
+
+    fn assert_cleanup_restore_retirement_retry(fault: CleanupDecisionFault) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let target = fs::metadata(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation_fault =
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::ESTALE));
+        let retirement_fault = CleanupDecisionFaultOverride::set(fault);
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error:?}");
+        drop(retirement_fault);
+        drop(validation_fault);
+        drop(parent);
+        let restored = fs::metadata(&root_path).unwrap();
+        assert_eq!(restored.dev(), target.dev());
+        assert_eq!(restored.ino(), target.ino());
+        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let names = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        match fault {
+            CleanupDecisionFault::AfterRestoreSync(_) => {
+                assert_eq!(names.len(), 2);
+                assert!(
+                    names
+                        .iter()
+                        .any(|name| { name.as_bytes().starts_with(b"cleanup-intent-v1-") })
+                );
+                assert!(
+                    names
+                        .iter()
+                        .any(|name| { name.as_bytes().starts_with(b"cleanup-decision-v1-") })
+                );
+            }
+            CleanupDecisionFault::AfterDecisionRetire(_) => {
+                assert_eq!(names.len(), 1);
+                assert!(names[0].as_bytes().starts_with(b"cleanup-intent-v1-"));
+            }
+            CleanupDecisionFault::AfterIntentRetire(_) => assert!(names.is_empty()),
+            _ => unreachable!(),
+        }
+
+        let parent = RootedDir::open(&physical).unwrap();
+        match fault {
+            CleanupDecisionFault::AfterRestoreSync(_)
+            | CleanupDecisionFault::AfterDecisionRetire(_) => {
+                assert!(parent.resume_pending_owned_child_cleanup("root").unwrap());
+                let restored = fs::metadata(&root_path).unwrap();
+                assert_eq!(restored.dev(), target.dev());
+                assert_eq!(restored.ino(), target.ino());
+                assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+                assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+                assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
+                assert!(!parent.resume_pending_owned_child_cleanup("root").unwrap());
+            }
+            CleanupDecisionFault::AfterIntentRetire(_) => {
+                assert!(!parent.resume_pending_owned_child_cleanup("root").unwrap());
+                let restored = fs::metadata(&root_path).unwrap();
+                assert_eq!(restored.dev(), target.dev());
+                assert_eq!(restored.ino(), target.ino());
+                assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+                assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+                assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
+                parent.remove_owned_child("root").unwrap();
+                assert!(!root_path.exists());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn cleanup_restore_retries_after_target_mode_sync() {
+        assert_cleanup_restore_retirement_retry(CleanupDecisionFault::AfterRestoreSync(libc::EIO));
+    }
+
+    #[test]
+    fn cleanup_restore_retries_after_decision_retirement() {
+        assert_cleanup_restore_retirement_retry(CleanupDecisionFault::AfterDecisionRetire(
+            libc::EIO,
+        ));
+    }
+
+    #[test]
+    fn cleanup_restore_retries_after_intent_retirement() {
+        assert_cleanup_restore_retirement_retry(CleanupDecisionFault::AfterIntentRetire(libc::EIO));
+    }
+
+    #[test]
+    fn cleanup_live_restore_error_survives_retryable_rollback() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let target = fs::metadata(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation_fault =
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::EPERM));
+        let rollback_fault = CleanupDecisionFaultOverride::set(
+            CleanupDecisionFault::DuringRestoreRollback(libc::EAGAIN),
+        );
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        assert!(
+            super::TEST_CLEANUP_DECISION_FAULT
+                .with(std::cell::Cell::get)
+                .is_none()
+        );
+        let restored = fs::metadata(&root_path).unwrap();
+        assert_eq!(restored.dev(), target.dev());
+        assert_eq!(restored.ino(), target.ino());
+        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(rollback_fault);
+        drop(validation_fault);
+    }
+
+    #[test]
+    fn cleanup_live_restore_error_survives_retryable_decision_publication() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let target = fs::metadata(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation_fault =
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::EPERM));
+        let publication_fault =
+            CleanupDecisionFaultOverride::set(CleanupDecisionFault::AfterRename(libc::EAGAIN));
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        assert!(
+            super::TEST_CLEANUP_DECISION_FAULT
+                .with(std::cell::Cell::get)
+                .is_none()
+        );
+        let restored = fs::metadata(&root_path).unwrap();
+        assert_eq!(restored.dev(), target.dev());
+        assert_eq!(restored.ino(), target.ino());
+        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(publication_fault);
+        drop(validation_fault);
+    }
+
+    #[test]
+    fn cleanup_live_restore_error_survives_retryable_intent_retirement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let target = fs::metadata(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation_fault =
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::EPERM));
+        let retirement_fault = CleanupDecisionFaultOverride::set(
+            CleanupDecisionFault::AfterIntentRetire(libc::EAGAIN),
+        );
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        let restored = fs::metadata(&root_path).unwrap();
+        assert_eq!(restored.dev(), target.dev());
+        assert_eq!(restored.ino(), target.ino());
+        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(retirement_fault);
+        drop(validation_fault);
+    }
+
+    #[test]
+    fn cleanup_recovered_restore_survives_retryable_intent_retirement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let target = fs::metadata(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation_fault =
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::ESTALE));
+        let first_retirement =
+            CleanupDecisionFaultOverride::set(CleanupDecisionFault::AfterDecisionRetire(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(first_retirement);
+        drop(validation_fault);
+        drop(parent);
+
+        let parent = RootedDir::open(&physical).unwrap();
+        let second_retirement = CleanupDecisionFaultOverride::set(
+            CleanupDecisionFault::AfterIntentRetire(libc::EAGAIN),
+        );
+        assert!(parent.resume_pending_owned_child_cleanup("root").unwrap());
+
+        let restored = fs::metadata(&root_path).unwrap();
+        assert_eq!(restored.dev(), target.dev());
+        assert_eq!(restored.ino(), target.ino());
+        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!parent.resume_pending_owned_child_cleanup("root").unwrap());
+        drop(second_retirement);
+    }
+
+    #[test]
+    fn cleanup_resume_only_consumes_restore_without_deleting_target() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let inode = fs::metadata(&root_path).unwrap().ino();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation_fault =
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::ESTALE));
+        let restore_fault =
+            CleanupDecisionFaultOverride::set(CleanupDecisionFault::AfterRestoreSync(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(restore_fault);
+        drop(validation_fault);
+        drop(parent);
+
+        let parent = RootedDir::open(&physical).unwrap();
+        assert!(parent.resume_pending_owned_child_cleanup("root").unwrap());
+        let restored = fs::metadata(&root_path).unwrap();
+        assert_eq!(restored.ino(), inode);
+        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!parent.resume_pending_owned_child_cleanup("root").unwrap());
+    }
+
+    #[test]
+    fn cleanup_no_decision_restore_tail_rejects_journal_owned_mode() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation_fault =
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::ESTALE));
+        let retire_fault =
+            CleanupDecisionFaultOverride::set(CleanupDecisionFault::AfterDecisionRetire(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(retire_fault);
+        drop(validation_fault);
+        drop(parent);
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let before = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(before.len(), 1);
+
+        let error = RootedDir::open(&physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert!(root_path.exists());
+        assert_eq!(
+            fs::metadata(&root_path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::read_dir(namespace)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
     fn assert_cleanup_intent_tree_bootstrap_retry(fault: CleanupFault) {
         let fixture = tempfile::tempdir().unwrap();
         let physical = fixture.path().canonicalize().unwrap();
@@ -8251,6 +11618,283 @@ mod tests {
         assert_cleanup_intent_tree_bootstrap_retry(CleanupFault::AfterCleanupBootstrap(libc::EIO));
     }
 
+    fn assert_cleanup_capability_probe_retry(fault: CleanupFault, probe_present: bool) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let before = fs::metadata(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault = CleanupFaultOverride::set(fault);
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        drop(fault);
+        drop(parent);
+        let after = fs::metadata(&root_path).unwrap();
+        assert_eq!(after.dev(), before.dev());
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.ctime(), before.ctime());
+        assert_eq!(after.ctime_nsec(), before.ctime_nsec());
+        assert_eq!(after.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let top = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(top.len(), 1);
+        assert!(
+            top[0]
+                .file_name()
+                .unwrap()
+                .as_bytes()
+                .starts_with(b"cleanup-op-v1-")
+        );
+        assert_eq!(
+            top[0].join("cleanup-capability-probe-v1").exists(),
+            probe_present
+        );
+
+        RootedDir::open(&physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap();
+        assert!(!root_path.exists());
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cleanup_capability_probe_recovers_mid_probe() {
+        assert_cleanup_capability_probe_retry(
+            CleanupFault::DuringCleanupCapabilityProbe(5, libc::EIO),
+            true,
+        );
+    }
+
+    #[test]
+    fn cleanup_capability_probe_all_durable_transitions_converge() {
+        for transition in 1..=24 {
+            assert_cleanup_capability_probe_retry(
+                CleanupFault::DuringCleanupCapabilityProbe(transition, libc::EIO),
+                transition < 24,
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_capability_probe_recovers_after_final_sync() {
+        assert_cleanup_capability_probe_retry(
+            CleanupFault::AfterCleanupCapabilityProbeSync(libc::EIO),
+            false,
+        );
+    }
+
+    fn assert_cleanup_capability_unsupported_fails_before_public_mutation<T>(_guard: T) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let before = fs::metadata(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTSUP));
+        let after = fs::metadata(&root_path).unwrap();
+        assert_eq!(after.dev(), before.dev());
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.ctime(), before.ctime());
+        assert_eq!(after.ctime_nsec(), before.ctime_nsec());
+        assert_eq!(after.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cleanup_capability_probe_regular_no_replace_unsupported() {
+        assert_cleanup_capability_unsupported_fails_before_public_mutation(
+            RenameNoReplaceOverride::fail_cross_directory_with(libc::ENOTSUP),
+        );
+    }
+
+    #[test]
+    fn cleanup_capability_probe_directory_no_replace_unsupported() {
+        assert_cleanup_capability_unsupported_fails_before_public_mutation(
+            RenameNoReplaceOverride::fail_directory_with(libc::ENOTSUP),
+        );
+    }
+
+    #[test]
+    fn cleanup_capability_probe_directory_exchange_unsupported() {
+        assert_cleanup_capability_unsupported_fails_before_public_mutation(
+            AtomicRenameCapabilityOverride::set(AtomicRenameCapability::NoExchange),
+        );
+    }
+
+    fn cleanup_capability_probe_fixture(
+        transition: usize,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault = CleanupFaultOverride::set(CleanupFault::DuringCleanupCapabilityProbe(
+            transition,
+            libc::EIO,
+        ));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(fault);
+        drop(parent);
+        let operation = fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        (fixture, physical, operation)
+    }
+
+    fn assert_cleanup_capability_probe_malformed(physical: &Path) {
+        let error = RootedDir::open(physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap_err();
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ESTALE)
+        ));
+        assert_eq!(fs::read(physical.join("root/value")).unwrap(), b"owned");
+        assert_eq!(
+            fs::metadata(physical.join("root"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+    }
+
+    #[test]
+    fn cleanup_capability_probe_preserves_substituted_known_roles() {
+        let (_fixture, physical, operation) = cleanup_capability_probe_fixture(5);
+        let source = operation
+            .join("cleanup-capability-probe-v1/left-v1")
+            .join("regular-no-replace-source-v1");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+        let inode = fs::metadata(&source).unwrap().ino();
+        assert_cleanup_capability_probe_malformed(&physical);
+        assert_eq!(fs::metadata(&source).unwrap().ino(), inode);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let (_fixture, physical, operation) = cleanup_capability_probe_fixture(5);
+        let source = operation
+            .join("cleanup-capability-probe-v1/left-v1")
+            .join("regular-no-replace-source-v1");
+        fs::remove_file(&source).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        let inode = fs::metadata(&source).unwrap().ino();
+        assert_cleanup_capability_probe_malformed(&physical);
+        assert!(source.is_dir());
+        assert_eq!(fs::metadata(&source).unwrap().ino(), inode);
+
+        let (_fixture, physical, operation) = cleanup_capability_probe_fixture(5);
+        let left = operation.join("cleanup-capability-probe-v1/left-v1");
+        let right = operation.join("cleanup-capability-probe-v1/right-v1");
+        let source = left.join("regular-no-replace-source-v1");
+        let destination = right.join("regular-no-replace-destination-v1");
+        fs::remove_file(&destination).unwrap();
+        fs::hard_link(&source, &destination).unwrap();
+        let inode = fs::metadata(&source).unwrap().ino();
+        assert_cleanup_capability_probe_malformed(&physical);
+        assert_eq!(fs::metadata(&source).unwrap().ino(), inode);
+        assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
+        assert_eq!(fs::metadata(&source).unwrap().nlink(), 2);
+
+        let (_fixture, physical, operation) = cleanup_capability_probe_fixture(11);
+        let directory = operation
+            .join("cleanup-capability-probe-v1/left-v1")
+            .join("directory-no-replace-source-v1");
+        let payload = directory.join("payload-v1");
+        fs::write(&payload, b"preserve").unwrap();
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o600)).unwrap();
+        let inode = fs::metadata(&payload).unwrap().ino();
+        assert_cleanup_capability_probe_malformed(&physical);
+        assert_eq!(fs::read(&payload).unwrap(), b"preserve");
+        assert_eq!(fs::metadata(&payload).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn cleanup_capability_probe_preserves_malformed_subtree() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault =
+            CleanupFaultOverride::set(CleanupFault::DuringCleanupCapabilityProbe(5, libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(fault);
+        drop(parent);
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let operation = fs::read_dir(&namespace)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let unexpected = operation
+            .join("cleanup-capability-probe-v1")
+            .join("left-v1")
+            .join("unexpected-v1");
+        fs::write(&unexpected, b"preserve").unwrap();
+        fs::set_permissions(&unexpected, fs::Permissions::from_mode(0o600)).unwrap();
+        let inode = fs::metadata(&unexpected).unwrap().ino();
+
+        let error = RootedDir::open(&physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap_err();
+
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ESTALE)
+        ));
+        assert_eq!(fs::read(&unexpected).unwrap(), b"preserve");
+        assert_eq!(fs::metadata(&unexpected).unwrap().ino(), inode);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+    }
+
     #[test]
     fn cleanup_intent_tree_bootstrap_retry_after_placeholder_fsync() {
         assert_cleanup_intent_tree_bootstrap_retry(CleanupFault::AfterCleanupPlaceholder(
@@ -8259,10 +11903,451 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_intent_tree_bootstrap_retry_after_placeholder_object_fsync() {
+        assert_cleanup_intent_tree_bootstrap_retry(
+            CleanupFault::AfterCleanupPlaceholderObjectSync(libc::EIO),
+        );
+    }
+
+    #[test]
     fn cleanup_intent_tree_bootstrap_retry_after_partial_stage_sync() {
         assert_cleanup_intent_tree_bootstrap_retry(CleanupFault::DuringCleanupIntentWrite(
             libc::EIO,
         ));
+    }
+
+    #[test]
+    fn cleanup_intent_complete_stage_is_synced_before_adoption() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let write_fault =
+            CleanupFaultOverride::set(CleanupFault::AfterCleanupIntentWriteBeforeSync(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(write_fault);
+        drop(parent);
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let operation = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-op-v1-")
+            })
+            .unwrap();
+        let stage = fs::read_dir(&operation)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-intent-stage-v1-")
+            })
+            .unwrap();
+        let bytes = fs::read(&stage).unwrap();
+        cleanup_parse_canonical_json::<CleanupIntentV1>(&bytes).unwrap();
+        let inode = fs::metadata(&stage).unwrap().ino();
+
+        let parent = RootedDir::open(&physical).unwrap();
+        let adoption_fault =
+            CleanupFaultOverride::set(CleanupFault::AfterCleanupIntentAdoptionSync(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert_eq!(fs::read(&stage).unwrap(), bytes);
+        assert_eq!(fs::metadata(&stage).unwrap().ino(), inode);
+        drop(adoption_fault);
+        drop(parent);
+
+        RootedDir::open(&physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap();
+        assert!(!root_path.exists());
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+
+    fn cleanup_intent_stage_fixture(complete: bool) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault = CleanupFaultOverride::set(if complete {
+            CleanupFault::AfterCleanupIntentSync(libc::EIO)
+        } else {
+            CleanupFault::DuringCleanupIntentWrite(libc::EIO)
+        });
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(fault);
+        drop(parent);
+        let operation = fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-op-v1-")
+            })
+            .unwrap();
+        let stage = fs::read_dir(operation)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-intent-stage-v1-")
+            })
+            .unwrap();
+        (fixture, physical, stage)
+    }
+
+    #[test]
+    fn cleanup_intent_stage_repair_preserves_complete_schema_invalid_bytes() {
+        // Catches treating complete JSON with missing, unknown, or wrongly
+        // typed fields as a crash-truncated record and replacing it.
+        for bytes in [
+            b"{}".as_slice(),
+            br#"{"unknown":1}"#.as_slice(),
+            br#"{"version":"wrong"}"#.as_slice(),
+        ] {
+            let (_fixture, physical, stage) = cleanup_intent_stage_fixture(false);
+            fs::write(&stage, bytes).unwrap();
+            let inode = fs::metadata(&stage).unwrap().ino();
+            let parent = RootedDir::open(&physical).unwrap();
+
+            let error = parent.remove_owned_child("root").unwrap_err();
+
+            assert!(matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ESTALE)
+            ));
+            assert_eq!(fs::read(&stage).unwrap(), bytes);
+            assert_eq!(fs::metadata(&stage).unwrap().ino(), inode);
+            assert_eq!(fs::read(physical.join("root/value")).unwrap(), b"owned");
+        }
+    }
+
+    #[test]
+    fn cleanup_intent_stage_repair_preserves_non_prefix_eof_bytes() {
+        // `[` is syntactically incomplete JSON, but cannot be a sequential
+        // prefix of the object record this exact bound slot publishes.
+        let (_fixture, physical, stage) = cleanup_intent_stage_fixture(false);
+        fs::write(&stage, b"[").unwrap();
+        let inode = fs::metadata(&stage).unwrap().ino();
+        let parent = RootedDir::open(&physical).unwrap();
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ESTALE)
+        ));
+        assert_eq!(fs::read(&stage).unwrap(), b"[");
+        assert_eq!(fs::metadata(&stage).unwrap().ino(), inode);
+        assert_eq!(fs::read(physical.join("root/value")).unwrap(), b"owned");
+    }
+
+    #[test]
+    fn cleanup_intent_stage_repair_preserves_valid_noncanonical_bytes() {
+        // A complete record with trailing whitespace is valid JSON but not
+        // the protocol's canonical byte representation and must stay intact.
+        let (_fixture, physical, stage) = cleanup_intent_stage_fixture(true);
+        let mut bytes = fs::read(&stage).unwrap();
+        bytes.push(b' ');
+        fs::write(&stage, &bytes).unwrap();
+        let inode = fs::metadata(&stage).unwrap().ino();
+        let parent = RootedDir::open(&physical).unwrap();
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ESTALE)
+        ));
+        assert_eq!(fs::read(&stage).unwrap(), bytes);
+        assert_eq!(fs::metadata(&stage).unwrap().ino(), inode);
+        assert_eq!(fs::read(physical.join("root/value")).unwrap(), b"owned");
+    }
+
+    #[test]
+    fn cleanup_intent_stage_empty_and_bound_canonical_prefixes_converge() {
+        // Catches rejecting crash states before serde has enough bytes to
+        // identify any field, or at the fixed-fields/quarantine boundary.
+        for prefix_ordinal in 0..5 {
+            let (_fixture, physical, stage) = cleanup_intent_stage_fixture(true);
+            let canonical = fs::read(&stage).unwrap();
+            assert_eq!(canonical.first(), Some(&b'{'));
+            let quarantine_field = b"\"quarantine\":\"";
+            let field_start = canonical
+                .windows(quarantine_field.len())
+                .position(|window| window == quarantine_field)
+                .unwrap();
+            let value_start = field_start + quarantine_field.len();
+            let prefix_len = [0, 1, field_start, value_start - 1, value_start][prefix_ordinal];
+            fs::write(&stage, &canonical[..prefix_len]).unwrap();
+
+            RootedDir::open(&physical)
+                .unwrap()
+                .remove_owned_child("root")
+                .unwrap();
+
+            assert!(!physical.join("root").exists());
+            assert_eq!(
+                fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    fn cleanup_intent_quarantine_offset(bytes: &[u8]) -> (usize, CleanupIntentV1) {
+        let intent: CleanupIntentV1 = cleanup_parse_canonical_json(bytes).unwrap();
+        let quarantine = intent.quarantine.as_bytes();
+        let offset = bytes
+            .windows(quarantine.len())
+            .position(|window| window == quarantine)
+            .unwrap();
+        (offset, intent)
+    }
+
+    #[test]
+    fn cleanup_intent_stage_valid_uuid_truncation_converges() {
+        // Catches requiring a complete random quarantine name before an
+        // otherwise attributable sequential stage prefix may be rebuilt.
+        let (_fixture, physical, stage) = cleanup_intent_stage_fixture(true);
+        let canonical = fs::read(&stage).unwrap();
+        let (quarantine_offset, intent) = cleanup_intent_quarantine_offset(&canonical);
+        let uuid_prefix_len = "cleanup-tree-v1-".len() + 20;
+        assert!(uuid_prefix_len < intent.quarantine.len());
+        let truncated = &canonical[..quarantine_offset + uuid_prefix_len];
+        assert!(matches!(
+            super::cleanup_parse_stage_json::<CleanupIntentV1>(truncated).unwrap(),
+            super::CleanupStageJson::Truncated
+        ));
+        fs::write(&stage, truncated).unwrap();
+
+        RootedDir::open(&physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap();
+
+        assert!(!physical.join("root").exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cleanup_intent_stage_preserves_bad_uuid_version_and_hex_prefixes() {
+        // Catches broad EOF repair that would erase non-v4 or non-hex
+        // quarantine evidence merely because the JSON string is unfinished.
+        for (uuid_index, replacement) in [(14, b'5'), (6, b'g')] {
+            let (_fixture, physical, stage) = cleanup_intent_stage_fixture(true);
+            let canonical = fs::read(&stage).unwrap();
+            let (quarantine_offset, intent) = cleanup_intent_quarantine_offset(&canonical);
+            let uuid_offset = quarantine_offset + "cleanup-tree-v1-".len();
+            let mut malformed = canonical[..uuid_offset + usize::max(uuid_index + 1, 20)].to_vec();
+            assert_eq!(
+                intent.quarantine.as_bytes()["cleanup-tree-v1-".len() + 14],
+                b'4'
+            );
+            malformed[uuid_offset + uuid_index] = replacement;
+            assert!(matches!(
+                super::cleanup_parse_stage_json::<CleanupIntentV1>(&malformed).unwrap(),
+                super::CleanupStageJson::Truncated
+            ));
+            fs::write(&stage, &malformed).unwrap();
+            let inode = fs::metadata(&stage).unwrap().ino();
+
+            let error = RootedDir::open(&physical)
+                .unwrap()
+                .remove_owned_child("root")
+                .unwrap_err();
+
+            assert!(matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ESTALE)
+            ));
+            assert_eq!(fs::read(&stage).unwrap(), malformed);
+            assert_eq!(fs::metadata(&stage).unwrap().ino(), inode);
+            assert_eq!(fs::read(physical.join("root/value")).unwrap(), b"owned");
+        }
+    }
+
+    #[test]
+    fn cleanup_partial_intent_preserves_evidence_when_public_target_is_absent() {
+        // Catches rebuilding a partial intent after its required public A has
+        // disappeared, which would invent a new quarantine generation.
+        let (_fixture, physical, stage) = cleanup_intent_stage_fixture(false);
+        let bytes = fs::read(&stage).unwrap();
+        let inode = fs::metadata(&stage).unwrap().ino();
+        let root_path = physical.join("root");
+        let detached_a = physical.join("detached-a");
+        let a = fs::metadata(&root_path).unwrap();
+        // macOS requires write permission on a directory being renamed. Put
+        // the detached fixture back in the intent's recorded mode before the
+        // retry observes it.
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&root_path, &detached_a).unwrap();
+        fs::set_permissions(&detached_a, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let error = RootedDir::open(&physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap_err();
+
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ENOENT) | Some(libc::ESTALE)
+        ));
+        assert_eq!(fs::read(&stage).unwrap(), bytes);
+        assert_eq!(fs::metadata(&stage).unwrap().ino(), inode);
+        assert!(!root_path.exists());
+        let detached = fs::metadata(&detached_a).unwrap();
+        assert_eq!(detached.dev(), a.dev());
+        assert_eq!(detached.ino(), a.ino());
+        assert_eq!(detached.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(detached_a.join("value")).unwrap(), b"owned");
+    }
+
+    #[test]
+    fn cleanup_partial_intent_preserves_public_replacement() {
+        // Catches authorizing B from a partial stage that was bound to A.
+        let (_fixture, physical, stage) = cleanup_intent_stage_fixture(false);
+        let bytes = fs::read(&stage).unwrap();
+        let inode = fs::metadata(&stage).unwrap().ino();
+        let root_path = physical.join("root");
+        let detached_a = physical.join("detached-a");
+        let a = fs::metadata(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&root_path, &detached_a).unwrap();
+        fs::set_permissions(&detached_a, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("sentinel-b"), b"replacement").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let b_inode = fs::metadata(&root_path).unwrap().ino();
+        assert_ne!(a.ino(), b_inode);
+
+        let error = RootedDir::open(&physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap_err();
+
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ESTALE)
+        ));
+        assert_eq!(fs::read(&stage).unwrap(), bytes);
+        assert_eq!(fs::metadata(&stage).unwrap().ino(), inode);
+        assert_eq!(fs::metadata(&root_path).unwrap().ino(), b_inode);
+        assert_eq!(
+            fs::read(root_path.join("sentinel-b")).unwrap(),
+            b"replacement"
+        );
+        let detached = fs::metadata(&detached_a).unwrap();
+        assert_eq!(detached.dev(), a.dev());
+        assert_eq!(detached.ino(), a.ino());
+        assert_eq!(detached.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(detached_a.join("value")).unwrap(), b"owned");
+    }
+
+    #[test]
+    fn cleanup_partial_intent_preserves_unexpected_operation_child() {
+        // Catches deleting an unknown operation child while trying to repair
+        // the known deterministic intent-stage role.
+        let (_fixture, physical, stage) = cleanup_intent_stage_fixture(false);
+        let stage_bytes = fs::read(&stage).unwrap();
+        let stage_inode = fs::metadata(&stage).unwrap().ino();
+        let unexpected = stage.parent().unwrap().join("unexpected-v1");
+        fs::write(&unexpected, b"preserve").unwrap();
+        fs::set_permissions(&unexpected, fs::Permissions::from_mode(0o600)).unwrap();
+        let unexpected_inode = fs::metadata(&unexpected).unwrap().ino();
+
+        let error = RootedDir::open(&physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap_err();
+
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ESTALE)
+        ));
+        assert_eq!(fs::read(&stage).unwrap(), stage_bytes);
+        assert_eq!(fs::metadata(&stage).unwrap().ino(), stage_inode);
+        assert_eq!(fs::read(&unexpected).unwrap(), b"preserve");
+        assert_eq!(fs::metadata(&unexpected).unwrap().ino(), unexpected_inode);
+        assert_eq!(fs::read(physical.join("root/value")).unwrap(), b"owned");
+    }
+
+    #[test]
+    fn cleanup_intent_stage_repeated_repairs_converge() {
+        // Catches a repair path that handles one interrupted replacement but
+        // cannot attribute and rebuild the deterministic slot again.
+        let (_fixture, physical, initial_stage) = cleanup_intent_stage_fixture(false);
+        let parent = RootedDir::open(&physical).unwrap();
+        let root_path = physical.join("root");
+        let target = fs::metadata(&root_path).unwrap();
+        for _ in 0..2 {
+            let fault =
+                CleanupFaultOverride::set(CleanupFault::DuringCleanupIntentWrite(libc::EIO));
+            let error = parent.remove_owned_child("root").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            drop(fault);
+            let bytes = fs::read(&initial_stage).unwrap();
+            assert!(!bytes.is_empty());
+            assert!(matches!(
+                super::cleanup_parse_stage_json::<CleanupIntentV1>(&bytes).unwrap(),
+                super::CleanupStageJson::Truncated
+            ));
+            let current = fs::metadata(&root_path).unwrap();
+            assert_eq!(current.dev(), target.dev());
+            assert_eq!(current.ino(), target.ino());
+            assert_eq!(current.permissions().mode() & 0o777, 0o500);
+            assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+        }
+
+        parent.remove_owned_child("root").unwrap();
+        assert!(!physical.join("root").exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -8336,16 +12421,228 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_intent_tree_bootstrap_two_retriers_converge() {
+    fn cleanup_intent_publication_holds_inode_lock_through_directory_syncs() {
         let fixture = tempfile::tempdir().unwrap();
         let physical = fixture.path().canonicalize().unwrap();
         fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
         let root_path = physical.join("root");
         fs::create_dir(&root_path).unwrap();
-        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
-        for index in 0..32 {
-            fs::write(root_path.join(format!("value-{index}")), b"owned").unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let (renamed_tx, renamed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let publisher_physical = physical.clone();
+        let publisher = std::thread::spawn(move || {
+            let _handoff = super::CleanupIntentHandoffOverride::set(renamed_tx, release_rx);
+            let parent = RootedDir::open(&publisher_physical).unwrap();
+            let parent_metadata = super::stat_fd(parent.root.as_raw_fd()).unwrap();
+            let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+            let namespace = PrivateNamespace::select_for_cleanup(
+                parent.root.as_raw_fd(),
+                parent_metadata.st_dev,
+                &[],
+            )
+            .unwrap();
+            let component = std::ffi::CString::new("root").unwrap();
+            let target = super::FileIdentity::from_stat(
+                &stat_at(parent.root.as_raw_fd(), &component).unwrap(),
+            );
+            super::publish_tree_cleanup_intent(
+                &namespace,
+                parent.root.as_raw_fd(),
+                parent_identity,
+                &component,
+                target,
+                0o500,
+            )
+        });
+        renamed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let observer = RootedDir::open(&physical).unwrap();
+        let parent_metadata = super::stat_fd(observer.root.as_raw_fd()).unwrap();
+        let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+        let namespace = PrivateNamespace::select_for_cleanup(
+            observer.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )
+        .unwrap();
+        let key = super::cleanup_key(parent_identity, b"root");
+        let intent_name = super::cleanup_intent_name(&key).unwrap();
+        let (probe, _bytes, canonical_identity) = super::open_cleanup_record(
+            namespace.directory.as_raw_fd(),
+            &intent_name,
+            parent_identity.device,
+            false,
+        )
+        .unwrap();
+        super::clear_errno();
+        let probe_result = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let probe_errno = super::current_errno();
+        if probe_result == 0 {
+            assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
         }
+
+        let waiter_physical = physical.clone();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let parent = RootedDir::open(&waiter_physical).unwrap();
+            let parent_metadata = super::stat_fd(parent.root.as_raw_fd()).unwrap();
+            let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+            let namespace = PrivateNamespace::select_for_cleanup(
+                parent.root.as_raw_fd(),
+                parent_metadata.st_dev,
+                &[],
+            )
+            .unwrap();
+            waiting_tx.send(()).unwrap();
+            let loaded = super::find_cleanup_intent(&namespace, parent_identity, b"root")
+                .unwrap()
+                .unwrap();
+            loaded_tx.send(loaded.identity).unwrap();
+        });
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap().unwrap();
+        assert_eq!(
+            loaded_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            canonical_identity
+        );
+        waiter.join().unwrap();
+        assert_eq!(probe_result, -1, "publisher did not retain the intent lock");
+        assert!(probe_errno == libc::EAGAIN || probe_errno == libc::EWOULDBLOCK);
+
+        drop(probe);
+        drop(namespace);
+        drop(observer);
+        RootedDir::open(&physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap();
+        assert!(!root_path.exists());
+    }
+
+    fn assert_cleanup_terminal_snapshot_holds_namespace_lock(phase: CleanupTerminalPhase) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        if phase == CleanupTerminalPhase::Final {
+            fs::create_dir(&root_path).unwrap();
+            fs::write(root_path.join("value"), b"owned").unwrap();
+            fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let observer = RootedDir::open(&physical).unwrap();
+        let parent_metadata = super::stat_fd(observer.root.as_raw_fd()).unwrap();
+        let namespace = PrivateNamespace::select_for_cleanup(
+            observer.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )
+        .unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_physical = physical.clone();
+        let worker = std::thread::spawn(move || {
+            let _handoff =
+                super::CleanupTerminalHandoffOverride::set(phase, reached_tx, release_rx);
+            RootedDir::open(&worker_physical)
+                .unwrap()
+                .remove_owned_child("root")
+        });
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        super::clear_errno();
+        let probe_result = unsafe {
+            libc::flock(
+                namespace.directory.as_raw_fd(),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        let probe_errno = super::current_errno();
+        if probe_result == 0 {
+            assert_eq!(
+                unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_UN) },
+                0
+            );
+        }
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+
+        assert_eq!(probe_result, -1, "terminal snapshot was not linearized");
+        assert!(probe_errno == libc::EAGAIN || probe_errno == libc::EWOULDBLOCK);
+        if phase == CleanupTerminalPhase::Final {
+            assert!(!root_path.exists());
+        } else {
+            assert!(!root_path.exists());
+        }
+    }
+
+    #[test]
+    fn cleanup_initial_absence_snapshot_holds_namespace_lock() {
+        assert_cleanup_terminal_snapshot_holds_namespace_lock(CleanupTerminalPhase::Initial);
+    }
+
+    #[test]
+    fn cleanup_final_absence_snapshot_holds_namespace_lock() {
+        assert_cleanup_terminal_snapshot_holds_namespace_lock(CleanupTerminalPhase::Final);
+    }
+
+    #[test]
+    fn cleanup_owned_root_replacement_never_creates_replacement_bootstrap() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+        fs::rename(&root_path, physical.join("detached-owned")).unwrap();
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"replacement").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let replacement = fs::metadata(&root_path).unwrap();
+
+        let error = root.remove_owned_tree().unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        let after = fs::metadata(&root_path).unwrap();
+        assert_eq!(after.dev(), replacement.dev());
+        assert_eq!(after.ino(), replacement.ino());
+        assert_eq!(after.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"replacement");
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
+        assert!(
+            !RootedDir::open(&physical)
+                .unwrap()
+                .resume_pending_owned_child_cleanup("root")
+                .unwrap()
+        );
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cleanup_intent_tree_bootstrap_two_retriers_converge() {
+        let iterations = std::env::var("MAC_WORKER_CLEANUP_RETRIER_STRESS_ITERS")
+            .ok()
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(128);
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let mut retriers = Vec::new();
         for _ in 0..2 {
@@ -8353,21 +12650,179 @@ mod tests {
             let barrier = barrier.clone();
             retriers.push(std::thread::spawn(move || {
                 let parent = RootedDir::open(&physical).unwrap();
-                barrier.wait();
-                parent.remove_owned_child("root")
+                let mut results = Vec::with_capacity(iterations);
+                for _ in 0..iterations {
+                    barrier.wait();
+                    results.push(parent.remove_owned_child_inner("root"));
+                    barrier.wait();
+                }
+                results
             }));
         }
-        barrier.wait();
-        for retrier in retriers {
-            retrier.join().unwrap().unwrap();
+
+        for iteration in 0..iterations {
+            let root_path = physical.join("root");
+            fs::create_dir(&root_path).unwrap();
+            fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+            for index in 0..2 {
+                fs::write(root_path.join(format!("value-{index}")), b"owned").unwrap();
+            }
+            barrier.wait();
+            barrier.wait();
+            assert!(!root_path.exists(), "iteration {iteration}");
+            assert_eq!(
+                fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                    .unwrap()
+                    .count(),
+                0,
+                "iteration {iteration}"
+            );
         }
-        assert!(!root_path.exists());
-        assert_eq!(
-            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+        for retrier in retriers {
+            for (iteration, result) in retrier.join().unwrap().into_iter().enumerate() {
+                result.unwrap_or_else(|error| panic!("iteration {iteration}: {error:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_cross_process_public_retrier_adopts_paused_bootstrap() {
+        const ROLE_ENV: &str = "MAC_WORKER_CLEANUP_CROSS_PROCESS_ROLE";
+        const ROOT_ENV: &str = "MAC_WORKER_CLEANUP_CROSS_PROCESS_ROOT";
+        const STREAM_FD_ENV: &str = "MAC_WORKER_CLEANUP_CROSS_PROCESS_STREAM_FD";
+        const TEST_NAME: &str =
+            "rooted_fs::tests::cleanup_cross_process_public_retrier_adopts_paused_bootstrap";
+
+        if let Some(role) = std::env::var_os(ROLE_ENV) {
+            let physical = std::path::PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
+            let descriptor = std::env::var(STREAM_FD_ENV)
                 .unwrap()
-                .count(),
-            0
-        );
+                .parse::<libc::c_int>()
+                .unwrap();
+            let mut stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) };
+            let parent = RootedDir::open(&physical).unwrap();
+            match role.to_str().unwrap() {
+                "publisher" => {
+                    let _handoff = super::CleanupBootstrapHandoffOverride::set(stream);
+                    parent.remove_owned_child("root").unwrap();
+                }
+                "retrier" => {
+                    stream.write_all(b"W").unwrap();
+                    let mut go = [0];
+                    stream.read_exact(&mut go).unwrap();
+                    assert_eq!(go, [b'G']);
+                    parent.remove_owned_child("root").unwrap();
+                }
+                role => panic!("unexpected cleanup child role {role}"),
+            }
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+
+        let spawn_worker = |role: &str, stream: std::os::unix::net::UnixStream| {
+            let descriptor = stream.as_raw_fd();
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            assert_ne!(flags, -1);
+            assert_eq!(
+                unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+                0
+            );
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .env(ROLE_ENV, role)
+                .env(ROOT_ENV, &physical)
+                .env(STREAM_FD_ENV, descriptor.to_string())
+                .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            drop(stream);
+            child
+        };
+        let assert_child_success = |role: &str, output: std::process::Output| {
+            assert!(
+                output.status.success(),
+                "{role} stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        let (mut retrier_control, retrier_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let retrier = spawn_worker("retrier", retrier_stream);
+        let mut ready = [0];
+        retrier_control.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [b'W']);
+
+        let (mut publisher_control, publisher_stream) =
+            std::os::unix::net::UnixStream::pair().unwrap();
+        let publisher = spawn_worker("publisher", publisher_stream);
+        let mut handoff = [0];
+        publisher_control.read_exact(&mut handoff).unwrap();
+        assert_eq!(handoff, [b'H']);
+        assert!(root_path.exists());
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let evidence = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(evidence.len(), 1);
+        assert!(evidence[0].as_bytes().starts_with(b"cleanup-op-v1-"));
+
+        retrier_control.write_all(b"G").unwrap();
+        assert_child_success("retrier", retrier.wait_with_output().unwrap());
+        assert!(!root_path.exists());
+        assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
+
+        publisher_control.write_all(b"R").unwrap();
+        assert_child_success("publisher", publisher.wait_with_output().unwrap());
+        assert!(!root_path.exists());
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cleanup_process_entry_guard_serializes_same_process_journals() {
+        let first = super::lock_cleanup_process_journal().unwrap();
+        let (blocked, blocked_receive) = std::sync::mpsc::channel();
+        let (entered, receive) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            match super::CLEANUP_PROCESS_JOURNAL_LOCK.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => blocked.send(()).unwrap(),
+                Ok(_) => panic!("cleanup process gate admitted a concurrent journal"),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("cleanup process gate was unexpectedly poisoned")
+                }
+            }
+            let _second = super::lock_cleanup_process_journal().unwrap();
+            entered.send(()).unwrap();
+        });
+
+        blocked_receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(first);
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn cleanup_process_entry_guard_recovers_from_poison() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = super::CLEANUP_PROCESS_JOURNAL_LOCK.lock().unwrap();
+            panic!("poison cleanup test gate");
+        });
+        assert!(poisoned.join().is_err());
+        drop(super::lock_cleanup_process_journal().unwrap());
+        super::CLEANUP_PROCESS_JOURNAL_LOCK.clear_poison();
     }
 
     fn install_same_key_cleanup_bootstrap(namespace: &Path) -> std::path::PathBuf {
@@ -8552,6 +13007,416 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
         assert_eq!(fs::read(root_path.join("sentinel")).unwrap(), b"unrelated");
         assert_eq!(fs::metadata(quarantine).unwrap().ino(), quarantine_inode);
+    }
+
+    #[test]
+    fn cleanup_bound_exact_generation_never_resumes_later_same_key_intent() {
+        // A key binds parent+component, not an inode generation. A stale
+        // resolver bound to retired A must not adopt canonical intent B.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value-a"), b"generation-a").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let held_a = RootedDir::open(&root_path).unwrap();
+        let a_metadata = fs::metadata(&root_path).unwrap();
+        let a = super::FileIdentity {
+            device: a_metadata.dev(),
+            inode: a_metadata.ino(),
+        };
+        let parent = RootedDir::open(&physical).unwrap();
+        parent.remove_owned_child("root").unwrap();
+
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("sentinel-b"), b"generation-b").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let b_inode = fs::metadata(&root_path).unwrap().ino();
+        assert_ne!(b_inode, a.inode);
+        let fault = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(fault);
+        let parent_metadata = super::stat_fd(parent.root.as_raw_fd()).unwrap();
+        let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+        let namespace =
+            PrivateNamespace::select(parent.root.as_raw_fd(), parent_metadata.st_dev, &[]).unwrap();
+
+        let error = super::resolve_bound_tree_cleanup(
+            &namespace,
+            parent.root.as_raw_fd(),
+            parent_identity,
+            b"root",
+            a,
+            0o500,
+            None,
+            &|| Ok(()),
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(
+            fs::read(root_path.join("sentinel-b")).unwrap(),
+            b"generation-b"
+        );
+        assert_eq!(fs::metadata(&root_path).unwrap().ino(), b_inode);
+        drop(held_a);
+    }
+
+    #[test]
+    fn cleanup_bound_canonical_intent_rejects_wrong_expected_original_mode() {
+        // Catches treating target+intent/operation identity as the complete
+        // generation fence while silently accepting a mismatched mode.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"generation-a").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let target_metadata = fs::metadata(&root_path).unwrap();
+        let target = super::FileIdentity {
+            device: target_metadata.dev(),
+            inode: target_metadata.ino(),
+        };
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(fault);
+        let parent_metadata = super::stat_fd(parent.root.as_raw_fd()).unwrap();
+        let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+        let namespace = PrivateNamespace::select_for_cleanup(
+            parent.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )
+        .unwrap();
+        let loaded = super::find_cleanup_intent(&namespace, parent_identity, b"root")
+            .unwrap()
+            .unwrap();
+        assert_eq!(super::FileIdentity::from(loaded.intent.target), target);
+        assert_eq!(loaded.intent.original_mode, 0o500);
+        let generation =
+            super::cleanup_generation_from_loaded(&namespace, parent_identity, b"root", &loaded)
+                .unwrap();
+        let intent_name = super::cleanup_intent_name(&loaded.intent.key_sha256).unwrap();
+        let intent_path = physical
+            .join(".mac-worker-rooted-fs")
+            .join(std::ffi::OsStr::from_bytes(intent_name.to_bytes()));
+        let intent_bytes = fs::read(&intent_path).unwrap();
+        let intent_inode = fs::metadata(&intent_path).unwrap().ino();
+        drop(loaded);
+
+        let error = super::resolve_bound_tree_cleanup(
+            &namespace,
+            parent.root.as_raw_fd(),
+            parent_identity,
+            b"root",
+            target,
+            0o700,
+            Some(&generation),
+            &|| Ok(()),
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(fs::read(&intent_path).unwrap(), intent_bytes);
+        assert_eq!(fs::metadata(&intent_path).unwrap().ino(), intent_inode);
+        let current = fs::metadata(&root_path).unwrap();
+        assert_eq!(current.dev(), target.device);
+        assert_eq!(current.ino(), target.inode);
+        assert_eq!(current.permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"generation-a");
+    }
+
+    #[test]
+    fn cleanup_bound_predicate_candidate_never_resumes_later_same_key_intent() {
+        // Models a cross-process retirement between predicate snapshot and
+        // resume: cached approval for A cannot authorize canonical B.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value-a"), b"generation-a").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let held_a = RootedDir::open(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        parent.remove_owned_child("root").unwrap_err();
+        drop(fault);
+        let parent_metadata = super::stat_fd(parent.root.as_raw_fd()).unwrap();
+        let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+        let namespace =
+            PrivateNamespace::select(parent.root.as_raw_fd(), parent_metadata.st_dev, &[]).unwrap();
+        let candidate = super::collect_pending_tree_cleanup_candidates(
+            &namespace,
+            parent.root.as_raw_fd(),
+            parent_identity,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        drop(namespace);
+        parent.remove_owned_child("root").unwrap();
+
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("sentinel-b"), b"generation-b").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let b_inode = fs::metadata(&root_path).unwrap().ino();
+        assert_ne!(b_inode, candidate.target.inode);
+        let fault = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        parent.remove_owned_child("root").unwrap_err();
+        drop(fault);
+        let namespace =
+            PrivateNamespace::select(parent.root.as_raw_fd(), parent_metadata.st_dev, &[]).unwrap();
+
+        let error = super::resolve_bound_tree_cleanup(
+            &namespace,
+            parent.root.as_raw_fd(),
+            parent_identity,
+            &candidate.component,
+            candidate.target,
+            candidate.original_mode,
+            Some(&candidate.generation),
+            &|| Ok(()),
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(
+            fs::read(root_path.join("sentinel-b")).unwrap(),
+            b"generation-b"
+        );
+        assert_eq!(fs::metadata(&root_path).unwrap().ino(), b_inode);
+        drop(held_a);
+    }
+
+    #[test]
+    fn cleanup_predicate_resnapshots_later_generation_with_fresh_callback() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value-a"), b"generation-a").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(fault);
+
+        let peer = RootedDir::open(&physical).unwrap();
+        let parent_metadata = super::stat_fd(peer.root.as_raw_fd()).unwrap();
+        let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+        let namespace = PrivateNamespace::select_for_cleanup(
+            peer.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )
+        .unwrap();
+        let candidate = super::collect_pending_tree_cleanup_candidates(
+            &namespace,
+            peer.root.as_raw_fd(),
+            parent_identity,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let a_inode = candidate.target.inode;
+        let mut calls = Vec::new();
+        let mut replaced = false;
+
+        let resumed = parent
+            .retry_pending_owned_children_matching(|component, identity| {
+                assert_eq!(component, b"root");
+                super::clear_errno();
+                assert_eq!(
+                    unsafe {
+                        libc::flock(
+                            namespace.directory.as_raw_fd(),
+                            libc::LOCK_EX | libc::LOCK_NB,
+                        )
+                    },
+                    0,
+                    "predicate ran under the namespace lock: {}",
+                    super::current_errno()
+                );
+                assert_eq!(
+                    unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_UN) },
+                    0
+                );
+                calls.push(identity.inode);
+                if !replaced {
+                    super::complete_bound_tree_cleanup(
+                        &namespace,
+                        peer.root.as_raw_fd(),
+                        parent_identity,
+                        &candidate.component,
+                        candidate.target,
+                        candidate.original_mode,
+                        Some(candidate.generation.clone()),
+                        &|| Ok(()),
+                        false,
+                    )
+                    .unwrap();
+                    assert!(!root_path.exists());
+                    fs::create_dir(&root_path).unwrap();
+                    fs::write(root_path.join("value-b"), b"generation-b").unwrap();
+                    fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+                    let component = std::ffi::CString::new("root").unwrap();
+                    let b = super::FileIdentity::from_stat(
+                        &stat_at(peer.root.as_raw_fd(), &component).unwrap(),
+                    );
+                    super::publish_tree_cleanup_intent(
+                        &namespace,
+                        peer.root.as_raw_fd(),
+                        parent_identity,
+                        &component,
+                        b,
+                        0o500,
+                    )
+                    .unwrap();
+                    replaced = true;
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap();
+
+        assert_eq!(resumed, 0);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], a_inode);
+        assert_ne!(calls[1], a_inode);
+        assert_eq!(
+            fs::read(root_path.join("value-b")).unwrap(),
+            b"generation-b"
+        );
+        assert!(parent.resume_pending_owned_child_cleanup("root").unwrap());
+        assert!(!root_path.exists());
+    }
+
+    #[test]
+    fn cleanup_predicate_does_not_count_generation_retired_during_callback() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value-a"), b"generation-a").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        parent.remove_owned_child("root").unwrap_err();
+        drop(fault);
+
+        let peer = RootedDir::open(&physical).unwrap();
+        let parent_metadata = super::stat_fd(peer.root.as_raw_fd()).unwrap();
+        let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+        let namespace = PrivateNamespace::select_for_cleanup(
+            peer.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )
+        .unwrap();
+        let candidate = super::collect_pending_tree_cleanup_candidates(
+            &namespace,
+            peer.root.as_raw_fd(),
+            parent_identity,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let mut calls = 0;
+
+        let resumed = parent
+            .retry_pending_owned_children_matching(|component, identity| {
+                assert_eq!(component, b"root");
+                assert_eq!(identity.inode, candidate.target.inode);
+                calls += 1;
+                super::complete_bound_tree_cleanup(
+                    &namespace,
+                    peer.root.as_raw_fd(),
+                    parent_identity,
+                    &candidate.component,
+                    candidate.target,
+                    candidate.original_mode,
+                    Some(candidate.generation.clone()),
+                    &|| Ok(()),
+                    false,
+                )
+                .unwrap();
+                true
+            })
+            .unwrap();
+
+        assert_eq!(calls, 1);
+        assert_eq!(resumed, 0);
+        assert!(!root_path.exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cleanup_predicate_preserves_exact_generation_on_completion_estale() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"generation-a").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let interrupted = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(interrupted);
+
+        let completion =
+            CleanupFaultOverride::set(CleanupFault::BeforeBoundCompletion(libc::ESTALE));
+        let error = parent
+            .retry_pending_owned_children_matching(|component, _| component == b"root")
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"generation-a");
+        drop(completion);
+
+        assert!(parent.resume_pending_owned_child_cleanup("root").unwrap());
+        assert!(!root_path.exists());
     }
 
     #[test]
