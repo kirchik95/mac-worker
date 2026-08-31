@@ -1065,7 +1065,16 @@ fn parse_rsync_stats(bytes: &[u8]) -> Result<TransferReceipt, WorkerError> {
     }
     let text = std::str::from_utf8(bytes).map_err(|_| invalid_stats())?;
     let lines = text.split('\n').collect::<Vec<_>>();
-    if lines.len() != 13 || !lines[9].is_empty() || !lines[12].is_empty() {
+    let optional_line_offset = match lines.len() {
+        13 => 0,
+        15 => {
+            millisecond_counter(lines[7], "File list generation time: ", " seconds")?;
+            millisecond_counter(lines[8], "File list transfer time: ", " seconds")?;
+            2
+        }
+        _ => return Err(invalid_stats()),
+    };
+    if !lines[9 + optional_line_offset].is_empty() || !lines[12 + optional_line_offset].is_empty() {
         return Err(invalid_stats());
     }
 
@@ -1076,8 +1085,8 @@ fn parse_rsync_stats(bytes: &[u8]) -> Result<TransferReceipt, WorkerError> {
     let unmatched = counter(lines[4], "Unmatched data: ", " B")?;
     let matched = counter(lines[5], "Matched data: ", " B")?;
     let _file_list_size = counter(lines[6], "File list size: ", " B")?;
-    let total_sent = counter(lines[7], "Total sent: ", " B")?;
-    let total_received = counter(lines[8], "Total received: ", " B")?;
+    let total_sent = counter(lines[7 + optional_line_offset], "Total sent: ", " B")?;
+    let total_received = counter(lines[8 + optional_line_offset], "Total received: ", " B")?;
     if files_transferred > files
         || transferred_size > total_file_size
         || unmatched.checked_add(matched) != Some(transferred_size)
@@ -1085,7 +1094,7 @@ fn parse_rsync_stats(bytes: &[u8]) -> Result<TransferReceipt, WorkerError> {
         return Err(invalid_stats());
     }
 
-    let summary = lines[10]
+    let summary = lines[10 + optional_line_offset]
         .strip_prefix("sent ")
         .and_then(|value| value.split_once(" bytes  received "))
         .ok_or_else(invalid_stats)?;
@@ -1098,7 +1107,7 @@ fn parse_rsync_stats(bytes: &[u8]) -> Result<TransferReceipt, WorkerError> {
         return Err(invalid_stats());
     }
 
-    let total = lines[11]
+    let total = lines[11 + optional_line_offset]
         .strip_prefix("total size is ")
         .and_then(|value| value.split_once("  speedup is "))
         .ok_or_else(invalid_stats)?;
@@ -1120,6 +1129,22 @@ fn counter(line: &str, prefix: &str, suffix: &str) -> Result<u64, WorkerError> {
         .and_then(|value| value.strip_suffix(suffix))
         .ok_or_else(invalid_stats)?;
     decimal(value)
+}
+
+fn millisecond_counter(line: &str, prefix: &str, suffix: &str) -> Result<(), WorkerError> {
+    let value = line
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(suffix))
+        .ok_or_else(invalid_stats)?;
+    let (seconds, milliseconds) = value.split_once('.').ok_or_else(invalid_stats)?;
+    if seconds.is_empty()
+        || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+        || milliseconds.len() != 3
+        || !milliseconds.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid_stats());
+    }
+    Ok(())
 }
 
 fn decimal(value: &str) -> Result<u64, WorkerError> {

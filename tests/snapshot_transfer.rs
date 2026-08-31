@@ -360,6 +360,8 @@ fn snapshot(cache: &Path) -> (GitRepo, Snapshot) {
 
 const STOCK_STATS: &[u8] = b"Number of files: 5\nNumber of files transferred: 4\nTotal file size: 41 B\nTotal transferred file size: 41 B\nUnmatched data: 41 B\nMatched data: 0 B\nFile list size: 172 B\nTotal sent: 501 B\nTotal received: 94 B\n\nsent 501 bytes  received 94 bytes  540909 bytes/sec\ntotal size is 41  speedup is 0.07\n";
 
+const STOCK_STATS_WITH_FILE_LIST_TIMINGS: &[u8] = b"Number of files: 2\nNumber of files transferred: 1\nTotal file size: 3000000 B\nTotal transferred file size: 3000000 B\nUnmatched data: 3000000 B\nMatched data: 0 B\nFile list size: 46 B\nFile list generation time: 0.001 seconds\nFile list transfer time: 0.000 seconds\nTotal sent: 3000482 B\nTotal received: 48 B\n\nsent 3000482 bytes  received 48 bytes  26297370 bytes/sec\ntotal size is 3000000  speedup is 1.00\n";
+
 #[test]
 fn ssh_json_request_uses_exact_fixed_argv_and_compact_stdin() {
     // Break caught: a caller-controlled path/shell fragment or pretty JSON is
@@ -634,6 +636,33 @@ fn rsync_upload_uses_exact_stock_argv_and_only_the_publication_root() {
 }
 
 #[test]
+fn rsync_stats_parser_accepts_stock_file_list_timing_lines() {
+    // Stock macOS rsync emits these lines when file-list construction takes
+    // measurable time.
+    let cache = tempfile::tempdir().unwrap();
+    let (_repo, snapshot) = snapshot(cache.path());
+    let runner = RecordingRunner::returning(vec![Ok(result(
+        status(0),
+        STOCK_STATS_WITH_FILE_LIST_TIMINGS,
+        b"",
+    ))]);
+
+    let receipt = RsyncTransport::new(&runner)
+        .upload(&worker(), &snapshot, &transfer_identity())
+        .unwrap();
+
+    assert_eq!(
+        receipt,
+        TransferReceipt {
+            files_transferred: 1,
+            file_bytes_transferred: 3_000_000,
+            wire_bytes_sent: 3_000_482,
+            wire_bytes_received: 48,
+        }
+    );
+}
+
+#[test]
 fn transfer_identity_debug_and_failures_never_expose_the_lease_token() {
     // Break caught: the rsync-path secret is copied into Debug or a public
     // process diagnostic.
@@ -743,6 +772,18 @@ fn rsync_stats_parser_rejects_duplicates_malformed_overflow_and_trailing_text() 
         STOCK_STATS.replace_bytes(
             b"Number of files transferred: 4",
             b"Number of files transferred: 18446744073709551616",
+        ),
+        STOCK_STATS.replace_bytes(
+            b"File list size: 172 B",
+            b"File list size: 172 B\nFile list generation time: 0.001 seconds",
+        ),
+        STOCK_STATS_WITH_FILE_LIST_TIMINGS.replace_bytes(
+            b"File list generation time: 0.001 seconds\nFile list transfer time: 0.000 seconds",
+            b"File list transfer time: 0.000 seconds\nFile list generation time: 0.001 seconds",
+        ),
+        STOCK_STATS_WITH_FILE_LIST_TIMINGS.replace_bytes(
+            b"File list generation time: 0.001 seconds",
+            b"File list generation time: 0.01 seconds",
         ),
         [STOCK_STATS, b"PLANTED trailing text\n"].concat(),
     ];
