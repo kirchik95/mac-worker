@@ -608,7 +608,11 @@ impl<'a> RemoteJobClient<'a> {
                         return Ok(PreacceptanceDisposition::Accepted(response));
                     }
                 }
-                Err(error @ WorkerError::Protocol(_)) => return Err(error),
+                Err(error @ WorkerError::Protocol(_)) => match protocol_error_code(&error) {
+                    Some("JOB_NOT_FOUND") => {}
+                    Some("JOB_ABANDONED") => break,
+                    _ => return Err(error),
+                },
                 Err(_) => {}
             }
             let Some(remaining) = remaining_resolution_budget(start, self.retry.monotonic_now())
@@ -774,6 +778,13 @@ fn decode_host_control_error(bytes: &[u8]) -> Option<WorkerError> {
         error.error().code(),
         error.error().message()
     )))
+}
+
+fn protocol_error_code(error: &WorkerError) -> Option<&str> {
+    let WorkerError::Protocol(message) = error else {
+        return None;
+    };
+    message.split_once(": ").map(|(code, _)| code)
 }
 
 fn invalid_remote_response() -> WorkerError {

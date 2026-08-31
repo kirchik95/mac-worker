@@ -211,6 +211,10 @@ impl JumpResolutionRuntime {
             now: Mutex::new(Duration::ZERO),
         }
     }
+
+    fn elapsed(&self) -> Duration {
+        *self.now.lock().unwrap()
+    }
 }
 
 impl ResolutionRuntime for JumpResolutionRuntime {
@@ -2605,6 +2609,52 @@ fn last_positive_budget_status_success_wins_without_a_resolve_call() {
             .iter()
             .all(|call| call.args.last().unwrap() == "~/.local/bin/worker host status")
     );
+}
+
+#[test]
+fn preacceptance_missing_or_abandoned_status_still_uses_the_identity_bound_resolver() {
+    // Break caught: an expected preacceptance status code returns early and
+    // skips the only endpoint that can bind the full request and release it.
+    let submit = remote_submit(85_500, 10);
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+
+    for code in ["JOB_NOT_FOUND", "JOB_ABANDONED"] {
+        let status_error =
+            HostControlError::new(code, "exact job has no queryable status").unwrap();
+        let abandoned = ResolveOrAbandonResponse::abandoned();
+        let runner = RecordingRunner::returning(vec![
+            Ok(result(status(70), &canonical_line(&status_error), b"")),
+            Ok(result(status(0), &canonical_line(&abandoned), b"")),
+        ]);
+        let runtime = JumpResolutionRuntime::new();
+
+        let disposition = RemoteJobClient::new_with_runtime(&runner, &runtime)
+            .resolve_preacceptance(&worker(), &request)
+            .unwrap_or_else(|error| panic!("{code}: {error}"));
+
+        assert!(matches!(disposition, PreacceptanceDisposition::Abandoned));
+        let recorded = runner.requests();
+        assert_eq!(recorded.len(), 2, "{code}");
+        assert_eq!(
+            recorded[0].args.last().unwrap(),
+            "~/.local/bin/worker host status",
+            "{code}"
+        );
+        assert_eq!(
+            recorded[1].args.last().unwrap(),
+            "~/.local/bin/worker host resolve-or-abandon",
+            "{code}"
+        );
+        assert_eq!(
+            runtime.elapsed(),
+            if code == "JOB_NOT_FOUND" {
+                Duration::from_secs(30)
+            } else {
+                Duration::ZERO
+            },
+            "{code}"
+        );
+    }
 }
 
 #[test]

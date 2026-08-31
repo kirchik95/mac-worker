@@ -10,6 +10,7 @@ use std::{
         unix::{ffi::OsStrExt, fs::FileExt},
     },
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 use sha2::{Digest, Sha256};
@@ -399,7 +400,9 @@ pub struct RootedDir {
     parent: OwnedFd,
     root_name: CString,
     root_identity: FileIdentity,
-    lineage: Vec<DirectoryBinding>,
+    // These immutable capability bindings are safe to share; each RootedDir
+    // still owns fresh descriptors for its current root and direct parent.
+    lineage: Vec<Arc<DirectoryBinding>>,
     security_device: Option<u64>,
 }
 
@@ -544,7 +547,7 @@ impl RootedDir {
                     security_device: None,
                 });
             }
-            lineage.push(DirectoryBinding {
+            lineage.push(Arc::new(DirectoryBinding {
                 directory: reopen_directory(child.as_raw_fd())?,
                 parent: reopen_directory(current.as_raw_fd())?,
                 name: component.clone(),
@@ -552,7 +555,7 @@ impl RootedDir {
                 owner: opened.st_uid,
                 mode: (opened.st_mode & 0o777) as u32,
                 security_device: None,
-            });
+            }));
             current = child;
         }
         unreachable!("a non-empty component sequence returns its final directory")
@@ -584,7 +587,7 @@ impl RootedDir {
             parent: reopen_directory(self.parent.as_raw_fd())?,
             root_name: self.root_name.clone(),
             root_identity: self.root_identity,
-            lineage: clone_lineage(&self.lineage)?,
+            lineage: clone_lineage(&self.lineage),
             security_device: self.security_device,
         })
     }
@@ -2329,7 +2332,7 @@ impl RootedDir {
         path: &RelativePath,
         create_missing: bool,
         security_device: Option<u64>,
-    ) -> io::Result<(OwnedFd, CString, Vec<DirectoryBinding>)> {
+    ) -> io::Result<(OwnedFd, CString, Vec<Arc<DirectoryBinding>>)> {
         let components = path
             .as_str()
             .split('/')
@@ -2365,7 +2368,7 @@ impl RootedDir {
             if !same_file(&path_stat, &opened) {
                 return Err(os_error(libc::ESTALE));
             }
-            lineage.push(DirectoryBinding {
+            lineage.push(Arc::new(DirectoryBinding {
                 directory: reopen_directory(child.as_raw_fd())?,
                 parent: reopen_directory(parent.as_raw_fd())?,
                 name: component.clone(),
@@ -2373,7 +2376,7 @@ impl RootedDir {
                 owner: opened.st_uid,
                 mode: (opened.st_mode & 0o777) as u32,
                 security_device,
-            });
+            }));
             parent = child;
         }
         Ok((parent, name.clone(), lineage))
@@ -2408,10 +2411,10 @@ impl RootedDir {
         Ok(())
     }
 
-    fn child_lineage(&self) -> io::Result<Vec<DirectoryBinding>> {
-        let mut lineage = clone_lineage(&self.lineage)?;
+    fn child_lineage(&self) -> io::Result<Vec<Arc<DirectoryBinding>>> {
+        let mut lineage = clone_lineage(&self.lineage);
         let metadata = stat_fd(self.root.as_raw_fd())?;
-        lineage.push(DirectoryBinding {
+        lineage.push(Arc::new(DirectoryBinding {
             directory: reopen_directory(self.root.as_raw_fd())?,
             parent: reopen_directory(self.parent.as_raw_fd())?,
             name: self.root_name.clone(),
@@ -2419,7 +2422,7 @@ impl RootedDir {
             owner: metadata.st_uid,
             mode: (metadata.st_mode & 0o777) as u32,
             security_device: self.security_device,
-        });
+        }));
         Ok(lineage)
     }
 }
@@ -2446,24 +2449,11 @@ impl DirectoryBinding {
     }
 }
 
-fn clone_lineage(lineage: &[DirectoryBinding]) -> io::Result<Vec<DirectoryBinding>> {
-    lineage
-        .iter()
-        .map(|binding| {
-            Ok(DirectoryBinding {
-                directory: reopen_directory(binding.directory.as_raw_fd())?,
-                parent: reopen_directory(binding.parent.as_raw_fd())?,
-                name: binding.name.clone(),
-                identity: binding.identity,
-                owner: binding.owner,
-                mode: binding.mode,
-                security_device: binding.security_device,
-            })
-        })
-        .collect()
+fn clone_lineage(lineage: &[Arc<DirectoryBinding>]) -> Vec<Arc<DirectoryBinding>> {
+    lineage.to_vec()
 }
 
-fn verify_lineage(lineage: &[DirectoryBinding]) -> io::Result<()> {
+fn verify_lineage(lineage: &[Arc<DirectoryBinding>]) -> io::Result<()> {
     for binding in lineage {
         binding.verify()?;
     }
