@@ -403,6 +403,11 @@ impl<'a> RemoteSnapshotService<'a> {
                 ));
             }
         }
+        if directory.has_private_cleanup_residue()? {
+            return Err(WorkerError::Protocol(
+                "verified private cleanup residue remains".into(),
+            ));
+        }
         Ok(())
     }
 

@@ -889,6 +889,275 @@ fn every_resolution_cleanup_boundary_is_retryable_and_keeps_the_exact_lease() {
 }
 
 #[test]
+fn durable_mid_incoming_cleanup_crash_fails_closed() {
+    // Break caught: a resolver retry mistakes an absent caller-visible token
+    // for completed cleanup even though RootedDir left a partially deleted,
+    // privately acquired exact token behind after a crash.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let acquire = lease_request();
+    let lease = match LeaseService::new(&store)
+        .acquire(&acquire, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    let request = ResolveOrAbandonRequest::from_submit_request(&SubmitRequest::new(
+        acquire.material().clone(),
+    ))
+    .unwrap();
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    fs::create_dir_all(&incoming).unwrap();
+    for private in [incoming.parent().unwrap(), incoming.as_path()] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    replace_bytes(&incoming.join("removed-before-crash"), b"removed").unwrap();
+    replace_bytes(
+        &incoming.join("retained-after-crash"),
+        b"retain-exact-bytes",
+    )
+    .unwrap();
+
+    // Resolution publishes this exact durable authority before it starts
+    // mutable cleanup.
+    store.record_abandoned(&acquire, 2).unwrap();
+
+    // Recreate remove_owned_tree's durable post-rename, mid-recursion image.
+    let incoming_job = incoming.parent().unwrap().to_path_buf();
+    let private_namespace = incoming_job.join(".mac-worker-rooted-fs");
+    fs::create_dir(&private_namespace).unwrap();
+    fs::set_permissions(&private_namespace, fs::Permissions::from_mode(0o700)).unwrap();
+    let residue = private_namespace.join("cleanup-303f0f4a-6b5c-4d8e-9f00-112233445566");
+    fs::rename(&incoming, &residue).unwrap();
+    File::open(&private_namespace).unwrap().sync_all().unwrap();
+    File::open(&incoming_job).unwrap().sync_all().unwrap();
+    remove_and_sync(&residue.join("removed-before-crash"));
+    assert!(!incoming.exists());
+    assert!(!residue.join("removed-before-crash").exists());
+    assert_eq!(
+        fs::read(residue.join("retained-after-crash")).unwrap(),
+        b"retain-exact-bytes"
+    );
+    drop(store);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let response = JobService::new(&reopened, &RejectLauncher)
+        .resolve_or_abandon(request)
+        .unwrap();
+
+    assert!(
+        matches!(
+            response.outcome(),
+            ResolveOrAbandonOutcome::CleanupPending { code }
+                if code == "MUTABLE_CLEANUP_FAILED"
+        ),
+        "{response:?}"
+    );
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), Some(lease));
+    assert!(!residue.join("removed-before-crash").exists());
+    assert_eq!(
+        fs::read(residue.join("retained-after-crash")).unwrap(),
+        b"retain-exact-bytes"
+    );
+}
+
+#[test]
+fn durable_private_cleanup_residue_matrix_fails_closed() {
+    // Break caught: a resolver retry proves cleanup only from the vanished
+    // caller-visible name and overlooks RootedDir's durable private crash
+    // image, then releases the exact lease while owned bytes still remain.
+    #[derive(Clone, Copy, Debug)]
+    enum CrashImage {
+        FinalJobTree,
+        LeaseStageTree,
+        VerifiedRegular,
+        WholeIncomingJobTree,
+    }
+
+    let mut failures = Vec::new();
+    for (case_index, crash_image) in [
+        CrashImage::FinalJobTree,
+        CrashImage::LeaseStageTree,
+        CrashImage::VerifiedRegular,
+        CrashImage::WholeIncomingJobTree,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(format!("host-{case_index}"));
+        let (lease, request, residue, planted) = match crash_image {
+            CrashImage::FinalJobTree => {
+                let (store, lease, submit) = unindexed_identityless_job(&root);
+                let acquire = LeaseAcquireRequest::new(submit.material().clone());
+                let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+                let job = store
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap();
+                remove_and_sync(&job.join("status.json"));
+                store.record_abandoned(&acquire, 2).unwrap();
+
+                // This is the durable point reached only after earlier exact
+                // resolution scopes and the first two job trees are gone.
+                remove_and_sync(&job.join("execution.json"));
+                let receipt = store.verified_receipt(lease.job_id()).unwrap();
+                remove_and_sync(&receipt);
+                for name in ["workspace", "home"] {
+                    fs::remove_dir_all(job.join(name)).unwrap();
+                }
+                let tmp = job.join("tmp");
+                let planted = b"final-job-private-residue".to_vec();
+                replace_bytes(&tmp.join("retained-after-crash"), &planted).unwrap();
+                let private_namespace = job.join(".mac-worker-rooted-fs");
+                fs::create_dir_all(&private_namespace).unwrap();
+                fs::set_permissions(&private_namespace, fs::Permissions::from_mode(0o700)).unwrap();
+                assert_eq!(fs::read_dir(&private_namespace).unwrap().count(), 0);
+                let private_tree =
+                    private_namespace.join("cleanup-303f0f4a-6b5c-4d8e-9f00-112233445566");
+                fs::rename(&tmp, &private_tree).unwrap();
+                File::open(&private_namespace).unwrap().sync_all().unwrap();
+                File::open(&job).unwrap().sync_all().unwrap();
+                for name in ["workspace", "home", "tmp"] {
+                    assert!(!job.join(name).exists(), "{name} remains before retry");
+                }
+                let residue = private_tree.join("retained-after-crash");
+                assert_eq!(fs::read(&residue).unwrap(), planted);
+                drop(store);
+                (lease, request, residue, planted)
+            }
+            CrashImage::LeaseStageTree => {
+                let store = HostStore::open(&root).unwrap();
+                let acquire = lease_request();
+                let lease = match LeaseService::new(&store)
+                    .acquire(&acquire, &healthy(), 1)
+                    .unwrap()
+                {
+                    LeaseAcquireResponse::Acquired { lease } => lease,
+                    LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+                };
+                let submit = SubmitRequest::new(acquire.material().clone());
+                let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+                let leases = root.join("leases");
+                let stage = leases.join(format!(".job-{}-{}", lease.job_id(), "1".repeat(32)));
+                fs::create_dir(&stage).unwrap();
+                fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+                let planted = b"lease-stage-private-residue".to_vec();
+                replace_bytes(&stage.join("retained-after-crash"), &planted).unwrap();
+                store.record_abandoned(&acquire, 2).unwrap();
+
+                let private_namespace = leases.join(".mac-worker-rooted-fs");
+                fs::create_dir_all(&private_namespace).unwrap();
+                fs::set_permissions(&private_namespace, fs::Permissions::from_mode(0o700)).unwrap();
+                assert_eq!(fs::read_dir(&private_namespace).unwrap().count(), 0);
+                let private_tree =
+                    private_namespace.join("cleanup-303f0f4a-6b5c-4d8e-9f00-112233445566");
+                fs::rename(&stage, &private_tree).unwrap();
+                File::open(&private_namespace).unwrap().sync_all().unwrap();
+                File::open(&leases).unwrap().sync_all().unwrap();
+                assert!(!stage.exists());
+                let residue = private_tree.join("retained-after-crash");
+                assert_eq!(fs::read(&residue).unwrap(), planted);
+                drop(store);
+                (lease, request, residue, planted)
+            }
+            CrashImage::VerifiedRegular => {
+                let (store, lease, submit) = prepared_host(&root);
+                let acquire = LeaseAcquireRequest::new(submit.material().clone());
+                let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+                store.record_abandoned(&acquire, 2).unwrap();
+                let receipt = store.verified_receipt(lease.job_id()).unwrap();
+                let planted = fs::read(&receipt).unwrap();
+                let residue = receipt
+                    .parent()
+                    .unwrap()
+                    .join("remove-303f0f4a-6b5c-4d8e-9f00-112233445566");
+                fs::rename(&receipt, &residue).unwrap();
+                File::open(receipt.parent().unwrap())
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+                assert!(!receipt.exists());
+                assert_eq!(fs::read(&residue).unwrap(), planted);
+                drop(store);
+                (lease, request, residue, planted)
+            }
+            CrashImage::WholeIncomingJobTree => {
+                let store = HostStore::open(&root).unwrap();
+                let acquire = lease_request();
+                let lease = match LeaseService::new(&store)
+                    .acquire(&acquire, &healthy(), 1)
+                    .unwrap()
+                {
+                    LeaseAcquireResponse::Acquired { lease } => lease,
+                    LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+                };
+                let submit = SubmitRequest::new(acquire.material().clone());
+                let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+                let token = store
+                    .incoming_job(lease.job_id(), lease.lease_token())
+                    .unwrap();
+                fs::create_dir_all(&token).unwrap();
+                for directory in [token.parent().unwrap(), token.as_path()] {
+                    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                let planted = b"whole-incoming-job-private-residue".to_vec();
+                replace_bytes(&token.join("retained-after-crash"), &planted).unwrap();
+                store.record_abandoned(&acquire, 2).unwrap();
+
+                // Recreate cleanup_job_owned's outer remove_owned_child(job)
+                // post-publish image: the public job name is already gone.
+                let incoming_job = token.parent().unwrap().to_path_buf();
+                let incoming_root = incoming_job.parent().unwrap().to_path_buf();
+                let private_namespace = incoming_root.join(".mac-worker-rooted-fs");
+                fs::create_dir_all(&private_namespace).unwrap();
+                fs::set_permissions(&private_namespace, fs::Permissions::from_mode(0o700)).unwrap();
+                assert_eq!(fs::read_dir(&private_namespace).unwrap().count(), 0);
+                let private_tree =
+                    private_namespace.join("cleanup-303f0f4a-6b5c-4d8e-9f00-112233445566");
+                fs::rename(&incoming_job, &private_tree).unwrap();
+                File::open(&private_namespace).unwrap().sync_all().unwrap();
+                File::open(&incoming_root).unwrap().sync_all().unwrap();
+                assert!(!incoming_job.exists());
+                let residue = private_tree
+                    .join(lease.lease_token().to_string())
+                    .join("retained-after-crash");
+                assert_eq!(fs::read(&residue).unwrap(), planted);
+                drop(store);
+                (lease, request, residue, planted)
+            }
+        };
+
+        let reopened = HostStore::open(&root).unwrap();
+        let response = JobService::new(&reopened, &RejectLauncher)
+            .resolve_or_abandon(request)
+            .unwrap();
+        let cleanup_pending = matches!(
+            response.outcome(),
+            ResolveOrAbandonOutcome::CleanupPending { code }
+                if code == "MUTABLE_CLEANUP_FAILED"
+        );
+        let lease_retained = LeaseService::new(&reopened).load().unwrap() == Some(lease.clone());
+        let residue_preserved = fs::read(&residue).unwrap() == planted;
+        if !(cleanup_pending && lease_retained && residue_preserved) {
+            failures.push(format!(
+                "{crash_image:?}: outcome={:?}, lease_retained={lease_retained}, residue_preserved={residue_preserved}",
+                response.outcome()
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "durable private cleanup was mistaken for absence:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn response_loss_after_durable_retirement_retries_abandoned_without_resurrection() {
     // Break caught: the post-retirement crash seam recreates or wedges the
     // heavy slot, or a retry cannot recognize completed abandonment.

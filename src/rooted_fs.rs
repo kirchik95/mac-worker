@@ -796,6 +796,24 @@ impl RootedDir {
         })
     }
 
+    pub(crate) fn has_private_cleanup_residue(&self) -> io::Result<bool> {
+        self.verify_root_name()?;
+        let root = stat_fd(self.root.as_raw_fd())?;
+        let parent = stat_fd(self.parent.as_raw_fd())?;
+        if parent.st_dev != root.st_dev {
+            return Err(os_error(libc::EXDEV));
+        }
+        let nested_namespace_has_entries =
+            private_namespace_has_entries_at(self.root.as_raw_fd(), root.st_dev as u64)?;
+        let adjacent_namespace_has_entries =
+            private_namespace_has_entries_at(self.parent.as_raw_fd(), root.st_dev as u64)?;
+        let direct_remove_residue = directory_entries(self.root.as_raw_fd())?
+            .iter()
+            .any(|name| is_random_private_name(name, "remove"));
+        self.verify_root_name()?;
+        Ok(nested_namespace_has_entries || adjacent_namespace_has_entries || direct_remove_residue)
+    }
+
     pub(crate) fn validate_private_entry(&self, name: &str) -> io::Result<()> {
         self.verify_root_name()?;
         let name = CString::new(name).map_err(interior_nul_error)?;
@@ -3955,6 +3973,43 @@ fn random_private_name(kind: &str) -> CString {
     CString::new(format!("{kind}-{}", uuid::Uuid::new_v4())).expect("UUID private name has no NUL")
 }
 
+fn is_random_private_name(name: &CStr, kind: &str) -> bool {
+    let Ok(name) = name.to_str() else {
+        return false;
+    };
+    let Some(value) = name
+        .strip_prefix(kind)
+        .and_then(|name| name.strip_prefix('-'))
+    else {
+        return false;
+    };
+    uuid::Uuid::parse_str(value).is_ok_and(|uuid| uuid.hyphenated().to_string() == value)
+}
+
+fn private_namespace_has_entries_at(parent: RawFd, expected_device: u64) -> io::Result<bool> {
+    let initial = match stat_at(parent, PRIVATE_NAMESPACE_NAME) {
+        Ok(initial) => initial,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    require_private_directory_on_device(&initial, expected_device)?;
+    if initial.st_mode & 0o777 != 0o700 {
+        return Err(os_error(libc::ESTALE));
+    }
+    let namespace = open_directory_at(parent, PRIVATE_NAMESPACE_NAME)?;
+    let opened = stat_fd(namespace.as_raw_fd())?;
+    require_private_directory_on_device(&opened, expected_device)?;
+    if opened.st_mode & 0o777 != 0o700 || !same_file(&initial, &opened) {
+        return Err(os_error(libc::ESTALE));
+    }
+    let has_entries = !directory_entries(namespace.as_raw_fd())?.is_empty();
+    let current = stat_at(parent, PRIVATE_NAMESPACE_NAME)?;
+    if !same_file(&opened, &current) {
+        return Err(os_error(libc::ESTALE));
+    }
+    Ok(has_entries)
+}
+
 fn effective_user_id() -> libc::uid_t {
     // SAFETY: geteuid takes no arguments and has no memory-safety contract.
     unsafe { libc::geteuid() }
@@ -5406,6 +5461,40 @@ mod tests {
         assert!(acquired[0].is_dir());
         assert!(fs::read_dir(&acquired[0]).unwrap().count() >= 1);
         fs::remove_dir_all(&namespace_path).unwrap();
+    }
+
+    #[test]
+    fn cleanup_residue_probe_covers_nested_adjacent_and_direct_quarantines() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+
+        assert!(!root.has_private_cleanup_residue().unwrap());
+
+        let nested = root_path.join(".mac-worker-rooted-fs");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!root.has_private_cleanup_residue().unwrap());
+        let nested_cleanup = nested.join("cleanup-303f0f4a-6b5c-4d8e-9f00-112233445566");
+        fs::create_dir(&nested_cleanup).unwrap();
+        assert!(root.has_private_cleanup_residue().unwrap());
+        fs::remove_dir(&nested_cleanup).unwrap();
+        fs::remove_dir(&nested).unwrap();
+
+        let direct = root_path.join("remove-303f0f4a-6b5c-4d8e-9f00-112233445566");
+        fs::write(&direct, b"quarantined").unwrap();
+        assert!(root.has_private_cleanup_residue().unwrap());
+        fs::remove_file(&direct).unwrap();
+        fs::write(root_path.join("remove-not-an-operation"), b"ordinary").unwrap();
+        assert!(!root.has_private_cleanup_residue().unwrap());
+
+        let adjacent = physical.join(".mac-worker-rooted-fs");
+        fs::create_dir(&adjacent).unwrap();
+        fs::set_permissions(&adjacent, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(adjacent.join("operation-303f0f4a-6b5c-4d8e-9f00-112233445566")).unwrap();
+        assert!(root.has_private_cleanup_residue().unwrap());
     }
 
     #[test]

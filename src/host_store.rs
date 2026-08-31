@@ -2131,7 +2131,9 @@ impl HostStore {
                     "exact incoming scope remains after resolution cleanup".into(),
                 ));
             }
+            require_no_private_cleanup_residue(&job_incoming, "incoming job")?;
         }
+        require_no_private_cleanup_residue(&incoming, "incoming root")?;
         if let Some(job) = job {
             job.verify_bound()?;
             for name in ["workspace", "home", "tmp", "execution.json"] {
@@ -2141,7 +2143,9 @@ impl HostStore {
                     )));
                 }
             }
+            require_no_private_cleanup_residue(job, "resolution job")?;
         }
+        self.verify_resolution_verified_scope_absent(identity.job_id())?;
         let leases = self.open_directory("leases", false)?;
         let stage_prefix = format!(".job-{}-", identity.job_id());
         let exact_acquire = format!(".acquire-{}", identity.job_id());
@@ -2156,6 +2160,7 @@ impl HostStore {
                 ));
             }
         }
+        require_no_private_cleanup_residue(&leases, "lease staging")?;
         if self.consume_fault(HostStoreWritePoint::AfterResolutionAbsenceProof) {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected resolution absence proof interruption",
@@ -2699,6 +2704,7 @@ impl HostStore {
                 "incoming job scope remains after cleanup".into(),
             ));
         }
+        require_no_private_cleanup_residue(&incoming, "incoming root")?;
         if let Some(job) = self.open_optional_directory(&format!(
             "jobs/{}/{}/{}",
             lease.project_id(),
@@ -2712,6 +2718,7 @@ impl HostStore {
                     )));
                 }
             }
+            require_no_private_cleanup_residue(&job, "terminal job")?;
         }
         let leases = self.open_directory("leases", false)?;
         let stage_prefix = format!(".job-{}-", lease.job_id());
@@ -2727,6 +2734,7 @@ impl HostStore {
                 ));
             }
         }
+        require_no_private_cleanup_residue(&leases, "lease staging")?;
         Ok(())
     }
 
@@ -2740,7 +2748,9 @@ impl HostStore {
                     "exact incoming scope remains after cleanup".into(),
                 ));
             }
+            require_no_private_cleanup_residue(&job_incoming, "incoming job")?;
         }
+        require_no_private_cleanup_residue(&incoming, "incoming root")?;
         if let Some(job) = self.open_optional_directory(&format!(
             "jobs/{}/{}/{}",
             lease.project_id(),
@@ -2754,7 +2764,9 @@ impl HostStore {
                     )));
                 }
             }
+            require_no_private_cleanup_residue(&job, "resolution job")?;
         }
+        self.verify_resolution_verified_scope_absent(lease.job_id())?;
         let leases = self.open_directory("leases", false)?;
         let stage_prefix = format!(".job-{}-", lease.job_id());
         let exact_acquire = format!(".acquire-{}", lease.job_id());
@@ -2769,6 +2781,7 @@ impl HostStore {
                 ));
             }
         }
+        require_no_private_cleanup_residue(&leases, "lease staging")?;
         Ok(())
     }
 
@@ -2785,7 +2798,9 @@ impl HostStore {
                     "exact incoming scope remains after cleanup".into(),
                 ));
             }
+            require_no_private_cleanup_residue(&job_incoming, "incoming job")?;
         }
+        require_no_private_cleanup_residue(&incoming, "incoming root")?;
         if let Some(job) = self.open_optional_directory(&format!(
             "jobs/{}/{}/{}",
             identity.project_id(),
@@ -2799,7 +2814,9 @@ impl HostStore {
                     )));
                 }
             }
+            require_no_private_cleanup_residue(&job, "resolution job")?;
         }
+        self.verify_resolution_verified_scope_absent(identity.job_id())?;
         let leases = self.open_directory("leases", false)?;
         let stage_prefix = format!(".job-{}-", identity.job_id());
         let exact_acquire = format!(".acquire-{}", identity.job_id());
@@ -2814,7 +2831,20 @@ impl HostStore {
                 ));
             }
         }
+        require_no_private_cleanup_residue(&leases, "lease staging")?;
         Ok(())
+    }
+
+    fn verify_resolution_verified_scope_absent(&self, job: JobId) -> Result<(), WorkerError> {
+        let verified = self.open_directory("verified", false)?;
+        for name in [format!("{job}.json"), format!(".verify-{job}.json.pending")] {
+            if verified.entry_exists(&name)? {
+                return Err(WorkerError::Protocol(
+                    "exact verified state remains after resolution cleanup".into(),
+                ));
+            }
+        }
+        require_no_private_cleanup_residue(&verified, "verified state")
     }
 
     fn open_optional_directory(&self, path: &str) -> Result<Option<RootedDir>, WorkerError> {
@@ -3582,6 +3612,18 @@ fn validate_digest(value: &str, label: &str) -> Result<(), WorkerError> {
             "{label} must be 64 lowercase hexadecimal bytes"
         )))
     }
+}
+
+fn require_no_private_cleanup_residue(
+    directory: &RootedDir,
+    scope: &str,
+) -> Result<(), WorkerError> {
+    if directory.has_private_cleanup_residue()? {
+        return Err(WorkerError::Protocol(format!(
+            "{scope} private cleanup residue remains"
+        )));
+    }
+    Ok(())
 }
 
 fn protocol_code(code: &'static str, message: &str) -> WorkerError {
