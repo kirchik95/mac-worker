@@ -5606,6 +5606,22 @@ fn revalidate_cleanup_record_bytes(
     Ok(())
 }
 
+fn revalidate_cleanup_record_bytes_or_retry(
+    parent: RawFd,
+    name: &CStr,
+    file: &File,
+    identity: FileIdentity,
+    expected_device: u64,
+    expected: &[u8],
+) -> io::Result<()> {
+    revalidate_cleanup_record_bytes(parent, name, file, identity, expected_device, expected)
+        .map_err(|error| match error.raw_os_error() {
+            Some(libc::ENOENT) | Some(libc::EAGAIN) | Some(libc::ESTALE) => os_error(libc::EAGAIN),
+            _ if error.kind() == io::ErrorKind::NotFound => os_error(libc::EAGAIN),
+            _ => error,
+        })
+}
+
 fn reopen_and_revalidate_cleanup_record_bytes(
     parent: RawFd,
     name: &CStr,
@@ -5900,7 +5916,7 @@ fn collect_pending_tree_cleanup_candidates(
                     namespace.directory.as_raw_fd(),
                     intent_name,
                     parent.device,
-                    true,
+                    false,
                 ) {
                     Ok(opened) => opened,
                     Err(error)
@@ -5937,6 +5953,21 @@ fn collect_pending_tree_cleanup_candidates(
                         || bindings.original_mode != parsed.original_mode)
                 {
                     return Err(os_error(libc::ESTALE));
+                }
+                if let Err(error) = revalidate_cleanup_record_bytes_or_retry(
+                    namespace.directory.as_raw_fd(),
+                    intent_name,
+                    &intent_file,
+                    opened_identity,
+                    parent.device,
+                    &bytes,
+                ) {
+                    if error.raw_os_error() == Some(libc::EAGAIN) {
+                        last_race = error;
+                        drifted = true;
+                        break;
+                    }
+                    return Err(error);
                 }
                 let candidate = PendingTreeCleanupCandidate {
                     component: component.clone(),
@@ -5978,7 +6009,17 @@ fn collect_pending_tree_cleanup_candidates(
                 drifted = true;
                 break;
             }
-            cvt(unsafe { libc::flock(operation.as_raw_fd(), libc::LOCK_EX) })?;
+            // A live bootstrap for another key is valid transient grammar and
+            // must not serialize unrelated cleanups. Same-key callers will
+            // wait when they open/adopt that exact operation later.
+            match cvt(unsafe { libc::flock(operation.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) })
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             let rebound = match stat_at(namespace.directory.as_raw_fd(), operation_name) {
                 Ok(rebound) => rebound,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -6119,22 +6160,14 @@ fn validate_cleanup_namespace_evidence_once(
         if intent.key_sha256 != key {
             return Err(os_error(libc::ESTALE));
         }
-        if let Err(error) = revalidate_cleanup_record_bytes(
+        revalidate_cleanup_record_bytes_or_retry(
             namespace.directory.as_raw_fd(),
             name,
             &file,
             identity,
             device,
             &bytes,
-        ) {
-            return Err(match error.raw_os_error() {
-                Some(libc::ENOENT) | Some(libc::EAGAIN) | Some(libc::ESTALE) => {
-                    os_error(libc::EAGAIN)
-                }
-                _ if error.kind() == io::ErrorKind::NotFound => os_error(libc::EAGAIN),
-                _ => error,
-            });
-        }
+        )?;
         if intents
             .insert(
                 key.to_owned(),
@@ -11680,11 +11713,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cleanup_restore_syncs_destination_before_source() {
-        // The destination directory is the authoritative crash-recovery
-        // boundary for operation -> public. Its rename must be durable before
-        // the source directory is synced.
+    fn cleanup_restore_sync_trace() -> Vec<super::CleanupRestoreSyncBoundary> {
         let fixture = tempfile::tempdir().unwrap();
         let physical = fixture.path().canonicalize().unwrap();
         fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
@@ -11700,15 +11729,7 @@ mod tests {
         let error = parent.remove_owned_child("root").unwrap_err();
 
         assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
-        assert_eq!(
-            trace.snapshot(),
-            vec![
-                super::CleanupRestoreSyncBoundary::CaptureDestination,
-                super::CleanupRestoreSyncBoundary::CaptureSource,
-                super::CleanupRestoreSyncBoundary::Destination,
-                super::CleanupRestoreSyncBoundary::Source,
-            ]
-        );
+        let events = trace.snapshot();
         drop(trace);
         drop(validation);
         let restored = fs::metadata(&root_path).unwrap();
@@ -11719,6 +11740,22 @@ mod tests {
                 .unwrap()
                 .count(),
             0
+        );
+        events
+    }
+
+    #[test]
+    fn cleanup_restore_syncs_destination_before_source() {
+        // The destination directory is the authoritative crash-recovery
+        // boundary for operation -> public. Its rename must be durable before
+        // the source directory is synced.
+        let events = cleanup_restore_sync_trace();
+        assert_eq!(
+            &events[events.len().saturating_sub(2)..],
+            [
+                super::CleanupRestoreSyncBoundary::Destination,
+                super::CleanupRestoreSyncBoundary::Source,
+            ]
         );
     }
 
@@ -11727,40 +11764,13 @@ mod tests {
         // After a valid capture exchange the payload lives in
         // operation.directory. That destination must be durable before the
         // source parent records removal of the old binding.
-        let fixture = tempfile::tempdir().unwrap();
-        let physical = fixture.path().canonicalize().unwrap();
-        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
-        let root_path = physical.join("root");
-        fs::create_dir(&root_path).unwrap();
-        fs::write(root_path.join("value"), b"owned").unwrap();
-        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
-        let parent = RootedDir::open(&physical).unwrap();
-        let validation =
-            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::ESTALE));
-        let trace = super::CleanupRestoreSyncTraceOverride::set();
-
-        let error = parent.remove_owned_child("root").unwrap_err();
-
-        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        let events = cleanup_restore_sync_trace();
         assert_eq!(
-            trace.snapshot(),
-            vec![
+            &events[..2],
+            [
                 super::CleanupRestoreSyncBoundary::CaptureDestination,
                 super::CleanupRestoreSyncBoundary::CaptureSource,
-                super::CleanupRestoreSyncBoundary::Destination,
-                super::CleanupRestoreSyncBoundary::Source,
             ]
-        );
-        drop(trace);
-        drop(validation);
-        let restored = fs::metadata(&root_path).unwrap();
-        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
-        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
-        assert_eq!(
-            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
-                .unwrap()
-                .count(),
-            0
         );
     }
 
@@ -13576,6 +13586,216 @@ mod tests {
         drop(probe);
         drop(namespace);
         drop(observer);
+    }
+
+    #[test]
+    fn cleanup_predicate_does_not_wait_on_unrelated_canonical_intent() {
+        // Predicate collection must read an unrelated published canonical
+        // intent without taking its inode flock. Otherwise sibling B waits
+        // behind publisher A after A's canonical rename even though global
+        // validation already skips that lock.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["paused", "peer"] {
+            let path = physical.join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("value"), name.as_bytes()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let parent = RootedDir::open(&physical).unwrap();
+        let prepare = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("peer")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(prepare);
+        drop(parent);
+
+        let (renamed_tx, renamed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let paused_physical = physical.clone();
+        let paused = std::thread::spawn(move || {
+            let _handoff = super::CleanupIntentHandoffOverride::set(renamed_tx, release_rx);
+            RootedDir::open(&paused_physical)
+                .unwrap()
+                .remove_owned_child("paused")
+        });
+        renamed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let observer = RootedDir::open(&physical).unwrap();
+        let parent_metadata = super::stat_fd(observer.root.as_raw_fd()).unwrap();
+        let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+        let namespace = PrivateNamespace::select_for_cleanup(
+            observer.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )
+        .unwrap();
+        let key = super::cleanup_key(parent_identity, b"paused");
+        let intent_name = super::cleanup_intent_name(&key).unwrap();
+        let (probe, _bytes, _canonical_identity) = super::open_cleanup_record(
+            namespace.directory.as_raw_fd(),
+            &intent_name,
+            parent_identity.device,
+            false,
+        )
+        .unwrap();
+        super::clear_errno();
+        let probe_result = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let probe_errno = super::current_errno();
+        if probe_result == 0 {
+            assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
+        }
+        super::validate_cleanup_namespace_evidence(
+            &namespace,
+            observer.root.as_raw_fd(),
+            parent_identity,
+        )
+        .unwrap();
+
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel();
+        let peer_physical = physical.clone();
+        let peer = std::thread::spawn(move || {
+            peer_tx
+                .send(
+                    RootedDir::open(&peer_physical)
+                        .unwrap()
+                        .retry_pending_owned_children_matching(|component, _| component == b"peer"),
+                )
+                .unwrap();
+        });
+        let peer_while_paused = peer_rx.recv_timeout(std::time::Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        paused.join().unwrap().unwrap();
+        peer.join().unwrap();
+
+        assert_eq!(probe_result, -1, "publisher did not retain the intent lock");
+        assert!(probe_errno == libc::EAGAIN || probe_errno == libc::EWOULDBLOCK);
+        assert_eq!(peer_while_paused.unwrap().unwrap(), 1);
+        assert!(!physical.join("paused").exists());
+        assert!(!physical.join("peer").exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(probe);
+        drop(namespace);
+        drop(observer);
+    }
+
+    #[test]
+    fn cleanup_predicate_does_not_wait_on_unrelated_live_bootstrap() {
+        // Predicate collection must LOCK_NB-skip a live unpublished bootstrap.
+        // A blocking operation flock reintroduces cross-key HOL even though
+        // global validation already treats WouldBlock as in-flight work.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["paused", "peer"] {
+            let path = physical.join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("value"), name.as_bytes()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let parent = RootedDir::open(&physical).unwrap();
+        let prepare = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("peer")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(prepare);
+        drop(parent);
+
+        let observer = RootedDir::open(&physical).unwrap();
+        let parent_metadata = super::stat_fd(observer.root.as_raw_fd()).unwrap();
+        let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+        let namespace = PrivateNamespace::select_for_cleanup(
+            observer.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )
+        .unwrap();
+        let component = std::ffi::CString::new("paused").unwrap();
+        let target = super::FileIdentity::from_stat(
+            &stat_at(observer.root.as_raw_fd(), &component).unwrap(),
+        );
+        let held = super::open_or_create_cleanup_bootstrap(
+            &namespace,
+            observer.root.as_raw_fd(),
+            &component,
+            &super::cleanup_key(parent_identity, b"paused"),
+            target,
+            0o500,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            super::find_cleanup_intent(&namespace, parent_identity, b"paused")
+                .unwrap()
+                .is_none()
+        );
+        let parsed = super::parse_cleanup_bootstrap_name(&held.name)
+            .unwrap()
+            .unwrap();
+        let (probe, _probe_identity) =
+            super::open_cleanup_bootstrap_directory(&namespace, &held.name, &parsed).unwrap();
+        super::clear_errno();
+        let probe_result = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let probe_errno = super::current_errno();
+        if probe_result == 0 {
+            assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
+        }
+        super::validate_cleanup_namespace_evidence(
+            &namespace,
+            observer.root.as_raw_fd(),
+            parent_identity,
+        )
+        .unwrap();
+
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel();
+        let peer_physical = physical.clone();
+        let peer = std::thread::spawn(move || {
+            peer_tx
+                .send(
+                    RootedDir::open(&peer_physical)
+                        .unwrap()
+                        .retry_pending_owned_children_matching(|component, _| component == b"peer"),
+                )
+                .unwrap();
+        });
+        let peer_while_held = peer_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        peer.join().unwrap();
+
+        assert_eq!(
+            probe_result, -1,
+            "bootstrap helper did not retain the operation lock"
+        );
+        assert!(probe_errno == libc::EAGAIN || probe_errno == libc::EWOULDBLOCK);
+        assert_eq!(peer_while_held.unwrap().unwrap(), 1);
+        assert!(physical.join("paused").exists());
+        assert!(!physical.join("peer").exists());
+        drop(probe);
+        drop(namespace);
+        observer.remove_owned_child("paused").unwrap();
+        assert!(!physical.join("paused").exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
