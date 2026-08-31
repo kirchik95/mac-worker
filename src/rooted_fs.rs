@@ -10,7 +10,7 @@ use std::{
         unix::{ffi::OsStrExt, fs::FileExt},
     },
     path::{Component, Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex, MutexGuard},
+    sync::{Arc, Condvar, LazyLock, Mutex},
 };
 
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,31 @@ const CLEANUP_PROBE_DIRECTORY_DESTINATION: &CStr = c"directory-no-replace-destin
 const CLEANUP_PROBE_EXCHANGE_LEFT: &CStr = c"directory-exchange-left-v1";
 const CLEANUP_PROBE_EXCHANGE_RIGHT: &CStr = c"directory-exchange-right-v1";
 
-static CLEANUP_PROCESS_JOURNAL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+struct CleanupProcessKeyRegistry {
+    active: Mutex<BTreeSet<String>>,
+    released: Condvar,
+}
+
+static CLEANUP_PROCESS_KEYS: LazyLock<CleanupProcessKeyRegistry> =
+    LazyLock::new(|| CleanupProcessKeyRegistry {
+        active: Mutex::new(BTreeSet::new()),
+        released: Condvar::new(),
+    });
+
+struct CleanupProcessKeyGuard {
+    key: String,
+}
+
+impl Drop for CleanupProcessKeyGuard {
+    fn drop(&mut self) {
+        let mut active = match CLEANUP_PROCESS_KEYS.active.lock() {
+            Ok(active) => active,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        active.remove(&self.key);
+        CLEANUP_PROCESS_KEYS.released.notify_all();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -278,6 +302,15 @@ thread_local! {
     static TEST_CLEANUP_DECISION_REWRITE_HANDOFF: std::cell::RefCell<Option<CleanupDecisionRewriteHandoff>> = const {
         std::cell::RefCell::new(None)
     };
+    static TEST_CLEANUP_INTENT_RETIRE_HANDOFF: std::cell::RefCell<Option<CleanupIntentRetireHandoff>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static TEST_CLEANUP_PREDICATE_COMPLETION_HANDOFF: std::cell::RefCell<Option<CleanupPredicateCompletionHandoff>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static TEST_CLEANUP_RESTORE_SYNC_TRACE: std::cell::RefCell<Option<Vec<CleanupRestoreSyncBoundary>>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 #[cfg(test)]
@@ -372,6 +405,7 @@ enum CleanupFault {
     AfterTargetChmod(libc::c_int),
     AfterFirstRemoval(libc::c_int),
     BeforeFinalRootRemoval(libc::c_int),
+    AfterCleanupTargetExchange(libc::c_int),
 }
 
 #[cfg(test)]
@@ -385,6 +419,8 @@ enum CleanupDecisionFault {
     AfterRename(libc::c_int),
     AfterDestinationSync(libc::c_int),
     AfterSourceSync(libc::c_int),
+    AfterRestoreDestinationSync(libc::c_int),
+    AfterRestoreSourceSync(libc::c_int),
     DuringRestoreRollback(libc::c_int),
     AfterRestoreSync(libc::c_int),
     AfterDecisionRetire(libc::c_int),
@@ -519,6 +555,88 @@ impl CleanupDecisionRewriteHandoffOverride {
 impl Drop for CleanupDecisionRewriteHandoffOverride {
     fn drop(&mut self) {
         TEST_CLEANUP_DECISION_REWRITE_HANDOFF.replace(self.0.take());
+    }
+}
+
+#[cfg(test)]
+struct CleanupIntentRetireHandoff {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct CleanupIntentRetireHandoffOverride(Option<CleanupIntentRetireHandoff>);
+
+#[cfg(test)]
+impl CleanupIntentRetireHandoffOverride {
+    fn set(reached: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>) -> Self {
+        Self(
+            TEST_CLEANUP_INTENT_RETIRE_HANDOFF
+                .replace(Some(CleanupIntentRetireHandoff { reached, release })),
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for CleanupIntentRetireHandoffOverride {
+    fn drop(&mut self) {
+        TEST_CLEANUP_INTENT_RETIRE_HANDOFF.replace(self.0.take());
+    }
+}
+
+#[cfg(test)]
+struct CleanupPredicateCompletionHandoff {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct CleanupPredicateCompletionHandoffOverride(Option<CleanupPredicateCompletionHandoff>);
+
+#[cfg(test)]
+impl CleanupPredicateCompletionHandoffOverride {
+    fn set(reached: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>) -> Self {
+        Self(
+            TEST_CLEANUP_PREDICATE_COMPLETION_HANDOFF
+                .replace(Some(CleanupPredicateCompletionHandoff { reached, release })),
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for CleanupPredicateCompletionHandoffOverride {
+    fn drop(&mut self) {
+        TEST_CLEANUP_PREDICATE_COMPLETION_HANDOFF.replace(self.0.take());
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupRestoreSyncBoundary {
+    CaptureDestination,
+    CaptureSource,
+    Destination,
+    Source,
+}
+
+#[cfg(test)]
+struct CleanupRestoreSyncTraceOverride(Option<Vec<CleanupRestoreSyncBoundary>>);
+
+#[cfg(test)]
+impl CleanupRestoreSyncTraceOverride {
+    fn set() -> Self {
+        Self(TEST_CLEANUP_RESTORE_SYNC_TRACE.replace(Some(Vec::new())))
+    }
+
+    fn snapshot(&self) -> Vec<CleanupRestoreSyncBoundary> {
+        TEST_CLEANUP_RESTORE_SYNC_TRACE.with(|trace| trace.borrow().clone().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+impl Drop for CleanupRestoreSyncTraceOverride {
+    fn drop(&mut self) {
+        TEST_CLEANUP_RESTORE_SYNC_TRACE.replace(self.0.take());
     }
 }
 
@@ -1761,7 +1879,12 @@ impl RootedDir {
     }
 
     pub(crate) fn remove_owned_child(&self, name: &str) -> io::Result<()> {
-        let _process_journal = lock_cleanup_process_journal()?;
+        let component = private_leaf_name(name)?;
+        self.verify_root_name()?;
+        let parent_metadata = stat_fd(self.root.as_raw_fd())?;
+        require_private_directory(&parent_metadata)?;
+        let parent = FileIdentity::from_stat(&parent_metadata);
+        let _process_key = lock_cleanup_process_key(parent, component.to_bytes())?;
         self.remove_owned_child_inner(name)
     }
 
@@ -1958,12 +2081,12 @@ impl RootedDir {
     }
 
     pub(crate) fn resume_pending_owned_child_cleanup(&self, name: &str) -> io::Result<bool> {
-        let _process_journal = lock_cleanup_process_journal()?;
         let component = private_leaf_name(name)?;
         self.verify_root_name()?;
         let parent_metadata = stat_fd(self.root.as_raw_fd())?;
         require_private_directory(&parent_metadata)?;
         let parent = FileIdentity::from_stat(&parent_metadata);
+        let _process_key = lock_cleanup_process_key(parent, component.to_bytes())?;
         let namespace = PrivateNamespace::select_for_cleanup(
             self.root.as_raw_fd(),
             parent_metadata.st_dev,
@@ -2029,6 +2152,7 @@ impl RootedDir {
                 )?;
                 return match outcome {
                     TreeCleanupOutcome::Deleted | TreeCleanupOutcome::Restored(None) => Ok(true),
+                    TreeCleanupOutcome::AlreadyRetired => Ok(false),
                     TreeCleanupOutcome::Restored(Some(error)) => Err(error),
                 };
             }
@@ -2051,6 +2175,7 @@ impl RootedDir {
                 )?;
                 return match outcome {
                     TreeCleanupOutcome::Deleted | TreeCleanupOutcome::Restored(None) => Ok(true),
+                    TreeCleanupOutcome::AlreadyRetired => Ok(false),
                     TreeCleanupOutcome::Restored(Some(error)) => Err(error),
                 };
             }
@@ -2062,7 +2187,6 @@ impl RootedDir {
         &self,
         mut predicate: impl FnMut(&[u8], PrivateEntryIdentity) -> bool,
     ) -> io::Result<usize> {
-        let _process_journal = lock_cleanup_process_journal()?;
         self.verify_root_name()?;
         let parent_metadata = stat_fd(self.root.as_raw_fd())?;
         require_private_directory(&parent_metadata)?;
@@ -2150,6 +2274,7 @@ impl RootedDir {
                 if !approved {
                     continue;
                 }
+                let _process_key = lock_cleanup_process_key(parent, &candidate.component)?;
                 let current = match collect_pending_tree_cleanup_candidates(
                     &namespace,
                     self.root.as_raw_fd(),
@@ -2176,6 +2301,7 @@ impl RootedDir {
                     retry = true;
                     break;
                 }
+                injected_cleanup_predicate_completion_handoff();
                 match complete_bound_tree_cleanup_outcome(
                     &namespace,
                     self.root.as_raw_fd(),
@@ -2189,6 +2315,11 @@ impl RootedDir {
                 ) {
                     Ok(TreeCleanupOutcome::Deleted) => {
                         resumed += 1;
+                        retry = true;
+                        break;
+                    }
+                    Ok(TreeCleanupOutcome::AlreadyRetired) => {
+                        last_race = os_error(libc::EAGAIN);
                         retry = true;
                         break;
                     }
@@ -2857,12 +2988,12 @@ impl RootedDir {
     }
 
     pub fn remove_owned_tree(&self) -> io::Result<()> {
-        let _process_journal = lock_cleanup_process_journal()?;
         let parent_metadata = stat_fd(self.parent.as_raw_fd())?;
         let parent = FileIdentity::from_stat(&parent_metadata);
         if self.root_identity.device != parent.device {
             return Err(os_error(libc::EXDEV));
         }
+        let _process_key = lock_cleanup_process_key(parent, self.root_name.to_bytes())?;
         let namespace = PrivateNamespace::select_for_cleanup(
             self.parent.as_raw_fd(),
             parent_metadata.st_dev,
@@ -3408,6 +3539,7 @@ struct LoadedCleanupDecision {
 #[derive(Debug)]
 enum TreeCleanupOutcome {
     Deleted,
+    AlreadyRetired,
     Restored(Option<io::Error>),
 }
 
@@ -4899,9 +5031,14 @@ fn capture_expected_entry(
         .as_ref()
         .is_ok_and(|metadata| FileIdentity::from_stat(metadata) == placeholder);
     if valid {
-        if let Err(error) = cvt(unsafe { libc::fsync(source_parent) })
-            .and_then(|()| cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) }))
-        {
+        let synced = (|| {
+            cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
+            record_cleanup_capture_destination_sync();
+            cvt(unsafe { libc::fsync(source_parent) })?;
+            record_cleanup_capture_source_sync();
+            Ok(())
+        })();
+        if let Err(error) = synced {
             // The exact owned entry has already crossed into the private
             // operation. Preserve it there when durability is uncertain.
             operation.cleaned = true;
@@ -5484,11 +5621,47 @@ fn cleanup_record_error() -> io::Error {
     os_error(libc::EINVAL)
 }
 
-fn lock_cleanup_process_journal() -> io::Result<MutexGuard<'static, ()>> {
-    Ok(match CLEANUP_PROCESS_JOURNAL_LOCK.lock() {
-        Ok(guard) => guard,
+fn lock_cleanup_process_key(
+    parent: FileIdentity,
+    component: &[u8],
+) -> io::Result<CleanupProcessKeyGuard> {
+    lock_cleanup_process_serialization_key(cleanup_process_key_id(parent, component))
+}
+
+fn cleanup_process_key_id(parent: FileIdentity, component: &[u8]) -> String {
+    format!("cleanup:{}", cleanup_key(parent, component))
+}
+
+#[cfg(test)]
+fn try_lock_cleanup_process_key(
+    parent: FileIdentity,
+    component: &[u8],
+) -> io::Result<Option<CleanupProcessKeyGuard>> {
+    let key = cleanup_process_key_id(parent, component);
+    let mut active = match CLEANUP_PROCESS_KEYS.active.lock() {
+        Ok(active) => active,
         Err(poisoned) => poisoned.into_inner(),
-    })
+    };
+    if active.contains(&key) {
+        return Ok(None);
+    }
+    active.insert(key.clone());
+    Ok(Some(CleanupProcessKeyGuard { key }))
+}
+
+fn lock_cleanup_process_serialization_key(key: String) -> io::Result<CleanupProcessKeyGuard> {
+    let mut active = match CLEANUP_PROCESS_KEYS.active.lock() {
+        Ok(active) => active,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    while active.contains(&key) {
+        active = match CLEANUP_PROCESS_KEYS.released.wait(active) {
+            Ok(active) => active,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+    }
+    active.insert(key.clone());
+    Ok(CleanupProcessKeyGuard { key })
 }
 
 fn with_cleanup_namespace_lock<T>(
@@ -5498,6 +5671,13 @@ fn with_cleanup_namespace_lock<T>(
     // This lock protects only short, descriptor-relative namespace snapshots
     // and same-key bootstrap publication. Callers must not wait for an intent
     // or operation lock, recurse, or invoke user code from `action`.
+    // `flock` ownership differs across Unix implementations. Pair it with a
+    // same-process mutex so independent OFDs cannot split one logical
+    // snapshot or accidentally unlock each other in this process.
+    let _process_namespace = lock_cleanup_process_serialization_key(format!(
+        "namespace:{:016x}:{:016x}",
+        namespace.identity.device, namespace.identity.inode
+    ))?;
     cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_EX) })?;
     let result = action();
     let unlock = cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_UN) });
@@ -5927,8 +6107,8 @@ fn validate_cleanup_namespace_evidence_once(
         if cleanup_intent_name(key)?.as_bytes() != name.as_bytes() {
             return Err(cleanup_record_error());
         }
-        let (_file, bytes, identity) =
-            open_cleanup_record(namespace.directory.as_raw_fd(), name, device, true)?;
+        let (file, bytes, identity) =
+            open_cleanup_record(namespace.directory.as_raw_fd(), name, device, false)?;
         let intent: CleanupIntentV1 = cleanup_parse_canonical_json(&bytes)?;
         let component = cleanup_hex_decode(&intent.component_hex)?;
         let parent = FileIdentity::from(intent.parent);
@@ -5936,17 +6116,35 @@ fn validate_cleanup_namespace_evidence_once(
             return Err(os_error(libc::ESTALE));
         }
         let bindings = validate_cleanup_intent(&intent, parent, &component, namespace)?;
-        if intent.key_sha256 != key
-            || intents
-                .insert(
-                    key.to_owned(),
-                    EvidenceIntent {
-                        intent,
-                        identity,
-                        bindings,
-                    },
-                )
-                .is_some()
+        if intent.key_sha256 != key {
+            return Err(os_error(libc::ESTALE));
+        }
+        if let Err(error) = revalidate_cleanup_record_bytes(
+            namespace.directory.as_raw_fd(),
+            name,
+            &file,
+            identity,
+            device,
+            &bytes,
+        ) {
+            return Err(match error.raw_os_error() {
+                Some(libc::ENOENT) | Some(libc::EAGAIN) | Some(libc::ESTALE) => {
+                    os_error(libc::EAGAIN)
+                }
+                _ if error.kind() == io::ErrorKind::NotFound => os_error(libc::EAGAIN),
+                _ => error,
+            });
+        }
+        if intents
+            .insert(
+                key.to_owned(),
+                EvidenceIntent {
+                    intent,
+                    identity,
+                    bindings,
+                },
+            )
+            .is_some()
         {
             return Err(os_error(libc::ESTALE));
         }
@@ -5980,11 +6178,17 @@ fn validate_cleanup_namespace_evidence_once(
             let intent_name = cleanup_intent_name(key)?;
             let (operation, operation_identity) =
                 open_cleanup_bootstrap_directory(namespace, operation_name, parsed)?;
-            // No namespace lock is held while waiting for the keyed bootstrap
-            // owner. A completed publisher makes the canonical intent visible
-            // before releasing this lock, so the validator can restart from a
-            // coherent grammar instead of misclassifying the handoff.
-            cvt(unsafe { libc::flock(operation.as_raw_fd(), libc::LOCK_EX) })?;
+            // A live bootstrap for another key is valid transient grammar and
+            // must not serialize unrelated cleanups. Same-key callers will
+            // wait when they open/adopt that exact operation later.
+            match cvt(unsafe { libc::flock(operation.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) })
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             let rebound = match stat_at(namespace.directory.as_raw_fd(), operation_name) {
                 Ok(rebound) => rebound,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -6814,6 +7018,7 @@ fn resolve_bound_tree_cleanup(
     let mut last_race = os_error(libc::ESTALE);
     let mut pending_restore_error = None;
     let mut restore_expected = false;
+    let mut locally_completed_delete = false;
     for _ in 0..32 {
         validate_cleanup_namespace_evidence(namespace, public_parent, parent)?;
         if let Some(loaded) = find_cleanup_intent(namespace, parent, component)? {
@@ -6839,7 +7044,13 @@ fn resolve_bound_tree_cleanup(
                 &mut restore_expected,
             );
             match result {
-                Ok(TreeCleanupOutcome::Deleted) => continue,
+                Ok(TreeCleanupOutcome::Deleted) => {
+                    locally_completed_delete = true;
+                    continue;
+                }
+                Ok(TreeCleanupOutcome::AlreadyRetired) => {
+                    return Ok(TreeCleanupOutcome::AlreadyRetired);
+                }
                 Ok(outcome @ TreeCleanupOutcome::Restored(_)) => return Ok(outcome),
                 Err(error)
                     if matches!(
@@ -6899,7 +7110,12 @@ fn resolve_bound_tree_cleanup(
             CleanupTerminalSnapshot::Absent if restore_expected => {
                 return Err(os_error(libc::ESTALE));
             }
-            CleanupTerminalSnapshot::Absent => return Ok(TreeCleanupOutcome::Deleted),
+            CleanupTerminalSnapshot::Absent if locally_completed_delete || generation.is_none() => {
+                return Ok(TreeCleanupOutcome::Deleted);
+            }
+            CleanupTerminalSnapshot::Absent => {
+                return Ok(TreeCleanupOutcome::AlreadyRetired);
+            }
             CleanupTerminalSnapshot::Public(metadata) if restore_expected => {
                 if file_type(metadata.st_mode) != libc::S_IFDIR
                     || metadata.st_uid != effective_user_id()
@@ -6985,6 +7201,9 @@ fn complete_bound_tree_cleanup_outcome(
             allow_injected_validation,
         )? {
             TreeCleanupOutcome::Deleted => return Ok(TreeCleanupOutcome::Deleted),
+            TreeCleanupOutcome::AlreadyRetired => {
+                return Ok(TreeCleanupOutcome::AlreadyRetired);
+            }
             TreeCleanupOutcome::Restored(Some(error)) => return Err(error),
             TreeCleanupOutcome::Restored(None) => {
                 if continuation != 0 {
@@ -8193,6 +8412,7 @@ fn remove_bound_cleanup_record(
     name: &CStr,
     file: &File,
     expected: FileIdentity,
+    before_sync: impl FnOnce(),
 ) -> io::Result<()> {
     let opened = stat_fd(file.as_raw_fd())?;
     let current = stat_at(namespace.directory.as_raw_fd(), name)?;
@@ -8205,6 +8425,7 @@ fn remove_bound_cleanup_record(
         return Err(os_error(libc::ESTALE));
     }
     unlink_at(namespace.directory.as_raw_fd(), name, 0)?;
+    before_sync();
     cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })
 }
 
@@ -8213,14 +8434,28 @@ fn finish_cleanup_records(
     loaded: &LoadedCleanupIntent,
     decision: Option<&LoadedCleanupDecision>,
 ) -> io::Result<()> {
-    if let Some(decision) = decision {
-        let decision_name = cleanup_decision_name(&loaded.intent.key_sha256)?;
-        remove_bound_cleanup_record(namespace, &decision_name, &decision.file, decision.identity)?;
-        injected_cleanup_after_decision_retire_result()?;
-    }
-    let intent_name = cleanup_intent_name(&loaded.intent.key_sha256)?;
-    remove_bound_cleanup_record(namespace, &intent_name, &loaded.file, loaded.identity)?;
-    injected_cleanup_after_intent_retire_result()
+    with_cleanup_namespace_lock(namespace, || {
+        if let Some(decision) = decision {
+            let decision_name = cleanup_decision_name(&loaded.intent.key_sha256)?;
+            remove_bound_cleanup_record(
+                namespace,
+                &decision_name,
+                &decision.file,
+                decision.identity,
+                || {},
+            )?;
+            injected_cleanup_after_decision_retire_result()?;
+        }
+        let intent_name = cleanup_intent_name(&loaded.intent.key_sha256)?;
+        remove_bound_cleanup_record(
+            namespace,
+            &intent_name,
+            &loaded.file,
+            loaded.identity,
+            injected_cleanup_intent_retire_before_sync_handoff,
+        )?;
+        injected_cleanup_after_intent_retire_result()
+    })
 }
 
 fn cleanup_placeholder_only(
@@ -8396,6 +8631,7 @@ fn resume_tree_cleanup(
                             Some(0o700),
                         )?;
                         remove_acquired_directory_contents(target.as_raw_fd())?;
+                        cvt(unsafe { libc::fsync(target.as_raw_fd()) })?;
                         injected_cleanup_final_remove_result()?;
                         let operation = operation.as_mut().ok_or_else(|| os_error(libc::ESTALE))?;
                         capture_expected_entry(
@@ -8407,6 +8643,7 @@ fn resume_tree_cleanup(
                             bindings.target,
                             true,
                         )?;
+                        injected_cleanup_after_target_exchange_result()?;
                     }
                     (CleanupSlot::Placeholder, CleanupSlot::Target, true) => {
                         let operation = operation.as_mut().ok_or_else(|| os_error(libc::ESTALE))?;
@@ -8417,9 +8654,8 @@ fn resume_tree_cleanup(
                             bindings.parent.device,
                             Some(0o700),
                         )?;
-                        if !directory_entries(target.as_raw_fd())?.is_empty() {
-                            return Err(os_error(libc::ESTALE));
-                        }
+                        remove_acquired_directory_contents(target.as_raw_fd())?;
+                        cvt(unsafe { libc::fsync(target.as_raw_fd()) })?;
                         unlink_at(
                             operation.directory.as_raw_fd(),
                             &bindings.placeholder,
@@ -8493,8 +8729,10 @@ fn resume_tree_cleanup(
                             bindings.parent.device,
                             Some(0o700),
                         )?);
-                        cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
                         cvt(unsafe { libc::fsync(public_parent) })?;
+                        injected_cleanup_restore_destination_sync_result()?;
+                        cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
+                        injected_cleanup_restore_source_sync_result()?;
                     }
                     (CleanupSlot::Target, CleanupSlot::Placeholder, CleanupSlot::Missing, true) => {
                         let operation = operation.as_mut().ok_or_else(|| os_error(libc::ESTALE))?;
@@ -9194,6 +9432,28 @@ fn injected_cleanup_decision_rewrite_handoff() {
     });
 }
 
+fn injected_cleanup_intent_retire_before_sync_handoff() {
+    #[cfg(test)]
+    TEST_CLEANUP_INTENT_RETIRE_HANDOFF.with(|handoff| {
+        let handoff = handoff.borrow();
+        if let Some(handoff) = handoff.as_ref() {
+            let _ = handoff.reached.send(());
+            let _ = handoff.release.recv();
+        }
+    });
+}
+
+fn injected_cleanup_predicate_completion_handoff() {
+    #[cfg(test)]
+    TEST_CLEANUP_PREDICATE_COMPLETION_HANDOFF.with(|handoff| {
+        let handoff = handoff.borrow();
+        if let Some(handoff) = handoff.as_ref() {
+            let _ = handoff.reached.send(());
+            let _ = handoff.release.recv();
+        }
+    });
+}
+
 fn injected_cleanup_decision_write_before_sync_result() -> io::Result<()> {
     #[cfg(test)]
     if let Some(CleanupDecisionFault::AfterFullWriteBeforeSync(errno)) =
@@ -9256,6 +9516,60 @@ fn injected_cleanup_decision_source_sync_result() -> io::Result<()> {
     {
         TEST_CLEANUP_DECISION_FAULT.set(None);
         return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn record_cleanup_capture_destination_sync() {
+    #[cfg(test)]
+    TEST_CLEANUP_RESTORE_SYNC_TRACE.with(|trace| {
+        if let Some(trace) = trace.borrow_mut().as_mut() {
+            trace.push(CleanupRestoreSyncBoundary::CaptureDestination);
+        }
+    });
+}
+
+fn record_cleanup_capture_source_sync() {
+    #[cfg(test)]
+    TEST_CLEANUP_RESTORE_SYNC_TRACE.with(|trace| {
+        if let Some(trace) = trace.borrow_mut().as_mut() {
+            trace.push(CleanupRestoreSyncBoundary::CaptureSource);
+        }
+    });
+}
+
+fn injected_cleanup_restore_destination_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    {
+        TEST_CLEANUP_RESTORE_SYNC_TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow_mut().as_mut() {
+                trace.push(CleanupRestoreSyncBoundary::Destination);
+            }
+        });
+        if let Some(CleanupDecisionFault::AfterRestoreDestinationSync(errno)) =
+            TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+        {
+            TEST_CLEANUP_DECISION_FAULT.set(None);
+            return Err(os_error(errno));
+        }
+    }
+    Ok(())
+}
+
+fn injected_cleanup_restore_source_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    {
+        TEST_CLEANUP_RESTORE_SYNC_TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow_mut().as_mut() {
+                trace.push(CleanupRestoreSyncBoundary::Source);
+            }
+        });
+        if let Some(CleanupDecisionFault::AfterRestoreSourceSync(errno)) =
+            TEST_CLEANUP_DECISION_FAULT.with(std::cell::Cell::get)
+        {
+            TEST_CLEANUP_DECISION_FAULT.set(None);
+            return Err(os_error(errno));
+        }
     }
     Ok(())
 }
@@ -9329,6 +9643,17 @@ fn injected_cleanup_after_removal_result() -> io::Result<()> {
 fn injected_cleanup_final_remove_result() -> io::Result<()> {
     #[cfg(test)]
     if let Some(CleanupFault::BeforeFinalRootRemoval(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_after_target_exchange_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupTargetExchange(errno)) =
         TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
     {
         TEST_CLEANUP_FAULT.set(None);
@@ -10552,6 +10877,50 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_delete_replays_entries_in_exact_operation_target_after_exchange() {
+        // Catches assuming that an exchanged target must stay empty after a
+        // crash. Directory-entry deletion can replay unless the target was
+        // synced, and recovery must remain descriptor/identity-bound.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let fault = CleanupFaultOverride::set(CleanupFault::AfterCleanupTargetExchange(libc::EIO));
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        drop(fault);
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        let intent_path = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"cleanup-intent-v1-")
+            })
+            .unwrap();
+        let intent: CleanupIntentV1 =
+            serde_json::from_slice(&fs::read(intent_path).unwrap()).unwrap();
+        let operation_target = namespace.join(&intent.operation).join(&intent.placeholder);
+        let target_before = fs::metadata(&operation_target).unwrap();
+        assert_eq!(target_before.dev(), intent.target.device);
+        assert_eq!(target_before.ino(), intent.target.inode);
+        fs::write(operation_target.join("replayed-value"), b"owned").unwrap();
+
+        assert!(parent.resume_pending_owned_child_cleanup("root").unwrap());
+
+        assert!(!root_path.exists());
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+
+    #[test]
     fn cleanup_intent_tree_retry_after_target_chmod_restores_original_mode() {
         let fixture = tempfile::tempdir().unwrap();
         let physical = fixture.path().canonicalize().unwrap();
@@ -11309,6 +11678,141 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn cleanup_restore_syncs_destination_before_source() {
+        // The destination directory is the authoritative crash-recovery
+        // boundary for operation -> public. Its rename must be durable before
+        // the source directory is synced.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation =
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::ESTALE));
+        let trace = super::CleanupRestoreSyncTraceOverride::set();
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                super::CleanupRestoreSyncBoundary::CaptureDestination,
+                super::CleanupRestoreSyncBoundary::CaptureSource,
+                super::CleanupRestoreSyncBoundary::Destination,
+                super::CleanupRestoreSyncBoundary::Source,
+            ]
+        );
+        drop(trace);
+        drop(validation);
+        let restored = fs::metadata(&root_path).unwrap();
+        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cleanup_restore_capture_syncs_destination_before_source() {
+        // After a valid capture exchange the payload lives in
+        // operation.directory. That destination must be durable before the
+        // source parent records removal of the old binding.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation =
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::ESTALE));
+        let trace = super::CleanupRestoreSyncTraceOverride::set();
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                super::CleanupRestoreSyncBoundary::CaptureDestination,
+                super::CleanupRestoreSyncBoundary::CaptureSource,
+                super::CleanupRestoreSyncBoundary::Destination,
+                super::CleanupRestoreSyncBoundary::Source,
+            ]
+        );
+        drop(trace);
+        drop(validation);
+        let restored = fs::metadata(&root_path).unwrap();
+        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    fn assert_cleanup_restore_move_sync_fault_recovers(fault: CleanupDecisionFault) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"exact-owned-bytes").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let target = fs::metadata(&root_path).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let validation =
+            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::ESTALE));
+        let sync_fault = CleanupDecisionFaultOverride::set(fault);
+
+        let error = parent.remove_owned_child("root").unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error:?}");
+        drop(sync_fault);
+        drop(validation);
+        assert!(parent.resume_pending_owned_child_cleanup("root").unwrap());
+        let restored = fs::metadata(&root_path).unwrap();
+        assert_eq!(restored.dev(), target.dev());
+        assert_eq!(restored.ino(), target.ino());
+        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
+        assert_eq!(
+            fs::read(root_path.join("value")).unwrap(),
+            b"exact-owned-bytes"
+        );
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!parent.resume_pending_owned_child_cleanup("root").unwrap());
+    }
+
+    #[test]
+    fn cleanup_restore_recovers_after_destination_directory_sync() {
+        assert_cleanup_restore_move_sync_fault_recovers(
+            CleanupDecisionFault::AfterRestoreDestinationSync(libc::EIO),
+        );
+    }
+
+    #[test]
+    fn cleanup_restore_recovers_after_source_directory_sync() {
+        assert_cleanup_restore_move_sync_fault_recovers(
+            CleanupDecisionFault::AfterRestoreSourceSync(libc::EIO),
+        );
     }
 
     #[test]
@@ -12600,6 +13104,131 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_intent_retirement_is_atomic_through_final_directory_sync_cross_process() {
+        const ROLE_ENV: &str = "MAC_WORKER_CLEANUP_RETIRE_OBSERVER_ROLE";
+        const ROOT_ENV: &str = "MAC_WORKER_CLEANUP_RETIRE_OBSERVER_ROOT";
+        const STREAM_FD_ENV: &str = "MAC_WORKER_CLEANUP_RETIRE_OBSERVER_STREAM_FD";
+        const TEST_NAME: &str = "rooted_fs::tests::cleanup_intent_retirement_is_atomic_through_final_directory_sync_cross_process";
+
+        if std::env::var_os(ROLE_ENV).is_some() {
+            let physical = std::path::PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
+            let descriptor = std::env::var(STREAM_FD_ENV)
+                .unwrap()
+                .parse::<libc::c_int>()
+                .unwrap();
+            let mut stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) };
+            stream.write_all(b"W").unwrap();
+            let mut go = [0];
+            stream.read_exact(&mut go).unwrap();
+            assert_eq!(go, [b'G']);
+            let observed = RootedDir::open(&physical)
+                .unwrap()
+                .resume_pending_owned_child_cleanup("root")
+                .unwrap();
+            stream.write_all(&[b'D', u8::from(observed)]).unwrap();
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let prepare = CleanupFaultOverride::set(CleanupFault::BeforeFinalRootRemoval(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(prepare);
+
+        let (mut observer_control, observer_stream) =
+            std::os::unix::net::UnixStream::pair().unwrap();
+        let descriptor = observer_stream.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_eq!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        let observer = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(ROLE_ENV, "observer")
+            .env(ROOT_ENV, &physical)
+            .env(STREAM_FD_ENV, descriptor.to_string())
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(observer_stream);
+        let mut ready = [0];
+        observer_control.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [b'W']);
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_physical = physical.clone();
+        let worker = std::thread::spawn(move || {
+            let _handoff = super::CleanupIntentRetireHandoffOverride::set(reached_tx, release_rx);
+            RootedDir::open(&worker_physical)
+                .unwrap()
+                .resume_pending_owned_child_cleanup("root")
+        });
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        observer_control.write_all(b"G").unwrap();
+        let mut early_probe = observer_control.try_clone().unwrap();
+        early_probe
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut observed = [0; 2];
+        let early = match early_probe.read_exact(&mut observed) {
+            Ok(()) => true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                false
+            }
+            Err(error) => panic!("observer handoff failed: {error:?}"),
+        };
+        drop(early_probe);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        if !early {
+            observer_control.read_exact(&mut observed).unwrap();
+        }
+        let output = observer.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "observer stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            !early,
+            "observer returned before final intent unlink was synced"
+        );
+        assert_eq!(observed, [b'D', 0]);
+        assert!(!root_path.exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn cleanup_owned_root_replacement_never_creates_replacement_bootstrap() {
         let fixture = tempfile::tempdir().unwrap();
         let physical = fixture.path().canonicalize().unwrap();
@@ -12788,19 +13417,292 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_process_guard_allows_different_keys_and_roots_while_one_key_is_paused() {
+        // Catches a process-wide cleanup guard: a paused journal for one
+        // (parent, component) key must not stall unrelated keys or roots.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["paused", "peer"] {
+            let path = physical.join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("value"), name.as_bytes()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+
+        let other_fixture = tempfile::tempdir().unwrap();
+        let other_physical = other_fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&other_physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let other_root = other_physical.join("paused");
+        fs::create_dir(&other_root).unwrap();
+        fs::write(other_root.join("value"), b"other").unwrap();
+        fs::set_permissions(&other_root, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let paused_physical = physical.clone();
+        let paused = std::thread::spawn(move || {
+            let (hook, mut worker) = std::os::unix::net::UnixStream::pair().unwrap();
+            let relay = std::thread::spawn(move || {
+                let mut reached = [0];
+                worker.read_exact(&mut reached).unwrap();
+                assert_eq!(reached, [b'H']);
+                paused_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                worker.write_all(b"R").unwrap();
+            });
+            let _handoff = super::CleanupBootstrapHandoffOverride::set(hook);
+            let result = RootedDir::open(&paused_physical)
+                .unwrap()
+                .remove_owned_child("paused");
+            relay.join().unwrap();
+            result
+        });
+        paused_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let (same_parent_tx, same_parent_rx) = std::sync::mpsc::channel();
+        let peer_physical = physical.clone();
+        let same_parent = std::thread::spawn(move || {
+            same_parent_tx
+                .send(
+                    RootedDir::open(&peer_physical)
+                        .unwrap()
+                        .remove_owned_child("peer"),
+                )
+                .unwrap();
+        });
+        let (other_root_tx, other_root_rx) = std::sync::mpsc::channel();
+        let other_root_worker = std::thread::spawn(move || {
+            other_root_tx
+                .send(
+                    RootedDir::open(&other_physical)
+                        .unwrap()
+                        .remove_owned_child("paused"),
+                )
+                .unwrap();
+        });
+
+        let same_parent_while_paused =
+            same_parent_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let other_root_while_paused = other_root_rx.recv_timeout(std::time::Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        paused.join().unwrap().unwrap();
+        same_parent.join().unwrap();
+        other_root_worker.join().unwrap();
+
+        same_parent_while_paused.unwrap().unwrap();
+        other_root_while_paused.unwrap().unwrap();
+        assert!(!physical.join("paused").exists());
+        assert!(!physical.join("peer").exists());
+        assert!(!other_root.exists());
+    }
+
+    #[test]
+    fn cleanup_namespace_validation_does_not_wait_on_unrelated_canonical_intent() {
+        // Global namespace validation must read an unrelated published
+        // canonical intent without taking its inode flock. Otherwise cleanup
+        // B waits behind publisher A after A's canonical rename.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["paused", "peer"] {
+            let path = physical.join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("value"), name.as_bytes()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+
+        let (renamed_tx, renamed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let paused_physical = physical.clone();
+        let paused = std::thread::spawn(move || {
+            let _handoff = super::CleanupIntentHandoffOverride::set(renamed_tx, release_rx);
+            RootedDir::open(&paused_physical)
+                .unwrap()
+                .remove_owned_child("paused")
+        });
+        renamed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let observer = RootedDir::open(&physical).unwrap();
+        let parent_metadata = super::stat_fd(observer.root.as_raw_fd()).unwrap();
+        let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+        let namespace = PrivateNamespace::select_for_cleanup(
+            observer.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )
+        .unwrap();
+        let key = super::cleanup_key(parent_identity, b"paused");
+        let intent_name = super::cleanup_intent_name(&key).unwrap();
+        let (probe, _bytes, _canonical_identity) = super::open_cleanup_record(
+            namespace.directory.as_raw_fd(),
+            &intent_name,
+            parent_identity.device,
+            false,
+        )
+        .unwrap();
+        super::clear_errno();
+        let probe_result = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let probe_errno = super::current_errno();
+        if probe_result == 0 {
+            assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
+        }
+
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel();
+        let peer_physical = physical.clone();
+        let peer = std::thread::spawn(move || {
+            peer_tx
+                .send(
+                    RootedDir::open(&peer_physical)
+                        .unwrap()
+                        .remove_owned_child("peer"),
+                )
+                .unwrap();
+        });
+        let peer_while_paused = peer_rx.recv_timeout(std::time::Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        paused.join().unwrap().unwrap();
+        peer.join().unwrap();
+
+        assert_eq!(probe_result, -1, "publisher did not retain the intent lock");
+        assert!(probe_errno == libc::EAGAIN || probe_errno == libc::EWOULDBLOCK);
+        peer_while_paused.unwrap().unwrap();
+        assert!(!physical.join("paused").exists());
+        assert!(!physical.join("peer").exists());
+        drop(probe);
+        drop(namespace);
+        drop(observer);
+    }
+
+    #[test]
+    fn cleanup_predicate_callback_can_reenter_same_key_without_deadlock() {
+        const ROLE_ENV: &str = "MAC_WORKER_CLEANUP_CALLBACK_REENTRY_ROLE";
+        const ROOT_ENV: &str = "MAC_WORKER_CLEANUP_CALLBACK_REENTRY_ROOT";
+        const STREAM_FD_ENV: &str = "MAC_WORKER_CLEANUP_CALLBACK_REENTRY_STREAM_FD";
+        const TEST_NAME: &str =
+            "rooted_fs::tests::cleanup_predicate_callback_can_reenter_same_key_without_deadlock";
+
+        if std::env::var_os(ROLE_ENV).is_some() {
+            let physical = std::path::PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
+            let descriptor = std::env::var(STREAM_FD_ENV)
+                .unwrap()
+                .parse::<libc::c_int>()
+                .unwrap();
+            let mut stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) };
+            let parent = RootedDir::open(&physical).unwrap();
+            stream.write_all(b"W").unwrap();
+            let resumed = parent
+                .retry_pending_owned_children_matching(|component, _| {
+                    assert_eq!(component, b"root");
+                    stream.write_all(b"C").unwrap();
+                    assert!(
+                        RootedDir::open(&physical)
+                            .unwrap()
+                            .resume_pending_owned_child_cleanup("root")
+                            .unwrap()
+                    );
+                    stream.write_all(b"R").unwrap();
+                    true
+                })
+                .unwrap();
+            stream.write_all(&[b'D', resumed as u8]).unwrap();
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let prepare = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        parent.remove_owned_child("root").unwrap_err();
+        drop(prepare);
+        drop(parent);
+
+        let (mut control, worker_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let descriptor = worker_stream.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_eq!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(ROLE_ENV, "worker")
+            .env(ROOT_ENV, &physical)
+            .env(STREAM_FD_ENV, descriptor.to_string())
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(worker_stream);
+        let mut progress = [0; 2];
+        control.read_exact(&mut progress).unwrap();
+        assert_eq!(progress, [b'W', b'C']);
+        control
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut completion = [0; 3];
+        let reentered = match control.read_exact(&mut completion) {
+            Ok(()) => true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                false
+            }
+            Err(error) => panic!("callback re-entry handoff failed: {error:?}"),
+        };
+        if !reentered {
+            worker.kill().unwrap();
+        }
+        let output = worker.wait_with_output().unwrap();
+
+        assert!(reentered, "same-key callback re-entry deadlocked");
+        assert!(
+            output.status.success(),
+            "worker stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(completion, [b'R', b'D', 0]);
+        assert!(!root_path.exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn cleanup_process_entry_guard_serializes_same_process_journals() {
-        let first = super::lock_cleanup_process_journal().unwrap();
+        let parent = super::FileIdentity {
+            device: u64::MAX - 1,
+            inode: u64::MAX - 2,
+        };
+        let first = super::lock_cleanup_process_key(parent, b"same-key").unwrap();
         let (blocked, blocked_receive) = std::sync::mpsc::channel();
         let (entered, receive) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            match super::CLEANUP_PROCESS_JOURNAL_LOCK.try_lock() {
-                Err(std::sync::TryLockError::WouldBlock) => blocked.send(()).unwrap(),
-                Ok(_) => panic!("cleanup process gate admitted a concurrent journal"),
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    panic!("cleanup process gate was unexpectedly poisoned")
-                }
-            }
-            let _second = super::lock_cleanup_process_journal().unwrap();
+            assert!(
+                super::try_lock_cleanup_process_key(parent, b"same-key")
+                    .unwrap()
+                    .is_none(),
+                "cleanup process gate admitted a concurrent same-key journal"
+            );
+            blocked.send(()).unwrap();
+            let _second = super::lock_cleanup_process_key(parent, b"same-key").unwrap();
             entered.send(()).unwrap();
         });
 
@@ -12817,12 +13719,21 @@ mod tests {
     #[test]
     fn cleanup_process_entry_guard_recovers_from_poison() {
         let poisoned = std::thread::spawn(|| {
-            let _guard = super::CLEANUP_PROCESS_JOURNAL_LOCK.lock().unwrap();
+            let _guard = super::CLEANUP_PROCESS_KEYS.active.lock().unwrap();
             panic!("poison cleanup test gate");
         });
         assert!(poisoned.join().is_err());
-        drop(super::lock_cleanup_process_journal().unwrap());
-        super::CLEANUP_PROCESS_JOURNAL_LOCK.clear_poison();
+        drop(
+            super::lock_cleanup_process_key(
+                super::FileIdentity {
+                    device: u64::MAX - 3,
+                    inode: u64::MAX - 4,
+                },
+                b"poison-recovery",
+            )
+            .unwrap(),
+        );
+        super::CLEANUP_PROCESS_KEYS.active.clear_poison();
     }
 
     fn install_same_key_cleanup_bootstrap(namespace: &Path) -> std::path::PathBuf {
@@ -13376,6 +14287,113 @@ mod tests {
             .unwrap();
 
         assert_eq!(calls, 1);
+        assert_eq!(resumed, 0);
+        assert!(!root_path.exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cleanup_predicate_does_not_count_cross_process_retirement_after_resnapshot() {
+        const ROLE_ENV: &str = "MAC_WORKER_CLEANUP_PREDICATE_LATE_RETIRE_ROLE";
+        const ROOT_ENV: &str = "MAC_WORKER_CLEANUP_PREDICATE_LATE_RETIRE_ROOT";
+        const STREAM_FD_ENV: &str = "MAC_WORKER_CLEANUP_PREDICATE_LATE_RETIRE_STREAM_FD";
+        const TEST_NAME: &str = "rooted_fs::tests::cleanup_predicate_does_not_count_cross_process_retirement_after_resnapshot";
+
+        if std::env::var_os(ROLE_ENV).is_some() {
+            let physical = std::path::PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
+            let descriptor = std::env::var(STREAM_FD_ENV)
+                .unwrap()
+                .parse::<libc::c_int>()
+                .unwrap();
+            let mut stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) };
+            stream.write_all(b"W").unwrap();
+            let mut go = [0];
+            stream.read_exact(&mut go).unwrap();
+            assert_eq!(go, [b'G']);
+            let retired = RootedDir::open(&physical)
+                .unwrap()
+                .resume_pending_owned_child_cleanup("root")
+                .unwrap();
+            stream.write_all(&[b'D', u8::from(retired)]).unwrap();
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"generation-a").unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+        let prepare = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(prepare);
+
+        let (mut peer_control, peer_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let descriptor = peer_stream.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_eq!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        let peer = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(ROLE_ENV, "peer")
+            .env(ROOT_ENV, &physical)
+            .env(STREAM_FD_ENV, descriptor.to_string())
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(peer_stream);
+        let mut ready = [0];
+        peer_control.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [b'W']);
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_physical = physical.clone();
+        let worker = std::thread::spawn(move || {
+            let _handoff =
+                super::CleanupPredicateCompletionHandoffOverride::set(reached_tx, release_rx);
+            RootedDir::open(&worker_physical)
+                .unwrap()
+                .retry_pending_owned_children_matching(|component, identity| {
+                    assert_eq!(component, b"root");
+                    assert_eq!(identity.kind, libc::S_IFDIR as u32);
+                    true
+                })
+        });
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        peer_control.write_all(b"G").unwrap();
+        let mut retired = [0; 2];
+        peer_control.read_exact(&mut retired).unwrap();
+        assert_eq!(retired, [b'D', 1]);
+        let output = peer.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "peer stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        release_tx.send(()).unwrap();
+        let resumed = worker.join().unwrap().unwrap();
+
         assert_eq!(resumed, 0);
         assert!(!root_path.exists());
         assert_eq!(
