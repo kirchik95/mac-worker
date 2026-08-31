@@ -155,8 +155,8 @@ impl<'a> LeaseService<'a> {
         LeaseService::new(&store).occupancy()
     }
 
-    #[allow(dead_code)] // Task 7 lifecycle consumes this internal release boundary.
-    pub(crate) fn release_after_cleanup(
+    #[doc(hidden)]
+    pub fn release_after_cleanup(
         &self,
         expected: &LeaseRecord,
         receipt: &CleanupReceipt,
@@ -173,6 +173,11 @@ impl<'a> LeaseService<'a> {
         if live != *expected {
             return Err(WorkerError::Protocol("live lease identity mismatch".into()));
         }
+        let leases = self.store.open_directory("leases", false)?;
+        let retired = format!(".released-{}", live.job_id());
+        guard.validate()?;
+        capacity.validate()?;
+        self.store.remove_owned_child_committed(&leases, &retired)?;
         receipt.validate_durable(self.store, &live)?;
         guard.validate()?;
         capacity.validate()?;
@@ -183,13 +188,6 @@ impl<'a> LeaseService<'a> {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected lease retirement failure",
             )));
-        }
-        let leases = self.store.open_directory("leases", false)?;
-        let retired = format!(".released-{}", live.job_id());
-        if leases.entry_exists(&retired)? {
-            guard.validate()?;
-            capacity.validate()?;
-            leases.remove_owned_child(&retired)?;
         }
         let mut live_dir = leases.open_child_directory(&relative("heavy")?, false)?;
         guard.validate()?;
@@ -228,9 +226,8 @@ impl<'a> LeaseService<'a> {
         capacity.validate()?;
         let leases = self.store.open_directory("leases", false)?;
         let operation_name = format!(".acquire-{}", lease.job_id());
-        if leases.entry_exists(&operation_name)? {
-            leases.remove_owned_child(&operation_name)?;
-        }
+        self.store
+            .remove_owned_child_committed(&leases, &operation_name)?;
         let mut operation = leases.create_new_child_directory(&operation_name)?;
         let bytes = serde_json::to_vec(lease).map_err(|error| {
             WorkerError::Protocol(format!("failed to serialize lease: {error}"))

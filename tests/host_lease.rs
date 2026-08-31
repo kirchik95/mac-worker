@@ -4,9 +4,10 @@ use std::{
     fs,
     io::Cursor,
     os::unix::{
-        ffi::OsStringExt,
+        ffi::{OsStrExt, OsStringExt},
         fs::{OpenOptionsExt, PermissionsExt, symlink},
     },
+    path::Path,
     sync::{Arc, Barrier},
     thread,
 };
@@ -19,7 +20,7 @@ use mac_worker::{
     host_store::{HostStore, HostStoreWritePoint},
     job::{
         ClientId, CommandSpec, HostControlError, JobId, JobStatus, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseToken, RequestFingerprintMaterial,
+        LeaseAcquireResponse, LeaseRecord, LeaseToken, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService, SlotState},
     paths::PathLayout,
@@ -694,6 +695,218 @@ fn every_lease_crash_boundary_leaves_absent_or_complete_live_state() {
         } else {
             assert_eq!(live, None, "staging residue must be idle at {point:?}");
         }
+    }
+}
+
+#[test]
+fn after_cleanup_intent_commit_acquire_leftover_retries() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let req = request(1);
+    let leftover = root
+        .join("leases")
+        .join(format!(".acquire-{}", req.material().job_id()));
+    fs::create_dir(&leftover).unwrap();
+    fs::set_permissions(&leftover, fs::Permissions::from_mode(0o700)).unwrap();
+    let leftover_leaf = leftover.join("leftover-leaf");
+    fs::write(&leftover_leaf, b"acquire-leftover").unwrap();
+    fs::set_permissions(&leftover_leaf, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::File::open(&leftover_leaf).unwrap().sync_all().unwrap();
+    fs::File::open(&leftover).unwrap().sync_all().unwrap();
+    fs::File::open(root.join("leases"))
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    assert!(
+        LeaseService::new(&faulted)
+            .acquire(&req, &healthy(), 1)
+            .is_err()
+    );
+    assert_eq!(LeaseService::new(&faulted).load().unwrap(), None);
+    assert!(!leftover.exists());
+    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    assert_canonical_tree_delete_journal(&namespace);
+    drop(faulted);
+
+    let recovered = HostStore::open(&root).unwrap();
+    assert!(matches!(
+        LeaseService::new(&recovered)
+            .acquire(&req, &healthy(), 1)
+            .unwrap(),
+        LeaseAcquireResponse::Acquired { .. }
+    ));
+    assert!(!leftover.exists());
+    if namespace.exists() {
+        assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
+    }
+}
+
+fn assert_canonical_tree_delete_journal(namespace: &Path) {
+    assert!(
+        namespace.is_dir(),
+        "expected tree journal {}",
+        namespace.display()
+    );
+    let mut intent = 0usize;
+    let mut decision = 0usize;
+    let mut operation = 0usize;
+    let mut quarantine = 0usize;
+    let mut decision_path = None;
+    for entry in fs::read_dir(namespace).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        let file_type = entry.file_type().unwrap();
+        if bytes.starts_with(b"cleanup-intent-v1-") {
+            intent += 1;
+            assert!(
+                file_type.is_file(),
+                "cleanup intent must be a regular file: {}",
+                path.display()
+            );
+        } else if bytes.starts_with(b"cleanup-decision-v1-") {
+            decision += 1;
+            assert!(
+                file_type.is_file(),
+                "cleanup decision must be a regular file: {}",
+                path.display()
+            );
+            decision_path = Some(path);
+        } else if bytes.starts_with(b"cleanup-op-v1-") {
+            operation += 1;
+            assert!(
+                file_type.is_dir(),
+                "cleanup operation must be a directory: {}",
+                path.display()
+            );
+        } else if bytes.starts_with(b"cleanup-tree-v1-") {
+            quarantine += 1;
+            assert!(
+                file_type.is_dir(),
+                "cleanup tree quarantine must be a directory: {}",
+                path.display()
+            );
+        } else {
+            panic!(
+                "unexpected journal entry {} under {}",
+                name.to_string_lossy(),
+                namespace.display()
+            );
+        }
+    }
+    assert_eq!(
+        (intent, decision, operation, quarantine),
+        (1, 1, 1, 1),
+        "unexpected tree journal under {}",
+        namespace.display()
+    );
+    let decision_path = decision_path.expect("decision role path");
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&decision_path).unwrap())
+        .expect("cleanup decision must be valid JSON");
+    assert!(
+        value.is_object(),
+        "cleanup decision must be a JSON object: {value:?}"
+    );
+    assert_eq!(
+        value.get("decision"),
+        Some(&serde_json::json!("delete")),
+        "cleanup decision must be Delete: {value}"
+    );
+}
+
+fn abandoned_lease_with_receipt(
+    store: &HostStore,
+    seed: u128,
+) -> (LeaseRecord, mac_worker::host_store::CleanupReceipt) {
+    let req = request(seed);
+    let lease = match LeaseService::new(store)
+        .acquire(&req, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    store.record_abandoned(&req, 2).unwrap();
+    let receipt = store.cleanup_job_owned(&lease).unwrap();
+    (lease, receipt)
+}
+
+#[test]
+fn after_cleanup_intent_commit_release_leftover_keeps_heavy() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let (lease, receipt) = abandoned_lease_with_receipt(&store, 2);
+    let leftover = root
+        .join("leases")
+        .join(format!(".released-{}", lease.job_id()));
+    fs::create_dir(&leftover).unwrap();
+    fs::set_permissions(&leftover, fs::Permissions::from_mode(0o700)).unwrap();
+    let leftover_leaf = leftover.join("released-leaf");
+    fs::write(&leftover_leaf, b"released-leftover").unwrap();
+    fs::set_permissions(&leftover_leaf, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::File::open(&leftover_leaf).unwrap().sync_all().unwrap();
+    fs::File::open(&leftover).unwrap().sync_all().unwrap();
+    fs::File::open(root.join("leases"))
+        .unwrap()
+        .sync_all()
+        .unwrap();
+
+    let error = LeaseService::new(&store)
+        .release_after_cleanup(&lease, &receipt)
+        .unwrap_err();
+    assert!(matches!(error, WorkerError::Io(_)), "{error}");
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(root.join("leases/heavy").is_dir());
+    assert!(!leftover.exists());
+    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    assert_canonical_tree_delete_journal(&namespace);
+    drop(store);
+
+    let recovered = HostStore::open(&root).unwrap();
+    LeaseService::new(&recovered)
+        .release_after_cleanup(&lease, &receipt)
+        .unwrap();
+    assert_eq!(LeaseService::new(&recovered).load().unwrap(), None);
+    assert!(!leftover.exists());
+    if namespace.exists() {
+        assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn after_cleanup_intent_commit_does_not_break_post_publish_retirement() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let (lease, receipt) = abandoned_lease_with_receipt(&store, 3);
+    LeaseService::new(&store)
+        .release_after_cleanup(&lease, &receipt)
+        .unwrap();
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert!(
+        !root
+            .join("leases")
+            .join(format!(".released-{}", lease.job_id()))
+            .exists()
+    );
+    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    if namespace.exists() {
+        assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
     }
 }
 

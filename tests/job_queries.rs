@@ -5,7 +5,7 @@ use std::{
     io::{Cursor, Write as _},
     os::fd::AsRawFd,
     os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt, symlink},
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
         process::ExitStatusExt,
     },
     path::{Path, PathBuf},
@@ -889,6 +889,429 @@ fn every_resolution_cleanup_boundary_is_retryable_and_keeps_the_exact_lease() {
 }
 
 #[test]
+fn after_cleanup_intent_commit_incoming_token_retries_to_abandoned() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let acquire = lease_request();
+    let lease = match LeaseService::new(&store)
+        .acquire(&acquire, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    let request = ResolveOrAbandonRequest::from_submit_request(&SubmitRequest::new(
+        acquire.material().clone(),
+    ))
+    .unwrap();
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    fs::create_dir_all(&incoming).unwrap();
+    for private in [incoming.parent().unwrap(), incoming.as_path()] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    replace_bytes(&incoming.join("token-leaf"), b"incoming-token-bytes").unwrap();
+    let incoming_job = incoming.parent().unwrap().to_path_buf();
+    store.record_abandoned(&acquire, 2).unwrap();
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let pending = JobService::new(&faulted, &RejectLauncher)
+        .resolve_or_abandon(request.clone())
+        .unwrap();
+    assert!(
+        matches!(
+            pending.outcome(),
+            ResolveOrAbandonOutcome::CleanupPending { code }
+                if code == "MUTABLE_CLEANUP_FAILED"
+        ),
+        "{pending:?}"
+    );
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(faulted.job_index(lease.job_id()).unwrap().is_file());
+    assert!(!incoming.exists());
+    assert_canonical_delete_journal(
+        &incoming_job.join(".mac-worker-rooted-fs"),
+        "cleanup-tree-v1-",
+    );
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let completed = JobService::new(&reopened, &RejectLauncher)
+        .resolve_or_abandon(request)
+        .unwrap();
+    assert!(
+        matches!(completed.outcome(), ResolveOrAbandonOutcome::Abandoned),
+        "{completed:?}"
+    );
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+    assert!(!incoming.exists());
+    assert_journal_empty_or_absent(&incoming_job.join(".mac-worker-rooted-fs"));
+}
+
+#[test]
+fn after_cleanup_intent_commit_whole_incoming_job_terminal_retries() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, _submit) = indexed_identityless_job(&root);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(96_001), 11)
+        .unwrap()
+        .with_child(identity(96_002), 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap()
+        .into_succeeded(14, 0, 0)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    let incoming_job = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::create_dir_all(&incoming_job).unwrap();
+    fs::set_permissions(&incoming_job, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!incoming_job.join(lease.lease_token().to_string()).exists());
+    let incoming_namespace = incoming_job.parent().unwrap().join(".mac-worker-rooted-fs");
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let error = JobService::new(&faulted, &RejectLauncher)
+        .status(lease.job_id())
+        .unwrap_err();
+    assert!(error.to_string().contains("I/O error"), "{error}");
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(!incoming_job.exists());
+    assert_canonical_delete_journal(&incoming_namespace, "cleanup-tree-v1-");
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let response = JobService::new(&reopened, &RejectLauncher)
+        .status(lease.job_id())
+        .unwrap();
+    assert_eq!(response.status().state(), status.state());
+    assert_eq!(
+        response.status().cleanup_error_code(),
+        Some("MUTABLE_CLEANUP_FAILED")
+    );
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+    assert!(!incoming_job.exists());
+    assert_journal_empty_or_absent(&incoming_namespace);
+}
+
+#[test]
+fn after_cleanup_intent_commit_whole_incoming_job_resolution_resumes() {
+    // Break caught: resolution starts a new outer incoming/{job} delete
+    // instead of resuming the already-published canonical Tree journal.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let acquire = lease_request();
+    let lease = match LeaseService::new(&store)
+        .acquire(&acquire, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    let request = ResolveOrAbandonRequest::from_submit_request(&SubmitRequest::new(
+        acquire.material().clone(),
+    ))
+    .unwrap();
+    let incoming_job = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::create_dir_all(&incoming_job).unwrap();
+    for private in [incoming_job.parent().unwrap(), incoming_job.as_path()] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert!(
+        !incoming_job.join(lease.lease_token().to_string()).exists(),
+        "exact token must be absent so the one-shot reaches outer incoming"
+    );
+    let incoming_namespace = incoming_job.parent().unwrap().join(".mac-worker-rooted-fs");
+    store.record_abandoned(&acquire, 2).unwrap();
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let error = faulted.cleanup_job_owned(&lease).unwrap_err();
+    assert!(
+        matches!(error, WorkerError::Io(_)) || error.to_string().contains("I/O error"),
+        "{error}"
+    );
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(
+        !incoming_job.exists(),
+        "public outer must already be absent"
+    );
+    assert_canonical_delete_journal(&incoming_namespace, "cleanup-tree-v1-");
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let completed = JobService::new(&reopened, &RejectLauncher)
+        .resolve_or_abandon(request)
+        .unwrap();
+    assert!(
+        matches!(completed.outcome(), ResolveOrAbandonOutcome::Abandoned),
+        "{completed:?}"
+    );
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+    assert!(!incoming_job.exists());
+    assert_journal_empty_or_absent(&incoming_namespace);
+}
+
+#[test]
+fn resolution_leaves_ordinary_empty_incoming_job_untouched() {
+    // Break caught: resolution treats an ordinary public incoming/{job}
+    // without a journal as owned cleanup and starts a new outer deletion.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, submit) = unindexed_identityless_job(&root);
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    remove_and_sync(&job.join("status.json"));
+    let incoming_job = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::create_dir_all(&incoming_job).unwrap();
+    for private in [incoming_job.parent().unwrap(), incoming_job.as_path()] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert!(!incoming_job.join(lease.lease_token().to_string()).exists());
+    File::open(&incoming_job).unwrap().sync_all().unwrap();
+    File::open(incoming_job.parent().unwrap())
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    let incoming_meta = fs::symlink_metadata(&incoming_job).unwrap();
+    let incoming_layout = directory_entry_names(&incoming_job);
+    let incoming_namespace = incoming_job.parent().unwrap().join(".mac-worker-rooted-fs");
+    drop(store);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let completed = JobService::new(&reopened, &RejectLauncher)
+        .resolve_or_abandon(request)
+        .unwrap();
+    assert!(
+        matches!(completed.outcome(), ResolveOrAbandonOutcome::Abandoned),
+        "{completed:?}"
+    );
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+    assert!(
+        incoming_job.is_dir(),
+        "ordinary public incoming/{{job}} was deleted"
+    );
+    let after = fs::symlink_metadata(&incoming_job).unwrap();
+    assert_eq!(after.dev(), incoming_meta.dev());
+    assert_eq!(after.ino(), incoming_meta.ino());
+    let after_layout = directory_entry_names(&incoming_job);
+    let added = after_layout
+        .iter()
+        .filter(|name| !incoming_layout.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        added.is_empty() || (added.len() == 1 && added[0] == ".mac-worker-rooted-fs"),
+        "incoming/{{job}} layout changed beyond an empty nested namespace: {added:?}"
+    );
+    for name in &incoming_layout {
+        assert!(after_layout.contains(name), "incoming/{{job}} lost {name}");
+    }
+    assert!(!incoming_job.join(lease.lease_token().to_string()).exists());
+    assert_journal_empty_or_absent(&incoming_job.join(".mac-worker-rooted-fs"));
+    assert_journal_empty_or_absent(&incoming_namespace);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CleanupSeamTarget {
+    ExecutionRegular,
+    JobMutableTree(&'static str),
+    JobStageThisJob,
+    ReleasedLeftover,
+}
+
+#[test]
+fn after_cleanup_intent_commit_seam_matrix_retries() {
+    for target in [
+        CleanupSeamTarget::ExecutionRegular,
+        CleanupSeamTarget::JobMutableTree("workspace"),
+        CleanupSeamTarget::JobMutableTree("home"),
+        CleanupSeamTarget::JobMutableTree("tmp"),
+        CleanupSeamTarget::JobStageThisJob,
+        CleanupSeamTarget::ReleasedLeftover,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("host");
+        let (store, lease, submit) = unindexed_identityless_job(&root);
+        let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        remove_and_sync(&job.join("status.json"));
+        let foreign_job = JobId::new(uuid::Uuid::from_u128(
+            0x1111_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let job_stage =
+            root.join("leases")
+                .join(format!(".job-{}-{}", lease.job_id(), "1".repeat(32)));
+        let foreign_stage =
+            root.join("leases")
+                .join(format!(".job-{}-{}", foreign_job, "2".repeat(32)));
+        let released = root
+            .join("leases")
+            .join(format!(".released-{}", lease.job_id()));
+        match target {
+            CleanupSeamTarget::ExecutionRegular => {}
+            CleanupSeamTarget::JobMutableTree(name) => {
+                isolate_resolution_scopes_before_staging(&job, &store, &lease);
+                let path = job.join(name);
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                replace_bytes(&path.join("leaf"), b"mutable-tree").unwrap();
+                File::open(&job).unwrap().sync_all().unwrap();
+            }
+            CleanupSeamTarget::JobStageThisJob => {
+                isolate_resolution_scopes_before_staging(&job, &store, &lease);
+                fs::create_dir(&job_stage).unwrap();
+                fs::set_permissions(&job_stage, fs::Permissions::from_mode(0o700)).unwrap();
+                replace_bytes(&job_stage.join("stage-leaf"), b"this-job-stage").unwrap();
+                fs::create_dir(&foreign_stage).unwrap();
+                fs::set_permissions(&foreign_stage, fs::Permissions::from_mode(0o700)).unwrap();
+                replace_bytes(&foreign_stage.join("foreign-leaf"), b"foreign-job-stage").unwrap();
+                File::open(root.join("leases")).unwrap().sync_all().unwrap();
+            }
+            CleanupSeamTarget::ReleasedLeftover => {
+                isolate_resolution_scopes_before_staging(&job, &store, &lease);
+                fs::create_dir(&released).unwrap();
+                fs::set_permissions(&released, fs::Permissions::from_mode(0o700)).unwrap();
+                replace_bytes(&released.join("released-leaf"), b"released-leftover").unwrap();
+                File::open(root.join("leases")).unwrap().sync_all().unwrap();
+            }
+        }
+        let foreign_meta = foreign_stage
+            .exists()
+            .then(|| fs::symlink_metadata(&foreign_stage).unwrap());
+        drop(store);
+
+        let faulted =
+            HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+                .unwrap();
+        let pending = JobService::new(&faulted, &RejectLauncher)
+            .resolve_or_abandon(request.clone())
+            .unwrap();
+        assert!(
+            matches!(
+                pending.outcome(),
+                ResolveOrAbandonOutcome::CleanupPending { code }
+                    if code == "MUTABLE_CLEANUP_FAILED"
+            ),
+            "{target:?}: {pending:?}"
+        );
+        assert_eq!(
+            LeaseService::new(&faulted).load().unwrap(),
+            Some(lease.clone()),
+            "{target:?}"
+        );
+        let (public, namespace, quarantine_prefix) = match target {
+            CleanupSeamTarget::ExecutionRegular => (
+                job.join("execution.json"),
+                job.join(".mac-worker-rooted-fs"),
+                "cleanup-regular-v1-",
+            ),
+            CleanupSeamTarget::JobMutableTree(name) => (
+                job.join(name),
+                job.join(".mac-worker-rooted-fs"),
+                "cleanup-tree-v1-",
+            ),
+            CleanupSeamTarget::JobStageThisJob => (
+                job_stage.clone(),
+                root.join("leases/.mac-worker-rooted-fs"),
+                "cleanup-tree-v1-",
+            ),
+            CleanupSeamTarget::ReleasedLeftover => (
+                released.clone(),
+                root.join("leases/.mac-worker-rooted-fs"),
+                "cleanup-tree-v1-",
+            ),
+        };
+        assert!(!public.exists(), "{target:?}: public target survived");
+        assert_canonical_delete_journal(&namespace, quarantine_prefix);
+        if let Some(meta) = &foreign_meta {
+            let current = fs::symlink_metadata(&foreign_stage).unwrap();
+            assert_eq!(current.dev(), meta.dev(), "{target:?}");
+            assert_eq!(current.ino(), meta.ino(), "{target:?}");
+            assert_eq!(
+                fs::read(foreign_stage.join("foreign-leaf")).unwrap(),
+                b"foreign-job-stage",
+                "{target:?}"
+            );
+        }
+        drop(faulted);
+
+        let reopened = HostStore::open(&root).unwrap();
+        let completed = JobService::new(&reopened, &RejectLauncher)
+            .resolve_or_abandon(request)
+            .unwrap();
+        assert!(
+            matches!(completed.outcome(), ResolveOrAbandonOutcome::Abandoned),
+            "{target:?}: {completed:?}"
+        );
+        assert_eq!(
+            LeaseService::new(&reopened).load().unwrap(),
+            None,
+            "{target:?}"
+        );
+        assert!(!public.exists(), "{target:?}: public target resurrected");
+        assert_journal_empty_or_absent(&namespace);
+        if let Some(meta) = &foreign_meta {
+            let current = fs::symlink_metadata(&foreign_stage).unwrap();
+            assert_eq!(
+                current.dev(),
+                meta.dev(),
+                "{target:?}: foreign stage replaced"
+            );
+            assert_eq!(
+                current.ino(),
+                meta.ino(),
+                "{target:?}: foreign stage replaced"
+            );
+            assert_eq!(
+                fs::read(foreign_stage.join("foreign-leaf")).unwrap(),
+                b"foreign-job-stage",
+                "{target:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn durable_mid_incoming_cleanup_crash_fails_closed() {
     // Break caught: a resolver retry mistakes an absent caller-visible token
     // for completed cleanup even though RootedDir left a partially deleted,
@@ -976,6 +1399,9 @@ fn durable_private_cleanup_residue_matrix_fails_closed() {
         LeaseStageTree,
         VerifiedRegular,
         WholeIncomingJobTree,
+        EmptyCleanupUuid,
+        MalformedNamespace,
+        WrongModeNamespace,
     }
 
     let mut failures = Vec::new();
@@ -984,6 +1410,9 @@ fn durable_private_cleanup_residue_matrix_fails_closed() {
         CrashImage::LeaseStageTree,
         CrashImage::VerifiedRegular,
         CrashImage::WholeIncomingJobTree,
+        CrashImage::EmptyCleanupUuid,
+        CrashImage::MalformedNamespace,
+        CrashImage::WrongModeNamespace,
     ]
     .into_iter()
     .enumerate()
@@ -1129,24 +1558,116 @@ fn durable_private_cleanup_residue_matrix_fails_closed() {
                 drop(store);
                 (lease, request, residue, planted)
             }
+            CrashImage::EmptyCleanupUuid => {
+                let (store, lease, submit) = unindexed_identityless_job(&root);
+                let acquire = LeaseAcquireRequest::new(submit.material().clone());
+                let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+                let job = store
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap();
+                remove_and_sync(&job.join("status.json"));
+                store.record_abandoned(&acquire, 2).unwrap();
+                isolate_resolution_scopes_before_staging(&job, &store, &lease);
+                let private_namespace = job.join(".mac-worker-rooted-fs");
+                fs::create_dir_all(&private_namespace).unwrap();
+                fs::set_permissions(&private_namespace, fs::Permissions::from_mode(0o700)).unwrap();
+                let residue =
+                    private_namespace.join("cleanup-303f0f4a-6b5c-4d8e-9f00-112233445566");
+                fs::create_dir(&residue).unwrap();
+                fs::set_permissions(&residue, fs::Permissions::from_mode(0o700)).unwrap();
+                File::open(&residue).unwrap().sync_all().unwrap();
+                File::open(&private_namespace).unwrap().sync_all().unwrap();
+                File::open(&job).unwrap().sync_all().unwrap();
+                drop(store);
+                (lease, request, residue, Vec::new())
+            }
+            CrashImage::MalformedNamespace => {
+                let (store, lease, submit) = unindexed_identityless_job(&root);
+                let acquire = LeaseAcquireRequest::new(submit.material().clone());
+                let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+                let job = store
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap();
+                remove_and_sync(&job.join("status.json"));
+                store.record_abandoned(&acquire, 2).unwrap();
+                isolate_resolution_scopes_before_staging(&job, &store, &lease);
+                let residue = job.join(".mac-worker-rooted-fs");
+                let planted = b"malformed-namespace".to_vec();
+                replace_bytes(&residue, &planted).unwrap();
+                drop(store);
+                (lease, request, residue, planted)
+            }
+            CrashImage::WrongModeNamespace => {
+                let (store, lease, submit) = unindexed_identityless_job(&root);
+                let acquire = LeaseAcquireRequest::new(submit.material().clone());
+                let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+                let job = store
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap();
+                remove_and_sync(&job.join("status.json"));
+                store.record_abandoned(&acquire, 2).unwrap();
+                isolate_resolution_scopes_before_staging(&job, &store, &lease);
+                let residue = job.join(".mac-worker-rooted-fs");
+                fs::create_dir_all(&residue).unwrap();
+                fs::set_permissions(&residue, fs::Permissions::from_mode(0o755)).unwrap();
+                File::open(&residue).unwrap().sync_all().unwrap();
+                File::open(&job).unwrap().sync_all().unwrap();
+                drop(store);
+                (lease, request, residue, Vec::new())
+            }
         };
 
-        let reopened = HostStore::open(&root).unwrap();
-        let response = JobService::new(&reopened, &RejectLauncher)
-            .resolve_or_abandon(request)
-            .unwrap();
-        let cleanup_pending = matches!(
-            response.outcome(),
-            ResolveOrAbandonOutcome::CleanupPending { code }
-                if code == "MUTABLE_CLEANUP_FAILED"
-        );
-        let lease_retained = LeaseService::new(&reopened).load().unwrap() == Some(lease.clone());
-        let residue_preserved = fs::read(&residue).unwrap() == planted;
-        if !(cleanup_pending && lease_retained && residue_preserved) {
-            failures.push(format!(
-                "{crash_image:?}: outcome={:?}, lease_retained={lease_retained}, residue_preserved={residue_preserved}",
-                response.outcome()
-            ));
+        let residue_meta = fs::symlink_metadata(&residue).unwrap();
+        let residue_dev = residue_meta.dev();
+        let residue_ino = residue_meta.ino();
+        let residue_mode = residue_meta.permissions().mode();
+        let residue_bytes = residue_meta
+            .file_type()
+            .is_file()
+            .then(|| fs::read(&residue).unwrap());
+        let residue_entries = residue_meta
+            .file_type()
+            .is_dir()
+            .then(|| directory_entry_names(&residue));
+        if let Some(bytes) = &residue_bytes {
+            assert_eq!(bytes, &planted, "{crash_image:?}: planted bytes drifted");
+        }
+
+        for attempt in 0..2 {
+            let reopened = HostStore::open(&root).unwrap();
+            let response = JobService::new(&reopened, &RejectLauncher)
+                .resolve_or_abandon(request.clone())
+                .unwrap();
+            let cleanup_pending = matches!(
+                response.outcome(),
+                ResolveOrAbandonOutcome::CleanupPending { code }
+                    if code == "MUTABLE_CLEANUP_FAILED"
+            );
+            let lease_retained =
+                LeaseService::new(&reopened).load().unwrap() == Some(lease.clone());
+            let current = fs::symlink_metadata(&residue).unwrap();
+            let inode_stable = current.dev() == residue_dev && current.ino() == residue_ino;
+            let mode_stable = current.permissions().mode() == residue_mode;
+            let bytes_stable = match &residue_bytes {
+                Some(bytes) => fs::read(&residue).unwrap() == *bytes,
+                None => true,
+            };
+            let entries_stable = match &residue_entries {
+                Some(entries) => directory_entry_names(&residue) == *entries,
+                None => true,
+            };
+            if !(cleanup_pending
+                && lease_retained
+                && inode_stable
+                && mode_stable
+                && bytes_stable
+                && entries_stable)
+            {
+                failures.push(format!(
+                    "{crash_image:?} attempt {attempt}: outcome={:?}, lease_retained={lease_retained}, inode_stable={inode_stable}, mode_stable={mode_stable}, bytes_stable={bytes_stable}, entries_stable={entries_stable}",
+                    response.outcome()
+                ));
+            }
         }
     }
 
@@ -6076,6 +6597,146 @@ fn replace_ascii_once(path: &Path, from: &str, to: &str) {
         .unwrap_or_else(|| panic!("{from:?} is absent from {}", path.display()));
     bytes[offset..offset + from.len()].copy_from_slice(to.as_bytes());
     replace_bytes(path, &bytes).unwrap();
+}
+
+fn directory_entry_names(path: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn isolate_resolution_scopes_before_staging(job: &Path, store: &HostStore, lease: &LeaseRecord) {
+    if job.join("execution.json").exists() {
+        remove_and_sync(&job.join("execution.json"));
+    }
+    for name in ["workspace", "home", "tmp"] {
+        let path = job.join(name);
+        if path.exists() {
+            fs::remove_dir_all(&path).unwrap();
+        }
+    }
+    File::open(job).unwrap().sync_all().unwrap();
+    let receipt = store.verified_receipt(lease.job_id()).unwrap();
+    if receipt.exists() {
+        remove_and_sync(&receipt);
+    }
+    let pending = receipt
+        .parent()
+        .unwrap()
+        .join(format!(".verify-{}.json.pending", lease.job_id()));
+    if pending.exists() {
+        remove_and_sync(&pending);
+    }
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    if let Some(incoming_job) = incoming.parent() {
+        if incoming_job.exists() {
+            fs::remove_dir_all(incoming_job).unwrap();
+            if let Some(incoming_root) = incoming_job.parent() {
+                File::open(incoming_root).unwrap().sync_all().unwrap();
+            }
+        }
+    }
+}
+
+fn assert_canonical_delete_journal(namespace: &Path, quarantine_prefix: &str) {
+    assert!(
+        namespace.is_dir(),
+        "journal namespace {}",
+        namespace.display()
+    );
+    let mut intent = 0usize;
+    let mut decision = 0usize;
+    let mut operation = 0usize;
+    let mut quarantine = 0usize;
+    let mut decision_path = None;
+    for entry in fs::read_dir(namespace).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .unwrap_or_else(|| panic!("non-UTF-8 journal entry under {}", namespace.display()));
+        let file_type = entry.file_type().unwrap();
+        if name.starts_with("cleanup-intent-v1-") {
+            intent += 1;
+            assert!(
+                file_type.is_file(),
+                "cleanup intent must be a regular file: {}",
+                path.display()
+            );
+        } else if name.starts_with("cleanup-decision-v1-") {
+            decision += 1;
+            assert!(
+                file_type.is_file(),
+                "cleanup decision must be a regular file: {}",
+                path.display()
+            );
+            decision_path = Some(path);
+        } else if name.starts_with("cleanup-op-v1-") {
+            operation += 1;
+            assert!(
+                file_type.is_dir(),
+                "cleanup operation must be a directory: {}",
+                path.display()
+            );
+        } else if name.starts_with(quarantine_prefix) {
+            quarantine += 1;
+            match quarantine_prefix {
+                "cleanup-tree-v1-" => assert!(
+                    file_type.is_dir(),
+                    "tree cleanup quarantine must be a directory: {}",
+                    path.display()
+                ),
+                "cleanup-regular-v1-" => assert!(
+                    file_type.is_file(),
+                    "regular cleanup quarantine must be a regular file: {}",
+                    path.display()
+                ),
+                _ => panic!("unsupported cleanup quarantine prefix {quarantine_prefix}"),
+            }
+        } else {
+            panic!(
+                "unexpected journal entry {} under {}",
+                name,
+                namespace.display()
+            );
+        }
+    }
+    assert_eq!(
+        (intent, decision, operation, quarantine),
+        (1, 1, 1, 1),
+        "unexpected journal roles under {}",
+        namespace.display()
+    );
+    let decision_path = decision_path.expect("decision role path");
+    let decision: serde_json::Value = serde_json::from_slice(&fs::read(decision_path).unwrap())
+        .expect("cleanup decision must be valid JSON");
+    assert!(
+        decision.is_object(),
+        "cleanup decision must be a JSON object: {decision:?}"
+    );
+    assert_eq!(
+        decision.get("decision"),
+        Some(&serde_json::json!("delete")),
+        "cleanup decision must be Delete: {decision}"
+    );
+}
+
+fn assert_journal_empty_or_absent(namespace: &Path) {
+    if !namespace.exists() {
+        return;
+    }
+    assert_eq!(
+        fs::read_dir(namespace).unwrap().count(),
+        0,
+        "journal residue remains in {}",
+        namespace.display()
+    );
 }
 
 fn remove_and_sync(path: &Path) {

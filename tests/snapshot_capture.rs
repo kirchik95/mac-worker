@@ -6,7 +6,7 @@ use std::{
     fs, io,
     os::unix::{
         ffi::OsStrExt,
-        fs::{PermissionsExt, symlink},
+        fs::{MetadataExt, PermissionsExt, symlink},
         process::ExitStatusExt,
     },
     path::{Path, PathBuf},
@@ -33,6 +33,7 @@ use support::{GitRepo, create_directory};
 const MANIFEST_PROPERTY_CASES: u32 = 256;
 const MAX_MANIFEST_PATH_BYTES: usize = 1_024;
 const MUTATION_CAPTURE_COUNT: usize = 1_000;
+const STAGING_SIBLING: &str = ".partial-22222222-2222-4222-8222-222222222222";
 
 fn settings(include_untracked: &[&str], include_empty_dirs: &[&str]) -> SnapshotSettings {
     SnapshotSettings {
@@ -772,8 +773,12 @@ fn assert_snapshot_changed(label: &str, mutation: Mutation) {
     let initial = select(&context, &settings);
     let cache = tempfile::tempdir().unwrap();
     let staging = cache.path().join("snapshots/staging");
-    create_directory(staging.join(".partial-sibling"));
-    fs::write(staging.join(".partial-sibling/sentinel"), b"keep sibling\n").unwrap();
+    create_directory(staging.join(STAGING_SIBLING));
+    fs::write(
+        staging.join(STAGING_SIBLING).join("sentinel"),
+        b"keep sibling\n",
+    )
+    .unwrap();
     let repo_root = repo.root().to_path_buf();
     let hook = RecordingHook::new(move |_tree: &Path| mutation(&repo_root));
 
@@ -805,7 +810,7 @@ fn assert_snapshot_changed(label: &str, mutation: Mutation) {
         "{label}: owned partial capture was not removed"
     );
     assert_eq!(
-        fs::read(staging.join(".partial-sibling/sentinel")).unwrap(),
+        fs::read(staging.join(STAGING_SIBLING).join("sentinel")).unwrap(),
         b"keep sibling\n",
         "{label}: cleanup crossed its owned boundary"
     );
@@ -1455,16 +1460,21 @@ fn cleanup_failure_is_an_io_error_and_never_a_successful_capture() {
     let context = inspect(&repo);
     let settings = settings(&[], &[]);
     let initial = select(&context, &settings);
-    let moved = Mutex::new(None::<PathBuf>);
-    let replaced = Mutex::new(None::<PathBuf>);
+    let moved = Mutex::new(None::<(PathBuf, u64, Vec<u8>)>);
+    let replaced = Mutex::new(None::<(PathBuf, u64, Vec<u8>)>);
     let hook = RecordingHook::new(|tree: &Path| {
         let partial = tree.parent().unwrap();
         let staging = partial.parent().unwrap();
         let moved_path = staging.join("moved-owned-capture");
         fs::rename(partial, &moved_path)?;
         symlink(&moved_path, partial)?;
-        *moved.lock().unwrap() = Some(moved_path);
-        *replaced.lock().unwrap() = Some(partial.to_path_buf());
+        let moved_meta = fs::symlink_metadata(&moved_path)?;
+        let moved_bytes = fs::read(moved_path.join("tree/tracked.txt"))?;
+        *moved.lock().unwrap() = Some((moved_path, moved_meta.ino(), moved_bytes));
+        let replaced_meta = fs::symlink_metadata(partial)?;
+        let replaced_bytes = fs::read_link(partial)?.as_os_str().as_bytes().to_vec();
+        *replaced.lock().unwrap() =
+            Some((partial.to_path_buf(), replaced_meta.ino(), replaced_bytes));
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "injected hook failure",
@@ -1476,7 +1486,10 @@ fn cleanup_failure_is_an_io_error_and_never_a_successful_capture() {
         .expect_err("failed owned cleanup must not return a snapshot");
 
     match error {
-        WorkerError::Io(error) => assert_eq!(error.raw_os_error(), Some(libc::ELOOP)),
+        WorkerError::Io(error) => assert!(
+            matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ESTALE)),
+            "cleanup failure errno: {error:?}"
+        ),
         other => panic!("cleanup failure had wrong classification: {other}"),
     }
     assert!(
@@ -1487,8 +1500,34 @@ fn cleanup_failure_is_an_io_error_and_never_a_successful_capture() {
             .exists()
     );
 
-    fs::remove_file(replaced.into_inner().unwrap().unwrap()).unwrap();
-    fs::remove_dir_all(moved.into_inner().unwrap().unwrap()).unwrap();
+    let (replaced_path, replaced_ino, replaced_bytes) = replaced.into_inner().unwrap().unwrap();
+    let (moved_path, moved_ino, moved_bytes) = moved.into_inner().unwrap().unwrap();
+    assert_eq!(
+        fs::symlink_metadata(&replaced_path).unwrap().ino(),
+        replaced_ino,
+        "substituted symlink inode mutated before manual cleanup"
+    );
+    assert_eq!(
+        fs::read_link(&replaced_path)
+            .unwrap()
+            .as_os_str()
+            .as_bytes(),
+        replaced_bytes.as_slice(),
+        "substituted symlink target mutated before manual cleanup"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&moved_path).unwrap().ino(),
+        moved_ino,
+        "relocated capture inode mutated before manual cleanup"
+    );
+    assert_eq!(
+        fs::read(moved_path.join("tree/tracked.txt")).unwrap(),
+        moved_bytes,
+        "relocated capture bytes mutated before manual cleanup"
+    );
+
+    fs::remove_file(&replaced_path).unwrap();
+    fs::remove_dir_all(&moved_path).unwrap();
 }
 
 #[test]
@@ -1570,4 +1609,330 @@ fn selection_origin_changes_are_compared_exactly() {
             ..
         }
     ));
+}
+
+struct CaptureCleanupFault {
+    capture_id: Mutex<Option<String>>,
+    repo_root: PathBuf,
+}
+
+impl SnapshotHook for CaptureCleanupFault {
+    fn after_materialization(&self, tree: &Path) -> io::Result<()> {
+        let partial_name = tree
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::other("missing partial capture path"))?;
+        let capture_id = partial_name
+            .strip_prefix(".partial-")
+            .ok_or_else(|| io::Error::other("invalid partial capture path"))?;
+        *self.capture_id.lock().unwrap() = Some(capture_id.to_owned());
+        mutate_file_bytes(&self.repo_root)
+    }
+
+    fn after_owned_cleanup_commit(&self) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    }
+}
+
+fn assert_cleanup_decision_is_delete(path: &Path) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    assert!(
+        metadata.file_type().is_file(),
+        "cleanup decision must be a regular file: {}",
+        path.display()
+    );
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap())
+        .expect("cleanup decision must be valid JSON");
+    assert!(
+        value.is_object(),
+        "cleanup decision must be a JSON object: {value:?}"
+    );
+    assert_eq!(
+        value.get("decision"),
+        Some(&serde_json::json!("delete")),
+        "cleanup decision must be Delete: {value}"
+    );
+}
+
+fn assert_canonical_tree_delete_journal(namespace: &Path) {
+    assert!(
+        namespace.is_dir(),
+        "expected tree journal {}",
+        namespace.display()
+    );
+    let mut intent = 0usize;
+    let mut decision = 0usize;
+    let mut operation = 0usize;
+    let mut quarantine = 0usize;
+    let mut decision_path = None;
+    for entry in fs::read_dir(namespace).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        if bytes.starts_with(b"cleanup-intent-v1-") {
+            intent += 1;
+        } else if bytes.starts_with(b"cleanup-decision-v1-") {
+            decision += 1;
+            decision_path = Some(path);
+        } else if bytes.starts_with(b"cleanup-op-v1-") {
+            operation += 1;
+        } else if bytes.starts_with(b"cleanup-tree-v1-") {
+            quarantine += 1;
+        }
+    }
+    assert_eq!(
+        (intent, decision, operation, quarantine),
+        (1, 1, 1, 1),
+        "unexpected snapshot tree journal under {}",
+        namespace.display()
+    );
+    assert_cleanup_decision_is_delete(&decision_path.expect("decision role path"));
+}
+
+#[test]
+fn capture_failure_after_delete_leaves_partial_journal_and_scan_converges() {
+    let repo = GitRepo::init();
+    repo.write("tracked.txt", b"original bytes\n");
+    repo.commit_all("track cleanup interrupt fixture");
+    let cache = tempfile::tempdir().unwrap();
+    let staging = cache.path().join("snapshots/staging");
+    create_directory(staging.join(STAGING_SIBLING));
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        staging.join(STAGING_SIBLING).join("sentinel"),
+        b"keep sibling\n",
+    )
+    .unwrap();
+    let context = inspect(&repo);
+    let settings = settings(&[], &[]);
+    let initial = select(&context, &settings);
+    let hook = CaptureCleanupFault {
+        capture_id: Mutex::new(None),
+        repo_root: repo.root().to_path_buf(),
+    };
+
+    let error = SnapshotBuilder::with_hook(&SystemProcessRunner, cache.path(), &hook)
+        .capture(&context, &settings, initial)
+        .expect_err("interrupted owned cleanup must not return a snapshot");
+    match error {
+        WorkerError::Io(error) => assert_eq!(error.raw_os_error(), Some(libc::EIO)),
+        other => panic!("cleanup failure had wrong classification: {other}"),
+    }
+    let capture_id = hook.capture_id.lock().unwrap().clone().unwrap();
+    assert!(!staging.join(format!(".partial-{capture_id}")).exists());
+    assert_canonical_tree_delete_journal(&staging.join(".mac-worker-rooted-fs"));
+    assert_eq!(
+        fs::read(staging.join(STAGING_SIBLING).join("sentinel")).unwrap(),
+        b"keep sibling\n"
+    );
+
+    let retried = SnapshotBuilder::new(&SystemProcessRunner, cache.path())
+        .capture(&context, &settings, select(&context, &settings))
+        .unwrap();
+    retried.cleanup().unwrap();
+    let namespace = staging.join(".mac-worker-rooted-fs");
+    if namespace.exists() {
+        assert!(
+            fs::read_dir(&namespace).unwrap().next().is_none(),
+            "staging cleanup journal remained"
+        );
+    }
+    assert_eq!(
+        fs::read(staging.join(STAGING_SIBLING).join("sentinel")).unwrap(),
+        b"keep sibling\n"
+    );
+    assert!(
+        fs::read_dir(&staging)
+            .unwrap()
+            .filter(|entry| {
+                let name = entry.as_ref().unwrap().file_name();
+                name != STAGING_SIBLING && name != ".mac-worker-rooted-fs"
+            })
+            .next()
+            .is_none(),
+        "owned partial capture remained after retry"
+    );
+}
+
+#[test]
+fn ready_cleanup_after_delete_does_not_delete_sibling_ready_uuid() {
+    let repo = GitRepo::init();
+    repo.write("tracked.txt", b"snapshot bytes\n");
+    repo.commit_all("track ready cleanup fixture");
+    let cache = tempfile::tempdir().unwrap();
+    let first = capture(&repo, cache.path(), &settings(&[], &[]));
+    let second = capture(&repo, cache.path(), &settings(&[], &[]));
+    let first_container = first.root.parent().unwrap().to_path_buf();
+    let second_container = second.root.parent().unwrap().to_path_buf();
+    let second_identity = (
+        fs::symlink_metadata(&second_container).unwrap().ino(),
+        fs::read(second.root.join("tracked.txt")).unwrap(),
+    );
+
+    let error = first
+        .cleanup_with_hook(&|| Err(io::Error::from_raw_os_error(libc::EIO)))
+        .unwrap_err();
+    match error {
+        WorkerError::Io(error) => assert_eq!(error.raw_os_error(), Some(libc::EIO)),
+        other => panic!("ready cleanup failure had wrong classification: {other}"),
+    }
+    assert!(!first_container.exists());
+    assert_canonical_tree_delete_journal(
+        &cache.path().join("snapshots/ready/.mac-worker-rooted-fs"),
+    );
+    assert!(second_container.exists());
+    assert_eq!(
+        (
+            fs::symlink_metadata(&second_container).unwrap().ino(),
+            fs::read(second.root.join("tracked.txt")).unwrap(),
+        ),
+        second_identity
+    );
+
+    let resumed = capture(&repo, cache.path(), &settings(&[], &[]));
+    assert!(!first_container.exists());
+    assert!(second_container.exists());
+    assert_eq!(
+        (
+            fs::symlink_metadata(&second_container).unwrap().ino(),
+            fs::read(second.root.join("tracked.txt")).unwrap(),
+        ),
+        second_identity
+    );
+    resumed.cleanup().unwrap();
+    second.cleanup().unwrap();
+    assert_snapshot_capture_roots_empty(cache.path());
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StartupScope {
+    Staging,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StartupResidueKind {
+    LegacyCleanupUuid,
+    DirectRemoveUuid,
+    WrongModeNamespace,
+}
+
+fn file_inode_and_bytes(path: &Path) -> (u64, Vec<u8>) {
+    (
+        fs::symlink_metadata(path).unwrap().ino(),
+        fs::read(path).unwrap(),
+    )
+}
+
+fn assert_startup_scan_fail_closed(scope: StartupScope, kind: StartupResidueKind) {
+    let repo = GitRepo::init();
+    repo.write("tracked.txt", b"input\n");
+    repo.commit_all("track residue fixture");
+    let cache = tempfile::tempdir().unwrap();
+    let staging = cache.path().join("snapshots/staging");
+    let ready = cache.path().join("snapshots/ready");
+    let parent = match scope {
+        StartupScope::Staging => &staging,
+        StartupScope::Ready => &ready,
+    };
+    create_directory(parent);
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let sibling_sentinel = match scope {
+        StartupScope::Staging => {
+            create_directory(parent.join(STAGING_SIBLING));
+            let sentinel = parent.join(STAGING_SIBLING).join("sentinel");
+            fs::write(&sentinel, b"keep sibling\n").unwrap();
+            sentinel
+        }
+        StartupScope::Ready => {
+            let sibling = parent.join("22222222-2222-4222-8222-222222222222");
+            create_directory(&sibling);
+            fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+            let sentinel = sibling.join("sentinel");
+            fs::write(&sentinel, b"keep ready sibling\n").unwrap();
+            sentinel
+        }
+    };
+    let sibling_identity = file_inode_and_bytes(&sibling_sentinel);
+
+    let residue_path = match kind {
+        StartupResidueKind::LegacyCleanupUuid => {
+            let namespace = parent.join(".mac-worker-rooted-fs");
+            fs::create_dir_all(&namespace).unwrap();
+            fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+            let leftover = namespace.join("cleanup-11111111-1111-4111-8111-111111111111");
+            fs::create_dir(&leftover).unwrap();
+            fs::set_permissions(&leftover, fs::Permissions::from_mode(0o700)).unwrap();
+            let sentinel = leftover.join("sentinel");
+            fs::write(&sentinel, b"legacy-unbound").unwrap();
+            sentinel
+        }
+        StartupResidueKind::DirectRemoveUuid => {
+            let residue = parent.join("remove-303f0f4a-6b5c-4d8e-9f00-112233445566");
+            fs::write(&residue, b"direct-remove-residue").unwrap();
+            residue
+        }
+        StartupResidueKind::WrongModeNamespace => {
+            let namespace = parent.join(".mac-worker-rooted-fs");
+            fs::create_dir_all(&namespace).unwrap();
+            fs::set_permissions(&namespace, fs::Permissions::from_mode(0o755)).unwrap();
+            namespace
+        }
+    };
+    let residue_meta = fs::symlink_metadata(&residue_path).unwrap();
+    let residue_ino = residue_meta.ino();
+    let residue_mode = residue_meta.permissions().mode() & 0o777;
+    let residue_bytes = residue_meta
+        .file_type()
+        .is_file()
+        .then(|| fs::read(&residue_path).unwrap());
+
+    let context = inspect(&repo);
+    let settings = settings(&[], &[]);
+    let initial = select(&context, &settings);
+    let error = SnapshotBuilder::new(&SystemProcessRunner, cache.path())
+        .capture(&context, &settings, initial)
+        .expect_err("startup residue must fail closed");
+    assert!(matches!(error, WorkerError::Io(_)), "{error}");
+    assert_eq!(
+        file_inode_and_bytes(&sibling_sentinel),
+        sibling_identity,
+        "sibling inode/bytes mutated for {scope:?}/{kind:?}"
+    );
+    let after = fs::symlink_metadata(&residue_path).unwrap();
+    assert_eq!(after.ino(), residue_ino, "residue inode mutated");
+    assert_eq!(after.permissions().mode() & 0o777, residue_mode);
+    if let Some(bytes) = residue_bytes {
+        assert_eq!(fs::read(&residue_path).unwrap(), bytes);
+    }
+    if matches!(scope, StartupScope::Staging) {
+        assert!(
+            !ready.exists()
+                || fs::read_dir(&ready)
+                    .unwrap()
+                    .filter(|entry| entry.as_ref().unwrap().file_name() != ".mac-worker-rooted-fs")
+                    .next()
+                    .is_none()
+        );
+    }
+}
+
+#[test]
+fn startup_scan_fail_closed_on_legacy_residue() {
+    for (scope, kind) in [
+        (StartupScope::Staging, StartupResidueKind::LegacyCleanupUuid),
+        (StartupScope::Ready, StartupResidueKind::LegacyCleanupUuid),
+        (StartupScope::Staging, StartupResidueKind::DirectRemoveUuid),
+        (StartupScope::Ready, StartupResidueKind::DirectRemoveUuid),
+        (
+            StartupScope::Staging,
+            StartupResidueKind::WrongModeNamespace,
+        ),
+        (StartupScope::Ready, StartupResidueKind::WrongModeNamespace),
+    ] {
+        assert_startup_scan_fail_closed(scope, kind);
+    }
 }

@@ -40,6 +40,11 @@ pub trait SnapshotHook: Send + Sync {
     fn after_publication(&self, _capture: &Path) -> io::Result<()> {
         Ok(())
     }
+
+    #[doc(hidden)]
+    fn after_owned_cleanup_commit(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct NoopSnapshotHook;
@@ -114,8 +119,16 @@ impl Snapshot {
     }
 
     pub fn cleanup(&self) -> Result<(), WorkerError> {
+        self.cleanup_with_hook(&|| Ok(()))
+    }
+
+    #[doc(hidden)]
+    pub fn cleanup_with_hook(
+        &self,
+        after_durable_delete: &dyn Fn() -> io::Result<()>,
+    ) -> Result<(), WorkerError> {
         self.owned_capture
-            .remove_owned_tree()
+            .remove_owned_tree_with_cleanup_hook(after_durable_delete)
             .map_err(WorkerError::Io)
     }
 }
@@ -150,46 +163,54 @@ impl<'a> SnapshotBuilder<'a> {
         let ready = snapshots.join("ready");
         ensure_directory_chain(&staging)?;
         ensure_directory_chain(&ready)?;
+        recover_pending_snapshot_parent(&staging, is_canonical_partial_name)?;
+        recover_pending_snapshot_parent(&ready, is_canonical_ready_uuid)?;
 
+        let cleanup_hook = || self.hook.after_owned_cleanup_commit();
         let (capture_id, partial_path, mut partial, partial_identity) =
-            create_unique_partial(&staging)?;
+            create_unique_partial(&staging, &cleanup_hook)?;
         let tree_path = partial_path.join("tree");
         let tree = match RootedDir::create(&tree_path) {
             Ok(tree) => tree,
-            Err(error) => return fail_with_owned_cleanup(&partial, WorkerError::Io(error)),
+            Err(error) => {
+                return fail_with_owned_cleanup(&partial, &cleanup_hook, WorkerError::Io(error));
+            }
         };
 
         let prepared = match self.prepare_capture(context, settings, &initial, &tree_path, &tree) {
             Ok(prepared) => prepared,
-            Err(error) => return fail_with_owned_cleanup(&partial, error),
+            Err(error) => return fail_with_owned_cleanup(&partial, &cleanup_hook, error),
         };
 
         let manifest_path = partial_path.join("manifest.json");
         if let Err(error) = write_manifest(&manifest_path, &prepared.canonical_bytes) {
-            return fail_with_owned_cleanup(&partial, WorkerError::Io(error));
+            return fail_with_owned_cleanup(&partial, &cleanup_hook, WorkerError::Io(error));
         }
         if let Err(error) = sync_directory(&partial_path) {
-            return fail_with_owned_cleanup(&partial, WorkerError::Io(error));
+            return fail_with_owned_cleanup(&partial, &cleanup_hook, WorkerError::Io(error));
         }
         if let Err(error) = tree.make_read_only() {
-            return fail_with_owned_cleanup(&partial, WorkerError::Io(error));
+            return fail_with_owned_cleanup(&partial, &cleanup_hook, WorkerError::Io(error));
         }
         if let Err(error) = sync_directory(&tree_path).and_then(|()| sync_directory(&partial_path))
         {
-            return fail_with_owned_cleanup(&partial, WorkerError::Io(error));
+            return fail_with_owned_cleanup(&partial, &cleanup_hook, WorkerError::Io(error));
         }
         match path_identity(&partial_path) {
             Ok(identity) if identity == partial_identity => {}
             Ok(_) => {
                 return fail_with_owned_cleanup(
                     &partial,
+                    &cleanup_hook,
                     snapshot_error(
                         "SNAPSHOT_CHANGED",
                         "the owned staging directory changed before publication",
                     ),
                 );
             }
-            Err(error) => return fail_with_owned_cleanup(&partial, WorkerError::Io(error)),
+            Err(error) => {
+                return fail_with_owned_cleanup(&partial, &cleanup_hook, WorkerError::Io(error));
+            }
         }
 
         let ready_capture = ready.join(capture_id.to_string());
@@ -202,13 +223,13 @@ impl<'a> SnapshotBuilder<'a> {
             } else {
                 WorkerError::Io(error)
             };
-            return fail_with_owned_cleanup(&partial, primary);
+            return fail_with_owned_cleanup(&partial, &cleanup_hook, primary);
         }
         if let Err(error) = self.hook.after_publication(&ready_capture) {
-            return fail_with_owned_cleanup(&partial, WorkerError::Io(error));
+            return fail_with_owned_cleanup(&partial, &cleanup_hook, WorkerError::Io(error));
         }
         if let Err(error) = partial.sync_parent() {
-            return fail_with_owned_cleanup(&partial, WorkerError::Io(error));
+            return fail_with_owned_cleanup(&partial, &cleanup_hook, WorkerError::Io(error));
         }
 
         Ok(Snapshot {
@@ -554,6 +575,7 @@ fn remove_empty_rooted_fs_namespace(partial_path: &Path) -> Result<(), WorkerErr
 
 fn create_unique_partial(
     staging: &Path,
+    cleanup_hook: &dyn Fn() -> io::Result<()>,
 ) -> Result<(Uuid, PathBuf, RootedDir, PathIdentity), WorkerError> {
     for _ in 0..16 {
         let capture_id = Uuid::new_v4();
@@ -563,7 +585,11 @@ fn create_unique_partial(
                 let metadata = match fs::symlink_metadata(&path) {
                     Ok(metadata) => metadata,
                     Err(error) => {
-                        return fail_with_owned_cleanup(&root, WorkerError::Io(error));
+                        return fail_with_owned_cleanup(
+                            &root,
+                            cleanup_hook,
+                            WorkerError::Io(error),
+                        );
                     }
                 };
                 if !metadata.file_type().is_dir()
@@ -572,6 +598,7 @@ fn create_unique_partial(
                 {
                     return fail_with_owned_cleanup(
                         &root,
+                        cleanup_hook,
                         WorkerError::Io(io::Error::new(
                             io::ErrorKind::PermissionDenied,
                             "snapshot staging root is not an owner-only directory",
@@ -594,11 +621,51 @@ fn create_unique_partial(
     ))
 }
 
-fn fail_with_owned_cleanup<T>(root: &RootedDir, primary: WorkerError) -> Result<T, WorkerError> {
-    match root.remove_owned_tree() {
+fn fail_with_owned_cleanup<T>(
+    root: &RootedDir,
+    cleanup_hook: &dyn Fn() -> io::Result<()>,
+    primary: WorkerError,
+) -> Result<T, WorkerError> {
+    match root.remove_owned_tree_with_cleanup_hook(cleanup_hook) {
         Ok(()) => Err(primary),
         Err(cleanup_error) => Err(WorkerError::Io(cleanup_error)),
     }
+}
+
+fn is_canonical_hyphenated_uuid(name: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(name) else {
+        return false;
+    };
+    Uuid::parse_str(text).is_ok_and(|uuid| uuid.hyphenated().to_string() == text)
+}
+
+fn is_canonical_partial_name(name: &[u8]) -> bool {
+    name.strip_prefix(b".partial-")
+        .is_some_and(is_canonical_hyphenated_uuid)
+}
+
+fn is_canonical_ready_uuid(name: &[u8]) -> bool {
+    is_canonical_hyphenated_uuid(name)
+}
+
+fn recover_pending_snapshot_parent(
+    path: &Path,
+    accept: fn(&[u8]) -> bool,
+) -> Result<(), WorkerError> {
+    let parent = RootedDir::open(path).map_err(WorkerError::Io)?;
+    if !parent.entry_exists(ROOTED_FS_NAMESPACE)? {
+        if parent.has_private_cleanup_residue()? {
+            return Err(io::Error::other("private cleanup residue remains").into());
+        }
+        return Ok(());
+    }
+    parent
+        .retry_pending_owned_children_matching(|component, _| accept(component))
+        .map_err(WorkerError::Io)?;
+    if parent.has_private_cleanup_residue()? {
+        return Err(io::Error::other("private cleanup residue remains").into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -791,5 +858,47 @@ fn snapshot_error(code: &'static str, message: impl Into<String>) -> WorkerError
     WorkerError::Snapshot {
         code,
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ROOTED_FS_NAMESPACE, is_canonical_partial_name, is_canonical_ready_uuid,
+        recover_pending_snapshot_parent,
+    };
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn startup_scan_does_not_mkdir_namespace() {
+        let fixture = tempfile::tempdir().unwrap();
+        let staging = fixture.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(staging.join(".partial-sibling")).unwrap();
+        recover_pending_snapshot_parent(&staging, is_canonical_partial_name).unwrap();
+        assert!(
+            !staging.join(ROOTED_FS_NAMESPACE).exists(),
+            "resume scan must not create an empty cleanup namespace"
+        );
+        assert!(staging.join(".partial-sibling").is_dir());
+    }
+
+    #[test]
+    fn snapshot_name_parsers_accept_only_canonical_ids() {
+        let uuid = uuid::Uuid::from_u128(0x11111111111141118111111111111111);
+        let hyphenated = uuid.hyphenated().to_string();
+        assert!(is_canonical_partial_name(
+            format!(".partial-{hyphenated}").as_bytes()
+        ));
+        assert!(is_canonical_ready_uuid(hyphenated.as_bytes()));
+        assert!(!is_canonical_partial_name(b".partial-sibling"));
+        assert!(!is_canonical_ready_uuid(b".partial-sibling"));
+        assert!(!is_canonical_ready_uuid(
+            uuid.simple().to_string().as_bytes()
+        ));
+        assert!(!is_canonical_partial_name(
+            format!(".partial-{hyphenated}-extra").as_bytes()
+        ));
     }
 }

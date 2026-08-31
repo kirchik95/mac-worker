@@ -4,14 +4,14 @@ mod support;
 use std::{
     collections::{BTreeMap, VecDeque},
     ffi::{OsStr, OsString},
-    fs,
-    io::Cursor,
+    fs::{self, File, OpenOptions},
+    io::{Cursor, Write as _},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::MetadataExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         process::ExitStatusExt,
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::{
         Arc, Barrier, Mutex,
@@ -43,6 +43,7 @@ use mac_worker::{
     project::{ProjectContext, ProjectInspector},
     project_config::SnapshotSettings,
     protocol::{MemoryPressure, PROTOCOL_VERSION},
+    remote_snapshot::{RemoteSnapshotService, VerifiedReceipt},
     run_with_rsync_executor_in_context, run_with_stdio_in_context,
     snapshot::{Snapshot, SnapshotBuilder},
     transfer::{
@@ -2866,4 +2867,605 @@ fn resolution_outcomes_keep_host_authority_and_submission_error_rules_exact() {
         WorkerError::Protocol(ref message)
             if message == "UNKNOWN_REMOTE: remote job state is unknown"
     ));
+}
+
+fn isolated_leased_job(root: &Path, seed: u128) -> (HostStore, LeaseRecord, SubmitRequest) {
+    let (store, request, _) = leased_store(root, seed);
+    let lease = LeaseService::new(&store)
+        .load()
+        .unwrap()
+        .expect("acquired lease");
+    let submit = SubmitRequest::new(request.material().clone());
+    (store, lease, submit)
+}
+
+fn canonical_receipt_bytes(lease: &LeaseRecord, verified_at_millis: u64) -> Vec<u8> {
+    let token_hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(lease.lease_token().to_string().as_bytes())
+    );
+    let value = serde_json::json!({
+        "version": 1,
+        "job_id": lease.job_id().to_string(),
+        "client_id": lease.client_id().to_string(),
+        "lease_token_sha256": token_hash,
+        "request_fingerprint": lease.request_fingerprint().to_string(),
+        "project_id": lease.project_id(),
+        "worktree_id": lease.worktree_id(),
+        "manifest_digest": lease.manifest_digest(),
+        "cache_key": {
+            "project_id": lease.project_id(),
+            "worktree_id": lease.worktree_id(),
+            "manifest_digest": lease.manifest_digest(),
+        },
+        "verified_at_millis": verified_at_millis,
+    });
+    let receipt: VerifiedReceipt = serde_json::from_value(value).unwrap();
+    serde_json::to_vec(&receipt).unwrap()
+}
+
+fn write_owner_file(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+        let mut permissions = fs::metadata(parent).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(parent, permissions).unwrap();
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+    File::open(path.parent().unwrap())
+        .unwrap()
+        .sync_all()
+        .unwrap();
+}
+
+fn plant_verified_receipt(store: &HostStore, lease: &LeaseRecord) -> PathBuf {
+    let path = store.verified_receipt(lease.job_id()).unwrap();
+    write_owner_file(&path, &canonical_receipt_bytes(lease, 42));
+    path
+}
+
+fn plant_verified_pending(store: &HostStore, lease: &LeaseRecord, bytes: &[u8]) -> PathBuf {
+    let path = store
+        .verified_receipt(lease.job_id())
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!(".verify-{}.json.pending", lease.job_id()));
+    write_owner_file(&path, bytes);
+    path
+}
+
+fn plant_sibling_verified_receipt(store: &HostStore, seed: u128) -> PathBuf {
+    let foreign = acquire_request(seed);
+    let material = foreign.material();
+    let token_hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(material.lease_token().to_string().as_bytes())
+    );
+    let value = serde_json::json!({
+        "version": 1,
+        "job_id": material.job_id().to_string(),
+        "client_id": material.client_id().to_string(),
+        "lease_token_sha256": token_hash,
+        "request_fingerprint": foreign.request_fingerprint().to_string(),
+        "project_id": material.project_id(),
+        "worktree_id": material.worktree_id(),
+        "manifest_digest": material.manifest_digest(),
+        "cache_key": {
+            "project_id": material.project_id(),
+            "worktree_id": material.worktree_id(),
+            "manifest_digest": material.manifest_digest(),
+        },
+        "verified_at_millis": 7,
+    });
+    let receipt: VerifiedReceipt = serde_json::from_value(value).unwrap();
+    let path = store.verified_receipt(material.job_id()).unwrap();
+    write_owner_file(&path, &serde_json::to_vec(&receipt).unwrap());
+    path
+}
+
+fn file_identity(path: &Path) -> (u64, u64, Vec<u8>) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    (metadata.dev(), metadata.ino(), fs::read(path).unwrap())
+}
+
+fn assert_file_identity_unchanged(path: &Path, expected: (u64, u64, Vec<u8>)) {
+    let actual = file_identity(path);
+    assert_eq!(actual, expected, "sibling capture or receipt mutated");
+}
+
+fn verified_namespace(root: &Path) -> PathBuf {
+    root.join("verified/.mac-worker-rooted-fs")
+}
+
+fn assert_cleanup_decision_is_delete(path: &Path) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    assert!(
+        metadata.file_type().is_file(),
+        "cleanup decision must be a regular file: {}",
+        path.display()
+    );
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap())
+        .expect("cleanup decision must be valid JSON");
+    assert!(
+        value.is_object(),
+        "cleanup decision must be a JSON object: {value:?}"
+    );
+    assert_eq!(
+        value.get("decision"),
+        Some(&serde_json::json!("delete")),
+        "cleanup decision must be Delete: {value}"
+    );
+}
+
+fn assert_canonical_regular_delete_journal(namespace: &Path) {
+    assert!(
+        namespace.is_dir(),
+        "expected cleanup journal {}",
+        namespace.display()
+    );
+    let mut intent = 0usize;
+    let mut decision = 0usize;
+    let mut operation = 0usize;
+    let mut quarantine = 0usize;
+    let mut decision_path = None;
+    for entry in fs::read_dir(namespace).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        if bytes.starts_with(b"cleanup-intent-v1-") {
+            intent += 1;
+            assert!(entry.file_type().unwrap().is_file());
+        } else if bytes.starts_with(b"cleanup-decision-v1-") {
+            decision += 1;
+            assert!(entry.file_type().unwrap().is_file());
+            decision_path = Some(path);
+        } else if bytes.starts_with(b"cleanup-op-v1-") {
+            operation += 1;
+            assert!(entry.file_type().unwrap().is_dir());
+        } else if bytes.starts_with(b"cleanup-regular-v1-") {
+            quarantine += 1;
+            assert!(entry.file_type().unwrap().is_file() || entry.path().is_dir());
+        }
+    }
+    assert_eq!(
+        (intent, decision, operation, quarantine),
+        (1, 1, 1, 1),
+        "unexpected verified Regular journal under {}",
+        namespace.display()
+    );
+    assert_cleanup_decision_is_delete(&decision_path.expect("decision role path"));
+}
+
+fn assert_cleanup_namespace_empty_or_absent(namespace: &Path) {
+    if !namespace.exists() {
+        return;
+    }
+    assert!(
+        fs::read_dir(namespace).unwrap().next().is_none(),
+        "cleanup journal remained under {}",
+        namespace.display()
+    );
+}
+
+fn plant_incoming_payload(store: &HostStore, lease: &LeaseRecord, payload: &[u8]) {
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    fs::create_dir_all(incoming.join("tree")).unwrap();
+    for private in [
+        incoming.parent().unwrap().parent().unwrap(),
+        incoming.parent().unwrap(),
+        incoming.as_path(),
+    ] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let digest = format!("{:x}", sha2::Sha256::digest(payload));
+    assert_eq!(digest, lease.manifest_digest());
+    fs::write(incoming.join("manifest.json"), payload).unwrap();
+    fs::write(incoming.join("tree/payload.txt"), b"payload").unwrap();
+    fs::set_permissions(
+        incoming.join("manifest.json"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(
+        incoming.join("tree/payload.txt"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
+}
+
+fn matching_manifest_lease(
+    root: &Path,
+    seed: u128,
+) -> (HostStore, LeaseRecord, SubmitRequest, String) {
+    let store = HostStore::open(root).unwrap();
+    let payload = format!(
+        concat!(
+            r#"{{"version":1,"project_id":"{project}","worktree_id":"{worktree}","#,
+            r#""head":null,"branch":null,"dirty":false,"relative_working_dir":"","#,
+            r#""entries":[{{"path":"payload.txt","kind":"file","mode":420,"size":7,"#,
+            r#""sha256":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5","#,
+            r#""symlink_target":null}}],"tracked_deletions":[]}}"#
+        ),
+        project = "a".repeat(64),
+        worktree = "b".repeat(64),
+    )
+    .into_bytes();
+    let digest = format!("{:x}", sha2::Sha256::digest(&payload));
+    let request = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            JobId::new(uuid::Uuid::from_u128(seed)),
+            ClientId::new(uuid::Uuid::from_u128(seed + 1)),
+            LeaseToken::new(uuid::Uuid::from_u128(seed + 2)),
+            1,
+            "mini-1".into(),
+            "a".repeat(64),
+            "b".repeat(64),
+            digest.clone(),
+            String::new(),
+            60_000,
+            "heavy".into(),
+            CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+        )
+        .unwrap(),
+    );
+    let lease = match LeaseService::new(&store)
+        .acquire(&request, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    plant_incoming_payload(&store, &lease, &payload);
+    let submit = SubmitRequest::new(request.material().clone());
+    (store, lease, submit, digest)
+}
+
+#[test]
+fn resolution_verified_receipt_after_delete_keeps_lease_and_converges_on_reopen() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, lease, submit) = isolated_leased_job(&root, 401);
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let receipt = plant_verified_receipt(&store, &lease);
+    let sibling = plant_sibling_verified_receipt(&store, 901);
+    let sibling_identity = file_identity(&sibling);
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let pending = JobService::new(&faulted, &NeverLaunchResolution)
+        .resolve_or_abandon(request.clone())
+        .unwrap();
+    assert!(
+        matches!(
+            pending.outcome(),
+            ResolveOrAbandonOutcome::CleanupPending { code } if code == "MUTABLE_CLEANUP_FAILED"
+        ),
+        "{pending:?}"
+    );
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(!receipt.exists(), "public receipt must be quarantined");
+    assert_canonical_regular_delete_journal(&verified_namespace(&root));
+    assert_file_identity_unchanged(&sibling, sibling_identity.clone());
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let completed = JobService::new(&reopened, &NeverLaunchResolution)
+        .resolve_or_abandon(request)
+        .unwrap();
+    assert!(
+        matches!(completed.outcome(), ResolveOrAbandonOutcome::Abandoned),
+        "{completed:?}"
+    );
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+    assert!(!receipt.exists());
+    assert_cleanup_namespace_empty_or_absent(&verified_namespace(&root));
+    assert_file_identity_unchanged(&sibling, sibling_identity);
+}
+
+#[test]
+fn resolution_verified_pending_after_delete_keeps_lease_and_converges_on_reopen() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, lease, submit) = isolated_leased_job(&root, 402);
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let pending_path = plant_verified_pending(&store, &lease, &canonical_receipt_bytes(&lease, 42));
+    let sibling = plant_sibling_verified_receipt(&store, 902);
+    let sibling_identity = file_identity(&sibling);
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let pending = JobService::new(&faulted, &NeverLaunchResolution)
+        .resolve_or_abandon(request.clone())
+        .unwrap();
+    assert!(
+        matches!(
+            pending.outcome(),
+            ResolveOrAbandonOutcome::CleanupPending { code } if code == "MUTABLE_CLEANUP_FAILED"
+        ),
+        "{pending:?}"
+    );
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(!pending_path.exists(), "public pending must be quarantined");
+    assert_canonical_regular_delete_journal(&verified_namespace(&root));
+    assert_file_identity_unchanged(&sibling, sibling_identity.clone());
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let completed = JobService::new(&reopened, &NeverLaunchResolution)
+        .resolve_or_abandon(request)
+        .unwrap();
+    assert!(
+        matches!(completed.outcome(), ResolveOrAbandonOutcome::Abandoned),
+        "{completed:?}"
+    );
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+    assert!(!pending_path.exists());
+    assert_cleanup_namespace_empty_or_absent(&verified_namespace(&root));
+    assert_file_identity_unchanged(&sibling, sibling_identity);
+}
+
+#[test]
+fn resolution_verified_legacy_residue_stays_fail_closed() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, lease, submit) = isolated_leased_job(&root, 403);
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    drop(store);
+
+    let namespace = verified_namespace(&root);
+    fs::create_dir_all(&namespace).unwrap();
+    fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+    let leftover = namespace.join("cleanup-11111111-1111-4111-8111-111111111111");
+    fs::create_dir(&leftover).unwrap();
+    fs::set_permissions(&leftover, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(leftover.join("sentinel"), b"legacy-unbound").unwrap();
+    let leftover_identity = file_identity(&leftover.join("sentinel"));
+
+    for attempt in 0..2 {
+        let store = HostStore::open(&root).unwrap();
+        let pending = JobService::new(&store, &NeverLaunchResolution)
+            .resolve_or_abandon(request.clone())
+            .unwrap();
+        assert!(
+            matches!(
+                pending.outcome(),
+                ResolveOrAbandonOutcome::CleanupPending { code } if code == "MUTABLE_CLEANUP_FAILED"
+            ),
+            "attempt {attempt}: {pending:?}"
+        );
+        assert_eq!(
+            LeaseService::new(&store).load().unwrap(),
+            Some(lease.clone()),
+            "attempt {attempt}"
+        );
+        assert_file_identity_unchanged(&leftover.join("sentinel"), leftover_identity.clone());
+    }
+}
+
+#[test]
+fn publish_receipt_matching_pending_after_delete_is_retryable_io() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, lease, _, digest) = matching_manifest_lease(&root, 404);
+    RemoteSnapshotService::new(&store)
+        .verify_and_promote_at(&lease, &digest, 42)
+        .unwrap();
+    let receipt = store.verified_receipt(lease.job_id()).unwrap();
+    let pending = receipt
+        .parent()
+        .unwrap()
+        .join(format!(".verify-{}.json.pending", lease.job_id()));
+    fs::copy(&receipt, &pending).unwrap();
+    fs::set_permissions(&pending, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&receipt).unwrap();
+    File::open(receipt.parent().unwrap())
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let error = RemoteSnapshotService::new(&faulted)
+        .verify_and_promote_at(&lease, &digest, 42)
+        .unwrap_err();
+    assert!(
+        matches!(error, WorkerError::Io(_)),
+        "publish staging hook must stay Io, got {error}"
+    );
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(!pending.exists());
+    assert!(!receipt.exists());
+    assert_canonical_regular_delete_journal(&verified_namespace(&root));
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    RemoteSnapshotService::new(&reopened)
+        .verify_and_promote_at(&lease, &digest, 42)
+        .unwrap();
+    assert!(receipt.is_file());
+    assert!(!pending.exists());
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), Some(lease));
+    assert_cleanup_namespace_empty_or_absent(&verified_namespace(&root));
+}
+
+#[test]
+fn publish_receipt_conflicting_pending_is_fail_closed() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, lease, _, digest) = matching_manifest_lease(&root, 405);
+    RemoteSnapshotService::new(&store)
+        .verify_and_promote_at(&lease, &digest, 42)
+        .unwrap();
+    let receipt = store.verified_receipt(lease.job_id()).unwrap();
+    fs::remove_file(&receipt).unwrap();
+    let foreign = plant_sibling_verified_receipt(&store, 905);
+    let pending = receipt
+        .parent()
+        .unwrap()
+        .join(format!(".verify-{}.json.pending", lease.job_id()));
+    fs::copy(&foreign, &pending).unwrap();
+    fs::set_permissions(&pending, fs::Permissions::from_mode(0o600)).unwrap();
+    File::open(receipt.parent().unwrap())
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    let pending_identity = file_identity(&pending);
+    let foreign_identity = file_identity(&foreign);
+
+    let error = RemoteSnapshotService::new(&store)
+        .verify_and_promote_at(&lease, &digest, 42)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WorkerError::Snapshot {
+                code: "UNSAFE_REMOTE_SNAPSHOT",
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert_file_identity_unchanged(&pending, pending_identity);
+    assert_file_identity_unchanged(&foreign, foreign_identity);
+    assert!(!receipt.exists());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+}
+
+#[test]
+fn publish_receipt_noncanonical_pending_is_fail_closed() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, lease, _, digest) = matching_manifest_lease(&root, 406);
+    RemoteSnapshotService::new(&store)
+        .verify_and_promote_at(&lease, &digest, 42)
+        .unwrap();
+    let receipt = store.verified_receipt(lease.job_id()).unwrap();
+    let pending = receipt
+        .parent()
+        .unwrap()
+        .join(format!(".verify-{}.json.pending", lease.job_id()));
+    let mut garbage = fs::read(&receipt).unwrap();
+    garbage.extend_from_slice(b"\n");
+    fs::remove_file(&receipt).unwrap();
+    write_owner_file(&pending, &garbage);
+    let pending_identity = file_identity(&pending);
+
+    let error = RemoteSnapshotService::new(&store)
+        .verify_and_promote_at(&lease, &digest, 42)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WorkerError::Snapshot {
+                code: "UNSAFE_REMOTE_SNAPSHOT",
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert_file_identity_unchanged(&pending, pending_identity);
+    assert!(!receipt.exists());
+}
+
+#[test]
+fn publish_receipt_estale_cleanup_is_unsafe_remote_snapshot() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, lease, _, digest) = matching_manifest_lease(&root, 407);
+    RemoteSnapshotService::new(&store)
+        .verify_and_promote_at(&lease, &digest, 42)
+        .unwrap();
+    let receipt = store.verified_receipt(lease.job_id()).unwrap();
+    let pending = receipt
+        .parent()
+        .unwrap()
+        .join(format!(".verify-{}.json.pending", lease.job_id()));
+    fs::copy(&receipt, &pending).unwrap();
+    fs::set_permissions(&pending, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&receipt).unwrap();
+    File::open(receipt.parent().unwrap())
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let error = RemoteSnapshotService::new(&faulted)
+        .verify_and_promote_at(&lease, &digest, 42)
+        .unwrap_err();
+    assert!(
+        matches!(error, WorkerError::Io(_)),
+        "publish staging hook must stay Io, got {error}"
+    );
+    assert!(!pending.exists());
+    assert_canonical_regular_delete_journal(&verified_namespace(&root));
+    let sibling = plant_sibling_verified_receipt(&faulted, 907);
+    let sibling_identity = file_identity(&sibling);
+    let namespace = verified_namespace(&root);
+    fs::set_permissions(&namespace, fs::Permissions::from_mode(0o755)).unwrap();
+    let namespace_ino = fs::symlink_metadata(&namespace).unwrap().ino();
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let error = RemoteSnapshotService::new(&reopened)
+        .verify_and_promote_at(&lease, &digest, 42)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WorkerError::Snapshot {
+                code: "UNSAFE_REMOTE_SNAPSHOT",
+                ..
+            }
+        ),
+        "ESTALE cleanup must map to UNSAFE_REMOTE_SNAPSHOT, got {error}"
+    );
+    assert_eq!(
+        LeaseService::new(&reopened).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(!receipt.exists());
+    assert_eq!(
+        fs::symlink_metadata(&namespace)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::symlink_metadata(&namespace).unwrap().ino(),
+        namespace_ino
+    );
+    assert_file_identity_unchanged(&sibling, sibling_identity);
+    assert_canonical_regular_delete_journal(&namespace);
 }

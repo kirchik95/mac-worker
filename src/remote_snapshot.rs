@@ -355,10 +355,9 @@ impl<'a> RemoteSnapshotService<'a> {
         self.validate_resolution_evidence_after(admission, transfer, identity)?;
         let directory = self.store.open_directory("verified", false)?;
         let receipt = format!("{}.json", identity.job_id());
-        if directory.entry_exists(&receipt)? {
-            directory.remove_owned_regular(&receipt)?;
-            directory.sync_root()?;
-        }
+        self.store
+            .remove_owned_regular_committed(&directory, &receipt)?;
+        directory.sync_root()?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterResolutionVerifiedReceiptRemoval)
@@ -368,10 +367,9 @@ impl<'a> RemoteSnapshotService<'a> {
             )));
         }
         let staging = format!(".verify-{}.json.pending", identity.job_id());
-        if directory.entry_exists(&staging)? {
-            directory.remove_owned_regular(&staging)?;
-            directory.sync_root()?;
-        }
+        self.store
+            .remove_owned_regular_committed(&directory, &staging)?;
+        directory.sync_root()?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterResolutionVerificationStageRemoval)
@@ -589,11 +587,23 @@ impl<'a> RemoteSnapshotService<'a> {
         let bytes = serde_json::to_vec(desired)
             .map_err(|_| WorkerError::Protocol("verified receipt is invalid".into()))?;
         let staging_name = format!(".verify-{}.json.pending", desired.job_id());
-        if directory.entry_exists(&staging_name)? {
+        if directory.entry_exists(".mac-worker-rooted-fs")? {
             directory
-                .remove_owned_regular(&staging_name)
-                .map_err(unsafe_snapshot_io)?;
-            directory.sync_root().map_err(unsafe_snapshot_io)?;
+                .resume_pending_owned_regular_cleanup(&staging_name)
+                .map_err(map_verified_cleanup_io)?;
+        }
+        if directory.entry_exists(&staging_name)? {
+            let staged_bytes = directory
+                .read_private_regular(&staging_name, 1024 * 1024)
+                .map_err(|_| unsafe_remote_snapshot())?;
+            let staged: VerifiedReceipt = decode_canonical_json(&staged_bytes, "verified receipt")?;
+            if !receipt_identity_equal(&staged, desired) {
+                return Err(unsafe_remote_snapshot());
+            }
+            self.store
+                .remove_owned_regular_committed(&directory, &staging_name)
+                .map_err(map_verified_cleanup_io)?;
+            directory.sync_root().map_err(WorkerError::Io)?;
         }
         match directory.write_private_atomic_no_replace_with_commit_hooks(
             &name,
@@ -1214,6 +1224,14 @@ fn unsafe_remote_snapshot() -> WorkerError {
 
 fn unsafe_snapshot_io(_error: io::Error) -> WorkerError {
     unsafe_remote_snapshot()
+}
+
+fn map_verified_cleanup_io(error: io::Error) -> WorkerError {
+    if error.raw_os_error() == Some(libc::ESTALE) {
+        unsafe_remote_snapshot()
+    } else {
+        WorkerError::Io(error)
+    }
 }
 
 fn lease_identity_mismatch() -> WorkerError {

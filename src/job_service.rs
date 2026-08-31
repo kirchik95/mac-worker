@@ -937,9 +937,8 @@ impl<'a> JobService<'a> {
                 supervisor_identity,
                 current.child_identity(),
             )?;
-            if job.entry_exists("execution.json")? {
-                job.remove_owned_regular("execution.json")?;
-            }
+            self.store
+                .remove_owned_regular_committed(&job, "execution.json")?;
             let stdout = job.open_private_append("stdout.log")?;
             let stderr = job.open_private_append("stderr.log")?;
             stdout.sync_all()?;

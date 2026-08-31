@@ -811,7 +811,7 @@ impl PrivateEntryIdentity {
             inode: metadata.st_ino,
             kind: file_type(metadata.st_mode) as u32,
             owner: metadata.st_uid,
-            mode: (metadata.st_mode & 0o777) as u32,
+            mode: (metadata.st_mode & 0o7777) as u32,
         }
     }
 }
@@ -1922,16 +1922,33 @@ impl RootedDir {
     }
 
     pub(crate) fn remove_owned_child(&self, name: &str) -> io::Result<()> {
+        self.remove_owned_child_with_cleanup_hook(name, &|| Ok(()))
+    }
+
+    pub(crate) fn remove_owned_child_with_cleanup_hook(
+        &self,
+        name: &str,
+        after_durable_delete: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
         let component = private_leaf_name(name)?;
         self.verify_root_name()?;
         let parent_metadata = stat_fd(self.root.as_raw_fd())?;
         require_private_directory(&parent_metadata)?;
         let parent = FileIdentity::from_stat(&parent_metadata);
         let _process_key = lock_cleanup_process_key(parent, component.to_bytes())?;
-        self.remove_owned_child_inner(name)
+        self.remove_owned_child_inner_with_hook(name, after_durable_delete)
     }
 
+    #[cfg(test)]
     fn remove_owned_child_inner(&self, name: &str) -> io::Result<()> {
+        self.remove_owned_child_inner_with_hook(name, &|| Ok(()))
+    }
+
+    fn remove_owned_child_inner_with_hook(
+        &self,
+        name: &str,
+        after_durable_delete: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
         let component = private_leaf_name(name)?;
         self.verify_root_name()?;
         let parent_metadata = stat_fd(self.root.as_raw_fd())?;
@@ -1997,7 +2014,7 @@ impl RootedDir {
                             &loaded,
                         )?;
                         drop(loaded);
-                        return complete_bound_tree_cleanup(
+                        return complete_bound_cleanup(
                             &namespace,
                             self.root.as_raw_fd(),
                             parent,
@@ -2007,7 +2024,10 @@ impl RootedDir {
                             Some(generation),
                             &verify_parent,
                             true,
-                        );
+                            CleanupTargetKind::Tree,
+                            after_durable_delete,
+                        )
+                        .map(|_| ());
                     }
                     if let Some(candidate) = find_unpublished_cleanup_bootstrap(
                         &namespace,
@@ -2015,7 +2035,7 @@ impl RootedDir {
                         parent,
                         component.to_bytes(),
                     )? {
-                        return complete_bound_tree_cleanup(
+                        return complete_bound_cleanup(
                             &namespace,
                             self.root.as_raw_fd(),
                             parent,
@@ -2025,7 +2045,10 @@ impl RootedDir {
                             Some(candidate.generation),
                             &verify_parent,
                             true,
-                        );
+                            CleanupTargetKind::Tree,
+                            after_durable_delete,
+                        )
+                        .map(|_| ());
                     }
                 }
                 Err(error)
@@ -2060,7 +2083,7 @@ impl RootedDir {
                     Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
                 ) =>
             {
-                return complete_bound_tree_cleanup(
+                return complete_bound_cleanup(
                     &namespace,
                     self.root.as_raw_fd(),
                     parent,
@@ -2070,7 +2093,10 @@ impl RootedDir {
                     Some(initial_generation.clone()),
                     &verify_parent,
                     true,
-                );
+                    CleanupTargetKind::Tree,
+                    after_durable_delete,
+                )
+                .map(|_| ());
             }
             Err(error) => return Err(error),
         };
@@ -2080,7 +2106,7 @@ impl RootedDir {
             || opened.st_dev != parent_metadata.st_dev
             || opened.st_mode as u32 & 0o7777 != original_mode
         {
-            return complete_bound_tree_cleanup(
+            return complete_bound_cleanup(
                 &namespace,
                 self.root.as_raw_fd(),
                 parent,
@@ -2090,7 +2116,10 @@ impl RootedDir {
                 Some(initial_generation.clone()),
                 &verify_parent,
                 true,
-            );
+                CleanupTargetKind::Tree,
+                after_durable_delete,
+            )
+            .map(|_| ());
         }
         match publish_tree_cleanup_intent(
             &namespace,
@@ -2111,7 +2140,7 @@ impl RootedDir {
                 ) => {}
             Err(error) => return Err(error),
         }
-        complete_bound_tree_cleanup(
+        complete_bound_cleanup(
             &namespace,
             self.root.as_raw_fd(),
             parent,
@@ -2121,21 +2150,43 @@ impl RootedDir {
             Some(initial_generation),
             &verify_parent,
             true,
+            CleanupTargetKind::Tree,
+            after_durable_delete,
         )
+        .map(|_| ())
     }
 
     pub(crate) fn resume_pending_owned_child_cleanup(&self, name: &str) -> io::Result<bool> {
+        self.resume_pending_owned_cleanup(name, CleanupTargetKind::Tree)
+    }
+
+    pub(crate) fn resume_pending_owned_regular_cleanup(&self, name: &str) -> io::Result<bool> {
+        self.resume_pending_owned_cleanup(name, CleanupTargetKind::Regular)
+    }
+
+    fn resume_pending_owned_cleanup(
+        &self,
+        name: &str,
+        kind: CleanupTargetKind,
+    ) -> io::Result<bool> {
         let component = private_leaf_name(name)?;
         self.verify_root_name()?;
         let parent_metadata = stat_fd(self.root.as_raw_fd())?;
         require_private_directory(&parent_metadata)?;
         let parent = FileIdentity::from_stat(&parent_metadata);
         let _process_key = lock_cleanup_process_key(parent, component.to_bytes())?;
-        let namespace = PrivateNamespace::select_for_cleanup(
-            self.root.as_raw_fd(),
-            parent_metadata.st_dev,
-            &[],
-        )?;
+        let namespace = match kind {
+            CleanupTargetKind::Tree => PrivateNamespace::select_for_cleanup(
+                self.root.as_raw_fd(),
+                parent_metadata.st_dev,
+                &[],
+            )?,
+            CleanupTargetKind::Regular => PrivateNamespace::select_for_cleanup_at(
+                self.root.as_raw_fd(),
+                parent_metadata.st_dev,
+                &[],
+            )?,
+        };
         let verify_parent = || {
             self.verify_root_name()?;
             let current = stat_fd(self.root.as_raw_fd())?;
@@ -2174,6 +2225,9 @@ impl RootedDir {
                 Err(error) => return Err(error),
             }
             if let Some(loaded) = find_cleanup_intent(&namespace, parent, component.to_bytes())? {
+                if loaded.intent.kind != kind {
+                    return Err(os_error(libc::ESTALE));
+                }
                 let target = FileIdentity::from(loaded.intent.target);
                 let original_mode = loaded.intent.original_mode;
                 let generation = cleanup_generation_from_loaded(
@@ -2183,7 +2237,7 @@ impl RootedDir {
                     &loaded,
                 )?;
                 drop(loaded);
-                let outcome = resolve_bound_tree_cleanup(
+                let outcome = resolve_bound_cleanup(
                     &namespace,
                     self.root.as_raw_fd(),
                     parent,
@@ -2193,6 +2247,8 @@ impl RootedDir {
                     Some(&generation),
                     &verify_parent,
                     false,
+                    kind,
+                    &|| Ok(()),
                 )?;
                 return match outcome {
                     TreeCleanupOutcome::Deleted | TreeCleanupOutcome::Restored(None) => Ok(true),
@@ -2206,7 +2262,10 @@ impl RootedDir {
                 parent,
                 component.to_bytes(),
             )? {
-                let outcome = resolve_bound_tree_cleanup(
+                if candidate.kind != kind {
+                    return Err(os_error(libc::ESTALE));
+                }
+                let outcome = resolve_bound_cleanup(
                     &namespace,
                     self.root.as_raw_fd(),
                     parent,
@@ -2216,6 +2275,8 @@ impl RootedDir {
                     Some(&candidate.generation),
                     &verify_parent,
                     false,
+                    kind,
+                    &|| Ok(()),
                 )?;
                 return match outcome {
                     TreeCleanupOutcome::Deleted | TreeCleanupOutcome::Restored(None) => Ok(true),
@@ -2229,17 +2290,39 @@ impl RootedDir {
 
     pub(crate) fn retry_pending_owned_children_matching(
         &self,
+        predicate: impl FnMut(&[u8], PrivateEntryIdentity) -> bool,
+    ) -> io::Result<usize> {
+        self.retry_pending_owned_matching(CleanupTargetKind::Tree, predicate)
+    }
+
+    pub(crate) fn retry_pending_owned_regulars_matching(
+        &self,
+        predicate: impl FnMut(&[u8], PrivateEntryIdentity) -> bool,
+    ) -> io::Result<usize> {
+        self.retry_pending_owned_matching(CleanupTargetKind::Regular, predicate)
+    }
+
+    fn retry_pending_owned_matching(
+        &self,
+        kind: CleanupTargetKind,
         mut predicate: impl FnMut(&[u8], PrivateEntryIdentity) -> bool,
     ) -> io::Result<usize> {
         self.verify_root_name()?;
         let parent_metadata = stat_fd(self.root.as_raw_fd())?;
         require_private_directory(&parent_metadata)?;
         let parent = FileIdentity::from_stat(&parent_metadata);
-        let namespace = PrivateNamespace::select_for_cleanup(
-            self.root.as_raw_fd(),
-            parent_metadata.st_dev,
-            &[],
-        )?;
+        let namespace = match kind {
+            CleanupTargetKind::Tree => PrivateNamespace::select_for_cleanup(
+                self.root.as_raw_fd(),
+                parent_metadata.st_dev,
+                &[],
+            )?,
+            CleanupTargetKind::Regular => PrivateNamespace::select_for_cleanup_at(
+                self.root.as_raw_fd(),
+                parent_metadata.st_dev,
+                &[],
+            )?,
+        };
         let verify_parent = || {
             self.verify_root_name()?;
             let current = stat_fd(self.root.as_raw_fd())?;
@@ -2265,10 +2348,11 @@ impl RootedDir {
                 }
                 Err(error) => return Err(error),
             }
-            let candidates = match collect_pending_tree_cleanup_candidates(
+            let candidates = match collect_pending_cleanup_candidates(
                 &namespace,
                 self.root.as_raw_fd(),
                 parent,
+                kind,
             ) {
                 Ok(candidates) => candidates,
                 Err(error)
@@ -2302,9 +2386,9 @@ impl RootedDir {
                         let target = PrivateEntryIdentity {
                             device: candidate.target.device,
                             inode: candidate.target.inode,
-                            kind: libc::S_IFDIR as u32,
+                            kind: cleanup_target_file_type(candidate.kind) as u32,
                             owner: effective_user_id(),
-                            mode: candidate.original_mode & 0o777,
+                            mode: candidate.original_mode & 0o7777,
                         };
                         let approved = predicate(&candidate.component, target);
                         decisions.push((
@@ -2319,10 +2403,11 @@ impl RootedDir {
                     continue;
                 }
                 let _process_key = lock_cleanup_process_key(parent, &candidate.component)?;
-                let current = match collect_pending_tree_cleanup_candidates(
+                let current = match collect_pending_cleanup_candidates(
                     &namespace,
                     self.root.as_raw_fd(),
                     parent,
+                    kind,
                 ) {
                     Ok(current) => current,
                     Err(error)
@@ -2346,17 +2431,33 @@ impl RootedDir {
                     break;
                 }
                 injected_cleanup_predicate_completion_handoff();
-                match complete_bound_tree_cleanup_outcome(
-                    &namespace,
-                    self.root.as_raw_fd(),
-                    parent,
-                    &candidate.component,
-                    candidate.target,
-                    candidate.original_mode,
-                    Some(candidate.generation.clone()),
-                    &verify_parent,
-                    false,
-                ) {
+                let completion = match candidate.kind {
+                    CleanupTargetKind::Tree => complete_bound_tree_cleanup_outcome(
+                        &namespace,
+                        self.root.as_raw_fd(),
+                        parent,
+                        &candidate.component,
+                        candidate.target,
+                        candidate.original_mode,
+                        Some(candidate.generation.clone()),
+                        &verify_parent,
+                        false,
+                    ),
+                    CleanupTargetKind::Regular => complete_bound_cleanup(
+                        &namespace,
+                        self.root.as_raw_fd(),
+                        parent,
+                        &candidate.component,
+                        candidate.target,
+                        candidate.original_mode,
+                        Some(candidate.generation.clone()),
+                        &verify_parent,
+                        false,
+                        candidate.kind,
+                        &|| Ok(()),
+                    ),
+                };
+                match completion {
                     Ok(TreeCleanupOutcome::Deleted) => {
                         resumed += 1;
                         retry = true;
@@ -2379,10 +2480,11 @@ impl RootedDir {
                         ) =>
                     {
                         if error.raw_os_error() == Some(libc::ESTALE) {
-                            match collect_pending_tree_cleanup_candidates(
+                            match collect_pending_cleanup_candidates(
                                 &namespace,
                                 self.root.as_raw_fd(),
                                 parent,
+                                kind,
                             ) {
                                 Ok(current)
                                     if current.iter().any(|current| {
@@ -2427,6 +2529,14 @@ impl RootedDir {
     }
 
     pub(crate) fn remove_owned_regular(&self, name: &str) -> io::Result<()> {
+        self.remove_owned_regular_with_cleanup_hook(name, &|| Ok(()))
+    }
+
+    pub(crate) fn remove_owned_regular_with_cleanup_hook(
+        &self,
+        name: &str,
+        after_durable_delete: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
         let component = private_leaf_name(name)?;
         self.verify_root_name()?;
         let parent_metadata = stat_fd(self.root.as_raw_fd())?;
@@ -2508,6 +2618,7 @@ impl RootedDir {
                             &verify_parent,
                             true,
                             CleanupTargetKind::Regular,
+                            after_durable_delete,
                         )
                         .map(|_| ());
                     }
@@ -2531,6 +2642,7 @@ impl RootedDir {
                             &verify_parent,
                             true,
                             CleanupTargetKind::Regular,
+                            after_durable_delete,
                         )
                         .map(|_| ());
                     }
@@ -2583,6 +2695,7 @@ impl RootedDir {
                     &verify_parent,
                     true,
                     CleanupTargetKind::Regular,
+                    after_durable_delete,
                 )
                 .map(|_| ());
             }
@@ -2606,6 +2719,7 @@ impl RootedDir {
                 &verify_parent,
                 true,
                 CleanupTargetKind::Regular,
+                after_durable_delete,
             )
             .map(|_| ());
         }
@@ -2641,6 +2755,7 @@ impl RootedDir {
             &verify_parent,
             true,
             CleanupTargetKind::Regular,
+            after_durable_delete,
         )
         .map(|_| ())
     }
@@ -3147,6 +3262,13 @@ impl RootedDir {
     }
 
     pub fn remove_owned_tree(&self) -> io::Result<()> {
+        self.remove_owned_tree_with_cleanup_hook(&|| Ok(()))
+    }
+
+    pub(crate) fn remove_owned_tree_with_cleanup_hook(
+        &self,
+        after_durable_delete: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
         let parent_metadata = stat_fd(self.parent.as_raw_fd())?;
         let parent = FileIdentity::from_stat(&parent_metadata);
         if self.root_identity.device != parent.device {
@@ -3215,7 +3337,7 @@ impl RootedDir {
                             &loaded,
                         )?;
                         drop(loaded);
-                        return complete_bound_tree_cleanup(
+                        return complete_bound_cleanup(
                             &namespace,
                             self.parent.as_raw_fd(),
                             parent,
@@ -3225,7 +3347,10 @@ impl RootedDir {
                             Some(generation),
                             &verify_parent,
                             true,
-                        );
+                            CleanupTargetKind::Tree,
+                            after_durable_delete,
+                        )
+                        .map(|_| ());
                     }
                     if let Some(candidate) = find_unpublished_cleanup_bootstrap(
                         &namespace,
@@ -3233,7 +3358,7 @@ impl RootedDir {
                         parent,
                         self.root_name.to_bytes(),
                     )? {
-                        return complete_bound_tree_cleanup(
+                        return complete_bound_cleanup(
                             &namespace,
                             self.parent.as_raw_fd(),
                             parent,
@@ -3243,7 +3368,10 @@ impl RootedDir {
                             Some(candidate.generation),
                             &verify_parent,
                             true,
-                        );
+                            CleanupTargetKind::Tree,
+                            after_durable_delete,
+                        )
+                        .map(|_| ());
                     }
                 }
                 Err(error)
@@ -3290,7 +3418,7 @@ impl RootedDir {
                 ) => {}
             Err(error) => return Err(error),
         }
-        complete_bound_tree_cleanup(
+        complete_bound_cleanup(
             &namespace,
             self.parent.as_raw_fd(),
             parent,
@@ -3300,9 +3428,13 @@ impl RootedDir {
             Some(initial_generation),
             &verify_parent,
             true,
+            CleanupTargetKind::Tree,
+            after_durable_delete,
         )
+        .map(|_| ())
     }
 
+    #[cfg(test)]
     fn remove_owned_tree_with_hook(
         &self,
         after_private_validation: impl FnOnce(),
@@ -3310,6 +3442,7 @@ impl RootedDir {
         self.remove_owned_tree_with_hooks(|| {}, || {}, after_private_validation, || {}, || {})
     }
 
+    #[cfg(test)]
     fn remove_owned_tree_with_hooks(
         &self,
         before_private_rename: impl FnOnce(),
@@ -6224,10 +6357,20 @@ fn pending_cleanup_evidence_snapshot(
     })
 }
 
+#[cfg(test)]
 fn collect_pending_tree_cleanup_candidates(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
     parent: FileIdentity,
+) -> io::Result<Vec<PendingTreeCleanupCandidate>> {
+    collect_pending_cleanup_candidates(namespace, public_parent, parent, CleanupTargetKind::Tree)
+}
+
+fn collect_pending_cleanup_candidates(
+    namespace: &PrivateNamespace,
+    public_parent: RawFd,
+    parent: FileIdentity,
+    kind: CleanupTargetKind,
 ) -> io::Result<Vec<PendingTreeCleanupCandidate>> {
     let mut last_race = os_error(libc::ESTALE);
     for _ in 0..32 {
@@ -6294,7 +6437,7 @@ fn collect_pending_tree_cleanup_candidates(
                     }
                     return Err(error);
                 }
-                if intent.kind != CleanupTargetKind::Tree {
+                if intent.kind != kind {
                     drop(intent_file);
                     continue;
                 }
@@ -6373,7 +6516,7 @@ fn collect_pending_tree_cleanup_candidates(
                 &operation,
                 *operation_identity,
             )?;
-            if candidate.kind != CleanupTargetKind::Tree {
+            if candidate.kind != kind {
                 continue;
             }
             if candidates
@@ -7399,6 +7542,7 @@ fn find_unpublished_cleanup_bootstrap(
     Ok(Some(candidate))
 }
 
+#[cfg(test)]
 fn resolve_bound_tree_cleanup(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
@@ -7421,6 +7565,7 @@ fn resolve_bound_tree_cleanup(
         verify_parent,
         allow_injected_validation,
         CleanupTargetKind::Tree,
+        &|| Ok(()),
     )
 }
 
@@ -7435,6 +7580,7 @@ fn resolve_bound_cleanup(
     verify_parent: &impl Fn() -> io::Result<()>,
     allow_injected_validation: bool,
     kind: CleanupTargetKind,
+    after_durable_delete: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<TreeCleanupOutcome> {
     let component_name = CString::new(component).map_err(|_| cleanup_record_error())?;
     let mut last_race = os_error(libc::ESTALE);
@@ -7465,6 +7611,7 @@ fn resolve_bound_cleanup(
                 allow_injected_validation,
                 &mut pending_restore_error,
                 &mut restore_expected,
+                after_durable_delete,
             );
             match result {
                 Ok(TreeCleanupOutcome::Deleted) => {
@@ -7577,6 +7724,7 @@ fn resolve_bound_cleanup(
     Err(last_race)
 }
 
+#[cfg(test)]
 fn complete_bound_tree_cleanup(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
@@ -7599,6 +7747,7 @@ fn complete_bound_tree_cleanup(
         verify_parent,
         allow_injected_validation,
         CleanupTargetKind::Tree,
+        &|| Ok(()),
     )
     .map(|_| ())
 }
@@ -7625,6 +7774,7 @@ fn complete_bound_tree_cleanup_outcome(
         verify_parent,
         allow_injected_validation,
         CleanupTargetKind::Tree,
+        &|| Ok(()),
     )
 }
 
@@ -7639,6 +7789,7 @@ fn complete_bound_cleanup(
     verify_parent: &impl Fn() -> io::Result<()>,
     allow_injected_validation: bool,
     kind: CleanupTargetKind,
+    after_durable_delete: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<TreeCleanupOutcome> {
     injected_cleanup_before_bound_completion_result()?;
     let component_name = CString::new(component).map_err(|_| cleanup_record_error())?;
@@ -7654,6 +7805,7 @@ fn complete_bound_cleanup(
             verify_parent,
             allow_injected_validation,
             kind,
+            after_durable_delete,
         )? {
             TreeCleanupOutcome::Deleted => return Ok(TreeCleanupOutcome::Deleted),
             TreeCleanupOutcome::AlreadyRetired => {
@@ -9244,6 +9396,7 @@ fn resume_cleanup(
     allow_injected_validation: bool,
     pending_restore_error: &mut Option<io::Error>,
     restore_expected: &mut bool,
+    after_durable_delete: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<TreeCleanupOutcome> {
     let bindings = validate_cleanup_intent(&loaded.intent, parent, component, namespace)?;
     match bindings.kind {
@@ -9257,6 +9410,7 @@ fn resume_cleanup(
             allow_injected_validation,
             pending_restore_error,
             restore_expected,
+            after_durable_delete,
         ),
         CleanupTargetKind::Regular => resume_regular_cleanup(
             namespace,
@@ -9268,6 +9422,7 @@ fn resume_cleanup(
             allow_injected_validation,
             pending_restore_error,
             restore_expected,
+            after_durable_delete,
         ),
     }
 }
@@ -9282,6 +9437,7 @@ fn resume_tree_cleanup(
     allow_injected_validation: bool,
     pending_restore_error: &mut Option<io::Error>,
     restore_expected: &mut bool,
+    after_durable_delete: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<TreeCleanupOutcome> {
     let bindings = validate_cleanup_intent(&loaded.intent, parent, component, namespace)?;
     loop {
@@ -9389,6 +9545,7 @@ fn resume_tree_cleanup(
                                     operation,
                                     CleanupDecisionV1::Delete,
                                 )?;
+                                after_durable_delete()?;
                             }
                             Err(error) => {
                                 *restore_expected = true;
@@ -9579,6 +9736,7 @@ fn resume_regular_cleanup(
     allow_injected_validation: bool,
     pending_restore_error: &mut Option<io::Error>,
     restore_expected: &mut bool,
+    after_durable_delete: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<TreeCleanupOutcome> {
     let bindings = validate_cleanup_intent(&loaded.intent, parent, component, namespace)?;
     loop {
@@ -9683,6 +9841,7 @@ fn resume_regular_cleanup(
                                     operation,
                                     CleanupDecisionV1::Delete,
                                 )?;
+                                after_durable_delete()?;
                             }
                             Err(error) => {
                                 *restore_expected = true;
@@ -12205,6 +12364,265 @@ mod tests {
         fs::write(path, REGULAR_RETRY_SUBSTITUTE_BYTES).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    fn after_delete_hook_eio() -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    fn unique_namespace_role(namespace: &Path, prefix: &[u8]) -> PathBuf {
+        let matches = fs::read_dir(namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.as_bytes().starts_with(prefix))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "{prefix:?} roles in {namespace:?}");
+        matches.into_iter().next().unwrap()
+    }
+
+    fn assert_canonical_delete_residue(namespace: &Path, quarantine_prefix: &[u8]) {
+        let intent = unique_namespace_role(namespace, b"cleanup-intent-v1-");
+        assert!(fs::symlink_metadata(&intent).unwrap().file_type().is_file());
+        let decision = unique_namespace_role(namespace, b"cleanup-decision-v1-");
+        let record: CleanupDecisionRecordV1 =
+            serde_json::from_slice(&fs::read(&decision).unwrap()).unwrap();
+        assert!(matches!(record.decision, CleanupDecisionV1::Delete));
+        assert!(unique_namespace_role(namespace, b"cleanup-op-v1-").is_dir());
+        assert!(unique_namespace_role(namespace, quarantine_prefix).exists());
+    }
+
+    #[test]
+    fn cleanup_predicate_identity_preserves_full_mode_mask() {
+        // Catches PrivateEntryIdentity::from_stat dropping setuid/setgid/sticky
+        // bits by masking with 0o777 instead of the full 0o7777 mode. A
+        // synthetic stat is required: APFS may strip setuid/setgid on chmod.
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        metadata.st_dev = 7;
+        metadata.st_ino = 11;
+        metadata.st_uid = 42;
+        metadata.st_mode = libc::S_IFREG | 0o7600;
+        let identity = super::PrivateEntryIdentity::from_stat(&metadata);
+
+        assert_eq!(identity.kind, libc::S_IFREG as u32);
+        assert_eq!(identity.owner, 42);
+        assert_eq!(identity.mode, 0o7600);
+        assert_eq!(identity.device, 7);
+        assert_eq!(identity.inode, 11);
+    }
+
+    #[test]
+    fn cleanup_intent_regular_retry_resume_only_leaves_ordinary_public_untouched() {
+        let fixture = RegularCleanupRetryFixture::create();
+        let parent = RootedDir::open(&fixture.root).unwrap();
+
+        assert!(
+            !parent
+                .resume_pending_owned_regular_cleanup("entry")
+                .unwrap()
+        );
+
+        fixture.assert_public_entry_unchanged();
+        fixture.assert_namespace_empty_or_absent();
+    }
+
+    #[test]
+    fn cleanup_intent_regular_retry_resume_only_resumes_canonical_pending() {
+        let fixture = RegularCleanupRetryFixture::create();
+        let fault = fixture.interrupt_after_public_entry_vanishes(
+            CleanupFault::AfterCleanupQuarantineRename(libc::EIO),
+        );
+        drop(fault);
+        fixture.assert_regular_retry_intent_bootstrap_binding();
+
+        let parent = RootedDir::open(&fixture.root).unwrap();
+        assert!(
+            parent
+                .resume_pending_owned_regular_cleanup("entry")
+                .unwrap()
+        );
+        drop(parent);
+
+        fixture.assert_public_entry_absent();
+        fixture.assert_namespace_empty_or_absent();
+    }
+
+    #[test]
+    fn cleanup_predicate_regular_accepts_matching_generated_name() {
+        const MATCHED: &str = ".replace-11111111-1111-4111-8111-111111111111";
+        const REJECTED: &str = ".replace-22222222-2222-4222-8222-222222222222";
+        const SPECIAL_MODE: u32 = 0o1600;
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = physical.join("root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut identities = Vec::new();
+        for (name, bytes) in [
+            (MATCHED, b"matched-generated\n".as_slice()),
+            (REJECTED, b"rejected-generated\n".as_slice()),
+        ] {
+            let path = root.join(name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(SPECIAL_MODE)).unwrap();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o7777, SPECIAL_MODE);
+            identities.push((metadata.dev(), metadata.ino(), bytes));
+        }
+        let parent = RootedDir::open(&root).unwrap();
+        for name in [MATCHED, REJECTED] {
+            let fault =
+                CleanupFaultOverride::set(CleanupFault::AfterCleanupQuarantineRename(libc::EIO));
+            assert_eq!(
+                parent
+                    .remove_owned_regular(name)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EIO)
+            );
+            drop(fault);
+            assert!(!root.join(name).exists());
+        }
+
+        let mut observed = Vec::new();
+        let resumed = parent
+            .retry_pending_owned_regulars_matching(|component, identity| {
+                observed.push((component.to_vec(), identity));
+                component == MATCHED.as_bytes()
+            })
+            .unwrap();
+
+        assert_eq!(resumed, 1);
+        assert_eq!(observed.len(), 2);
+        for (component, identity) in &observed {
+            let (expected_device, expected_inode, _) = if component.as_slice() == MATCHED.as_bytes()
+            {
+                identities[0]
+            } else {
+                assert_eq!(component.as_slice(), REJECTED.as_bytes());
+                identities[1]
+            };
+            assert_eq!(identity.device, expected_device);
+            assert_eq!(identity.inode, expected_inode);
+            assert_eq!(identity.kind, libc::S_IFREG as u32);
+            assert_eq!(identity.owner, unsafe { libc::geteuid() });
+            assert_eq!(identity.mode, SPECIAL_MODE);
+        }
+        assert!(!root.join(MATCHED).exists());
+        assert!(!root.join(REJECTED).exists());
+        assert!(
+            !parent
+                .resume_pending_owned_regular_cleanup(MATCHED)
+                .unwrap()
+        );
+        let rejected_quarantine =
+            unique_namespace_role(&root.join(".mac-worker-rooted-fs"), b"cleanup-regular-v1-");
+        let rejected_meta = fs::symlink_metadata(&rejected_quarantine).unwrap();
+        assert_eq!(rejected_meta.dev(), identities[1].0);
+        assert_eq!(rejected_meta.ino(), identities[1].1);
+        assert_eq!(rejected_meta.permissions().mode() & 0o7777, SPECIAL_MODE);
+        assert_eq!(fs::read(&rejected_quarantine).unwrap(), identities[1].2);
+        assert!(
+            parent
+                .resume_pending_owned_regular_cleanup(REJECTED)
+                .unwrap()
+        );
+        assert_eq!(
+            fs::read_dir(root.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cleanup_intent_tree_retry_after_delete_hook_leaves_canonical_residue() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root_path.join("first"), b"first\n").unwrap();
+        fs::write(root_path.join("second"), b"second\n").unwrap();
+        let parent = RootedDir::open(&physical).unwrap();
+
+        let error = parent
+            .remove_owned_child_with_cleanup_hook("root", &after_delete_hook_eio)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error:?}");
+        drop(parent);
+
+        assert!(!root_path.exists());
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        assert_canonical_delete_residue(&namespace, b"cleanup-tree-v1-");
+        let quarantine = unique_namespace_role(&namespace, b"cleanup-tree-v1-");
+        assert!(fs::read_dir(&quarantine).unwrap().count() >= 1);
+
+        let parent = RootedDir::open(&physical).unwrap();
+        parent.remove_owned_child("root").unwrap();
+        assert!(!root_path.exists());
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cleanup_intent_regular_retry_after_delete_hook_leaves_canonical_residue() {
+        let fixture = RegularCleanupRetryFixture::create();
+        let parent = RootedDir::open(&fixture.root).unwrap();
+
+        let error = parent
+            .remove_owned_regular_with_cleanup_hook("entry", &after_delete_hook_eio)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error:?}");
+        drop(parent);
+
+        fixture.assert_public_entry_absent();
+        let namespace = fixture.root.join(".mac-worker-rooted-fs");
+        assert_canonical_delete_residue(&namespace, b"cleanup-regular-v1-");
+        let quarantine = unique_namespace_role(&namespace, b"cleanup-regular-v1-");
+        let quarantined = fs::symlink_metadata(&quarantine).unwrap();
+        assert!(quarantined.file_type().is_file());
+        assert_eq!(quarantined.dev(), fixture.entry_device);
+        assert_eq!(quarantined.ino(), fixture.entry_inode);
+        assert_eq!(fs::read(&quarantine).unwrap(), REGULAR_RETRY_ENTRY_BYTES);
+
+        let parent = RootedDir::open(&fixture.root).unwrap();
+        parent.remove_owned_regular("entry").unwrap();
+        drop(parent);
+        fixture.assert_public_entry_absent();
+        fixture.assert_namespace_empty_or_absent();
+    }
+
+    #[test]
+    fn cleanup_intent_tree_retry_root_after_delete_hook_leaves_canonical_residue() {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root_path.join("value"), b"owned bytes\n").unwrap();
+        let root = RootedDir::open(&root_path).unwrap();
+
+        let error = root
+            .remove_owned_tree_with_cleanup_hook(&after_delete_hook_eio)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error:?}");
+        drop(root);
+
+        assert!(!root_path.exists());
+        let namespace = physical.join(".mac-worker-rooted-fs");
+        assert_canonical_delete_residue(&namespace, b"cleanup-tree-v1-");
+        let quarantine = unique_namespace_role(&namespace, b"cleanup-tree-v1-");
+        assert!(fs::read_dir(&quarantine).unwrap().count() >= 1);
+
+        let root = RootedDir::open(&physical).unwrap();
+        root.remove_owned_child("root").unwrap();
+        assert!(!root_path.exists());
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
     }
 
     #[test]

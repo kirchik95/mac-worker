@@ -112,6 +112,7 @@ pub enum HostStoreWritePoint {
     AfterResolutionAbsenceProof = 57,
     AfterResolutionCleanupMarker = 58,
     BeforeResolutionLeaseRelease = 59,
+    AfterCleanupIntentCommit = 60,
 }
 
 impl LayoutEntry {
@@ -1237,6 +1238,9 @@ impl HostStore {
                     "canonical transfer lock identity is absent".into(),
                 ));
             }
+            job_locks.retry_pending_owned_children_matching(|component, _| {
+                parse_generated_hex_prefix(component, b".transfer-init-")
+            })?;
             for name in job_locks.list_names()? {
                 let name = std::str::from_utf8(&name).map_err(|_| {
                     WorkerError::Protocol("job lock namespace contains a non-UTF-8 entry".into())
@@ -1248,7 +1252,7 @@ impl HostStore {
                         ));
                     }
                     admission.validate()?;
-                    job_locks.remove_owned_child(name)?;
+                    self.remove_owned_child_committed(&job_locks, name)?;
                 }
             }
             let operation_name = format!(
@@ -1315,6 +1319,10 @@ impl HostStore {
         };
 
         if !job_locks.entry_exists(TRANSFER_DIRECTORY)? {
+            let winner = identity.directory.as_private();
+            job_locks.retry_pending_owned_children_matching(|component, target| {
+                parse_generated_hex_prefix(component, b".transfer-init-") && target != winner
+            })?;
             let mut matching_operation = None;
             for bytes in job_locks.list_names()? {
                 let name = std::str::from_utf8(&bytes).map_err(|_| {
@@ -1338,7 +1346,7 @@ impl HostStore {
                     matching_operation = Some(operation);
                 } else {
                     admission.validate()?;
-                    job_locks.remove_owned_child(name)?;
+                    self.remove_owned_child_committed(&job_locks, name)?;
                 }
             }
             let mut operation = matching_operation.ok_or_else(|| {
@@ -1441,6 +1449,9 @@ impl HostStore {
                     "canonical supervisor lock identity is absent".into(),
                 ));
             }
+            job_locks.retry_pending_owned_children_matching(|component, _| {
+                parse_generated_hex_prefix(component, b".supervisor-init-")
+            })?;
             for bytes in job_locks.list_names()? {
                 let name = std::str::from_utf8(&bytes).map_err(|_| {
                     WorkerError::Protocol("job lock namespace contains a non-UTF-8 entry".into())
@@ -1452,7 +1463,7 @@ impl HostStore {
                         ));
                     }
                     admission.validate_for(job)?;
-                    job_locks.remove_owned_child(name)?;
+                    self.remove_owned_child_committed(&job_locks, name)?;
                 }
             }
             let operation_name = format!(
@@ -1506,6 +1517,10 @@ impl HostStore {
         };
 
         if !job_locks.entry_exists(SUPERVISOR_DIRECTORY)? {
+            let winner = identity.directory.as_private();
+            job_locks.retry_pending_owned_children_matching(|component, target| {
+                parse_generated_hex_prefix(component, b".supervisor-init-") && target != winner
+            })?;
             let mut matching_operation = None;
             for bytes in job_locks.list_names()? {
                 let name = std::str::from_utf8(&bytes).map_err(|_| {
@@ -1529,7 +1544,7 @@ impl HostStore {
                     matching_operation = Some(operation);
                 } else {
                     admission.validate_for(job)?;
-                    job_locks.remove_owned_child(name)?;
+                    self.remove_owned_child_committed(&job_locks, name)?;
                 }
             }
             let mut operation = matching_operation.ok_or_else(|| {
@@ -2032,10 +2047,8 @@ impl HostStore {
         transfer.validate()?;
         if let Some(job) = job {
             job.verify_bound()?;
-            if job.entry_exists("execution.json")? {
-                job.remove_owned_regular("execution.json")?;
-                job.sync_root()?;
-            }
+            self.remove_owned_regular_committed(job, "execution.json")?;
+            job.sync_root()?;
         }
         if self.consume_fault(HostStoreWritePoint::AfterResolutionExecutionRemoval) {
             return Err(WorkerError::Io(std::io::Error::other(
@@ -2058,9 +2071,7 @@ impl HostStore {
         if let Some(job) = job {
             job.verify_bound()?;
             for name in ["workspace", "home", "tmp"] {
-                if job.entry_exists(name)? {
-                    job.remove_owned_child(name)?;
-                }
+                self.remove_owned_child_committed(job, name)?;
             }
             job.sync_root()?;
         }
@@ -2082,27 +2093,7 @@ impl HostStore {
         admission.validate_for(identity.job_id())?;
         transfer.validate()?;
         let leases = self.open_directory("leases", false)?;
-        let stage_prefix = format!(".job-{}-", identity.job_id());
-        let exact_acquire = format!(".acquire-{}", identity.job_id());
-        let exact_released = format!(".released-{}", identity.job_id());
-        for name in leases.list_names()? {
-            let name = std::str::from_utf8(&name).map_err(|_| {
-                WorkerError::Protocol("lease namespace contains a non-UTF-8 entry".into())
-            })?;
-            let owned = if let Some(suffix) = name.strip_prefix(&stage_prefix) {
-                if !is_lower_hex(suffix, 32) {
-                    return Err(WorkerError::Protocol(
-                        "unsafe job-owned staging replacement".into(),
-                    ));
-                }
-                true
-            } else {
-                name == exact_acquire || name == exact_released
-            };
-            if owned {
-                leases.remove_owned_child(name)?;
-            }
-        }
+        self.remove_job_owned_lease_stages(&leases, identity.job_id())?;
         leases.sync_root()?;
         if self.consume_fault(HostStoreWritePoint::AfterResolutionJobStageRemoval) {
             return Err(WorkerError::Io(std::io::Error::other(
@@ -2136,6 +2127,7 @@ impl HostStore {
         require_no_private_cleanup_residue(&incoming, "incoming root")?;
         if let Some(job) = job {
             job.verify_bound()?;
+            self.resume_job_replace_stages(job)?;
             for name in ["workspace", "home", "tmp", "execution.json"] {
                 if job.entry_exists(name)? {
                     return Err(WorkerError::Protocol(format!(
@@ -2260,14 +2252,14 @@ impl HostStore {
         }
         admission.validate()?;
         transfer.validate()?;
+        let incoming_root = self.open_directory("incoming", false)?;
+        incoming_root.resume_pending_owned_child_cleanup(&job.to_string())?;
         if let Some(incoming) = self.open_optional_directory(&format!("incoming/{job}"))? {
             let token = token.to_string();
-            if incoming.entry_exists(&token)? {
-                admission.validate()?;
-                transfer.validate()?;
-                incoming.remove_owned_child(&token)?;
-                incoming.sync_root()?;
-            }
+            admission.validate()?;
+            transfer.validate()?;
+            self.remove_owned_child_committed(&incoming, &token)?;
+            incoming.sync_root()?;
         }
         if self.consume_fault(HostStoreWritePoint::AfterResolutionIncomingRemoval) {
             return Err(WorkerError::Io(std::io::Error::other(
@@ -2329,6 +2321,7 @@ impl HostStore {
                 return Err(WorkerError::Protocol("host JSON exceeds 1 MiB".into()));
             }
             let staging = format!(".accept-{job}.json");
+            index.resume_pending_owned_regular_cleanup(&staging)?;
             if index.entry_exists(&staging)? {
                 let staged: JobDisposition = read_json_strict_at(&index, &staging)?;
                 if !same_recoverable_accepted_staging(&staged, disposition) {
@@ -2337,7 +2330,7 @@ impl HostStore {
                         "accepted-index staging evidence conflicts with the request",
                     ));
                 }
-                index.remove_owned_regular(&staging)?;
+                self.remove_owned_regular_committed(&index, &staging)?;
             }
             index
                 .write_private_atomic_no_replace_with_commit_hooks(
@@ -2389,11 +2382,8 @@ impl HostStore {
         write_json_once(&job_dir, "status.json", status, "terminal status")
     }
 
-    #[allow(dead_code)] // Task 7 lifecycle consumes the only cleanup-receipt minting path.
-    pub(crate) fn cleanup_job_owned(
-        &self,
-        lease: &LeaseRecord,
-    ) -> Result<CleanupReceipt, WorkerError> {
+    #[doc(hidden)]
+    pub fn cleanup_job_owned(&self, lease: &LeaseRecord) -> Result<CleanupReceipt, WorkerError> {
         lease.validate()?;
         let admission = self.admission_lock(lease.job_id())?;
         let capacity = self.capacity_lock_after(&admission)?;
@@ -2499,6 +2489,30 @@ impl HostStore {
             .secondary_fault
             .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
+    }
+
+    fn after_cleanup_intent_commit(&self) -> std::io::Result<()> {
+        if self.consume_fault(HostStoreWritePoint::AfterCleanupIntentCommit) {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn remove_owned_child_committed(
+        &self,
+        parent: &RootedDir,
+        name: &str,
+    ) -> std::io::Result<()> {
+        parent.remove_owned_child_with_cleanup_hook(name, &|| self.after_cleanup_intent_commit())
+    }
+
+    pub(crate) fn remove_owned_regular_committed(
+        &self,
+        parent: &RootedDir,
+        name: &str,
+    ) -> std::io::Result<()> {
+        parent.remove_owned_regular_with_cleanup_hook(name, &|| self.after_cleanup_intent_commit())
     }
 
     pub(crate) fn validate_layout(&self) -> Result<(), WorkerError> {
@@ -2636,13 +2650,12 @@ impl HostStore {
     fn remove_job_mutable_scopes(&self, lease: &LeaseRecord) -> Result<(), WorkerError> {
         let incoming_root = self.open_directory("incoming", false)?;
         let incoming_job_name = lease.job_id().to_string();
+        incoming_root.resume_pending_owned_child_cleanup(&incoming_job_name)?;
         if incoming_root.entry_exists(&incoming_job_name)? {
             let incoming =
                 incoming_root.open_child_directory(&relative(&incoming_job_name)?, false)?;
             let token = lease.lease_token().to_string();
-            if incoming.entry_exists(&token)? {
-                incoming.remove_owned_child(&token)?;
-            }
+            self.remove_owned_child_committed(&incoming, &token)?;
             let remaining = incoming.list_names()?;
             let only_private_namespace = remaining.len() == 1
                 && remaining[0].as_slice() == b".mac-worker-rooted-fs"
@@ -2655,7 +2668,7 @@ impl HostStore {
                     "incoming job scope contains non-lease evidence".into(),
                 ));
             }
-            incoming_root.remove_owned_child(&incoming_job_name)?;
+            self.remove_owned_child_committed(&incoming_root, &incoming_job_name)?;
         }
         if let Some(job) = self.open_optional_directory(&format!(
             "jobs/{}/{}/{}",
@@ -2663,37 +2676,14 @@ impl HostStore {
             lease.worktree_id(),
             lease.job_id()
         ))? {
+            self.resume_job_replace_stages(&job)?;
             for name in ["workspace", "home", "tmp"] {
-                if job.entry_exists(name)? {
-                    job.remove_owned_child(name)?;
-                }
+                self.remove_owned_child_committed(&job, name)?;
             }
-            if job.entry_exists("execution.json")? {
-                job.remove_owned_regular("execution.json")?;
-            }
+            self.remove_owned_regular_committed(&job, "execution.json")?;
         }
         let leases = self.open_directory("leases", false)?;
-        for name in leases.list_names()? {
-            let name = std::str::from_utf8(&name).map_err(|_| {
-                WorkerError::Protocol("lease namespace contains a non-UTF-8 entry".into())
-            })?;
-            let stage_prefix = format!(".job-{}-", lease.job_id());
-            let exact_acquire = format!(".acquire-{}", lease.job_id());
-            let exact_released = format!(".released-{}", lease.job_id());
-            let owned = if let Some(suffix) = name.strip_prefix(&stage_prefix) {
-                if !is_lower_hex(suffix, 32) {
-                    return Err(WorkerError::Protocol(
-                        "unsafe job-owned staging replacement".into(),
-                    ));
-                }
-                true
-            } else {
-                name == exact_acquire || name == exact_released
-            };
-            if owned {
-                leases.remove_owned_child(name)?;
-            }
-        }
+        self.remove_job_owned_lease_stages(&leases, lease.job_id())?;
         Ok(())
     }
 
@@ -2711,6 +2701,7 @@ impl HostStore {
             lease.worktree_id(),
             lease.job_id()
         ))? {
+            self.resume_job_replace_stages(&job)?;
             for name in ["workspace", "home", "tmp", "execution.json"] {
                 if job.entry_exists(name)? {
                     return Err(WorkerError::Protocol(format!(
@@ -2757,6 +2748,7 @@ impl HostStore {
             lease.worktree_id(),
             lease.job_id()
         ))? {
+            self.resume_job_replace_stages(&job)?;
             for name in ["workspace", "home", "tmp", "execution.json"] {
                 if job.entry_exists(name)? {
                     return Err(WorkerError::Protocol(format!(
@@ -2807,6 +2799,7 @@ impl HostStore {
             identity.worktree_id(),
             identity.job_id()
         ))? {
+            self.resume_job_replace_stages(&job)?;
             for name in ["workspace", "home", "tmp", "execution.json"] {
                 if job.entry_exists(name)? {
                     return Err(WorkerError::Protocol(format!(
@@ -2853,6 +2846,50 @@ impl HostStore {
             Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    fn remove_job_owned_lease_stages(
+        &self,
+        leases: &RootedDir,
+        job: JobId,
+    ) -> Result<(), WorkerError> {
+        let exact_acquire = format!(".acquire-{job}");
+        let exact_released = format!(".released-{job}");
+        self.remove_owned_child_committed(leases, &exact_acquire)?;
+        self.remove_owned_child_committed(leases, &exact_released)?;
+        leases.retry_pending_owned_children_matching(|component, _| {
+            parse_job_stage_component(component, job)
+        })?;
+        for name in leases.list_names()? {
+            let name = std::str::from_utf8(&name).map_err(|_| {
+                WorkerError::Protocol("lease namespace contains a non-UTF-8 entry".into())
+            })?;
+            if let Some(suffix) = name.strip_prefix(&format!(".job-{job}-")) {
+                if !is_lower_hex(suffix, 32) {
+                    return Err(WorkerError::Protocol(
+                        "unsafe job-owned staging replacement".into(),
+                    ));
+                }
+                self.remove_owned_child_committed(leases, name)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn resume_job_replace_stages(&self, job: &RootedDir) -> Result<(), WorkerError> {
+        job.retry_pending_owned_regulars_matching(|component, _| {
+            std::str::from_utf8(component).is_ok_and(parse_replace_uuid_name)
+        })?;
+        for name in job.list_names()? {
+            let name = std::str::from_utf8(&name)
+                .map_err(|_| WorkerError::Protocol("job contains a non-UTF-8 entry".into()))?;
+            if parse_replace_uuid_name(name) {
+                return Err(WorkerError::Protocol(
+                    "unbound replace stage remains after cleanup recovery".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3214,6 +3251,31 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn parse_generated_hex_prefix(component: &[u8], prefix: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(component) else {
+        return false;
+    };
+    let Ok(prefix) = std::str::from_utf8(prefix) else {
+        return false;
+    };
+    name.strip_prefix(prefix)
+        .is_some_and(|suffix| is_lower_hex(suffix, 32))
+}
+
+fn parse_job_stage_component(component: &[u8], job: JobId) -> bool {
+    let Ok(name) = std::str::from_utf8(component) else {
+        return false;
+    };
+    name.strip_prefix(&format!(".job-{job}-"))
+        .is_some_and(|suffix| is_lower_hex(suffix, 32))
+}
+
+fn parse_replace_uuid_name(name: &str) -> bool {
+    name.strip_prefix("replace-").is_some_and(|value| {
+        uuid::Uuid::parse_str(value).is_ok_and(|uuid| uuid.hyphenated().to_string() == value)
+    })
 }
 
 fn read_json_strict_at<T: DeserializeOwned + Serialize>(
@@ -3642,7 +3704,7 @@ mod review_regression_tests {
     };
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{MetadataExt, PermissionsExt},
         sync::{Arc, Barrier, mpsc},
         thread,
         time::Duration,
@@ -3661,6 +3723,15 @@ mod review_regression_tests {
             .collect::<Vec<_>>();
         entries.sort();
         entries
+    }
+
+    fn create_owner_only_job_tree(job_path: &Path) {
+        fs::create_dir_all(job_path).unwrap();
+        let mut current = job_path.to_path_buf();
+        for _ in 0..3 {
+            fs::set_permissions(&current, fs::Permissions::from_mode(0o700)).unwrap();
+            current = current.parent().unwrap().to_path_buf();
+        }
     }
 
     fn request(seed: u128) -> LeaseAcquireRequest {
@@ -4541,5 +4612,193 @@ mod review_regression_tests {
                 "{mutation} replacement formed a second supervisor lock domain"
             );
         }
+    }
+
+    #[test]
+    fn transfer_and_supervisor_init_preserve_winner_inode_and_bytes() {
+        for (directory, prefix, seed) in [
+            ("transfer", ".transfer-init-", 90u128),
+            ("supervisor", ".supervisor-init-", 91u128),
+        ] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let store = HostStore::open(&root).unwrap();
+            let job = request(seed).material().job_id();
+            let admission = store.admission_lock(job).unwrap();
+            if directory == "transfer" {
+                drop(store.transfer_lock_after(&admission, job).unwrap());
+            } else {
+                drop(store.supervisor_lock_after(&admission, job, true).unwrap());
+            }
+            let job_locks = root.join("locks/jobs").join(job.to_string());
+            let published = job_locks.join(directory);
+            fs::write(published.join("winner-leaf"), b"winner-bytes").unwrap();
+            let winner = job_locks.join(format!("{prefix}{}", "a".repeat(32)));
+            fs::rename(&published, &winner).unwrap();
+            let winner_meta = fs::symlink_metadata(&winner).unwrap();
+            let loser = job_locks.join(format!("{prefix}{}", "b".repeat(32)));
+            fs::create_dir(&loser).unwrap();
+            fs::set_permissions(&loser, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(loser.join("loser-leaf"), b"loser-bytes").unwrap();
+            fs::set_permissions(loser.join("loser-leaf"), fs::Permissions::from_mode(0o600))
+                .unwrap();
+            if directory == "transfer" {
+                drop(store.transfer_lock_after(&admission, job).unwrap());
+            } else {
+                drop(store.supervisor_lock_after(&admission, job, true).unwrap());
+            }
+            assert!(published.is_dir(), "{directory}");
+            assert!(!winner.exists(), "{directory}");
+            assert!(!loser.exists(), "{directory}");
+            let current = fs::symlink_metadata(&published).unwrap();
+            assert_eq!(current.dev(), winner_meta.dev(), "{directory}");
+            assert_eq!(current.ino(), winner_meta.ino(), "{directory}");
+            assert_eq!(
+                fs::read(published.join("winner-leaf")).unwrap(),
+                b"winner-bytes",
+                "{directory}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_job_replace_stages_converges_canonical_pending() {
+        use crate::{
+            job::LeaseAcquireResponse,
+            lease::{AdmissionFacts, LeaseService},
+        };
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request(92);
+        let lease = match LeaseService::new(&store)
+            .acquire(
+                &request,
+                &AdmissionFacts {
+                    free_disk_bytes: 200 * 1024 * 1024 * 1024,
+                    total_disk_bytes: 500 * 1024 * 1024 * 1024,
+                    memory_pressure: crate::protocol::MemoryPressure::Normal,
+                    swap_used_bytes: Some(0),
+                },
+                1,
+            )
+            .unwrap()
+        {
+            LeaseAcquireResponse::Acquired { lease } => lease,
+            LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+        };
+        store.record_abandoned(&request, 2).unwrap();
+        let job_path = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        create_owner_only_job_tree(&job_path);
+        let replace = format!(
+            "replace-{}",
+            uuid::Uuid::from_u128(0x1111_4111_8111_1111_1111_1111_1111_1111).hyphenated()
+        );
+        fs::write(job_path.join(&replace), b"pending-replace").unwrap();
+        fs::set_permissions(job_path.join(&replace), fs::Permissions::from_mode(0o600)).unwrap();
+        drop(store);
+
+        let faulted =
+            HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+                .unwrap();
+        let job = faulted
+            .open_directory(
+                &format!(
+                    "jobs/{}/{}/{}",
+                    lease.project_id(),
+                    lease.worktree_id(),
+                    lease.job_id()
+                ),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            faulted
+                .remove_owned_regular_committed(&job, &replace)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert!(!job_path.join(&replace).exists());
+        let namespace = job_path.join(".mac-worker-rooted-fs");
+        assert!(fs::read_dir(&namespace).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cleanup-regular-v1-")
+        }));
+        drop(job);
+        let receipt = faulted.cleanup_job_owned(&lease).unwrap();
+        assert!(!job_path.join(&replace).exists());
+        if namespace.exists() {
+            assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
+        }
+        drop(receipt);
+        drop(faulted);
+    }
+
+    #[test]
+    fn resume_job_replace_stages_preserves_unbound_public_replace() {
+        use crate::{
+            job::LeaseAcquireResponse,
+            lease::{AdmissionFacts, LeaseService},
+        };
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request(93);
+        let lease = match LeaseService::new(&store)
+            .acquire(
+                &request,
+                &AdmissionFacts {
+                    free_disk_bytes: 200 * 1024 * 1024 * 1024,
+                    total_disk_bytes: 500 * 1024 * 1024 * 1024,
+                    memory_pressure: crate::protocol::MemoryPressure::Normal,
+                    swap_used_bytes: Some(0),
+                },
+                1,
+            )
+            .unwrap()
+        {
+            LeaseAcquireResponse::Acquired { lease } => lease,
+            LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+        };
+        store.record_abandoned(&request, 2).unwrap();
+        let job_path = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        create_owner_only_job_tree(&job_path);
+        let replace = format!(
+            "replace-{}",
+            uuid::Uuid::from_u128(0x2222_4222_8222_2222_2222_2222_2222_2222).hyphenated()
+        );
+        let replace_path = job_path.join(&replace);
+        fs::write(&replace_path, b"unbound-replace-bytes").unwrap();
+        fs::set_permissions(&replace_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::symlink_metadata(&replace_path).unwrap();
+        let error = store.cleanup_job_owned(&lease).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unbound replace stage remains after cleanup recovery"),
+            "{error}"
+        );
+        let after = fs::symlink_metadata(&replace_path).unwrap();
+        assert_eq!(after.dev(), before.dev());
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(fs::read(&replace_path).unwrap(), b"unbound-replace-bytes");
+        assert!(
+            !root
+                .join("locks/jobs")
+                .join(lease.job_id().to_string())
+                .join("cleanup-complete.json")
+                .exists()
+        );
+        assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
     }
 }

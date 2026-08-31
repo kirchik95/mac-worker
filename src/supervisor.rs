@@ -1065,7 +1065,8 @@ impl<'a> Supervisor<'a> {
         let payload_removal = if self.fault == Some(SupervisorFaultPoint::BeforePayloadErase) {
             Err(io::Error::other("injected supervisor fault"))
         } else {
-            job.remove_owned_regular("execution.json")
+            self.store
+                .remove_owned_regular_committed(&job, "execution.json")
         };
         if let Err(error) = payload_removal {
             child.abort();
@@ -2044,7 +2045,7 @@ fn erase_payload_and_record_prelaunch(
     status: &JobStatus,
     code: &str,
 ) -> Result<JobStatus, WorkerError> {
-    if let Err(removal_error) = job.remove_owned_regular("execution.json") {
+    if let Err(removal_error) = store.remove_owned_regular_committed(job, "execution.json") {
         if let (Ok(stdout), Ok(stderr)) = (
             job.open_private_append("stdout.log"),
             job.open_private_append("stderr.log"),
