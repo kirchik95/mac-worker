@@ -323,7 +323,7 @@ mod tests {
     use std::{
         ffi::OsStr,
         fs,
-        os::unix::process::ExitStatusExt,
+        os::unix::{ffi::OsStrExt, process::ExitStatusExt},
         path::{Path, PathBuf},
         process::{Command, ExitStatus, Output},
         sync::atomic::{AtomicUsize, Ordering},
@@ -576,13 +576,40 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
-        assert_eq!(retained.len(), 1);
-        assert!(retained[0].is_dir());
-        assert_eq!(fs::read_dir(&retained[0]).unwrap().count(), 0);
+        assert_eq!(retained.len(), 4);
+        let role = |prefix: &[u8]| {
+            let matches = retained
+                .iter()
+                .filter(|path| path.file_name().unwrap().as_bytes().starts_with(prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1);
+            matches.into_iter().next().unwrap()
+        };
+        let intent = role(b"cleanup-intent-v1-");
+        let decision = role(b"cleanup-decision-v1-");
+        let operation = role(b"cleanup-op-v1-");
+        let quarantine = role(b"cleanup-tree-v1-");
+        assert!(intent.is_file());
+        assert!(decision.is_file());
+        assert!(operation.is_dir());
+        assert!(quarantine.is_dir());
+        assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 0);
+        let operation_entries = fs::read_dir(&operation)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(operation_entries.len(), 1);
+        assert_eq!(
+            operation_entries[0].file_name().unwrap(),
+            "cleanup-placeholder-v1"
+        );
+        assert!(operation_entries[0].is_dir());
+        assert_eq!(fs::read_dir(&operation_entries[0]).unwrap().count(), 0);
 
-        // The injected kernel-boundary failure intentionally leaves the empty
-        // privately acquired capture as evidence. The fixture removes exactly
-        // that private namespace only after validating the service contract.
+        // The public capture is absent. The injected final-root failure leaves
+        // only the four exact durable cleanup roles, which the fixture removes
+        // after validating the service contract.
         fs::remove_dir_all(&ready_entries[0]).unwrap();
     }
 
@@ -670,10 +697,39 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
-        assert_eq!(retained.len(), 1);
-        assert!(retained[0].is_dir());
-        assert_eq!(fs::read_dir(&retained[0]).unwrap().count(), 0);
+        assert_eq!(retained.len(), 4);
+        let role = |prefix: &[u8]| {
+            let matches = retained
+                .iter()
+                .filter(|path| path.file_name().unwrap().as_bytes().starts_with(prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1);
+            matches.into_iter().next().unwrap()
+        };
+        let intent = role(b"cleanup-intent-v1-");
+        let decision = role(b"cleanup-decision-v1-");
+        let operation = role(b"cleanup-op-v1-");
+        let quarantine = role(b"cleanup-tree-v1-");
+        assert!(intent.is_file());
+        assert!(decision.is_file());
+        assert!(operation.is_dir());
+        assert!(quarantine.is_dir());
+        assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 0);
+        let operation_entries = fs::read_dir(&operation)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(operation_entries.len(), 1);
+        assert_eq!(
+            operation_entries[0].file_name().unwrap(),
+            "cleanup-placeholder-v1"
+        );
+        assert!(operation_entries[0].is_dir());
+        assert_eq!(fs::read_dir(&operation_entries[0]).unwrap().count(), 0);
 
+        // The public capture is absent; only the exact durable cleanup roles
+        // remain beneath the private namespace at the injected fault boundary.
         fs::remove_dir_all(&ready_entries[0]).unwrap();
     }
 }
