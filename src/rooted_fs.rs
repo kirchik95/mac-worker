@@ -409,12 +409,17 @@ enum CleanupFault {
     AfterCleanupIntentWriteBeforeSync(libc::c_int),
     AfterCleanupIntentAdoptionSync(libc::c_int),
     AfterCleanupIntentSync(libc::c_int),
+    AfterCleanupIntentPublish(libc::c_int),
     BeforeBoundCompletion(libc::c_int),
     AfterTargetChmod(libc::c_int),
     AfterFirstRemoval(libc::c_int),
     BeforeFinalRootRemoval(libc::c_int),
     AfterCleanupTargetExchange(libc::c_int),
+    AfterCleanupQuarantineNamespaceSync(libc::c_int),
+    AfterCleanupQuarantineParentSync(libc::c_int),
     AfterCleanupQuarantineRename(libc::c_int),
+    AfterCleanupPlaceholderRemoval(libc::c_int),
+    AfterCleanupOperationRemoval(libc::c_int),
 }
 
 #[cfg(test)]
@@ -5471,9 +5476,9 @@ fn remove_installed_placeholder(
     unlink_at(operation.directory.as_raw_fd(), private_name, flags)?;
     cvt(unsafe { libc::fsync(source_parent) })?;
     cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
-    operation.remove_empty_owned()?;
-    operation.cleaned = true;
-    Ok(())
+    injected_cleanup_after_placeholder_removal_result()?;
+    let namespace = operation.namespace;
+    remove_empty_cleanup_operation(namespace, operation)
 }
 
 struct PrivateCommit<'a> {
@@ -9089,6 +9094,7 @@ fn publish_cleanup_intent(
         &staged_bytes,
     )?;
     operation.cleaned = true;
+    injected_cleanup_intent_publish_result()?;
     Ok(())
 }
 
@@ -9304,6 +9310,7 @@ fn remove_empty_cleanup_operation(
     match (removal, unlock) {
         (Ok(()), Ok(())) => {
             operation.cleaned = true;
+            injected_cleanup_after_operation_removal_result()?;
             Ok(())
         }
         (Err(error), Ok(())) => Err(error),
@@ -9383,6 +9390,7 @@ fn cleanup_placeholder_only(
         libc::AT_REMOVEDIR,
     )?;
     cvt(unsafe { libc::fsync(operation.directory.as_raw_fd()) })?;
+    injected_cleanup_after_placeholder_removal_result()?;
     remove_empty_cleanup_operation(namespace, operation)
 }
 
@@ -9519,8 +9527,11 @@ fn resume_tree_cleanup(
                             );
                             return restoration.and(Err(error));
                         }
+                        injected_cleanup_after_quarantine_rename_result()?;
                         cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })?;
+                        injected_cleanup_after_quarantine_namespace_sync_result()?;
                         cvt(unsafe { libc::fsync(public_parent) })?;
+                        injected_cleanup_after_quarantine_parent_sync_result()?;
                     }
                     (CleanupSlot::Missing, CleanupSlot::Target, CleanupSlot::Placeholder) => {
                         drop(open_bound_cleanup_directory(
@@ -9813,10 +9824,12 @@ fn resume_regular_cleanup(
                             namespace.directory.as_raw_fd(),
                             &bindings.quarantine,
                         )?;
+                        injected_cleanup_after_quarantine_rename_result()?;
                         drop(public_target);
                         cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) })?;
+                        injected_cleanup_after_quarantine_namespace_sync_result()?;
                         cvt(unsafe { libc::fsync(public_parent) })?;
-                        injected_cleanup_after_quarantine_rename_result()?;
+                        injected_cleanup_after_quarantine_parent_sync_result()?;
                     }
                     (CleanupSlot::Missing, CleanupSlot::Target, CleanupSlot::Placeholder) => {
                         drop(open_bound_cleanup_regular(
@@ -10612,6 +10625,17 @@ fn injected_cleanup_intent_sync_result() -> io::Result<()> {
     Ok(())
 }
 
+fn injected_cleanup_intent_publish_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupIntentPublish(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
 fn injected_cleanup_before_bound_completion_result() -> io::Result<()> {
     #[cfg(test)]
     if let Some(CleanupFault::BeforeBoundCompletion(errno)) =
@@ -10945,6 +10969,50 @@ fn injected_cleanup_after_quarantine_rename_result() -> io::Result<()> {
     Ok(())
 }
 
+fn injected_cleanup_after_quarantine_namespace_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupQuarantineNamespaceSync(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_after_quarantine_parent_sync_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupQuarantineParentSync(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_after_placeholder_removal_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupPlaceholderRemoval(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_after_operation_removal_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupOperationRemoval(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
 fn open_verified_child_directory(
     parent: RawFd,
     name: &CStr,
@@ -11133,8 +11201,8 @@ mod tests {
         CleanupDecisionFaultOverride, CleanupDecisionRecordV1, CleanupDecisionV1, CleanupFault,
         CleanupFaultOverride, CleanupIntentV1, CleanupTerminalPhase,
         CopyPrivateCleanupFailureOverride, PrivateNamespace, RenameNoReplaceOverride, RootedDir,
-        cleanup_parse_canonical_json, copy_regular, copy_regular_with_clone,
-        copy_regular_with_clone_and_publish, create_regular_at, link_at,
+        cleanup_canonical_json, cleanup_parse_canonical_json, copy_regular,
+        copy_regular_with_clone, copy_regular_with_clone_and_publish, create_regular_at, link_at,
         make_regular_read_only_with_hook, open_directory_path, open_regular_at,
         open_verified_child_directory, publish_regular_with_link_ops, stat_at,
         unsupported_rename_no_replace,
@@ -18811,5 +18879,1049 @@ mod tests {
             replacement_inode.get()
         );
         assert!(evidence.is_dir());
+    }
+
+    #[derive(Clone, Copy)]
+    enum CrashMatrixKind {
+        Tree,
+        Regular,
+    }
+
+    enum CrashMatrixFault {
+        Cleanup(CleanupFault),
+        Decision(CleanupDecisionFault),
+        RestoreThen(CleanupDecisionFault),
+    }
+
+    struct CrashMatrixCell {
+        name: &'static str,
+        kind: CrashMatrixKind,
+        fault: CrashMatrixFault,
+        post_rename: bool,
+        expect_restore: bool,
+    }
+
+    fn assert_content_free_cleanup_error(
+        error: &std::io::Error,
+        expected_raw: Option<i32>,
+        expected_kind: Option<std::io::ErrorKind>,
+        forbidden: &[&[u8]],
+    ) {
+        if let Some(errno) = expected_raw {
+            assert_eq!(error.raw_os_error(), Some(errno), "{error:?}");
+        }
+        if let Some(kind) = expected_kind {
+            assert_eq!(error.kind(), kind, "{error:?}");
+        }
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        for needle in forbidden {
+            let text = String::from_utf8_lossy(needle);
+            if text.is_empty() {
+                continue;
+            }
+            assert!(
+                !display.contains(text.as_ref()),
+                "Display leaked {text:?}: {display}"
+            );
+            assert!(
+                !debug.contains(text.as_ref()),
+                "Debug leaked {text:?}: {debug}"
+            );
+        }
+    }
+
+    fn assert_cleanup_namespace_roles_retired(namespace: &Path) {
+        if !namespace.exists() {
+            return;
+        }
+        let leftover = fs::read_dir(namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        assert!(
+            leftover.iter().all(|name| {
+                !name.starts_with(b"cleanup-intent-v1-")
+                    && !name.starts_with(b"cleanup-decision-v1-")
+                    && !name.starts_with(b"cleanup-op-v1-")
+                    && !name.starts_with(b"cleanup-tree-v1-")
+                    && !name.starts_with(b"cleanup-regular-v1-")
+                    && name.as_slice() != b"cleanup-placeholder-v1"
+            }),
+            "journal roles remain: {leftover:?}"
+        );
+        assert_eq!(leftover.len(), 0, "namespace not empty: {leftover:?}");
+    }
+
+    fn crash_matrix_forbidden(root: &Path, public: &str, component_hex: &[u8]) -> Vec<Vec<u8>> {
+        let mut forbidden = vec![
+            root.as_os_str().as_bytes().to_vec(),
+            public.as_bytes().to_vec(),
+            component_hex.to_vec(),
+            b"replacement-bytes".to_vec(),
+            b"owned-leaf".to_vec(),
+            b"owned-regular".to_vec(),
+            b"sibling-bytes".to_vec(),
+        ];
+        let namespace = root.join(".mac-worker-rooted-fs");
+        if let Ok(entries) = fs::read_dir(&namespace) {
+            for entry in entries {
+                let name = entry.unwrap().file_name();
+                let bytes = name.as_bytes();
+                if bytes.starts_with(b"cleanup-intent-v1-")
+                    || bytes.starts_with(b"cleanup-decision-v1-")
+                    || bytes.starts_with(b"cleanup-op-v1-")
+                    || bytes.starts_with(b"cleanup-tree-v1-")
+                    || bytes.starts_with(b"cleanup-regular-v1-")
+                    || bytes == b"cleanup-placeholder-v1"
+                {
+                    forbidden.push(bytes.to_vec());
+                }
+            }
+        }
+        forbidden
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum OriginalEvidenceExpectation {
+        Present,
+        Missing,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TreeLeafExpectation {
+        Intact,
+        Removed,
+        NotATree,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum PinnedTreeLeaf {
+        Intact {
+            dev: u64,
+            ino: u64,
+            mode: u32,
+            bytes: Vec<u8>,
+        },
+        Removed,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum PinnedOriginalPayload {
+        RegularFile {
+            bytes: Vec<u8>,
+        },
+        Tree {
+            entries: Vec<Vec<u8>>,
+            leaf: PinnedTreeLeaf,
+        },
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct OriginalEvidencePin {
+        path: PathBuf,
+        dev: u64,
+        ino: u64,
+        mode: u32,
+        payload: PinnedOriginalPayload,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum OriginalEvidenceState {
+        Present(OriginalEvidencePin),
+        Missing { dev: u64, ino: u64 },
+    }
+
+    fn expected_original_after_crash(cell: &CrashMatrixCell) -> OriginalEvidenceExpectation {
+        match &cell.fault {
+            CrashMatrixFault::Cleanup(CleanupFault::AfterCleanupPlaceholderRemoval(_))
+            | CrashMatrixFault::Cleanup(CleanupFault::AfterCleanupOperationRemoval(_))
+            | CrashMatrixFault::Decision(CleanupDecisionFault::AfterDecisionRetire(_)) => {
+                OriginalEvidenceExpectation::Missing
+            }
+            _ => OriginalEvidenceExpectation::Present,
+        }
+    }
+
+    fn expected_tree_leaf_after_crash(cell: &CrashMatrixCell) -> TreeLeafExpectation {
+        match cell.kind {
+            CrashMatrixKind::Regular => TreeLeafExpectation::NotATree,
+            CrashMatrixKind::Tree => match &cell.fault {
+                CrashMatrixFault::Cleanup(CleanupFault::AfterFirstRemoval(_))
+                | CrashMatrixFault::Cleanup(CleanupFault::BeforeFinalRootRemoval(_)) => {
+                    TreeLeafExpectation::Removed
+                }
+                _ => match expected_original_after_crash(cell) {
+                    OriginalEvidenceExpectation::Present => TreeLeafExpectation::Intact,
+                    OriginalEvidenceExpectation::Missing => TreeLeafExpectation::NotATree,
+                },
+            },
+        }
+    }
+
+    fn find_inode_path(root: &Path, dev: u64, ino: u64) -> Option<PathBuf> {
+        let meta = fs::symlink_metadata(root).ok()?;
+        if meta.dev() == dev && meta.ino() == ino {
+            return Some(root.to_path_buf());
+        }
+        if !meta.file_type().is_dir() {
+            return None;
+        }
+        for entry in fs::read_dir(root).ok()? {
+            if let Some(found) = find_inode_path(&entry.ok()?.path(), dev, ino) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn capture_original_evidence_state(
+        namespace: &Path,
+        original: &fs::Metadata,
+    ) -> OriginalEvidenceState {
+        match find_inode_path(namespace, original.dev(), original.ino()) {
+            Some(path) => OriginalEvidenceState::Present(pin_present_original(&path, original)),
+            None => OriginalEvidenceState::Missing {
+                dev: original.dev(),
+                ino: original.ino(),
+            },
+        }
+    }
+
+    fn pin_present_original(path: &Path, original: &fs::Metadata) -> OriginalEvidencePin {
+        let meta = fs::symlink_metadata(path).unwrap();
+        assert_eq!(meta.dev(), original.dev());
+        assert_eq!(meta.ino(), original.ino());
+        let payload = if meta.file_type().is_file() {
+            PinnedOriginalPayload::RegularFile {
+                bytes: fs::read(path).unwrap(),
+            }
+        } else if meta.file_type().is_dir() {
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().as_bytes().to_vec())
+                .collect::<Vec<_>>();
+            entries.sort();
+            let leaf_path = path.join("leaf");
+            let leaf = match fs::symlink_metadata(&leaf_path) {
+                Ok(leaf_meta) => PinnedTreeLeaf::Intact {
+                    dev: leaf_meta.dev(),
+                    ino: leaf_meta.ino(),
+                    mode: leaf_meta.permissions().mode() & 0o7777,
+                    bytes: fs::read(&leaf_path).unwrap(),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    PinnedTreeLeaf::Removed
+                }
+                Err(error) => panic!("tree leaf metadata: {error:?}"),
+            };
+            PinnedOriginalPayload::Tree { entries, leaf }
+        } else {
+            panic!("original evidence is neither file nor directory: {path:?}");
+        };
+        OriginalEvidencePin {
+            path: path.to_path_buf(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mode: meta.permissions().mode() & 0o7777,
+            payload,
+        }
+    }
+
+    fn require_original_evidence_for_phase(
+        cell: &CrashMatrixCell,
+        observed: &OriginalEvidenceState,
+    ) {
+        let expected = expected_original_after_crash(cell);
+        match (expected, observed) {
+            (OriginalEvidenceExpectation::Present, OriginalEvidenceState::Present(pin)) => {
+                match (expected_tree_leaf_after_crash(cell), &pin.payload) {
+                    (
+                        TreeLeafExpectation::NotATree,
+                        PinnedOriginalPayload::RegularFile { bytes },
+                    ) => {
+                        assert_eq!(bytes, b"owned-regular", "{}", cell.name);
+                    }
+                    (
+                        TreeLeafExpectation::Intact,
+                        PinnedOriginalPayload::Tree {
+                            leaf: PinnedTreeLeaf::Intact { bytes, .. },
+                            entries,
+                        },
+                    ) => {
+                        assert_eq!(bytes, b"owned-leaf", "{}", cell.name);
+                        assert!(
+                            entries.iter().any(|name| name == b"leaf"),
+                            "{}: intact tree missing leaf entry {entries:?}",
+                            cell.name
+                        );
+                    }
+                    (
+                        TreeLeafExpectation::Removed,
+                        PinnedOriginalPayload::Tree {
+                            leaf: PinnedTreeLeaf::Removed,
+                            entries,
+                        },
+                    ) => {
+                        assert!(
+                            !entries.iter().any(|name| name == b"leaf"),
+                            "{}: removed tree still lists leaf {entries:?}",
+                            cell.name
+                        );
+                    }
+                    (leaf, payload) => panic!(
+                        "{}: original payload {payload:?} does not match leaf expectation {leaf:?}",
+                        cell.name
+                    ),
+                }
+            }
+            (OriginalEvidenceExpectation::Missing, OriginalEvidenceState::Missing { .. }) => {}
+            (expected, observed) => panic!(
+                "{}: expected original evidence {expected:?}, observed {observed:?}",
+                cell.name
+            ),
+        }
+    }
+
+    fn assert_original_evidence_state_unchanged(
+        before: &OriginalEvidenceState,
+        namespace: &Path,
+        original: &fs::Metadata,
+        cell_name: &str,
+    ) {
+        let after = capture_original_evidence_state(namespace, original);
+        match (before, &after) {
+            (
+                OriginalEvidenceState::Present(before_pin),
+                OriginalEvidenceState::Present(after_pin),
+            ) => {
+                assert_eq!(after_pin, before_pin, "{cell_name}");
+            }
+            (
+                OriginalEvidenceState::Missing { dev, ino },
+                OriginalEvidenceState::Missing {
+                    dev: after_dev,
+                    ino: after_ino,
+                },
+            ) => {
+                assert_eq!(after_dev, dev, "{cell_name}");
+                assert_eq!(after_ino, ino, "{cell_name}");
+                assert!(
+                    find_inode_path(namespace, *dev, *ino).is_none(),
+                    "{cell_name}: deleted original {dev}/{ino} reappeared"
+                );
+            }
+            (before, after) => {
+                panic!("{cell_name}: original evidence state changed: {before:?} -> {after:?}")
+            }
+        }
+    }
+
+    fn run_crash_matrix_cell(cell: CrashMatrixCell) {
+        let temp = tempfile::tempdir().unwrap();
+        let physical = temp.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = physical.join("parent");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let public = match cell.kind {
+            CrashMatrixKind::Tree => "child",
+            CrashMatrixKind::Regular => "entry",
+        };
+        let public_path = root.join(public);
+        let sibling = root.join("sibling");
+        fs::write(&sibling, b"sibling-bytes").unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o600)).unwrap();
+        match cell.kind {
+            CrashMatrixKind::Tree => {
+                fs::create_dir(&public_path).unwrap();
+                fs::write(public_path.join("leaf"), b"owned-leaf").unwrap();
+                fs::set_permissions(&public_path, fs::Permissions::from_mode(0o500)).unwrap();
+            }
+            CrashMatrixKind::Regular => {
+                fs::write(&public_path, b"owned-regular").unwrap();
+                fs::set_permissions(&public_path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        let original = fs::symlink_metadata(&public_path).unwrap();
+        let parent = RootedDir::open(&root).unwrap();
+        let cleanup_fault = match &cell.fault {
+            CrashMatrixFault::Cleanup(fault) => Some(CleanupFaultOverride::set(*fault)),
+            CrashMatrixFault::RestoreThen(_) => Some(CleanupFaultOverride::set(
+                CleanupFault::AfterAcquisitionValidation(libc::ESTALE),
+            )),
+            CrashMatrixFault::Decision(_) => None,
+        };
+        let decision_fault = match &cell.fault {
+            CrashMatrixFault::Decision(fault) | CrashMatrixFault::RestoreThen(fault) => {
+                Some(CleanupDecisionFaultOverride::set(*fault))
+            }
+            CrashMatrixFault::Cleanup(_) => None,
+        };
+        let first = match cell.kind {
+            CrashMatrixKind::Tree => parent.remove_owned_child(public),
+            CrashMatrixKind::Regular => parent.remove_owned_regular(public),
+        };
+        let first = match first {
+            Ok(()) => panic!("{}: first call succeeded", cell.name),
+            Err(error) => error,
+        };
+        assert_eq!(
+            first.raw_os_error(),
+            Some(libc::EIO),
+            "{}: {first:?}",
+            cell.name
+        );
+        drop(decision_fault);
+        drop(cleanup_fault);
+        drop(parent);
+        assert_eq!(
+            fs::read(&sibling).unwrap(),
+            b"sibling-bytes",
+            "{}",
+            cell.name
+        );
+
+        if cell.post_rename {
+            assert!(!public_path.exists(), "{}: public still present", cell.name);
+            match cell.kind {
+                CrashMatrixKind::Tree => {
+                    fs::create_dir(&public_path).unwrap();
+                    fs::set_permissions(&public_path, fs::Permissions::from_mode(0o700)).unwrap();
+                    fs::write(public_path.join("replacement"), b"replacement-bytes").unwrap();
+                }
+                CrashMatrixKind::Regular => {
+                    fs::write(&public_path, b"replacement-bytes").unwrap();
+                    fs::set_permissions(&public_path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            }
+            let planted = fs::symlink_metadata(&public_path).unwrap();
+            let namespace = root.join(".mac-worker-rooted-fs");
+            let original_state = capture_original_evidence_state(&namespace, &original);
+            require_original_evidence_for_phase(&cell, &original_state);
+            let intent_path = unique_namespace_role(&namespace, b"cleanup-intent-v1-");
+            let intent_record: CleanupIntentV1 =
+                cleanup_parse_canonical_json(&fs::read(&intent_path).unwrap()).unwrap();
+            let forbidden =
+                crash_matrix_forbidden(&root, public, intent_record.component_hex.as_bytes());
+            let retry = match cell.kind {
+                CrashMatrixKind::Tree => RootedDir::open(&root).unwrap().remove_owned_child(public),
+                CrashMatrixKind::Regular => {
+                    RootedDir::open(&root).unwrap().remove_owned_regular(public)
+                }
+            };
+            let error = match retry {
+                Ok(()) => panic!("{}: post-rename retry succeeded", cell.name),
+                Err(error) => error,
+            };
+            assert_eq!(error.raw_os_error(), Some(libc::ESTALE), "{}", cell.name);
+            let needles = forbidden
+                .iter()
+                .map(|bytes| bytes.as_slice())
+                .collect::<Vec<_>>();
+            assert_content_free_cleanup_error(&error, Some(libc::ESTALE), None, &needles);
+            assert_original_evidence_state_unchanged(
+                &original_state,
+                &namespace,
+                &original,
+                cell.name,
+            );
+            let after = fs::symlink_metadata(&public_path).unwrap_or_else(|error| {
+                panic!("{}: replacement missing after retry: {error:?}", cell.name)
+            });
+            assert_eq!(after.dev(), planted.dev(), "{}", cell.name);
+            assert_eq!(after.ino(), planted.ino(), "{}", cell.name);
+            match cell.kind {
+                CrashMatrixKind::Tree => {
+                    assert_eq!(
+                        fs::read(public_path.join("replacement")).unwrap(),
+                        b"replacement-bytes",
+                        "{}",
+                        cell.name
+                    );
+                }
+                CrashMatrixKind::Regular => {
+                    assert_eq!(
+                        fs::read(&public_path).unwrap(),
+                        b"replacement-bytes",
+                        "{}",
+                        cell.name
+                    );
+                }
+            }
+            assert_eq!(
+                fs::read(&sibling).unwrap(),
+                b"sibling-bytes",
+                "{}",
+                cell.name
+            );
+            return;
+        }
+
+        let reopened = RootedDir::open(&root).unwrap();
+        if cell.expect_restore {
+            let resumed = match cell.kind {
+                CrashMatrixKind::Tree => reopened.resume_pending_owned_child_cleanup(public),
+                CrashMatrixKind::Regular => reopened.resume_pending_owned_regular_cleanup(public),
+            };
+            resumed.unwrap_or_else(|error| panic!("{}: {error:?}", cell.name));
+        } else {
+            let retry = match cell.kind {
+                CrashMatrixKind::Tree => reopened.remove_owned_child(public),
+                CrashMatrixKind::Regular => reopened.remove_owned_regular(public),
+            };
+            retry.unwrap_or_else(|error| panic!("{}: {error:?}", cell.name));
+        }
+        assert_eq!(
+            fs::read(&sibling).unwrap(),
+            b"sibling-bytes",
+            "{}",
+            cell.name
+        );
+        let namespace = root.join(".mac-worker-rooted-fs");
+        assert_cleanup_namespace_roles_retired(&namespace);
+        if cell.expect_restore {
+            let after = fs::symlink_metadata(&public_path).unwrap();
+            assert_eq!(after.dev(), original.dev(), "{}", cell.name);
+            assert_eq!(after.ino(), original.ino(), "{}", cell.name);
+            match cell.kind {
+                CrashMatrixKind::Tree => {
+                    assert_eq!(after.permissions().mode() & 0o777, 0o500, "{}", cell.name);
+                    assert_eq!(
+                        fs::read(public_path.join("leaf")).unwrap(),
+                        b"owned-leaf",
+                        "{}",
+                        cell.name
+                    );
+                }
+                CrashMatrixKind::Regular => {
+                    assert_eq!(after.permissions().mode() & 0o777, 0o600, "{}", cell.name);
+                    assert_eq!(
+                        fs::read(&public_path).unwrap(),
+                        b"owned-regular",
+                        "{}",
+                        cell.name
+                    );
+                }
+            }
+        } else {
+            assert!(!public_path.exists(), "{}: public survived", cell.name);
+        }
+    }
+
+    fn crash_matrix_cells() -> Vec<CrashMatrixCell> {
+        let mut cells = Vec::new();
+        for kind in [CrashMatrixKind::Tree, CrashMatrixKind::Regular] {
+            cells.extend([
+                CrashMatrixCell {
+                    name: "intent file sync",
+                    kind,
+                    fault: CrashMatrixFault::Cleanup(
+                        CleanupFault::AfterCleanupIntentWriteBeforeSync(libc::EIO),
+                    ),
+                    post_rename: false,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "intent publish",
+                    kind,
+                    fault: CrashMatrixFault::Cleanup(CleanupFault::AfterCleanupIntentPublish(
+                        libc::EIO,
+                    )),
+                    post_rename: false,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "target quarantine rename",
+                    kind,
+                    fault: CrashMatrixFault::Cleanup(CleanupFault::AfterCleanupQuarantineRename(
+                        libc::EIO,
+                    )),
+                    post_rename: true,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "namespace sync",
+                    kind,
+                    fault: CrashMatrixFault::Cleanup(
+                        CleanupFault::AfterCleanupQuarantineNamespaceSync(libc::EIO),
+                    ),
+                    post_rename: true,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "public-parent sync",
+                    kind,
+                    fault: CrashMatrixFault::Cleanup(
+                        CleanupFault::AfterCleanupQuarantineParentSync(libc::EIO),
+                    ),
+                    post_rename: true,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "decision publish",
+                    kind,
+                    fault: CrashMatrixFault::Decision(CleanupDecisionFault::AfterSourceSync(
+                        libc::EIO,
+                    )),
+                    post_rename: true,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "final target unlink",
+                    kind,
+                    fault: CrashMatrixFault::Cleanup(CleanupFault::BeforeFinalRootRemoval(
+                        libc::EIO,
+                    )),
+                    post_rename: true,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "placeholder removal",
+                    kind,
+                    fault: CrashMatrixFault::Cleanup(CleanupFault::AfterCleanupPlaceholderRemoval(
+                        libc::EIO,
+                    )),
+                    post_rename: true,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "operation removal",
+                    kind,
+                    fault: CrashMatrixFault::Cleanup(CleanupFault::AfterCleanupOperationRemoval(
+                        libc::EIO,
+                    )),
+                    post_rename: true,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "decision removal",
+                    kind,
+                    fault: CrashMatrixFault::Decision(CleanupDecisionFault::AfterDecisionRetire(
+                        libc::EIO,
+                    )),
+                    post_rename: true,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "intent removal",
+                    kind,
+                    fault: CrashMatrixFault::Decision(CleanupDecisionFault::AfterIntentRetire(
+                        libc::EIO,
+                    )),
+                    post_rename: false,
+                    expect_restore: false,
+                },
+                CrashMatrixCell {
+                    name: "restore after destination sync",
+                    kind,
+                    fault: CrashMatrixFault::RestoreThen(
+                        CleanupDecisionFault::AfterRestoreDestinationSync(libc::EIO),
+                    ),
+                    post_rename: false,
+                    expect_restore: true,
+                },
+            ]);
+        }
+        cells.push(CrashMatrixCell {
+            name: "first recursive removal",
+            kind: CrashMatrixKind::Tree,
+            fault: CrashMatrixFault::Cleanup(CleanupFault::AfterFirstRemoval(libc::EIO)),
+            post_rename: true,
+            expect_restore: false,
+        });
+        cells
+    }
+
+    #[test]
+    fn cleanup_crash_matrix_tree_and_regular_one_safe_result() {
+        for cell in crash_matrix_cells() {
+            run_crash_matrix_cell(cell);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EvidenceKind {
+        Tree,
+        Regular,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EvidencePlant {
+        EmptyLegacyCleanupUuid,
+        NonemptyLegacyCleanupUuid,
+        PublicRemoveUuid,
+        UnknownIntentField,
+        ConcatenatedJson,
+        OversizedJson,
+        NoncanonicalHex,
+        WrongParentIdentity,
+        WrongNamespaceIdentity,
+        WrongTargetIdentity,
+        SymlinkIntent,
+        HardlinkIntent,
+        IntentMode0644,
+        IntentOwner,
+    }
+
+    fn evidence_expected(plant: &EvidencePlant) -> (Option<i32>, Option<std::io::ErrorKind>, bool) {
+        match plant {
+            EvidencePlant::EmptyLegacyCleanupUuid | EvidencePlant::NonemptyLegacyCleanupUuid => {
+                (Some(libc::ESTALE), None, false)
+            }
+            EvidencePlant::PublicRemoveUuid => (None, None, true),
+            EvidencePlant::UnknownIntentField
+            | EvidencePlant::ConcatenatedJson
+            | EvidencePlant::NoncanonicalHex => (Some(libc::EINVAL), None, false),
+            EvidencePlant::OversizedJson => (Some(libc::EFBIG), None, false),
+            EvidencePlant::WrongParentIdentity | EvidencePlant::WrongNamespaceIdentity => {
+                (Some(libc::ESTALE), None, false)
+            }
+            EvidencePlant::WrongTargetIdentity => (Some(libc::EINVAL), None, false),
+            EvidencePlant::SymlinkIntent
+            | EvidencePlant::HardlinkIntent
+            | EvidencePlant::IntentMode0644
+            | EvidencePlant::IntentOwner => {
+                (None, Some(std::io::ErrorKind::PermissionDenied), false)
+            }
+        }
+    }
+
+    const OVERSIZED_UNIQUE_MUTATION: &[u8] = b"oversized-unique-mutation-marker";
+
+    fn run_published_evidence_case(kind: EvidenceKind, plant: EvidencePlant) {
+        if matches!(plant, EvidencePlant::IntentOwner) && unsafe { libc::geteuid() } != 0 {
+            // Owner-violation coverage needs chown(2) to a foreign uid.
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let physical = temp.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = physical.join("parent");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let public = match kind {
+            EvidenceKind::Tree => "child",
+            EvidenceKind::Regular => "entry",
+        };
+        let public_path = root.join(public);
+        let sibling = root.join("sibling");
+        fs::write(&sibling, b"sibling-bytes").unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o600)).unwrap();
+        let namespace = root.join(".mac-worker-rooted-fs");
+        let (success, raw, kind_expected) = {
+            let (raw, kind_expected, success) = evidence_expected(&plant);
+            (success, raw, kind_expected)
+        };
+
+        match plant {
+            EvidencePlant::EmptyLegacyCleanupUuid | EvidencePlant::NonemptyLegacyCleanupUuid => {
+                fs::create_dir(&namespace).unwrap();
+                fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+                let legacy = namespace.join("cleanup-303f0f4a-6b5c-4d8e-9f00-112233445566");
+                fs::create_dir(&legacy).unwrap();
+                if matches!(plant, EvidencePlant::NonemptyLegacyCleanupUuid) {
+                    fs::write(legacy.join("sentinel"), b"preserve-legacy").unwrap();
+                }
+                let inode = fs::symlink_metadata(&legacy).unwrap().ino();
+                let error = match kind {
+                    EvidenceKind::Tree => RootedDir::open(&root)
+                        .unwrap()
+                        .remove_owned_child("absent")
+                        .unwrap_err(),
+                    EvidenceKind::Regular => RootedDir::open(&root)
+                        .unwrap()
+                        .remove_owned_regular("absent")
+                        .unwrap_err(),
+                };
+                let forbidden = [
+                    root.as_os_str().as_bytes(),
+                    b"preserve-legacy".as_slice(),
+                    b"303f0f4a-6b5c-4d8e-9f00-112233445566".as_slice(),
+                    public.as_bytes(),
+                    b"absent".as_slice(),
+                ];
+                assert_eq!(error.raw_os_error(), raw, "{kind:?} {plant:?}: {error:?}");
+                assert_content_free_cleanup_error(&error, raw, kind_expected, &forbidden);
+                assert_eq!(fs::symlink_metadata(&legacy).unwrap().ino(), inode);
+                if matches!(plant, EvidencePlant::NonemptyLegacyCleanupUuid) {
+                    assert_eq!(
+                        fs::read(legacy.join("sentinel")).unwrap(),
+                        b"preserve-legacy"
+                    );
+                } else {
+                    assert_eq!(fs::read_dir(&legacy).unwrap().count(), 0);
+                }
+                assert_eq!(fs::read(&sibling).unwrap(), b"sibling-bytes");
+                return;
+            }
+            EvidencePlant::PublicRemoveUuid => {
+                let legacy = root.join("remove-303f0f4a-6b5c-4d8e-9f00-112233445566");
+                fs::write(&legacy, b"legacy-public-remove").unwrap();
+                let inode = fs::symlink_metadata(&legacy).unwrap().ino();
+                match kind {
+                    EvidenceKind::Tree => RootedDir::open(&root)
+                        .unwrap()
+                        .remove_owned_child("absent")
+                        .unwrap(),
+                    EvidenceKind::Regular => RootedDir::open(&root)
+                        .unwrap()
+                        .remove_owned_regular("absent")
+                        .unwrap(),
+                }
+                assert_eq!(fs::read(&legacy).unwrap(), b"legacy-public-remove");
+                assert_eq!(fs::symlink_metadata(&legacy).unwrap().ino(), inode);
+                assert_eq!(fs::read(&sibling).unwrap(), b"sibling-bytes");
+                assert_cleanup_namespace_roles_retired(&namespace);
+                return;
+            }
+            _ => {}
+        }
+
+        match kind {
+            EvidenceKind::Tree => {
+                fs::create_dir(&public_path).unwrap();
+                fs::set_permissions(&public_path, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(public_path.join("leaf"), b"owned-leaf").unwrap();
+            }
+            EvidenceKind::Regular => {
+                fs::write(&public_path, b"owned-regular").unwrap();
+                fs::set_permissions(&public_path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        let parent = RootedDir::open(&root).unwrap();
+        let interrupt =
+            CleanupFaultOverride::set(CleanupFault::AfterCleanupQuarantineRename(libc::EIO));
+        let first = match kind {
+            EvidenceKind::Tree => parent.remove_owned_child(public).unwrap_err(),
+            EvidenceKind::Regular => parent.remove_owned_regular(public).unwrap_err(),
+        };
+        assert_eq!(first.raw_os_error(), Some(libc::EIO));
+        drop(interrupt);
+        drop(parent);
+
+        let intent_path = unique_namespace_role(&namespace, b"cleanup-intent-v1-");
+        let operation = unique_namespace_role(&namespace, b"cleanup-op-v1-");
+        let quarantine_prefix = match kind {
+            EvidenceKind::Tree => b"cleanup-tree-v1-".as_slice(),
+            EvidenceKind::Regular => b"cleanup-regular-v1-".as_slice(),
+        };
+        let quarantine = unique_namespace_role(&namespace, quarantine_prefix);
+        let canonical = fs::read(&intent_path).unwrap();
+        let intent_inode = fs::symlink_metadata(&intent_path).unwrap().ino();
+        let operation_inode = fs::symlink_metadata(&operation).unwrap().ino();
+        let quarantine_inode = fs::symlink_metadata(&quarantine).unwrap().ino();
+        let intent_record: CleanupIntentV1 = cleanup_parse_canonical_json(&canonical).unwrap();
+        let component_hex = intent_record.component_hex.clone();
+        let mut planted = canonical.clone();
+        let mut auxiliary = None;
+        match plant {
+            EvidencePlant::UnknownIntentField => {
+                assert_eq!(planted.pop(), Some(b'}'));
+                planted.extend_from_slice(br#","extra":1}"#);
+                fs::write(&intent_path, &planted).unwrap();
+            }
+            EvidencePlant::ConcatenatedJson => {
+                planted.extend_from_slice(&canonical);
+                fs::write(&intent_path, &planted).unwrap();
+            }
+            EvidencePlant::OversizedJson => {
+                planted = vec![b'x'; 4097];
+                let start = 128;
+                let end = start + OVERSIZED_UNIQUE_MUTATION.len();
+                planted[start..end].copy_from_slice(OVERSIZED_UNIQUE_MUTATION);
+                fs::write(&intent_path, &planted).unwrap();
+            }
+            EvidencePlant::NoncanonicalHex => {
+                let mut rewritten = intent_record;
+                rewritten.component_hex = rewritten.component_hex.to_ascii_uppercase();
+                planted = cleanup_canonical_json(&rewritten).unwrap();
+                fs::write(&intent_path, &planted).unwrap();
+            }
+            EvidencePlant::WrongParentIdentity => {
+                let mut rewritten = intent_record;
+                rewritten.parent.inode = rewritten.parent.inode.wrapping_add(1);
+                planted = cleanup_canonical_json(&rewritten).unwrap();
+                fs::write(&intent_path, &planted).unwrap();
+            }
+            EvidencePlant::WrongNamespaceIdentity => {
+                let mut rewritten = intent_record;
+                rewritten.namespace.inode = rewritten.namespace.inode.wrapping_add(1);
+                planted = cleanup_canonical_json(&rewritten).unwrap();
+                fs::write(&intent_path, &planted).unwrap();
+            }
+            EvidencePlant::WrongTargetIdentity => {
+                let mut rewritten = intent_record;
+                rewritten.target.inode = rewritten.target.inode.wrapping_add(1);
+                planted = cleanup_canonical_json(&rewritten).unwrap();
+                fs::write(&intent_path, &planted).unwrap();
+            }
+            EvidencePlant::SymlinkIntent => {
+                let backup = root.parent().unwrap().join("intent-symlink-target");
+                fs::write(&backup, &canonical).unwrap();
+                fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::remove_file(&intent_path).unwrap();
+                std::os::unix::fs::symlink(&backup, &intent_path).unwrap();
+                planted = canonical.clone();
+                let meta = fs::symlink_metadata(&backup).unwrap();
+                auxiliary = Some((backup, meta, canonical.clone()));
+            }
+            EvidencePlant::HardlinkIntent => {
+                let extra = root.parent().unwrap().join("intent-hardlink-alias");
+                fs::hard_link(&intent_path, &extra).unwrap();
+                let meta = fs::symlink_metadata(&extra).unwrap();
+                auxiliary = Some((extra, meta, canonical.clone()));
+            }
+            EvidencePlant::IntentMode0644 => {
+                fs::set_permissions(&intent_path, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            EvidencePlant::IntentOwner => {
+                let foreign_uid = 1;
+                assert_ne!(foreign_uid, unsafe { libc::geteuid() });
+                let path = std::ffi::CString::new(intent_path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(
+                    unsafe { libc::chown(path.as_ptr(), foreign_uid, u32::MAX) },
+                    0,
+                    "chown intent to foreign uid"
+                );
+            }
+            EvidencePlant::EmptyLegacyCleanupUuid
+            | EvidencePlant::NonemptyLegacyCleanupUuid
+            | EvidencePlant::PublicRemoveUuid => unreachable!(),
+        }
+        let forbidden = {
+            let mut needles = vec![
+                root.as_os_str().as_bytes().to_vec(),
+                public.as_bytes().to_vec(),
+                component_hex.as_bytes().to_vec(),
+                intent_path.file_name().unwrap().as_bytes().to_vec(),
+                operation.file_name().unwrap().as_bytes().to_vec(),
+                quarantine.file_name().unwrap().as_bytes().to_vec(),
+                b"owned-leaf".to_vec(),
+                b"owned-regular".to_vec(),
+                b"sibling-bytes".to_vec(),
+                b"replacement-bytes".to_vec(),
+            ];
+            if let Some((aux_path, _, aux_bytes)) = auxiliary.as_ref() {
+                needles.push(aux_path.as_os_str().as_bytes().to_vec());
+                needles.push(aux_path.file_name().unwrap().as_bytes().to_vec());
+                needles.push(aux_bytes.clone());
+            }
+            needles.push(planted.clone());
+            if matches!(plant, EvidencePlant::OversizedJson) {
+                needles.push(OVERSIZED_UNIQUE_MUTATION.to_vec());
+            }
+            needles
+        };
+
+        let error = match kind {
+            EvidenceKind::Tree => RootedDir::open(&root)
+                .unwrap()
+                .remove_owned_child(public)
+                .unwrap_err(),
+            EvidenceKind::Regular => RootedDir::open(&root)
+                .unwrap()
+                .remove_owned_regular(public)
+                .unwrap_err(),
+        };
+        assert!(!success);
+        let needles = forbidden
+            .iter()
+            .map(|bytes| bytes.as_slice())
+            .collect::<Vec<_>>();
+        assert_content_free_cleanup_error(&error, raw, kind_expected, &needles);
+        match plant {
+            EvidencePlant::SymlinkIntent => {
+                assert!(
+                    fs::symlink_metadata(&intent_path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+            }
+            EvidencePlant::HardlinkIntent => {
+                assert_eq!(fs::symlink_metadata(&intent_path).unwrap().nlink(), 2);
+                assert_eq!(fs::read(&intent_path).unwrap(), canonical);
+            }
+            EvidencePlant::IntentMode0644 => {
+                assert_eq!(
+                    fs::symlink_metadata(&intent_path)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o644
+                );
+                assert_eq!(fs::read(&intent_path).unwrap(), canonical);
+            }
+            EvidencePlant::IntentOwner => {
+                let meta = fs::symlink_metadata(&intent_path).unwrap();
+                assert_eq!(meta.ino(), intent_inode);
+                assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+                assert_eq!(meta.uid(), 1);
+                assert_eq!(fs::read(&intent_path).unwrap(), canonical);
+            }
+            _ => {
+                assert_eq!(fs::read(&intent_path).unwrap(), planted);
+            }
+        }
+        if let Some((aux_path, aux_meta, aux_bytes)) = auxiliary.as_ref() {
+            let after = fs::symlink_metadata(aux_path).unwrap();
+            assert_eq!(after.dev(), aux_meta.dev());
+            assert_eq!(after.ino(), aux_meta.ino());
+            assert_eq!(fs::read(aux_path).unwrap(), aux_bytes.as_slice());
+        }
+        if !matches!(plant, EvidencePlant::SymlinkIntent) {
+            assert_eq!(
+                fs::symlink_metadata(&intent_path).unwrap().ino(),
+                intent_inode
+            );
+        }
+        assert_eq!(
+            fs::symlink_metadata(&operation).unwrap().ino(),
+            operation_inode
+        );
+        assert_eq!(
+            fs::symlink_metadata(&quarantine).unwrap().ino(),
+            quarantine_inode
+        );
+        assert_eq!(fs::read(&sibling).unwrap(), b"sibling-bytes");
+        assert!(!public_path.exists());
+    }
+
+    #[test]
+    fn cleanup_evidence_legacy_and_malformed_published_intent_matrix() {
+        let cases = [
+            (EvidenceKind::Tree, EvidencePlant::EmptyLegacyCleanupUuid),
+            (EvidenceKind::Regular, EvidencePlant::EmptyLegacyCleanupUuid),
+            (
+                EvidenceKind::Regular,
+                EvidencePlant::NonemptyLegacyCleanupUuid,
+            ),
+            (EvidenceKind::Tree, EvidencePlant::PublicRemoveUuid),
+            (EvidenceKind::Tree, EvidencePlant::UnknownIntentField),
+            (EvidenceKind::Regular, EvidencePlant::UnknownIntentField),
+            (EvidenceKind::Tree, EvidencePlant::ConcatenatedJson),
+            (EvidenceKind::Regular, EvidencePlant::ConcatenatedJson),
+            (EvidenceKind::Tree, EvidencePlant::OversizedJson),
+            (EvidenceKind::Tree, EvidencePlant::NoncanonicalHex),
+            (EvidenceKind::Regular, EvidencePlant::NoncanonicalHex),
+            (EvidenceKind::Tree, EvidencePlant::WrongParentIdentity),
+            (EvidenceKind::Regular, EvidencePlant::WrongParentIdentity),
+            (EvidenceKind::Tree, EvidencePlant::WrongNamespaceIdentity),
+            (EvidenceKind::Regular, EvidencePlant::WrongNamespaceIdentity),
+            (EvidenceKind::Tree, EvidencePlant::WrongTargetIdentity),
+            (EvidenceKind::Regular, EvidencePlant::WrongTargetIdentity),
+            (EvidenceKind::Tree, EvidencePlant::SymlinkIntent),
+            (EvidenceKind::Regular, EvidencePlant::SymlinkIntent),
+            (EvidenceKind::Tree, EvidencePlant::HardlinkIntent),
+            (EvidenceKind::Regular, EvidencePlant::HardlinkIntent),
+            (EvidenceKind::Tree, EvidencePlant::IntentMode0644),
+            (EvidenceKind::Tree, EvidencePlant::IntentOwner),
+            (EvidenceKind::Regular, EvidencePlant::IntentOwner),
+        ];
+        for (kind, plant) in cases {
+            run_published_evidence_case(kind, plant);
+        }
     }
 }

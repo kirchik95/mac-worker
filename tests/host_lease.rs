@@ -5,11 +5,12 @@ use std::{
     io::Cursor,
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{OpenOptionsExt, PermissionsExt, symlink},
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
     },
-    path::Path,
-    sync::{Arc, Barrier},
+    path::{Path, PathBuf},
+    sync::{Arc, Barrier, mpsc},
     thread,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -838,6 +839,117 @@ fn abandoned_lease_with_receipt(
     (lease, receipt)
 }
 
+const CONCURRENCY_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn plant_leases_leftover(root: &Path, name: &str, leaf: &str, bytes: &[u8]) -> PathBuf {
+    let leftover = root.join("leases").join(name);
+    fs::create_dir(&leftover).unwrap();
+    fs::set_permissions(&leftover, fs::Permissions::from_mode(0o700)).unwrap();
+    let leftover_leaf = leftover.join(leaf);
+    fs::write(&leftover_leaf, bytes).unwrap();
+    fs::set_permissions(&leftover_leaf, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::File::open(&leftover_leaf).unwrap().sync_all().unwrap();
+    fs::File::open(&leftover).unwrap().sync_all().unwrap();
+    fs::File::open(root.join("leases"))
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    leftover
+}
+
+fn leftover_leaf_pin(leftover: &Path, leaf: &str) -> (u64, u64, Vec<u8>) {
+    let path = leftover.join(leaf);
+    let metadata = fs::symlink_metadata(&path).unwrap();
+    (metadata.dev(), metadata.ino(), fs::read(&path).unwrap())
+}
+
+fn assert_leftover_leaf_pin(leftover: &Path, leaf: &str, expected: &(u64, u64, Vec<u8>)) {
+    assert_eq!(
+        leftover_leaf_pin(leftover, leaf),
+        *expected,
+        "sibling leftover {}/{} must keep its exact identity",
+        leftover.display(),
+        leaf
+    );
+}
+
+fn pin_tree(root: &Path) -> BTreeMap<Vec<u8>, (u64, u64, Option<Vec<u8>>)> {
+    let mut identities = BTreeMap::new();
+    fn walk(
+        dir: &Path,
+        prefix: &[u8],
+        identities: &mut BTreeMap<Vec<u8>, (u64, u64, Option<Vec<u8>>)>,
+    ) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let mut key = prefix.to_vec();
+            if !key.is_empty() {
+                key.push(b'/');
+            }
+            key.extend(entry.file_name().as_bytes());
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                identities.insert(key.clone(), (metadata.dev(), metadata.ino(), None));
+                walk(&path, &key, identities);
+            } else {
+                identities.insert(
+                    key,
+                    (
+                        metadata.dev(),
+                        metadata.ino(),
+                        Some(fs::read(&path).unwrap()),
+                    ),
+                );
+            }
+        }
+    }
+    walk(root, b"", &mut identities);
+    identities
+}
+
+fn assert_journal_empty_or_absent(namespace: &Path) {
+    if namespace.exists() {
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+    }
+}
+
+fn assert_no_acquire_leftovers(leases: &Path) {
+    for entry in fs::read_dir(leases).unwrap() {
+        let name = entry.unwrap().file_name();
+        assert!(
+            !name.as_bytes().starts_with(b".acquire-"),
+            "acquire leftover remained: {}",
+            name.to_string_lossy()
+        );
+    }
+}
+
+fn spawn_independent_acquire(
+    root: PathBuf,
+    req: LeaseAcquireRequest,
+    barrier: Arc<Barrier>,
+    now: u64,
+) -> thread::JoinHandle<Result<LeaseAcquireResponse, WorkerError>> {
+    thread::spawn(move || {
+        let store = HostStore::open(&root).unwrap();
+        barrier.wait();
+        LeaseService::new(&store).acquire(&req, &healthy(), now)
+    })
+}
+
+fn join_bounded<T: Send + 'static>(handle: thread::JoinHandle<T>) -> T {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(handle.join());
+    });
+    match rx.recv_timeout(CONCURRENCY_TIMEOUT) {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) => panic!("worker thread panicked"),
+        Err(_) => panic!("worker thread exceeded {CONCURRENCY_TIMEOUT:?}"),
+    }
+}
+
 #[test]
 fn after_cleanup_intent_commit_release_leftover_keeps_heavy() {
     let temp = tempdir().unwrap();
@@ -908,6 +1020,220 @@ fn after_cleanup_intent_commit_does_not_break_post_publish_retirement() {
     if namespace.exists() {
         assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
     }
+}
+
+#[test]
+fn two_acquirers_race_one_acquire_leftover_intent() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let req = request(11);
+    let leftover = plant_leases_leftover(
+        &root,
+        &format!(".acquire-{}", req.material().job_id()),
+        "leftover-leaf",
+        b"acquire-leftover",
+    );
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    assert!(
+        LeaseService::new(&faulted)
+            .acquire(&req, &healthy(), 1)
+            .is_err()
+    );
+    assert_eq!(LeaseService::new(&faulted).load().unwrap(), None);
+    assert!(!leftover.exists());
+    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    assert_canonical_tree_delete_journal(&namespace);
+    drop(faulted);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let first = spawn_independent_acquire(root.clone(), req.clone(), Arc::clone(&barrier), 2);
+    let second = spawn_independent_acquire(root.clone(), req.clone(), barrier, 3);
+    let first_outcome = join_bounded(first);
+    let second_outcome = join_bounded(second);
+
+    let observer = HostStore::open(&root).unwrap();
+    let live = LeaseService::new(&observer)
+        .load()
+        .unwrap()
+        .expect("exactly one canonical live lease");
+    assert_eq!(live.job_id(), req.material().job_id());
+    assert!(root.join("leases/heavy/lease.json").is_file());
+    assert!(!leftover.exists());
+    assert_no_acquire_leftovers(root.join("leases").as_path());
+    assert_journal_empty_or_absent(&namespace);
+
+    for (label, outcome) in [("first", first_outcome), ("second", second_outcome)] {
+        match outcome {
+            Ok(LeaseAcquireResponse::Acquired { lease }) => assert_eq!(
+                lease, live,
+                "{label} matching retry must return the one durable live lease"
+            ),
+            other => {
+                panic!("{label} matching retry must be Acquired with the existing lease: {other:?}")
+            }
+        }
+    }
+}
+
+#[test]
+fn two_job_leftovers_sharing_leases_stay_isolated() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    let first = request(21);
+    let second = request(22);
+    let leftover_a = plant_leases_leftover(
+        &root,
+        &format!(".acquire-{}", first.material().job_id()),
+        "leaf-a",
+        b"job-a-leftover-bytes",
+    );
+    let leftover_b = plant_leases_leftover(
+        &root,
+        &format!(".acquire-{}", second.material().job_id()),
+        "leaf-b",
+        b"job-b-leftover-bytes",
+    );
+    let pin_b = leftover_leaf_pin(&leftover_b, "leaf-b");
+    drop(store);
+
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    assert!(
+        LeaseService::new(&faulted)
+            .acquire(&first, &healthy(), 1)
+            .is_err()
+    );
+    assert_eq!(LeaseService::new(&faulted).load().unwrap(), None);
+    assert!(!leftover_a.exists());
+    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    assert_canonical_tree_delete_journal(&namespace);
+    assert_leftover_leaf_pin(&leftover_b, "leaf-b", &pin_b);
+    let journal_pin = pin_tree(&namespace);
+    drop(faulted);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let first_handle =
+        spawn_independent_acquire(root.clone(), first.clone(), Arc::clone(&barrier), 2);
+    let second_handle = spawn_independent_acquire(root.clone(), second.clone(), barrier, 3);
+    let first_outcome = join_bounded(first_handle);
+    let second_outcome = join_bounded(second_handle);
+
+    let observer = HostStore::open(&root).unwrap();
+    let live = LeaseService::new(&observer)
+        .load()
+        .unwrap()
+        .expect("single-live-lease model must keep exactly one heavy authority");
+    let first_acquired = match &first_outcome {
+        Ok(LeaseAcquireResponse::Acquired { lease }) => Some(lease.clone()),
+        Err(WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            ..
+        }) => None,
+        other => panic!("first leftover acquire must stay semantically valid: {other:?}"),
+    };
+    let second_acquired = match &second_outcome {
+        Ok(LeaseAcquireResponse::Acquired { lease }) => Some(lease.clone()),
+        Err(WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            ..
+        }) => None,
+        other => panic!("second leftover acquire must stay semantically valid: {other:?}"),
+    };
+    assert_eq!(
+        first_acquired.is_some() as u8 + second_acquired.is_some() as u8,
+        1,
+        "distinct leftover jobs must not both mint the single heavy lease: {first_outcome:?} {second_outcome:?}"
+    );
+    assert_eq!(live, first_acquired.or(second_acquired).unwrap());
+
+    if live.job_id() == first.material().job_id() {
+        assert_leftover_leaf_pin(&leftover_b, "leaf-b", &pin_b);
+        assert!(!leftover_a.exists());
+        assert_journal_empty_or_absent(&namespace);
+    } else {
+        assert_eq!(live.job_id(), second.material().job_id());
+        assert!(!leftover_b.exists());
+        assert!(!leftover_a.exists());
+        assert_canonical_tree_delete_journal(&namespace);
+        assert_eq!(
+            pin_tree(&namespace),
+            journal_pin,
+            "the losing leftover job must not resume or mutate the sibling leftover journal"
+        );
+    }
+}
+
+#[test]
+fn independent_hoststore_reopen_finishes_release_leftover() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let (lease, receipt) = abandoned_lease_with_receipt(&faulted, 31);
+    let leftover = plant_leases_leftover(
+        &root,
+        &format!(".released-{}", lease.job_id()),
+        "released-leaf",
+        b"released-leftover",
+    );
+    let heavy = root.join("leases/heavy");
+    let error = LeaseService::new(&faulted)
+        .release_after_cleanup(&lease, &receipt)
+        .unwrap_err();
+    assert!(matches!(error, WorkerError::Io(_)), "{error}");
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(heavy.is_dir());
+    assert!(!leftover.exists());
+    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    assert_canonical_tree_delete_journal(&namespace);
+
+    let heavy_meta = fs::symlink_metadata(&heavy).unwrap();
+    let heavy_pin = (heavy_meta.dev(), heavy_meta.ino());
+    let lease_pin = leftover_leaf_pin(&heavy, "lease.json");
+    let journal_pin = pin_tree(&namespace);
+
+    let recovered = HostStore::open(&root).unwrap();
+    let heavy_before = fs::symlink_metadata(&heavy).unwrap();
+    assert_eq!((heavy_before.dev(), heavy_before.ino()), heavy_pin);
+    assert_eq!(leftover_leaf_pin(&heavy, "lease.json"), lease_pin);
+    assert_eq!(pin_tree(&namespace), journal_pin);
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert_eq!(
+        LeaseService::new(&recovered).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(!leftover.exists());
+
+    let finish = {
+        let root = root.clone();
+        let lease = lease.clone();
+        thread::spawn(move || {
+            let recovered = HostStore::open(&root).unwrap();
+            LeaseService::new(&recovered).release_after_cleanup(&lease, &receipt)
+        })
+    };
+    join_bounded(finish).unwrap();
+
+    assert_eq!(LeaseService::new(&faulted).load().unwrap(), None);
+    assert_eq!(LeaseService::new(&recovered).load().unwrap(), None);
+    assert!(!leftover.exists());
+    assert!(!heavy.exists());
+    assert_journal_empty_or_absent(&namespace);
+    let _keep_faulted_alive = faulted;
 }
 
 #[test]
