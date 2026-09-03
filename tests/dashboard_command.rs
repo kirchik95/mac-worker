@@ -199,7 +199,7 @@ impl DashboardLauncher for RecordingLauncher {
                 service: Arc::new(DashboardService::new(source, FixedClock, FixedClock)),
                 log_source: logs,
             });
-            let server = DashboardHttpServer::bind(request.port, state)
+            let server = DashboardHttpServer::bind(Some(0), state)
                 .await
                 .map_err(api_error)?;
             if let Some(sender) = started {
