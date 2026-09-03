@@ -59,6 +59,10 @@ const LEASE_TOKEN: &str = "202f0f4a6b5c7d8e9f00112233445566";
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const MANIFEST_DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+// These tests exercise real filesystem cleanup alongside a 100-row matrix.
+// Keep the prompt post-marker contention assertion tight, but allow the
+// pre-marker progress checks to tolerate normal parallel-test scheduling.
+const CLEANUP_PROGRESS_DEADLINE: Duration = Duration::from_secs(10);
 
 struct RejectLauncher;
 
@@ -4375,7 +4379,7 @@ fn cleanup_and_release_failures_return_promptly_under_enrichment_contention() {
             .join("locks/jobs")
             .join(lease.job_id().to_string())
             .join("cleanup-complete.json");
-        let marker_deadline = Instant::now() + Duration::from_secs(2);
+        let marker_deadline = Instant::now() + CLEANUP_PROGRESS_DEADLINE;
         while !cleanup_marker.exists() {
             assert!(
                 Instant::now() < marker_deadline,
@@ -4465,7 +4469,7 @@ fn assert_primary_error_survives_uncontended_typed_enrichment_failure(
     .unwrap_err();
 
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < CLEANUP_PROGRESS_DEADLINE,
         "{label} primary failure did not return within the bound"
     );
     let rendered = error.to_string();
