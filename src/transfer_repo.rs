@@ -309,6 +309,12 @@ impl TransferRepo {
         worker: &str,
         task_id: TaskId,
     ) -> Result<ImportReceipt, WorkerError> {
+        if repo_id_for(user_common_dir)? != self.repo_id {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "the transfer repository is bound to a different user repository",
+            ));
+        }
         self.verify_alternates()?;
         if !is_safe_worker_ref_component(worker) {
             return Err(task_config("worker name is invalid"));

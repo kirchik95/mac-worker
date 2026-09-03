@@ -392,6 +392,25 @@ fn import_result_writes_exactly_one_remote_tracking_ref() {
 }
 
 #[test]
+fn import_result_rejects_a_user_repository_other_than_its_bound_transfer_repo() {
+    let cache = cache_root();
+    let task = task_id();
+    let (_source, transfer) = repo_and_transfer_with_result(&cache, task);
+    let other = repo_with_commits();
+    let before = RepositoryFingerprint::capture(other.path()).unwrap();
+
+    let error = transfer
+        .import_result(&runner(), &other.common_dir(), "mini-1", task)
+        .expect_err("a transfer repository must be bound to its original user repository");
+
+    assert_eq!(error.public_code(), "BASE_UNAVAILABLE");
+    assert_eq!(
+        RepositoryFingerprint::capture(other.path()).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn import_result_rejects_worker_names_that_cannot_be_a_configured_ref_component() {
     for worker in [
         "mini/other",
