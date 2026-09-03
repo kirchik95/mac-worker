@@ -392,6 +392,28 @@ fn import_result_writes_exactly_one_remote_tracking_ref() {
 }
 
 #[test]
+fn import_result_rejects_worker_names_that_cannot_be_a_configured_ref_component() {
+    for worker in [
+        "mini/other",
+        "mini..other",
+        "mini.",
+        "mini.lock",
+        "m\u{00e9}ni",
+    ] {
+        let cache = cache_root();
+        let (repo, transfer) = repo_and_transfer_with_result(&cache, task_id());
+        let before = RepositoryFingerprint::capture(repo.path()).unwrap();
+
+        let error = transfer
+            .import_result(&runner(), &repo.common_dir(), worker, task_id())
+            .unwrap_err();
+
+        assert_eq!(error.public_code(), "TASK_CONFIG_INVALID", "{worker:?}");
+        assert_eq!(RepositoryFingerprint::capture(repo.path()).unwrap(), before);
+    }
+}
+
+#[test]
 fn base_refs_resolve_in_the_user_repository_not_the_bare_transfer_repository() {
     let repo = repo_with_branch("feature");
     let cache = cache_root();

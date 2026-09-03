@@ -310,7 +310,7 @@ impl TransferRepo {
         task_id: TaskId,
     ) -> Result<ImportReceipt, WorkerError> {
         self.verify_alternates()?;
-        if worker.is_empty() || worker.chars().any(char::is_control) {
+        if !is_safe_worker_ref_component(worker) {
             return Err(task_config("worker name is invalid"));
         }
         let local_ref = format!("refs/remotes/mac-worker/{worker}/task/{task_id}");
@@ -1171,6 +1171,17 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_safe_worker_ref_component(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && !value.ends_with(".lock")
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'))
 }
 
 fn git_error(code: &'static str, message: &str) -> WorkerError {
