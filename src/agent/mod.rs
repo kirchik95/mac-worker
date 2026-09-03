@@ -74,6 +74,9 @@ impl TurnLimits {
         if self.timeout_millis > Self::MAX_TIMEOUT_MILLIS {
             return Err(AdapterError::new("timeout must not exceed 24 hours"));
         }
+        if self.max_turns == Some(0) {
+            return Err(AdapterError::new("max turns must be greater than zero"));
+        }
         if self
             .max_budget_usd_cents
             .is_some_and(|budget| budget > Self::MAX_BUDGET_USD_CENTS)

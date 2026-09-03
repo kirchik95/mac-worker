@@ -458,7 +458,9 @@ fn tool_and_command_summaries_are_bounded_and_escape_controls() {
 fn turn_limits_reject_zero_timeout_over_day_and_huge_budget() {
     assert!(TurnLimits::new(0, None, None).is_err());
     assert!(TurnLimits::new(DAY_MILLIS + 1, None, None).is_err());
+    assert!(TurnLimits::new(DEFAULT_TIMEOUT_MILLIS, Some(0), None).is_err());
     assert!(TurnLimits::new(DEFAULT_TIMEOUT_MILLIS, None, Some(100_001)).is_err());
+    assert!(TurnLimits::new(DEFAULT_TIMEOUT_MILLIS, Some(1), None).is_ok());
     assert!(TurnLimits::new(1, None, Some(100_000)).is_ok());
     assert!(TurnLimits::new(DAY_MILLIS, None, None).is_ok());
 }
