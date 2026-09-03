@@ -423,6 +423,7 @@ pub struct TaskMetaInput {
     pub close_policy: ClosePolicy,
     pub env_profile: Option<String>,
     pub git_identity: GitIdentity,
+    pub title: Option<String>,
     pub prompt: String,
     pub created_at_millis: u64,
 }
@@ -451,7 +452,10 @@ pub struct TaskMeta {
 impl TaskMeta {
     pub fn new(input: TaskMetaInput) -> Result<Self, WorkerError> {
         validate_prompt(&input.prompt)?;
-        let title = title_from_prompt(&input.prompt);
+        let title = match input.title {
+            Some(title) if !title.trim().is_empty() => redact_title(&title),
+            _ => title_from_prompt(&input.prompt),
+        };
         let meta = Self {
             task_id: input.task_id,
             run_id: input.run_id,
@@ -1323,7 +1327,11 @@ fn title_from_prompt(prompt: &str) -> TaskTitle {
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("");
-    TaskTitle(truncate_bytes(&escape_controls(line), MAX_TITLE_BYTES))
+    redact_title(line)
+}
+
+fn redact_title(title: &str) -> TaskTitle {
+    TaskTitle(RedactionBoundary::from_env().title(title))
 }
 
 fn validate_prompt(prompt: &str) -> Result<(), WorkerError> {
@@ -1333,33 +1341,6 @@ fn validate_prompt(prompt: &str) -> Result<(), WorkerError> {
         )));
     }
     Ok(())
-}
-
-fn escape_controls(input: &str) -> String {
-    let mut escaped = String::with_capacity(input.len());
-    for character in input.chars() {
-        match character {
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            other if other.is_control() => {
-                escaped.push_str(&format!("\\u{{{:04x}}}", u32::from(other)));
-            }
-            other => escaped.push(other),
-        }
-    }
-    escaped
-}
-
-fn truncate_bytes(input: &str, max_bytes: usize) -> String {
-    if input.len() <= max_bytes {
-        return input.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !input.is_char_boundary(end) {
-        end -= 1;
-    }
-    input[..end].to_string()
 }
 
 fn is_valid_branch_name(value: &str) -> bool {

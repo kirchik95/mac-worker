@@ -60,6 +60,7 @@ fn fields_with_prompt(prompt: String) -> TaskMetaInput {
         close_policy: ClosePolicy::Done,
         env_profile: None,
         git_identity: git_identity(),
+        title: None,
         prompt,
         created_at_millis: 1_700_000_000_000,
     }
@@ -361,10 +362,27 @@ fn titles_use_the_first_non_empty_prompt_line() {
     .unwrap();
     assert_eq!(meta.title().as_str(), "Fix the tab\\tlogin spec");
 
-    let long = format!("{}\ntrailer", "y".repeat(200));
+    let long = format!("{}\ntrailer", "safe title word ".repeat(20));
     let meta = TaskMeta::new(fields_with_prompt(long)).unwrap();
     assert_eq!(meta.title().as_str().len(), 120);
-    assert!(meta.title().as_str().chars().all(|ch| ch == 'y'));
+    assert!(meta.title().as_str().starts_with("safe title word"));
+}
+
+#[test]
+fn explicit_title_wins_and_derived_titles_are_redacted() {
+    let mut fields = fields_with_prompt("sk-abcdefghijklmnopqrstuvwxyz012345\nDetails".into());
+    fields.title = Some("Ship the billing client".into());
+    let meta = TaskMeta::new(fields).unwrap();
+    assert_eq!(meta.title().as_str(), "Ship the billing client");
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/alice".into());
+    let meta = TaskMeta::new(fields_with_prompt(format!(
+        "read {home}/.ssh/id_ed25519 and Bearer leaked-title-token\nbody"
+    )))
+    .unwrap();
+    assert!(!meta.title().as_str().contains(&home));
+    assert!(!meta.title().as_str().contains("leaked-title-token"));
+    assert!(meta.title().as_str().contains("[path]") || meta.title().as_str().contains("[token]"));
 }
 
 #[test]
