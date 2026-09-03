@@ -12,6 +12,8 @@ pub const DASHBOARD_API_VERSION: u32 = 1;
 pub const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 pub const MAX_PROJECT_LABEL_CHARS: usize = 96;
 
+const MAX_ERROR_CODE_BYTES: usize = 128;
+const FALLBACK_ERROR_CODE: &str = "DASHBOARD_ERROR";
 const INVALID_DASHBOARD_API_VERSION_MESSAGE: &str = "dashboard snapshot API version must be 1";
 const INVALID_CPU_BUSY_PERCENT_MESSAGE: &str =
     "dashboard CPU busy percent must be finite and between 0 and 100";
@@ -250,7 +252,7 @@ pub struct DashboardError {
 impl DashboardError {
     pub fn new(code: impl Into<String>, message: impl AsRef<str>) -> Self {
         Self {
-            code: code.into(),
+            code: sanitize_error_code(&code.into()),
             message: sanitize_bounded(message.as_ref(), MAX_ERROR_MESSAGE_CHARS),
         }
     }
@@ -357,7 +359,7 @@ pub struct ApiError {
 impl ApiError {
     pub fn new(code: impl Into<String>, message: impl AsRef<str>) -> Self {
         Self {
-            code: code.into(),
+            code: sanitize_error_code(&code.into()),
             message: sanitize_bounded(message.as_ref(), MAX_ERROR_MESSAGE_CHARS),
         }
     }
@@ -434,4 +436,17 @@ pub fn sanitize_bounded(value: &str, limit: usize) -> String {
         tokens.push("…".to_owned());
     }
     tokens.concat()
+}
+
+fn sanitize_error_code(code: &str) -> String {
+    if code.len() <= MAX_ERROR_CODE_BYTES
+        && code.starts_with(|character: char| character.is_ascii_uppercase())
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        code.to_owned()
+    } else {
+        FALLBACK_ERROR_CODE.to_owned()
+    }
 }

@@ -256,6 +256,27 @@ fn api_error_uses_the_global_error_envelope() {
 }
 
 #[test]
+fn public_dashboard_error_codes_are_stable_and_bounded() {
+    for invalid in [
+        "",
+        "lower_case",
+        "DASHBOARD ERROR",
+        "A\nB",
+        &"A".repeat(129),
+    ] {
+        let dashboard = DashboardError::new(invalid, "safe message");
+        let api = ApiError::new(invalid, "safe message");
+
+        assert_eq!(dashboard.code, "DASHBOARD_ERROR", "{invalid:?}");
+        assert_eq!(
+            serde_json::to_value(api).unwrap()["error"]["code"],
+            "DASHBOARD_ERROR",
+            "{invalid:?}"
+        );
+    }
+}
+
+#[test]
 fn system_summary_serializes_none_and_finite_cpu_percentages_without_changing_shape() {
     for (cpu_busy_percent, expected) in [
         (None, serde_json::Value::Null),
