@@ -7,7 +7,7 @@ use crate::{
     client_state::ClientStateStore,
     config::{Config, WorkerEntry},
     dashboard::{
-        cache::Observation,
+        cache::{CpuCounters, Observation},
         model::{
             ApiError, DashboardCommandMode, DashboardCommandSummary, DashboardError, DashboardJob,
             DashboardJobState, DashboardLogChunk, DashboardMemoryPressure, DashboardSlotState,
@@ -23,7 +23,10 @@ use crate::{
     job::{JobId, JobState, JobStatus, LocalJobRecord, LogChunk, LogStream, StatusResponse},
     lease::SlotState,
     process::{ProcessRunner, SystemProcessRunner},
-    protocol::{HealthStatus, MemoryPressure, WorkerHealth as ProbeWorkerHealth, WorkersReport},
+    protocol::{
+        CpuCounters as ProbeCpuCounters, HealthStatus, MemoryPressure,
+        WorkerHealth as ProbeWorkerHealth, WorkersReport,
+    },
     transfer::RemoteJobClient,
     transport::{SshTransport, WorkersService},
 };
@@ -376,8 +379,17 @@ pub fn project_worker(
             error: None,
         },
         observed_at_millis,
-        cpu_counters: None,
+        cpu_counters: probe.cpu_counters.clone().and_then(cache_counters),
     })
+}
+
+pub fn cache_counters(counters: ProbeCpuCounters) -> Option<CpuCounters> {
+    let total_ticks = counters
+        .user_ticks
+        .checked_add(counters.system_ticks)?
+        .checked_add(counters.idle_ticks)?
+        .checked_add(counters.nice_ticks)?;
+    CpuCounters::new(total_ticks, counters.idle_ticks).ok()
 }
 
 pub fn project_job(record: &LocalJobRecord, status: Option<&JobStatus>) -> DashboardJob {
