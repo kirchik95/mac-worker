@@ -1105,6 +1105,8 @@ impl RunProgress {
 enum AgentKindWire {
     Codex,
     Claude,
+    Cursor,
+    Opencode,
 }
 
 impl From<AgentKind> for AgentKindWire {
@@ -1112,6 +1114,8 @@ impl From<AgentKind> for AgentKindWire {
         match kind {
             AgentKind::Codex => Self::Codex,
             AgentKind::Claude => Self::Claude,
+            AgentKind::Cursor => Self::Cursor,
+            AgentKind::Opencode => Self::Opencode,
         }
     }
 }
@@ -1121,6 +1125,8 @@ impl From<AgentKindWire> for AgentKind {
         match kind {
             AgentKindWire::Codex => Self::Codex,
             AgentKindWire::Claude => Self::Claude,
+            AgentKindWire::Cursor => Self::Cursor,
+            AgentKindWire::Opencode => Self::Opencode,
         }
     }
 }

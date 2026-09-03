@@ -1,8 +1,9 @@
 use std::fs;
 
 use mac_worker::agent::{
-    AgentEvent, AgentKind, AgentOutcome, PermissionPolicy, PromptDelivery, RESULT_SCHEMA_JSON,
-    ResultStatus, TurnLaunch, TurnLimits, TurnParams, adapter_for, render_shell,
+    AgentEvent, AgentKind, AgentOutcome, PROMPT_POINTER, PermissionPolicy, PromptDelivery,
+    RESULT_SCHEMA_JSON, ResultStatus, TurnLaunch, TurnLimits, TurnParams, adapter_for,
+    render_shell,
 };
 use uuid::Uuid;
 
@@ -506,4 +507,431 @@ fn render_shell_rejects_an_argument_containing_nul() {
     );
     let error = render_shell(&launch).expect_err("NUL must be rejected");
     assert!(error.to_string().to_ascii_lowercase().contains("nul"));
+}
+
+const CURSOR_SESSION: &str = "00000000-0000-4000-8000-0000000000c1";
+const OPENCODE_SESSION: &str = "ses_PLACEHOLDER";
+
+fn cursor_params(policy: PermissionPolicy) -> TurnParams {
+    let mut params = params(policy);
+    params.kind = AgentKind::Cursor;
+    params
+}
+
+fn opencode_params(policy: PermissionPolicy) -> TurnParams {
+    let mut params = params(policy);
+    params.kind = AgentKind::Opencode;
+    params
+}
+
+#[test]
+fn cursor_first_turn_uses_argv_pointer_trust_and_force() {
+    let params = cursor_params(PermissionPolicy::Unattended);
+    let launch = adapter_for(AgentKind::Cursor).first_turn(&params).unwrap();
+    assert_eq!(launch.program(), "cursor-agent");
+    assert!(launch.args().starts_with(&["-p".into()]));
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "stream-json")
+    );
+    assert!(launch.args().contains(&"--trust".into()));
+    assert!(launch.args().contains(&"--force".into()));
+    assert!(
+        launch
+            .args()
+            .iter()
+            .all(|argument| argument != "--workspace" && argument != "--yolo")
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--resume" && w[1] == params.session_seed.to_string())
+    );
+    assert_eq!(
+        launch.args().last().map(String::as_str),
+        Some(PROMPT_POINTER)
+    );
+    assert_eq!(launch.prompt_delivery(), PromptDelivery::ArgvPointer);
+    assert_eq!(launch.env_names(), &["CURSOR_API_KEY"]);
+    assert!(!launch.permission_fallback());
+    assert!(
+        !launch
+            .args()
+            .iter()
+            .any(|argument| argument.contains("Reply"))
+    );
+}
+
+#[test]
+fn cursor_workspace_policy_falls_back_to_unattended() {
+    let launch = adapter_for(AgentKind::Cursor)
+        .first_turn(&cursor_params(PermissionPolicy::Workspace))
+        .unwrap();
+    assert!(launch.permission_fallback());
+    assert!(launch.args().contains(&"--force".into()));
+}
+
+#[test]
+fn cursor_resume_uses_bound_chat_id_and_never_workspace_path() {
+    let launch = adapter_for(AgentKind::Cursor)
+        .resume_turn(&cursor_params(PermissionPolicy::Unattended), CURSOR_SESSION)
+        .unwrap();
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--resume" && w[1] == CURSOR_SESSION)
+    );
+    assert!(launch.args().contains(&"--trust".into()));
+    assert!(launch.args().contains(&"--force".into()));
+    assert!(
+        launch
+            .args()
+            .iter()
+            .all(|argument| argument != "--workspace" && argument != "--continue")
+    );
+    assert_eq!(
+        launch.args().last().map(String::as_str),
+        Some(PROMPT_POINTER)
+    );
+    assert_eq!(launch.prompt_delivery(), PromptDelivery::ArgvPointer);
+}
+
+#[test]
+fn cursor_prebind_session_is_create_chat() {
+    assert_eq!(
+        adapter_for(AgentKind::Cursor).prebind_session(),
+        Some(vec!["cursor-agent".into(), "create-chat".into()])
+    );
+    assert_eq!(adapter_for(AgentKind::Codex).prebind_session(), None);
+    assert_eq!(adapter_for(AgentKind::Claude).prebind_session(), None);
+    assert_eq!(adapter_for(AgentKind::Opencode).prebind_session(), None);
+}
+
+#[test]
+fn opencode_first_turn_uses_argv_pointer_and_auto() {
+    let launch = adapter_for(AgentKind::Opencode)
+        .first_turn(&opencode_params(PermissionPolicy::Unattended))
+        .unwrap();
+    assert_eq!(launch.program(), "opencode");
+    assert!(
+        launch
+            .args()
+            .starts_with(&["run".into(), "--format".into(), "json".into()])
+    );
+    assert!(launch.args().contains(&"--auto".into()));
+    assert!(launch.args().iter().all(|argument| argument != "--dir"
+        && argument != "--continue"
+        && argument != "--session"));
+    assert_eq!(
+        launch.args().last().map(String::as_str),
+        Some(PROMPT_POINTER)
+    );
+    assert_eq!(launch.prompt_delivery(), PromptDelivery::ArgvPointer);
+    assert!(launch.env_names().is_empty());
+    assert!(!launch.permission_fallback());
+}
+
+#[test]
+fn opencode_workspace_policy_falls_back_to_unattended() {
+    let launch = adapter_for(AgentKind::Opencode)
+        .first_turn(&opencode_params(PermissionPolicy::Workspace))
+        .unwrap();
+    assert!(launch.permission_fallback());
+    assert!(launch.args().contains(&"--auto".into()));
+}
+
+#[test]
+fn opencode_resume_uses_session_and_keeps_auto() {
+    let launch = adapter_for(AgentKind::Opencode)
+        .resume_turn(
+            &opencode_params(PermissionPolicy::Unattended),
+            OPENCODE_SESSION,
+        )
+        .unwrap();
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--session" && w[1] == OPENCODE_SESSION)
+    );
+    assert!(launch.args().contains(&"--auto".into()));
+    assert!(
+        launch
+            .args()
+            .iter()
+            .all(|argument| argument != "--dir" && argument != "--continue")
+    );
+    assert_eq!(
+        launch.args().last().map(String::as_str),
+        Some(PROMPT_POINTER)
+    );
+}
+
+#[test]
+fn model_is_passed_through_for_cursor_and_opencode() {
+    let mut params = cursor_params(PermissionPolicy::Unattended);
+    params.model = Some("gpt-test".into());
+    let launch = adapter_for(AgentKind::Cursor).first_turn(&params).unwrap();
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--model" && w[1] == "gpt-test")
+    );
+
+    let resume = adapter_for(AgentKind::Cursor)
+        .resume_turn(&params, CURSOR_SESSION)
+        .unwrap();
+    assert!(
+        resume
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--model" && w[1] == "gpt-test")
+    );
+
+    params = opencode_params(PermissionPolicy::Unattended);
+    params.model = Some("opencode/mimo-v2.5-free".into());
+    let launch = adapter_for(AgentKind::Opencode)
+        .first_turn(&params)
+        .unwrap();
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--model" && w[1] == "opencode/mimo-v2.5-free")
+    );
+    let resume = adapter_for(AgentKind::Opencode)
+        .resume_turn(&params, OPENCODE_SESSION)
+        .unwrap();
+    assert!(
+        resume
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--model" && w[1] == "opencode/mimo-v2.5-free")
+    );
+    assert!(
+        resume
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--session" && w[1] == OPENCODE_SESSION)
+    );
+}
+
+#[test]
+fn cursor_and_opencode_resume_without_a_session_reference_is_unbound() {
+    for kind in [AgentKind::Cursor, AgentKind::Opencode] {
+        let error = adapter_for(kind)
+            .resume_turn(&params(PermissionPolicy::Unattended), "")
+            .expect_err("an empty session reference must not launch");
+        assert!(error.to_string().to_ascii_lowercase().contains("session"));
+    }
+}
+
+#[test]
+fn cursor_stream_yields_session_ref_and_normalized_events() {
+    let adapter = adapter_for(AgentKind::Cursor);
+    let events: Vec<AgentEvent> = fixture_lines("cursor-success.jsonl")
+        .filter_map(|line| adapter.parse_event(&line))
+        .collect();
+    assert_eq!(
+        adapter.session_ref(&events).as_deref(),
+        Some(CURSOR_SESSION)
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCall { name, .. } if name == "read"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::FileChange { paths } if paths == &["src/agent/cursor.rs"]
+    )));
+    assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
+}
+
+#[test]
+fn opencode_stream_yields_session_ref_and_normalized_events() {
+    let adapter = adapter_for(AgentKind::Opencode);
+    let events: Vec<AgentEvent> = fixture_lines("opencode-success.jsonl")
+        .filter_map(|line| adapter.parse_event(&line))
+        .collect();
+    assert_eq!(
+        adapter.session_ref(&events).as_deref(),
+        Some(OPENCODE_SESSION)
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Command {
+            exit_code: Some(0),
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::FileChange { paths } if paths == &["src/agent/opencode.rs"]
+    )));
+    assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
+}
+
+#[test]
+fn trailer_result_is_extracted_or_unknown_never_an_error() {
+    let cursor = adapter_for(AgentKind::Cursor);
+    assert_eq!(
+        cursor
+            .extract_result(&fixture("cursor-success.jsonl"), None)
+            .unwrap()
+            .status(),
+        ResultStatus::Done
+    );
+    assert_eq!(
+        cursor
+            .extract_result(&fixture("cursor-malformed.jsonl"), None)
+            .unwrap()
+            .status(),
+        ResultStatus::Unknown
+    );
+
+    let opencode = adapter_for(AgentKind::Opencode);
+    assert_eq!(
+        opencode
+            .extract_result(&fixture("opencode-success.jsonl"), None)
+            .unwrap()
+            .status(),
+        ResultStatus::Done
+    );
+    assert_eq!(
+        opencode
+            .extract_result(&fixture("opencode-malformed.jsonl"), None)
+            .unwrap()
+            .status(),
+        ResultStatus::Unknown
+    );
+}
+
+#[test]
+fn trailer_results_cover_needs_input_and_blocked() {
+    let cursor = adapter_for(AgentKind::Cursor);
+    let needs_input = cursor
+        .extract_result(&fixture("cursor-needs-input.jsonl"), None)
+        .unwrap();
+    assert_eq!(needs_input.status(), ResultStatus::NeedsInput);
+    assert_eq!(needs_input.questions(), &["Which crate should be renamed?"]);
+    assert_eq!(
+        cursor
+            .extract_result(&fixture("cursor-blocked.jsonl"), None)
+            .unwrap()
+            .status(),
+        ResultStatus::Blocked
+    );
+
+    let opencode = adapter_for(AgentKind::Opencode);
+    let needs_input = opencode
+        .extract_result(&fixture("opencode-needs-input.jsonl"), None)
+        .unwrap();
+    assert_eq!(needs_input.status(), ResultStatus::NeedsInput);
+    assert_eq!(needs_input.questions(), &["Which crate should be renamed?"]);
+    assert_eq!(
+        opencode
+            .extract_result(&fixture("opencode-blocked.jsonl"), None)
+            .unwrap()
+            .status(),
+        ResultStatus::Blocked
+    );
+}
+
+#[test]
+fn trailer_extract_prefers_the_last_message_file() {
+    let adapter = adapter_for(AgentKind::Cursor);
+    let result = adapter
+        .extract_result(
+            &fixture("cursor-success.jsonl"),
+            Some("```mac-worker-result\n{\"status\":\"needs_input\",\"summary\":\"from file\",\"questions\":[\"q\"],\"files_changed\":[]}\n```"),
+        )
+        .unwrap();
+    assert_eq!(result.status(), ResultStatus::NeedsInput);
+    assert_eq!(result.summary(), "from file");
+    assert_eq!(result.questions(), &["q"]);
+}
+
+#[test]
+fn cursor_and_opencode_truncated_final_line_is_ignored() {
+    let cursor = adapter_for(AgentKind::Cursor);
+    let events: Vec<AgentEvent> = fixture_lines("cursor-truncated.jsonl")
+        .filter_map(|line| cursor.parse_event(&line))
+        .collect();
+    assert_eq!(cursor.session_ref(&events).as_deref(), Some(CURSOR_SESSION));
+    assert!(
+        cursor
+            .parse_event(r#"{"type":"result","subtype":"success","result":"ok","session_id""#)
+            .is_none()
+    );
+    assert!(!matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
+
+    let opencode = adapter_for(AgentKind::Opencode);
+    let events: Vec<AgentEvent> = fixture_lines("opencode-truncated.jsonl")
+        .filter_map(|line| opencode.parse_event(&line))
+        .collect();
+    assert_eq!(
+        opencode.session_ref(&events).as_deref(),
+        Some(OPENCODE_SESSION)
+    );
+    assert!(!matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
+}
+
+#[test]
+fn cursor_and_opencode_classify_like_codex() {
+    for kind in [AgentKind::Cursor, AgentKind::Opencode] {
+        let adapter = adapter_for(kind);
+        assert_eq!(
+            adapter.classify(Some(0), ResultStatus::Done),
+            AgentOutcome::Done
+        );
+        assert_eq!(
+            adapter.classify(Some(0), ResultStatus::NeedsInput),
+            AgentOutcome::NeedsInput
+        );
+        assert_eq!(
+            adapter.classify(Some(1), ResultStatus::Done),
+            AgentOutcome::Failed { exit_code: 1 }
+        );
+        assert_eq!(
+            adapter.classify(None, ResultStatus::Done),
+            AgentOutcome::Signalled
+        );
+        assert_eq!(
+            adapter.classify(Some(0), ResultStatus::Blocked),
+            AgentOutcome::Blocked
+        );
+        assert_eq!(
+            adapter.classify(Some(0), ResultStatus::Unknown),
+            AgentOutcome::Unknown
+        );
+    }
+}
+
+#[test]
+fn render_shell_double_quotes_the_argv_pointer_and_single_quotes_the_rest() {
+    let launch = adapter_for(AgentKind::Cursor)
+        .first_turn(&cursor_params(PermissionPolicy::Unattended))
+        .unwrap();
+    let shell = render_shell(&launch).unwrap();
+    assert!(shell.starts_with("exec 'cursor-agent' '-p' '--output-format' 'stream-json'"));
+    assert!(shell.contains("'--trust' '--force'"));
+    assert!(shell.ends_with(&format!("\"{PROMPT_POINTER}\"")));
+    assert!(
+        shell.contains("\"$MAC_WORKER_TURN_DIR/prompt.md\"")
+            || shell.contains("$MAC_WORKER_TURN_DIR/prompt.md")
+    );
+    assert!(!shell.contains(&format!("'{PROMPT_POINTER}'")));
+    assert!(!PROMPT_POINTER.contains("Reply"));
+
+    let launch = adapter_for(AgentKind::Opencode)
+        .first_turn(&opencode_params(PermissionPolicy::Unattended))
+        .unwrap();
+    let shell = render_shell(&launch).unwrap();
+    assert!(shell.starts_with("exec 'opencode' 'run' '--format' 'json' '--auto'"));
+    assert!(shell.ends_with(&format!("\"{PROMPT_POINTER}\"")));
 }

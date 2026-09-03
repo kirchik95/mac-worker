@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","apiKeySource":"env","cwd":"/workspace","session_id":"00000000-0000-4000-8000-0000000000c1","model":"cursor-placeholder","permissionMode":"default"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]},"session_id":"00000000-0000-4000-8000-0000000000c1"}
+{"type":"tool_call","subtype":"started","call_id":"call_0","tool_call":{"readToolCall":{"args":{"path":"src/agent/mod.rs"}}},"session_id":"00000000-0000-4000-8000-0000000000c1"}
+{"type":"tool_call","subtype":"started","call_id":"call_1","tool_call":{"writeToolCall":{"args":{"path":"src/agent/cursor.rs","fileText":"ok"}}},"session_id":"00000000-0000-4000-8000-0000000000c1"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok\n\n```mac-worker-result\n{\"status\":\"done\",\"summary\":\"ok\",\"questions\":[],\"files_changed\":[\"src/agent/cursor.rs\"]}\n```"}]},"session_id":"00000000-0000-4000-8000-0000000000c1"}
+{"type":"result","subtype":"success","duration_ms":1000,"duration_api_ms":1000,"is_error":false,"result":"ok\n\n```mac-worker-result\n{\"status\":\"done\",\"summary\":\"ok\",\"questions\":[],\"files_changed\":[\"src/agent/cursor.rs\"]}\n```","session_id":"00000000-0000-4000-8000-0000000000c1","usage":{"inputTokens":10,"outputTokens":8,"cacheReadTokens":0,"cacheWriteTokens":0}}

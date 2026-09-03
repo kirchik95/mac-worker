@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","apiKeySource":"env","cwd":"/workspace","session_id":"00000000-0000-4000-8000-0000000000c4","model":"cursor-placeholder","permissionMode":"default"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I finished, but this is not structured JSON.\n\n```mac-worker-result\n{status:done}\n```"}]},"session_id":"00000000-0000-4000-8000-0000000000c4"}
+{"type":"result","subtype":"success","duration_ms":1000,"duration_api_ms":1000,"is_error":false,"result":"I finished, but this is not structured JSON.\n\n```mac-worker-result\n{status:done}\n```","session_id":"00000000-0000-4000-8000-0000000000c4"}

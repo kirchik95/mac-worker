@@ -1,8 +1,12 @@
 mod claude;
 mod codex;
+mod cursor;
+mod opencode;
 
 use claude::ClaudeAdapter;
 use codex::CodexAdapter;
+use cursor::CursorAdapter;
+use opencode::OpencodeAdapter;
 use serde_json::Value;
 
 pub const MAX_SUMMARY_BYTES: usize = 512;
@@ -10,14 +14,19 @@ pub const RESULT_SCHEMA_JSON: &str = r#"{"type":"object","properties":{"status":
 pub const TURN_DIR_ENV: &str = "MAC_WORKER_TURN_DIR";
 pub const SCHEMA_FILE_NAME: &str = "result.schema.json";
 pub const LAST_MESSAGE_FILE_NAME: &str = "last.md";
+pub const PROMPT_FILE_NAME: &str = "prompt.md";
+pub const PROMPT_POINTER: &str = "Read the task from $MAC_WORKER_TURN_DIR/prompt.md and follow it.";
 
 const SCHEMA_PLACEHOLDER: &str = "{schema}";
 const LAST_MESSAGE_PLACEHOLDER: &str = "{last_message}";
+const RESULT_TRAILER_TAG: &str = "mac-worker-result";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     Codex,
     Claude,
+    Cursor,
+    Opencode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +38,7 @@ pub enum PermissionPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptDelivery {
     Stdin,
+    ArgvPointer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +240,9 @@ pub trait AgentAdapter: Send + Sync {
         params: &TurnParams,
         session_ref: &str,
     ) -> Result<TurnLaunch, AdapterError>;
+    fn prebind_session(&self) -> Option<Vec<String>> {
+        None
+    }
     fn parse_event(&self, line: &str) -> Option<AgentEvent>;
     fn session_ref(&self, events: &[AgentEvent]) -> Option<String> {
         events.iter().find_map(|event| match event {
@@ -262,14 +275,24 @@ pub fn adapter_for(kind: AgentKind) -> &'static dyn AgentAdapter {
     match kind {
         AgentKind::Codex => &CodexAdapter,
         AgentKind::Claude => &ClaudeAdapter,
+        AgentKind::Cursor => &CursorAdapter,
+        AgentKind::Opencode => &OpencodeAdapter,
     }
 }
 
 pub fn render_shell(launch: &TurnLaunch) -> Result<String, AdapterError> {
     let mut parts = Vec::with_capacity(1 + launch.args.len());
     parts.push(single_quote(launch.program())?);
-    for argument in launch.args() {
-        parts.push(render_argument(argument)?);
+    let pointer_index = match launch.prompt_delivery() {
+        PromptDelivery::ArgvPointer => launch.args().len().checked_sub(1),
+        PromptDelivery::Stdin => None,
+    };
+    for (index, argument) in launch.args().iter().enumerate() {
+        if pointer_index == Some(index) {
+            parts.push(double_quote(argument)?);
+        } else {
+            parts.push(render_argument(argument)?);
+        }
     }
     Ok(format!("exec {}", parts.join(" ")))
 }
@@ -297,6 +320,69 @@ fn single_quote(argument: &str) -> Result<String, AdapterError> {
     }
     quoted.push('\'');
     Ok(quoted)
+}
+
+fn double_quote(argument: &str) -> Result<String, AdapterError> {
+    if argument.contains('\0') {
+        return Err(AdapterError::new("argument contains a NUL byte"));
+    }
+    let mut quoted = String::with_capacity(argument.len() + 2);
+    quoted.push('"');
+    for character in argument.chars() {
+        if character == '"' || character == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    Ok(quoted)
+}
+
+fn argv_pointer_launch(
+    program: impl Into<String>,
+    mut args: Vec<String>,
+    env_names: Vec<&'static str>,
+    policy: PermissionPolicy,
+) -> TurnLaunch {
+    args.push(PROMPT_POINTER.to_string());
+    TurnLaunch::new(
+        program,
+        args,
+        PromptDelivery::ArgvPointer,
+        env_names,
+        policy == PermissionPolicy::Workspace,
+    )
+}
+
+fn resolve_trailer_result(
+    last_message_file: Option<&str>,
+    stream_candidates: &[String],
+) -> StructuredResult {
+    for text in last_message_file
+        .into_iter()
+        .chain(stream_candidates.iter().map(String::as_str))
+    {
+        if let Some(result) = parse_trailer_result(text) {
+            return result;
+        }
+    }
+    StructuredResult::unknown()
+}
+
+fn parse_trailer_result(text: &str) -> Option<StructuredResult> {
+    parse_structured_result(last_trailer_block(text)?)
+}
+
+fn last_trailer_block(text: &str) -> Option<&str> {
+    let open = format!("```{RESULT_TRAILER_TAG}");
+    let start = text.rfind(&open)?;
+    let after_tag = &text[start + open.len()..];
+    let after_tag = after_tag.trim_start_matches([' ', '\t']);
+    let body = after_tag
+        .strip_prefix("\r\n")
+        .or_else(|| after_tag.strip_prefix('\n'))?;
+    let end = body.find("```")?;
+    Some(body[..end].trim())
 }
 
 fn require_session_ref(session_ref: &str) -> Result<&str, AdapterError> {
