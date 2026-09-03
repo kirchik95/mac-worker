@@ -71,6 +71,7 @@ pub mod snapshot;
 pub mod supervisor;
 pub mod task;
 pub mod transfer;
+pub mod transfer_repo;
 pub mod transport;
 
 #[doc(hidden)]
