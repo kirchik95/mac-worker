@@ -165,6 +165,16 @@ fn local_record(
     worker: &str,
     status: Option<JobStatus>,
 ) -> LocalJobRecord {
+    local_record_with_uncertainty(store, job_id, worker, status, RemoteUncertainty::None)
+}
+
+fn local_record_with_uncertainty(
+    store: &ClientStateStore,
+    job_id: JobId,
+    worker: &str,
+    status: Option<JobStatus>,
+    uncertainty: RemoteUncertainty,
+) -> LocalJobRecord {
     let material = RequestFingerprintMaterial::new(
         job_id,
         store.client_id(),
@@ -184,9 +194,36 @@ fn local_record(
         JobMeta::new(&material, material.fingerprint()).unwrap(),
         material.lease_token(),
         status,
-        RemoteUncertainty::None,
+        uncertainty,
     )
     .unwrap()
+}
+
+fn dispatching_batch(
+    store: &ClientStateStore,
+    job_id: &str,
+    dispatcher: ProcessIdentity,
+    enqueued_at_millis: u64,
+) -> QueueEntry {
+    let entry = store
+        .enqueue(queued(store, job_id, enqueued_at_millis, dispatcher))
+        .unwrap();
+    let claimed = store
+        .claim_next(dispatcher, &["mini-1".into()], enqueued_at_millis + 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.entry().job_id(), entry.job_id());
+    entry
+}
+
+fn assert_terminal_unproven(error: WorkerError) {
+    assert!(matches!(
+        error,
+        WorkerError::Queue {
+            code: "QUEUE_TERMINAL_UNPROVEN",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -1076,9 +1113,9 @@ fn cancel_racing_claim_is_removed_waiting_or_durably_requested_dispatch() {
 }
 
 #[test]
-fn waiting_remove_and_terminal_remove_are_state_and_owner_scoped() {
-    // Break caught: cleanup deletes an in-flight row or a stale process removes
-    // a claim owned by another dispatcher.
+fn waiting_remove_and_dispatch_removal_are_state_and_owner_scoped() {
+    // Break caught: waiting cleanup deletes an in-flight row or a stale process
+    // removes a claim owned by another dispatcher.
     let fixture = open_queue();
     let dispatcher = owner(560);
     let waiting = fixture
@@ -1095,20 +1132,12 @@ fn waiting_remove_and_terminal_remove_are_state_and_owner_scoped() {
         Some(waiting)
     );
 
-    let dispatching = fixture
-        .store
-        .enqueue(queued(
-            &fixture.store,
-            "00000000000000000000000000000087",
-            561,
-            dispatcher,
-        ))
-        .unwrap();
-    fixture
-        .store
-        .claim_next(dispatcher, &["mini-1".into()], 562)
-        .unwrap()
-        .unwrap();
+    let dispatching = dispatching_batch(
+        &fixture.store,
+        "00000000000000000000000000000087",
+        dispatcher,
+        561,
+    );
     assert!(fixture.store.remove_queued(dispatching.job_id()).is_err());
     assert!(
         fixture
@@ -1116,6 +1145,201 @@ fn waiting_remove_and_terminal_remove_are_state_and_owner_scoped() {
             .remove_after_terminal(dispatching.job_id(), owner(999))
             .is_err()
     );
+    let snapshot = fixture.store.queue_snapshot().unwrap();
+    assert_eq!(snapshot.entries().len(), 1);
+    assert_eq!(snapshot.entries()[0].job_id(), dispatching.job_id());
+    assert!(matches!(
+        snapshot.entries()[0].state(),
+        QueueState::Dispatching { dispatch_owner, .. } if *dispatch_owner == dispatcher
+    ));
+}
+
+#[test]
+fn terminal_remove_rejects_a_missing_local_job_record() {
+    // Break caught: dispatcher ownership alone is mistaken for durable terminal
+    // or abandonment proof.
+    let fixture = open_queue();
+    let dispatcher = owner(562);
+    let dispatching = dispatching_batch(
+        &fixture.store,
+        "00000000000000000000000000000096",
+        dispatcher,
+        562,
+    );
+
+    let error = fixture
+        .store
+        .remove_after_terminal(dispatching.job_id(), dispatcher)
+        .unwrap_err();
+
+    assert_terminal_unproven(error);
+    assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 1);
+}
+
+#[test]
+fn terminal_remove_rejects_a_statusless_local_job_record() {
+    // Break caught: merely publishing the pre-acceptance local record is
+    // mistaken for durable terminal proof.
+    let fixture = open_queue();
+    let dispatcher = owner(563);
+    let dispatching = dispatching_batch(
+        &fixture.store,
+        "00000000000000000000000000000097",
+        dispatcher,
+        563,
+    );
+    fixture
+        .store
+        .create_job(local_record(
+            &fixture.store,
+            dispatching.job_id(),
+            "mini-1",
+            None,
+        ))
+        .unwrap();
+
+    let error = fixture
+        .store
+        .remove_after_terminal(dispatching.job_id(), dispatcher)
+        .unwrap_err();
+
+    assert_terminal_unproven(error);
+    assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 1);
+}
+
+#[test]
+fn terminal_remove_rejects_a_nonterminal_local_job_record() {
+    // Break caught: an accepted but still nonterminal job releases its queue
+    // reservation early.
+    let fixture = open_queue();
+    let dispatcher = owner(564);
+    let dispatching = dispatching_batch(
+        &fixture.store,
+        "00000000000000000000000000000098",
+        dispatcher,
+        564,
+    );
+    fixture
+        .store
+        .create_job(local_record(
+            &fixture.store,
+            dispatching.job_id(),
+            "mini-1",
+            Some(JobStatus::accepted(566).unwrap()),
+        ))
+        .unwrap();
+
+    let error = fixture
+        .store
+        .remove_after_terminal(dispatching.job_id(), dispatcher)
+        .unwrap_err();
+
+    assert_terminal_unproven(error);
+    assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 1);
+}
+
+#[test]
+fn terminal_remove_rejects_remote_uncertainty_even_with_a_terminal_status() {
+    // Break caught: a terminal observation with unresolved remote ownership or
+    // cleanup is treated as safe durable completion.
+    for (job_id, dispatcher, uncertainty) in [
+        (
+            "00000000000000000000000000000099",
+            owner(565),
+            RemoteUncertainty::unknown_remote("UNKNOWN_REMOTE").unwrap(),
+        ),
+        (
+            "0000000000000000000000000000009a",
+            owner(566),
+            RemoteUncertainty::cleanup_pending("CLEANUP_INCOMPLETE").unwrap(),
+        ),
+    ] {
+        let fixture = open_queue();
+        let dispatching = dispatching_batch(&fixture.store, job_id, dispatcher, 567);
+        fixture
+            .store
+            .create_job(local_record_with_uncertainty(
+                &fixture.store,
+                dispatching.job_id(),
+                "mini-1",
+                Some(JobStatus::succeeded(569, 10, 20).unwrap()),
+                uncertainty,
+            ))
+            .unwrap();
+
+        let error = fixture
+            .store
+            .remove_after_terminal(dispatching.job_id(), dispatcher)
+            .unwrap_err();
+
+        assert_terminal_unproven(error);
+        assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 1);
+    }
+}
+
+#[test]
+fn terminal_remove_rejects_a_terminal_record_from_another_client() {
+    // Break caught: a copied terminal record from another client is accepted as
+    // authority to retire this client's queue reservation.
+    let fixture = open_queue();
+    let foreign = open_queue();
+    let dispatcher = owner(568);
+    let dispatching = dispatching_batch(
+        &fixture.store,
+        "0000000000000000000000000000009c",
+        dispatcher,
+        573,
+    );
+    let foreign_record = local_record(
+        &foreign.store,
+        dispatching.job_id(),
+        "mini-1",
+        Some(JobStatus::succeeded(575, 10, 20).unwrap()),
+    );
+    foreign.store.create_job(foreign_record).unwrap();
+    let filename = format!("{}.json", dispatching.job_id());
+    fs::copy(
+        foreign.root.join("jobs").join(&filename),
+        fixture.root.join("jobs").join(&filename),
+    )
+    .unwrap();
+    fs::set_permissions(
+        fixture.root.join("jobs").join(&filename),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    assert!(
+        fixture
+            .store
+            .remove_after_terminal(dispatching.job_id(), dispatcher)
+            .is_err()
+    );
+    assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 1);
+}
+
+#[test]
+fn terminal_remove_accepts_a_durably_terminal_same_client_record() {
+    // Break caught: terminal cleanup cannot retire a proven completed local
+    // reservation after tightening the lifecycle guard.
+    let fixture = open_queue();
+    let dispatcher = owner(567);
+    let dispatching = dispatching_batch(
+        &fixture.store,
+        "0000000000000000000000000000009b",
+        dispatcher,
+        570,
+    );
+    fixture
+        .store
+        .create_job(local_record(
+            &fixture.store,
+            dispatching.job_id(),
+            "mini-1",
+            Some(JobStatus::succeeded(572, 10, 20).unwrap()),
+        ))
+        .unwrap();
+
     assert_eq!(
         fixture
             .store
@@ -1124,6 +1348,7 @@ fn waiting_remove_and_terminal_remove_are_state_and_owner_scoped() {
             .job_id(),
         dispatching.job_id()
     );
+    assert!(fixture.store.queue_snapshot().unwrap().entries().is_empty());
 }
 
 #[test]

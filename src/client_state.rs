@@ -623,6 +623,18 @@ impl ClientStateStore {
                     "queue dispatch owner does not match",
                 ));
             }
+            let name = job_file_name(job_id)?;
+            let record = read_job_optional(self.inner.jobs.as_raw_fd(), &name)?
+                .ok_or_else(terminal_unproven)?;
+            self.require_local_client(&record)
+                .map_err(|_| terminal_unproven())?;
+            if !record
+                .last_status()
+                .is_some_and(|status| status.state().is_terminal())
+                || !matches!(record.remote_uncertainty(), RemoteUncertainty::None)
+            {
+                return Err(terminal_unproven());
+            }
             Ok((snapshot.entries.remove(index), true))
         })
     }
@@ -1732,6 +1744,13 @@ fn queue_error(code: &'static str, message: &'static str) -> WorkerError {
         code,
         message: message.into(),
     }
+}
+
+fn terminal_unproven() -> WorkerError {
+    queue_error(
+        "QUEUE_TERMINAL_UNPROVEN",
+        "queue row has no durable terminal or abandonment proof",
+    )
 }
 
 fn require_same_immutable(
