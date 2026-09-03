@@ -362,6 +362,16 @@ fn origin_and_push_parse_but_core_scope_rejects_them() {
 }
 
 #[test]
+fn task_records_require_the_always_on_fetch_publish_mode() {
+    let mut fields = fields_with_prompt("Keep the result importable".into());
+    fields.publish.clear();
+
+    let error = TaskMeta::new(fields).unwrap_err();
+    assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
+    assert!(error.to_string().contains("fetch"), "{error}");
+}
+
+#[test]
 fn new_worker_error_variants_map_to_documented_exit_kinds() {
     let cases = [
         (

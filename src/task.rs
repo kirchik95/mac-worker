@@ -530,6 +530,9 @@ impl TaskMeta {
         if matches!(self.source, TaskSource::Origin { .. }) {
             return Err(task_config("source origin is deferred to a later plan"));
         }
+        if !self.publish.contains(&PublishMode::Fetch) {
+            return Err(task_config("publish fetch is required for every task"));
+        }
         if self.publish.contains(&PublishMode::Push) {
             return Err(task_config("publish push is deferred to a later plan"));
         }
