@@ -550,7 +550,7 @@ git commit -m "feat: add dashboard static client"
 - Consumes: `DashboardService::snapshot`, `DashboardLogChunk`, `ApiError`, and static files from Tasks 1–4.
 - Produces: `DashboardHttpState`, `DashboardHttpServer`, `DashboardHttpServer::bind`, `DashboardHttpServer::local_url`, and `DashboardHttpServer::shutdown`.
 
-- [ ] **Step 1: Write failing HTTP integration tests**
+- [x] **Step 1: Write failing HTTP integration tests**
 
 Using a fake `DashboardDataSource` and an actual TCP client against an OS-assigned port, test all routes and the exact security policy:
 
@@ -573,13 +573,13 @@ async fn api_rejects_unbounded_log_ranges_without_calling_source() {
 }
 ```
 
-- [ ] **Step 2: Run web tests to verify they fail**
+- [x] **Step 2: Run web tests to verify they fail**
 
 Run: `cargo test --locked --test dashboard_web -- --nocapture`
 
 Expected: FAIL because the HTTP adapter and `axum`/`tokio` dependencies do not exist.
 
-- [ ] **Step 3: Add dependencies and implement the loopback-only router**
+- [x] **Step 3: Add dependencies and implement the loopback-only router**
 
 Add exact runtime dependencies:
 
@@ -611,7 +611,7 @@ impl DashboardHttpServer {
 
 Add exactly `pub mod web;` to `src/dashboard/mod.rs` in this task. Use `TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port.unwrap_or(0))))`; `bind` starts the owned `task` which serves the router until a cloned `watch` receiver observes `true`. `shutdown(self)` sends `true`, awaits `self.task`, maps a join failure to `ApiError { code: "DASHBOARD_SERVER_FAILED", message: "dashboard server task stopped unexpectedly" }`, and returns the task's inner result. Reject any configured address because the only bind input is `Option<u16>`. Embed assets with `include_str!`. Add route handlers only for the five specified GET routes. Parse `JobId` before source lookup, parse stream with a two-value enum, reject `limit` outside `1..=65_536`, and use source errors only after validation. Return browser text as escaped DOM data, never server-rendered untrusted HTML.
 
-- [ ] **Step 4: Run HTTP and existing dashboard tests**
+- [x] **Step 4: Run HTTP and existing dashboard tests**
 
 Run:
 
@@ -623,7 +623,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 5: Commit the HTTP adapter**
+- [x] **Step 5: Commit the HTTP adapter**
 
 ```bash
 git add Cargo.toml Cargo.lock src/dashboard/mod.rs src/dashboard/web.rs tests/dashboard_web.rs
@@ -645,7 +645,7 @@ git commit -m "feat: serve dashboard over loopback"
 - Consumes: `Config`, `WorkersService`, `ClientStateStore::list_jobs`, `RemoteJobClient::status`, `RemoteJobClient::log_chunk`, `JobMeta`, `JobStatus`, `StatusResponse`, `LogChunkResponse`, and `ProbeResponse`.
 - Produces: `MacWorkerDashboardSource`, `MacWorkerLogSource`, `DashboardDataSource` implementation, `DashboardLogSource` implementation, `project_job`, `project_worker`, and `map_remote_error`.
 
-- [ ] **Step 1: Write failing typed-adapter tests**
+- [x] **Step 1: Write failing typed-adapter tests**
 
 Create `tests/dashboard_source.rs` using recording fakes for worker probes and `RemoteJobClient`. Prove the adapter:
 
@@ -668,13 +668,13 @@ fn adapter_uses_authoritative_status_for_active_local_record() {
 }
 ```
 
-- [ ] **Step 2: Run adapter tests to verify they fail**
+- [x] **Step 2: Run adapter tests to verify they fail**
 
 Run: `cargo test --locked --test dashboard_source -- --nocapture`
 
 Expected: FAIL because `MacWorkerDashboardSource` and the completed Phase 3 remote-client interfaces are absent.
 
-- [ ] **Step 3: Implement direct-library projection adapters**
+- [x] **Step 3: Implement direct-library projection adapters**
 
 Define constructor dependencies as traits so tests remain fake-driven:
 
@@ -700,7 +700,7 @@ pub trait DashboardRemoteReader: Send + Sync + 'static {
 
 Add exactly `pub mod source;` to `src/dashboard/mod.rs` in this task. Construct the pre-Phase-4 source with `queue: Arc::new(EmptyDashboardQueueReader)`; that makes the required snapshot `queue` an empty array without inventing scheduler semantics. The `Arc` fields make `MacWorkerDashboardSource: Send + Sync + 'static`, so it can satisfy Task 3's `DashboardDataSource` bound and can be owned by `Arc<DashboardService<MacWorkerDashboardSource, SystemClock>>` in Task 5. `project_job` derives only the fields stated in Task 1 from `JobMeta`/`JobStatus`, sets `project_label` and `artifact_status` to `None`, and maps `RemoteUncertainty` to its code only. `MacWorkerLogSource` resolves the worker only from a locally owned `JobId` record and config inventory name; it never accepts an HTTP worker/SSH value. Enforce remote status authority in this adapter; the service only merges its typed output.
 
-- [ ] **Step 4: Run source/service/web regression tests**
+- [x] **Step 4: Run source/service/web regression tests**
 
 Run:
 
@@ -711,7 +711,7 @@ cargo fmt --all --check
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 5: Commit the Phase-3 adapter**
+- [x] **Step 5: Commit the Phase-3 adapter**
 
 ```bash
 git add src/dashboard/mod.rs src/dashboard/source.rs tests/dashboard_source.rs
@@ -879,7 +879,7 @@ git commit -m "feat: project coordinated worker cpu metrics"
 - Consumes: `DashboardHttpServer::bind`, `DashboardHttpServer::local_url`, `DashboardHttpServer::shutdown`, completed `MacWorkerDashboardSource`, and `MacWorkerLogSource`.
 - Produces: `DashboardCommandRequest`, `DashboardRunResult`, `DashboardLauncher`, `SystemDashboardLauncher`, `SystemBrowserOpener`, public `Command::Dashboard { port, no_open }`, and `run_dashboard`.
 
-- [ ] **Step 1: Write failing command/lifecycle tests**
+- [x] **Step 1: Write failing command/lifecycle tests**
 
 Add CLI parsing tests for exactly:
 
@@ -901,13 +901,13 @@ async fn no_open_prints_loopback_url_without_invoking_browser() {
 }
 ```
 
-- [ ] **Step 2: Run command tests to verify they fail**
+- [x] **Step 2: Run command tests to verify they fail**
 
 Run: `cargo test --locked --test dashboard_command --test cli_help -- --nocapture`
 
 Expected: FAIL because the public dashboard command does not exist.
 
-- [ ] **Step 3: Implement the ephemeral command lifecycle**
+- [x] **Step 3: Implement the ephemeral command lifecycle**
 
 Add to `src/cli.rs`:
 
@@ -935,7 +935,7 @@ pub async fn run_dashboard(request: DashboardCommandRequest, launcher: &dyn Dash
 
 Add exactly `pub mod command;` to `src/dashboard/mod.rs` in this task. `SystemDashboardLauncher::launch` returns `Box::pin(DashboardHttpServer::bind(request.port, Arc::clone(&self.state)))`, so it does not borrow command-local state across the asynchronous server lifetime. `SystemBrowserOpener` invokes `/usr/bin/open` with a single validated loopback URL. It never accepts a browser executable, URL, or arbitrary path from HTTP input. In the synchronous `src/lib.rs` dispatch branch, build a Tokio runtime with `tokio::runtime::Builder::new_multi_thread().enable_all().build()?` and invoke `runtime.block_on(run_dashboard(request, &launcher, &opener, Box::pin(tokio::signal::ctrl_c()), stdout, stderr))`. `run_dashboard` writes and flushes the URL, awaits the injected shutdown signal, then awaits `DashboardHttpServer::shutdown`. This is the exact async/sync boundary; the `tokio` `signal` feature in Task 5 is required for the production `ctrl_c` future. Do not add it to `--json` streaming output and do not make a browser-launch warning an execution failure.
 
-- [ ] **Step 4: Run CLI and dashboard regression tests**
+- [x] **Step 4: Run CLI and dashboard regression tests**
 
 Run:
 
@@ -946,7 +946,7 @@ cargo build --locked --release
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 5: Commit public dashboard startup**
+- [x] **Step 5: Commit public dashboard startup**
 
 ```bash
 git add src/dashboard/command.rs src/dashboard/mod.rs src/cli.rs src/lib.rs tests/dashboard_command.rs tests/cli_help.rs
