@@ -48,6 +48,12 @@ pub enum WorkerError {
     Capacity { code: &'static str, message: String },
     #[error("transport error [{code}]: {message}")]
     Transport { code: &'static str, message: String },
+    #[error("git error [{code}]: {message}")]
+    Git { code: &'static str, message: String },
+    #[error("agent error [{code}]: {message}")]
+    Agent { code: &'static str, message: String },
+    #[error("task error [{code}]: {message}")]
+    Task { code: &'static str, message: String },
     #[error("command exited with status {code}")]
     CommandExit { code: u8 },
     #[error("I/O error: {0}")]
@@ -56,14 +62,29 @@ pub enum WorkerError {
     Process(#[from] ProcessError),
 }
 
+impl From<crate::agent::AdapterError> for WorkerError {
+    fn from(error: crate::agent::AdapterError) -> Self {
+        Self::Agent {
+            code: "AGENT_UNSUPPORTED",
+            message: error.to_string(),
+        }
+    }
+}
+
 impl WorkerError {
     pub fn exit_kind(&self) -> ExitKind {
         match self {
             Self::Config(_) => ExitKind::Usage,
             Self::Project { .. } => ExitKind::Usage,
+            Self::Unavailable(message) if coded_prefix(message) == Some("HOST_LAYOUT_OUTDATED") => {
+                ExitKind::Infrastructure
+            }
             Self::Unavailable(_) => ExitKind::Unavailable,
             Self::Capacity { .. } => ExitKind::Capacity,
             Self::Transport { .. } => ExitKind::Unavailable,
+            Self::Git { code, .. } => git_exit_kind(code),
+            Self::Agent { code, .. } => agent_exit_kind(code),
+            Self::Task { code, .. } => task_exit_kind(code),
             Self::CommandExit { .. } => ExitKind::Infrastructure,
             Self::Protocol(_) | Self::Process(_) | Self::Snapshot { .. } => {
                 ExitKind::Infrastructure
@@ -75,6 +96,10 @@ impl WorkerError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::CommandExit { code } => *code,
+            Self::Agent {
+                code: "AGENT_LIMIT_REACHED",
+                ..
+            } => 1,
             _ => self.exit_kind() as u8,
         }
     }
@@ -85,6 +110,9 @@ impl WorkerError {
             Self::Snapshot { code, .. } => stable_public_code(code, "SNAPSHOT"),
             Self::Capacity { code, .. } => stable_public_code(code, "CAPACITY"),
             Self::Transport { code, .. } => stable_public_code(code, "TRANSPORT"),
+            Self::Git { code, .. } => stable_public_code(code, "GIT"),
+            Self::Agent { code, .. } => stable_public_code(code, "AGENT"),
+            Self::Task { code, .. } => stable_public_code(code, "TASK"),
             Self::Config(message) => coded_prefix(message).unwrap_or("CONFIG").to_owned(),
             Self::Unavailable(message) => coded_prefix(message).unwrap_or("UNAVAILABLE").to_owned(),
             Self::Protocol(message) => coded_prefix(message).unwrap_or("PROTOCOL").to_owned(),
@@ -100,6 +128,9 @@ impl WorkerError {
             Self::Snapshot { .. } => "snapshot error".into(),
             Self::Capacity { .. } => "capacity error".into(),
             Self::Transport { .. } => "transport error".into(),
+            Self::Git { .. } => "git error".into(),
+            Self::Agent { .. } => "agent error".into(),
+            Self::Task { .. } => "task error".into(),
             Self::Config(_) => "configuration error".into(),
             Self::Unavailable(_) => "worker unavailable".into(),
             Self::Protocol(_) => "protocol error".into(),
@@ -120,6 +151,28 @@ fn stable_public_code(code: &str, fallback: &'static str) -> String {
         code.to_owned()
     } else {
         fallback.to_owned()
+    }
+}
+
+fn git_exit_kind(code: &str) -> ExitKind {
+    match code {
+        "BASE_PUSH_FAILED" | "RESULT_FETCH_FAILED" => ExitKind::Unavailable,
+        _ => ExitKind::Infrastructure,
+    }
+}
+
+fn agent_exit_kind(code: &str) -> ExitKind {
+    match code {
+        "AGENT_NOT_INSTALLED" | "AGENT_NOT_AUTHENTICATED" => ExitKind::Capacity,
+        "AGENT_UNSUPPORTED" => ExitKind::Usage,
+        _ => ExitKind::Infrastructure,
+    }
+}
+
+fn task_exit_kind(code: &str) -> ExitKind {
+    match code {
+        "RUNNER_HANDOFF_FAILED" => ExitKind::Io,
+        _ => ExitKind::Usage,
     }
 }
 
@@ -307,6 +360,30 @@ mod tests {
                 },
                 "TRANSPORT",
                 "transport error",
+            ),
+            (
+                WorkerError::Git {
+                    code: "BASE_UNAVAILABLE",
+                    message: format!("missing at {planted_path}"),
+                },
+                "BASE_UNAVAILABLE",
+                "git error",
+            ),
+            (
+                WorkerError::Agent {
+                    code: "SESSION_UNBOUND",
+                    message: planted_secret.into(),
+                },
+                "SESSION_UNBOUND",
+                "agent error",
+            ),
+            (
+                WorkerError::Task {
+                    code: "TASK_NOT_FOUND",
+                    message: format!("no task at {planted_path}"),
+                },
+                "TASK_NOT_FOUND",
+                "task error",
             ),
             (
                 WorkerError::CommandExit { code: 64 },

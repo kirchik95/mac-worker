@@ -69,6 +69,7 @@ pub mod rooted_fs;
 pub mod run;
 pub mod snapshot;
 pub mod supervisor;
+pub mod task;
 pub mod transfer;
 pub mod transport;
 
