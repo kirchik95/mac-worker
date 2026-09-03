@@ -27,9 +27,9 @@ use mac_worker::{
     host_store::{HostStore, HostStoreWritePoint, JobDisposition, SupervisorGuard},
     inputs::RelativePath,
     job::{
-        ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobState, JobStatus,
-        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk,
-        LogChunkRequest, LogChunkResponse, LogCursor, LogStream, ProcessIdentity,
+        CancelRequest, CancelResponse, ClientId, CommandSpec, HostControlError, JobId, JobMeta,
+        JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
+        LogChunk, LogChunkRequest, LogChunkResponse, LogCursor, LogStream, ProcessIdentity,
         RequestFingerprintMaterial, ResolveOrAbandonOutcome, ResolveOrAbandonRequest,
         ResolveOrAbandonResponse, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
         TerminalLogDrain,
@@ -108,6 +108,7 @@ struct ScriptedReconciliationInner {
     process: Mutex<VecDeque<ProcessObservation>>,
     groups: Mutex<VecDeque<ProcessGroupObservation>>,
     signals: Mutex<Vec<(u32, i32)>>,
+    fail_signal: Mutex<Option<i32>>,
     sleeps: Mutex<Vec<Duration>>,
     now: Mutex<Duration>,
     clock: Mutex<Option<VecDeque<Duration>>>,
@@ -129,6 +130,7 @@ impl ScriptedReconciliation {
                 process: Mutex::new(process.into_iter().collect()),
                 groups: Mutex::new(groups.into_iter().collect()),
                 signals: Mutex::new(Vec::new()),
+                fail_signal: Mutex::new(None),
                 sleeps: Mutex::new(Vec::new()),
                 now: Mutex::new(Duration::ZERO),
                 clock: Mutex::new(None),
@@ -144,6 +146,11 @@ impl ScriptedReconciliation {
 
     fn with_first_observation_gate(self, gate: FirstObservationGate) -> Self {
         *self.inner.first_observation_gate.lock().unwrap() = Some(gate);
+        self
+    }
+
+    fn with_signal_failure(self, signal: i32) -> Self {
+        *self.inner.fail_signal.lock().unwrap() = Some(signal);
         self
     }
 
@@ -205,6 +212,16 @@ impl ReconciliationRuntime for ScriptedReconciliation {
             .lock()
             .unwrap()
             .push((process_group, signal));
+        let mut fail_signal = self.inner.fail_signal.lock().unwrap();
+        if fail_signal
+            .as_ref()
+            .is_some_and(|expected| *expected == signal)
+        {
+            *fail_signal = None;
+            return Err(mac_worker::error::WorkerError::Protocol(format!(
+                "injected signal failure {signal}"
+            )));
+        }
         Ok(())
     }
 
@@ -266,6 +283,35 @@ fn queue_supervisor_lock_contender(
         release_tx,
         contender,
     )
+}
+
+fn wait_until_admission_is_busy(root: &Path, job_id: JobId) {
+    let lock = root
+        .join("locks/jobs")
+        .join(job_id.to_string())
+        .join("admission.lock");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .expect("admission lock must exist");
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == -1 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EWOULDBLOCK),
+                "admission lock probe failed unexpectedly"
+            );
+            return;
+        }
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) }, 0);
+        if Instant::now() >= deadline {
+            panic!("cancellation never entered its admission validation section");
+        }
+        thread::yield_now();
+    }
 }
 
 impl SupervisorLauncher for RejectLauncher {
@@ -393,6 +439,401 @@ fn status_reports_a_missing_job_without_launching() {
         .unwrap_err();
 
     assert!(error.to_string().contains("JOB_NOT_FOUND"), "{error}");
+}
+
+#[test]
+fn cancel_fences_an_accepted_job_without_a_child_then_cleans_and_releases() {
+    // Break caught: cancellation tries to signal an unrecorded launch child,
+    // allows a later launcher to escape the fence, or releases capacity before
+    // the durable Cancelled status and mutable payload cleanup.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cancel-prelaunch");
+    let (store, lease, _submit) = indexed_identityless_job(&root);
+    let request = CancelRequest::new(
+        lease.job_id(),
+        lease.client_id(),
+        lease.lease_token(),
+        lease.request_fingerprint().clone(),
+    )
+    .unwrap();
+
+    let response = JobService::new(&store, &RejectLauncher)
+        .cancel(request)
+        .unwrap();
+
+    assert_eq!(response.status().status().state(), JobState::Cancelled);
+    assert_eq!(response.status().status().child_identity(), None);
+    assert_eq!(
+        response.status().status().error_code(),
+        Some("CANCELLED_PRELAUNCH")
+    );
+    assert_mutable_job_scopes_absent(&store, &lease);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
+fn cancel_waits_for_a_held_supervisor_without_retaining_admission() {
+    // Break caught: a pre-Running supervisor needs admission to finish its
+    // own terminal cleanup, while cancellation waits for its guard. Holding
+    // admission during that wait creates a lock inversion and loses the
+    // cancellation handoff.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cancel-supervisor-handoff");
+    let (store, lease, _submit) = indexed_identityless_job(&root);
+    let job_id = lease.job_id();
+    let request = CancelRequest::new(
+        lease.job_id(),
+        lease.client_id(),
+        lease.lease_token(),
+        lease.request_fingerprint().clone(),
+    )
+    .unwrap();
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let launching_store = store.clone();
+    let job_path = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = BlockingLauncher {
+        launches: Arc::new(AtomicUsize::new(0)),
+        job_path,
+        identity: identity(90_101),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    };
+    let launch_job_id = job_id;
+    let launching_status =
+        thread::spawn(move || JobService::new(&launching_store, &launcher).status(launch_job_id));
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("pre-Running supervisor did not retain its guard");
+
+    let cancel_store = store.clone();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let canceller = thread::spawn(move || {
+        cancel_tx
+            .send(JobService::new(&cancel_store, &RejectLauncher).cancel(request))
+            .expect("cancellation result receiver must remain live");
+    });
+
+    wait_until_admission_is_busy(&root, job_id);
+    let probe_root = root.clone();
+    let (probe_tx, probe_rx) = mpsc::channel();
+    let probe = thread::spawn(move || {
+        let admission = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                probe_root
+                    .join("locks/jobs")
+                    .join(job_id.to_string())
+                    .join("admission.lock"),
+            )
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(admission.as_raw_fd(), libc::LOCK_EX) },
+            0
+        );
+        probe_tx.send(()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(admission.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+    });
+    let released_admission_before_guard = probe_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+
+    release_tx.send(()).unwrap();
+    let response = cancel_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("cancellation must finish after the supervisor handoff")
+        .unwrap();
+    canceller.join().unwrap();
+    probe.join().unwrap();
+    launching_status.join().unwrap().unwrap();
+
+    assert!(
+        released_admission_before_guard,
+        "cancellation retained admission while waiting for the supervisor guard"
+    );
+    assert_eq!(response.status().status().state(), JobState::Cancelled);
+    assert_eq!(read_job_status(&store, &lease).state(), JobState::Cancelled);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
+fn cancel_terms_then_kills_only_the_exact_recorded_group_before_cleanup() {
+    // Break caught: cancellation relies on supervisor absence, signals an
+    // unrecorded/reused process, skips the full TERM grace, or frees capacity
+    // before the exact group and mutable scopes are proven gone.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cancel-term-kill");
+    let (store, lease, request, _status, child) = indexed_running_job(&root, 90_201, 90_202);
+    let runtime = ScriptedReconciliation::new(
+        [
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Absent,
+        ],
+        [ProcessGroupObservation::Absent],
+    );
+
+    let response =
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+            .cancel(request.clone())
+            .unwrap();
+
+    assert_eq!(response.status().status().state(), JobState::Cancelled);
+    assert_eq!(
+        runtime.signals(),
+        vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+    );
+    assert_eq!(runtime.sleeps(), vec![Duration::from_secs(10)]);
+    assert_mutable_job_scopes_absent(&store, &lease);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+
+    let retry = ScriptedReconciliation::new([], []);
+    let repeated =
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(retry.clone()))
+            .cancel(request)
+            .unwrap();
+    assert_eq!(repeated.status().status().state(), JobState::Cancelled);
+    assert!(retry.signals().is_empty(), "terminal retry must not signal");
+}
+
+#[test]
+fn cancel_term_only_exact_absence_skips_kill_after_full_grace() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cancel-term-only");
+    let (store, lease, request, _status, child) = indexed_running_job(&root, 90_301, 90_302);
+    let runtime = ScriptedReconciliation::new(
+        [
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Absent,
+        ],
+        [ProcessGroupObservation::Absent],
+    );
+
+    JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+        .cancel(request)
+        .unwrap();
+
+    assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+    assert_eq!(runtime.sleeps(), vec![Duration::from_secs(10)]);
+    assert_mutable_job_scopes_absent(&store, &lease);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
+fn cancel_kill_failure_retains_status_payload_and_exact_lease_for_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cancel-kill-failure");
+    let (store, lease, request, status, child) = indexed_running_job(&root, 90_351, 90_352);
+    let before_scopes = mutable_job_scope_presence(&store, &lease);
+    let runtime = ScriptedReconciliation::new(
+        [
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+        ],
+        [],
+    )
+    .with_signal_failure(libc::SIGKILL);
+
+    let error =
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+            .cancel(request)
+            .unwrap_err();
+
+    assert!(
+        error.to_string().contains("injected signal failure"),
+        "{error}"
+    );
+    assert_eq!(
+        runtime.signals(),
+        vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+    );
+    assert_eq!(read_job_status(&store, &lease), status);
+    assert_eq!(mutable_job_scope_presence(&store, &lease), before_scopes);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+}
+
+#[test]
+fn cancel_never_signals_stale_reused_or_ambiguous_child_identity() {
+    let cases = [
+        (
+            "reused",
+            vec![ProcessObservation::Reused],
+            Vec::<ProcessGroupObservation>::new(),
+        ),
+        (
+            "ambiguous",
+            vec![ProcessObservation::Ambiguous],
+            Vec::<ProcessGroupObservation>::new(),
+        ),
+        (
+            "wrong-group",
+            vec![ProcessObservation::Matching { process_group: 1 }],
+            Vec::<ProcessGroupObservation>::new(),
+        ),
+        (
+            "leader-absent-group-live",
+            vec![ProcessObservation::Absent],
+            vec![ProcessGroupObservation::Present],
+        ),
+    ];
+
+    for (index, (label, process, groups)) in cases.into_iter().enumerate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(format!("cancel-unsafe-child-{index}"));
+        let (store, lease, request, status, _child) = indexed_running_job(
+            &root,
+            90_401 + index as u32 * 10,
+            90_402 + index as u32 * 10,
+        );
+        let before_scopes = mutable_job_scope_presence(&store, &lease);
+        let runtime = ScriptedReconciliation::new(process, groups);
+
+        let error =
+            JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+                .cancel(request)
+                .unwrap_err();
+
+        assert_error_code(error, "RECONCILIATION_AMBIGUOUS", label);
+        assert!(runtime.signals().is_empty(), "{label}");
+        assert_eq!(read_job_status(&store, &lease), status, "{label}");
+        assert_eq!(
+            mutable_job_scope_presence(&store, &lease),
+            before_scopes,
+            "{label}"
+        );
+        assert_eq!(
+            LeaseService::new(&store).load().unwrap(),
+            Some(lease),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn cancel_cleanup_failure_retains_the_exact_lease_for_terminal_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cancel-cleanup-failure");
+    let (store, lease, request, _status, child) = indexed_running_job(&root, 90_501, 90_502);
+    drop(store);
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobCleanupProof).unwrap();
+    let first_runtime = ScriptedReconciliation::new(
+        [
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Absent,
+        ],
+        [ProcessGroupObservation::Absent],
+    );
+
+    let error = JobService::new_with_reconciliation(
+        &faulted,
+        &RejectLauncher,
+        Arc::new(first_runtime.clone()),
+    )
+    .cancel(request.clone())
+    .unwrap_err();
+
+    assert!(error.to_string().contains("cleanup-proof"), "{error}");
+    assert_eq!(
+        read_job_status(&faulted, &lease).state(),
+        JobState::Cancelled
+    );
+    assert_eq!(
+        LeaseService::new(&faulted).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert_eq!(first_runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+    drop(faulted);
+
+    let reopened = HostStore::open(&root).unwrap();
+    let retry_runtime = ScriptedReconciliation::new([], []);
+    let response = JobService::new_with_reconciliation(
+        &reopened,
+        &RejectLauncher,
+        Arc::new(retry_runtime.clone()),
+    )
+    .cancel(request)
+    .unwrap();
+    assert_eq!(response.status().status().state(), JobState::Cancelled);
+    assert!(retry_runtime.signals().is_empty());
+    assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
+}
+
+#[test]
+fn cancel_request_wire_rejects_malformed_identity_and_extra_fields() {
+    let valid = serde_json::json!({
+        "job_id": JOB_ID,
+        "client_id": CLIENT_ID,
+        "lease_token": LEASE_TOKEN,
+        "request_fingerprint": "c".repeat(64),
+    });
+    assert!(serde_json::from_value::<CancelRequest>(valid.clone()).is_ok());
+
+    let mut malformed_token = valid.clone();
+    malformed_token["lease_token"] = serde_json::Value::String("not-a-token".into());
+    assert!(serde_json::from_value::<CancelRequest>(malformed_token).is_err());
+
+    let mut malformed_fingerprint = valid.clone();
+    malformed_fingerprint["request_fingerprint"] =
+        serde_json::Value::String("not-a-fingerprint".into());
+    assert!(serde_json::from_value::<CancelRequest>(malformed_fingerprint).is_err());
+
+    let mut extra_field = valid;
+    extra_field["protocol_version"] = serde_json::Value::from(3);
+    assert!(
+        serde_json::from_value::<CancelRequest>(extra_field).is_err(),
+        "fixed cancel requests must not grow a protocol envelope"
+    );
+
+    let acquire = lease_request();
+    let response = CancelResponse::new(
+        StatusResponse::new(
+            JobMeta::new(acquire.material(), acquire.request_fingerprint().clone()).unwrap(),
+            JobStatus::accepted(acquire.material().created_at_millis()).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut response_with_extra = serde_json::to_value(response).unwrap();
+    response_with_extra["unexpected"] = serde_json::Value::Bool(true);
+    assert!(serde_json::from_value::<CancelResponse>(response_with_extra).is_err());
+}
+
+#[test]
+fn cancel_missing_job_is_a_typed_not_found_without_side_effects() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("cancel-missing")).unwrap();
+    let acquire = lease_request();
+    let request = CancelRequest::new(
+        acquire.material().job_id(),
+        acquire.material().client_id(),
+        acquire.material().lease_token(),
+        acquire.request_fingerprint().clone(),
+    )
+    .unwrap();
+
+    let error = JobService::new(&store, &RejectLauncher)
+        .cancel(request)
+        .unwrap_err();
+    assert_error_code(error, "JOB_NOT_FOUND", "not indexed");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 }
 
 #[test]
@@ -4702,6 +5143,13 @@ fn hidden_query_endpoints_are_argument_free_and_return_one_canonical_typed_line(
     let (runtime, submit, expected_status) = endpoint_runtime_and_completed_job(&temp);
     let job_id = submit.material().job_id();
     let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let cancel = CancelRequest::new(
+        submit.material().job_id(),
+        submit.material().client_id(),
+        submit.material().lease_token(),
+        submit.request_fingerprint().clone(),
+    )
+    .unwrap();
     let expected_log = LogChunkResponse::new(
         LogChunk::new(LogStream::Stdout, 0, b"endpoint-log".to_vec()).unwrap(),
     )
@@ -4723,6 +5171,11 @@ fn hidden_query_endpoints_are_argument_free_and_return_one_canonical_typed_line(
             "resolve-or-abandon",
             serde_json::to_vec(&resolve).unwrap(),
             serde_json::to_vec(&expected_resolve).unwrap(),
+        ),
+        (
+            "cancel",
+            serde_json::to_vec(&cancel).unwrap(),
+            serde_json::to_vec(&CancelResponse::new(expected_status.clone()).unwrap()).unwrap(),
         ),
     ];
 
@@ -4748,6 +5201,13 @@ fn every_query_endpoint_rejects_noncanonical_or_unbounded_input_with_typed_stdou
     let (runtime, submit, _) = endpoint_runtime_and_completed_job(&temp);
     let job_id = submit.material().job_id();
     let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let cancel = CancelRequest::new(
+        submit.material().job_id(),
+        submit.material().client_id(),
+        submit.material().lease_token(),
+        submit.request_fingerprint().clone(),
+    )
+    .unwrap();
     let valid = [
         (
             "status",
@@ -4758,6 +5218,7 @@ fn every_query_endpoint_rejects_noncanonical_or_unbounded_input_with_typed_stdou
             serde_json::to_vec(&LogChunkRequest::new(job_id, LogStream::Stdout, 0, 64)).unwrap(),
         ),
         ("resolve-or-abandon", serde_json::to_vec(&resolve).unwrap()),
+        ("cancel", serde_json::to_vec(&cancel).unwrap()),
     ];
     for (command, valid) in valid {
         let mut wrong_version: serde_json::Value = serde_json::from_slice(&valid).unwrap();
@@ -6736,6 +7197,38 @@ fn indexed_identityless_job(root: &Path) -> (HostStore, LeaseRecord, SubmitReque
     assert!(faulted.job_index(lease.job_id()).unwrap().is_file());
     drop(faulted);
     (HostStore::open(root).unwrap(), lease, request)
+}
+
+fn indexed_running_job(
+    root: &Path,
+    supervisor_pid: u32,
+    child_pid: u32,
+) -> (
+    HostStore,
+    LeaseRecord,
+    CancelRequest,
+    JobStatus,
+    ProcessIdentity,
+) {
+    let (store, lease, _submit) = indexed_identityless_job(root);
+    let child = identity(child_pid);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(supervisor_pid), 11)
+        .unwrap()
+        .with_child(child, 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    let request = CancelRequest::new(
+        lease.job_id(),
+        lease.client_id(),
+        lease.lease_token(),
+        lease.request_fingerprint().clone(),
+    )
+    .unwrap();
+    (store, lease, request, status, child)
 }
 
 fn unindexed_identityless_job(root: &Path) -> (HostStore, LeaseRecord, SubmitRequest) {

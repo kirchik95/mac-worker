@@ -106,6 +106,18 @@ pub(crate) enum ObservationRelation {
     Conflict,
 }
 
+/// Durable observation of the row that a public cancellation previously
+/// marked while it was dispatching. This is intentionally queue-lock scoped:
+/// callers must release the lock before resolving a host or waiting for an
+/// owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchCancellationObservation {
+    NotRequested,
+    Requested,
+    WaitingCancelled,
+    Gone,
+}
+
 struct ClientStateInner {
     root: OwnedFd,
     jobs: OwnedFd,
@@ -634,6 +646,83 @@ impl ClientStateStore {
                     ))
                 }
             }
+        })
+    }
+
+    pub(crate) fn observe_dispatch_cancellation(
+        &self,
+        job_id: JobId,
+        dispatch_owner: ProcessIdentity,
+    ) -> Result<DispatchCancellationObservation, WorkerError> {
+        dispatch_owner.validate()?;
+        self.update_queue(|snapshot| {
+            let Some(entry) = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.job_id() == job_id)
+            else {
+                return Ok((DispatchCancellationObservation::Gone, false));
+            };
+            let observation = match entry.state() {
+                QueueState::Dispatching {
+                    dispatch_owner: current,
+                    ..
+                } if *current == dispatch_owner && entry.is_cancel_requested() => {
+                    DispatchCancellationObservation::Requested
+                }
+                QueueState::Dispatching {
+                    dispatch_owner: current,
+                    ..
+                } if *current == dispatch_owner => DispatchCancellationObservation::NotRequested,
+                QueueState::Waiting { .. } if entry.is_cancel_requested() => {
+                    DispatchCancellationObservation::WaitingCancelled
+                }
+                QueueState::Dispatching { .. } => {
+                    return Err(queue_error(
+                        "QUEUE_OWNER_MISMATCH",
+                        "queue dispatch owner does not match",
+                    ));
+                }
+                QueueState::Waiting { .. } => DispatchCancellationObservation::NotRequested,
+            };
+            Ok((observation, false))
+        })
+    }
+
+    /// Retires a cancellation-requested dispatch before a local immutable job
+    /// record exists. At that point Task 3/4 ordering proves no remote
+    /// boundary has been reached, so this is the only safe no-SSH claim-race
+    /// retirement path.
+    pub(crate) fn remove_cancelled_dispatch_before_local_record(
+        &self,
+        job_id: JobId,
+        dispatch_owner: ProcessIdentity,
+    ) -> Result<Option<QueueEntry>, WorkerError> {
+        dispatch_owner.validate()?;
+        self.update_queue(|snapshot| {
+            let Some(index) = snapshot
+                .entries
+                .iter()
+                .position(|entry| entry.job_id() == job_id)
+            else {
+                return Ok((None, false));
+            };
+            let entry = &snapshot.entries[index];
+            if !matches!(
+                entry.state(),
+                QueueState::Dispatching { dispatch_owner: current, .. } if *current == dispatch_owner
+            ) || !entry.is_cancel_requested()
+            {
+                return Err(queue_error(
+                    "QUEUE_CANCEL_CONFLICT",
+                    "dispatch row is not the exact cancellation-requested owner",
+                ));
+            }
+            let name = job_file_name(job_id)?;
+            if read_job_optional(self.inner.jobs.as_raw_fd(), &name)?.is_some() {
+                return Ok((None, false));
+            }
+            Ok((Some(snapshot.entries.remove(index)), true))
         })
     }
 

@@ -202,14 +202,26 @@ impl ReconciliationRuntime for SystemReconciliationRuntime {
 
 pub(crate) fn reconcile_orphan_processes(
     runtime: &dyn ReconciliationRuntime,
-    supervisor: ProcessIdentity,
+    supervisor_observation: ProcessObservation,
     child: Option<ProcessIdentity>,
 ) -> Result<(), WorkerError> {
-    if runtime.observe(supervisor) != ProcessObservation::Absent {
+    if supervisor_observation != ProcessObservation::Absent {
         return Err(reconciliation_ambiguous(
             "recorded supervisor identity is live, reused, or ambiguous",
         ));
     }
+    terminate_exact_recorded_group(runtime, child)
+}
+
+/// Stops only the exact recorded child-led process group. Unlike orphan
+/// reconciliation it deliberately does not require a supervisor to be
+/// absent: explicit cancellation runs while a live supervisor has yielded its
+/// guard after publishing durable Running state. Every signal remains gated by
+/// a fresh exact child identity and process-group proof.
+pub(crate) fn terminate_exact_recorded_group(
+    runtime: &dyn ReconciliationRuntime,
+    child: Option<ProcessIdentity>,
+) -> Result<(), WorkerError> {
     let Some(child) = child else {
         return Ok(());
     };
@@ -1172,7 +1184,12 @@ impl<'a> Supervisor<'a> {
             }
         };
         status = running;
-        status_bytes = canonical_json(&status)?;
+
+        // Running is the sole durable handoff boundary. Before this fsynced
+        // status, the elected guard stays held and prelaunch ownership is
+        // unchanged; afterwards an explicit cancellation may acquire the
+        // guard and fence this supervisor while it waits for the child.
+        drop(guard);
 
         if self.fault == Some(SupervisorFaultPoint::AfterRunningStatus) {
             let _ = wait_for_child(child_identity, lease.timeout_millis(), self.inspector)?;
@@ -1180,13 +1197,78 @@ impl<'a> Supervisor<'a> {
         }
 
         let outcome = wait_for_child(child_identity, lease.timeout_millis(), self.inspector)?;
+
+        // Reacquire through the documented admission -> supervisor order.
+        // Cancellation may have won while we were intentionally unlocked,
+        // published Cancelled, cleaned mutable scopes, and released the lease;
+        // in that case do not touch stale status/log capabilities.
+        let admission = self.store.admission_lock(job_id)?;
+        let Some(mut guard) = self.store.supervisor_lock_after(&admission, job_id, true)? else {
+            return Err(protocol_code(
+                "SUPERVISOR_LOCK_UNAVAILABLE",
+                "supervisor lock was unavailable after running handoff",
+            ));
+        };
+        let live = LeaseService::new(self.store).load_after(&admission, job_id);
+        let (current_job, current_bytes, _current, terminal_lease) = match live {
+            // A readable live lease remains the authoritative handoff proof.
+            // Do not allow a valid replacement lease to inherit this
+            // supervisor's terminal-write capability.
+            Ok(Some(live)) if live == lease => {
+                let values = self.revalidate_running_handoff(&lease, &status, &live)?;
+                if values.2.state().is_terminal() {
+                    drop(guard);
+                    drop(admission);
+                    return Ok(());
+                }
+                values
+            }
+            Ok(Some(_)) => {
+                drop(guard);
+                drop(admission);
+                return Err(protocol_code(
+                    "STATUS_CHANGED",
+                    "live lease changed during supervisor handoff",
+                ));
+            }
+            // A completed cancellation removes the exact lease before this
+            // supervisor returns from its intentional unlocked wait. It owns
+            // the terminal state now, so leave it untouched.
+            Ok(None) => {
+                drop(guard);
+                drop(admission);
+                return Ok(());
+            }
+            Err(_) => {
+                // Phase 3 deliberately publishes the terminal result before
+                // attempting exact lease retirement. Preserve that recovery
+                // property when the child has made the known lease unreadable:
+                // the still-held supervisor guard plus the same Accepted
+                // disposition, metadata, and active Running status prove that
+                // neither cancellation nor another lifecycle owner won the
+                // handoff. The cached exact lease is then used only to publish
+                // the terminal result; cleanup/release will retain and enrich
+                // the failure as before.
+                let values = self.revalidate_running_handoff(&lease, &status, &lease)?;
+                if values.2.state().is_terminal() {
+                    drop(guard);
+                    drop(admission);
+                    return Ok(());
+                }
+                values
+            }
+        };
+        drop(admission);
+
+        let stdout = current_job.open_private_append("stdout.log")?;
+        let stderr = current_job.open_private_append("stderr.log")?;
         stdout.sync_all()?;
         stderr.sync_all()?;
         if self.fault == Some(SupervisorFaultPoint::AfterLogSync) {
             return Err(injected_supervisor_fault("log sync"));
         }
-        let stdout_length = job.validate_private_append_binding("stdout.log", &stdout)?;
-        let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
+        let stdout_length = current_job.validate_private_append_binding("stdout.log", &stdout)?;
+        let stderr_length = current_job.validate_private_append_binding("stderr.log", &stderr)?;
         let terminal = match outcome {
             ChildOutcome::Exited(0) => {
                 status.into_succeeded(now_millis()?, stdout_length, stderr_length)?
@@ -1207,10 +1289,10 @@ impl<'a> Supervisor<'a> {
         };
         replace_status(
             self.store,
-            &lease,
+            &terminal_lease,
             &mut guard,
-            &job,
-            &status_bytes,
+            &current_job,
+            &current_bytes,
             &status,
             &terminal,
         )?;
@@ -1218,7 +1300,39 @@ impl<'a> Supervisor<'a> {
             return Err(injected_supervisor_fault("terminal status"));
         }
         drop(guard);
-        self.cleanup_and_release(&lease, &job, terminal)
+        self.cleanup_and_release(&terminal_lease, &current_job, terminal)
+    }
+
+    fn revalidate_running_handoff(
+        &self,
+        expected_lease: &LeaseRecord,
+        expected_status: &JobStatus,
+        terminal_lease: &LeaseRecord,
+    ) -> Result<(RootedDir, Vec<u8>, JobStatus, LeaseRecord), WorkerError> {
+        require_accepted_disposition(
+            self.store.disposition(expected_lease.job_id())?,
+            expected_lease,
+        )?;
+        let current_job = self.store.open_directory(
+            &format!(
+                "jobs/{}/{}/{}",
+                expected_lease.project_id(),
+                expected_lease.worktree_id(),
+                expected_lease.job_id()
+            ),
+            false,
+        )?;
+        let current_meta: JobMeta = read_canonical_json(&current_job, "meta.json")?;
+        require_meta_matches_lease(&current_meta, expected_lease)?;
+        let (current_bytes, current): (Vec<u8>, JobStatus) =
+            read_canonical_json_with_bytes(&current_job, "status.json")?;
+        if !current.state().is_terminal() && current != *expected_status {
+            return Err(protocol_code(
+                "STATUS_CHANGED",
+                "running status changed during supervisor handoff",
+            ));
+        }
+        Ok((current_job, current_bytes, current, terminal_lease.clone()))
     }
 
     fn cleanup_and_release(

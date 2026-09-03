@@ -27,12 +27,12 @@ use mac_worker::{
     config::{Config, WorkerEntry},
     error::WorkerError,
     job::{
-        AdmissionObservation, ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobState,
-        JobStatus, JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
-        LocalJobRecord, LogChunk, LogChunkRequest, LogChunkResponse, LogStream, ProcessIdentity,
-        QueueEntry, QueueEntryKind, QueueState, RemoteUncertainty, RequestFingerprintMaterial,
-        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest, StatusResponse,
-        SubmitRequest, SubmitResponse,
+        AdmissionObservation, CancelRequest, CancelResponse, ClientId, CommandSpec,
+        HostControlError, JobId, JobMeta, JobState, JobStatus, JsonEvent, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseRecord, LeaseToken, LocalJobRecord, LogChunk, LogChunkRequest,
+        LogChunkResponse, LogStream, ProcessIdentity, QueueEntry, QueueEntryKind, QueueState,
+        RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
+        ResolveOrAbandonResponse, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
     },
     lease::{LeaseSummary, SlotState},
     paths::PathLayout,
@@ -41,9 +41,10 @@ use mac_worker::{
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     run::{
-        FollowRuntime, JobFollower, LogsService, RunCompletion, RunObserver, RunReport, RunRequest,
-        RunService, RunStage, STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT,
-        SchedulerRuntime, StatusReport, StatusRow, StatusService, SystemFollowRuntime,
+        CancelReport, CancelService, FollowRuntime, JobFollower, LogsService, RunCompletion,
+        RunObserver, RunReport, RunRequest, RunService, RunStage, STATUS_LIST_LIMIT,
+        STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT, SchedulerRuntime, StatusReport, StatusRow,
+        StatusService, SystemFollowRuntime,
     },
     run_with_io_in_context,
     scheduler::{CandidateSlot, WorkerPreference},
@@ -427,6 +428,22 @@ fn canonical_job_bytes(record: &LocalJobRecord) -> Vec<u8> {
 
 fn assert_status_call(request: &ProcessRequest, deadline: Duration, job_id: JobId) {
     assert_control_call(request, HostOperation::Status, deadline);
+    let status: StatusRequest = serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+    assert_eq!(status.job_id(), job_id);
+}
+
+fn assert_resolution_status_call(request: &ProcessRequest, job_id: JobId) {
+    assert_eq!(request.program, OsStr::new("/usr/bin/ssh"));
+    assert_eq!(
+        request.args.last().unwrap(),
+        HostOperation::Status.command()
+    );
+    assert_eq!(request.args[9], OsStr::new("mac1"));
+    assert!(
+        request.policy.deadline > Duration::ZERO
+            && request.policy.deadline <= Duration::from_secs(30),
+        "resolution status request must retain a finite control deadline"
+    );
     let status: StatusRequest = serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
     assert_eq!(status.job_id(), job_id);
 }
@@ -2323,6 +2340,7 @@ enum RunScriptStep {
     SubmitAccepted,
     SubmitAcceptedMismatch,
     SubmitExisting,
+    CancelPrelaunch,
     TransportFailure(HostOperation),
     AuthoritativeFailure(HostOperation, &'static str),
     UploadFailure,
@@ -2800,6 +2818,26 @@ impl ProcessRunner for RunScriptRunner {
                     })
                 }
             }
+            RunScriptStep::CancelPrelaunch => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    HostOperation::Cancel.command()
+                );
+                let cancel: CancelRequest =
+                    serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                let material = state.material.as_ref().unwrap();
+                assert_eq!(cancel.job_id(), material.job_id());
+                assert_eq!(cancel.client_id(), material.client_id());
+                assert_eq!(cancel.lease_token(), material.lease_token());
+                assert_eq!(cancel.request_fingerprint(), &material.fingerprint());
+                let cancelled = JobStatus::accepted(material.created_at_millis())
+                    .unwrap()
+                    .into_prelaunch_cancelled(material.created_at_millis() + 1, 0, 0)
+                    .unwrap();
+                canonical_process(
+                    &CancelResponse::new(material_status(material, cancelled)).unwrap(),
+                )
+            }
             RunScriptStep::TransportFailure(operation) => {
                 assert_eq!(request.args.last().unwrap(), operation.command());
                 if operation == HostOperation::LeaseAcquire {
@@ -3195,6 +3233,16 @@ struct RecordingRunObserver {
     fail_at: Option<RunStage>,
 }
 
+struct CancelAtClaimObserver {
+    store: ClientStateStore,
+    requests: AtomicUsize,
+}
+
+struct CancelAtSubmissionObserver {
+    store: ClientStateStore,
+    requests: AtomicUsize,
+}
+
 impl RecordingRunObserver {
     fn recording() -> Self {
         Self {
@@ -3232,6 +3280,49 @@ impl RunObserver for RecordingRunObserver {
         } else {
             Ok(())
         }
+    }
+}
+
+impl RunObserver for CancelAtClaimObserver {
+    fn observe(&self, stage: RunStage) -> Result<(), WorkerError> {
+        if stage != RunStage::QueueClaim {
+            return Ok(());
+        }
+        let job_id = self
+            .store
+            .queue_snapshot()?
+            .entries()
+            .first()
+            .ok_or_else(|| WorkerError::Queue {
+                code: "QUEUE_NOT_FOUND",
+                message: "claim observer found no durable queue row".into(),
+            })?
+            .job_id();
+        self.store.request_queue_cancel(job_id, 90_201)?;
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl RunObserver for CancelAtSubmissionObserver {
+    fn observe(&self, stage: RunStage) -> Result<(), WorkerError> {
+        if stage != RunStage::JobSubmission {
+            return Ok(());
+        }
+        let entry = self
+            .store
+            .queue_snapshot()?
+            .entries()
+            .first()
+            .cloned()
+            .ok_or_else(|| WorkerError::Queue {
+                code: "QUEUE_NOT_FOUND",
+                message: "submission observer found no durable queue row".into(),
+            })?;
+        self.store
+            .request_queue_cancel(entry.job_id(), entry.enqueued_at_millis())?;
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -3503,6 +3594,443 @@ fn no_wait_busy_pin_rejects_before_enqueue_snapshot_or_reroute() {
     );
     assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
     runner.assert_consumed();
+}
+
+#[test]
+fn cancel_removes_waiting_entry_without_ssh_or_snapshot() {
+    // Break caught: public cancellation reaches a worker or creates a snapshot
+    // after the queue lock proves this row is still waiting.
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let job_id = JobId::new(uuid::Uuid::from_u128(90_001));
+    store
+        .enqueue(
+            QueueEntry::new(
+                job_id,
+                store.client_id(),
+                "a".repeat(64),
+                "b".repeat(64),
+                CommandSpec::argv(vec!["queued".into()])
+                    .unwrap()
+                    .summary()
+                    .unwrap(),
+                Vec::new(),
+                WorkerPreference::Automatic,
+                QueueEntryKind::Batch,
+                None,
+                ProcessIdentity::new(90_001, 900_010_007).unwrap(),
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let runner = RecordingRunner::returning(Vec::new());
+    let runtime = TestSchedulerRuntime::new(2_000, 900);
+    let cancel_config = config();
+    let service =
+        CancelService::new(&runner, &cancel_config, &store).with_scheduler_runtime(&runtime);
+
+    assert_eq!(
+        service.cancel(job_id).unwrap(),
+        CancelReport::QueuedCancelled { job_id }
+    );
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    assert!(runner.requests().is_empty());
+    assert!(!paths.cache.join("snapshots").exists());
+}
+
+#[test]
+fn cancel_resolves_the_original_record_then_sends_one_exact_typed_remote_request() {
+    // Break caught: cancellation fabricates a new identity, targets a worker
+    // chosen by fresh scheduling, or puts a version envelope on the fixed
+    // cancel request before reaching the recorded host.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(
+        &store,
+        90_101,
+        100,
+        Some(JobStatus::accepted(100).unwrap()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(record.clone()).unwrap();
+    let cancelled = JobStatus::accepted(100)
+        .unwrap()
+        .into_prelaunch_cancelled(101, 0, 0)
+        .unwrap();
+    let accepted =
+        StatusResponse::new(record.meta().clone(), JobStatus::accepted(100).unwrap()).unwrap();
+    let response =
+        CancelResponse::new(StatusResponse::new(record.meta().clone(), cancelled.clone()).unwrap())
+            .unwrap();
+    let runner =
+        RecordingRunner::returning(vec![status_result(&accepted), status_result(&response)]);
+    let config = config();
+    let report = CancelService::new(&runner, &config, &store)
+        .cancel(record.meta().job_id())
+        .unwrap();
+
+    assert_eq!(
+        report,
+        CancelReport::RemoteCancelled {
+            response: response.clone()
+        }
+    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 2);
+    assert_resolution_status_call(&requests[0], record.meta().job_id());
+    assert_control_call(&requests[1], HostOperation::Cancel, Duration::from_secs(30));
+    let request: CancelRequest =
+        serde_json::from_slice(requests[1].stdin.as_deref().unwrap()).unwrap();
+    assert_eq!(request.job_id(), record.meta().job_id());
+    assert_eq!(request.client_id(), record.meta().client_id());
+    assert_eq!(request.lease_token(), record.lease_token());
+    assert_eq!(
+        request.request_fingerprint(),
+        record.meta().request_fingerprint()
+    );
+    let wire: Value = serde_json::from_slice(requests[1].stdin.as_deref().unwrap()).unwrap();
+    assert_eq!(wire.as_object().unwrap().len(), 4);
+    assert!(wire.get("protocol_version").is_none());
+    assert_eq!(
+        store
+            .load_job(record.meta().job_id())
+            .unwrap()
+            .last_status(),
+        Some(&cancelled)
+    );
+}
+
+#[test]
+fn cancel_transport_loss_is_resolved_only_by_original_id_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(
+        &store,
+        90_102,
+        100,
+        Some(JobStatus::accepted(100).unwrap()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(record.clone()).unwrap();
+    let accepted =
+        StatusResponse::new(record.meta().clone(), JobStatus::accepted(100).unwrap()).unwrap();
+    let cancelled = JobStatus::accepted(100)
+        .unwrap()
+        .into_prelaunch_cancelled(101, 0, 0)
+        .unwrap();
+    let terminal = StatusResponse::new(record.meta().clone(), cancelled.clone()).unwrap();
+    let runner = RecordingRunner::returning(vec![
+        status_result(&accepted),
+        transport_failure(),
+        status_result(&terminal),
+    ]);
+    let config = config();
+
+    let report = CancelService::new(&runner, &config, &store)
+        .cancel(record.meta().job_id())
+        .unwrap();
+
+    assert!(matches!(report, CancelReport::RemoteCancelled { .. }));
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 3);
+    assert_resolution_status_call(&requests[0], record.meta().job_id());
+    assert_control_call(&requests[1], HostOperation::Cancel, Duration::from_secs(30));
+    assert_status_call(
+        &requests[2],
+        Duration::from_secs(30),
+        record.meta().job_id(),
+    );
+    assert_eq!(
+        store
+            .load_job(record.meta().job_id())
+            .unwrap()
+            .last_status(),
+        Some(&cancelled)
+    );
+}
+
+#[test]
+fn cancel_unknown_remote_record_is_recovery_required_and_never_guessed_cancelled() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(
+        &store,
+        90_103,
+        100,
+        None,
+        RemoteUncertainty::unknown_remote("UNKNOWN_REMOTE").unwrap(),
+    );
+    store.create_job(record.clone()).unwrap();
+    let runner = RecordingRunner::returning(Vec::new());
+    let config = config();
+
+    let error = CancelService::new(&runner, &config, &store)
+        .cancel(record.meta().job_id())
+        .unwrap_err();
+
+    assert!(error.to_string().contains("UNKNOWN_REMOTE"), "{error}");
+    assert!(runner.requests().is_empty());
+    assert_eq!(
+        store
+            .load_job(record.meta().job_id())
+            .unwrap()
+            .remote_uncertainty(),
+        record.remote_uncertainty()
+    );
+}
+
+#[test]
+fn claim_race_cancellation_retires_only_the_exact_prelocal_dispatch_without_remote_work() {
+    // Break caught: cancel deletes a claimed row, the owner misses the durable
+    // request and crosses a remote boundary, or a queue report says queued
+    // after an accepted job could exist.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(paths.state.clone(), [RunScriptStep::ProbeReady]);
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(90_200, 90_201);
+    let observer = CancelAtClaimObserver {
+        store: store.clone(),
+        requests: AtomicUsize::new(0),
+    };
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_observer(&observer)
+        .with_scheduler_runtime(&scheduler);
+
+    let error = service
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Queue {
+            code: "CANCELLED",
+            ..
+        }
+    ));
+    assert_eq!(observer.requests.load(Ordering::SeqCst), 1);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert_eq!(
+        runner.requests().len(),
+        1,
+        "only pre-claim admission probe is allowed"
+    );
+    assert_eq!(
+        runner.requests()[0].args.last().unwrap(),
+        "~/.local/bin/worker host probe"
+    );
+    assert_no_run_capture(&paths.cache);
+    runner.assert_consumed();
+}
+
+#[test]
+fn dispatch_owner_cancels_an_acceptance_that_races_submit_completion() {
+    // Break caught: a cancellation recorded while submit returns is skipped,
+    // allowing the dispatcher to publish/follow an accepted job instead of
+    // resolving the original ID and issuing its exact typed cancellation.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(
+        paths.state.clone(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+            RunScriptStep::StatusAccepted,
+            RunScriptStep::CancelPrelaunch,
+        ],
+    );
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let observer = CancelAtSubmissionObserver {
+        store: store.clone(),
+        requests: AtomicUsize::new(0),
+    };
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_observer(&observer);
+
+    let error = service
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Queue {
+            code: "CANCELLED",
+            ..
+        }
+    ));
+    assert_eq!(observer.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    let record = store
+        .list_jobs()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("local record remains as authoritative cancellation evidence");
+    assert_eq!(
+        record.last_status().map(JobStatus::state),
+        Some(JobState::Cancelled)
+    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 7);
+    assert_resolution_status_call(&requests[5], record.meta().job_id());
+    assert_control_call(&requests[6], HostOperation::Cancel, Duration::from_secs(30));
+    runner.assert_consumed();
+}
+
+#[test]
+fn dispatch_cancel_with_a_durable_record_reports_remote_never_queued() {
+    // Break caught: a caller observes a dispatch row, then reports a queued
+    // cancellation even though the owner has already durably published the
+    // exact identity that may have reached remote acceptance.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(
+        &store,
+        90_104,
+        100,
+        Some(JobStatus::accepted(100).unwrap()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(record.clone()).unwrap();
+    let owner = ProcessIdentity::new(90_204, 902_040_007).unwrap();
+    store
+        .enqueue(
+            QueueEntry::new(
+                record.meta().job_id(),
+                store.client_id(),
+                record.meta().project_id().into(),
+                record.meta().worktree_id().into(),
+                record.meta().command_summary().clone(),
+                Vec::new(),
+                WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                QueueEntryKind::Batch,
+                None,
+                owner,
+                record.meta().created_at_millis(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    store
+        .claim_next(
+            owner,
+            &["mini-1".into()],
+            record.meta().created_at_millis() + 1,
+        )
+        .unwrap()
+        .expect("exact owner must claim its row");
+    let accepted =
+        StatusResponse::new(record.meta().clone(), JobStatus::accepted(100).unwrap()).unwrap();
+    let cancelled = JobStatus::accepted(100)
+        .unwrap()
+        .into_prelaunch_cancelled(101, 0, 0)
+        .unwrap();
+    let response =
+        CancelResponse::new(StatusResponse::new(record.meta().clone(), cancelled).unwrap())
+            .unwrap();
+    let runner =
+        RecordingRunner::returning(vec![status_result(&accepted), status_result(&response)]);
+    let runtime = TestSchedulerRuntime::new(90_205, 90_205);
+    let config = config();
+
+    let report = CancelService::new(&runner, &config, &store)
+        .with_scheduler_runtime(&runtime)
+        .cancel(record.meta().job_id())
+        .unwrap();
+
+    assert_eq!(report, CancelReport::RemoteCancelled { response });
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 2);
+    assert_resolution_status_call(&requests[0], record.meta().job_id());
+    assert_control_call(&requests[1], HostOperation::Cancel, Duration::from_secs(30));
+}
+
+#[test]
+fn dispatch_cancel_without_a_record_waits_boundedly_and_never_reports_queued() {
+    // Break caught: the public caller retires a claimed row itself or claims
+    // queued cancellation while the dispatch owner could still publish the
+    // original identity and resolve remote acceptance.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let job_id = JobId::new(uuid::Uuid::from_u128(90_105));
+    let owner = ProcessIdentity::new(90_205, 902_050_007).unwrap();
+    store
+        .enqueue(
+            QueueEntry::new(
+                job_id,
+                store.client_id(),
+                "a".repeat(64),
+                "b".repeat(64),
+                CommandSpec::argv(vec!["queued".into()])
+                    .unwrap()
+                    .summary()
+                    .unwrap(),
+                Vec::new(),
+                WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                QueueEntryKind::Batch,
+                None,
+                owner,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    store
+        .claim_next(owner, &["mini-1".into()], 2)
+        .unwrap()
+        .expect("exact owner must claim its row");
+    let runner = RecordingRunner::returning(Vec::new());
+    let scheduler = TestSchedulerRuntime::new(90_206, 90_206);
+    let config = config();
+
+    let error = CancelService::new(&runner, &config, &store)
+        .with_scheduler_runtime(&scheduler)
+        .cancel(job_id)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Queue {
+            code: "CANCEL_PENDING",
+            ..
+        }
+    ));
+    assert!(runner.requests().is_empty());
+    assert_eq!(scheduler.sleeps(), vec![Duration::from_secs(1)]);
+    let queue = store.queue_snapshot().unwrap();
+    assert_eq!(queue.entries().len(), 1);
+    assert!(
+        matches!(queue.entries()[0].state(), QueueState::Dispatching { dispatch_owner, .. } if *dispatch_owner == owner)
+    );
+    assert!(queue.entries()[0].is_cancel_requested());
 }
 
 #[test]
@@ -8383,7 +8911,7 @@ fn public_diag_json_error_keeps_exit_and_rejects_oversized_internal_payload() {
 
 #[test]
 fn public_diag_missing_config_is_sanitized_for_human_and_json() {
-    // Break caught: public run/logs/status render WorkerError::Display, so a
+    // Break caught: public run/logs/status/cancel render WorkerError::Display, so a
     // missing --config prints its absolute path and planted secret.
     let planted_secret = "PLANTED_PUBLIC_SECRET";
     let temp = tempfile::tempdir().unwrap();
@@ -8397,10 +8925,10 @@ fn public_diag_missing_config_is_sanitized_for_human_and_json() {
     assert!(missing.is_absolute());
     let planted_path = missing.to_string_lossy().into_owned();
     let job_id = JOB_ID.parse().unwrap();
-    let command_kinds = ["run", "logs", "status"];
+    let command_kinds = ["run", "logs", "status", "cancel"];
 
     for kind in command_kinds {
-        let is_status = kind == "status";
+        let is_status = matches!(kind, "status" | "cancel");
         for json in [false, true] {
             let command = match kind {
                 "run" => WorkerCommand::Run {
@@ -8416,9 +8944,10 @@ fn public_diag_missing_config_is_sanitized_for_human_and_json() {
                     follow: false,
                     job_id,
                 },
-                _ => WorkerCommand::Status {
+                "status" => WorkerCommand::Status {
                     job_id: Some(job_id),
                 },
+                _ => WorkerCommand::Cancel { job_id },
             };
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();

@@ -6,6 +6,7 @@ pub enum CommandOutput {
     Workers(crate::protocol::WorkersReport),
     Probe(crate::protocol::ProbeResponse),
     Status(crate::run::StatusReport),
+    Cancel(crate::run::CancelReport),
 }
 
 impl CommandOutput {
@@ -57,6 +58,16 @@ impl CommandOutput {
                 probe.hostname, probe.arch, probe.os_version, probe.protocol_version
             ),
             Self::Status(report) => render_status_report(report),
+            Self::Cancel(report) => match report {
+                crate::run::CancelReport::QueuedCancelled { job_id } => {
+                    format!("job {job_id} cancelled while queued")
+                }
+                crate::run::CancelReport::RemoteCancelled { response } => format!(
+                    "job {} cancellation resolved as {}",
+                    response.status().meta().job_id(),
+                    job_state_name(response.status().status().state())
+                ),
+            },
         }
     }
 

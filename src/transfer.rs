@@ -18,11 +18,11 @@ use crate::{
     error::{ProcessError, ProcessStream, WorkerError},
     host_store::{HostStore, JobDisposition},
     job::{
-        ClientId, CommandSummary, HostControlError, JobId, LeaseAcquireRequest, LeaseRecord,
-        LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse, LogStream, MAX_LOG_CHUNK_BYTES,
-        PreacceptanceDisposition, RequestFingerprint, ResolveOrAbandonOutcome,
-        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest, StatusResponse,
-        SubmitRequest, SubmitResponse,
+        CancelRequest, CancelResponse, ClientId, CommandSummary, HostControlError, JobId,
+        LeaseAcquireRequest, LeaseRecord, LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse,
+        LogStream, MAX_LOG_CHUNK_BYTES, PreacceptanceDisposition, RequestFingerprint,
+        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest,
+        StatusResponse, SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
@@ -53,6 +53,7 @@ pub enum HostOperation {
     Status,
     LogChunk,
     ResolveOrAbandon,
+    Cancel,
 }
 
 impl HostOperation {
@@ -64,6 +65,7 @@ impl HostOperation {
             Self::Status => "~/.local/bin/worker host status",
             Self::LogChunk => "~/.local/bin/worker host log-chunk",
             Self::ResolveOrAbandon => "~/.local/bin/worker host resolve-or-abandon",
+            Self::Cancel => "~/.local/bin/worker host cancel",
         }
     }
 }
@@ -671,6 +673,30 @@ impl<'a> RemoteJobClient<'a> {
         job_id: JobId,
     ) -> Result<StatusResponse, WorkerError> {
         self.status_with_deadline(worker, job_id, MAX_CONTROL_DEADLINE)
+    }
+
+    pub fn cancel(
+        &self,
+        worker: &WorkerEntry,
+        request: &CancelRequest,
+    ) -> Result<CancelResponse, WorkerError> {
+        request.validate()?;
+        let response: CancelResponse = self.transport.request(
+            worker,
+            HostOperation::Cancel,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        response.validate()?;
+        let meta = response.status().meta();
+        if meta.job_id() != request.job_id()
+            || meta.client_id() != request.client_id()
+            || meta.request_fingerprint() != request.request_fingerprint()
+            || meta.worker_name() != worker.name
+        {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
     }
 
     pub fn log_chunk(

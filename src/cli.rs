@@ -61,6 +61,9 @@ pub enum Command {
         follow: bool,
         job_id: JobId,
     },
+    Cancel {
+        job_id: JobId,
+    },
     #[command(hide = true)]
     Host {
         #[command(subcommand)]
@@ -76,6 +79,7 @@ pub enum HostCommand {
     LogChunk,
     #[command(name = "resolve-or-abandon")]
     ResolveOrAbandon,
+    Cancel,
     Submit,
     Supervise {
         job_id: HiddenComponent,

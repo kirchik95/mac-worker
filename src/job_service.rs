@@ -14,19 +14,24 @@ use crate::{
     },
     inputs::RelativePath,
     job::{
-        ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseRecord, LeaseToken,
-        LogChunk, LogStream, ProcessIdentity, RequestFingerprint, RequestFingerprintMaterial,
-        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusResponse, SubmitRequest,
-        SubmitResponse,
+        CancelRequest, CancelResponse, ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus,
+        LeaseRecord, LeaseToken, LogChunk, LogStream, ProcessIdentity, RequestFingerprint,
+        RequestFingerprintMaterial, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
+        StatusResponse, SubmitRequest, SubmitResponse,
     },
     lease::LeaseService,
     remote_snapshot::{RemoteSnapshotService, VerifiedRemoteSnapshot},
     rooted_fs::{RootedDir, is_log_offset_beyond_eof},
-    supervisor::{ReconciliationRuntime, SystemReconciliationRuntime, reconcile_orphan_processes},
+    supervisor::{
+        ProcessObservation, ReconciliationRuntime, SystemReconciliationRuntime,
+        reconcile_orphan_processes, terminate_exact_recorded_group,
+    },
 };
 
 const EXECUTION_PAYLOAD_VERSION: u32 = 1;
 const MAX_HOST_JSON_BYTES: u64 = 1024 * 1024;
+const CANCEL_SUPERVISOR_HANDOFF_DEADLINE: Duration = Duration::from_secs(5);
+const CANCEL_SUPERVISOR_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,6 +192,14 @@ struct AuthoritativeJob {
     directory: RootedDir,
 }
 
+struct CancelAuthority {
+    lease: Option<LeaseRecord>,
+    directory: RootedDir,
+    meta: JobMeta,
+    status_bytes: Vec<u8>,
+    status: JobStatus,
+}
+
 enum ResolutionFinal {
     Complete,
     Incomplete(RootedDir),
@@ -343,6 +356,243 @@ impl<'a> JobService<'a> {
     pub fn reconcile_job(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
         self.authoritative_job_with_supervisor_ensure(job_id, true)
             .map(AuthoritativeJob::into_response)
+    }
+
+    /// Cancels one exactly identified accepted job. The admission lock proves
+    /// immutable ownership, the supervisor lock fences launch/terminal
+    /// publication, and both locks are released before TERM/KILL waits or
+    /// mutable cleanup reacquires admission -> capacity.
+    pub fn cancel(&self, request: CancelRequest) -> Result<CancelResponse, WorkerError> {
+        request.validate()?;
+        self.store.validate_layout()?;
+        let job_id = request.job_id();
+        let handoff_deadline = Instant::now() + CANCEL_SUPERVISOR_HANDOFF_DEADLINE;
+
+        // A cancellation never blocks on the supervisor while holding
+        // admission: a pre-Running supervisor may need admission after
+        // releasing its own guard to publish cleanup. Each retry gets fresh
+        // admission authority, revalidates every durable identity, then
+        // attempts the supervisor handoff nonblocking.
+        let (admission, mut supervisor, current) = loop {
+            let admission = self.store.admission_lock(job_id)?;
+            let initial = self.read_cancel_authority_after(&admission, &request)?;
+
+            // A lease-retired terminal has already completed cleanup. It
+            // must prove the original token through the durable marker rather
+            // than being accepted on a job ID/meta match alone.
+            if initial.status.state().is_terminal() && initial.lease.is_none() {
+                self.store.validate_cancel_cleanup_marker_after(
+                    &admission,
+                    &request,
+                    &initial.meta,
+                )?;
+                drop(admission);
+                return cancel_response(initial.meta, initial.status);
+            }
+
+            let Some(supervisor) = self
+                .store
+                .supervisor_lock_after(&admission, job_id, false)?
+            else {
+                drop(admission);
+                if Instant::now() >= handoff_deadline {
+                    return Err(protocol_code(
+                        "SUPERVISOR_LOCK_PENDING",
+                        "supervisor handoff did not become available during cancellation",
+                    ));
+                }
+                std::thread::sleep(CANCEL_SUPERVISOR_HANDOFF_POLL_INTERVAL);
+                continue;
+            };
+
+            // A normal supervisor may have completed while this attempt was
+            // waiting outside admission. Re-read every durable authority
+            // while both capabilities are held; never infer a current state
+            // from the pre-wait observation or overwrite its terminal result.
+            let current = self.read_cancel_authority_after(&admission, &request)?;
+            break (admission, supervisor, current);
+        };
+
+        if current.status.state().is_terminal() {
+            if let Some(lease) = current.lease.as_ref() {
+                let terminal = current.status.clone();
+                let meta = current.meta.clone();
+                let job = current.directory;
+                drop(supervisor);
+                drop(admission);
+                self.cleanup_and_release_reconciled(lease, &job, &terminal)?;
+                return cancel_response(meta, terminal);
+            }
+            self.store
+                .validate_cancel_cleanup_marker_after(&admission, &request, &current.meta)?;
+            drop(supervisor);
+            drop(admission);
+            return cancel_response(current.meta, current.status);
+        }
+
+        let lease = current.lease.as_ref().ok_or_else(|| {
+            job_state_invalid("nonterminal cancellation target has no live lease")
+        })?;
+        let status = current.status;
+        let status_bytes = current.status_bytes;
+        let job = current.directory;
+        let meta = current.meta;
+
+        let cancelled = if status.child_identity().is_none() {
+            // This is the accepted/no-child launch fence. There is no process
+            // identity to signal; publish the deliberate no-child terminal
+            // form before any mutable data is removed.
+            let (stdout_length, stderr_length) = synced_log_lengths(&job)?;
+            let cancelled = status.into_prelaunch_cancelled(
+                reconciliation_timestamp(status.updated_at_millis())?,
+                stdout_length,
+                stderr_length,
+            )?;
+            self.store.replace_job_status_after(
+                &mut supervisor,
+                lease,
+                &job,
+                &status_bytes,
+                &status,
+                &cancelled,
+            )?;
+            cancelled
+        } else {
+            // Do not keep admission across the bounded group proof. The
+            // supervisor capability remains held so a natural terminal write
+            // cannot race this cancellation decision.
+            drop(admission);
+            terminate_exact_recorded_group(self.reconciliation.as_ref(), status.child_identity())?;
+            let (stdout_length, stderr_length) = synced_log_lengths(&job)?;
+            let cancelled = status.into_infrastructure_terminal(
+                JobState::Cancelled,
+                reconciliation_timestamp(status.updated_at_millis())?,
+                stdout_length,
+                stderr_length,
+                "CANCELLED".into(),
+            )?;
+            self.store.replace_job_status_after(
+                &mut supervisor,
+                lease,
+                &job,
+                &status_bytes,
+                &status,
+                &cancelled,
+            )?;
+            drop(supervisor);
+            self.cleanup_and_release_reconciled(lease, &job, &cancelled)?;
+            return cancel_response(meta, cancelled);
+        };
+
+        drop(supervisor);
+        drop(admission);
+        self.cleanup_and_release_reconciled(lease, &job, &cancelled)?;
+        cancel_response(meta, cancelled)
+    }
+
+    fn read_cancel_authority_after(
+        &self,
+        admission: &AdmissionGuard,
+        request: &CancelRequest,
+    ) -> Result<CancelAuthority, WorkerError> {
+        request.validate()?;
+        let job_id = request.job_id();
+        admission.validate_for(job_id)?;
+        let disposition = self
+            .store
+            .disposition(job_id)?
+            .ok_or_else(|| protocol_code("JOB_NOT_FOUND", "job ID is not indexed"))?;
+        let (project_id, worktree_id, indexed_initial) = match disposition {
+            JobDisposition::Accepted {
+                job_id: indexed_job,
+                client_id,
+                project_id,
+                worktree_id,
+                request_fingerprint,
+                status: indexed_initial,
+                ..
+            } => {
+                if indexed_job != job_id
+                    || client_id != request.client_id()
+                    || request_fingerprint != *request.request_fingerprint()
+                {
+                    return Err(protocol_code(
+                        "JOB_ID_CONFLICT",
+                        "cancel request does not match the accepted job index",
+                    ));
+                }
+                (project_id, worktree_id, indexed_initial)
+            }
+            JobDisposition::Abandoned { .. } => {
+                return Err(protocol_code(
+                    "JOB_ABANDONED",
+                    "job ID was permanently abandoned",
+                ));
+            }
+        };
+        let directory = self
+            .store
+            .open_directory(&format!("jobs/{project_id}/{worktree_id}/{job_id}"), false)
+            .map_err(|_| job_state_invalid("accepted job directory is absent or unsafe"))?;
+        let meta: JobMeta = read_canonical_json(&directory, "meta.json")
+            .map_err(|_| job_state_invalid("canonical job metadata is invalid"))?;
+        if meta.job_id() != job_id
+            || meta.client_id() != request.client_id()
+            || meta.project_id() != project_id
+            || meta.worktree_id() != worktree_id
+            || meta.request_fingerprint() != request.request_fingerprint()
+        {
+            return Err(protocol_code(
+                "JOB_ID_CONFLICT",
+                "accepted index does not match canonical job metadata",
+            ));
+        }
+        let expected_initial = JobStatus::accepted(meta.created_at_millis())
+            .map_err(|_| job_state_invalid("accepted job timestamp is invalid"))?;
+        if indexed_initial != expected_initial {
+            return Err(job_state_invalid(
+                "accepted index does not contain the immutable initial status",
+            ));
+        }
+        let (status_bytes, status): (Vec<u8>, JobStatus) =
+            read_mutable_canonical_json_with_bytes(&directory, "status.json")
+                .map_err(|_| job_state_invalid("canonical mutable job status is invalid"))?;
+        validate_queryable_status(&meta, &status)?;
+        if status.state().is_terminal() {
+            validate_terminal_log_lengths(&directory, &status)?;
+        }
+
+        let loaded = self
+            .leases
+            .load_after(admission, job_id)
+            .map_err(|_| job_state_invalid("live lease is invalid"))?;
+        let lease = match loaded {
+            Some(lease) if lease.job_id() == job_id => {
+                require_meta_matches_live_lease(&meta, &lease)?;
+                require_cancel_matches_lease(request, &lease)?;
+                Some(lease)
+            }
+            Some(_) if status.state().is_terminal() => None,
+            Some(_) => {
+                return Err(job_state_invalid(
+                    "nonterminal cancellation target has no live lease",
+                ));
+            }
+            None if !status.state().is_terminal() => {
+                return Err(job_state_invalid(
+                    "nonterminal cancellation target has no live lease",
+                ));
+            }
+            None => None,
+        };
+        admission.validate_for(job_id)?;
+        Ok(CancelAuthority {
+            lease,
+            directory,
+            meta,
+            status_bytes,
+            status,
+        })
     }
 
     pub fn resolve_or_abandon(
@@ -931,10 +1181,28 @@ impl<'a> JobService<'a> {
             let supervisor_identity = current.supervisor_identity().ok_or_else(|| {
                 job_state_invalid("nonterminal supervised job has no supervisor identity")
             })?;
+            // A normal supervisor deliberately releases its lock only after
+            // durable Running publication. If that exact detached supervisor
+            // is still live in its own recorded process group, this is a live
+            // handoff rather than an orphan: do not write Lost or signal the
+            // child. Reused, ambiguous, and wrong-group observations retain
+            // the existing fail-closed reconciliation path below.
+            let supervisor_observation = self.reconciliation.observe(supervisor_identity);
+            if current.state() == JobState::Running
+                && matches!(
+                    supervisor_observation,
+                    ProcessObservation::Matching { process_group }
+                        if process_group == supervisor_identity.pid()
+                )
+            {
+                drop(supervisor);
+                drop(admission);
+                return AuthoritativeJob::new(job, meta, current);
+            }
             drop(admission);
             reconcile_orphan_processes(
                 self.reconciliation.as_ref(),
-                supervisor_identity,
+                supervisor_observation,
                 current.child_identity(),
             )?;
             self.store
@@ -1731,6 +1999,41 @@ fn reconciliation_timestamp(previous: u64) -> Result<u64, WorkerError> {
     Ok(now.max(previous))
 }
 
+fn cancel_response(meta: JobMeta, status: JobStatus) -> Result<CancelResponse, WorkerError> {
+    CancelResponse::new(StatusResponse::new(meta, status)?)
+}
+
+fn require_cancel_matches_lease(
+    request: &CancelRequest,
+    lease: &LeaseRecord,
+) -> Result<(), WorkerError> {
+    request.validate()?;
+    lease
+        .validate()
+        .map_err(|_| job_state_invalid("live lease is invalid"))?;
+    if request.job_id() != lease.job_id()
+        || request.client_id() != lease.client_id()
+        || request.lease_token() != lease.lease_token()
+        || request.request_fingerprint() != lease.request_fingerprint()
+    {
+        return Err(protocol_code(
+            "JOB_ID_CONFLICT",
+            "cancel request does not match the live lease",
+        ));
+    }
+    Ok(())
+}
+
+fn synced_log_lengths(job: &RootedDir) -> Result<(u64, u64), WorkerError> {
+    let stdout = job.open_private_append("stdout.log")?;
+    let stderr = job.open_private_append("stderr.log")?;
+    stdout.sync_all()?;
+    stderr.sync_all()?;
+    let stdout_length = job.validate_private_append_binding("stdout.log", &stdout)?;
+    let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
+    Ok((stdout_length, stderr_length))
+}
+
 fn validate_queryable_status(meta: &JobMeta, status: &JobStatus) -> Result<(), WorkerError> {
     meta.validate()
         .map_err(|_| job_state_invalid("canonical job metadata is invalid"))?;
@@ -1754,11 +2057,23 @@ fn validate_queryable_status(meta: &JobMeta, status: &JobStatus) -> Result<(), W
         ));
     }
     match status.state() {
-        JobState::Succeeded | JobState::Failed | JobState::Cancelled | JobState::TimedOut
+        JobState::Succeeded | JobState::Failed | JobState::TimedOut
             if status.supervisor_identity().is_none() || status.child_identity().is_none() =>
         {
             return Err(job_state_invalid(
                 "command terminal status requires both durable process identities",
+            ));
+        }
+        JobState::Cancelled if status.child_identity().is_none() => {
+            if status.error_code() != Some("CANCELLED_PRELAUNCH") {
+                return Err(job_state_invalid(
+                    "no-child cancelled status must be the deliberate prelaunch cancellation form",
+                ));
+            }
+        }
+        JobState::Cancelled if status.supervisor_identity().is_none() => {
+            return Err(job_state_invalid(
+                "running cancellation requires both durable process identities",
             ));
         }
         JobState::Lost if status.supervisor_identity().is_none() => {

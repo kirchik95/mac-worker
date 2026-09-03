@@ -20,9 +20,9 @@ use crate::{
     error::WorkerError,
     inputs::RelativePath,
     job::{
-        ClientId, CommandSummary, JobId, JobMeta, JobStatus, LeaseAcquireRequest, LeaseRecord,
-        LeaseToken, RequestFingerprint, RequestFingerprintMaterial, ResolveOrAbandonRequest,
-        SubmitRequest,
+        CancelRequest, ClientId, CommandSummary, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
+        LeaseRecord, LeaseToken, RequestFingerprint, RequestFingerprintMaterial,
+        ResolveOrAbandonRequest, SubmitRequest,
     },
     rooted_fs::{PrivateEntryIdentity, RootedDir},
 };
@@ -2185,6 +2185,64 @@ impl HostStore {
         transfer.validate()
     }
 
+    /// A terminal job whose lease has already been retired is only
+    /// cancellable-idempotently when the request still proves ownership of
+    /// the durable cleanup marker. This prevents a stale/reused job ID from
+    /// being treated as a successful cancellation after capacity release.
+    pub(crate) fn validate_cancel_cleanup_marker_after(
+        &self,
+        admission: &AdmissionGuard,
+        request: &CancelRequest,
+        meta: &JobMeta,
+    ) -> Result<(), WorkerError> {
+        request.validate()?;
+        meta.validate()?;
+        admission.validate_for(request.job_id())?;
+        if meta.job_id() != request.job_id()
+            || meta.client_id() != request.client_id()
+            || meta.request_fingerprint() != request.request_fingerprint()
+        {
+            return Err(protocol_code(
+                "JOB_ID_CONFLICT",
+                "cancel request does not match durable job metadata",
+            ));
+        }
+        let proof_dir = self
+            .open_directory(&format!("locks/jobs/{}", request.job_id()), false)
+            .map_err(|_| {
+                protocol_code(
+                    "CLEANUP_PROOF_MISSING",
+                    "terminal job has no durable cleanup proof",
+                )
+            })?;
+        let marker: CleanupMarker = read_json_strict_at(&proof_dir, "cleanup-complete.json")
+            .map_err(|_| {
+                protocol_code(
+                    "CLEANUP_PROOF_MISSING",
+                    "terminal job cleanup proof is invalid",
+                )
+            })?;
+        let token_hash = format!(
+            "{:x}",
+            Sha256::digest(request.lease_token().to_string().as_bytes())
+        );
+        if !marker.terminal_or_abandoned
+            || marker.job_id != request.job_id()
+            || marker.client_id != request.client_id()
+            || marker.project_id != meta.project_id()
+            || marker.worktree_id != meta.worktree_id()
+            || marker.manifest_digest != meta.manifest_digest()
+            || marker.request_fingerprint != *request.request_fingerprint()
+            || marker.lease_token_sha256 != token_hash
+        {
+            return Err(protocol_code(
+                "JOB_ID_CONFLICT",
+                "terminal cleanup proof belongs to another immutable request",
+            ));
+        }
+        admission.validate_for(request.job_id())
+    }
+
     pub(crate) fn resolution_cleanup_receipt(
         &self,
         identity: &ResolutionIdentity,
@@ -3593,7 +3651,10 @@ fn validate_terminal_job_basis(
             "terminal cleanup proof is not terminal".into(),
         ));
     }
-    if job.entry_exists("execution.json")? {
+    let prelaunch_cancelled = status.state() == crate::job::JobState::Cancelled
+        && status.child_identity().is_none()
+        && status.error_code() == Some("CANCELLED_PRELAUNCH");
+    if job.entry_exists("execution.json")? && !prelaunch_cancelled {
         return Err(WorkerError::Protocol(
             "terminal cleanup requires erased execution payload".into(),
         ));
@@ -3637,11 +3698,14 @@ fn validate_terminal_job_basis(
     .into_iter()
     .map(String::from)
     .collect::<BTreeSet<_>>();
-    let allowed = retained
+    let mut allowed = retained
         .iter()
         .cloned()
         .chain(["workspace", "home", "tmp"].into_iter().map(String::from))
         .collect::<BTreeSet<_>>();
+    if prelaunch_cancelled {
+        allowed.insert("execution.json".into());
+    }
     if (require_mutable_absent && names != retained)
         || (!require_mutable_absent && !names.is_subset(&allowed))
     {

@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use clap::Parser;
-use mac_worker::cli::{Cli, Command as WorkerCommand};
+use mac_worker::cli::{Cli, Command as WorkerCommand, HostCommand};
 use mac_worker::protocol::PROTOCOL_VERSION;
 use predicates::prelude::*;
 use std::path::PathBuf;
@@ -20,9 +20,10 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
         .stdout(predicate::str::contains("run"))
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("logs"))
+        .stdout(predicate::str::contains("cancel"))
         .stdout(predicate::str::contains("host").not());
 
-    for public_command in ["dashboard", "run", "status", "logs"] {
+    for public_command in ["dashboard", "run", "status", "logs", "cancel"] {
         let mut command = Command::cargo_bin("worker").unwrap();
         command.args([public_command, "--help"]);
         command
@@ -31,6 +32,33 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
             .stdout(predicate::str::contains(public_command))
             .stdout(predicate::str::contains("Usage:"));
     }
+}
+
+#[test]
+fn cancel_parses_one_job_id_and_exposes_no_hidden_arguments() {
+    let job_id = "018f0f4a6b5c7d8e9f00112233445566";
+    let cli = Cli::try_parse_from(["worker", "cancel", job_id]).unwrap();
+    let WorkerCommand::Cancel { job_id: parsed } = cli.command else {
+        panic!("cancel arguments must select the cancel command");
+    };
+    assert_eq!(parsed.to_string(), job_id);
+
+    let mut command = Command::cargo_bin("worker").unwrap();
+    command.args(["cancel", "--help"]);
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<JOB_ID>"))
+        .stdout(predicate::str::contains("host").not());
+
+    let host = Cli::try_parse_from(["worker", "host", "cancel"]).unwrap();
+    assert!(matches!(
+        host.command,
+        WorkerCommand::Host {
+            command: HostCommand::Cancel
+        }
+    ));
+    assert!(Cli::try_parse_from(["worker", "host", "cancel", job_id]).is_err());
 }
 
 #[test]

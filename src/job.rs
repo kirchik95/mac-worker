@@ -397,7 +397,10 @@ impl JobState {
             (self, next),
             (Self::Uploading, Self::Verified | Self::Lost)
                 | (Self::Verified, Self::Accepted | Self::Lost)
-                | (Self::Accepted, Self::Running | Self::Failed | Self::Lost)
+                | (
+                    Self::Accepted,
+                    Self::Running | Self::Failed | Self::Cancelled | Self::Lost
+                )
                 | (
                     Self::Running,
                     Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Lost
@@ -2190,6 +2193,32 @@ impl JobStatus {
         )
     }
 
+    /// Marks an accepted job whose child was never durably recorded as
+    /// cancelled.  This is deliberately narrower than the generic
+    /// infrastructure-terminal constructor: query validation recognizes this
+    /// one no-child terminal shape as the launch-fence cancellation outcome.
+    pub fn into_prelaunch_cancelled(
+        &self,
+        updated_at_millis: u64,
+        stdout: u64,
+        stderr: u64,
+    ) -> Result<Self, WorkerError> {
+        if self.state != JobState::Accepted || self.child_identity().is_some() {
+            return Err(protocol_error(
+                "prelaunch cancellation requires accepted status without a child identity",
+            ));
+        }
+        self.transition_to_terminal(
+            JobState::Cancelled,
+            updated_at_millis,
+            None,
+            None,
+            stdout,
+            stderr,
+            Some("CANCELLED_PRELAUNCH".into()),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn transition_to_terminal(
         &self,
@@ -3480,6 +3509,178 @@ impl StatusResponse {
     }
     pub fn status(&self) -> &JobStatus {
         &self.status
+    }
+}
+
+/// Fixed-operation request for cancelling exactly one accepted job.  Unlike
+/// the general request envelopes it intentionally has no protocol-version
+/// field: the operation is bound by the immutable accepted identity, while
+/// its response carries the wire version.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CancelRequest {
+    job_id: JobId,
+    client_id: ClientId,
+    lease_token: LeaseToken,
+    request_fingerprint: RequestFingerprint,
+}
+
+impl fmt::Debug for CancelRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CancelRequest")
+            .field("job_id", &self.job_id)
+            .field("client_id", &self.client_id)
+            .field("lease_token", &"[REDACTED]")
+            .field("request_fingerprint", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl CancelRequest {
+    pub fn new(
+        job_id: JobId,
+        client_id: ClientId,
+        lease_token: LeaseToken,
+        request_fingerprint: RequestFingerprint,
+    ) -> Result<Self, WorkerError> {
+        let request = Self {
+            job_id,
+            client_id,
+            lease_token,
+            request_fingerprint,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn from_local_record(record: &LocalJobRecord) -> Result<Self, WorkerError> {
+        record.validate()?;
+        Self::new(
+            record.meta().job_id(),
+            record.meta().client_id(),
+            record.lease_token(),
+            record.meta().request_fingerprint().clone(),
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        // The constituent identifier types validate during construction and
+        // deserialization. Keep this method so every fixed-operation record
+        // has the same explicit validation boundary.
+        let _ = self;
+        Ok(())
+    }
+
+    pub fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    pub fn lease_token(&self) -> LeaseToken {
+        self.lease_token
+    }
+
+    pub fn request_fingerprint(&self) -> &RequestFingerprint {
+        &self.request_fingerprint
+    }
+}
+
+impl Serialize for CancelRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("CancelRequest", 4)?;
+        record.serialize_field("job_id", &self.job_id)?;
+        record.serialize_field("client_id", &self.client_id)?;
+        record.serialize_field("lease_token", &self.lease_token)?;
+        record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CancelRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            job_id: JobId,
+            client_id: ClientId,
+            lease_token: LeaseToken,
+            request_fingerprint: RequestFingerprint,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let request = Self {
+            job_id: wire.job_id,
+            client_id: wire.client_id,
+            lease_token: wire.lease_token,
+            request_fingerprint: wire.request_fingerprint,
+        };
+        request.validate().map_err(de::Error::custom)?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelResponse {
+    protocol_version: u32,
+    status: StatusResponse,
+}
+
+impl CancelResponse {
+    pub fn new(status: StatusResponse) -> Result<Self, WorkerError> {
+        let response = Self {
+            protocol_version: PROTOCOL_VERSION,
+            status,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "cancel response has an incompatible protocol version",
+            ));
+        }
+        self.status.validate()
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn status(&self) -> &StatusResponse {
+        &self.status
+    }
+}
+
+impl Serialize for CancelResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("CancelResponse", 2)?;
+        record.serialize_field("protocol_version", &self.protocol_version)?;
+        record.serialize_field("status", &self.status)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CancelResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            protocol_version: u32,
+            status: StatusResponse,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let response = Self {
+            protocol_version: wire.protocol_version,
+            status: wire.status,
+        };
+        response.validate().map_err(de::Error::custom)?;
+        Ok(response)
     }
 }
 

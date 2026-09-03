@@ -16,7 +16,7 @@ use error::WorkerError;
 use host_store::HostStore;
 use install::Installer;
 use job::{
-    CommandSpec, HostControlError, JsonEvent, LeaseAcquireRequest, LogChunkRequest,
+    CancelRequest, CommandSpec, HostControlError, JsonEvent, LeaseAcquireRequest, LogChunkRequest,
     LogChunkResponse, ResolveOrAbandonRequest, StatusRequest, SubmitRequest,
 };
 use job_service::JobService;
@@ -28,7 +28,8 @@ use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport};
 use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnapshotResponse};
 use run::{
-    LogsService, RunRequest, RunService, StatusService, SystemFollowRuntime, terminal_exit_code,
+    CancelService, LogsService, RunRequest, RunService, StatusService, SystemFollowRuntime,
+    terminal_exit_code,
 };
 use scheduler::WorkerPreference;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -195,6 +196,13 @@ fn execute_with_context(
         Command::Logs { .. } => Err(WorkerError::Protocol(
             "public logs requires the stdio execution boundary".into(),
         )),
+        Command::Cancel { job_id } => {
+            let paths = discover_paths(cli.config, runtime)?;
+            let config = Config::load(&paths.config)?;
+            let client_state = ClientStateStore::open(&paths.state)?;
+            let service = CancelService::new(runner, &config, &client_state);
+            Ok(CommandOutput::Cancel(service.cancel(job_id)?))
+        }
         Command::Host {
             command: HostCommand::Probe,
         } => {
@@ -222,6 +230,11 @@ fn execute_with_context(
             command: HostCommand::ResolveOrAbandon,
         } => Err(WorkerError::Protocol(
             "host resolve-or-abandon requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::Cancel,
+        } => Err(WorkerError::Protocol(
+            "host cancel requires the stdio execution boundary".into(),
         )),
         Command::Host {
             command: HostCommand::SnapshotVerify,
@@ -579,6 +592,14 @@ pub fn run_with_rsync_executor_in_context(
     ) {
         return run_host_resolve_or_abandon(cli.config, runtime, stdin, stdout);
     }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::Cancel
+        }
+    ) {
+        return run_host_cancel(cli.config, runtime, stdin, stdout);
+    }
     if let Command::Host {
         command:
             HostCommand::RsyncReceive {
@@ -603,7 +624,7 @@ pub fn run_with_rsync_executor_in_context(
         );
     }
     let json = cli.json;
-    let public_status = matches!(cli.command, Command::Status { .. });
+    let public_status = matches!(cli.command, Command::Status { .. } | Command::Cancel { .. });
     let raw_probe = matches!(
         &cli.command,
         Command::Host {
@@ -740,6 +761,21 @@ fn run_host_resolve_or_abandon(
         |request: ResolveOrAbandonRequest, store, launcher| {
             JobService::new(store, launcher).resolve_or_abandon(request)
         },
+    )
+}
+
+fn run_host_cancel(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_control_endpoint(
+        config_override,
+        runtime,
+        stdin,
+        stdout,
+        |request: CancelRequest, store, launcher| JobService::new(store, launcher).cancel(request),
     )
 }
 

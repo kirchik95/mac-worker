@@ -10,18 +10,19 @@ use serde::Serialize;
 
 use crate::{
     client_state::{
-        ClientStateStore, ConditionalStatusUpdate, ObservationRelation,
-        authoritative_observation_relation,
+        ClientStateStore, ConditionalStatusUpdate, DispatchCancellationObservation,
+        ObservationRelation, authoritative_observation_relation,
     },
     config::{Config, WorkerEntry},
     error::WorkerError,
     inputs::RelativePath,
     job::{
-        AdmissionObservation, CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus,
-        JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
-        LocalJobRecord, LogChunk, LogCursor, LogStream, PreacceptanceDisposition, ProcessIdentity,
-        QueueEntry, QueueEntryKind, RemoteUncertainty, RequestFingerprintMaterial,
-        ResolveOrAbandonRequest, StatusResponse, SubmitRequest, SubmitResponse, TerminalLogDrain,
+        AdmissionObservation, CancelRequest, CancelResponse, CommandSpec, CommandSummary, JobId,
+        JobMeta, JobState, JobStatus, JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse,
+        LeaseRecord, LeaseToken, LocalJobRecord, LogChunk, LogCursor, LogStream,
+        PreacceptanceDisposition, ProcessIdentity, QueueCancel, QueueEntry, QueueEntryKind,
+        RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest, StatusResponse,
+        SubmitRequest, SubmitResponse, TerminalLogDrain,
     },
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRunner},
@@ -47,6 +48,7 @@ use crate::{
 pub const STATUS_LIST_LIMIT: usize = 100;
 pub const STATUS_REFRESH_LIMIT: usize = 16;
 pub const STATUS_REFRESH_DEADLINE: Duration = Duration::from_secs(5);
+const DISPATCH_CANCEL_OBSERVE_DEADLINE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequest {
@@ -240,6 +242,23 @@ pub struct LogsService<'a> {
     pub runtime: &'a dyn FollowRuntime,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+// The public cancellation contract deliberately carries the complete typed
+// host response so callers can consume it without an allocation wrapper.
+#[allow(clippy::large_enum_variant)]
+pub enum CancelReport {
+    QueuedCancelled { job_id: JobId },
+    RemoteCancelled { response: CancelResponse },
+}
+
+pub struct CancelService<'a> {
+    config: &'a Config,
+    client_state: &'a ClientStateStore,
+    remote: RemoteJobClient<'a>,
+    scheduler_runtime: &'a dyn SchedulerRuntime,
+}
+
 pub struct RunService<'a> {
     pub runner: &'a dyn ProcessRunner,
     pub config: &'a Config,
@@ -267,6 +286,256 @@ struct AdmissionRound {
 struct ClaimedRun {
     identity: RunIdentity,
     worker: WorkerEntry,
+}
+
+impl<'a> CancelService<'a> {
+    pub fn new(
+        runner: &'a dyn ProcessRunner,
+        config: &'a Config,
+        client_state: &'a ClientStateStore,
+    ) -> Self {
+        Self {
+            config,
+            client_state,
+            remote: RemoteJobClient::new(runner),
+            scheduler_runtime: &SYSTEM_SCHEDULER_RUNTIME,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_scheduler_runtime(mut self, runtime: &'a dyn SchedulerRuntime) -> Self {
+        self.scheduler_runtime = runtime;
+        self
+    }
+
+    pub fn cancel(&self, job_id: JobId) -> Result<CancelReport, WorkerError> {
+        let requested_at = self.scheduler_runtime.now_millis()?;
+        match self
+            .client_state
+            .request_queue_cancel(job_id, requested_at)?
+        {
+            Some(QueueCancel::RemovedWaiting { job_id }) => {
+                Ok(CancelReport::QueuedCancelled { job_id })
+            }
+            Some(QueueCancel::RequestedDispatch {
+                job_id,
+                dispatch_owner,
+            }) => self.cancel_requested_dispatch(job_id, dispatch_owner),
+            None => {
+                let record = load_exact_job(self.client_state, job_id)?;
+                self.cancel_local_record(&record, None)
+            }
+        }
+    }
+
+    fn cancel_requested_dispatch(
+        &self,
+        job_id: JobId,
+        dispatch_owner: ProcessIdentity,
+    ) -> Result<CancelReport, WorkerError> {
+        let started_at = self.scheduler_runtime.now_millis()?;
+        loop {
+            if let Some(record) = load_optional_job(self.client_state, job_id)? {
+                return self.cancel_local_record(&record, Some(dispatch_owner));
+            }
+
+            match self
+                .client_state
+                .observe_dispatch_cancellation(job_id, dispatch_owner)?
+            {
+                DispatchCancellationObservation::NotRequested => {
+                    return Err(WorkerError::Queue {
+                        code: "CANCEL_REQUEST_LOST",
+                        message: "durable dispatch cancellation request was unexpectedly cleared"
+                            .into(),
+                    });
+                }
+                DispatchCancellationObservation::WaitingCancelled => {
+                    let removed = self.client_state.remove_queued(job_id)?;
+                    if removed.is_some() {
+                        return Ok(CancelReport::QueuedCancelled { job_id });
+                    }
+                }
+                DispatchCancellationObservation::Gone => {
+                    // Queue retirement without a local record is only legal
+                    // before local publication, hence before every remote
+                    // boundary. Recheck once under no lock before reporting
+                    // queued cancellation.
+                    if load_optional_job(self.client_state, job_id)?.is_none() {
+                        return Ok(CancelReport::QueuedCancelled { job_id });
+                    }
+                }
+                DispatchCancellationObservation::Requested => {}
+            }
+
+            let now = self.scheduler_runtime.now_millis()?;
+            let elapsed = now.saturating_sub(started_at);
+            if elapsed >= DISPATCH_CANCEL_OBSERVE_DEADLINE.as_millis() as u64 {
+                return Err(WorkerError::Queue {
+                    code: "CANCEL_PENDING",
+                    message: "dispatch owner has not yet reached a durable cancellation boundary"
+                        .into(),
+                });
+            }
+            let remaining = DISPATCH_CANCEL_OBSERVE_DEADLINE
+                .checked_sub(Duration::from_millis(elapsed))
+                .unwrap_or_default();
+            self.scheduler_runtime
+                .sleep(remaining.min(Duration::from_secs(1)));
+        }
+    }
+
+    fn cancel_local_record(
+        &self,
+        record: &LocalJobRecord,
+        dispatch_owner: Option<ProcessIdentity>,
+    ) -> Result<CancelReport, WorkerError> {
+        record.validate()?;
+        if !matches!(record.remote_uncertainty(), RemoteUncertainty::None) {
+            let code = record
+                .remote_uncertainty()
+                .code()
+                .unwrap_or("UNKNOWN_REMOTE");
+            return Err(recovery_error(
+                record,
+                code,
+                matches!(
+                    record.remote_uncertainty(),
+                    RemoteUncertainty::CleanupPending { .. }
+                ),
+            ));
+        }
+        let worker = configured_worker(self.config, record)?;
+        let resolution = ResolveOrAbandonRequest::from_local_record(record)?;
+        let resolved = self
+            .remote
+            .resolve_preacceptance_with_receipt(worker, &resolution)?;
+        match resolved.disposition() {
+            PreacceptanceDisposition::Accepted(authoritative) => {
+                // The original-ID resolution must agree with the one immutable
+                // local record before a typed cancel can target the host.
+                let _ = normalize_authoritative_status(record, authoritative.clone())?;
+                let response = self.cancel_accepted(worker, record)?;
+                self.persist_cancel_response(record, response.clone(), dispatch_owner)?;
+                Ok(CancelReport::RemoteCancelled { response })
+            }
+            PreacceptanceDisposition::Abandoned => {
+                if let Some(owner) = dispatch_owner {
+                    let receipt = resolved.abandonment_receipt().ok_or_else(|| {
+                        WorkerError::Protocol(
+                            "ABANDONMENT_PROOF_MISSING: remote abandonment lacked a receipt".into(),
+                        )
+                    })?;
+                    self.client_state
+                        .record_preacceptance_abandoned(receipt, owner)?;
+                    self.remove_terminal_queue_row(record.meta().job_id(), owner)?;
+                }
+                Ok(CancelReport::QueuedCancelled {
+                    job_id: record.meta().job_id(),
+                })
+            }
+            PreacceptanceDisposition::CleanupPending { code } => {
+                self.persist_cancel_uncertainty(record, code, true)
+            }
+            PreacceptanceDisposition::UnknownRemote { code } => {
+                self.persist_cancel_uncertainty(record, code, false)
+            }
+        }
+    }
+
+    fn cancel_accepted(
+        &self,
+        worker: &WorkerEntry,
+        record: &LocalJobRecord,
+    ) -> Result<CancelResponse, WorkerError> {
+        let request = CancelRequest::from_local_record(record)?;
+        match self.remote.cancel(worker, &request) {
+            Ok(response) if response.status().status().state().is_terminal() => Ok(response),
+            Ok(_) => Err(WorkerError::Protocol(
+                "CANCEL_RESPONSE_INVALID: host cancellation did not return a terminal status"
+                    .into(),
+            )),
+            Err(_) => {
+                // A lost cancel response is never retried blindly. Re-resolve
+                // the original job ID and accept only an exact terminal
+                // observation; otherwise retain recovery-required state.
+                match self.remote.status(worker, record.meta().job_id()) {
+                    Ok(status) => {
+                        let status = normalize_authoritative_status(record, status)?;
+                        if status.state().is_terminal() {
+                            let response = StatusResponse::new(record.meta().clone(), status)?;
+                            CancelResponse::new(response)
+                        } else {
+                            self.persist_cancel_uncertainty(
+                                record,
+                                "CANCEL_TRANSPORT_AMBIGUOUS",
+                                false,
+                            )
+                        }
+                    }
+                    Err(_) => {
+                        self.persist_cancel_uncertainty(record, "CANCEL_TRANSPORT_AMBIGUOUS", false)
+                    }
+                }
+            }
+        }
+    }
+
+    fn persist_cancel_response(
+        &self,
+        record: &LocalJobRecord,
+        response: CancelResponse,
+        dispatch_owner: Option<ProcessIdentity>,
+    ) -> Result<(), WorkerError> {
+        let status = normalize_authoritative_status(record, response.status().clone())?;
+        let persisted = persist_authoritative(self.client_state, record, status)?;
+        if let Some(owner) = dispatch_owner {
+            if !persisted
+                .last_status()
+                .is_some_and(|status| status.state().is_terminal())
+            {
+                return Err(WorkerError::Protocol(
+                    "CANCEL_RESPONSE_INVALID: cancellation status was not terminal".into(),
+                ));
+            }
+            self.remove_terminal_queue_row(persisted.meta().job_id(), owner)?;
+        }
+        Ok(())
+    }
+
+    fn remove_terminal_queue_row(
+        &self,
+        job_id: JobId,
+        dispatch_owner: ProcessIdentity,
+    ) -> Result<(), WorkerError> {
+        match self
+            .client_state
+            .remove_after_terminal(job_id, dispatch_owner)
+        {
+            Ok(_) => Ok(()),
+            Err(WorkerError::Queue {
+                code: "QUEUE_NOT_FOUND",
+                ..
+            }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn persist_cancel_uncertainty<T>(
+        &self,
+        record: &LocalJobRecord,
+        code: &str,
+        cleanup_pending: bool,
+    ) -> Result<T, WorkerError> {
+        let uncertainty = if cleanup_pending {
+            RemoteUncertainty::cleanup_pending(code.to_owned())?
+        } else {
+            RemoteUncertainty::unknown_remote(code.to_owned())?
+        };
+        self.client_state
+            .set_remote_uncertainty_if_same_immutable(record, uncertainty)?;
+        Err(recovery_error(record, code, cleanup_pending))
+    }
 }
 
 impl<'a> RunService<'a> {
@@ -395,6 +664,9 @@ impl<'a> RunService<'a> {
             return Err(error);
         }
         let claimed = self.claim_worker(&request, &initial, identity, first_round)?;
+        if self.cancel_before_local_record(&claimed)? {
+            return Err(dispatch_cancelled());
+        }
 
         let prepared = match ProjectState::prepare_observed(
             self.runner,
@@ -429,6 +701,27 @@ impl<'a> RunService<'a> {
         }) {
             Ok(()) => primary,
             Err(cleanup_error) => Err(cleanup_error),
+        }
+    }
+
+    fn cancel_before_local_record(&self, claimed: &ClaimedRun) -> Result<bool, WorkerError> {
+        match self.client_state.observe_dispatch_cancellation(
+            claimed.identity.job_id,
+            claimed.identity.dispatch_owner,
+        )? {
+            DispatchCancellationObservation::NotRequested => Ok(false),
+            DispatchCancellationObservation::Requested => self
+                .client_state
+                .remove_cancelled_dispatch_before_local_record(
+                    claimed.identity.job_id,
+                    claimed.identity.dispatch_owner,
+                )
+                .map(|removed| removed.is_some()),
+            DispatchCancellationObservation::WaitingCancelled => self
+                .client_state
+                .remove_queued(claimed.identity.job_id)
+                .map(|removed| removed.is_some()),
+            DispatchCancellationObservation::Gone => Ok(true),
         }
     }
 
@@ -673,6 +966,9 @@ impl<'a> RunService<'a> {
             Some(runtime) => RemoteJobClient::new_with_runtime(self.runner, runtime),
             None => RemoteJobClient::new(self.runner),
         };
+        if self.cancel_after_local_record(&remote, &worker, &record, identity.dispatch_owner)? {
+            return Err(dispatch_cancelled());
+        }
         let acquire_result: Result<LeaseAcquireResponse, WorkerError> = transport.request(
             &worker,
             HostOperation::LeaseAcquire,
@@ -682,6 +978,14 @@ impl<'a> RunService<'a> {
 
         let accepted = match acquire_result {
             Ok(LeaseAcquireResponse::ExistingAccepted { .. }) => {
+                if self.cancel_after_local_record(
+                    &remote,
+                    &worker,
+                    &record,
+                    identity.dispatch_owner,
+                )? {
+                    return Err(dispatch_cancelled());
+                }
                 match remote.status(&worker, material.job_id()) {
                     Ok(status) => status,
                     Err(error) => self.resolve_after_acceptance_evidence(
@@ -704,6 +1008,14 @@ impl<'a> RunService<'a> {
                     )?
                 } else {
                     self.observer.observe(RunStage::LeaseAcquire)?;
+                    if self.cancel_after_local_record(
+                        &remote,
+                        &worker,
+                        &record,
+                        identity.dispatch_owner,
+                    )? {
+                        return Err(dispatch_cancelled());
+                    }
                     if let Err(error) = RsyncTransport::new(self.runner).upload(
                         &worker,
                         &prepared.snapshot,
@@ -718,6 +1030,14 @@ impl<'a> RunService<'a> {
                         )?
                     } else {
                         self.observer.observe(RunStage::SnapshotUpload)?;
+                        if self.cancel_after_local_record(
+                            &remote,
+                            &worker,
+                            &record,
+                            identity.dispatch_owner,
+                        )? {
+                            return Err(dispatch_cancelled());
+                        }
                         let verified: Result<VerifiedSnapshotResponse, WorkerError> = transport
                             .request(
                                 &worker,
@@ -745,6 +1065,14 @@ impl<'a> RunService<'a> {
                                     )?
                                 } else {
                                     self.observer.observe(RunStage::SnapshotVerification)?;
+                                    if self.cancel_after_local_record(
+                                        &remote,
+                                        &worker,
+                                        &record,
+                                        identity.dispatch_owner,
+                                    )? {
+                                        return Err(dispatch_cancelled());
+                                    }
                                     let raw: Result<SubmitResponse, WorkerError> = transport
                                         .request(
                                             &worker,
@@ -807,6 +1135,14 @@ impl<'a> RunService<'a> {
             }
         };
 
+        // Submit/status resolution itself can be the boundary during which a
+        // durable cancellation arrives. Recheck before publishing Accepted or
+        // handing the record to the follower so the dispatch owner, rather
+        // than a bounded waiting caller, resolves and fences that exact job.
+        if self.cancel_after_local_record(&remote, &worker, &record, identity.dispatch_owner)? {
+            return Err(dispatch_cancelled());
+        }
+
         let accepted_status = match normalize_authoritative_status(&record, accepted) {
             Ok(status) => status,
             Err(error) => {
@@ -855,6 +1191,106 @@ impl<'a> RunService<'a> {
             )?,
             exit_code,
         })
+    }
+
+    fn cancel_after_local_record(
+        &self,
+        remote: &RemoteJobClient<'_>,
+        worker: &WorkerEntry,
+        record: &LocalJobRecord,
+        dispatch_owner: ProcessIdentity,
+    ) -> Result<bool, WorkerError> {
+        match self
+            .client_state
+            .observe_dispatch_cancellation(record.meta().job_id(), dispatch_owner)?
+        {
+            DispatchCancellationObservation::NotRequested => return Ok(false),
+            // A public canceller has already observed either a row retirement
+            // or a state transition it owns. This dispatch must not cross a
+            // new remote boundary; it leaves resolution to that owner.
+            DispatchCancellationObservation::WaitingCancelled
+            | DispatchCancellationObservation::Gone => return Ok(true),
+            DispatchCancellationObservation::Requested => {}
+        }
+
+        let resolution = ResolveOrAbandonRequest::from_local_record(record)?;
+        let resolved = remote.resolve_preacceptance_with_receipt(worker, &resolution)?;
+        match resolved.disposition() {
+            PreacceptanceDisposition::Accepted(authoritative) => {
+                let _ = normalize_authoritative_status(record, authoritative.clone())?;
+                let request = CancelRequest::from_local_record(record)?;
+                let response = match remote.cancel(worker, &request) {
+                    Ok(response) if response.status().status().state().is_terminal() => response,
+                    Ok(_) => {
+                        self.persist_uncertainty(record, "CANCEL_RESPONSE_INVALID", false)?;
+                        return Err(recovery_error(record, "CANCEL_RESPONSE_INVALID", false));
+                    }
+                    Err(_) => match remote.status(worker, record.meta().job_id()) {
+                        Ok(status) => {
+                            let status = normalize_authoritative_status(record, status)?;
+                            if status.state().is_terminal() {
+                                CancelResponse::new(StatusResponse::new(
+                                    record.meta().clone(),
+                                    status,
+                                )?)?
+                            } else {
+                                self.persist_uncertainty(
+                                    record,
+                                    "CANCEL_TRANSPORT_AMBIGUOUS",
+                                    false,
+                                )?;
+                                return Err(recovery_error(
+                                    record,
+                                    "CANCEL_TRANSPORT_AMBIGUOUS",
+                                    false,
+                                ));
+                            }
+                        }
+                        Err(_) => {
+                            self.persist_uncertainty(record, "CANCEL_TRANSPORT_AMBIGUOUS", false)?;
+                            return Err(recovery_error(
+                                record,
+                                "CANCEL_TRANSPORT_AMBIGUOUS",
+                                false,
+                            ));
+                        }
+                    },
+                };
+                let status = normalize_authoritative_status(record, response.status().clone())?;
+                let persisted = persist_authoritative(self.client_state, record, status)?;
+                match self
+                    .client_state
+                    .remove_after_terminal(persisted.meta().job_id(), dispatch_owner)
+                {
+                    Ok(_) => Ok(true),
+                    Err(WorkerError::Queue {
+                        code: "QUEUE_NOT_FOUND",
+                        ..
+                    }) => Ok(true),
+                    Err(error) => Err(error),
+                }
+            }
+            PreacceptanceDisposition::Abandoned => {
+                let receipt = resolved.abandonment_receipt().ok_or_else(|| {
+                    WorkerError::Protocol(
+                        "ABANDONMENT_PROOF_MISSING: remote abandonment lacked a receipt".into(),
+                    )
+                })?;
+                self.client_state
+                    .record_preacceptance_abandoned(receipt, dispatch_owner)?;
+                self.client_state
+                    .remove_after_terminal(record.meta().job_id(), dispatch_owner)?;
+                Ok(true)
+            }
+            PreacceptanceDisposition::CleanupPending { code } => {
+                self.persist_uncertainty(record, code, true)?;
+                Err(recovery_error(record, code, true))
+            }
+            PreacceptanceDisposition::UnknownRemote { code } => {
+                self.persist_uncertainty(record, code, false)?;
+                Err(recovery_error(record, code, false))
+            }
+        }
     }
 
     fn resolve_after_error(
@@ -996,6 +1432,13 @@ fn capacity_busy() -> WorkerError {
     WorkerError::Capacity {
         code: "CAPACITY_BUSY",
         message: "no eligible worker currently has an available heavy slot".into(),
+    }
+}
+
+fn dispatch_cancelled() -> WorkerError {
+    WorkerError::Queue {
+        code: "CANCELLED",
+        message: "job cancellation was requested before dispatch completed".into(),
     }
 }
 
@@ -1400,6 +1843,17 @@ fn load_exact_job(store: &ClientStateStore, job_id: JobId) -> Result<LocalJobRec
                 "JOB_NOT_FOUND: no local job record exists for the requested ID".into(),
             ))
         }
+        Err(error) => Err(error),
+    }
+}
+
+fn load_optional_job(
+    store: &ClientStateStore,
+    job_id: JobId,
+) -> Result<Option<LocalJobRecord>, WorkerError> {
+    match store.load_job(job_id) {
+        Ok(record) => Ok(Some(record)),
+        Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
