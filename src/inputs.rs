@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs, io,
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -158,11 +158,17 @@ impl<'a> InputSelector<'a> {
         context: &ProjectContext,
         settings: &SnapshotSettings,
     ) -> Result<InputSelection, SelectionFailure> {
+        let excludes_file = self.resolve_excludes_file(context)?;
         let (patterns, matcher) = compile_patterns(&settings.include_untracked)?;
         let allow_sensitive = parse_exact_paths(&settings.allow_sensitive)?;
         let empty_directories = parse_exact_paths(&settings.include_empty_dirs)?;
 
-        let index = self.required_git(context, &["ls-files", "--stage", "-z"], None)?;
+        let index = self.required_git(
+            context,
+            &["ls-files", "--stage", "-z"],
+            None,
+            excludes_file.as_deref(),
+        )?;
         let index_entries = parse_index(&index.stdout)?;
         let mut selected = BTreeMap::new();
         let mut tracked_deletions = Vec::new();
@@ -197,7 +203,7 @@ impl<'a> InputSelector<'a> {
             }
         }
 
-        self.reject_configured_filters(context)?;
+        self.reject_configured_filters(context, excludes_file.as_deref())?;
 
         for path in empty_directories {
             reject_forbidden(&path)?;
@@ -213,6 +219,7 @@ impl<'a> InputSelector<'a> {
             context,
             &["ls-files", "--others", "--exclude-standard", "-z"],
             None,
+            excludes_file.as_deref(),
         )?;
         let untracked = parse_path_list(&untracked.stdout)?;
         let mut uncovered = Vec::new();
@@ -251,7 +258,7 @@ impl<'a> InputSelector<'a> {
                     .iter()
                     .map(|pattern| OsString::from(format!(":(glob){pattern}"))),
             );
-            let ignored = self.required_git_os(context, args, None)?;
+            let ignored = self.required_git_os(context, args, None, excludes_file.as_deref())?;
             for path in parse_path_list(&ignored.stdout)? {
                 if matcher.is_match(path.as_path()) {
                     reject_forbidden(&path)?;
@@ -270,6 +277,7 @@ impl<'a> InputSelector<'a> {
                 .values()
                 .filter(|entry| entry.kind == SelectedInputKind::FilesystemEntry)
                 .map(|entry| &entry.path),
+            excludes_file.as_deref(),
         )?;
 
         let mut warnings = Vec::new();
@@ -308,11 +316,16 @@ impl<'a> InputSelector<'a> {
         })
     }
 
-    fn reject_configured_filters(&self, context: &ProjectContext) -> Result<(), SelectionFailure> {
+    fn reject_configured_filters(
+        &self,
+        context: &ProjectContext,
+        excludes_file: Option<&Path>,
+    ) -> Result<(), SelectionFailure> {
         let result = self.run_git(
             context,
             ["config", "--get-regexp", r"^filter\."].map(OsString::from),
             None,
+            excludes_file,
         )?;
         if result.status.success() {
             if !result.stdout.is_empty() {
@@ -335,6 +348,7 @@ impl<'a> InputSelector<'a> {
         &self,
         context: &ProjectContext,
         paths: impl Iterator<Item = &'b RelativePath>,
+        excludes_file: Option<&Path>,
     ) -> Result<(), SelectionFailure> {
         let expected = paths.collect::<Vec<_>>();
         if expected.len() > GIT_ENTRY_LIMIT {
@@ -352,6 +366,7 @@ impl<'a> InputSelector<'a> {
             context,
             &["check-attr", "-z", "--stdin", "filter"],
             Some(stdin),
+            excludes_file,
         )?;
         let mut records = nul_records(&output.stdout)?;
         for expected_path in expected {
@@ -404,13 +419,57 @@ impl<'a> InputSelector<'a> {
         Ok(())
     }
 
+    fn resolve_excludes_file(
+        &self,
+        context: &ProjectContext,
+    ) -> Result<Option<PathBuf>, SelectionFailure> {
+        let result = self.run_user_config_git(
+            context,
+            [
+                OsString::from("config"),
+                OsString::from("--get"),
+                OsString::from("core.excludesFile"),
+            ],
+        )?;
+        if !result.status.success() {
+            if result.status.code() == Some(1) {
+                return Ok(None);
+            }
+            return Err(git_failure("Git core.excludesFile query failed"));
+        }
+        let raw = std::str::from_utf8(&result.stdout).map_err(|_| {
+            failure(
+                "INVALID_EXCLUDES_FILE",
+                "core.excludesFile is not valid UTF-8",
+                Vec::new(),
+                0,
+            )
+        })?;
+        let raw = raw.trim_end_matches(['\n', '\r']);
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Ok(Some(validate_excludes_file(
+            raw,
+            home.as_deref(),
+            &context.root,
+        )?))
+    }
+
     fn required_git(
         &self,
         context: &ProjectContext,
         args: &[&str],
         stdin: Option<Vec<u8>>,
+        excludes_file: Option<&Path>,
     ) -> Result<ProcessResult, SelectionFailure> {
-        self.required_git_os(context, args.iter().map(OsString::from).collect(), stdin)
+        self.required_git_os(
+            context,
+            args.iter().map(OsString::from).collect(),
+            stdin,
+            excludes_file,
+        )
     }
 
     fn required_git_os(
@@ -418,8 +477,9 @@ impl<'a> InputSelector<'a> {
         context: &ProjectContext,
         args: Vec<OsString>,
         stdin: Option<Vec<u8>>,
+        excludes_file: Option<&Path>,
     ) -> Result<ProcessResult, SelectionFailure> {
-        let result = self.run_git(context, args, stdin)?;
+        let result = self.run_git(context, args, stdin, excludes_file)?;
         if result.status.success() {
             Ok(result)
         } else {
@@ -427,11 +487,10 @@ impl<'a> InputSelector<'a> {
         }
     }
 
-    fn run_git(
+    fn run_user_config_git(
         &self,
         context: &ProjectContext,
         args: impl IntoIterator<Item = OsString>,
-        stdin: Option<Vec<u8>>,
     ) -> Result<ProcessResult, SelectionFailure> {
         let request = ProcessRequest {
             program: OsString::from(GIT_PROGRAM),
@@ -439,6 +498,47 @@ impl<'a> InputSelector<'a> {
                 .chain(std::iter::once(context.root.as_os_str().to_os_string()))
                 .chain(args)
                 .collect(),
+            environment: Vec::new(),
+            environment_remove: GIT_ENVIRONMENT_REMOVALS
+                .iter()
+                .map(OsString::from)
+                .collect(),
+            stdin: None,
+            policy: ProcessPolicy {
+                stdout_limit: GIT_OUTPUT_LIMIT,
+                stderr_limit: GIT_OUTPUT_LIMIT,
+                deadline: GIT_DEADLINE,
+            },
+        };
+        let result = self.runner.run(&request).map_err(map_process_failure)?;
+        if result.stdout.len() > GIT_OUTPUT_LIMIT || result.stderr.len() > GIT_OUTPUT_LIMIT {
+            return Err(input_set_too_large());
+        }
+        Ok(result)
+    }
+
+    fn run_git(
+        &self,
+        context: &ProjectContext,
+        args: impl IntoIterator<Item = OsString>,
+        stdin: Option<Vec<u8>>,
+        excludes_file: Option<&Path>,
+    ) -> Result<ProcessResult, SelectionFailure> {
+        let mut command_args = vec![
+            OsString::from("-C"),
+            context.root.as_os_str().to_os_string(),
+        ];
+        if let Some(excludes_file) = excludes_file {
+            command_args.push(OsString::from("-c"));
+            command_args.push(OsString::from(format!(
+                "core.excludesFile={}",
+                excludes_file.display()
+            )));
+        }
+        command_args.extend(args);
+        let request = ProcessRequest {
+            program: OsString::from(GIT_PROGRAM),
+            args: command_args,
             environment: vec![
                 (
                     OsString::from("GIT_CONFIG_GLOBAL"),
@@ -464,6 +564,65 @@ impl<'a> InputSelector<'a> {
         }
         Ok(result)
     }
+}
+
+fn validate_excludes_file(
+    raw: &str,
+    home: Option<&Path>,
+    repo_root: &Path,
+) -> Result<PathBuf, SelectionFailure> {
+    if raw.is_empty() || raw.contains('\0') || raw.chars().any(char::is_control) {
+        return Err(invalid_excludes_file(
+            "core.excludesFile contains a control character or is empty",
+        ));
+    }
+    let expanded = if raw == "~" {
+        home.ok_or_else(|| invalid_excludes_file("core.excludesFile is ~ but HOME is unset"))?
+            .to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        let home = home.ok_or_else(|| {
+            invalid_excludes_file("core.excludesFile is ~-prefixed but HOME is unset")
+        })?;
+        home.join(rest)
+    } else if raw.starts_with('~') {
+        return Err(invalid_excludes_file(
+            "core.excludesFile must be absolute or expanded from the current user's home",
+        ));
+    } else {
+        PathBuf::from(raw)
+    };
+    if !expanded.is_absolute() {
+        return Err(invalid_excludes_file(
+            "core.excludesFile must be an absolute or ~-expanded path",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&expanded)
+        .map_err(|_| invalid_excludes_file("core.excludesFile is not a readable regular file"))?;
+    if !metadata.is_file() {
+        return Err(invalid_excludes_file(
+            "core.excludesFile is not a readable regular file",
+        ));
+    }
+    fs::File::open(&expanded)
+        .map_err(|_| invalid_excludes_file("core.excludesFile is not a readable regular file"))?;
+    let canonical = fs::canonicalize(&expanded)
+        .map_err(|_| invalid_excludes_file("core.excludesFile could not be resolved"))?;
+    let home_ok = home
+        .and_then(|home| fs::canonicalize(home).ok())
+        .is_some_and(|home| canonical.starts_with(&home));
+    let repo_ok = fs::canonicalize(repo_root)
+        .ok()
+        .is_some_and(|repo| canonical.starts_with(&repo));
+    if !home_ok && !repo_ok {
+        return Err(invalid_excludes_file(
+            "core.excludesFile is outside the user's home and repository",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn invalid_excludes_file(message: &str) -> SelectionFailure {
+    failure("INVALID_EXCLUDES_FILE", message, Vec::new(), 0)
 }
 
 fn compile_patterns(patterns: &[String]) -> Result<(Vec<String>, GlobSet), SelectionFailure> {

@@ -377,6 +377,94 @@ fn uncovered_untracked_inputs_are_one_bounded_exact_diagnostic() {
 }
 
 #[test]
+fn core_excludes_file_is_honoured_when_global_git_config_is_neutralized() {
+    // A file ignored only through the user's core.excludesFile must stay out
+    // of the captured selection and must not raise UNTRACKED_INPUT, even
+    // though selection commands neutralize GIT_CONFIG_GLOBAL.
+    let _home = IsolatedHome::lock();
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("initial");
+    repo.write("secret-only.dat", b"ignored only by core.excludesFile\n");
+    repo.write("visible.txt", b"untracked and included\n");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path();
+    let excludes = home.join("excludes");
+    fs::write(&excludes, "secret-only.dat\n").unwrap();
+    fs::write(
+        home.join(".gitconfig"),
+        format!("[core]\n\texcludesFile = {}\n", excludes.display()),
+    )
+    .unwrap();
+    IsolatedHome::set(home);
+
+    let selection = select(&repo, &settings(&["visible.txt"], &[], &[]))
+        .expect("a file ignored only through core.excludesFile must not raise UNTRACKED_INPUT");
+    assert!(
+        selection
+            .entries
+            .iter()
+            .all(|entry| entry.path.as_str() != "secret-only.dat"),
+        "core.excludesFile must keep secret-only.dat out of the selection"
+    );
+    assert!(
+        selection
+            .entries
+            .iter()
+            .any(|entry| entry.path.as_str() == "visible.txt")
+    );
+
+    let runner = RecordingRunner::default();
+    InputSelector::new(&runner)
+        .select(&context(&repo), &settings(&["visible.txt"], &[], &[]))
+        .unwrap();
+    let requests = runner.requests.lock().unwrap();
+    let resolver = requests
+        .iter()
+        .find(|request| {
+            request.args.iter().any(|arg| arg == "config")
+                && request.args.iter().any(|arg| arg == "core.excludesFile")
+        })
+        .expect("selection must resolve core.excludesFile under the user's configuration");
+    assert!(
+        !resolver
+            .environment
+            .iter()
+            .any(|(key, value)| key == "GIT_CONFIG_GLOBAL" && value == "/dev/null"),
+        "the resolver must not neutralize the user's global Git configuration"
+    );
+    let expected_override = format!("core.excludesFile={}", excludes.display());
+    let selection_commands = requests.iter().filter(|request| {
+        !request
+            .args
+            .iter()
+            .any(|arg| arg == "core.excludesFile" && request.args.iter().any(|arg| arg == "config"))
+    });
+    for request in selection_commands {
+        assert!(
+            request
+                .environment
+                .iter()
+                .any(|(key, value)| { key == "GIT_CONFIG_GLOBAL" && value == "/dev/null" }),
+            "selection commands must keep global configuration neutralized"
+        );
+        assert!(
+            request.args.iter().any(|arg| arg == "-c")
+                && request
+                    .args
+                    .iter()
+                    .any(|arg| *arg == OsString::from(&expected_override)
+                        || arg
+                            .to_string_lossy()
+                            .contains(excludes.to_string_lossy().as_ref())),
+            "selection commands must receive the validated core.excludesFile: {:?}",
+            request.args
+        );
+    }
+}
+
+#[test]
 fn explicit_patterns_admit_non_ignored_and_ignored_inputs_with_their_origins() {
     // Catches treating ignored and ordinary untracked inputs identically or
     // broadening ignored inclusion beyond the explicit Git pathspec.
@@ -648,6 +736,18 @@ fn input_count_and_git_request_policies_are_bounded_and_isolated() {
         assert_eq!(request.policy.stdout_limit, 64 * 1024 * 1024);
         assert_eq!(request.policy.stderr_limit, 64 * 1024 * 1024);
         assert_eq!(request.policy.deadline, Duration::from_secs(5));
+        let resolves_excludes = request.args.iter().any(|arg| arg == "core.excludesFile")
+            && request.args.iter().any(|arg| arg == "--get");
+        if resolves_excludes {
+            assert!(
+                !request
+                    .environment
+                    .iter()
+                    .any(|(key, value)| { key == "GIT_CONFIG_GLOBAL" && value == "/dev/null" }),
+                "the core.excludesFile resolver must use the user's configuration"
+            );
+            continue;
+        }
         assert_eq!(
             request.environment,
             vec![
@@ -709,7 +809,16 @@ struct FixedOutputRunner {
 }
 
 impl ProcessRunner for FixedOutputRunner {
-    fn run(&self, _request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.args.iter().any(|arg| arg == "core.excludesFile")
+            && request.args.iter().any(|arg| arg == "--get")
+        {
+            return Ok(ProcessResult {
+                status: ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
         Ok(ProcessResult {
             status: ExitStatus::from_raw(0),
             stdout: self.stdout.clone(),
@@ -737,7 +846,10 @@ impl ProcessRunner for AttributeOutputRunner {
                 ]
                 .concat(),
             )
-        } else if request.args.iter().any(|arg| arg == "--get-regexp") {
+        } else if request.args.iter().any(|arg| arg == "--get-regexp")
+            || (request.args.iter().any(|arg| arg == "--get")
+                && request.args.iter().any(|arg| arg == "core.excludesFile"))
+        {
             (ExitStatus::from_raw(1 << 8), Vec::new())
         } else if request.args.iter().any(|arg| arg == "check-attr") {
             (ExitStatus::from_raw(0), self.attributes.clone())
@@ -749,6 +861,49 @@ impl ProcessRunner for AttributeOutputRunner {
             stdout,
             stderr: Vec::new(),
         })
+    }
+}
+
+static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+struct IsolatedHome {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    previous_home: Option<OsString>,
+    previous_xdg: Option<OsString>,
+}
+
+impl IsolatedHome {
+    fn lock() -> Self {
+        let previous_home = std::env::var_os("HOME");
+        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        Self {
+            _guard: HOME_LOCK.lock().expect("home lock"),
+            previous_home,
+            previous_xdg,
+        }
+    }
+
+    fn set(home: &Path) {
+        // Isolation is scoped to the HOME_LOCK held by the current test.
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+    }
+}
+
+impl Drop for IsolatedHome {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.previous_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
     }
 }
 
