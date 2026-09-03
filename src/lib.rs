@@ -12,6 +12,7 @@ use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport};
 use transport::{SshTransport, WorkersService};
 
+pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod doctor;

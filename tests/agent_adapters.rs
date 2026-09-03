@@ -1,0 +1,506 @@
+use std::fs;
+
+use mac_worker::agent::{
+    AgentEvent, AgentKind, AgentOutcome, PermissionPolicy, PromptDelivery, RESULT_SCHEMA_JSON,
+    ResultStatus, TurnLaunch, TurnLimits, TurnParams, adapter_for, render_shell,
+};
+use uuid::Uuid;
+
+const DEFAULT_TIMEOUT_MILLIS: u64 = 45 * 60 * 1000;
+const DAY_MILLIS: u64 = 24 * 60 * 60 * 1000;
+const SESSION_PLACEHOLDER: &str = "0d3c…";
+
+fn params(policy: PermissionPolicy) -> TurnParams {
+    TurnParams {
+        kind: AgentKind::Codex,
+        model: None,
+        policy,
+        limits: TurnLimits::new(DEFAULT_TIMEOUT_MILLIS, None, None).unwrap(),
+        session_seed: Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001),
+    }
+}
+
+fn fixture(name: &str) -> String {
+    fs::read_to_string(format!("tests/fixtures/agents/{name}"))
+        .unwrap_or_else(|error| panic!("fixture {name} must be readable: {error}"))
+}
+
+fn fixture_lines(name: &str) -> impl Iterator<Item = String> {
+    fixture(name)
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+#[test]
+fn codex_first_turn_reads_prompt_from_stdin_and_requests_schema() {
+    let launch = adapter_for(AgentKind::Codex)
+        .first_turn(&params(PermissionPolicy::Workspace))
+        .unwrap();
+    assert_eq!(launch.program(), "codex");
+    assert!(launch.args().starts_with(&["exec".into(), "--json".into()]));
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "-s" && w[1] == "workspace-write")
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "approval_policy=\"never\"")
+    );
+    assert!(
+        launch
+            .args()
+            .iter()
+            .all(|argument| argument != "--approve-for-me")
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--output-schema" && w[1] == "{schema}")
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "-o" && w[1] == "{last_message}")
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| { w[0] == "-c" && w[1] == "sandbox_workspace_write.network_access=true" })
+    );
+    assert_eq!(launch.args().last().map(String::as_str), Some("-"));
+    assert_eq!(launch.prompt_delivery(), PromptDelivery::Stdin);
+    assert!(launch.env_names().is_empty());
+    assert!(!launch.permission_fallback());
+}
+
+#[test]
+fn codex_unattended_first_turn_uses_full_bypass() {
+    let launch = adapter_for(AgentKind::Codex)
+        .first_turn(&params(PermissionPolicy::Unattended))
+        .unwrap();
+    assert!(
+        launch
+            .args()
+            .contains(&"--dangerously-bypass-approvals-and-sandbox".into())
+    );
+    assert!(
+        launch
+            .args()
+            .iter()
+            .all(|argument| argument != "-s" && argument != "--approve-for-me")
+    );
+    assert_eq!(launch.args().last().map(String::as_str), Some("-"));
+}
+
+#[test]
+fn codex_resume_uses_config_sandbox_and_keeps_schema() {
+    let launch = adapter_for(AgentKind::Codex)
+        .resume_turn(&params(PermissionPolicy::Workspace), SESSION_PLACEHOLDER)
+        .unwrap();
+    assert!(launch.args().starts_with(&[
+        "exec".into(),
+        "resume".into(),
+        SESSION_PLACEHOLDER.into()
+    ]));
+    for key in [
+        "sandbox_mode=\"workspace-write\"",
+        "sandbox_workspace_write.network_access=true",
+        "approval_policy=\"never\"",
+    ] {
+        assert!(
+            launch
+                .args()
+                .windows(2)
+                .any(|w| w[0] == "-c" && w[1] == key),
+            "{key}"
+        );
+    }
+    assert!(
+        launch
+            .args()
+            .iter()
+            .all(|a| a != "-C" && a != "-s" && a != "--approve-for-me")
+    );
+    assert!(launch.args().windows(2).any(|w| w[0] == "--output-schema"));
+    assert_eq!(launch.args().last().map(String::as_str), Some("-"));
+}
+
+#[test]
+fn codex_unattended_resume_uses_bypass_config_equivalents() {
+    let launch = adapter_for(AgentKind::Codex)
+        .resume_turn(&params(PermissionPolicy::Unattended), SESSION_PLACEHOLDER)
+        .unwrap();
+    for key in [
+        "sandbox_mode=\"danger-full-access\"",
+        "approval_policy=\"never\"",
+    ] {
+        assert!(
+            launch
+                .args()
+                .windows(2)
+                .any(|w| w[0] == "-c" && w[1] == key),
+            "{key}"
+        );
+    }
+    assert!(
+        launch
+            .args()
+            .iter()
+            .all(|argument| argument != "-C" && argument != "-s" && argument != "--approve-for-me")
+    );
+}
+
+#[test]
+fn claude_first_turn_binds_generated_session_budget_and_turns() {
+    let mut params = params(PermissionPolicy::Unattended);
+    params.limits.max_turns = Some(40);
+    params.limits.max_budget_usd_cents = Some(1_250);
+    let launch = adapter_for(AgentKind::Claude).first_turn(&params).unwrap();
+    assert_eq!(launch.program(), "claude");
+    assert!(launch.args().starts_with(&["-p".into()]));
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "stream-json")
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--session-id" && w[1] == params.session_seed.to_string())
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--json-schema" && w[1] == RESULT_SCHEMA_JSON)
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--max-turns" && w[1] == "40")
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--max-budget-usd" && w[1] == "12.50")
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--permission-mode" && w[1] == "bypassPermissions")
+    );
+    assert_eq!(
+        launch.env_names(),
+        &["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
+    );
+    assert_eq!(launch.prompt_delivery(), PromptDelivery::Stdin);
+    assert!(!launch.permission_fallback());
+}
+
+#[test]
+fn claude_workspace_policy_falls_back_to_unattended() {
+    let launch = adapter_for(AgentKind::Claude)
+        .first_turn(&params(PermissionPolicy::Workspace))
+        .unwrap();
+    assert!(launch.permission_fallback());
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--permission-mode" && w[1] == "bypassPermissions")
+    );
+}
+
+#[test]
+fn claude_resume_uses_resume_and_never_session_id() {
+    let launch = adapter_for(AgentKind::Claude)
+        .resume_turn(&params(PermissionPolicy::Unattended), SESSION_PLACEHOLDER)
+        .unwrap();
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--resume" && w[1] == SESSION_PLACEHOLDER)
+    );
+    assert!(
+        launch
+            .args()
+            .iter()
+            .all(|argument| argument != "--session-id")
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "stream-json")
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--json-schema" && w[1] == RESULT_SCHEMA_JSON)
+    );
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--permission-mode" && w[1] == "bypassPermissions")
+    );
+}
+
+#[test]
+fn model_is_passed_through_for_both_agents() {
+    let mut params = params(PermissionPolicy::Workspace);
+    params.model = Some("gpt-test".into());
+    let launch = adapter_for(AgentKind::Codex).first_turn(&params).unwrap();
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "-m" && w[1] == "gpt-test")
+    );
+
+    let resume = adapter_for(AgentKind::Codex)
+        .resume_turn(&params, SESSION_PLACEHOLDER)
+        .unwrap();
+    assert!(
+        resume
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "-m" && w[1] == "gpt-test")
+    );
+
+    params.model = Some("opus".into());
+    let launch = adapter_for(AgentKind::Claude).first_turn(&params).unwrap();
+    assert!(
+        launch
+            .args()
+            .windows(2)
+            .any(|w| w[0] == "--model" && w[1] == "opus")
+    );
+}
+
+#[test]
+fn resume_without_a_session_reference_is_unbound() {
+    let error = adapter_for(AgentKind::Codex)
+        .resume_turn(&params(PermissionPolicy::Workspace), "")
+        .expect_err("an empty session reference must not launch");
+    assert!(error.to_string().to_ascii_lowercase().contains("session"));
+}
+
+#[test]
+fn codex_stream_yields_session_ref_and_normalized_events() {
+    let adapter = adapter_for(AgentKind::Codex);
+    let events: Vec<AgentEvent> = fixture_lines("codex-success.jsonl")
+        .filter_map(|line| adapter.parse_event(&line))
+        .collect();
+    assert_eq!(
+        adapter.session_ref(&events).as_deref(),
+        Some(SESSION_PLACEHOLDER)
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Command {
+            exit_code: Some(0),
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::FileChange { paths } if paths == &["src/agent/mod.rs"]
+    )));
+    assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
+}
+
+#[test]
+fn structured_result_is_extracted_or_unknown_never_an_error() {
+    let adapter = adapter_for(AgentKind::Claude);
+    assert_eq!(
+        adapter
+            .extract_result(&fixture("claude-success.jsonl"), None)
+            .unwrap()
+            .status(),
+        ResultStatus::Done
+    );
+    assert_eq!(
+        adapter
+            .extract_result(&fixture("claude-malformed.jsonl"), None)
+            .unwrap()
+            .status(),
+        ResultStatus::Unknown
+    );
+}
+
+#[test]
+fn structured_results_cover_needs_input_and_blocked() {
+    let codex = adapter_for(AgentKind::Codex);
+    let needs_input = codex
+        .extract_result(&fixture("codex-needs-input.jsonl"), None)
+        .unwrap();
+    assert_eq!(needs_input.status(), ResultStatus::NeedsInput);
+    assert_eq!(needs_input.questions(), &["Which crate should be renamed?"]);
+
+    let claude = adapter_for(AgentKind::Claude);
+    assert_eq!(
+        claude
+            .extract_result(&fixture("claude-blocked.jsonl"), None)
+            .unwrap()
+            .status(),
+        ResultStatus::Blocked
+    );
+}
+
+#[test]
+fn extract_result_prefers_the_last_message_file() {
+    let adapter = adapter_for(AgentKind::Codex);
+    let result = adapter
+        .extract_result(
+            &fixture("codex-success.jsonl"),
+            Some(
+                r#"{"status":"needs_input","summary":"from file","questions":["q"],"files_changed":[]}"#,
+            ),
+        )
+        .unwrap();
+    assert_eq!(result.status(), ResultStatus::NeedsInput);
+    assert_eq!(result.summary(), "from file");
+    assert_eq!(result.questions(), &["q"]);
+}
+
+#[test]
+fn truncated_final_line_is_ignored() {
+    let adapter = adapter_for(AgentKind::Codex);
+    let events: Vec<AgentEvent> = fixture_lines("codex-truncated.jsonl")
+        .filter_map(|line| adapter.parse_event(&line))
+        .collect();
+    assert_eq!(
+        adapter.session_ref(&events).as_deref(),
+        Some(SESSION_PLACEHOLDER)
+    );
+    assert!(
+        adapter
+            .parse_event(r#"{"type":"turn.completed","usage":{"input"#)
+            .is_none()
+    );
+    assert!(!matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
+}
+
+#[test]
+fn tool_and_command_summaries_are_bounded_and_escape_controls() {
+    let adapter = adapter_for(AgentKind::Codex);
+    let command = format!("head\n{}", "x".repeat(600));
+    let line = format!(
+        r#"{{"type":"item.completed","item":{{"id":"item_0","type":"command_execution","command":{command},"exit_code":0}}}}"#,
+        command = serde_json::to_string(&command).unwrap()
+    );
+    let Some(AgentEvent::Command { summary, exit_code }) = adapter.parse_event(&line) else {
+        panic!("command_execution must normalize to Command");
+    };
+    assert_eq!(exit_code, Some(0));
+    assert!(summary.len() <= 512);
+    assert!(!summary.contains('\n'));
+    assert!(summary.contains("\\n"));
+
+    let tool = format!("y\t{}", "z".repeat(600));
+    let line = format!(
+        r#"{{"type":"item.completed","item":{{"id":"item_1","type":"mcp_tool_call","server":"docs","tool":"search","arguments":{{"q":{query}}}}}}}"#,
+        query = serde_json::to_string(&tool).unwrap()
+    );
+    let Some(AgentEvent::ToolCall { name, summary }) = adapter.parse_event(&line) else {
+        panic!("mcp_tool_call must normalize to ToolCall");
+    };
+    assert_eq!(name, "search");
+    assert!(summary.len() <= 512);
+    assert!(!summary.contains('\t'));
+    assert!(summary.contains("\\t"));
+}
+
+#[test]
+fn turn_limits_reject_zero_timeout_over_day_and_huge_budget() {
+    assert!(TurnLimits::new(0, None, None).is_err());
+    assert!(TurnLimits::new(DAY_MILLIS + 1, None, None).is_err());
+    assert!(TurnLimits::new(DEFAULT_TIMEOUT_MILLIS, None, Some(100_001)).is_err());
+    assert!(TurnLimits::new(1, None, Some(100_000)).is_ok());
+    assert!(TurnLimits::new(DAY_MILLIS, None, None).is_ok());
+}
+
+#[test]
+fn result_schema_json_has_exactly_the_declared_keys() {
+    let value: serde_json::Value = serde_json::from_str(RESULT_SCHEMA_JSON).unwrap();
+    let mut keys: Vec<_> = value["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["files_changed", "questions", "status", "summary"]);
+}
+
+#[test]
+fn classify_maps_exit_and_status_without_guessing() {
+    let adapter = adapter_for(AgentKind::Codex);
+    assert_eq!(
+        adapter.classify(Some(0), ResultStatus::Done),
+        AgentOutcome::Done
+    );
+    assert_eq!(
+        adapter.classify(Some(0), ResultStatus::NeedsInput),
+        AgentOutcome::NeedsInput
+    );
+    assert_eq!(
+        adapter.classify(Some(1), ResultStatus::Done),
+        AgentOutcome::Failed { exit_code: 1 }
+    );
+    assert_eq!(
+        adapter.classify(None, ResultStatus::Done),
+        AgentOutcome::Signalled
+    );
+    assert_eq!(
+        adapter.classify(Some(0), ResultStatus::Blocked),
+        AgentOutcome::Blocked
+    );
+    assert_eq!(
+        adapter.classify(Some(0), ResultStatus::Unknown),
+        AgentOutcome::Unknown
+    );
+}
+
+#[test]
+fn render_shell_quotes_arguments_and_renders_file_placeholders_as_env_references() {
+    let launch = adapter_for(AgentKind::Codex)
+        .first_turn(&params(PermissionPolicy::Workspace))
+        .unwrap();
+    let shell = render_shell(&launch).unwrap();
+    assert!(shell.starts_with("exec 'codex' 'exec' '--json'"));
+    assert!(shell.contains("--output-schema' \"$MAC_WORKER_TURN_DIR/result.schema.json\""));
+    assert!(shell.contains("'-o' \"$MAC_WORKER_TURN_DIR/last.md\""));
+    assert!(!shell.contains("{schema}") && !shell.contains("'/"));
+    assert_eq!(render_shell(&launch).unwrap(), shell);
+}
+
+#[test]
+fn render_shell_rejects_an_argument_containing_nul() {
+    let launch = TurnLaunch::new(
+        "codex",
+        vec!["exec".into(), "bad\0arg".into()],
+        PromptDelivery::Stdin,
+        Vec::new(),
+        false,
+    );
+    let error = render_shell(&launch).expect_err("NUL must be rejected");
+    assert!(error.to_string().to_ascii_lowercase().contains("nul"));
+}

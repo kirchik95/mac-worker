@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"0d3c…"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"status\":\"needs_input\",\"summary\":\"Need the target crate name\",\"questions\":[\"Which crate should be renamed?\"],\"files_changed\":[]}"}}
+{"type":"turn.completed","usage":{"input_tokens":80,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":15,"reasoning_output_tokens":0}}

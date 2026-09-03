@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","cwd":"/workspace","session_id":"00000000-0000-4000-8000-000000000001","model":"claude-placeholder","permissionMode":"bypassPermissions"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"{\"status\":\"done\",\"summary\":\"ok\",\"questions\":[],\"files_changed\":[\"src/lib.rs\"]}"]},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"result","subtype":"success","result":"{\"status\":\"done\",\"summary\":\"ok\",\"questions\":[],\"files_changed\":[\"src/lib.rs\"]}","is_error":false,"session_id":"00000000-0000-4000-8000-000000000001","total_cost_usd":0.01,"usage":{"input_tokens":10,"output_tokens":8},"num_turns":1,"terminal_reason":"completed"}

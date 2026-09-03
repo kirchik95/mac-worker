@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","cwd":"/workspace","session_id":"00000000-0000-4000-8000-000000000003","model":"claude-placeholder"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I finished, but this is not structured JSON."}]},"session_id":"00000000-0000-4000-8000-000000000003"}
+{"type":"result","subtype":"success","result":"I finished, but this is not structured JSON.","is_error":false,"session_id":"00000000-0000-4000-8000-000000000003","num_turns":1}
