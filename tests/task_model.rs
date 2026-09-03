@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use mac_worker::{
     agent::{AdapterError, AgentKind, AgentOutcome, PermissionPolicy, TurnLimits},
     error::{ExitKind, WorkerError},
@@ -110,7 +108,6 @@ fn sample_record() -> LocalTaskRecord {
         )),
         None,
         REPO_ID.to_owned(),
-        PathBuf::from("/tmp/objects"),
         Some("mini-1".into()),
         true,
         None,
@@ -305,6 +302,15 @@ fn task_summary_contains_no_prompt_session_or_path_fields() {
     }
     assert_eq!(json["title"], "Fix the flaky login spec");
     assert_eq!(json["agent"], "codex");
+}
+
+#[test]
+fn local_task_record_never_persists_the_transfer_alternates_path() {
+    let bytes = sample_record().canonical_bytes().unwrap();
+    let record = String::from_utf8(bytes).unwrap();
+
+    assert!(!record.contains("alternates_target"));
+    assert!(!record.contains("/tmp/objects"));
 }
 
 #[test]
@@ -617,7 +623,6 @@ fn arbitrary_local_task_record() -> impl Strategy<Value = LocalTaskRecord> {
                     runner,
                     None,
                     REPO_ID.to_owned(),
-                    PathBuf::from("/tmp/objects"),
                     pinned_worker,
                     wait_for_capacity,
                     None,

@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf, str::FromStr};
+use std::{fmt, str::FromStr};
 
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -841,7 +841,6 @@ pub struct LocalTaskRecord {
     runner: Option<RunnerIdentity>,
     fetched_head: Option<BaseOid>,
     repo_id: String,
-    alternates_target: PathBuf,
     // Task 7 converts pinned_worker into WorkerPreference.
     pinned_worker: Option<String>,
     wait_for_capacity: bool,
@@ -857,7 +856,6 @@ impl LocalTaskRecord {
         runner: Option<RunnerIdentity>,
         fetched_head: Option<BaseOid>,
         repo_id: String,
-        alternates_target: PathBuf,
         pinned_worker: Option<String>,
         wait_for_capacity: bool,
         abandon_code: Option<String>,
@@ -869,7 +867,6 @@ impl LocalTaskRecord {
             runner,
             fetched_head,
             repo_id,
-            alternates_target,
             pinned_worker,
             wait_for_capacity,
             abandon_code,
@@ -917,14 +914,6 @@ impl LocalTaskRecord {
         self.meta.validate()?;
         self.status.validate()?;
         validate_hex_component(&self.repo_id, "repo ID")?;
-        if self.alternates_target.as_os_str().is_empty()
-            || self
-                .alternates_target
-                .to_str()
-                .is_none_or(|value| value.as_bytes().contains(&0))
-        {
-            return Err(task_config("alternates target is invalid"));
-        }
         if let Some(worker) = &self.pinned_worker {
             validate_pinned_worker(worker)?;
         }
@@ -938,14 +927,13 @@ impl LocalTaskRecord {
 impl Serialize for LocalTaskRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("LocalTaskRecord", 10)?;
+        let mut record = serializer.serialize_struct("LocalTaskRecord", 9)?;
         record.serialize_field("meta", &self.meta)?;
         record.serialize_field("status", &self.status)?;
         record.serialize_field("status_observed_at_millis", &self.status_observed_at_millis)?;
         record.serialize_field("runner", &self.runner)?;
         record.serialize_field("fetched_head", &self.fetched_head)?;
         record.serialize_field("repo_id", &self.repo_id)?;
-        record.serialize_field("alternates_target", &self.alternates_target)?;
         record.serialize_field("pinned_worker", &self.pinned_worker)?;
         record.serialize_field("wait_for_capacity", &self.wait_for_capacity)?;
         record.serialize_field("abandon_code", &self.abandon_code)?;
@@ -964,7 +952,6 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             runner: Option<RunnerIdentity>,
             fetched_head: Option<BaseOid>,
             repo_id: String,
-            alternates_target: PathBuf,
             pinned_worker: Option<String>,
             wait_for_capacity: bool,
             abandon_code: Option<String>,
@@ -977,7 +964,6 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             wire.runner,
             wire.fetched_head,
             wire.repo_id,
-            wire.alternates_target,
             wire.pinned_worker,
             wire.wait_for_capacity,
             wire.abandon_code,
