@@ -733,7 +733,7 @@ git commit -m "feat: project typed job data for dashboard"
 - Consumes: the Phase-4 queue service through the Task-3-owned read-only `DashboardQueueReader` trait.
 - Produces: `SchedulerQueueAdapter` implementing `DashboardQueueReader` and stable FIFO `DashboardQueueEntry` values.
 
-- [ ] **Step 1: Write failing FIFO-adapter tests**
+- [x] **Step 1: Write failing FIFO-adapter tests**
 
 Create tests against a fake queue reader with four records. Assert exact sequence order is preserved, positions are one-based, abandoned records are absent, assigned/running records are absent from the queue list, and each entry contains only `job_id`, optional project label, IDs, content-free command summary, creation time, requirements, and the scheduler-provided blocking code. Assert that `worker_name`, `ssh`, command strings, lease tokens, and paths are absent.
 
@@ -747,13 +747,13 @@ fn queue_adapter_preserves_scheduler_fifo_order_without_reimplementing_selection
 }
 ```
 
-- [ ] **Step 2: Run queue tests to verify they fail**
+- [x] **Step 2: Run queue tests to verify they fail**
 
 Run: `cargo test --locked --test dashboard_queue -- --nocapture`
 
 Expected: FAIL because Phase 4 queue types and `SchedulerQueueAdapter` are absent.
 
-- [ ] **Step 3: Implement the adapter with no scheduling logic**
+- [x] **Step 3: Implement the adapter with no scheduling logic**
 
 Define:
 
@@ -778,7 +778,9 @@ impl<R: PhaseFourQueueReader + Send + Sync + 'static> DashboardQueueReader for S
 
 Define `PhaseFourQueueReader` in this task as a private adapter trait returning `PhaseFourQueueEntry`; its production implementation is the only place that maps Phase-4 concrete queue records. Add exactly `pub mod queue;` to `src/dashboard/mod.rs`. The adapter only maps precomputed Phase-4 `position`, requirements, and blocking code. It must not choose workers, clean abandoned entries, reorder records, acquire capacity, or change queue state. Wire `Arc::new(SchedulerQueueAdapter::new(phase_four_queue_reader))` into `MacWorkerDashboardSource.queue` only after the adapter tests pass.
 
-- [ ] **Step 4: Run queue and snapshot integration tests**
+> Integration note: the merged Phase-4 contract currently exposes `ClientStateStore::queue_snapshot()` but does not expose scheduler-computed blocking reasons or a complete read-only producer projection. The production wiring is therefore deferred until that accessor exists; this task supplies the safe pass-through seam without inferring queue state from job files or probes.
+
+- [x] **Step 4: Run queue and snapshot integration tests**
 
 Run:
 
@@ -789,7 +791,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 5: Commit the queue projection**
+- [x] **Step 5: Commit the queue projection**
 
 ```bash
 git add src/dashboard/mod.rs src/dashboard/queue.rs tests/dashboard_queue.rs
@@ -810,7 +812,7 @@ git commit -m "feat: project scheduler queue in dashboard"
 - Consumes: the Phase-4-owned `ProbeResponse::cpu_counters` and `ProbeCpuCounters { total_ticks, idle_ticks }` contract, Task 2's `Observation::cpu_counters`, and the Task 3 rule that the service alone calls `ObservationCache::record`.
 - Produces: `cache_counters` and current source observations carrying optional cumulative counters; nullable `DashboardWorker.system.cpu_busy_percent` remains derived entirely by the service-owned MacBook cache.
 
-- [ ] **Step 1: Write failing adapter tests against the coordinated probe fixture**
+- [x] **Step 1: Write failing adapter tests against the coordinated probe fixture**
 
 Create `tests/dashboard_cpu_adapter.rs` using a typed `ProbeResponse` fixture supplied by the completed Phase 4 contract and the real `DashboardService` over a sequential fake/current source adapter. On the first current observation, assert `cpu_busy_percent` is null; on the second, assert counters `(1000,200)` then `(1100,220)` produce `80.0`; counter reset `(900,180)` produces null; `cpu_counters: None` produces null while preserving disk, memory-pressure, swap, and availability fields. Assert each probe contributes exactly one cache sample, the source has no cache reference, and `available_memory_bytes` is ignored by this dashboard version rather than creating a competing dashboard-specific memory metric.
 
@@ -827,13 +829,13 @@ fn dashboard_computes_cpu_only_from_two_current_coordinated_probe_samples() {
 }
 ```
 
-- [ ] **Step 2: Run CPU adapter tests to verify they fail**
+- [x] **Step 2: Run CPU adapter tests to verify they fail**
 
 Run: `cargo test --locked --test dashboard_cpu_adapter --test dashboard_cache -- --nocapture`
 
 Expected: FAIL because the Phase-4 coordinated probe contract and dashboard adapter mapping are absent.
 
-- [ ] **Step 3: Implement MacBook-side mapping only**
+- [x] **Step 3: Implement MacBook-side mapping only**
 
 Define in `src/dashboard/source.rs`:
 
@@ -843,7 +845,7 @@ pub fn cache_counters(counters: crate::protocol::ProbeCpuCounters) -> Option<cra
 
 `cache_counters` validates and copies the two cumulative fields without calculating a percentage, returning `None` for an invalid pair. Extend the existing current-probe projection so it maps the optional wire counters through this function into the single `Observation` returned to `DashboardService`. The source must not own, borrow, or call `ObservationCache`; the service's one `record` call computes and writes the delta percentage. Never calculate a percentage on a worker, sleep to obtain a second sample, persist samples, double-record one probe, or treat missing/invalid CPU counters as a failed worker.
 
-- [ ] **Step 4: Run adapter/source/cache regressions**
+- [x] **Step 4: Run adapter/source/cache regressions**
 
 Run:
 
@@ -854,7 +856,7 @@ cargo fmt --all --check
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 5: Commit the adapter-only CPU projection**
+- [x] **Step 5: Commit the adapter-only CPU projection**
 
 ```bash
 git add src/dashboard/source.rs tests/dashboard_cpu_adapter.rs
