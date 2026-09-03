@@ -224,6 +224,22 @@ fn unknown_and_duplicate_json_fields_are_rejected() {
 }
 
 #[test]
+fn nested_duplicate_json_fields_are_rejected() {
+    let record = String::from_utf8(sample_record().canonical_bytes().unwrap()).unwrap();
+    let duplicate = record.replacen(
+        r#""status":{"state":"queued","#,
+        r#""status":{"state":"queued","state":"queued","#,
+        1,
+    );
+    assert_ne!(
+        duplicate, record,
+        "fixture must contain a task status object"
+    );
+
+    assert!(serde_json::from_str::<LocalTaskRecord>(&duplicate).is_err());
+}
+
+#[test]
 fn task_limits_bound_followups_and_default_to_ten() {
     assert_eq!(TaskLimits::default().max_followups, 10);
     assert!(TaskLimits::new(turn_limits(), 0).is_ok());

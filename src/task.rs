@@ -1176,6 +1176,85 @@ impl TurnLimitsWire {
 
 struct UniqueObject(Map<String, Value>);
 
+struct UniqueValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = UniqueValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a JSON value with unique object keys")
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Bool(value)))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Number(value.into())))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Number(value.into())))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(Value::Number)
+                    .map(UniqueValue)
+                    .ok_or_else(|| E::custom("JSON number is not finite"))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::String(value.to_owned())))
+            }
+
+            fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+                self.visit_str(value)
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::String(value)))
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Null))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Null))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(UniqueValue(value)) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(UniqueValue(Value::Array(values)))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut object = Map::new();
+                while let Some((key, UniqueValue(value))) = map.next_entry()? {
+                    if object.contains_key(&key) {
+                        return Err(de::Error::custom(format!("duplicate field `{key}`")));
+                    }
+                    object.insert(key, value);
+                }
+                Ok(UniqueValue(Value::Object(object)))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for UniqueObject {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct Visitor;
@@ -1192,7 +1271,9 @@ impl<'de> Deserialize<'de> for UniqueObject {
                 A: de::MapAccess<'de>,
             {
                 let mut object = Map::new();
-                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                while let Some((key, UniqueValue(value))) =
+                    map.next_entry::<String, UniqueValue>()?
+                {
                     if object.contains_key(&key) {
                         return Err(de::Error::custom(format!("duplicate field `{key}`")));
                     }
