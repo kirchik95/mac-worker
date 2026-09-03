@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeSet, HashSet},
     ffi::{CStr, CString, OsStr},
     fs::File,
     io::{self, Read, Write},
@@ -20,7 +21,13 @@ use uuid::Uuid;
 
 use crate::{
     error::WorkerError,
-    job::{ClientId, JobId, JobState, JobStatus, LocalJobRecord, RemoteUncertainty},
+    job::{
+        AdmissionObservation, CachedAdmissionObservation, ClientId, JobId, JobState, JobStatus,
+        LocalJobRecord, ProcessIdentity, QueueCancel, QueueClaim, QueueEntry, QueueEntryKind,
+        QueueSnapshot, QueueState, RemoteUncertainty,
+    },
+    scheduler::AffinityHints,
+    supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
 };
 
 const DIRECTORY_FLAGS: libc::c_int =
@@ -33,6 +40,14 @@ const JOBS_NAME: &CStr = c"jobs";
 const OPERATIONS_NAME: &CStr = c".mac-worker-state";
 const LOCK_NAME: &CStr = c"jobs.lock";
 const PAYLOAD_NAME: &CStr = c"payload";
+const QUEUE_NAME: &CStr = c"queue";
+const QUEUE_STATE_NAME: &CStr = c"state.json";
+const QUEUE_LOCK_NAME: &CStr = c"lock";
+const AFFINITY_NAME: &CStr = c"affinity";
+const AFFINITY_PROJECTS_NAME: &CStr = c"projects";
+const AFFINITY_WORKTREES_NAME: &CStr = c"worktrees";
+const OBSERVATIONS_NAME: &CStr = c"observations";
+const OBSERVATION_TTL_MILLIS: u64 = 2_000;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +108,12 @@ struct ClientStateInner {
     root: OwnedFd,
     jobs: OwnedFd,
     operations: OwnedFd,
+    queue: OwnedFd,
+    affinity_projects: OwnedFd,
+    affinity_worktrees: OwnedFd,
+    observations: OwnedFd,
     client_id: ClientId,
+    owner_inspector: Arc<dyn ProcessInspector>,
     write_fault: Arc<AtomicU8>,
     sync_counts: Arc<SyncCounters>,
     cleanup_pause: Mutex<Option<Arc<CleanupPauseState>>>,
@@ -221,7 +241,7 @@ struct SyncCounters {
 
 impl ClientStateStore {
     pub fn open(state_root: &Path) -> Result<Self, WorkerError> {
-        Self::open_inner(state_root, None, None)
+        Self::open_inner(state_root, None, None, Arc::new(SystemProcessInspector))
     }
 
     #[doc(hidden)]
@@ -229,7 +249,12 @@ impl ClientStateStore {
         state_root: &Path,
         point: ClientStateWritePoint,
     ) -> Result<Self, WorkerError> {
-        Self::open_inner(state_root, Some(point), None)
+        Self::open_inner(
+            state_root,
+            Some(point),
+            None,
+            Arc::new(SystemProcessInspector),
+        )
     }
 
     #[doc(hidden)]
@@ -237,13 +262,30 @@ impl ClientStateStore {
         state_root: &Path,
         point: ClientStateCreationRacePoint,
     ) -> Result<Self, WorkerError> {
-        Self::open_inner(state_root, None, Some(point))
+        Self::open_inner(
+            state_root,
+            None,
+            Some(point),
+            Arc::new(SystemProcessInspector),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_owner_inspector<I>(
+        state_root: &Path,
+        inspector: I,
+    ) -> Result<Self, WorkerError>
+    where
+        I: ProcessInspector + 'static,
+    {
+        Self::open_inner(state_root, None, None, Arc::new(inspector))
     }
 
     fn open_inner(
         state_root: &Path,
         initial_fault: Option<ClientStateWritePoint>,
         initial_creation_race: Option<ClientStateCreationRacePoint>,
+        owner_inspector: Arc<dyn ProcessInspector>,
     ) -> Result<Self, WorkerError> {
         let write_fault = Arc::new(AtomicU8::new(initial_fault.map_or(0, |point| point as u8)));
         let sync_counts = Arc::new(SyncCounters::default());
@@ -264,9 +306,55 @@ impl ClientStateStore {
             SyncKind::Root,
             &creation_race,
         )?;
+        let queue = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            QUEUE_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
+        let affinity = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            AFFINITY_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
+        let affinity_projects = open_or_create_owned_directory(
+            affinity.as_raw_fd(),
+            AFFINITY_PROJECTS_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
+        let affinity_worktrees = open_or_create_owned_directory(
+            affinity.as_raw_fd(),
+            AFFINITY_WORKTREES_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
+        let observations = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            OBSERVATIONS_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
         let _lock =
             StateLock::acquire_with_creation_race(root.as_raw_fd(), &sync_counts, &creation_race)?;
-        require_same_device(root.as_raw_fd(), jobs.as_raw_fd(), operations.as_raw_fd())?;
+        require_same_device(
+            root.as_raw_fd(),
+            &[
+                jobs.as_raw_fd(),
+                operations.as_raw_fd(),
+                queue.as_raw_fd(),
+                affinity.as_raw_fd(),
+                affinity_projects.as_raw_fd(),
+                affinity_worktrees.as_raw_fd(),
+                observations.as_raw_fd(),
+            ],
+        )?;
         validate_root_entries(root.as_raw_fd())?;
         validate_operation_entries(operations.as_raw_fd())?;
         let client_id = load_or_create_client_id(
@@ -275,13 +363,32 @@ impl ClientStateStore {
             &write_fault,
             &sync_counts,
         )?;
+        open_or_create_queue_lock(queue.as_raw_fd())?;
+        let queue_snapshot = load_or_create_queue_snapshot(
+            queue.as_raw_fd(),
+            operations.as_raw_fd(),
+            &write_fault,
+            &sync_counts,
+        )?;
+        require_queue_client(&queue_snapshot, client_id)?;
+        validate_affinity_entries(
+            affinity.as_raw_fd(),
+            affinity_projects.as_raw_fd(),
+            affinity_worktrees.as_raw_fd(),
+        )?;
+        validate_observation_entries(observations.as_raw_fd())?;
 
         Ok(Self {
             inner: Arc::new(ClientStateInner {
                 root,
                 jobs,
                 operations,
+                queue,
+                affinity_projects,
+                affinity_worktrees,
+                observations,
                 client_id,
+                owner_inspector,
                 write_fault,
                 sync_counts,
                 cleanup_pause: Mutex::new(None),
@@ -291,6 +398,500 @@ impl ClientStateStore {
 
     pub fn client_id(&self) -> ClientId {
         self.inner.client_id
+    }
+
+    pub fn enqueue(&self, mut entry: QueueEntry) -> Result<QueueEntry, WorkerError> {
+        entry.validate()?;
+        if entry.client_id() != self.inner.client_id {
+            return Err(queue_error(
+                "QUEUE_CLIENT_MISMATCH",
+                "queue row belongs to another client identity",
+            ));
+        }
+        if entry.queue_id().value() != 0 {
+            return Err(queue_error(
+                "QUEUE_ID_ASSIGNED",
+                "new queue row already has a sequence ID",
+            ));
+        }
+        self.update_queue(|snapshot| {
+            if snapshot
+                .entries
+                .iter()
+                .any(|existing| existing.job_id() == entry.job_id())
+            {
+                return Err(queue_error(
+                    "QUEUE_JOB_CONFLICT",
+                    "job ID is already present in the queue",
+                ));
+            }
+            if let Some(previous) = snapshot.entries.last()
+                && entry.enqueued_at_millis() < previous.enqueued_at_millis()
+            {
+                return Err(queue_error(
+                    "QUEUE_TIME_REGRESSION",
+                    "queue enqueue timestamp moved backwards",
+                ));
+            }
+            let assigned = snapshot.next_id;
+            let next = assigned.checked_next()?;
+            entry.assign_queue_id(assigned);
+            snapshot.next_id = next;
+            snapshot.entries.push(entry.clone());
+            Ok((entry.clone(), true))
+        })
+    }
+
+    pub fn queue_snapshot(&self) -> Result<QueueSnapshot, WorkerError> {
+        let _lock = QueueLock::acquire(
+            self.inner.root.as_raw_fd(),
+            self.inner.queue.as_raw_fd(),
+            &self.inner.sync_counts,
+        )?;
+        let snapshot = read_queue_snapshot(self.inner.queue.as_raw_fd())?.0;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        Ok(snapshot)
+    }
+
+    pub fn adopt_row(
+        &self,
+        job_id: JobId,
+        new_owner: ProcessIdentity,
+    ) -> Result<QueueEntry, WorkerError> {
+        new_owner.validate()?;
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            entry.adopt(new_owner).map_err(|_| {
+                queue_error(
+                    "QUEUE_ADOPTION_CONFLICT",
+                    "queue row cannot be adopted in its current state",
+                )
+            })?;
+            Ok((entry.clone(), true))
+        })
+    }
+
+    pub fn claim_next(
+        &self,
+        owner: ProcessIdentity,
+        ranked_workers: &[String],
+        claimed_at_millis: u64,
+    ) -> Result<Option<QueueClaim>, WorkerError> {
+        owner.validate()?;
+        if claimed_at_millis == 0 {
+            return Err(queue_error(
+                "QUEUE_CLAIM_INVALID",
+                "queue claim timestamp must be positive",
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for worker in ranked_workers {
+            validate_state_worker_name(worker)?;
+            if !names.insert(worker.as_str()) {
+                return Err(queue_error(
+                    "QUEUE_CANDIDATES_INVALID",
+                    "ranked workers contain a duplicate",
+                ));
+            }
+        }
+
+        self.update_queue(|snapshot| {
+            let mut selected = None;
+            for worker in ranked_workers {
+                if snapshot.entries.iter().any(|entry| {
+                    matches!(
+                        entry.state(),
+                        QueueState::Dispatching { selected_worker, .. }
+                            if selected_worker == worker
+                    )
+                }) {
+                    continue;
+                }
+                let capabilities = read_observation_optional(
+                    self.inner.observations.as_raw_fd(),
+                    worker,
+                )?
+                .map(|observation| observation.capabilities().to_vec());
+                for index in 0..snapshot.entries.len() {
+                    let candidate = &snapshot.entries[index];
+                    if !matches!(candidate.state(), QueueState::Waiting { owner: row_owner } if *row_owner == owner)
+                        || candidate.is_cancel_requested()
+                        || !candidate.eligible_for(worker, capabilities.as_deref())
+                        || !self.run_has_capacity(snapshot, candidate)?
+                    {
+                        continue;
+                    }
+                    let mut blocked = false;
+                    for older in &snapshot.entries[..index] {
+                        if matches!(older.state(), QueueState::Waiting { .. })
+                            && !older.is_cancel_requested()
+                            && older.eligible_for(worker, capabilities.as_deref())
+                            && self.run_has_capacity(snapshot, older)?
+                            && self.owner_is_live_or_ambiguous(older.owner(), owner)
+                        {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                    if !blocked {
+                        selected = Some((index, worker.clone()));
+                        break;
+                    }
+                }
+                if selected.is_some() {
+                    break;
+                }
+            }
+
+            let Some((index, worker)) = selected else {
+                return Ok((None, false));
+            };
+            let entry = &mut snapshot.entries[index];
+            entry.dispatch(owner, worker, claimed_at_millis)?;
+            Ok((Some(QueueClaim::new(entry.clone())), true))
+        })
+    }
+
+    pub fn revert_dispatch(
+        &self,
+        job_id: JobId,
+        dispatch_owner: ProcessIdentity,
+    ) -> Result<QueueEntry, WorkerError> {
+        dispatch_owner.validate()?;
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            entry.revert(dispatch_owner).map_err(|_| {
+                queue_error(
+                    "QUEUE_OWNER_MISMATCH",
+                    "queue dispatch owner does not match",
+                )
+            })?;
+            Ok((entry.clone(), true))
+        })
+    }
+
+    pub fn request_queue_cancel(
+        &self,
+        job_id: JobId,
+        requested_at_millis: u64,
+    ) -> Result<Option<QueueCancel>, WorkerError> {
+        self.update_queue(|snapshot| {
+            let Some(index) = snapshot
+                .entries
+                .iter()
+                .position(|entry| entry.job_id() == job_id)
+            else {
+                return Ok((None, false));
+            };
+            match snapshot.entries[index].state().clone() {
+                QueueState::Waiting { .. } => {
+                    snapshot.entries.remove(index);
+                    Ok((Some(QueueCancel::RemovedWaiting { job_id }), true))
+                }
+                QueueState::Dispatching { dispatch_owner, .. } => {
+                    snapshot.entries[index].request_cancel(requested_at_millis)?;
+                    Ok((
+                        Some(QueueCancel::RequestedDispatch {
+                            job_id,
+                            dispatch_owner,
+                        }),
+                        true,
+                    ))
+                }
+            }
+        })
+    }
+
+    pub fn remove_after_terminal(
+        &self,
+        job_id: JobId,
+        dispatch_owner: ProcessIdentity,
+    ) -> Result<QueueEntry, WorkerError> {
+        dispatch_owner.validate()?;
+        self.update_queue(|snapshot| {
+            let index = snapshot
+                .entries
+                .iter()
+                .position(|entry| entry.job_id() == job_id)
+                .ok_or_else(|| queue_error("QUEUE_NOT_FOUND", "queue row was not found"))?;
+            if !matches!(
+                snapshot.entries[index].state(),
+                QueueState::Dispatching { dispatch_owner: current, .. } if *current == dispatch_owner
+            ) {
+                return Err(queue_error(
+                    "QUEUE_OWNER_MISMATCH",
+                    "queue dispatch owner does not match",
+                ));
+            }
+            Ok((snapshot.entries.remove(index), true))
+        })
+    }
+
+    pub fn recover_dead_dispatches(&self) -> Result<Vec<JobId>, WorkerError> {
+        self.update_queue(|snapshot| {
+            let mut recovered = Vec::new();
+            for entry in &mut snapshot.entries {
+                if entry.kind() != QueueEntryKind::Batch {
+                    continue;
+                }
+                let QueueState::Dispatching { dispatch_owner, .. } = entry.state() else {
+                    continue;
+                };
+                let dispatch_owner = *dispatch_owner;
+                if matches!(
+                    self.inner.owner_inspector.observe(dispatch_owner),
+                    ProcessObservation::Absent | ProcessObservation::Reused
+                ) {
+                    entry.revert(dispatch_owner)?;
+                    recovered.push(entry.job_id());
+                }
+            }
+            let changed = !recovered.is_empty();
+            Ok((recovered, changed))
+        })
+    }
+
+    pub fn remove_queued(&self, job_id: JobId) -> Result<Option<QueueEntry>, WorkerError> {
+        self.update_queue(|snapshot| {
+            let Some(index) = snapshot
+                .entries
+                .iter()
+                .position(|entry| entry.job_id() == job_id)
+            else {
+                return Ok((None, false));
+            };
+            if !matches!(snapshot.entries[index].state(), QueueState::Waiting { .. }) {
+                return Err(queue_error(
+                    "QUEUE_STATE_CONFLICT",
+                    "only a waiting queue row can be removed",
+                ));
+            }
+            Ok((Some(snapshot.entries.remove(index)), true))
+        })
+    }
+
+    pub fn record_affinity(
+        &self,
+        project_id: &str,
+        worktree_id: &str,
+        worker: &str,
+        observed_at_millis: u64,
+    ) -> Result<(), WorkerError> {
+        validate_affinity_key(project_id, "project ID")?;
+        validate_affinity_key(worktree_id, "worktree ID")?;
+        validate_state_worker_name(worker)?;
+        if observed_at_millis == 0 {
+            return Err(queue_error(
+                "AFFINITY_INVALID",
+                "affinity timestamp must be positive",
+            ));
+        }
+        let project = ProjectAffinityRecord {
+            project_id: project_id.to_owned(),
+            worker: worker.to_owned(),
+            observed_at_millis,
+        };
+        let worktree = WorktreeAffinityRecord {
+            project_id: project_id.to_owned(),
+            worktree_id: worktree_id.to_owned(),
+            worker: worker.to_owned(),
+            observed_at_millis,
+        };
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        read_worktree_affinity_optional(
+            self.inner.affinity_worktrees.as_raw_fd(),
+            &worktree_affinity_name(project_id, worktree_id)?,
+        )?;
+        read_project_affinity_optional(
+            self.inner.affinity_projects.as_raw_fd(),
+            &project_affinity_name(project_id)?,
+        )?;
+        publish_affinity_record(
+            self.inner.affinity_worktrees.as_raw_fd(),
+            &worktree_affinity_name(project_id, worktree_id)?,
+            &canonical_json_bytes(&worktree, "worktree affinity")?,
+            self,
+        )?;
+        publish_affinity_record(
+            self.inner.affinity_projects.as_raw_fd(),
+            &project_affinity_name(project_id)?,
+            &canonical_json_bytes(&project, "project affinity")?,
+            self,
+        )
+    }
+
+    pub fn affinity_hints(
+        &self,
+        project_id: &str,
+        worktree_id: &str,
+    ) -> Result<AffinityHints, WorkerError> {
+        validate_affinity_key(project_id, "project ID")?;
+        validate_affinity_key(worktree_id, "worktree ID")?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let project = read_project_affinity_optional(
+            self.inner.affinity_projects.as_raw_fd(),
+            &project_affinity_name(project_id)?,
+        )?;
+        let worktree = read_worktree_affinity_optional(
+            self.inner.affinity_worktrees.as_raw_fd(),
+            &worktree_affinity_name(project_id, worktree_id)?,
+        )?;
+        if project
+            .as_ref()
+            .is_some_and(|record| record.project_id != project_id)
+            || worktree.as_ref().is_some_and(|record| {
+                record.project_id != project_id || record.worktree_id != worktree_id
+            })
+        {
+            return Err(invalid_state(
+                "affinity filename and record identity differ",
+            ));
+        }
+        Ok(AffinityHints {
+            worktree_worker: worktree.map(|record| record.worker),
+            project_worker: project.map(|record| record.worker),
+        })
+    }
+
+    pub fn admission_observation<F>(
+        &self,
+        worker: &str,
+        now_millis: u64,
+        refresh: F,
+    ) -> Result<CachedAdmissionObservation, WorkerError>
+    where
+        F: FnOnce() -> Result<AdmissionObservation, WorkerError>,
+    {
+        validate_state_worker_name(worker)?;
+        let cached = {
+            let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+            read_observation_optional(self.inner.observations.as_raw_fd(), worker)?
+                .map(|observation| CachedAdmissionObservation::new(observation, now_millis))
+                .transpose()?
+        };
+        if cached
+            .as_ref()
+            .is_some_and(|cached| cached.age_millis() <= OBSERVATION_TTL_MILLIS)
+        {
+            return Ok(cached.expect("fresh observation is present"));
+        }
+
+        let marker = {
+            let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+            open_or_create_refresh_marker(
+                self.inner.observations.as_raw_fd(),
+                worker,
+                &self.inner.sync_counts,
+            )?
+        };
+        let refresh_lock = match RefreshLock::try_acquire(marker)? {
+            RefreshAcquire::Acquired(lock) => lock,
+            RefreshAcquire::Busy if cached.is_some() => {
+                return Ok(cached.expect("busy refresh has a stale observation"));
+            }
+            RefreshAcquire::Busy => {
+                let marker = {
+                    let _lock =
+                        StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+                    open_refresh_marker(self.inner.observations.as_raw_fd(), worker)?
+                };
+                RefreshLock::acquire(marker)?
+            }
+        };
+
+        let current = {
+            let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+            read_observation_optional(self.inner.observations.as_raw_fd(), worker)?
+                .map(|observation| CachedAdmissionObservation::new(observation, now_millis))
+                .transpose()?
+        };
+        if current
+            .as_ref()
+            .is_some_and(|cached| cached.age_millis() <= OBSERVATION_TTL_MILLIS)
+        {
+            drop(refresh_lock);
+            return Ok(current.expect("fresh observation is present"));
+        }
+
+        let observation = refresh()?;
+        observation.validate()?;
+        if observation.worker_name() != worker {
+            return Err(queue_error(
+                "OBSERVATION_WORKER_MISMATCH",
+                "refreshed observation belongs to another worker",
+            ));
+        }
+        let cached = CachedAdmissionObservation::new(observation.clone(), now_millis)?;
+        let bytes = canonical_json_bytes(&observation, "admission observation")?;
+        {
+            let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+            publish_observation(self.inner.observations.as_raw_fd(), worker, &bytes, self)?;
+        }
+        drop(refresh_lock);
+        Ok(cached)
+    }
+
+    fn update_queue<R, F>(&self, update: F) -> Result<R, WorkerError>
+    where
+        F: FnOnce(&mut QueueSnapshot) -> Result<(R, bool), WorkerError>,
+    {
+        let _lock = QueueLock::acquire(
+            self.inner.root.as_raw_fd(),
+            self.inner.queue.as_raw_fd(),
+            &self.inner.sync_counts,
+        )?;
+        let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        let (result, changed) = update(&mut snapshot)?;
+        snapshot.validate()?;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        if changed {
+            publish_queue_snapshot(self, &snapshot, identity)?;
+        }
+        Ok(result)
+    }
+
+    fn owner_is_live_or_ambiguous(
+        &self,
+        row_owner: &ProcessIdentity,
+        caller: ProcessIdentity,
+    ) -> bool {
+        *row_owner == caller
+            || matches!(
+                self.inner.owner_inspector.observe(*row_owner),
+                ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
+            )
+    }
+
+    fn run_has_capacity(
+        &self,
+        snapshot: &QueueSnapshot,
+        candidate: &QueueEntry,
+    ) -> Result<bool, WorkerError> {
+        let Some(run) = candidate.run() else {
+            return Ok(true);
+        };
+        let mut active = HashSet::new();
+        for sibling in snapshot.entries().iter().filter(|entry| {
+            entry
+                .run()
+                .is_some_and(|other| other.run_id() == run.run_id())
+        }) {
+            if matches!(sibling.state(), QueueState::Dispatching { .. }) {
+                active.insert(sibling.job_id());
+            }
+            let name = job_file_name(sibling.job_id())?;
+            if let Some(record) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? {
+                self.require_local_client(&record)?;
+                if record
+                    .last_status()
+                    .is_some_and(|status| !status.state().is_terminal())
+                {
+                    active.insert(sibling.job_id());
+                }
+            }
+        }
+        Ok(active.len() < run.max_parallel() as usize)
     }
 
     pub fn create_job(&self, record: LocalJobRecord) -> Result<(), WorkerError> {
@@ -622,6 +1223,514 @@ impl ClientStateStore {
             self.take_cleanup_pause(),
         )?;
         Ok(replacement)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProjectAffinityRecord {
+    project_id: String,
+    worker: String,
+    observed_at_millis: u64,
+}
+
+impl ProjectAffinityRecord {
+    fn validate(&self) -> Result<(), WorkerError> {
+        validate_affinity_key(&self.project_id, "project ID")?;
+        validate_state_worker_name(&self.worker)?;
+        if self.observed_at_millis == 0 {
+            return Err(invalid_state("project affinity timestamp is invalid"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct WorktreeAffinityRecord {
+    project_id: String,
+    worktree_id: String,
+    worker: String,
+    observed_at_millis: u64,
+}
+
+impl WorktreeAffinityRecord {
+    fn validate(&self) -> Result<(), WorkerError> {
+        validate_affinity_key(&self.project_id, "project ID")?;
+        validate_affinity_key(&self.worktree_id, "worktree ID")?;
+        validate_state_worker_name(&self.worker)?;
+        if self.observed_at_millis == 0 {
+            return Err(invalid_state("worktree affinity timestamp is invalid"));
+        }
+        Ok(())
+    }
+}
+
+struct QueueLock {
+    _state: StateLock,
+    marker: OwnedFd,
+}
+
+impl QueueLock {
+    fn acquire(root: RawFd, queue: RawFd, sync_counts: &SyncCounters) -> Result<Self, WorkerError> {
+        let state = StateLock::acquire(root, sync_counts)?;
+        let marker = open_regular_at(queue, QUEUE_LOCK_NAME)?;
+        require_owned_regular(marker.as_raw_fd(), 0)?;
+        cvt(unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX) })?;
+        Ok(Self {
+            _state: state,
+            marker,
+        })
+    }
+}
+
+impl Drop for QueueLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.marker.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+struct RefreshLock {
+    marker: OwnedFd,
+}
+
+enum RefreshAcquire {
+    Acquired(RefreshLock),
+    Busy,
+}
+
+impl RefreshLock {
+    fn try_acquire(marker: OwnedFd) -> Result<RefreshAcquire, WorkerError> {
+        match cvt(unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) {
+            Ok(()) => Ok(RefreshAcquire::Acquired(Self { marker })),
+            Err(error) if lock_would_block(&error) => Ok(RefreshAcquire::Busy),
+            Err(error) => Err(WorkerError::Io(error)),
+        }
+    }
+
+    fn acquire(marker: OwnedFd) -> Result<Self, WorkerError> {
+        cvt(unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX) })?;
+        Ok(Self { marker })
+    }
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.marker.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn open_or_create_queue_lock(queue: RawFd) -> Result<(), WorkerError> {
+    match open_regular_at(queue, QUEUE_LOCK_NAME) {
+        Ok(descriptor) => {
+            require_owned_regular(descriptor.as_raw_fd(), 0)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let descriptor = create_lock_at(queue, QUEUE_LOCK_NAME)?;
+            require_owned_regular(descriptor.as_raw_fd(), 0)?;
+            sync_directory(queue)
+        }
+        Err(error) => Err(WorkerError::Io(error)),
+    }
+}
+
+fn load_or_create_queue_snapshot(
+    queue: RawFd,
+    operations: RawFd,
+    fault: &AtomicU8,
+    sync_counts: &Arc<SyncCounters>,
+) -> Result<QueueSnapshot, WorkerError> {
+    let snapshot = match read_regular_optional(queue, QUEUE_STATE_NAME)? {
+        Some((bytes, _)) => parse_queue_snapshot(&bytes)?,
+        None => {
+            let snapshot = QueueSnapshot::empty();
+            let bytes = canonical_queue_bytes(&snapshot)?;
+            let operation = OperationFile::stage(operations, &bytes, Arc::clone(sync_counts))?;
+            operation.publish_no_replace(queue, QUEUE_STATE_NAME, fault)?;
+            sync_directory(queue)?;
+            operation.cleanup(fault, &[], None)?;
+            snapshot
+        }
+    };
+    validate_queue_entries(queue)?;
+    Ok(snapshot)
+}
+
+fn validate_queue_entries(queue: RawFd) -> Result<(), WorkerError> {
+    let mut state_seen = false;
+    let mut lock_seen = false;
+    for entry in directory_entries(queue)? {
+        match entry.to_bytes() {
+            b"state.json" if !state_seen => {
+                read_queue_snapshot(queue)?;
+                state_seen = true;
+            }
+            b"lock" if !lock_seen => {
+                let lock = open_regular_at(queue, &entry)?;
+                require_owned_regular(lock.as_raw_fd(), 0)?;
+                lock_seen = true;
+            }
+            _ => return Err(invalid_state("queue contains an unexpected entry")),
+        }
+    }
+    if !state_seen || !lock_seen {
+        return Err(invalid_state("queue is incomplete"));
+    }
+    Ok(())
+}
+
+fn read_queue_snapshot(queue: RawFd) -> Result<(QueueSnapshot, FileIdentity), WorkerError> {
+    let (bytes, identity) = read_regular(queue, QUEUE_STATE_NAME)?;
+    Ok((parse_queue_snapshot(&bytes)?, identity))
+}
+
+fn parse_queue_snapshot(bytes: &[u8]) -> Result<QueueSnapshot, WorkerError> {
+    parse_canonical_json(bytes, "queue snapshot")
+}
+
+fn canonical_queue_bytes(snapshot: &QueueSnapshot) -> Result<Vec<u8>, WorkerError> {
+    canonical_json_bytes(snapshot, "queue snapshot")
+}
+
+fn require_queue_client(snapshot: &QueueSnapshot, client_id: ClientId) -> Result<(), WorkerError> {
+    if snapshot
+        .entries()
+        .iter()
+        .any(|entry| entry.client_id() != client_id)
+    {
+        return Err(queue_error(
+            "QUEUE_CLIENT_MISMATCH",
+            "queue contains a row for another client identity",
+        ));
+    }
+    Ok(())
+}
+
+fn publish_queue_snapshot(
+    store: &ClientStateStore,
+    snapshot: &QueueSnapshot,
+    expected: FileIdentity,
+) -> Result<(), WorkerError> {
+    let bytes = canonical_queue_bytes(snapshot)?;
+    let operation = OperationFile::stage(
+        store.inner.operations.as_raw_fd(),
+        &bytes,
+        Arc::clone(&store.inner.sync_counts),
+    )?;
+    if store.take_fault(ClientStateWritePoint::BeforePublish) {
+        return Err(injected_failure(ClientStateWritePoint::BeforePublish));
+    }
+    operation.replace_if_identity(
+        store.inner.queue.as_raw_fd(),
+        QUEUE_STATE_NAME,
+        expected,
+        &store.inner.write_fault,
+    )?;
+    if store.take_fault(ClientStateWritePoint::AfterPublish) {
+        return Err(injected_failure(ClientStateWritePoint::AfterPublish));
+    }
+    sync_directory(store.inner.queue.as_raw_fd())?;
+    operation.cleanup(
+        &store.inner.write_fault,
+        &[expected],
+        store.take_cleanup_pause(),
+    )
+}
+
+fn find_queue_entry_mut(
+    snapshot: &mut QueueSnapshot,
+    job_id: JobId,
+) -> Result<&mut QueueEntry, WorkerError> {
+    snapshot
+        .entries
+        .iter_mut()
+        .find(|entry| entry.job_id() == job_id)
+        .ok_or_else(|| queue_error("QUEUE_NOT_FOUND", "queue row was not found"))
+}
+
+fn canonical_json_bytes<T: serde::Serialize>(
+    record: &T,
+    _label: &'static str,
+) -> Result<Vec<u8>, WorkerError> {
+    let mut bytes = serde_json::to_vec(record)
+        .map_err(|_| invalid_state("state record cannot be serialized"))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn parse_canonical_json<T>(bytes: &[u8], _label: &'static str) -> Result<T, WorkerError>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    if bytes.len() < 2 || bytes.last() != Some(&b'\n') || bytes[..bytes.len() - 1].contains(&b'\n')
+    {
+        return Err(invalid_state("state record is not canonical JSON"));
+    }
+    let record = serde_json::from_slice(&bytes[..bytes.len() - 1])
+        .map_err(|_| invalid_state("state record is corrupt"))?;
+    if canonical_json_bytes(&record, "state record")? != bytes {
+        return Err(invalid_state("state record is not canonical JSON"));
+    }
+    Ok(record)
+}
+
+fn project_affinity_name(project_id: &str) -> Result<CString, WorkerError> {
+    CString::new(format!("{project_id}.json"))
+        .map_err(|_| invalid_state("project affinity filename is invalid"))
+}
+
+fn worktree_affinity_name(project_id: &str, worktree_id: &str) -> Result<CString, WorkerError> {
+    CString::new(format!("{project_id}-{worktree_id}.json"))
+        .map_err(|_| invalid_state("worktree affinity filename is invalid"))
+}
+
+fn read_project_affinity_optional(
+    directory: RawFd,
+    name: &CStr,
+) -> Result<Option<ProjectAffinityRecord>, WorkerError> {
+    read_regular_optional(directory, name)?
+        .map(|(bytes, _)| {
+            let record: ProjectAffinityRecord = parse_canonical_json(&bytes, "project affinity")?;
+            record.validate()?;
+            Ok(record)
+        })
+        .transpose()
+}
+
+fn read_worktree_affinity_optional(
+    directory: RawFd,
+    name: &CStr,
+) -> Result<Option<WorktreeAffinityRecord>, WorkerError> {
+    read_regular_optional(directory, name)?
+        .map(|(bytes, _)| {
+            let record: WorktreeAffinityRecord = parse_canonical_json(&bytes, "worktree affinity")?;
+            record.validate()?;
+            Ok(record)
+        })
+        .transpose()
+}
+
+fn publish_affinity_record(
+    directory: RawFd,
+    name: &CStr,
+    bytes: &[u8],
+    store: &ClientStateStore,
+) -> Result<(), WorkerError> {
+    publish_optional_record(directory, name, bytes, store)
+}
+
+fn publish_optional_record(
+    directory: RawFd,
+    name: &CStr,
+    bytes: &[u8],
+    store: &ClientStateStore,
+) -> Result<(), WorkerError> {
+    let existing = read_regular_optional(directory, name)?.map(|(_, identity)| identity);
+    let operation = OperationFile::stage(
+        store.inner.operations.as_raw_fd(),
+        bytes,
+        Arc::clone(&store.inner.sync_counts),
+    )?;
+    if store.take_fault(ClientStateWritePoint::BeforePublish) {
+        return Err(injected_failure(ClientStateWritePoint::BeforePublish));
+    }
+    match existing {
+        Some(identity) => {
+            operation.replace_if_identity(directory, name, identity, &store.inner.write_fault)?
+        }
+        None => operation.publish_no_replace(directory, name, &store.inner.write_fault)?,
+    }
+    if store.take_fault(ClientStateWritePoint::AfterPublish) {
+        return Err(injected_failure(ClientStateWritePoint::AfterPublish));
+    }
+    sync_directory(directory)?;
+    operation.cleanup(
+        &store.inner.write_fault,
+        &existing.into_iter().collect::<Vec<_>>(),
+        store.take_cleanup_pause(),
+    )
+}
+
+fn validate_affinity_entries(
+    affinity: RawFd,
+    projects: RawFd,
+    worktrees: RawFd,
+) -> Result<(), WorkerError> {
+    let mut children = directory_entries(affinity)?;
+    children.sort();
+    if children
+        .iter()
+        .map(|name| name.to_bytes())
+        .collect::<Vec<_>>()
+        != [b"projects".as_slice(), b"worktrees".as_slice()]
+    {
+        return Err(invalid_state(
+            "affinity directory contains an unexpected entry",
+        ));
+    }
+    for entry in directory_entries(projects)? {
+        let text = std::str::from_utf8(entry.to_bytes())
+            .map_err(|_| invalid_state("project affinity filename is not UTF-8"))?;
+        let project_id = text
+            .strip_suffix(".json")
+            .ok_or_else(|| invalid_state("project affinity filename is invalid"))?;
+        validate_affinity_key(project_id, "project ID")?;
+        let record = read_project_affinity_optional(projects, &entry)?
+            .ok_or_else(|| invalid_state("project affinity record disappeared"))?;
+        if record.project_id != project_id {
+            return Err(invalid_state("project affinity filename and record differ"));
+        }
+    }
+    for entry in directory_entries(worktrees)? {
+        let text = std::str::from_utf8(entry.to_bytes())
+            .map_err(|_| invalid_state("worktree affinity filename is not UTF-8"))?;
+        let stem = text
+            .strip_suffix(".json")
+            .ok_or_else(|| invalid_state("worktree affinity filename is invalid"))?;
+        let (project_id, worktree_id) = stem
+            .split_once('-')
+            .ok_or_else(|| invalid_state("worktree affinity filename is invalid"))?;
+        validate_affinity_key(project_id, "project ID")?;
+        validate_affinity_key(worktree_id, "worktree ID")?;
+        let record = read_worktree_affinity_optional(worktrees, &entry)?
+            .ok_or_else(|| invalid_state("worktree affinity record disappeared"))?;
+        if record.project_id != project_id || record.worktree_id != worktree_id {
+            return Err(invalid_state(
+                "worktree affinity filename and record differ",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn observation_record_name(worker: &str) -> Result<CString, WorkerError> {
+    CString::new(format!("{worker}.json"))
+        .map_err(|_| invalid_state("observation filename is invalid"))
+}
+
+fn observation_marker_name(worker: &str) -> Result<CString, WorkerError> {
+    CString::new(format!("{worker}.refresh"))
+        .map_err(|_| invalid_state("observation marker filename is invalid"))
+}
+
+fn read_observation_optional(
+    directory: RawFd,
+    worker: &str,
+) -> Result<Option<AdmissionObservation>, WorkerError> {
+    let name = observation_record_name(worker)?;
+    read_regular_optional(directory, &name)?
+        .map(|(bytes, _)| {
+            let observation: AdmissionObservation =
+                parse_canonical_json(&bytes, "admission observation")?;
+            if observation.worker_name() != worker {
+                return Err(invalid_state(
+                    "observation filename and worker identity differ",
+                ));
+            }
+            Ok(observation)
+        })
+        .transpose()
+}
+
+fn publish_observation(
+    directory: RawFd,
+    worker: &str,
+    bytes: &[u8],
+    store: &ClientStateStore,
+) -> Result<(), WorkerError> {
+    read_observation_optional(directory, worker)?;
+    publish_optional_record(directory, &observation_record_name(worker)?, bytes, store)
+}
+
+fn open_or_create_refresh_marker(
+    directory: RawFd,
+    worker: &str,
+    sync_counts: &SyncCounters,
+) -> Result<OwnedFd, WorkerError> {
+    let name = observation_marker_name(worker)?;
+    match open_regular_at(directory, &name) {
+        Ok(marker) => {
+            require_owned_regular(marker.as_raw_fd(), 0)?;
+            Ok(marker)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match create_lock_at(directory, &name) {
+                Ok(marker) => {
+                    require_owned_regular(marker.as_raw_fd(), 0)?;
+                    sync_counted(directory, sync_counts, SyncKind::Root)?;
+                    Ok(marker)
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                    open_refresh_marker(directory, worker)
+                }
+                Err(error) => Err(WorkerError::Io(error)),
+            }
+        }
+        Err(error) => Err(WorkerError::Io(error)),
+    }
+}
+
+fn open_refresh_marker(directory: RawFd, worker: &str) -> Result<OwnedFd, WorkerError> {
+    let marker = open_regular_at(directory, &observation_marker_name(worker)?)?;
+    require_owned_regular(marker.as_raw_fd(), 0)?;
+    Ok(marker)
+}
+
+fn validate_observation_entries(directory: RawFd) -> Result<(), WorkerError> {
+    for entry in directory_entries(directory)? {
+        let text = std::str::from_utf8(entry.to_bytes())
+            .map_err(|_| invalid_state("observation filename is not UTF-8"))?;
+        if let Some(worker) = text.strip_suffix(".json") {
+            validate_state_worker_name(worker)?;
+            read_observation_optional(directory, worker)?
+                .ok_or_else(|| invalid_state("observation record disappeared"))?;
+        } else if let Some(worker) = text.strip_suffix(".refresh") {
+            validate_state_worker_name(worker)?;
+            let marker = open_regular_at(directory, &entry)?;
+            require_owned_regular(marker.as_raw_fd(), 0)?;
+        } else {
+            return Err(invalid_state(
+                "observations directory contains an unexpected entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_affinity_key(value: &str, _label: &'static str) -> Result<(), WorkerError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(queue_error(
+            "AFFINITY_INVALID",
+            "affinity identity is not canonical",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_state_worker_name(value: &str) -> Result<(), WorkerError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'))
+    {
+        return Err(queue_error(
+            "QUEUE_WORKER_INVALID",
+            "queue worker name is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn queue_error(code: &'static str, message: &'static str) -> WorkerError {
+    WorkerError::Queue {
+        code,
+        message: message.into(),
     }
 }
 
@@ -1557,7 +2666,8 @@ fn create_lock_file(root: RawFd) -> io::Result<OwnedFd> {
 fn validate_root_entries(root: RawFd) -> Result<(), WorkerError> {
     for entry in directory_entries(root)? {
         match entry.to_bytes() {
-            b"client-id" | b"jobs" | b".mac-worker-state" | b"jobs.lock" => {}
+            b"client-id" | b"jobs" | b".mac-worker-state" | b"jobs.lock" | b"queue"
+            | b"affinity" | b"observations" => {}
             bytes if std::str::from_utf8(bytes).is_err() => {
                 return Err(invalid_state("state root contains a non-UTF-8 entry"));
             }
@@ -1706,12 +2816,14 @@ fn require_owned_directory(descriptor: RawFd) -> Result<(), WorkerError> {
     Ok(())
 }
 
-fn require_same_device(root: RawFd, jobs: RawFd, operations: RawFd) -> Result<(), WorkerError> {
+fn require_same_device(root: RawFd, children: &[RawFd]) -> Result<(), WorkerError> {
     let device = stat_fd(root)?.st_dev;
-    if stat_fd(jobs)?.st_dev != device || stat_fd(operations)?.st_dev != device {
-        return Err(invalid_state(
-            "local state directories must share one filesystem",
-        ));
+    for child in children {
+        if stat_fd(*child)?.st_dev != device {
+            return Err(invalid_state(
+                "local state directories must share one filesystem",
+            ));
+        }
     }
     Ok(())
 }
@@ -1823,6 +2935,22 @@ fn create_regular_at(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
             parent,
             name.as_ptr(),
             libc::O_WRONLY
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK,
+            0o600,
+        )
+    })
+}
+
+fn create_lock_at(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
+    cvt_fd(unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDWR
                 | libc::O_CREAT
                 | libc::O_EXCL
                 | libc::O_CLOEXEC

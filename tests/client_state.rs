@@ -18,11 +18,13 @@ use mac_worker::{
     config::WorkerEntry,
     error::{ProcessError, WorkerError},
     job::{
-        ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseToken, LocalJobRecord,
-        PreacceptanceDisposition, ProcessIdentity, RemoteUncertainty, RequestFingerprintMaterial,
+        AdmissionObservation, ClientId, CommandSpec, CommandSummary, JobId, JobMeta, JobState,
+        JobStatus, LeaseToken, LocalJobRecord, PreacceptanceDisposition, ProcessIdentity,
+        QueueEntry, QueueEntryKind, RemoteUncertainty, RequestFingerprintMaterial,
         ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusResponse, SubmitRequest,
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner},
+    scheduler::{CandidateSlot, WorkerPreference},
     transfer::{RemoteJobClient, ResolutionRuntime},
 };
 
@@ -82,6 +84,23 @@ fn fresh_record(store: &ClientStateStore) -> LocalJobRecord {
         None,
         false,
     )
+}
+
+fn queue_record(store: &ClientStateStore, job_id: &str, at: u64) -> QueueEntry {
+    QueueEntry::new(
+        job_id.parse().unwrap(),
+        store.client_id(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        CommandSummary::shell(),
+        Vec::new(),
+        WorkerPreference::Automatic,
+        QueueEntryKind::Batch,
+        None,
+        ProcessIdentity::new(90_000, 90_000_001).unwrap(),
+        at,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -1671,4 +1690,92 @@ fn tree_contains_named_entry(root: &Path, expected_name: &str) -> bool {
         }
     }
     false
+}
+
+#[test]
+fn observation_refresh_holds_no_queue_or_root_state_lock() {
+    // Break caught: a slow external refresh retains the queue/root lock and
+    // blocks an unrelated local enqueue for the duration of SSH.
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = Arc::new(ClientStateStore::open(&state).unwrap());
+    let (refresh_entered_tx, refresh_entered_rx) = mpsc::channel();
+    let (release_refresh_tx, release_refresh_rx) = mpsc::channel();
+    let refreshing = {
+        let store = Arc::clone(&store);
+        thread::spawn(move || {
+            store.admission_observation("mini-1", 50_000, || {
+                refresh_entered_tx.send(()).unwrap();
+                release_refresh_rx.recv().unwrap();
+                AdmissionObservation::new(
+                    "mini-1".into(),
+                    true,
+                    CandidateSlot::Idle,
+                    vec!["rust".into()],
+                    Some(10),
+                    20,
+                    50_000,
+                )
+            })
+        })
+    };
+    refresh_entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+
+    let contention = store.observe_next_lock_contention();
+    let (enqueue_tx, enqueue_rx) = mpsc::channel();
+    let enqueueing = {
+        let store = Arc::clone(&store);
+        thread::spawn(move || {
+            enqueue_tx
+                .send(store.enqueue(queue_record(
+                    &store,
+                    "00000000000000000000000000001000",
+                    50_001,
+                )))
+                .unwrap();
+        })
+    };
+    enqueue_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("queue mutation blocked behind observation refresh")
+        .unwrap();
+    assert!(!contention.confirmed_within(Duration::from_millis(100)));
+    release_refresh_tx.send(()).unwrap();
+    refreshing.join().unwrap().unwrap();
+    enqueueing.join().unwrap();
+}
+
+#[test]
+fn queue_update_crash_after_publication_is_a_complete_canonical_replacement() {
+    // Break caught: the queue uses an in-place write instead of the established
+    // staged/fsynced/renamed client-state publication protocol.
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let dispatcher = ProcessIdentity::new(90_000, 90_000_001).unwrap();
+    store
+        .enqueue(queue_record(
+            &store,
+            "00000000000000000000000000001001",
+            51_000,
+        ))
+        .unwrap();
+    store.inject_write_failure_once(ClientStateWritePoint::AfterPublish);
+    assert!(
+        store
+            .claim_next(dispatcher, &["mini-1".into()], 51_001)
+            .is_err()
+    );
+
+    let reopened = ClientStateStore::open(&state).unwrap();
+    let bytes = fs::read(state.join("queue/state.json")).unwrap();
+    assert_eq!(bytes.last(), Some(&b'\n'));
+    assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+    assert!(matches!(
+        reopened.queue_snapshot().unwrap().entries()[0].state(),
+        mac_worker::job::QueueState::Dispatching { selected_worker, .. }
+            if selected_worker == "mini-1"
+    ));
 }

@@ -46,6 +46,8 @@ pub enum WorkerError {
     Snapshot { code: &'static str, message: String },
     #[error("capacity error [{code}]: {message}")]
     Capacity { code: &'static str, message: String },
+    #[error("queue error [{code}]: {message}")]
+    Queue { code: &'static str, message: String },
     #[error("transport error [{code}]: {message}")]
     Transport { code: &'static str, message: String },
     #[error("git error [{code}]: {message}")]
@@ -86,7 +88,7 @@ impl WorkerError {
             Self::Agent { code, .. } => agent_exit_kind(code),
             Self::Task { code, .. } => task_exit_kind(code),
             Self::CommandExit { .. } => ExitKind::Infrastructure,
-            Self::Protocol(_) | Self::Process(_) | Self::Snapshot { .. } => {
+            Self::Protocol(_) | Self::Process(_) | Self::Snapshot { .. } | Self::Queue { .. } => {
                 ExitKind::Infrastructure
             }
             Self::Io(_) => ExitKind::Io,
@@ -109,6 +111,7 @@ impl WorkerError {
             Self::Project { code, .. } => stable_public_code(code, "PROJECT"),
             Self::Snapshot { code, .. } => stable_public_code(code, "SNAPSHOT"),
             Self::Capacity { code, .. } => stable_public_code(code, "CAPACITY"),
+            Self::Queue { code, .. } => stable_public_code(code, "QUEUE"),
             Self::Transport { code, .. } => stable_public_code(code, "TRANSPORT"),
             Self::Git { code, .. } => stable_public_code(code, "GIT"),
             Self::Agent { code, .. } => stable_public_code(code, "AGENT"),
@@ -127,6 +130,7 @@ impl WorkerError {
             Self::Project { .. } => "project error".into(),
             Self::Snapshot { .. } => "snapshot error".into(),
             Self::Capacity { .. } => "capacity error".into(),
+            Self::Queue { .. } => "queue error".into(),
             Self::Transport { .. } => "transport error".into(),
             Self::Git { .. } => "git error".into(),
             Self::Agent { .. } => "agent error".into(),
@@ -221,6 +225,13 @@ mod tests {
                     message: "one heavy job is already active".into(),
                 },
                 ExitKind::Capacity,
+            ),
+            (
+                WorkerError::Queue {
+                    code: "QUEUE_JOB_CONFLICT",
+                    message: "job ID is already queued".into(),
+                },
+                ExitKind::Infrastructure,
             ),
             (
                 WorkerError::Transport {
@@ -344,6 +355,22 @@ mod tests {
                 },
                 "CAPACITY",
                 "capacity error",
+            ),
+            (
+                WorkerError::Queue {
+                    code: "QUEUE_JOB_CONFLICT",
+                    message: format!("queued {planted_path} {planted_secret}"),
+                },
+                "QUEUE_JOB_CONFLICT",
+                "queue error",
+            ),
+            (
+                WorkerError::Queue {
+                    code: "bad-queue-code",
+                    message: planted_secret.into(),
+                },
+                "QUEUE",
+                "queue error",
             ),
             (
                 WorkerError::Transport {

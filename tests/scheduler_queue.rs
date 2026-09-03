@@ -1,0 +1,1541 @@
+use std::{
+    fs,
+    os::unix::fs::{FileTypeExt, PermissionsExt, symlink},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
+
+use mac_worker::{
+    client_state::{ClientStateStore, ClientStateWritePoint},
+    error::WorkerError,
+    job::{
+        AdmissionObservation, CommandSpec, CommandSummary, JobId, JobMeta, JobStatus, LeaseToken,
+        LocalJobRecord, ProcessIdentity, QueueCancel, QueueEntry, QueueEntryKind, QueueId,
+        QueueRunReference, QueueState, RemoteUncertainty, RequestFingerprintMaterial, RunId,
+    },
+    scheduler::{CandidateSlot, WorkerPreference},
+    supervisor::{
+        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    },
+};
+
+const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const COMMAND_SECRET: &str = "PLANTED_EXACT_COMMAND_SECRET";
+const PATH_SECRET: &str = "/Users/alice/PLANTED_QUEUE_PATH";
+const TOKEN_SECRET: &str = "dddddddddddddddddddddddddddddddd";
+
+#[derive(Clone, Copy)]
+struct FixedOwnerInspector {
+    observation: ProcessObservation,
+}
+
+impl ProcessInspector for FixedOwnerInspector {
+    fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+        ProcessIdentity::new(pid, u64::from(pid) * 1_000 + 1)
+    }
+
+    fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+        match self.observation {
+            ProcessObservation::Matching { .. } => ProcessObservation::Matching {
+                process_group: expected.pid(),
+            },
+            observation => observation,
+        }
+    }
+
+    fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
+        ProcessGroupObservation::Ambiguous
+    }
+
+    fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
+        ProcessGroupMembership::Ambiguous
+    }
+}
+
+struct QueueFixture {
+    _directory: tempfile::TempDir,
+    root: PathBuf,
+    store: ClientStateStore,
+}
+
+fn open_queue() -> QueueFixture {
+    open_queue_with_owner_inspector(FixedOwnerInspector {
+        observation: ProcessObservation::Matching { process_group: 1 },
+    })
+}
+
+fn open_queue_with_owner_inspector<I>(inspector: I) -> QueueFixture
+where
+    I: ProcessInspector + 'static,
+{
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap().join("state");
+    let store = ClientStateStore::open_with_owner_inspector(&root, inspector).unwrap();
+    QueueFixture {
+        _directory: directory,
+        root,
+        store,
+    }
+}
+
+fn owner(pid: u32) -> ProcessIdentity {
+    ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
+}
+
+fn queued(
+    store: &ClientStateStore,
+    job_id: &str,
+    enqueued_at_millis: u64,
+    owner: ProcessIdentity,
+) -> QueueEntry {
+    queued_with(
+        store,
+        job_id,
+        enqueued_at_millis,
+        owner,
+        WorkerPreference::Automatic,
+        Vec::new(),
+        QueueEntryKind::Batch,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queued_with(
+    store: &ClientStateStore,
+    job_id: &str,
+    enqueued_at_millis: u64,
+    owner: ProcessIdentity,
+    preference: WorkerPreference,
+    requirements: Vec<String>,
+    kind: QueueEntryKind,
+    run: Option<QueueRunReference>,
+) -> QueueEntry {
+    QueueEntry::new(
+        job_id.parse().unwrap(),
+        store.client_id(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        CommandSummary::argv(2).unwrap(),
+        requirements,
+        preference,
+        kind,
+        run,
+        owner,
+        enqueued_at_millis,
+    )
+    .unwrap()
+}
+
+fn run_reference(id: &str, max_parallel: u32) -> QueueRunReference {
+    QueueRunReference::new(RunId::new(id.into()).unwrap(), max_parallel).unwrap()
+}
+
+fn cache_observation(store: &ClientStateStore, worker: &str, capabilities: &[&str], now: u64) {
+    let observation = AdmissionObservation::new(
+        worker.into(),
+        true,
+        CandidateSlot::Idle,
+        capabilities.iter().map(|value| (*value).into()).collect(),
+        Some(8 * 1024 * 1024 * 1024),
+        64 * 1024 * 1024 * 1024,
+        now,
+    )
+    .unwrap();
+    store
+        .admission_observation(worker, now, || Ok(observation))
+        .unwrap();
+}
+
+fn mode(path: impl AsRef<Path>) -> u32 {
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn local_record(
+    store: &ClientStateStore,
+    job_id: JobId,
+    worker: &str,
+    status: Option<JobStatus>,
+) -> LocalJobRecord {
+    let material = RequestFingerprintMaterial::new(
+        job_id,
+        store.client_id(),
+        LeaseToken::new(TOKEN_SECRET.parse().unwrap()),
+        1_000,
+        worker.into(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        DIGEST.into(),
+        "packages/app".into(),
+        30_000,
+        "heavy".into(),
+        CommandSpec::argv(vec!["tool".into(), COMMAND_SECRET.into()]).unwrap(),
+    )
+    .unwrap();
+    LocalJobRecord::new(
+        JobMeta::new(&material, material.fingerprint()).unwrap(),
+        material.lease_token(),
+        status,
+        RemoteUncertainty::None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn queue_records_are_canonical_owner_only_and_contain_summaries_not_secrets() {
+    // Break caught: queue persistence retains exact inputs or publishes
+    // permissive/non-canonical state that another invocation can misread.
+    let fixture = open_queue();
+    let entry = queued(
+        &fixture.store,
+        "00000000000000000000000000000001",
+        10,
+        owner(10),
+    );
+
+    let persisted = fixture.store.enqueue(entry).unwrap();
+    let bytes = fs::read(fixture.root.join("queue/state.json")).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+
+    assert_eq!(persisted.queue_id().value(), 1);
+    assert_eq!(
+        fixture.store.queue_snapshot().unwrap().entries(),
+        &[persisted]
+    );
+    assert_eq!(bytes.last(), Some(&b'\n'));
+    assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+    assert!(text.contains(r#""kind":"batch""#));
+    assert!(text.contains(r#""state":"waiting""#));
+    assert!(text.contains(r#""command_summary":{"mode":"argv","arg_count":2}"#));
+    for secret in [
+        COMMAND_SECRET,
+        PATH_SECRET,
+        DIGEST,
+        TOKEN_SECRET,
+        "prompt text",
+        "session_id",
+    ] {
+        assert!(!text.contains(secret), "queue leaked {secret}");
+    }
+    assert_eq!(mode(fixture.root.join("queue")), 0o700);
+    assert_eq!(mode(fixture.root.join("queue/state.json")), 0o600);
+    assert_eq!(mode(fixture.root.join("queue/lock")), 0o600);
+    let mut queue_entries = fs::read_dir(fixture.root.join("queue"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    queue_entries.sort();
+    assert_eq!(queue_entries, ["lock", "state.json"]);
+}
+
+#[test]
+fn schema_rejects_invalid_ids_caps_capabilities_modes_and_unknown_fields() {
+    // Break caught: permissive constructors or decoding admit values that
+    // cannot be used as canonical path/capacity decisions.
+    assert!(RunId::new("UPPER".into()).is_err());
+    assert!(RunId::new("../escape".into()).is_err());
+    assert!(QueueId::new(0).is_err());
+    assert!(QueueRunReference::new(RunId::new("run-1".into()).unwrap(), 0).is_err());
+
+    let fixture = open_queue();
+    let pending = queued(
+        &fixture.store,
+        "00000000000000000000000000000001",
+        10,
+        owner(10),
+    );
+    assert!(
+        serde_json::to_vec(&pending).is_err(),
+        "an unassigned queue ID must never serialize as a persistent record"
+    );
+    assert!(
+        serde_json::to_vec(&QueueState::Dispatching {
+            dispatch_owner: owner(10),
+            selected_worker: "../mini-1".into(),
+            claimed_at_millis: 0,
+        })
+        .is_err()
+    );
+    assert!(
+        serde_json::from_slice::<QueueState>(
+            br#"{"state":"dispatching","dispatch_owner":{"pid":10,"start_time_micros":100007},"selected_worker":"../mini-1","claimed_at_millis":0}"#,
+        )
+        .is_err()
+    );
+    assert!(
+        QueueEntry::new(
+            "00000000000000000000000000000002".parse().unwrap(),
+            fixture.store.client_id(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            CommandSummary::shell(),
+            vec!["Docker".into()],
+            WorkerPreference::Automatic,
+            QueueEntryKind::Batch,
+            None,
+            owner(11),
+            11,
+        )
+        .is_err()
+    );
+
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000003",
+            12,
+            owner(12),
+        ))
+        .unwrap();
+    let path = fixture.root.join("queue/state.json");
+    let bytes = fs::read(&path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["unknown"] = serde_json::json!(true);
+    let mut tampered = serde_json::to_vec(&value).unwrap();
+    tampered.push(b'\n');
+    fs::write(&path, tampered).unwrap();
+    assert!(fixture.store.queue_snapshot().is_err());
+
+    for (needle, replacement) in [
+        (r#""kind":"batch""#, r#""kind":"interactive""#),
+        (
+            r#""preference":{"mode":"automatic"}"#,
+            r#""preference":{"mode":"random"}"#,
+        ),
+    ] {
+        let fixture = open_queue();
+        fixture
+            .store
+            .enqueue(queued(
+                &fixture.store,
+                "00000000000000000000000000000004",
+                13,
+                owner(13),
+            ))
+            .unwrap();
+        let path = fixture.root.join("queue/state.json");
+        let original = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(original.contains(needle));
+        fs::write(path, original.replace(needle, replacement)).unwrap();
+        assert!(fixture.store.queue_snapshot().is_err());
+    }
+}
+
+#[test]
+fn malformed_noncanonical_duplicate_job_and_sequence_state_fails_closed() {
+    // Break caught: validation trusts syntax but not canonical ordering and
+    // uniqueness, allowing ambiguous FIFO identities to reach claim logic.
+    for mutation in [
+        "malformed",
+        "leading-space",
+        "duplicate-job",
+        "duplicate-sequence",
+    ] {
+        let fixture = open_queue();
+        fixture
+            .store
+            .enqueue(queued(
+                &fixture.store,
+                "00000000000000000000000000000004",
+                20,
+                owner(20),
+            ))
+            .unwrap();
+        fixture
+            .store
+            .enqueue(queued(
+                &fixture.store,
+                "00000000000000000000000000000005",
+                21,
+                owner(21),
+            ))
+            .unwrap();
+        let path = fixture.root.join("queue/state.json");
+        let original = fs::read(&path).unwrap();
+        let replacement = match mutation {
+            "malformed" => b"{\"next_id\":".to_vec(),
+            "leading-space" => {
+                let mut bytes = vec![b' '];
+                bytes.extend(original);
+                bytes
+            }
+            "duplicate-job" => String::from_utf8(original)
+                .unwrap()
+                .replace(
+                    "00000000000000000000000000000005",
+                    "00000000000000000000000000000004",
+                )
+                .into_bytes(),
+            "duplicate-sequence" => String::from_utf8(original)
+                .unwrap()
+                .replacen("\"queue_id\":2", "\"queue_id\":1", 1)
+                .into_bytes(),
+            _ => unreachable!(),
+        };
+        fs::write(path, replacement).unwrap();
+        assert!(
+            fixture.store.queue_snapshot().is_err(),
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_enqueue_and_backwards_time_do_not_mutate_fifo_state() {
+    // Break caught: enqueue aliases an existing job or lets caller time reorder
+    // the durable FIFO sequence.
+    let fixture = open_queue();
+    let first = queued(
+        &fixture.store,
+        "00000000000000000000000000000006",
+        30,
+        owner(30),
+    );
+    fixture.store.enqueue(first.clone()).unwrap();
+    assert_eq!(
+        fixture.store.enqueue(first).unwrap_err().public_code(),
+        "QUEUE_JOB_CONFLICT"
+    );
+    assert!(
+        fixture
+            .store
+            .enqueue(queued(
+                &fixture.store,
+                "00000000000000000000000000000007",
+                29,
+                owner(31),
+            ))
+            .is_err()
+    );
+    assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 1);
+}
+
+#[test]
+fn simultaneous_enqueues_allocate_unique_ids_without_lost_rows() {
+    // Break caught: read-unlocked/write-later enqueue loses a peer or allocates
+    // the same queue sequence twice.
+    let fixture = open_queue();
+    let store = Arc::new(fixture.store.clone());
+    let barrier = Arc::new(Barrier::new(32));
+    let handles = (1_u128..=32)
+        .map(|number| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let id = format!("{number:032x}");
+                let entry = queued(&store, &id, 100, owner(number as u32 + 100));
+                barrier.wait();
+                store.enqueue(entry)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    let snapshot = store.queue_snapshot().unwrap();
+    assert_eq!(snapshot.entries().len(), 32);
+    assert_eq!(snapshot.next_id().value(), 33);
+    assert_eq!(
+        snapshot
+            .entries()
+            .iter()
+            .map(|entry| entry.queue_id().value())
+            .collect::<Vec<_>>(),
+        (1..=32).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn replaced_queue_lock_cannot_split_the_authoritative_lock_domain() {
+    // Break caught: queue/lock replacement creates two mutexes and concurrent
+    // enqueues overwrite one another.
+    let fixture = open_queue();
+    fs::rename(
+        fixture.root.join("queue/lock"),
+        fixture.root.parent().unwrap().join("displaced-queue-lock"),
+    )
+    .unwrap();
+    fs::write(fixture.root.join("queue/lock"), b"").unwrap();
+    fs::set_permissions(
+        fixture.root.join("queue/lock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let reopened = ClientStateStore::open(&fixture.root).unwrap();
+    let first = fixture.store.clone();
+    let second = reopened.clone();
+    let barrier = Arc::new(Barrier::new(2));
+    let left = {
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            first.enqueue(queued(
+                &first,
+                "00000000000000000000000000000040",
+                200,
+                owner(200),
+            ))
+        })
+    };
+    let right = {
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            second.enqueue(queued(
+                &second,
+                "00000000000000000000000000000041",
+                200,
+                owner(201),
+            ))
+        })
+    };
+    left.join().unwrap().unwrap();
+    right.join().unwrap().unwrap();
+    assert_eq!(reopened.queue_snapshot().unwrap().entries().len(), 2);
+}
+
+#[test]
+fn queue_symlink_fifo_and_device_backed_replacements_fail_without_blocking() {
+    // Break caught: path-based reads follow a planted final entry or block on a
+    // FIFO instead of rejecting non-regular state.
+    for kind in ["symlink", "fifo", "device"] {
+        let fixture = open_queue();
+        let state = fixture.root.join("queue/state.json");
+        fs::rename(&state, fixture.root.join(format!("saved-{kind}"))).unwrap();
+        match kind {
+            "symlink" => symlink(fixture.root.join("saved-symlink"), &state).unwrap(),
+            "fifo" => {
+                let path = std::ffi::CString::new(state.as_os_str().as_encoded_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                assert!(fs::symlink_metadata(&state).unwrap().file_type().is_fifo());
+            }
+            "device" => symlink("/dev/null", &state).unwrap(),
+            _ => unreachable!(),
+        }
+        let (sent, received) = mpsc::channel();
+        let store = fixture.store.clone();
+        thread::spawn(move || sent.send(store.queue_snapshot().is_err()).unwrap());
+        assert!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "kind {kind}"
+        );
+    }
+}
+
+#[test]
+fn device_namespace_substituted_for_queue_is_rejected_on_reopen() {
+    // Break caught: component open follows a replacement queue link outside the
+    // local state root.
+    let fixture = open_queue();
+    fs::rename(fixture.root.join("queue"), fixture.root.join("saved-queue")).unwrap();
+    symlink("/dev", fixture.root.join("queue")).unwrap();
+    assert!(ClientStateStore::open(&fixture.root).is_err());
+}
+
+#[test]
+fn interrupted_publication_retains_exactly_old_or_fully_published_state() {
+    // Break caught: queue replacement writes in place and a crash exposes a
+    // truncated or half-updated claim.
+    for (point, dispatching) in [
+        (ClientStateWritePoint::BeforePublish, false),
+        (ClientStateWritePoint::AfterPublish, true),
+    ] {
+        let fixture = open_queue();
+        let dispatcher = owner(300);
+        fixture
+            .store
+            .enqueue(queued(
+                &fixture.store,
+                "00000000000000000000000000000050",
+                300,
+                dispatcher,
+            ))
+            .unwrap();
+        fixture.store.inject_write_failure_once(point);
+        assert!(
+            fixture
+                .store
+                .claim_next(dispatcher, &["mini-1".into()], 301)
+                .is_err()
+        );
+        let reopened = ClientStateStore::open(&fixture.root).unwrap();
+        let snapshot = reopened.queue_snapshot().unwrap();
+        assert_eq!(
+            matches!(
+                snapshot.entries()[0].state(),
+                QueueState::Dispatching { .. }
+            ),
+            dispatching
+        );
+    }
+}
+
+#[test]
+fn crash_after_retirement_rename_keeps_published_queue_reopenable() {
+    // Break caught: cleanup retirement is treated as transaction commit and
+    // reopening loses queue state already durably published.
+    let fixture = open_queue();
+    let dispatcher = owner(310);
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000051",
+            310,
+            dispatcher,
+        ))
+        .unwrap();
+    fixture
+        .store
+        .inject_write_failure_once(ClientStateWritePoint::CrashCleanupAfterOperationMoved);
+    assert!(
+        fixture
+            .store
+            .claim_next(dispatcher, &["mini-1".into()], 311)
+            .is_err()
+    );
+
+    let reopened = ClientStateStore::open(&fixture.root).unwrap();
+    assert!(matches!(
+        reopened.queue_snapshot().unwrap().entries()[0].state(),
+        QueueState::Dispatching { selected_worker, .. } if selected_worker == "mini-1"
+    ));
+}
+
+#[test]
+fn claim_marks_oldest_eligible_waiting_entry_dispatching_without_removing_it() {
+    // Break caught: claim pops before acceptance or bypasses the owner's older
+    // row for the same worker.
+    let fixture = open_queue();
+    let dispatcher = owner(400);
+    let first = queued(
+        &fixture.store,
+        "00000000000000000000000000000060",
+        400,
+        dispatcher,
+    );
+    let second = queued(
+        &fixture.store,
+        "00000000000000000000000000000061",
+        401,
+        dispatcher,
+    );
+    fixture.store.enqueue(first.clone()).unwrap();
+    fixture.store.enqueue(second).unwrap();
+    let claim = fixture
+        .store
+        .claim_next(dispatcher, &["mini-1".into()], 403)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(claim.entry().job_id(), first.job_id());
+    assert!(matches!(
+        claim.entry().state(),
+        QueueState::Dispatching { selected_worker, .. } if selected_worker == "mini-1"
+    ));
+    assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 2);
+}
+
+#[test]
+fn claims_are_owner_scoped_and_an_older_live_owner_wins_for_same_worker() {
+    // Break caught: a dispatcher steals another process's row or bypasses an
+    // older live-owned row eligible for the same idle worker.
+    let fixture = open_queue();
+    let older_owner = owner(410);
+    let younger_owner = owner(411);
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000062",
+            410,
+            older_owner,
+        ))
+        .unwrap();
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000063",
+            411,
+            younger_owner,
+        ))
+        .unwrap();
+
+    assert!(
+        fixture
+            .store
+            .claim_next(younger_owner, &["mini-1".into()], 412)
+            .unwrap()
+            .is_none()
+    );
+    let older = fixture
+        .store
+        .claim_next(older_owner, &["mini-1".into()], 413)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        older.entry().job_id().to_string(),
+        "00000000000000000000000000000062"
+    );
+    assert!(
+        fixture
+            .store
+            .claim_next(owner(999), &["mini-2".into()], 414)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn busy_pinned_head_does_not_block_younger_row_for_another_worker() {
+    // Break caught: queue-global head-of-line blocking prevents mini-2 work just
+    // because the oldest row is pinned to busy mini-1.
+    let fixture = open_queue();
+    let pinned_owner = owner(420);
+    let younger_owner = owner(421);
+    fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "00000000000000000000000000000064",
+            420,
+            pinned_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::Batch,
+            None,
+        ))
+        .unwrap();
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000065",
+            421,
+            younger_owner,
+        ))
+        .unwrap();
+    let claim = fixture
+        .store
+        .claim_next(younger_owner, &["mini-2".into()], 422)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.entry().job_id().to_string(),
+        "00000000000000000000000000000065"
+    );
+}
+
+#[test]
+fn capability_ineligible_head_blocks_no_unrelated_worker() {
+    // Break caught: FIFO compares age without checking the older row's actual
+    // capability eligibility for that worker.
+    let fixture = open_queue();
+    cache_observation(&fixture.store, "mini-2", &["rust"], 430);
+    let blocked_owner = owner(430);
+    let younger_owner = owner(431);
+    fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "00000000000000000000000000000066",
+            430,
+            blocked_owner,
+            WorkerPreference::Automatic,
+            vec!["docker".into()],
+            QueueEntryKind::Batch,
+            None,
+        ))
+        .unwrap();
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000067",
+            431,
+            younger_owner,
+        ))
+        .unwrap();
+    let claim = fixture
+        .store
+        .claim_next(younger_owner, &["mini-2".into()], 432)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.entry().job_id().to_string(),
+        "00000000000000000000000000000067"
+    );
+}
+
+#[test]
+fn three_rows_dispatch_only_to_three_distinct_workers() {
+    // Break caught: dispatch state reserves no worker slot and persists two
+    // in-flight rows for one single-slot worker.
+    let fixture = open_queue();
+    for (index, worker) in ["mini-1", "mini-2", "mini-3"].into_iter().enumerate() {
+        let dispatcher = owner(440 + index as u32);
+        let id = format!("{:032x}", 0x70 + index);
+        fixture
+            .store
+            .enqueue(queued(&fixture.store, &id, 440 + index as u64, dispatcher))
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .claim_next(dispatcher, &[worker.into()], 450 + index as u64)
+                .unwrap()
+                .is_some()
+        );
+    }
+    let fourth_owner = owner(449);
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000079",
+            449,
+            fourth_owner,
+        ))
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .claim_next(fourth_owner, &["mini-1".into()], 460)
+            .unwrap()
+            .is_none()
+    );
+    let workers = fixture
+        .store
+        .queue_snapshot()
+        .unwrap()
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry.state() {
+            QueueState::Dispatching {
+                selected_worker, ..
+            } => Some(selected_worker.clone()),
+            QueueState::Waiting { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(workers, ["mini-1", "mini-2", "mini-3"]);
+}
+
+#[test]
+fn waiting_task_turn_can_be_adopted_but_batch_and_dispatching_rows_cannot() {
+    // Break caught: Phase 5 cannot hand a waiting turn to its runner, or can
+    // rewrite batch/dispatch authority after a claim.
+    let fixture = open_queue();
+    let initial = owner(470);
+    let adopted = owner(471);
+    let task = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "00000000000000000000000000000080",
+            470,
+            initial,
+            WorkerPreference::Automatic,
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run_reference("run-80", 2)),
+        ))
+        .unwrap();
+    let adopted_entry = fixture.store.adopt_row(task.job_id(), adopted).unwrap();
+    assert_eq!(*adopted_entry.owner(), adopted);
+    assert_eq!(*adopted_entry.enqueue_owner(), initial);
+    assert!(
+        fixture
+            .store
+            .claim_next(initial, &["mini-1".into()], 471)
+            .unwrap()
+            .is_none()
+    );
+    fixture
+        .store
+        .claim_next(adopted, &["mini-1".into()], 472)
+        .unwrap()
+        .unwrap();
+    assert!(fixture.store.adopt_row(task.job_id(), owner(472)).is_err());
+
+    let batch = fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000081",
+            473,
+            initial,
+        ))
+        .unwrap();
+    assert!(fixture.store.adopt_row(batch.job_id(), adopted).is_err());
+}
+
+#[test]
+fn dead_batch_dispatch_is_first_persisted_waiting_and_pid_reuse_is_dead() {
+    // Break caught: a dead or PID-reused dispatcher deletes its durable row,
+    // losing the original identity needed for remote resolution.
+    for observation in [ProcessObservation::Absent, ProcessObservation::Reused] {
+        let fixture = open_queue_with_owner_inspector(FixedOwnerInspector { observation });
+        let dispatcher = owner(480);
+        let row = fixture
+            .store
+            .enqueue(queued(
+                &fixture.store,
+                "00000000000000000000000000000082",
+                480,
+                dispatcher,
+            ))
+            .unwrap();
+        fixture
+            .store
+            .claim_next(dispatcher, &["mini-1".into()], 481)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            fixture.store.recover_dead_dispatches().unwrap(),
+            vec![row.job_id()]
+        );
+        let snapshot = fixture.store.queue_snapshot().unwrap();
+        assert_eq!(snapshot.entries().len(), 1);
+        assert!(
+            matches!(snapshot.entries()[0].state(), QueueState::Waiting { owner } if *owner == dispatcher)
+        );
+    }
+}
+
+#[test]
+fn live_or_ambiguous_owner_is_never_recovered_as_abandoned() {
+    // Break caught: uncertainty is interpreted as death and mutates a row still
+    // owned by a possibly live dispatcher.
+    for observation in [
+        ProcessObservation::Matching { process_group: 1 },
+        ProcessObservation::Ambiguous,
+    ] {
+        let fixture = open_queue_with_owner_inspector(FixedOwnerInspector { observation });
+        let dispatcher = owner(490);
+        fixture
+            .store
+            .enqueue(queued(
+                &fixture.store,
+                "00000000000000000000000000000083",
+                490,
+                dispatcher,
+            ))
+            .unwrap();
+        fixture
+            .store
+            .claim_next(dispatcher, &["mini-1".into()], 491)
+            .unwrap()
+            .unwrap();
+        let before = fixture.store.queue_snapshot().unwrap();
+        assert!(fixture.store.recover_dead_dispatches().unwrap().is_empty());
+        assert_eq!(fixture.store.queue_snapshot().unwrap(), before);
+    }
+}
+
+#[test]
+fn dead_owner_task_turn_survives_recovery_unchanged_for_reownership() {
+    // Break caught: the batch reaper consumes a dead task-turn row that Phase 5
+    // must adopt using its durable task record.
+    let fixture = open_queue_with_owner_inspector(FixedOwnerInspector {
+        observation: ProcessObservation::Absent,
+    });
+    let dispatcher = owner(500);
+    fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "00000000000000000000000000000084",
+            500,
+            dispatcher,
+            WorkerPreference::Automatic,
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run_reference("run-84", 1)),
+        ))
+        .unwrap();
+    fixture
+        .store
+        .claim_next(dispatcher, &["mini-1".into()], 501)
+        .unwrap()
+        .unwrap();
+    let before = fixture.store.queue_snapshot().unwrap();
+    assert!(fixture.store.recover_dead_dispatches().unwrap().is_empty());
+    assert_eq!(fixture.store.queue_snapshot().unwrap(), before);
+}
+
+#[test]
+fn lease_busy_and_failed_preacceptance_revert_exact_dispatch_to_waiting() {
+    // Break caught: a failed attempt re-enqueues a row, loses FIFO identity, or
+    // lets a non-owner revert another dispatcher.
+    let fixture = open_queue();
+    let dispatcher = owner(510);
+    let row = fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000085",
+            510,
+            dispatcher,
+        ))
+        .unwrap();
+    fixture
+        .store
+        .claim_next(dispatcher, &["mini-1".into()], 511)
+        .unwrap()
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .revert_dispatch(row.job_id(), owner(999))
+            .is_err()
+    );
+    let reverted = fixture
+        .store
+        .revert_dispatch(row.job_id(), dispatcher)
+        .unwrap();
+    assert_eq!(reverted.queue_id(), row.queue_id());
+    assert!(matches!(reverted.state(), QueueState::Waiting { owner } if *owner == dispatcher));
+    assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 1);
+
+    fixture
+        .store
+        .claim_next(dispatcher, &["mini-2".into()], 512)
+        .unwrap()
+        .unwrap();
+    let again = fixture
+        .store
+        .revert_dispatch(row.job_id(), dispatcher)
+        .unwrap();
+    assert_eq!(again.queue_id(), row.queue_id());
+}
+
+#[test]
+fn cancel_racing_claim_is_removed_waiting_or_durably_requested_dispatch() {
+    // Break caught: cancel/claim interleaving loses the flag or returns a
+    // dispatch target after deleting its row.
+    for iteration in 0_u128..32 {
+        let fixture = open_queue();
+        let store = Arc::new(fixture.store.clone());
+        let dispatcher = owner(520 + iteration as u32);
+        let job_id: JobId = format!("{:032x}", 0x100 + iteration).parse().unwrap();
+        store
+            .enqueue(queued(&store, &job_id.to_string(), 520, dispatcher))
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let claim = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                store.claim_next(dispatcher, &["mini-1".into()], 521)
+            })
+        };
+        let cancel = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                store.request_queue_cancel(job_id, 522)
+            })
+        };
+        let claim = claim.join().unwrap().unwrap();
+        let cancel = cancel.join().unwrap().unwrap().unwrap();
+        let snapshot = store.queue_snapshot().unwrap();
+        match cancel {
+            QueueCancel::RemovedWaiting { job_id: removed } => {
+                assert_eq!(removed, job_id);
+                assert!(claim.is_none());
+                assert!(snapshot.entries().is_empty());
+            }
+            QueueCancel::RequestedDispatch {
+                job_id: requested,
+                dispatch_owner,
+            } => {
+                assert_eq!(requested, job_id);
+                assert_eq!(dispatch_owner, dispatcher);
+                assert!(claim.is_some());
+                assert_eq!(snapshot.entries().len(), 1);
+                assert!(snapshot.entries()[0].is_cancel_requested());
+            }
+        }
+    }
+}
+
+#[test]
+fn waiting_remove_and_terminal_remove_are_state_and_owner_scoped() {
+    // Break caught: cleanup deletes an in-flight row or a stale process removes
+    // a claim owned by another dispatcher.
+    let fixture = open_queue();
+    let dispatcher = owner(560);
+    let waiting = fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000086",
+            560,
+            dispatcher,
+        ))
+        .unwrap();
+    assert_eq!(
+        fixture.store.remove_queued(waiting.job_id()).unwrap(),
+        Some(waiting)
+    );
+
+    let dispatching = fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000087",
+            561,
+            dispatcher,
+        ))
+        .unwrap();
+    fixture
+        .store
+        .claim_next(dispatcher, &["mini-1".into()], 562)
+        .unwrap()
+        .unwrap();
+    assert!(fixture.store.remove_queued(dispatching.job_id()).is_err());
+    assert!(
+        fixture
+            .store
+            .remove_after_terminal(dispatching.job_id(), owner(999))
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .remove_after_terminal(dispatching.job_id(), dispatcher)
+            .unwrap()
+            .job_id(),
+        dispatching.job_id()
+    );
+}
+
+#[test]
+fn two_dispatchers_racing_last_local_run_slot_admit_at_most_cap() {
+    // Break caught: run-cap accounting occurs outside the queue mutation lock
+    // and two sibling claims both consume the final slot.
+    let fixture = open_queue();
+    let store = Arc::new(fixture.store.clone());
+    let run = run_reference("run-cap-race", 1);
+    let left_owner = owner(570);
+    let right_owner = owner(571);
+    store
+        .enqueue(queued_with(
+            &store,
+            "00000000000000000000000000000088",
+            570,
+            left_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run.clone()),
+        ))
+        .unwrap();
+    store
+        .enqueue(queued_with(
+            &store,
+            "00000000000000000000000000000089",
+            571,
+            right_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-2".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run),
+        ))
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let left = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.claim_next(left_owner, &["mini-1".into()], 572)
+        })
+    };
+    let right = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.claim_next(right_owner, &["mini-2".into()], 572)
+        })
+    };
+    let admitted = [
+        left.join().unwrap().unwrap(),
+        right.join().unwrap().unwrap(),
+    ]
+    .into_iter()
+    .filter(Option::is_some)
+    .count();
+    assert_eq!(admitted, 1);
+}
+
+#[test]
+fn accepted_nonterminal_local_sibling_also_consumes_run_cap() {
+    // Break caught: recovery reverts a dispatch and forgets its already-accepted
+    // local job still occupies the run slot.
+    let fixture = open_queue();
+    let run = run_reference("run-local-active", 1);
+    let active_owner = owner(580);
+    let active = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "0000000000000000000000000000008a",
+            580,
+            active_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run.clone()),
+        ))
+        .unwrap();
+    fixture
+        .store
+        .claim_next(active_owner, &["mini-1".into()], 581)
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .create_job(local_record(
+            &fixture.store,
+            active.job_id(),
+            "mini-1",
+            Some(JobStatus::accepted(582).unwrap()),
+        ))
+        .unwrap();
+    fixture
+        .store
+        .revert_dispatch(active.job_id(), active_owner)
+        .unwrap();
+
+    let sibling_owner = owner(581);
+    fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "0000000000000000000000000000008b",
+            583,
+            sibling_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-2".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run),
+        ))
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .claim_next(sibling_owner, &["mini-2".into()], 584)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn affinity_records_keep_worktree_and_project_fallbacks_separate_and_strict() {
+    // Break caught: a combined blob lets worktree updates clobber project
+    // fallback or malformed records silently become no affinity.
+    let fixture = open_queue();
+    fixture
+        .store
+        .record_affinity(PROJECT_ID, WORKTREE_ID, "mini-2", 600)
+        .unwrap();
+    let hints = fixture
+        .store
+        .affinity_hints(PROJECT_ID, WORKTREE_ID)
+        .unwrap();
+    assert_eq!(hints.worktree_worker.as_deref(), Some("mini-2"));
+    assert_eq!(hints.project_worker.as_deref(), Some("mini-2"));
+    assert_eq!(
+        mode(
+            fixture
+                .root
+                .join("affinity/projects")
+                .join(format!("{PROJECT_ID}.json"))
+        ),
+        0o600
+    );
+    assert_eq!(
+        mode(
+            fixture
+                .root
+                .join("affinity/worktrees")
+                .join(format!("{PROJECT_ID}-{WORKTREE_ID}.json"))
+        ),
+        0o600
+    );
+
+    fs::write(
+        fixture
+            .root
+            .join("affinity/projects")
+            .join(format!("{PROJECT_ID}.json")),
+        b"{\"project_id\":\"bad\"}\n",
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .store
+            .affinity_hints(PROJECT_ID, WORKTREE_ID)
+            .is_err()
+    );
+}
+
+#[test]
+fn stale_observation_refresh_is_single_flight_and_loser_keeps_age() {
+    // Break caught: every dispatcher probes the same stale worker, or a loser
+    // blocks instead of returning cached facts with their age.
+    let fixture = open_queue();
+    cache_observation(&fixture.store, "mini-1", &["rust"], 1_000);
+    let store = Arc::new(fixture.store.clone());
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let leader = {
+        let store = Arc::clone(&store);
+        let refreshes = Arc::clone(&refreshes);
+        thread::spawn(move || {
+            store.admission_observation("mini-1", 3_001, || {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                AdmissionObservation::new(
+                    "mini-1".into(),
+                    true,
+                    CandidateSlot::Idle,
+                    vec!["rust".into(), "docker".into()],
+                    Some(16),
+                    32,
+                    3_001,
+                )
+            })
+        })
+    };
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let loser_refreshes = Arc::clone(&refreshes);
+    let stale = store
+        .admission_observation("mini-1", 3_001, || {
+            loser_refreshes.fetch_add(100, Ordering::SeqCst);
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                CandidateSlot::Idle,
+                vec![],
+                None,
+                0,
+                3_001,
+            )
+        })
+        .unwrap();
+    assert_eq!(stale.age_millis(), 2_001);
+    assert_eq!(stale.observation().capabilities(), &["rust"]);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+
+    release_tx.send(()).unwrap();
+    let fresh = leader.join().unwrap().unwrap();
+    assert_eq!(fresh.age_millis(), 0);
+    assert_eq!(fresh.observation().capabilities(), &["rust", "docker"]);
+    assert_eq!(mode(fixture.root.join("observations/mini-1.json")), 0o600);
+    assert_eq!(
+        mode(fixture.root.join("observations/mini-1.refresh")),
+        0o600
+    );
+}
+
+#[test]
+fn exact_two_second_observation_is_fresh_and_unknown_fields_fail_closed() {
+    // Break caught: TTL boundary refreshes early or decoding drops fields a
+    // newer writer added instead of failing closed.
+    let fixture = open_queue();
+    cache_observation(&fixture.store, "mini-3", &["rust"], 10_000);
+    let calls = AtomicUsize::new(0);
+    let cached = fixture
+        .store
+        .admission_observation("mini-3", 12_000, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            unreachable!("exact TTL remains fresh")
+        })
+        .unwrap();
+    assert_eq!(cached.age_millis(), 2_000);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let path = fixture.root.join("observations/mini-3.json");
+    let bytes = fs::read(&path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["unknown"] = serde_json::json!("field");
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.push(b'\n');
+    fs::write(path, bytes).unwrap();
+    assert!(
+        fixture
+            .store
+            .admission_observation("mini-3", 12_001, || unreachable!())
+            .is_err()
+    );
+}
+
+#[test]
+fn observation_cache_rejects_symlink_and_fifo_replacement() {
+    // Break caught: cache reads follow external files or hang on attacker FIFOs.
+    for kind in ["symlink", "fifo"] {
+        let fixture = open_queue();
+        cache_observation(&fixture.store, "mini-1", &["rust"], 20_000);
+        let path = fixture.root.join("observations/mini-1.json");
+        fs::rename(
+            &path,
+            fixture.root.join(format!("saved-observation-{kind}")),
+        )
+        .unwrap();
+        if kind == "symlink" {
+            symlink(fixture.root.join("saved-observation-symlink"), &path).unwrap();
+        } else {
+            let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+        let (tx, rx) = mpsc::channel();
+        let store = fixture.store.clone();
+        thread::spawn(move || {
+            tx.send(
+                store
+                    .admission_observation("mini-1", 20_001, || unreachable!())
+                    .is_err(),
+            )
+            .unwrap()
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    }
+}
+
+#[test]
+fn independent_worker_capability_maps_do_not_cross_admit() {
+    // Break caught: claim uses a global capability set and admits a row on a
+    // worker that did not report the required capability.
+    let fixture = open_queue();
+    cache_observation(&fixture.store, "mini-1", &["docker"], 970);
+    cache_observation(&fixture.store, "mini-2", &["rust"], 970);
+    let dispatcher = owner(970);
+    fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "00000000000000000000000000000097",
+            970,
+            dispatcher,
+            WorkerPreference::Automatic,
+            vec!["docker".into()],
+            QueueEntryKind::Batch,
+            None,
+        ))
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .claim_next(dispatcher, &["mini-2".into()], 971)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .store
+            .claim_next(dispatcher, &["mini-1".into()], 972)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn run_reference_round_trips_as_opaque_canonical_metadata() {
+    // Break caught: run metadata expands with task/session data or accepts a
+    // nonpositive cap.
+    let reference = run_reference("018f0f4a6b5c7d8e9f00112233445566", 3);
+    let bytes = serde_json::to_vec(&reference).unwrap();
+    assert_eq!(
+        bytes,
+        br#"{"run_id":"018f0f4a6b5c7d8e9f00112233445566","max_parallel":3}"#
+    );
+    assert_eq!(
+        serde_json::from_slice::<QueueRunReference>(&bytes).unwrap(),
+        reference
+    );
+    assert!(
+        serde_json::from_slice::<QueueRunReference>(
+            br#"{"run_id":"run","max_parallel":1,"task_id":"secret"}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn cancelled_waiting_row_does_not_block_fifo_after_dispatch_reversion() {
+    // Break caught: a cancel flag retained through a race still blocks a younger
+    // row after exact dispatch reversion.
+    let fixture = open_queue();
+    let older_owner = owner(940);
+    let younger_owner = owner(941);
+    let older = fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000094",
+            940,
+            older_owner,
+        ))
+        .unwrap();
+    fixture
+        .store
+        .claim_next(older_owner, &["mini-1".into()], 941)
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .request_queue_cancel(older.job_id(), 942)
+        .unwrap();
+    fixture
+        .store
+        .revert_dispatch(older.job_id(), older_owner)
+        .unwrap();
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000095",
+            943,
+            younger_owner,
+        ))
+        .unwrap();
+    let claim = fixture
+        .store
+        .claim_next(younger_owner, &["mini-1".into()], 944)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.entry().job_id().to_string(),
+        "00000000000000000000000000000095"
+    );
+}

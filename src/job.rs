@@ -1,4 +1,8 @@
-use std::{fmt, str::FromStr};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fmt,
+    str::FromStr,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{
@@ -8,7 +12,11 @@ use serde::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{error::WorkerError, protocol::PROTOCOL_VERSION};
+use crate::{
+    error::WorkerError,
+    protocol::PROTOCOL_VERSION,
+    scheduler::{CandidateSlot, WorkerPreference},
+};
 
 pub const MAX_ARG_COUNT: usize = 256;
 pub const MAX_ARG_BYTES: usize = 16 * 1024;
@@ -629,8 +637,865 @@ impl ProcessIdentity {
         self.start_time_micros
     }
 
-    fn validate(self) -> Result<(), WorkerError> {
+    pub(crate) fn validate(self) -> Result<(), WorkerError> {
         Self::new(self.pid, self.start_time_micros).map(|_| ())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QueueId(u64);
+
+impl QueueId {
+    pub fn new(value: u64) -> Result<Self, WorkerError> {
+        if value == 0 {
+            return Err(protocol_error("queue ID must be positive"));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn value(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn pending() -> Self {
+        Self(0)
+    }
+
+    pub(crate) fn checked_next(self) -> Result<Self, WorkerError> {
+        self.0
+            .checked_add(1)
+            .ok_or_else(|| protocol_error("queue sequence is exhausted"))
+            .and_then(Self::new)
+    }
+}
+
+impl Serialize for QueueId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::new(self.0).map_err(ser::Error::custom)?;
+        serializer.serialize_u64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for QueueId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(u64::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RunId(String);
+
+impl RunId {
+    pub fn new(value: String) -> Result<Self, WorkerError> {
+        validate_opaque_identifier(&value, "run ID")?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for RunId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        validate_opaque_identifier(value, "run ID")
+            .map_err(|_| "run ID is not canonical".to_owned())?;
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl Serialize for RunId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        validate_opaque_identifier(&self.0, "run ID").map_err(ser::Error::custom)?;
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RunId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueEntryKind {
+    Batch,
+    TaskTurn,
+}
+
+impl Serialize for QueueEntryKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Batch => "batch",
+            Self::TaskTurn => "task_turn",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for QueueEntryKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "batch" => Ok(Self::Batch),
+            "task_turn" => Ok(Self::TaskTurn),
+            _ => Err(de::Error::custom("queue entry kind is invalid")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueRunReference {
+    run_id: RunId,
+    max_parallel: u32,
+}
+
+impl QueueRunReference {
+    pub fn new(run_id: RunId, max_parallel: u32) -> Result<Self, WorkerError> {
+        let reference = Self {
+            run_id,
+            max_parallel,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        validate_opaque_identifier(self.run_id.as_str(), "run ID")?;
+        if self.max_parallel == 0 {
+            return Err(protocol_error("run maximum parallelism must be positive"));
+        }
+        Ok(())
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn max_parallel(&self) -> u32 {
+        self.max_parallel
+    }
+}
+
+impl Serialize for QueueRunReference {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("QueueRunReference", 2)?;
+        record.serialize_field("run_id", &self.run_id)?;
+        record.serialize_field("max_parallel", &self.max_parallel)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for QueueRunReference {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            run_id: RunId,
+            max_parallel: u32,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.run_id, wire.max_parallel).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueState {
+    Waiting {
+        owner: ProcessIdentity,
+    },
+    Dispatching {
+        dispatch_owner: ProcessIdentity,
+        selected_worker: String,
+        claimed_at_millis: u64,
+    },
+}
+
+impl QueueState {
+    pub fn owner(&self) -> &ProcessIdentity {
+        match self {
+            Self::Waiting { owner } => owner,
+            Self::Dispatching { dispatch_owner, .. } => dispatch_owner,
+        }
+    }
+
+    fn validate(&self, enqueued_at_millis: u64) -> Result<(), WorkerError> {
+        self.owner().validate()?;
+        if let Self::Dispatching {
+            selected_worker,
+            claimed_at_millis,
+            ..
+        } = self
+        {
+            validate_worker_name(selected_worker)?;
+            if *claimed_at_millis == 0 || *claimed_at_millis < enqueued_at_millis {
+                return Err(protocol_error(
+                    "queue claim timestamp predates enqueue timestamp",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for QueueState {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate(0).map_err(ser::Error::custom)?;
+        match self {
+            Self::Waiting { owner } => {
+                let mut record = serializer.serialize_struct("QueueState", 2)?;
+                record.serialize_field("state", "waiting")?;
+                record.serialize_field("owner", owner)?;
+                record.end()
+            }
+            Self::Dispatching {
+                dispatch_owner,
+                selected_worker,
+                claimed_at_millis,
+            } => {
+                let mut record = serializer.serialize_struct("QueueState", 4)?;
+                record.serialize_field("state", "dispatching")?;
+                record.serialize_field("dispatch_owner", dispatch_owner)?;
+                record.serialize_field("selected_worker", selected_worker)?;
+                record.serialize_field("claimed_at_millis", claimed_at_millis)?;
+                record.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for QueueState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Waiting {
+                owner: ProcessIdentity,
+            },
+            Dispatching {
+                dispatch_owner: ProcessIdentity,
+                selected_worker: String,
+                claimed_at_millis: u64,
+            },
+        }
+        let state = match Wire::deserialize(deserializer)? {
+            Wire::Waiting { owner } => Self::Waiting { owner },
+            Wire::Dispatching {
+                dispatch_owner,
+                selected_worker,
+                claimed_at_millis,
+            } => Self::Dispatching {
+                dispatch_owner,
+                selected_worker,
+                claimed_at_millis,
+            },
+        };
+        state.validate(0).map_err(de::Error::custom)?;
+        Ok(state)
+    }
+}
+
+impl Serialize for WorkerPreference {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Automatic => {
+                let mut record = serializer.serialize_struct("WorkerPreference", 1)?;
+                record.serialize_field("mode", "automatic")?;
+                record.end()
+            }
+            Self::Pinned { worker } => {
+                validate_worker_name(worker).map_err(ser::Error::custom)?;
+                let mut record = serializer.serialize_struct("WorkerPreference", 2)?;
+                record.serialize_field("mode", "pinned")?;
+                record.serialize_field("worker", worker)?;
+                record.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerPreference {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Automatic {},
+            Pinned { worker: String },
+        }
+        let preference = match Wire::deserialize(deserializer)? {
+            Wire::Automatic {} => Self::Automatic,
+            Wire::Pinned { worker } => Self::Pinned { worker },
+        };
+        validate_worker_preference(&preference).map_err(de::Error::custom)?;
+        Ok(preference)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueEntry {
+    pub(crate) queue_id: QueueId,
+    pub(crate) job_id: JobId,
+    pub(crate) client_id: ClientId,
+    pub(crate) project_id: String,
+    pub(crate) worktree_id: String,
+    pub(crate) command_summary: CommandSummary,
+    pub(crate) requirements: Vec<String>,
+    pub(crate) preference: WorkerPreference,
+    pub(crate) kind: QueueEntryKind,
+    pub(crate) run: Option<QueueRunReference>,
+    pub(crate) enqueue_owner: ProcessIdentity,
+    pub(crate) state: QueueState,
+    pub(crate) cancel_requested_at_millis: Option<u64>,
+    pub(crate) enqueued_at_millis: u64,
+}
+
+impl QueueEntry {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        job_id: JobId,
+        client_id: ClientId,
+        project_id: String,
+        worktree_id: String,
+        command_summary: CommandSummary,
+        requirements: Vec<String>,
+        preference: WorkerPreference,
+        kind: QueueEntryKind,
+        run: Option<QueueRunReference>,
+        owner: ProcessIdentity,
+        enqueued_at_millis: u64,
+    ) -> Result<Self, WorkerError> {
+        let entry = Self {
+            queue_id: QueueId::pending(),
+            job_id,
+            client_id,
+            project_id,
+            worktree_id,
+            command_summary,
+            requirements,
+            preference,
+            kind,
+            run,
+            enqueue_owner: owner,
+            state: QueueState::Waiting { owner },
+            cancel_requested_at_millis: None,
+            enqueued_at_millis,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        validate_hex_component(&self.project_id, "queue project ID")?;
+        validate_hex_component(&self.worktree_id, "queue worktree ID")?;
+        self.command_summary.validate()?;
+        validate_requirements(&self.requirements)?;
+        validate_worker_preference(&self.preference)?;
+        self.enqueue_owner.validate()?;
+        self.state.validate(self.enqueued_at_millis)?;
+        if self.enqueued_at_millis == 0 {
+            return Err(protocol_error("queue enqueue timestamp must be positive"));
+        }
+        if let Some(run) = &self.run {
+            run.validate()?;
+        }
+        if let Some(cancelled_at) = self.cancel_requested_at_millis
+            && cancelled_at < self.enqueued_at_millis
+        {
+            return Err(protocol_error(
+                "queue cancellation timestamp predates enqueue timestamp",
+            ));
+        }
+        if self.kind == QueueEntryKind::Batch && self.owner() != &self.enqueue_owner {
+            return Err(protocol_error("batch queue ownership is not replaceable"));
+        }
+        Ok(())
+    }
+
+    pub fn queue_id(&self) -> QueueId {
+        self.queue_id
+    }
+
+    pub fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn worktree_id(&self) -> &str {
+        &self.worktree_id
+    }
+
+    pub fn command_summary(&self) -> &CommandSummary {
+        &self.command_summary
+    }
+
+    pub fn requirements(&self) -> &[String] {
+        &self.requirements
+    }
+
+    pub fn preference(&self) -> &WorkerPreference {
+        &self.preference
+    }
+
+    pub fn kind(&self) -> QueueEntryKind {
+        self.kind
+    }
+
+    pub fn run(&self) -> Option<&QueueRunReference> {
+        self.run.as_ref()
+    }
+
+    pub fn enqueue_owner(&self) -> &ProcessIdentity {
+        &self.enqueue_owner
+    }
+
+    pub fn owner(&self) -> &ProcessIdentity {
+        self.state.owner()
+    }
+
+    pub fn state(&self) -> &QueueState {
+        &self.state
+    }
+
+    pub fn is_cancel_requested(&self) -> bool {
+        self.cancel_requested_at_millis.is_some()
+    }
+
+    pub fn cancel_requested_at_millis(&self) -> Option<u64> {
+        self.cancel_requested_at_millis
+    }
+
+    pub fn enqueued_at_millis(&self) -> u64 {
+        self.enqueued_at_millis
+    }
+
+    pub(crate) fn assign_queue_id(&mut self, queue_id: QueueId) {
+        self.queue_id = queue_id;
+    }
+
+    pub(crate) fn adopt(&mut self, owner: ProcessIdentity) -> Result<(), WorkerError> {
+        if self.kind != QueueEntryKind::TaskTurn {
+            return Err(protocol_error("only a waiting task turn can be adopted"));
+        }
+        match &mut self.state {
+            QueueState::Waiting {
+                owner: current_owner,
+            } => *current_owner = owner,
+            QueueState::Dispatching { .. } => {
+                return Err(protocol_error("a dispatching queue row cannot be adopted"));
+            }
+        }
+        self.validate()
+    }
+
+    pub(crate) fn dispatch(
+        &mut self,
+        dispatch_owner: ProcessIdentity,
+        selected_worker: String,
+        claimed_at_millis: u64,
+    ) -> Result<(), WorkerError> {
+        self.state = QueueState::Dispatching {
+            dispatch_owner,
+            selected_worker,
+            claimed_at_millis,
+        };
+        self.validate()
+    }
+
+    pub(crate) fn revert(&mut self, dispatch_owner: ProcessIdentity) -> Result<(), WorkerError> {
+        match self.state {
+            QueueState::Dispatching {
+                dispatch_owner: current,
+                ..
+            } if current == dispatch_owner => {
+                self.state = QueueState::Waiting {
+                    owner: dispatch_owner,
+                };
+                self.validate()
+            }
+            _ => Err(protocol_error("queue dispatch owner does not match")),
+        }
+    }
+
+    pub(crate) fn request_cancel(&mut self, requested_at_millis: u64) -> Result<(), WorkerError> {
+        if requested_at_millis < self.enqueued_at_millis {
+            return Err(protocol_error(
+                "queue cancellation timestamp predates enqueue timestamp",
+            ));
+        }
+        if let Some(existing) = self.cancel_requested_at_millis
+            && requested_at_millis < existing
+        {
+            return Err(protocol_error(
+                "queue cancellation timestamp moved backwards",
+            ));
+        }
+        self.cancel_requested_at_millis = Some(requested_at_millis);
+        self.validate()
+    }
+
+    pub(crate) fn eligible_for(&self, worker: &str, capabilities: Option<&[String]>) -> bool {
+        let preference_matches = match &self.preference {
+            WorkerPreference::Automatic => true,
+            WorkerPreference::Pinned { worker: pinned } => pinned == worker,
+        };
+        preference_matches
+            && (self.requirements.is_empty()
+                || capabilities.is_some_and(|capabilities| {
+                    self.requirements
+                        .iter()
+                        .all(|required| capabilities.contains(required))
+                }))
+    }
+}
+
+impl Serialize for QueueEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("QueueEntry", 14)?;
+        record.serialize_field("queue_id", &self.queue_id)?;
+        record.serialize_field("job_id", &self.job_id)?;
+        record.serialize_field("client_id", &self.client_id)?;
+        record.serialize_field("project_id", &self.project_id)?;
+        record.serialize_field("worktree_id", &self.worktree_id)?;
+        record.serialize_field("command_summary", &self.command_summary)?;
+        record.serialize_field("requirements", &self.requirements)?;
+        record.serialize_field("preference", &self.preference)?;
+        record.serialize_field("kind", &self.kind)?;
+        record.serialize_field("run", &self.run)?;
+        record.serialize_field("enqueue_owner", &self.enqueue_owner)?;
+        record.serialize_field("state", &self.state)?;
+        record.serialize_field(
+            "cancel_requested_at_millis",
+            &self.cancel_requested_at_millis,
+        )?;
+        record.serialize_field("enqueued_at_millis", &self.enqueued_at_millis)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for QueueEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            queue_id: QueueId,
+            job_id: JobId,
+            client_id: ClientId,
+            project_id: String,
+            worktree_id: String,
+            command_summary: CommandSummary,
+            requirements: Vec<String>,
+            preference: WorkerPreference,
+            kind: QueueEntryKind,
+            run: Option<QueueRunReference>,
+            enqueue_owner: ProcessIdentity,
+            state: QueueState,
+            cancel_requested_at_millis: Option<u64>,
+            enqueued_at_millis: u64,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let entry = Self {
+            queue_id: wire.queue_id,
+            job_id: wire.job_id,
+            client_id: wire.client_id,
+            project_id: wire.project_id,
+            worktree_id: wire.worktree_id,
+            command_summary: wire.command_summary,
+            requirements: wire.requirements,
+            preference: wire.preference,
+            kind: wire.kind,
+            run: wire.run,
+            enqueue_owner: wire.enqueue_owner,
+            state: wire.state,
+            cancel_requested_at_millis: wire.cancel_requested_at_millis,
+            enqueued_at_millis: wire.enqueued_at_millis,
+        };
+        entry.validate().map_err(de::Error::custom)?;
+        Ok(entry)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueSnapshot {
+    pub(crate) next_id: QueueId,
+    pub(crate) entries: Vec<QueueEntry>,
+}
+
+impl QueueSnapshot {
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        let mut previous_id = 0;
+        let mut previous_timestamp = 0;
+        let mut jobs = HashSet::new();
+        let mut dispatch_workers = BTreeSet::new();
+        for entry in &self.entries {
+            entry.validate()?;
+            let queue_id = entry.queue_id.value();
+            if queue_id == 0 || queue_id <= previous_id || queue_id >= self.next_id.value() {
+                return Err(protocol_error(
+                    "queue IDs are not strictly increasing below next ID",
+                ));
+            }
+            if entry.enqueued_at_millis < previous_timestamp {
+                return Err(protocol_error("queue timestamps are not monotonic"));
+            }
+            if !jobs.insert(entry.job_id) {
+                return Err(protocol_error("queue contains a duplicate job ID"));
+            }
+            if let QueueState::Dispatching {
+                selected_worker, ..
+            } = &entry.state
+                && !dispatch_workers.insert(selected_worker.as_str())
+            {
+                return Err(protocol_error(
+                    "queue contains duplicate dispatch worker reservations",
+                ));
+            }
+            previous_id = queue_id;
+            previous_timestamp = entry.enqueued_at_millis;
+        }
+        Ok(())
+    }
+
+    pub fn next_id(&self) -> QueueId {
+        self.next_id
+    }
+
+    pub fn entries(&self) -> &[QueueEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            next_id: QueueId(1),
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl Serialize for QueueSnapshot {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("QueueSnapshot", 2)?;
+        record.serialize_field("next_id", &self.next_id)?;
+        record.serialize_field("entries", &self.entries)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for QueueSnapshot {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            next_id: QueueId,
+            entries: Vec<QueueEntry>,
+        }
+        let snapshot = {
+            let wire = Wire::deserialize(deserializer)?;
+            Self {
+                next_id: wire.next_id,
+                entries: wire.entries,
+            }
+        };
+        snapshot.validate().map_err(de::Error::custom)?;
+        Ok(snapshot)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueClaim {
+    entry: QueueEntry,
+}
+
+impl QueueClaim {
+    pub(crate) fn new(entry: QueueEntry) -> Self {
+        Self { entry }
+    }
+
+    pub fn entry(&self) -> &QueueEntry {
+        &self.entry
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueCancel {
+    RemovedWaiting {
+        job_id: JobId,
+    },
+    RequestedDispatch {
+        job_id: JobId,
+        dispatch_owner: ProcessIdentity,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionObservation {
+    worker_name: String,
+    ready: bool,
+    slot: CandidateSlot,
+    capabilities: Vec<String>,
+    available_memory_bytes: Option<u64>,
+    free_disk_bytes: u64,
+    observed_at_millis: u64,
+}
+
+impl AdmissionObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        worker_name: String,
+        ready: bool,
+        slot: CandidateSlot,
+        capabilities: Vec<String>,
+        available_memory_bytes: Option<u64>,
+        free_disk_bytes: u64,
+        observed_at_millis: u64,
+    ) -> Result<Self, WorkerError> {
+        let observation = Self {
+            worker_name,
+            ready,
+            slot,
+            capabilities,
+            available_memory_bytes,
+            free_disk_bytes,
+            observed_at_millis,
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        validate_worker_name(&self.worker_name)?;
+        validate_requirements(&self.capabilities)?;
+        if self.observed_at_millis == 0 {
+            return Err(protocol_error(
+                "admission observation timestamp must be positive",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn worker_name(&self) -> &str {
+        &self.worker_name
+    }
+
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
+
+    pub fn slot(&self) -> CandidateSlot {
+        self.slot
+    }
+
+    pub fn capabilities(&self) -> &[String] {
+        &self.capabilities
+    }
+
+    pub fn available_memory_bytes(&self) -> Option<u64> {
+        self.available_memory_bytes
+    }
+
+    pub fn free_disk_bytes(&self) -> u64 {
+        self.free_disk_bytes
+    }
+
+    pub fn observed_at_millis(&self) -> u64 {
+        self.observed_at_millis
+    }
+}
+
+impl Serialize for AdmissionObservation {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("AdmissionObservation", 7)?;
+        record.serialize_field("worker_name", &self.worker_name)?;
+        record.serialize_field("ready", &self.ready)?;
+        record.serialize_field(
+            "slot",
+            match self.slot {
+                CandidateSlot::Idle => "idle",
+                CandidateSlot::Busy => "busy",
+            },
+        )?;
+        record.serialize_field("capabilities", &self.capabilities)?;
+        record.serialize_field("available_memory_bytes", &self.available_memory_bytes)?;
+        record.serialize_field("free_disk_bytes", &self.free_disk_bytes)?;
+        record.serialize_field("observed_at_millis", &self.observed_at_millis)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AdmissionObservation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            worker_name: String,
+            ready: bool,
+            slot: String,
+            capabilities: Vec<String>,
+            available_memory_bytes: Option<u64>,
+            free_disk_bytes: u64,
+            observed_at_millis: u64,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let slot = match wire.slot.as_str() {
+            "idle" => CandidateSlot::Idle,
+            "busy" => CandidateSlot::Busy,
+            _ => return Err(de::Error::custom("admission observation slot is invalid")),
+        };
+        Self::new(
+            wire.worker_name,
+            wire.ready,
+            slot,
+            wire.capabilities,
+            wire.available_memory_bytes,
+            wire.free_disk_bytes,
+            wire.observed_at_millis,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedAdmissionObservation {
+    observation: AdmissionObservation,
+    age_millis: u64,
+}
+
+impl CachedAdmissionObservation {
+    pub(crate) fn new(
+        observation: AdmissionObservation,
+        now_millis: u64,
+    ) -> Result<Self, WorkerError> {
+        let age_millis = now_millis
+            .checked_sub(observation.observed_at_millis())
+            .ok_or_else(|| protocol_error("admission observation timestamp is in the future"))?;
+        Ok(Self {
+            observation,
+            age_millis,
+        })
+    }
+
+    pub fn observation(&self) -> &AdmissionObservation {
+        &self.observation
+    }
+
+    pub fn age_millis(&self) -> u64 {
+        self.age_millis
     }
 }
 
@@ -3420,6 +4285,66 @@ fn validate_non_nul(value: &str, max_bytes: usize, label: &str) -> Result<(), Wo
         return Err(protocol_error(&format!(
             "{label} is empty, too long, or contains NUL"
         )));
+    }
+    Ok(())
+}
+
+fn validate_opaque_identifier(value: &str, label: &str) -> Result<(), WorkerError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
+        })
+        || !value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return Err(protocol_error(&format!("{label} is not canonical")));
+    }
+    Ok(())
+}
+
+fn validate_worker_name(value: &str) -> Result<(), WorkerError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'))
+    {
+        return Err(protocol_error("queue worker name is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_worker_preference(preference: &WorkerPreference) -> Result<(), WorkerError> {
+    match preference {
+        WorkerPreference::Automatic => Ok(()),
+        WorkerPreference::Pinned { worker } => validate_worker_name(worker),
+    }
+}
+
+fn validate_requirements(requirements: &[String]) -> Result<(), WorkerError> {
+    if requirements.len() > 256 {
+        return Err(protocol_error("queue capability count exceeds its limit"));
+    }
+    let mut seen = BTreeSet::new();
+    for capability in requirements {
+        if capability.is_empty()
+            || capability.len() > 128
+            || !capability.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
+            })
+        {
+            return Err(protocol_error("queue capability is invalid"));
+        }
+        if !seen.insert(capability) {
+            return Err(protocol_error("queue capabilities contain a duplicate"));
+        }
     }
     Ok(())
 }
