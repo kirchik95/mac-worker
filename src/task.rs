@@ -12,6 +12,7 @@ use crate::{
     agent::{AgentKind, AgentOutcome, PermissionPolicy, TurnLimits},
     error::WorkerError,
     job::{JobId, ProcessIdentity},
+    redaction::RedactionBoundary,
 };
 
 pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
@@ -265,13 +266,24 @@ impl TaskOutcome {
             (
                 TurnTerminal::Succeeded | TurnTerminal::Failed,
                 Some(AgentOutcome::Failed { exit_code }),
-            ) => Self::Failed {
-                reason: format!("agent exited {exit_code}"),
-            },
+            ) => Self::failed(format!("agent exited {exit_code}")),
             (TurnTerminal::Succeeded, Some(AgentOutcome::Signalled)) => Self::Cancelled,
-            (TurnTerminal::Failed, _) => Self::Failed {
-                reason: "turn failed".into(),
+            (TurnTerminal::Failed, _) => Self::failed("turn failed"),
+        }
+    }
+
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self::Failed {
+            reason: RedactionBoundary::from_env().failure_reason(&reason.into()),
+        }
+    }
+
+    fn redact(self, boundary: &RedactionBoundary) -> Self {
+        match self {
+            Self::Failed { reason } => Self::Failed {
+                reason: boundary.failure_reason(&reason),
             },
+            other => other,
         }
     }
 }
@@ -672,15 +684,23 @@ impl TurnSummary {
         started_at_millis: Option<u64>,
         ended_at_millis: Option<u64>,
     ) -> Self {
+        let boundary = RedactionBoundary::from_env();
         Self {
             turn_number,
             turn_id,
             terminal,
-            outcome,
+            outcome: outcome.map(|outcome| outcome.redact(&boundary)),
             agent_committed,
             log_truncated,
             started_at_millis,
             ended_at_millis,
+        }
+    }
+
+    fn redact(self, boundary: &RedactionBoundary) -> Self {
+        Self {
+            outcome: self.outcome.map(|outcome| outcome.redact(boundary)),
+            ..self
         }
     }
 }
@@ -715,17 +735,21 @@ impl TaskStatus {
         turns: Vec<TurnSummary>,
         updated_at_millis: u64,
     ) -> Result<Self, WorkerError> {
+        let boundary = RedactionBoundary::from_env();
         let status = Self {
             state,
-            last_outcome,
+            last_outcome: last_outcome.map(|outcome| outcome.redact(&boundary)),
             worker,
             session_present,
             head_oid,
-            summary,
-            questions,
-            files_changed,
-            diff_stat,
-            turns,
+            summary: summary.as_deref().map(|summary| boundary.summary(summary)),
+            questions: boundary.questions(questions),
+            files_changed: boundary.changed_files(files_changed),
+            diff_stat: diff_stat.as_deref().map(|stat| boundary.diff_stat(stat)),
+            turns: turns
+                .into_iter()
+                .map(|turn| turn.redact(&boundary))
+                .collect(),
             updated_at_millis,
         };
         status.validate()?;

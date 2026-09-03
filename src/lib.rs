@@ -63,6 +63,7 @@ pub mod project;
 pub mod project_config;
 pub mod project_state;
 pub mod protocol;
+pub mod redaction;
 pub mod remote_snapshot;
 pub mod requirements;
 pub mod rooted_fs;
