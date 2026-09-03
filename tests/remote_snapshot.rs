@@ -513,6 +513,7 @@ fn assert_no_workspace_entry(path: &Path, row: usize) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assert_matrix_row_rejected(
     store: &HostStore,
     lease: &LeaseRecord,

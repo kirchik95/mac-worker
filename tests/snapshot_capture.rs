@@ -1746,11 +1746,10 @@ fn capture_failure_after_delete_leaves_partial_journal_and_scan_converges() {
     assert!(
         fs::read_dir(&staging)
             .unwrap()
-            .filter(|entry| {
+            .find(|entry| {
                 let name = entry.as_ref().unwrap().file_name();
                 name != STAGING_SIBLING && name != ".mac-worker-rooted-fs"
             })
-            .next()
             .is_none(),
         "owned partial capture remained after retry"
     );
@@ -1913,8 +1912,7 @@ fn assert_startup_scan_fail_closed(scope: StartupScope, kind: StartupResidueKind
             !ready.exists()
                 || fs::read_dir(&ready)
                     .unwrap()
-                    .filter(|entry| entry.as_ref().unwrap().file_name() != ".mac-worker-rooted-fs")
-                    .next()
+                    .find(|entry| entry.as_ref().unwrap().file_name() != ".mac-worker-rooted-fs")
                     .is_none()
         );
     }

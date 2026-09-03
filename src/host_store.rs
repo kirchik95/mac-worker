@@ -4732,12 +4732,11 @@ mod review_regression_tests {
                 .starts_with("cleanup-regular-v1-")
         }));
         drop(job);
-        let receipt = faulted.cleanup_job_owned(&lease).unwrap();
+        faulted.cleanup_job_owned(&lease).unwrap();
         assert!(!job_path.join(&replace).exists());
         if namespace.exists() {
             assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
         }
-        drop(receipt);
         drop(faulted);
     }
 

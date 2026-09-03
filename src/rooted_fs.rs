@@ -1586,7 +1586,9 @@ impl RootedDir {
         {
             return Err(snapshot_policy_error());
         }
-        chmod_fd(self.root.as_raw_fd(), 0o500)?;
+        if (metadata.st_mode & 0o7777) == 0o700 {
+            chmod_fd(self.root.as_raw_fd(), 0o500)?;
+        }
         cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
         self.verify_root_name()
     }
@@ -7550,6 +7552,7 @@ fn find_unpublished_cleanup_bootstrap(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn resolve_bound_tree_cleanup(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
@@ -7733,6 +7736,7 @@ fn resolve_bound_cleanup(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn complete_bound_tree_cleanup(
     namespace: &PrivateNamespace,
     public_parent: RawFd,
@@ -10523,7 +10527,7 @@ fn injected_cleanup_bootstrap_result() -> io::Result<()> {
         handoff.stream.write_all(b"H")?;
         let mut release = [0];
         handoff.stream.read_exact(&mut release)?;
-        if release != [b'R'] {
+        if release != *b"R" {
             return Err(os_error(libc::EIO));
         }
         Ok(())
@@ -10562,10 +10566,12 @@ fn injected_cleanup_probe_final_sync_result() -> io::Result<()> {
 fn cleanup_probe_was_interrupted() -> bool {
     #[cfg(test)]
     {
-        return TEST_CLEANUP_PROBE_INTERRUPTED.replace(false);
+        TEST_CLEANUP_PROBE_INTERRUPTED.replace(false)
     }
     #[cfg(not(test))]
-    false
+    {
+        false
+    }
 }
 
 fn injected_cleanup_placeholder_object_sync_result() -> io::Result<()> {
@@ -13402,15 +13408,11 @@ mod tests {
         // Catches adopting a Regular retry after kind, bootstrap, or quarantine
         // evidence is rewritten to the Tree grammar.
         enum Mismatch {
-            IntentKindTree,
-            OperationKindTree,
-            QuarantineKindTree,
+            Intent,
+            Operation,
+            Quarantine,
         }
-        for arm in [
-            Mismatch::IntentKindTree,
-            Mismatch::OperationKindTree,
-            Mismatch::QuarantineKindTree,
-        ] {
+        for arm in [Mismatch::Intent, Mismatch::Operation, Mismatch::Quarantine] {
             let fixture = RegularCleanupRetryFixture::create();
             let interrupt = fixture.interrupt_after_public_entry_vanishes(
                 CleanupFault::AfterCleanupQuarantineRename(libc::EIO),
@@ -13425,7 +13427,7 @@ mod tests {
             let quarantine_bytes = fs::read(&quarantine).unwrap();
             let namespace = fixture.root.join(".mac-worker-rooted-fs");
             let expected = match arm {
-                Mismatch::IntentKindTree => {
+                Mismatch::Intent => {
                     let mut record: CleanupIntentV1 =
                         cleanup_parse_canonical_json(&intent_bytes).unwrap();
                     record.kind = super::CleanupTargetKind::Tree;
@@ -13434,7 +13436,7 @@ mod tests {
                     fs::set_permissions(&intent, fs::Permissions::from_mode(0o600)).unwrap();
                     Some(libc::EINVAL)
                 }
-                Mismatch::OperationKindTree => {
+                Mismatch::Operation => {
                     let parsed = super::parse_cleanup_bootstrap_name(
                         &std::ffi::CString::new(operation.file_name().unwrap().as_bytes()).unwrap(),
                     )
@@ -13454,7 +13456,7 @@ mod tests {
                     .unwrap();
                     Some(libc::ESTALE)
                 }
-                Mismatch::QuarantineKindTree => {
+                Mismatch::Quarantine => {
                     fs::rename(
                         &quarantine,
                         namespace.join(format!(
@@ -13467,15 +13469,15 @@ mod tests {
                 }
             };
             let intent_after = match arm {
-                Mismatch::IntentKindTree => fs::read(&intent).unwrap(),
+                Mismatch::Intent => fs::read(&intent).unwrap(),
                 _ => intent_bytes,
             };
             let operation_after = match arm {
-                Mismatch::OperationKindTree => fixture.unique_namespace_role(b"cleanup-op-v1-"),
+                Mismatch::Operation => fixture.unique_namespace_role(b"cleanup-op-v1-"),
                 _ => operation.clone(),
             };
             let quarantine_after = match arm {
-                Mismatch::QuarantineKindTree => fs::read_dir(&namespace)
+                Mismatch::Quarantine => fs::read_dir(&namespace)
                     .unwrap()
                     .map(|entry| entry.unwrap().path())
                     .find(|path| {
@@ -16055,11 +16057,7 @@ mod tests {
 
         assert_eq!(probe_result, -1, "terminal snapshot was not linearized");
         assert!(probe_errno == libc::EAGAIN || probe_errno == libc::EWOULDBLOCK);
-        if phase == CleanupTerminalPhase::Final {
-            assert!(!root_path.exists());
-        } else {
-            assert!(!root_path.exists());
-        }
+        assert!(!root_path.exists());
     }
 
     #[test]

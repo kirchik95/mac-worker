@@ -1438,6 +1438,7 @@ mod exec_inheritance_tests {
     }
 
     #[test]
+    #[allow(clippy::zombie_processes)] // The harness terminates this intermediary before it can reap its leaf.
     fn production_exec_intermediary_probe() {
         let Ok(own_pid_fifo) = std::env::var(INTERMEDIARY_PID_FIFO_ENV) else {
             return;
