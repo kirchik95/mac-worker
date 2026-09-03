@@ -95,6 +95,14 @@ pub enum HostCommand {
     SnapshotVerify,
     #[command(name = "migrate-layout")]
     MigrateLayout,
+    #[command(name = "task-prepare")]
+    TaskPrepare,
+    #[command(name = "task-status")]
+    TaskStatus,
+    #[command(name = "task-diff")]
+    TaskDiff,
+    #[command(name = "task-close")]
+    TaskClose,
     #[command(name = "receive-pack")]
     ReceivePack {
         job_id: HiddenComponent,

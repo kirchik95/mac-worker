@@ -491,6 +491,14 @@ impl TaskMeta {
         self.run_id
     }
 
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn worktree_id(&self) -> &str {
+        &self.worktree_id
+    }
+
     pub fn agent(&self) -> AgentKind {
         self.agent
     }
@@ -505,6 +513,22 @@ impl TaskMeta {
 
     pub fn base_oid(&self) -> &BaseOid {
         &self.base_oid
+    }
+
+    pub fn policy(&self) -> PermissionPolicy {
+        self.policy
+    }
+
+    pub fn limits(&self) -> &TaskLimits {
+        &self.limits
+    }
+
+    pub fn close_policy(&self) -> ClosePolicy {
+        self.close_policy
+    }
+
+    pub fn created_at_millis(&self) -> u64 {
+        self.created_at_millis
     }
 
     pub fn git_identity(&self) -> &GitIdentity {
@@ -766,6 +790,38 @@ impl TaskStatus {
 
     pub fn last_outcome(&self) -> Option<&TaskOutcome> {
         self.last_outcome.as_ref()
+    }
+
+    pub fn worker(&self) -> Option<&str> {
+        self.worker.as_deref()
+    }
+
+    pub fn session_present(&self) -> bool {
+        self.session_present
+    }
+
+    pub fn head_oid(&self) -> Option<&BaseOid> {
+        self.head_oid.as_ref()
+    }
+
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
+    pub fn questions(&self) -> &[String] {
+        &self.questions
+    }
+
+    pub fn files_changed(&self) -> &[String] {
+        &self.files_changed
+    }
+
+    pub fn diff_stat(&self) -> Option<&str> {
+        self.diff_stat.as_deref()
+    }
+
+    pub fn updated_at_millis(&self) -> u64 {
+        self.updated_at_millis
     }
 
     pub fn turns(&self) -> &[TurnSummary] {

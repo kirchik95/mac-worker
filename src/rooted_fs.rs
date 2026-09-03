@@ -1214,7 +1214,7 @@ impl RootedDir {
         }
     }
 
-    pub(crate) fn entry_exists(&self, name: &str) -> io::Result<bool> {
+    pub fn entry_exists(&self, name: &str) -> io::Result<bool> {
         self.verify_root_name()?;
         let name = CString::new(name).map_err(interior_nul_error)?;
         match stat_at(self.root.as_raw_fd(), &name) {
@@ -1753,6 +1753,45 @@ impl RootedDir {
         })?)?;
         let final_binding = stat_at(self.root.as_raw_fd(), &target)?;
         if !same_file(&final_binding, &replacement_opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
+    /// Restores the owner-only mode of a regular file that an external
+    /// operation may have replaced in place. The name and inode are checked
+    /// through the rooted descriptor before and after the chmod.
+    pub(crate) fn set_private_regular_mode(&self, name: &str, mode: u32) -> io::Result<()> {
+        self.verify_root_name()?;
+        let target = CString::new(name).map_err(interior_nul_error)?;
+        let before = stat_at(self.root.as_raw_fd(), &target)?;
+        if file_type(before.st_mode) != libc::S_IFREG
+            || before.st_uid != unsafe { libc::geteuid() }
+            || before.st_nlink != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "host file is not a single owner regular file",
+            ));
+        }
+        let file = File::from(open_regular_at(self.root.as_raw_fd(), &target)?);
+        let opened = stat_fd(file.as_raw_fd())?;
+        if !same_file(&before, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        cvt(unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) })?;
+        file.sync_all()?;
+        let after = stat_fd(file.as_raw_fd())?;
+        let rebound = stat_at(self.root.as_raw_fd(), &target)?;
+        if !same_file(&before, &after)
+            || !same_file(&before, &rebound)
+            || after.st_uid != unsafe { libc::geteuid() }
+            || rebound.st_uid != unsafe { libc::geteuid() }
+            || after.st_nlink != 1
+            || rebound.st_nlink != 1
+            || after.st_mode as u32 & 0o7777 != mode
+            || rebound.st_mode as u32 & 0o7777 != mode
+        {
             return Err(os_error(libc::ESTALE));
         }
         cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })

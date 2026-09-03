@@ -42,6 +42,9 @@ use supervisor::{
     SUPERVISOR_LOCK_FD, Supervisor, SystemProcessInspector, SystemSupervisorLauncher,
     validate_detached_supervisor_context,
 };
+use task_store::{
+    TaskCloseRequest, TaskDiffRequest, TaskPrepareRequest, TaskStatusRequest, TaskStore,
+};
 use transfer::{
     HostTransferService, RemoteJobClient, RsyncServerExecutor, SystemRsyncServerExecutor,
     TransferIdentity,
@@ -82,6 +85,7 @@ pub mod scheduler_adapter;
 pub mod snapshot;
 pub mod supervisor;
 pub mod task;
+pub mod task_store;
 pub mod transfer;
 pub mod transfer_repo;
 pub mod transport;
@@ -290,6 +294,26 @@ fn execute_with_context(
             command: HostCommand::UploadPack { .. },
         } => Err(WorkerError::Protocol(
             "host upload-pack requires the binary stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::TaskPrepare,
+        } => Err(WorkerError::Protocol(
+            "host task-prepare requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::TaskStatus,
+        } => Err(WorkerError::Protocol(
+            "host task-status requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::TaskDiff,
+        } => Err(WorkerError::Protocol(
+            "host task-diff requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::TaskClose,
+        } => Err(WorkerError::Protocol(
+            "host task-close requires the stdio execution boundary".into(),
         )),
     }
 }
@@ -590,6 +614,38 @@ pub fn run_with_rsync_executor_in_context(
     if matches!(
         &cli.command,
         Command::Host {
+            command: HostCommand::TaskPrepare
+        }
+    ) {
+        return run_host_task_prepare(cli.config, runtime, runner, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::TaskStatus
+        }
+    ) {
+        return run_host_task_status(cli.config, runtime, runner, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::TaskDiff
+        }
+    ) {
+        return run_host_task_diff(cli.config, runtime, runner, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::TaskClose
+        }
+    ) {
+        return run_host_task_close(cli.config, runtime, runner, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
             command: HostCommand::LeaseAcquire
         }
     ) {
@@ -857,6 +913,78 @@ fn run_host_resolve_or_abandon(
     )
 }
 
+fn run_host_task_prepare(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_task_control_endpoint(
+        config_override,
+        runtime,
+        runner,
+        stdin,
+        stdout,
+        |request: TaskPrepareRequest, store, runner| {
+            let admission = store.admission_lock(request.job_id())?;
+            let transfer = store.transfer_lock_after(&admission, request.job_id())?;
+            TaskStore::new(store, runner).prepare(&request, &transfer)
+        },
+    )
+}
+
+fn run_host_task_status(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_task_control_endpoint(
+        config_override,
+        runtime,
+        runner,
+        stdin,
+        stdout,
+        |request: TaskStatusRequest, store, runner| TaskStore::new(store, runner).status(&request),
+    )
+}
+
+fn run_host_task_diff(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_task_control_endpoint(
+        config_override,
+        runtime,
+        runner,
+        stdin,
+        stdout,
+        |request: TaskDiffRequest, store, runner| TaskStore::new(store, runner).diff(&request),
+    )
+}
+
+fn run_host_task_close(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_task_control_endpoint(
+        config_override,
+        runtime,
+        runner,
+        stdin,
+        stdout,
+        |request: TaskCloseRequest, store, runner| TaskStore::new(store, runner).close(&request),
+    )
+}
+
 fn run_host_cancel(
     config_override: Option<PathBuf>,
     runtime: &RuntimeContext,
@@ -904,6 +1032,57 @@ fn run_host_reconcile(
             )
         },
     )
+}
+
+fn run_host_task_control_endpoint<Req, Res>(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    operation: impl FnOnce(Req, &HostStore, &dyn ProcessRunner) -> Result<Res, WorkerError>,
+) -> u8
+where
+    Req: DeserializeOwned + Serialize,
+    Res: Serialize,
+{
+    const LIMIT: usize = 1024 * 1024;
+    let result = (|| -> Result<Res, WorkerError> {
+        let mut bytes = Vec::new();
+        stdin.take((LIMIT + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > LIMIT {
+            return Err(WorkerError::Protocol(
+                "host task request exceeded 1 MiB".into(),
+            ));
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let request = Req::deserialize(&mut deserializer)
+            .map_err(|_| WorkerError::Protocol("invalid host task request".into()))?;
+        deserializer
+            .end()
+            .map_err(|_| WorkerError::Protocol("invalid host task request".into()))?;
+        if serde_json::to_vec(&request)
+            .map_err(|_| WorkerError::Protocol("invalid host task request".into()))?
+            != bytes
+        {
+            return Err(WorkerError::Protocol(
+                "host task request was not canonical JSON".into(),
+            ));
+        }
+        let paths = discover_paths(config_override, runtime)?;
+        let store = HostStore::open(&paths.host_state_root())?;
+        operation(request, &store, runner)
+    })();
+
+    let exit = result.as_ref().map_or_else(WorkerError::exit_code, |_| 0);
+    let write_result = match result {
+        Ok(response) => serde_json::to_writer(&mut *stdout, &response),
+        Err(error) => serde_json::to_writer(&mut *stdout, &versioned_host_error(&error)),
+    };
+    if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
+        return crate::error::ExitKind::Io as u8;
+    }
+    exit
 }
 
 fn run_host_control_endpoint<Req, Res>(
@@ -967,6 +1146,8 @@ fn versioned_host_error(error: &WorkerError) -> HostControlError {
     let (code, message) = match error {
         WorkerError::Capacity { code, .. } => (*code, "worker admission rejected"),
         WorkerError::Snapshot { code, .. } => (*code, "snapshot operation failed"),
+        WorkerError::Git { code, .. } => (*code, "Git operation failed"),
+        WorkerError::Task { code, .. } => (*code, "task operation failed"),
         WorkerError::Io(_) => ("HOST_IO", "host state operation failed"),
         _ => ("INVALID_REQUEST", "host request was invalid"),
     };

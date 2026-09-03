@@ -54,6 +54,10 @@ pub enum HostOperation {
     Status,
     LogChunk,
     ResolveOrAbandon,
+    TaskPrepare,
+    TaskStatus,
+    TaskDiff,
+    TaskClose,
     Cancel,
     Reconcile,
 }
@@ -67,6 +71,10 @@ impl HostOperation {
             Self::Status => "~/.local/bin/worker host status",
             Self::LogChunk => "~/.local/bin/worker host log-chunk",
             Self::ResolveOrAbandon => "~/.local/bin/worker host resolve-or-abandon",
+            Self::TaskPrepare => "~/.local/bin/worker host task-prepare",
+            Self::TaskStatus => "~/.local/bin/worker host task-status",
+            Self::TaskDiff => "~/.local/bin/worker host task-diff",
+            Self::TaskClose => "~/.local/bin/worker host task-close",
             Self::Cancel => "~/.local/bin/worker host cancel",
             Self::Reconcile => "~/.local/bin/worker host reconcile",
         }

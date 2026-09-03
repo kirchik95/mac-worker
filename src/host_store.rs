@@ -26,6 +26,7 @@ use crate::{
         ResolveOrAbandonRequest, SubmitRequest,
     },
     rooted_fs::{PrivateEntryIdentity, RootedDir},
+    task::{TaskId, TaskStatus},
 };
 
 const MAX_HOST_FILE_BYTES: u64 = 1024 * 1024;
@@ -416,6 +417,10 @@ impl AdmissionGuard {
 }
 
 impl TransferGuard {
+    pub(crate) fn job_id(&self) -> JobId {
+        self.identity.job_id
+    }
+
     pub(crate) fn validate(&self) -> Result<(), WorkerError> {
         self.anchor_namespace.verify_bound()?;
         self.anchor_namespace.validate_private_regular_binding(
@@ -1145,7 +1150,8 @@ impl HostStore {
         Ok(Some(store))
     }
 
-    pub(crate) fn admission_lock(&self, job: JobId) -> Result<AdmissionGuard, WorkerError> {
+    #[doc(hidden)]
+    pub fn admission_lock(&self, job: JobId) -> Result<AdmissionGuard, WorkerError> {
         let outer = Arc::new(self.installation_lock()?);
         self.validate_layout_locked(&outer)?;
         let jobs = self.open_directory("locks/jobs", false)?;
@@ -1243,7 +1249,8 @@ impl HostStore {
         Ok(guard)
     }
 
-    pub(crate) fn transfer_lock_after(
+    #[doc(hidden)]
+    pub fn transfer_lock_after(
         &self,
         admission: &AdmissionGuard,
         job: JobId,
@@ -1901,6 +1908,57 @@ impl HostStore {
         let mirror = repos.open_child_directory(&relative(&name)?, false)?;
         ensure_mirror_directory(&mirror)?;
         Ok(Some(mirror))
+    }
+
+    pub fn task_dir(&self, project_id: &str, task_id: TaskId) -> Result<PathBuf, WorkerError> {
+        self.validate_layout()?;
+        validate_digest(project_id, "project ID")?;
+        Ok(self
+            .inner
+            .display_root
+            .join("tasks")
+            .join(project_id)
+            .join(task_id.to_string()))
+    }
+
+    /// Returns the display path of a task workspace while retaining the
+    /// rooted validation boundary for opening it.
+    pub fn task_workspace(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+    ) -> Result<PathBuf, WorkerError> {
+        let task = self.open_task_directory(project_id, task_id, false)?;
+        let workspace = task.open_child_directory(&relative("workspace")?, false)?;
+        Ok(workspace.path().to_path_buf())
+    }
+
+    pub fn task_workspace_if_present(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+    ) -> Result<Option<PathBuf>, WorkerError> {
+        let task = match self.open_task_directory(project_id, task_id, false) {
+            Ok(task) => task,
+            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if !task.entry_exists("workspace")? {
+            return Ok(None);
+        }
+        let workspace = task.open_child_directory(&relative("workspace")?, false)?;
+        Ok(Some(workspace.path().to_path_buf()))
+    }
+
+    pub fn task_status(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+    ) -> Result<TaskStatus, WorkerError> {
+        let task = self.open_task_directory(project_id, task_id, false)?;
+        read_json_strict_at(&task, "status.json")
     }
 
     pub fn begin_job(
@@ -2769,6 +2827,16 @@ impl HostStore {
         };
         require_private_directory_metadata(&directory.root_metadata()?)?;
         Ok(directory)
+    }
+
+    pub(crate) fn open_task_directory(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        create: bool,
+    ) -> Result<RootedDir, WorkerError> {
+        validate_digest(project_id, "project ID")?;
+        self.open_directory(&format!("tasks/{project_id}/{task_id}"), create)
     }
 
     fn root_identity(&self) -> Result<HostRootIdentity, WorkerError> {
