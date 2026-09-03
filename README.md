@@ -52,3 +52,59 @@ cargo build --release
 Doctor inspects the Git worktree, probes configured workers read-only, creates a unique local snapshot, verifies the selected source a second time, and deletes that exact snapshot before a successful return. It does not upload project data or start a user command. A cleanup failure is an I/O failure, never a ready result.
 
 `UNTRACKED_INPUT` means local inputs are not covered by an explicit policy. Commit them, ignore or remove them when appropriate, or include only the exact file or narrow project-owned subtree needed by the command. Do not use a catch-all include. `SENSITIVE_PATH` means a conventional credential path is selected: remove it from the project input and use a documented example file or separately provisioned worker configuration. If the name is intentionally non-secret, review it and add only that exact relative path to `snapshot.allow_sensitive` in `.worker.toml`; Doctor will emit a content-free warning.
+
+## Phase 4 and Phase 5
+
+Phase 4 adds automatic scheduling and queueing across the configured workers, cancellation, and a local loopback dashboard. `worker dashboard` is available today. Automatic worker selection, the FIFO queue, and cancellation are planned and are not in the current CLI.
+
+Phase 5 adds agent tasks: submit a prompt instead of a command, run a headless coding agent on a Mac mini, and collect the result as a Git branch. The following are planned and are not in the current CLI: `worker task …` (including `worker task reconcile`) and `worker workers --refresh`. Prepare each worker first using the [macOS worker setup guide](docs/setup-macos-worker.md). After a helper that migrates the host layout or collects agent facts for the first time, rerun `worker setup` on every worker.
+
+When those commands exist, a batch file looks like this:
+
+```toml
+version = 1
+agent = "codex"
+base = "main"
+source = "local"
+publish = ["fetch"]
+timeout = "45m"
+
+[[tasks]]
+title = "Flaky login spec"
+prompt_file = "tasks/fix-flaky-login.md"
+
+[[tasks]]
+title = "Extract billing client"
+prompt = """
+Move the billing HTTP client into packages/billing-client …
+"""
+agent = "claude"
+publish = ["fetch", "push"]
+publish_branch = "feat/billing-client"
+```
+
+Top-level keys are defaults; each task may override them. Project defaults live in `.worker.toml`:
+
+```toml
+[task]
+source = "local"
+publish = ["fetch"]
+env_profile = "agents"
+default_agent = "codex"
+timeout = "45m"
+max_followups = 10
+
+[task.permissions]
+codex = "workspace"        # workspace | unattended
+claude = "unattended"
+cursor = "unattended"
+opencode = "unattended"
+```
+
+Claude Code is deferred on the workers by operator decision. When it is enabled, put its token in an owner-only profile on each worker (`~/.config/mac-worker/env/agents.env`, mode `0600`) with `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. Codex uses its file-based login and needs no profile. mac-worker never creates, uploads, or prints a profile.
+
+`worker workers --refresh` and `worker task reconcile` are planned: refresh recollects agent, profile, and Git-identity facts; reconcile re-owns dead runners and re-enqueues orphaned tasks without submitting anything.
+
+These remain later phases, not this execution core: `source = origin`, `publish = push`, Cursor Agent, OpenCode, retention through `worker gc`, and the dashboard tasks view.
+
+Agent turns run with the worker account's full access: its files, processes, caches, agent configuration, and any credentials that account holds. A task workspace is not a security boundary. Only dispatch trusted prompts.
