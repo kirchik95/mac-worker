@@ -445,3 +445,90 @@ If inspection shows the exact terminal state `promoted` or `rolled_back`, run th
 ```
 
 If any inspection, identity check, probe, removal, or `rmdir` step fails, stop, retain the lock and transaction as evidence, and do not retry setup. Do not delete unrelated setup directories or release a lock whose owner no longer matches.
+
+The sections above remain the account, SSH, and helper-install steps. The rest of this guide provisions the same worker for agent tasks. It does not replace the recovery procedure.
+
+## Agent-task provisioning
+
+**Available today:** `worker setup`, `worker workers`, `worker run`, and `worker dashboard`. Also available, and unchanged by this material: `worker doctor`, `worker status`, and `worker logs`.
+
+**Planned for phase 5, not in the current CLI:** `worker task …` and `worker workers --refresh`. Do not run those forms until they exist in this binary. Prepare the worker now so a later helper can collect agent facts and migrate the host layout through `worker setup`.
+
+## 6. Agent CLIs on the worker
+
+The pool can run these agents. Install them on the worker account's login-shell `PATH` yourself; `worker setup` never installs or logs into an agent.
+
+| Agent | Status on this pool | Headless authentication |
+| --- | --- | --- |
+| Codex | In use now | File-based login on the worker. No env profile is required. |
+| Claude Code | Deferred on the workers by operator decision | Env profile (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`). Not authenticated on the workers today. |
+| Cursor Agent | Adapter exists; not wired into the CLI until a later plan | Env profile (`CURSOR_API_KEY`). Keychain login is invisible over SSH. |
+| OpenCode | Adapter exists; not wired into the CLI until a later plan | File-based or provider login, plus any provider variables the agent needs in an env profile. |
+
+The binary named `agent` on a worker is unrelated; Cursor must be invoked as `cursor-agent`.
+
+Keychain-backed logins are invisible to a non-interactive SSH session: the login keychain is locked when no GUI session is present. Only a file-based login (Codex today) or an environment profile works for headless turns. mac-worker will not unlock the keychain.
+
+## 7. Env profiles
+
+Place one file per profile on each worker:
+
+```text
+~/.config/mac-worker/env/<name>.env
+```
+
+The file must be a regular file with mode `0600`, owned by the worker account. Write one `KEY=value` per line. Do not put a profile in the project, and do not ask mac-worker to create, upload, or print one.
+
+Variables each adapter reads from a profile:
+
+| Agent | Variables |
+| --- | --- |
+| Codex | none; file-based login is enough |
+| Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` |
+| Cursor Agent | `CURSOR_API_KEY` |
+| OpenCode | whatever provider variables that CLI needs |
+
+mac-worker reads a profile only to inject those names into the agent's environment and to run a read-only authentication check. It never copies, forwards, prints, or records values. Records may list variable names.
+
+A profile that is group- or world-readable is reported by the probe as insecure. A turn that names that profile is refused with `ENV_PROFILE_PERMISSIONS` before the agent starts. The probe that reports profiles, and the turn that refuses them, arrive with phase 5; the file and its mode are required now.
+
+## 8. Git identity on the worker
+
+A worker may have no `user.name` or `user.email`. Agent commits and publisher commits must not pick up Git's automatic identity fallback, which can attribute work to the worker host.
+
+The launcher therefore exports the submitting user's Git identity as `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL`. That identity is taken from the submitter's `user.name` and `user.email` (not secret) and recorded with the task. If the submitter has no identity, the launcher uses a fixed `mac-worker` fallback rather than the worker's hostname.
+
+Without an exported identity, a commit on the worker can still succeed through Git's fallback and be attributed incorrectly. Configure `user.name` and `user.email` on the MacBook that submits tasks.
+
+## 9. Rerunning `worker setup`
+
+The v2 helper migrates the host layout only through `worker setup`. Every other entry point, including the read-only probe, fails closed on an outdated layout. A worker whose data root predates the installation anchor reports `HOST_LAYOUT_OUTDATED` or fails setup; it is not eligible until setup has migrated it.
+
+`worker setup` does not rewrite a pre-anchor data root in place. The operator remedy used today is to move the old tree aside to a dated archive name and rerun setup:
+
+```bash
+mv ~/.local/share/mac-worker ~/.local/share/mac-worker.pre-anchor-<date>
+./target/release/worker setup mini-1
+```
+
+Name the archive `mac-worker.pre-anchor-<date>`, for example `mac-worker.pre-anchor-2026-09-03`. Do not use `sudo`, `rm -rf`, or globs under `~/.local/share/mac-worker`. Keep the archive until the new helper has been probed and a trusted job has completed. After a successful setup, `worker workers` should report the worker ready again.
+
+Rerun `worker setup` on every worker after a helper that changes the host layout or that collects agent facts for the first time.
+
+## 10. What the worker will hold
+
+Under the mac-worker data root (`~/.local/share/mac-worker`), an agent-capable helper keeps:
+
+- a per-project bare mirror
+- one task workspace per open task (a shared clone of that mirror)
+- turn job directories and their event logs
+
+Agents keep their own session stores outside that data root, for example under the account's Codex or Claude directories. Prompts, file contents, and diffs persist there under the agent's own retention. Closing or discarding a task does not guarantee those stores are empty.
+
+Remote jobs still inherit everything the selected account can access. Agent turns use that same account.
+
+## 11. Sleep and network
+
+Workers must not sleep. Every worker used for agent tasks needs outbound network access to the agent's model provider. Codex, Claude Code, Cursor Agent, and OpenCode all call their providers from the worker, not from the MacBook.
+
+ProxyJump-style SSH aliases are fine. Every mac-worker call is SSH; nothing on the worker listens for the control plane. Do not open inbound ports for mac-worker, and do not forward an SSH agent.
