@@ -75,7 +75,7 @@ tests/dashboard_command.rs           Phase-3-gated CLI/server lifecycle tests
 - Consumes: `crate::job::{CommandSummary, JobId, JobState, LogStream}` and `crate::protocol::MemoryPressure` only through explicit conversion functions in later tasks.
 - Produces: `DashboardSnapshot`, `DashboardWorker`, `DashboardJob`, `DashboardJobState`, `DashboardQueueEntry`, `DashboardError`, `Freshness`, `WorkerHealth`, `SlotSummary`, `SystemSummary`, `ArtifactStatus`, `DashboardLogChunk`, `ApiError`, `short_identifier`, and `project_label_or_fallback`.
 
-- [ ] **Step 1: Write failing projection-contract tests**
+- [x] **Step 1: Write failing projection-contract tests**
 
 Create `tests/dashboard_model.rs` with exact JSON assertions: a snapshot has `api_version: 1`, `queue: []`, nullable `cpu_busy_percent`/`artifact_status`, a typed job ID, and no keys named `ssh`, `lease_token`, `command`, `argv`, `shell`, `path`, or `environment`. Cover `project_label: null` falling back to `project-0123456789ab/worktree-fedcba987654` and a supplied label being bounded and control-character escaped. Cover `DashboardLogChunk` for base64 data and byte-exact `offset`/`next_offset`.
 
@@ -105,13 +105,13 @@ fn assert_absent_object_keys(value: &serde_json::Value, forbidden: &[&str]) {
 }
 ```
 
-- [ ] **Step 2: Run the model test to verify it fails**
+- [x] **Step 2: Run the model test to verify it fails**
 
 Run: `cargo test --locked --test dashboard_model -- --nocapture`
 
 Expected: FAIL because module `dashboard` and its DTOs do not exist.
 
-- [ ] **Step 3: Implement the projection DTOs and validation**
+- [x] **Step 3: Implement the projection DTOs and validation**
 
 Create `src/dashboard/mod.rs`:
 
@@ -204,7 +204,7 @@ pub enum DashboardMemoryPressure { Normal, Warn, Critical, Unknown }
 
 Use a dashboard-specific `DashboardCommandSummary { mode: DashboardCommandMode, arg_count: Option<u16> }`, so serializing a `DashboardJob` cannot accidentally inherit future private fields from `CommandSummary`. `DashboardError` holds only a code and `sanitize_bounded` message. `DashboardLogChunk` holds `stream`, `offset`, `next_offset`, and base64 `data`; construct it only from an existing validated `LogChunk` or decoded bounded bytes. `ApiError` serializes exactly as the global error envelope. Set `project_label` to `Option<String>` and implement `project_label_or_fallback(&DashboardJob) -> String` using 12-character IDs without retaining paths.
 
-- [ ] **Step 4: Run focused model tests and formatting**
+- [x] **Step 4: Run focused model tests and formatting**
 
 Run:
 
@@ -215,7 +215,7 @@ cargo fmt --all --check
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 5: Commit the independently usable contract**
+- [x] **Step 5: Commit the independently usable contract**
 
 ```bash
 git add src/lib.rs src/dashboard/mod.rs src/dashboard/model.rs tests/dashboard_model.rs
@@ -239,7 +239,7 @@ git commit -m "feat: define dashboard projection contract"
 
 At the implementation step, add exactly `pub mod cache;` to `src/dashboard/mod.rs`; retain the existing `pub mod model;` line and export no future dashboard modules.
 
-- [ ] **Step 1: Write failing bounded-cache tests**
+- [x] **Step 1: Write failing bounded-cache tests**
 
 Create `tests/dashboard_cache.rs`. Test all-full, all-CPU-only, and mixed 151-insert sequences retain the newest 150 samples across one canonical per-worker history; `latest` selects the newest full observation. Per-worker timestamps must be strictly increasing across both insertion APIs: duplicate or older input changes neither the history nor the CPU baseline. A current failure with a cached full observation whose age is `<= OBSERVATION_TTL_MILLIS` becomes `stale`; an older observation or cache miss becomes `offline` through `None`. Use saturating age so a regressed caller clock treats the last observation as age zero, and always preserve its original `observed_at_millis`.
 
@@ -255,13 +255,13 @@ fn cpu_busy_uses_consecutive_cumulative_counter_deltas_only() {
 }
 ```
 
-- [ ] **Step 2: Run cache tests to verify they fail**
+- [x] **Step 2: Run cache tests to verify they fail**
 
 Run: `cargo test --locked --test dashboard_cache -- --nocapture`
 
 Expected: FAIL because `dashboard::cache` is absent.
 
-- [ ] **Step 3: Implement cache-only behavior**
+- [x] **Step 3: Implement cache-only behavior**
 
 Define exact bounds and methods:
 
@@ -307,7 +307,7 @@ impl ObservationCache {
 
 `stale_worker` clones the newest full worker, changes only `freshness` to `Stale`, retains `observed_at_millis`, and never calls an external source. A cache miss or expired full observation is represented by `None`; the service turns it into an offline projection. Add a field-level serialization guard to `SystemSummary.cpu_busy_percent` so arbitrary public construction cannot emit NaN, infinity, or a value outside `0..=100`. The cache does not read clocks, sleep, touch disk, or retain source objects.
 
-- [ ] **Step 4: Run cache/model regressions**
+- [x] **Step 4: Run cache/model regressions**
 
 Run:
 
@@ -318,7 +318,7 @@ cargo clippy --locked --test dashboard_cache -- -D warnings
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 5: Commit the cache boundary**
+- [x] **Step 5: Commit the cache boundary**
 
 ```bash
 git add src/dashboard/cache.rs src/dashboard/mod.rs src/dashboard/model.rs tests/dashboard_cache.rs tests/dashboard_model.rs
@@ -340,7 +340,7 @@ git commit -m "feat: add bounded dashboard observation cache"
 
 At the implementation step, add exactly `pub mod service;` to `src/dashboard/mod.rs`; retain `model` and `cache` and export no future dashboard modules.
 
-- [ ] **Step 1: Write failing service tests with a deterministic fake**
+- [x] **Step 1: Write failing service tests with a deterministic fake**
 
 Create a `FakeSource` in `tests/dashboard_service.rs` that returns three configured names, deterministic worker observations, a local job list, and an explicitly supplied queue. Assert:
 
@@ -364,13 +364,13 @@ fn snapshot_uses_remote_status_before_lease_and_local_observation() {
 }
 ```
 
-- [ ] **Step 2: Run service tests to verify they fail**
+- [x] **Step 2: Run service tests to verify they fail**
 
 Run: `cargo test --locked --test dashboard_service -- --nocapture`
 
 Expected: FAIL because `DashboardService` and `DashboardDataSource` do not exist.
 
-- [ ] **Step 3: Implement a source-neutral, read-only service**
+- [x] **Step 3: Implement a source-neutral, read-only service**
 
 Define:
 
@@ -425,7 +425,7 @@ impl<S: DashboardDataSource, C: Clock> DashboardService<S, C> {
 
 `DashboardSnapshotRequest` has no caller-controlled worker, command, path, or deadline; it is an empty public struct. Use the global deadline to bound source work and return a last completed snapshot marked stale only if the local collection lock cannot be acquired before that deadline. For each `WorkerObservationResult::Current`, call `ObservationCache::record` exactly once and project the returned `CachedObservation.worker`; the source never borrows or owns the cache, and the service never separately calls `record_cpu` for that probe. If `record` returns `None` for a duplicate or out-of-order timestamp, add the bounded collection error code `INVALID_OBSERVATION_TIMESTAMP`, then use `stale_worker(worker_name, clock.now_millis())` or the normal offline projection on a cache miss; never render the rejected payload as current or silently omit its configured worker. Keep refresh coalescing inside the service: exactly one leader refreshes; waiters consume the same completed immutable snapshot. The service never invokes a command, writes a `ClientStateStore`, or calls a mutating lease/job API.
 
-- [ ] **Step 4: Run focused service/cache/model tests**
+- [x] **Step 4: Run focused service/cache/model tests**
 
 Run:
 
@@ -436,7 +436,7 @@ cargo fmt --all --check
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 5: Commit the testable snapshot service**
+- [x] **Step 5: Commit the testable snapshot service**
 
 ```bash
 git add src/dashboard/service.rs src/dashboard/mod.rs tests/dashboard_service.rs
@@ -458,7 +458,7 @@ git commit -m "feat: assemble read-only dashboard snapshots"
 - Produces: a static no-network dashboard shell using `data-testid` identifiers `worker-grid`, `queue-list`, `active-jobs`, `recent-jobs`, `job-detail`, `stdout-log`, and `stderr-log`.
 
 
-- [ ] **Step 1: Write failing executable client behavior tests**
+- [x] **Step 1: Write failing executable client behavior tests**
 
 Create `tests/dashboard_client.mjs` using Node's built-in `node:test` and `node:assert/strict`. Import `createDashboardClient` from `../src/dashboard/static/dashboard.mjs`. Build injected fakes: `FakeDocument` supplies test-id nodes; every `FakeNode` has `textContent`, `children`, `append`, and `replaceChildren`, but deliberately no `innerHTML`, `insertAdjacentHTML`, or HTML parser. `FakeFetch` records paths and returns fixtures. `FakeTimers` records delay values and exposes `fire(id)`/`cleared(id)`.
 
@@ -488,13 +488,13 @@ test('renderer treats project labels as text and log cursors independently', asy
 ```
 
 
-- [ ] **Step 2: Run client tests to verify they fail**
+- [x] **Step 2: Run client tests to verify they fail**
 
 Run: `node --test tests/dashboard_client.mjs`
 
 Expected: FAIL because `dashboard.mjs` does not export `createDashboardClient`.
 
-- [ ] **Step 3: Add the static shell and polling renderer**
+- [x] **Step 3: Add the static shell and polling renderer**
 
 Write `index.html` with only local `<link rel="stylesheet" href="/assets/dashboard.css">` and `<script type="module" src="/assets/dashboard.mjs"></script>` resources. Use semantic headings, `aria-live="polite"` for refresh status, buttons only for read-only job-detail selection, and `<pre>` elements for logs.
 
@@ -515,7 +515,7 @@ export function createDashboardClient({ document, fetch, timers }) {
 
 Define `renderSnapshot`, `refreshStream`, and `isTerminal` in the same module. `renderSnapshot` constructs nodes with `document.createElement`, `replaceChildren`, `append`, and `textContent` only; `refreshStream` calls `/api/v1/jobs/{job_id}/logs?stream={stream}&offset={offset}&limit=65536`, base64-decodes into text for the `<pre>`, and returns `next_offset`. The browser entrypoint calls `createDashboardClient({ document, fetch: window.fetch.bind(window), timers: window })` and `start()`. Do not add action endpoints or buttons for cancel/retry/delete. Use `project_label ?? shortId(project_id) + '/' + shortId(worktree_id)` and render command metadata as `argv (N arguments)` or `shell`, never a command string.
 
-- [ ] **Step 4: Run asset tests**
+- [x] **Step 4: Run asset tests**
 
 Run:
 
@@ -526,7 +526,7 @@ git diff --check
 
 Expected: both commands exit `0`.
 
-- [ ] **Step 5: Commit the embedded-client source**
+- [x] **Step 5: Commit the embedded-client source**
 
 ```bash
 git add src/dashboard/static/index.html src/dashboard/static/dashboard.css src/dashboard/static/dashboard.mjs tests/dashboard_client.mjs
@@ -537,7 +537,7 @@ git commit -m "feat: add dashboard static client"
 
 ### Task 5: Loopback HTTP Adapter and Embedded-Asset Tests
 
-**Gate:** Start only after Phase 3 Tasks 8–9 have merged to the dashboard branch's base, because this task changes `Cargo.toml` and establishes the runtime that later command wiring uses. It still does not modify Phase 3 service logic.
+**Gate:** Start only after the dashboard branch is based on `main` with the complete Phase 3 public job lifecycle integrated, because this task changes `Cargo.toml` and establishes the runtime that later command wiring uses. It still does not modify Phase 3 service logic.
 
 **Files:**
 - Modify: `Cargo.toml`
@@ -634,7 +634,7 @@ git commit -m "feat: serve dashboard over loopback"
 
 ### Task 6: Typed Phase-3 Remote Status and Log Adapter
 
-**Gate:** Start only when Task 8 provides `RemoteJobClient::status` and `RemoteJobClient::log_chunk`, and Task 9 provides the public/local job orchestration and stable local record listing described in `docs/superpowers/plans/2026-08-27-single-worker-execution.md:747-954`. Rebase this branch on that merged commit before editing.
+**Gate:** Start only when `main` provides the completed Phase 3 `RemoteJobClient::status` and `RemoteJobClient::log_chunk` interfaces plus public/local job orchestration and stable local record listing. Rebase this branch on that `main` before editing.
 
 **Files:**
 - Create: `src/dashboard/source.rs`
@@ -865,7 +865,7 @@ git commit -m "feat: project coordinated worker cpu metrics"
 
 ### Task 9: Dashboard CLI Lifecycle and Browser Opening
 
-**Gate:** Start after Tasks 5–8 and Phase 3 Task 9 are integrated, because this task changes the active CLI/parser/dispatch files. Rebase first and resolve changes in favor of the Phase 3 public command orchestration.
+**Gate:** Start after Tasks 5–6 are integrated on a branch based on `main` after Phase 3. Tasks 7–8 remain gated on Phase 4 and do not block this phase-3 dashboard CLI lifecycle. Because this task changes the active CLI/parser/dispatch files, rebase first and resolve changes in favor of the Phase 3 public command orchestration.
 
 **Files:**
 - Create: `src/dashboard/command.rs`
@@ -957,7 +957,7 @@ git commit -m "feat: add loopback dashboard command"
 
 ### Task 10: Three-Worker Live Acceptance and Documentation
 
-**Gate:** Start only after Tasks 5–9, all three helpers run the Phase-4-coordinated probe contract consumed by Task 8, and Phase 4 FIFO scheduling is integrated. This is an operational validation task, not a substitute for fake-source tests.
+**Gate:** Start only after Tasks 5–9 are integrated on `main` after Phase 3, all three helpers run the Phase-4-coordinated probe contract consumed by Task 8, and Phase 4 FIFO scheduling is integrated. This is an operational validation task, not a substitute for fake-source tests.
 
 **Files:**
 - Modify: `README.md`
