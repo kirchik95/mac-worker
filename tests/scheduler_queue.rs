@@ -1,9 +1,14 @@
 use std::{
+    collections::VecDeque,
     fs,
-    os::unix::fs::{FileTypeExt, PermissionsExt, symlink},
+    os::unix::{
+        fs::{FileTypeExt, PermissionsExt, symlink},
+        process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
+    process::ExitStatus,
     sync::{
-        Arc, Barrier,
+        Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -13,17 +18,21 @@ use std::{
 
 use mac_worker::{
     client_state::{ClientStateStore, ClientStateWritePoint},
-    error::WorkerError,
+    config::WorkerEntry,
+    error::{ProcessError, WorkerError},
     job::{
-        AdmissionObservation, CommandSpec, CommandSummary, JobId, JobMeta, JobStatus, LeaseToken,
-        LocalJobRecord, ProcessIdentity, QueueCancel, QueueEntry, QueueEntryKind, QueueId,
-        QueueRunReference, QueueSnapshot, QueueState, RemoteUncertainty,
-        RequestFingerprintMaterial, ResolveOrAbandonRequest, RunId,
+        AdmissionObservation, CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus,
+        LeaseToken, LocalJobRecord, PreacceptanceDisposition, ProcessIdentity, QueueCancel,
+        QueueEntry, QueueEntryKind, QueueId, QueueRunReference, QueueSnapshot, QueueState,
+        RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
+        ResolveOrAbandonResponse, RunId,
     },
+    process::{ProcessRequest, ProcessResult, ProcessRunner},
     scheduler::{CandidateSlot, WorkerPreference},
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
     },
+    transfer::{PreacceptanceAbandonmentReceipt, RemoteJobClient, ResolutionRuntime},
 };
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -241,6 +250,79 @@ fn install_abandonment_request(
     let record = local_record(&fixture.store, job_id, worker, None);
     fixture.store.create_job(record.clone()).unwrap();
     ResolveOrAbandonRequest::from_local_record(&record).unwrap()
+}
+
+struct AbandonedResolutionRunner {
+    results: Mutex<VecDeque<Result<ProcessResult, WorkerError>>>,
+}
+
+impl ProcessRunner for AbandonedResolutionRunner {
+    fn run(&self, _request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected remote resolution call")
+    }
+}
+
+#[derive(Default)]
+struct ImmediateResolutionRuntime {
+    now: Mutex<Duration>,
+}
+
+impl ResolutionRuntime for ImmediateResolutionRuntime {
+    fn monotonic_now(&self) -> Duration {
+        *self.now.lock().unwrap()
+    }
+
+    fn sleep(&self, _duration: Duration) {
+        *self.now.lock().unwrap() = Duration::from_secs(30);
+    }
+}
+
+fn queue_worker(name: &str) -> WorkerEntry {
+    WorkerEntry {
+        name: name.into(),
+        ssh: "unused-test-host".into(),
+        slots: 1,
+        capabilities: Vec::new(),
+        remote_binary: "~/.local/bin/worker".into(),
+    }
+}
+
+fn remote_abandonment_receipt(
+    request: &ResolveOrAbandonRequest,
+) -> PreacceptanceAbandonmentReceipt {
+    let mut stdout = serde_json::to_vec(&ResolveOrAbandonResponse::abandoned()).unwrap();
+    stdout.push(b'\n');
+    let runner = AbandonedResolutionRunner {
+        results: Mutex::new(
+            vec![
+                Err(ProcessError::DeadlineExceeded {
+                    deadline: Duration::from_secs(30),
+                }
+                .into()),
+                Ok(ProcessResult {
+                    status: ExitStatus::from_raw(0),
+                    stdout,
+                    stderr: Vec::new(),
+                }),
+            ]
+            .into(),
+        ),
+    };
+    let runtime = ImmediateResolutionRuntime::default();
+    let resolution = RemoteJobClient::new_with_runtime(&runner, &runtime)
+        .resolve_preacceptance_with_receipt(&queue_worker(request.worker_name()), request)
+        .unwrap();
+    assert!(matches!(
+        resolution.disposition(),
+        PreacceptanceDisposition::Abandoned
+    ));
+    resolution
+        .into_abandonment_receipt()
+        .expect("an actual Abandoned response must carry authority")
 }
 
 fn dispatching_batch(
@@ -1075,10 +1157,11 @@ fn preacceptance_abandonment_requires_matching_request_row_owner_and_state() {
         ))
         .unwrap();
     let request = install_abandonment_request(&fixture, row.job_id(), "mini-1");
+    let receipt = remote_abandonment_receipt(&request);
     assert!(
         fixture
             .store
-            .record_preacceptance_abandoned(&request, dispatcher)
+            .record_preacceptance_abandoned(&receipt, dispatcher)
             .is_err()
     );
     fixture
@@ -1089,7 +1172,7 @@ fn preacceptance_abandonment_requires_matching_request_row_owner_and_state() {
     assert!(
         fixture
             .store
-            .record_preacceptance_abandoned(&request, owner(477))
+            .record_preacceptance_abandoned(&receipt, owner(477))
             .is_err()
     );
     let missing_request = install_abandonment_request(
@@ -1097,10 +1180,11 @@ fn preacceptance_abandonment_requires_matching_request_row_owner_and_state() {
         "000000000000000000000000000000b2".parse().unwrap(),
         "mini-1",
     );
+    let missing_receipt = remote_abandonment_receipt(&missing_request);
     assert!(
         fixture
             .store
-            .record_preacceptance_abandoned(&missing_request, dispatcher)
+            .record_preacceptance_abandoned(&missing_receipt, dispatcher)
             .is_err()
     );
     let error = fixture
@@ -1116,6 +1200,161 @@ fn preacceptance_abandonment_requires_matching_request_row_owner_and_state() {
 }
 
 #[test]
+fn remote_abandonment_receipt_for_a_cannot_authorize_valid_row_b() {
+    // Break caught: a caller observes an actual Abandoned outcome for A, then
+    // supplies B's freely chosen request to manufacture authority for B.
+    let fixture = open_queue();
+    let dispatcher = owner(475);
+    let row_b = dispatching_batch(
+        &fixture.store,
+        "000000000000000000000000000000af",
+        dispatcher,
+        475,
+    );
+    install_abandonment_request(&fixture, row_b.job_id(), "mini-1");
+
+    let record_a = local_record(
+        &fixture.store,
+        "000000000000000000000000000000ae".parse().unwrap(),
+        "mini-1",
+        None,
+    );
+    let request_a = ResolveOrAbandonRequest::from_local_record(&record_a).unwrap();
+    let receipt_a = remote_abandonment_receipt(&request_a);
+
+    let before = fixture.store.queue_snapshot().unwrap();
+    assert!(
+        fixture
+            .store
+            .record_preacceptance_abandoned(&receipt_a, dispatcher)
+            .is_err()
+    );
+    assert_eq!(fixture.store.queue_snapshot().unwrap(), before);
+    assert!(
+        fixture.store.queue_snapshot().unwrap().entries()[0]
+            .preacceptance_abandonment_proof()
+            .is_none()
+    );
+
+    let debug = format!("{receipt_a:?}");
+    for secret in [COMMAND_SECRET, PATH_SECRET, DIGEST, TOKEN_SECRET] {
+        assert!(!debug.contains(secret), "receipt debug leaked {secret}");
+    }
+}
+
+#[test]
+fn abandonment_receipt_rejects_every_positive_status_and_remote_uncertainty() {
+    // Break caught: an already accepted/running/terminal or remotely uncertain
+    // local record can be mislabeled pre-acceptance-abandoned and retired.
+    let cases = vec![
+        (
+            "uploading",
+            Some(
+                JobStatus::new(
+                    JobState::Uploading,
+                    1_100,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ),
+            RemoteUncertainty::None,
+        ),
+        (
+            "verified",
+            Some(
+                JobStatus::new(
+                    JobState::Verified,
+                    1_101,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ),
+            RemoteUncertainty::None,
+        ),
+        (
+            "accepted",
+            Some(JobStatus::accepted(1_102).unwrap()),
+            RemoteUncertainty::None,
+        ),
+        (
+            "running",
+            Some(JobStatus::running(1_103, 11, 12, 13, 14).unwrap()),
+            RemoteUncertainty::None,
+        ),
+        (
+            "terminal",
+            Some(JobStatus::succeeded(1_104, 1, 1).unwrap()),
+            RemoteUncertainty::None,
+        ),
+        (
+            "unknown remote",
+            None,
+            RemoteUncertainty::unknown_remote("UNKNOWN_REMOTE").unwrap(),
+        ),
+        (
+            "cleanup pending",
+            None,
+            RemoteUncertainty::cleanup_pending("CLEANUP_INCOMPLETE").unwrap(),
+        ),
+    ];
+
+    for (index, (label, status, uncertainty)) in cases.into_iter().enumerate() {
+        let fixture = open_queue();
+        let dispatcher = owner(700 + index as u32);
+        let job_id: JobId = format!("000000000000000000000000000001{index:02x}")
+            .parse()
+            .unwrap();
+        dispatching_batch(
+            &fixture.store,
+            &job_id.to_string(),
+            dispatcher,
+            700 + index as u64 * 2,
+        );
+        let base = local_record(&fixture.store, job_id, "mini-1", None);
+        let request = ResolveOrAbandonRequest::from_local_record(&base).unwrap();
+        let receipt = remote_abandonment_receipt(&request);
+        fixture
+            .store
+            .create_job(local_record_with_uncertainty(
+                &fixture.store,
+                job_id,
+                "mini-1",
+                status,
+                uncertainty,
+            ))
+            .unwrap();
+        let before = fixture.store.queue_snapshot().unwrap();
+
+        assert!(
+            fixture
+                .store
+                .record_preacceptance_abandoned(&receipt, dispatcher)
+                .is_err(),
+            "accepted invalid abandonment authority for {label}"
+        );
+        assert_eq!(fixture.store.queue_snapshot().unwrap(), before, "{label}");
+    }
+}
+
+#[test]
 fn proven_preacceptance_abandonment_is_exactly_idempotent_and_can_be_retired() {
     // Break caught: retries can replace a proof with a different request
     // fingerprint or cannot durably retire a verified abandonment.
@@ -1128,10 +1367,11 @@ fn proven_preacceptance_abandonment_is_exactly_idempotent_and_can_be_retired() {
         481,
     );
     let request = install_abandonment_request(&fixture, row.job_id(), "mini-1");
+    let receipt = remote_abandonment_receipt(&request);
 
     let marked = fixture
         .store
-        .record_preacceptance_abandoned(&request, dispatcher)
+        .record_preacceptance_abandoned(&receipt, dispatcher)
         .unwrap();
     let proof = marked.preacceptance_abandonment_proof().unwrap();
     assert_eq!(proof.job_id(), row.job_id());
@@ -1140,7 +1380,7 @@ fn proven_preacceptance_abandonment_is_exactly_idempotent_and_can_be_retired() {
     assert_eq!(
         fixture
             .store
-            .record_preacceptance_abandoned(&request, dispatcher)
+            .record_preacceptance_abandoned(&receipt, dispatcher)
             .unwrap(),
         marked
     );
@@ -1156,11 +1396,10 @@ fn proven_preacceptance_abandonment_is_exactly_idempotent_and_can_be_retired() {
         RemoteUncertainty::None,
     );
     install_local_record_as(&fixture, row.job_id(), &changed_record);
-    let changed_request = ResolveOrAbandonRequest::from_local_record(&changed_record).unwrap();
     assert!(
         fixture
             .store
-            .record_preacceptance_abandoned(&changed_request, dispatcher)
+            .record_preacceptance_abandoned(&receipt, dispatcher)
             .is_err()
     );
     assert_eq!(fixture.store.queue_snapshot().unwrap().entries(), &[marked]);
@@ -1224,10 +1463,11 @@ fn one_dispatcher_cannot_apply_one_resolution_to_its_other_live_row() {
         .unwrap();
     let request_a = install_abandonment_request(&fixture, run_a.job_id(), "mini-1");
     install_abandonment_request(&fixture, run_b.job_id(), "mini-2");
+    let receipt_a = remote_abandonment_receipt(&request_a);
 
     fixture
         .store
-        .record_preacceptance_abandoned(&request_a, dispatcher)
+        .record_preacceptance_abandoned(&receipt_a, dispatcher)
         .unwrap();
 
     let snapshot = fixture.store.queue_snapshot().unwrap();
@@ -1286,11 +1526,12 @@ fn abandonment_rejects_mismatched_local_request_fingerprint_or_queue_binding() {
     let unpersisted_record = local_record(&missing_fixture.store, row.job_id(), "mini-1", None);
     let unpersisted_request =
         ResolveOrAbandonRequest::from_local_record(&unpersisted_record).unwrap();
+    let unpersisted_receipt = remote_abandonment_receipt(&unpersisted_request);
     let before = missing_fixture.store.queue_snapshot().unwrap();
     assert!(
         missing_fixture
             .store
-            .record_preacceptance_abandoned(&unpersisted_request, dispatcher)
+            .record_preacceptance_abandoned(&unpersisted_receipt, dispatcher)
             .is_err()
     );
     assert_eq!(missing_fixture.store.queue_snapshot().unwrap(), before);
@@ -1316,11 +1557,12 @@ fn abandonment_rejects_mismatched_local_request_fingerprint_or_queue_binding() {
     );
     let mismatched_request =
         ResolveOrAbandonRequest::from_local_record(&mismatched_record).unwrap();
+    let mismatched_receipt = remote_abandonment_receipt(&mismatched_request);
     let before = fingerprint_fixture.store.queue_snapshot().unwrap();
     assert!(
         fingerprint_fixture
             .store
-            .record_preacceptance_abandoned(&mismatched_request, dispatcher)
+            .record_preacceptance_abandoned(&mismatched_receipt, dispatcher)
             .is_err()
     );
     assert_eq!(fingerprint_fixture.store.queue_snapshot().unwrap(), before);
@@ -1348,14 +1590,51 @@ fn abandonment_rejects_mismatched_local_request_fingerprint_or_queue_binding() {
         .unwrap();
     let mismatched_request =
         ResolveOrAbandonRequest::from_local_record(&mismatched_record).unwrap();
+    let mismatched_receipt = remote_abandonment_receipt(&mismatched_request);
     let before = binding_fixture.store.queue_snapshot().unwrap();
     assert!(
         binding_fixture
             .store
-            .record_preacceptance_abandoned(&mismatched_request, dispatcher)
+            .record_preacceptance_abandoned(&mismatched_receipt, dispatcher)
             .is_err()
     );
     assert_eq!(binding_fixture.store.queue_snapshot().unwrap(), before);
+}
+
+#[test]
+fn abandonment_receipt_requires_the_exact_durable_resolution_request() {
+    // Break caught: checking only the public request fingerprint/row summary
+    // misses canonical local corruption in a secret request field.
+    let fixture = open_queue();
+    let dispatcher = owner(489);
+    let row = dispatching_batch(
+        &fixture.store,
+        "000000000000000000000000000000c5",
+        dispatcher,
+        489,
+    );
+    let record = local_record(&fixture.store, row.job_id(), "mini-1", None);
+    fixture.store.create_job(record.clone()).unwrap();
+    let request = ResolveOrAbandonRequest::from_local_record(&record).unwrap();
+    let receipt = remote_abandonment_receipt(&request);
+
+    let changed_token = LocalJobRecord::new(
+        record.meta().clone(),
+        LeaseToken::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap()),
+        None,
+        RemoteUncertainty::None,
+    )
+    .unwrap();
+    install_local_record_as(&fixture, row.job_id(), &changed_token);
+    let before = fixture.store.queue_snapshot().unwrap();
+
+    assert!(
+        fixture
+            .store
+            .record_preacceptance_abandoned(&receipt, dispatcher)
+            .is_err()
+    );
+    assert_eq!(fixture.store.queue_snapshot().unwrap(), before);
 }
 
 #[test]
@@ -1371,9 +1650,10 @@ fn preacceptance_abandonment_proof_is_row_bound_canonical_strict_and_private() {
         489,
     );
     let request = install_abandonment_request(&fixture, row.job_id(), "mini-1");
+    let receipt = remote_abandonment_receipt(&request);
     fixture
         .store
-        .record_preacceptance_abandoned(&request, dispatcher)
+        .record_preacceptance_abandoned(&receipt, dispatcher)
         .unwrap();
     let path = fixture.root.join("queue/state.json");
     let text = String::from_utf8(fs::read(&path).unwrap()).unwrap();
@@ -1468,13 +1748,14 @@ fn dead_batch_recovery_retires_persisted_abandonment_instead_of_reclaiming_it() 
         486,
     );
     let request = install_abandonment_request(&fixture, row.job_id(), "mini-1");
+    let receipt = remote_abandonment_receipt(&request);
     fixture
         .store
         .inject_write_failure_once(ClientStateWritePoint::AfterPublish);
     assert!(
         fixture
             .store
-            .record_preacceptance_abandoned(&request, dispatcher)
+            .record_preacceptance_abandoned(&receipt, dispatcher)
             .is_err()
     );
 
@@ -1539,9 +1820,10 @@ fn abandoned_task_turn_proof_survives_dispatch_adoption_until_retirement() {
         .unwrap()
         .unwrap();
     let request = install_abandonment_request(&fixture, task.job_id(), "mini-1");
+    let receipt = remote_abandonment_receipt(&request);
     fixture
         .store
-        .record_preacceptance_abandoned(&request, initial)
+        .record_preacceptance_abandoned(&receipt, initial)
         .unwrap();
 
     assert!(fixture.store.recover_dead_dispatches().unwrap().is_empty());
@@ -2205,6 +2487,176 @@ fn accepted_nonterminal_local_sibling_also_consumes_run_cap() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn run_cap_counts_only_durably_accepted_nonterminal_local_siblings() {
+    // Break caught: pre-acceptance Uploading/Verified state consumes the run
+    // cap even though no durable acceptance exists yet.
+    let cases = vec![
+        (
+            "uploading",
+            JobStatus::new(
+                JobState::Uploading,
+                600,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            false,
+        ),
+        (
+            "verified",
+            JobStatus::new(
+                JobState::Verified,
+                601,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            false,
+        ),
+        ("accepted", JobStatus::accepted(602).unwrap(), true),
+        (
+            "running",
+            JobStatus::running(603, 11, 12, 13, 14).unwrap(),
+            true,
+        ),
+    ];
+
+    for (index, (label, status, blocks)) in cases.into_iter().enumerate() {
+        let fixture = open_queue();
+        let run = run_reference(&format!("run-stage-{index}"), 1);
+        let first_owner = owner(590 + index as u32 * 2);
+        let first_id = format!("000000000000000000000000000002{index:02x}");
+        let first = fixture
+            .store
+            .enqueue(queued_with(
+                &fixture.store,
+                &first_id,
+                610 + index as u64 * 2,
+                first_owner,
+                WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                Vec::new(),
+                QueueEntryKind::TaskTurn,
+                Some(run.clone()),
+            ))
+            .unwrap();
+        fixture
+            .store
+            .create_job(local_record(
+                &fixture.store,
+                first.job_id(),
+                "mini-1",
+                Some(status),
+            ))
+            .unwrap();
+
+        let sibling_owner = owner(591 + index as u32 * 2);
+        let sibling_id = format!("000000000000000000000000000003{index:02x}");
+        fixture
+            .store
+            .enqueue(queued_with(
+                &fixture.store,
+                &sibling_id,
+                611 + index as u64 * 2,
+                sibling_owner,
+                WorkerPreference::Pinned {
+                    worker: "mini-2".into(),
+                },
+                Vec::new(),
+                QueueEntryKind::TaskTurn,
+                Some(run),
+            ))
+            .unwrap();
+
+        let claim = fixture
+            .store
+            .claim_next(sibling_owner, &["mini-2".into()], 620 + index as u64)
+            .unwrap();
+        assert_eq!(claim.is_none(), blocks, "unexpected capacity for {label}");
+    }
+}
+
+#[test]
+fn run_cap_rejects_same_job_and_client_with_mismatched_queue_metadata() {
+    // Break caught: a copied same-client record with the right filename but
+    // different immutable queue metadata is counted instead of failing closed.
+    let fixture = open_queue();
+    let run = run_reference("run-binding-mismatch", 1);
+    let first_owner = owner(598);
+    let first = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "00000000000000000000000000000400",
+            630,
+            first_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run.clone()),
+        ))
+        .unwrap();
+    fixture
+        .store
+        .create_job(local_record_with_binding(
+            &fixture.store,
+            first.job_id(),
+            "mini-1",
+            OTHER_PROJECT_ID,
+            WORKTREE_ID,
+            CommandSpec::argv(vec!["tool".into(), COMMAND_SECRET.into()]).unwrap(),
+            Some(JobStatus::accepted(631).unwrap()),
+            RemoteUncertainty::None,
+        ))
+        .unwrap();
+
+    let sibling_owner = owner(599);
+    fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "00000000000000000000000000000401",
+            632,
+            sibling_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-2".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run),
+        ))
+        .unwrap();
+    let before = fixture.store.queue_snapshot().unwrap();
+
+    assert!(
+        fixture
+            .store
+            .claim_next(sibling_owner, &["mini-2".into()], 633)
+            .is_err()
+    );
+    assert_eq!(fixture.store.queue_snapshot().unwrap(), before);
 }
 
 #[test]

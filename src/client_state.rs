@@ -27,8 +27,9 @@ use crate::{
         QueueEntry, QueueEntryKind, QueueSnapshot, QueueState, RemoteUncertainty,
         ResolveOrAbandonRequest,
     },
-    scheduler::AffinityHints,
+    scheduler::{AffinityHints, WorkerPreference},
     supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
+    transfer::PreacceptanceAbandonmentReceipt,
 };
 
 const DIRECTORY_FLAGS: libc::c_int =
@@ -573,25 +574,30 @@ impl ClientStateStore {
 
     pub fn record_preacceptance_abandoned(
         &self,
-        request: &ResolveOrAbandonRequest,
+        receipt: &PreacceptanceAbandonmentReceipt,
         dispatch_owner: ProcessIdentity,
     ) -> Result<QueueEntry, WorkerError> {
-        request.validate()?;
         dispatch_owner.validate()?;
         self.update_queue(|snapshot| {
-            let name = job_file_name(request.job_id())?;
+            let name = job_file_name(receipt.job_id())?;
             let record = read_job_optional(self.inner.jobs.as_raw_fd(), &name)?
                 .ok_or_else(abandonment_conflict)?;
             self.require_local_client(&record)
                 .map_err(|_| abandonment_conflict())?;
-            let durable_request = ResolveOrAbandonRequest::from_local_record(&record)
-                .map_err(|_| abandonment_conflict())?;
-            if &durable_request != request {
+            if record.last_status().is_some()
+                || record.remote_uncertainty() != &RemoteUncertainty::None
+            {
                 return Err(abandonment_conflict());
             }
-            let entry = find_queue_entry_mut(snapshot, request.job_id())?;
-            let proof = QueueAbandonmentProof::from_resolution(entry, request, dispatch_owner)
+            let durable_request = ResolveOrAbandonRequest::from_local_record(&record)
                 .map_err(|_| abandonment_conflict())?;
+            if !receipt.matches_request(&durable_request) {
+                return Err(abandonment_conflict());
+            }
+            let entry = find_queue_entry_mut(snapshot, receipt.job_id())?;
+            let proof =
+                QueueAbandonmentProof::from_resolution(entry, &durable_request, dispatch_owner)
+                    .map_err(|_| abandonment_conflict())?;
             let changed = entry
                 .record_preacceptance_abandoned(proof)
                 .map_err(|_| abandonment_conflict())?;
@@ -935,17 +941,16 @@ impl ClientStateStore {
             }
             let name = job_file_name(sibling.job_id())?;
             if let Some(record) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? {
-                if record.meta().job_id() != sibling.job_id() {
+                self.require_local_client(&record)?;
+                if !local_record_matches_queue_entry(sibling, &record) {
                     return Err(queue_error(
                         "QUEUE_JOB_RECORD_MISMATCH",
-                        "local run job identity does not match its queue row",
+                        "local run job metadata does not match its queue row",
                     ));
                 }
-                self.require_local_client(&record)?;
-                if record
-                    .last_status()
-                    .is_some_and(|status| !status.state().is_terminal())
-                {
+                if record.last_status().is_some_and(|status| {
+                    matches!(status.state(), JobState::Accepted | JobState::Running)
+                }) {
                     active.insert(sibling.job_id());
                 }
             }
@@ -1808,23 +1813,31 @@ fn abandonment_conflict() -> WorkerError {
 }
 
 fn terminal_record_matches(entry: &QueueEntry, record: &LocalJobRecord) -> bool {
-    let QueueState::Dispatching {
-        selected_worker, ..
-    } = entry.state()
-    else {
-        return false;
-    };
-    let meta = record.meta();
-    meta.job_id() == entry.job_id()
-        && meta.client_id() == entry.client_id()
-        && meta.worker_name() == selected_worker
-        && meta.project_id() == entry.project_id()
-        && meta.worktree_id() == entry.worktree_id()
-        && meta.command_summary() == entry.command_summary()
+    matches!(entry.state(), QueueState::Dispatching { .. })
+        && local_record_matches_queue_entry(entry, record)
         && record
             .last_status()
             .is_some_and(|status| status.state().is_terminal())
         && matches!(record.remote_uncertainty(), RemoteUncertainty::None)
+}
+
+fn local_record_matches_queue_entry(entry: &QueueEntry, record: &LocalJobRecord) -> bool {
+    let meta = record.meta();
+    let worker_matches = match entry.state() {
+        QueueState::Dispatching {
+            selected_worker, ..
+        } => meta.worker_name() == selected_worker,
+        QueueState::Waiting { .. } => match entry.preference() {
+            WorkerPreference::Automatic => true,
+            WorkerPreference::Pinned { worker } => meta.worker_name() == worker,
+        },
+    };
+    meta.job_id() == entry.job_id()
+        && meta.client_id() == entry.client_id()
+        && worker_matches
+        && meta.project_id() == entry.project_id()
+        && meta.worktree_id() == entry.worktree_id()
+        && meta.command_summary() == entry.command_summary()
 }
 
 fn require_same_immutable(

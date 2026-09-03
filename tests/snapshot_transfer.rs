@@ -2720,9 +2720,15 @@ fn resolution_outcomes_keep_host_authority_and_submission_error_rules_exact() {
             Ok(result(status(0), &canonical_line(&response), b"")),
         ]);
         let runtime = JumpResolutionRuntime::new();
-        let disposition = RemoteJobClient::new_with_runtime(&runner, &runtime)
-            .resolve_preacceptance(&worker(), &request)
+        let resolution = RemoteJobClient::new_with_runtime(&runner, &runtime)
+            .resolve_preacceptance_with_receipt(&worker(), &request)
             .unwrap();
+        assert_eq!(
+            resolution.abandonment_receipt().is_some(),
+            matches!(response.outcome(), ResolveOrAbandonOutcome::Abandoned),
+            "only an exact remote Abandoned result may issue a receipt"
+        );
+        let disposition = resolution.into_disposition();
         match response.outcome() {
             ResolveOrAbandonOutcome::Accepted { .. } => {
                 assert!(matches!(disposition, PreacceptanceDisposition::Accepted(_)))

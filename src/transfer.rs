@@ -18,8 +18,8 @@ use crate::{
     error::{ProcessError, ProcessStream, WorkerError},
     host_store::{HostStore, JobDisposition},
     job::{
-        ClientId, HostControlError, JobId, LeaseAcquireRequest, LeaseRecord, LeaseToken, LogChunk,
-        LogChunkRequest, LogChunkResponse, LogStream, MAX_LOG_CHUNK_BYTES,
+        ClientId, CommandSummary, HostControlError, JobId, LeaseAcquireRequest, LeaseRecord,
+        LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse, LogStream, MAX_LOG_CHUNK_BYTES,
         PreacceptanceDisposition, RequestFingerprint, ResolveOrAbandonOutcome,
         ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest, StatusResponse,
         SubmitRequest, SubmitResponse,
@@ -96,6 +96,113 @@ impl ResolutionRuntime for SystemResolutionRuntime {
 pub struct RemoteJobClient<'a> {
     transport: SshJsonTransport<'a>,
     retry: &'a dyn ResolutionRuntime,
+}
+
+/// Process-local authority proving that one exact remote resolution returned
+/// `Abandoned`. It deliberately has no serialization implementation.
+pub struct PreacceptanceAbandonmentReceipt {
+    job_id: JobId,
+    client_id: ClientId,
+    worker_name: String,
+    project_id: String,
+    worktree_id: String,
+    command_summary: CommandSummary,
+    request_fingerprint: RequestFingerprint,
+    resolution_request_digest: [u8; 32],
+}
+
+impl PreacceptanceAbandonmentReceipt {
+    fn from_remote_abandonment(request: &ResolveOrAbandonRequest) -> Result<Self, WorkerError> {
+        request.validate()?;
+        Ok(Self {
+            job_id: request.job_id(),
+            client_id: request.client_id(),
+            worker_name: request.worker_name().into(),
+            project_id: request.project_id().into(),
+            worktree_id: request.worktree_id().into(),
+            command_summary: request.command_summary().clone(),
+            request_fingerprint: request.request_fingerprint().clone(),
+            resolution_request_digest: resolution_request_digest(request)?,
+        })
+    }
+
+    pub(crate) fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    pub(crate) fn matches_request(&self, request: &ResolveOrAbandonRequest) -> bool {
+        request.validate().is_ok()
+            && self.job_id == request.job_id()
+            && self.client_id == request.client_id()
+            && self.worker_name == request.worker_name()
+            && self.project_id == request.project_id()
+            && self.worktree_id == request.worktree_id()
+            && self.command_summary == *request.command_summary()
+            && self.request_fingerprint == *request.request_fingerprint()
+            && resolution_request_digest(request)
+                .is_ok_and(|digest| self.resolution_request_digest == digest)
+    }
+}
+
+fn resolution_request_digest(request: &ResolveOrAbandonRequest) -> Result<[u8; 32], WorkerError> {
+    let bytes = serde_json::to_vec(request)
+        .map_err(|_| transport_error("INVALID_REQUEST", "control request is invalid"))?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+impl fmt::Debug for PreacceptanceAbandonmentReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreacceptanceAbandonmentReceipt")
+            .field("job_id", &self.job_id)
+            .field("client_id", &self.client_id)
+            .field("worker_name", &self.worker_name)
+            .field("project_id", &self.project_id)
+            .field("worktree_id", &self.worktree_id)
+            .field("command_summary", &self.command_summary)
+            .field("request_fingerprint", &self.request_fingerprint)
+            .finish()
+    }
+}
+
+/// Opaque result of the receipt-bearing resolution path. Its private fields
+/// keep the disposition/receipt invariant caller-unforgeable.
+#[derive(Debug)]
+pub struct PreacceptanceResolution {
+    disposition: PreacceptanceDisposition,
+    abandonment_receipt: Option<PreacceptanceAbandonmentReceipt>,
+}
+
+impl PreacceptanceResolution {
+    fn from_remote_result(
+        request: &ResolveOrAbandonRequest,
+        disposition: PreacceptanceDisposition,
+    ) -> Result<Self, WorkerError> {
+        disposition.validate()?;
+        let abandonment_receipt = matches!(disposition, PreacceptanceDisposition::Abandoned)
+            .then(|| PreacceptanceAbandonmentReceipt::from_remote_abandonment(request))
+            .transpose()?;
+        Ok(Self {
+            disposition,
+            abandonment_receipt,
+        })
+    }
+
+    pub fn disposition(&self) -> &PreacceptanceDisposition {
+        &self.disposition
+    }
+
+    pub fn abandonment_receipt(&self) -> Option<&PreacceptanceAbandonmentReceipt> {
+        self.abandonment_receipt.as_ref()
+    }
+
+    pub fn into_disposition(self) -> PreacceptanceDisposition {
+        self.disposition
+    }
+
+    pub fn into_abandonment_receipt(self) -> Option<PreacceptanceAbandonmentReceipt> {
+        self.abandonment_receipt
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -599,7 +706,28 @@ impl<'a> RemoteJobClient<'a> {
         worker: &WorkerEntry,
         request: &ResolveOrAbandonRequest,
     ) -> Result<PreacceptanceDisposition, WorkerError> {
+        self.resolve_preacceptance_with_receipt(worker, request)
+            .map(PreacceptanceResolution::into_disposition)
+    }
+
+    pub fn resolve_preacceptance_with_receipt(
+        &self,
+        worker: &WorkerEntry,
+        request: &ResolveOrAbandonRequest,
+    ) -> Result<PreacceptanceResolution, WorkerError> {
+        let disposition = self.resolve_preacceptance_disposition(worker, request)?;
+        PreacceptanceResolution::from_remote_result(request, disposition)
+    }
+
+    fn resolve_preacceptance_disposition(
+        &self,
+        worker: &WorkerEntry,
+        request: &ResolveOrAbandonRequest,
+    ) -> Result<PreacceptanceDisposition, WorkerError> {
         request.validate()?;
+        if worker.name != request.worker_name() {
+            return Err(invalid_remote_response());
+        }
         let start = self.retry.monotonic_now();
         while let Some(remaining) = remaining_resolution_budget(start, self.retry.monotonic_now()) {
             match self.status_with_deadline(worker, request.job_id(), remaining) {
