@@ -17,15 +17,27 @@
 - Every worker has one heavy slot. Fresh probes are advisory; the existing atomic host lease is the only admission authority.
 - The MacBook is the source of truth. Upload only a verified immutable `Snapshot`; never sync a live worktree or source changes back.
 - Queue state is canonical owner-only JSON below `PathLayout::state`, protected by the existing cross-process lock and no-follow filesystem layer. No daemon/database is introduced.
+- Phase 5 consumes the queue fields and admission semantics defined by this plan. Queue schemas are canonical JSON with strict unknown-field rejection, like every other persisted record; later task work must not need to migrate or reinterpret Phase 4 rows.
 - Queue records hold only IDs, sanitized command summary, requirements, worker preference, timestamps, owner identity, and bounded error codes—never argv/shell, environment values, paths, snapshot paths, or lease tokens.
-- FIFO is immutable enqueue order and means claim/admission consideration order, not wall-clock child-start order. A queue row is persistently `Waiting` or `Dispatching`; a dead dispatcher is recovered to `Waiting`, never silently deleted. Multiple distinct-worker dispatches may be in flight to fill three slots.
-- Eligible means fresh ready/protocol/capability-compatible idle probe plus successful atomic lease. Ranking is worktree affinity, project affinity, greatest available memory, greatest free disk, lexical worker name; affinity never overrides eligibility.
+- FIFO is immutable enqueue order and means per-worker claim/admission consideration order, not wall-clock child-start order. A queue row is persistently `Waiting` or `Dispatching`; an identity-proven dead batch dispatcher is recovered to `Waiting`, never silently deleted, while task-turn ownership follows the binding amendment below. Multiple distinct-worker dispatches may be in flight to fill three slots.
+- Eligible means a ready/protocol/capability-compatible idle admission observation plus successful atomic lease. Admission observations are cached and advisory; the atomic host lease is authoritative. Ranking is worktree affinity, project affinity, greatest available memory, greatest free disk, lexical worker name; affinity never overrides eligibility.
 - `--no-wait` returns `CAPACITY_BUSY` without queue entry, snapshot, lease, or remote mutation.
 - Once remotely accepted, resolve every ambiguity with its original job/client/token/fingerprint through Phase 3 `resolve-or-abandon`; never create a replacement job.
 - Cancellation is explicit. Ctrl-C or log-follow disconnect never cancels an accepted job.
 - Remote cancellation targets only the recorded process group: TERM, ten-second wait, KILL if needed, proof of absence, atomic `cancelled`, job-owned cleanup, then exact lease release. No broad process kill.
 - Fleet reconciliation issues bounded typed per-job requests for known IDs. A failed probe is never evidence a retained job is gone.
 - Dashboard/watch, artifacts/fetch, caches/env profiles, Docker, retention/general GC, notifications, and Phase 5 acceptance work are out of scope.
+
+### Binding Phase 5 queue compatibility amendments
+
+The agent-task pool design supersedes the otherwise-conflicting queue wording in Tasks 3, 4, and 6 below. Phase 4 implements this durable compatibility surface; Phase 5 consumes it without a queue migration.
+
+- `QueueEntry` has a canonical `kind` (`batch` or `task_turn`) and optional run reference (`RunId`, an opaque validated string, and `max_parallel`). A `task_turn` has a replaceable `ProcessIdentity` owner while `Waiting` and while `Dispatching`; enqueue records the initial owner and `adopt_row(job_id, new_owner)` rewrites it. Batch rows retain the Phase 3/4 ownership meaning: the invoking CLI process is the row owner.
+- Dead-owner reaping applies only to `batch` rows. The scheduler never removes or reaps a dead-owner `task_turn`; `worker run` skips such rows so a later Phase 5 mutating task command can re-own the row.
+- `claim_next(owner, ranked_workers, now)` is owner-scoped and per-worker FIFO. For each ranked idle worker that is not already selected by a live dispatch, it may claim the caller-owned row only when that row is eligible for the worker (kind requirements, pin, and run cap) and no older uncancelled `Waiting` row with a live owner is eligible for the same worker. Otherwise it returns `None`. Rows ineligible for every idle worker do not block younger rows for other workers. For batches, `owner` is the calling CLI process, preserving Phase 4 batch behaviour except that a pinned or capability-blocked head no longer blocks unrelated workers.
+- The run cap is evaluated inside `claim_next` under the queue lock from local state only: count sibling rows in `Dispatching` plus same-run records durably accepted and not terminal in the local job registry. A successful claim consumes a slot until reversion or terminal completion. No SSH, probe, or remote status operation may run while this lock is held.
+- Admission observations use a shared per-worker cache below the local state root at `observations/<worker>.json`. It is canonical, owner-only JSON with strict decoding. A cache entry has a two-second TTL; the first dispatcher finding it stale refreshes it under a per-worker single-flight marker, while other dispatchers use the cached observation and its age. The dashboard may later read this cache read-only.
+- A waiting `WorkerPreference::Pinned` row waits only for its named worker and is never rerouted. Under per-worker FIFO it therefore does not delay work eligible for another idle worker.
 
 ---
 
@@ -36,7 +48,7 @@ src/protocol.rs                 one Phase 4 probe protocol bump: memory and CPU 
 src/probe.rs                    bounded macOS available-memory and cumulative CPU collection
 src/scheduler.rs                pure scheduler-owned observations, eligibility, and ranking
 src/scheduler_adapter.rs        post-Phase-3 projection from WorkerHealth/ProbeResponse to policy facts
-src/client_state.rs             descriptor-bound queue persistence and affinity history
+src/client_state.rs             descriptor-bound queue persistence, affinity history, and shared admission observations
 src/job.rs                      QueueId/QueueEntry and cancellation records
 src/job_service.rs              host cancellation and exact-job reconciliation entry points
 src/transfer.rs                 fixed cancel/reconcile host operations and remote client helpers
@@ -241,7 +253,7 @@ git commit -m "feat: expose scheduler and dashboard probe facts"
 
 **Interfaces:**
 - Consumes: Phase 3 `JobId`, `ClientId`, `CommandSummary`, `ProcessIdentity`, `ClientStateStore`, Task 1 `WorkerPreference`/`AffinityHints`, and Task 2 configured candidate projections.
-- Produces: `QueueId`, `QueueState`, `QueueEntry`, `QueueSnapshot`, `QueueClaim`, `QueueCancel`, and `ClientStateStore::{enqueue,queue_snapshot,claim_next,revert_dispatch,request_queue_cancel,remove_after_terminal,recover_dead_dispatches,remove_queued,record_affinity,affinity_hints}`.
+- Produces: `QueueId`, validated opaque `RunId`, `QueueEntryKind`, `QueueRunReference`, `QueueState`, `QueueEntry`, `QueueSnapshot`, `QueueClaim`, `QueueCancel`, canonical admission observations, and `ClientStateStore::{enqueue,queue_snapshot,adopt_row,claim_next,revert_dispatch,request_queue_cancel,remove_after_terminal,recover_dead_dispatches,remove_queued,record_affinity,affinity_hints}`.
 
 - [ ] **Step 1: Write failing queue schema and persistence tests**
 
@@ -268,7 +280,7 @@ fn live_or_ambiguous_owner_is_never_reaped_as_abandoned() {
 }
 ```
 
-Cover duplicate job/sequence IDs, stale lock state, malformed/noncanonical JSON, symlink/FIFO/device replacement, interrupted atomic write, simultaneous enqueue, crash after retirement rename, PID reuse, cancel racing `claim_next`, and lease-busy/failed-preacceptance reversion. Prove a dead dispatcher is first persisted back to `Waiting`, not removed. Prove three rows can be `Dispatching` only when their selected workers are distinct; no later compatible `Waiting` row is claimed before an older compatible `Waiting` row.
+Cover duplicate job/sequence IDs, stale lock state, malformed/noncanonical JSON (including unknown fields), symlink/FIFO/device replacement, interrupted atomic write, simultaneous enqueue, crash after retirement rename, PID reuse, cancel racing `claim_next`, and lease-busy/failed-preacceptance reversion. Prove a dead batch dispatcher is first persisted back to `Waiting`, not removed, and a dead-owner `task_turn` row survives unchanged for Phase 5 re-ownership. Prove three rows can be `Dispatching` only when their selected workers are distinct. Add explicit owner-scoped claim tests: an owner cannot claim another owner's row, an older live-owned row wins for the same worker, a busy pinned head does not block a younger row eligible for another worker, and an ineligible head blocks no unrelated worker. Add a two-dispatcher race proving the local run cap admits at most its limit, and a single-flight two-second observation-cache refresh test.
 
 - [ ] **Step 2: Run queue tests to verify RED**
 
@@ -282,21 +294,28 @@ Add strict manual serialization/validation in `src/job.rs`:
 
 ```rust
 pub struct QueueId(u64);
-pub enum QueueState { Waiting, Dispatching { dispatch_owner: ProcessIdentity, selected_worker: String, claimed_at_millis: u64 } }
+pub struct RunId(String); // opaque, validated canonical string
+pub enum QueueEntryKind { Batch, TaskTurn }
+pub struct QueueRunReference { run_id: RunId, max_parallel: u32 }
+pub enum QueueState {
+    Waiting { owner: ProcessIdentity },
+    Dispatching { dispatch_owner: ProcessIdentity, selected_worker: String, claimed_at_millis: u64 },
+}
 pub struct QueueEntry {
     queue_id: QueueId, job_id: JobId, client_id: ClientId, project_id: String,
     worktree_id: String, command_summary: CommandSummary, requirements: Vec<String>,
-    preference: WorkerPreference, enqueue_owner: ProcessIdentity, state: QueueState,
+    preference: WorkerPreference, kind: QueueEntryKind, run: Option<QueueRunReference>,
+    enqueue_owner: ProcessIdentity, state: QueueState,
     cancel_requested_at_millis: Option<u64>, enqueued_at_millis: u64,
 }
-impl QueueEntry { pub fn job_id(&self) -> JobId; pub fn state(&self) -> &QueueState; pub fn is_cancel_requested(&self) -> bool; }
+impl QueueEntry { pub fn job_id(&self) -> JobId; pub fn kind(&self) -> QueueEntryKind; pub fn run(&self) -> Option<&QueueRunReference>; pub fn owner(&self) -> &ProcessIdentity; pub fn state(&self) -> &QueueState; pub fn is_cancel_requested(&self) -> bool; }
 pub struct QueueSnapshot { next_id: QueueId, entries: Vec<QueueEntry> }
 pub struct QueueClaim { entry: QueueEntry }
 impl QueueClaim { pub fn entry(&self) -> &QueueEntry; }
 pub enum QueueCancel { RemovedWaiting { job_id: JobId }, RequestedDispatch { job_id: JobId, dispatch_owner: ProcessIdentity } }
 ```
 
-`QueueEntry::new` and `validate` reuse canonical identifiers and bounded lowercase capabilities. It must not contain exact command data, environment values, local paths, manifest digest, snapshot path, or lease token. `QueueSnapshot::validate` requires monotonically increasing IDs/timestamps, unique dispatching worker names, and valid owner identities. It accepts persisted `Dispatching` so a crash can be recovered precisely.
+`QueueEntry::new` and `validate` reuse canonical identifiers and bounded lowercase capabilities. `kind` is exactly `batch` or `task_turn`; a run reference validates both its opaque ID and positive cap. A `task_turn` owns its row in both persistent states, and `adopt_row` may replace that owner only while it is `Waiting`; enqueue records the initial owner. Batch ownership remains the invoking CLI process. Records must not contain exact command data, environment values, local paths, manifest digest, snapshot path, lease token, prompt text, or Phase 5 session data. `QueueSnapshot::validate` requires monotonically increasing IDs/timestamps, unique dispatching worker names, and valid owner identities. It accepts persisted `Dispatching` so a crash can be recovered precisely.
 
 - [ ] **Step 4: Implement descriptor-bound queue operations**
 
@@ -305,17 +324,18 @@ Create only `queue/state.json`, `queue/lock`, and owner-scoped retirement record
 ```rust
 pub fn enqueue(&self, entry: QueueEntry) -> Result<QueueEntry, WorkerError>;
 pub fn queue_snapshot(&self) -> Result<QueueSnapshot, WorkerError>;
-pub fn claim_next(&self, dispatch_owner: ProcessIdentity, ranked_workers: &[String], claimed_at_millis: u64) -> Result<Option<QueueClaim>, WorkerError>;
+pub fn adopt_row(&self, job_id: JobId, new_owner: ProcessIdentity) -> Result<QueueEntry, WorkerError>;
+pub fn claim_next(&self, owner: ProcessIdentity, ranked_workers: &[String], claimed_at_millis: u64) -> Result<Option<QueueClaim>, WorkerError>;
 pub fn revert_dispatch(&self, job_id: JobId, dispatch_owner: ProcessIdentity) -> Result<QueueEntry, WorkerError>;
 pub fn request_queue_cancel(&self, job_id: JobId, requested_at_millis: u64) -> Result<Option<QueueCancel>, WorkerError>;
 pub fn remove_after_terminal(&self, job_id: JobId, dispatch_owner: ProcessIdentity) -> Result<QueueEntry, WorkerError>;
-pub fn recover_dead_dispatches(&self) -> Result<Vec<JobId>, WorkerError>;
+pub fn recover_dead_dispatches(&self) -> Result<Vec<JobId>, WorkerError>; // batch rows only
 pub fn remove_queued(&self, job_id: JobId) -> Result<Option<QueueEntry>, WorkerError>;
 pub fn record_affinity(&self, project_id: &str, worktree_id: &str, worker: &str, observed_at_millis: u64) -> Result<(), WorkerError>;
 pub fn affinity_hints(&self, project_id: &str, worktree_id: &str) -> Result<AffinityHints, WorkerError>;
 ```
 
-`claim_next` examines the oldest uncancelled `Waiting` row only; it marks that row `Dispatching` with the first ranked compatible worker not already selected by a live dispatch. It never holds the queue lock during SSH. If the head has no eligible worker, it returns `None` and does not inspect later waiting rows. `revert_dispatch` changes exactly matching dispatcher/job rows back to `Waiting` after lease busy or any pre-acceptance failure. `request_queue_cancel` removes a waiting row immediately, or persists `cancel_requested_at_millis` on a dispatching row and returns its dispatcher identity. Dispatch code rereads/checks that flag before snapshot, lease, upload, verify, and submit; after any race it uses the original-ID Phase 3 resolution before deciding whether remote cancellation is needed. `remove_after_terminal` removes only a durably accepted-and-terminal or durably abandoned row. `recover_dead_dispatches` changes identity-proven dead dispatchers to `Waiting`; it never deletes them. `remove_queued` is an internal waiting-only primitive. Keep project/worktree and project-level healthy worker names as separate canonical affinity records; malformed records fail closed.
+`claim_next` is owner-scoped and per-worker FIFO. For each ranked idle worker not selected by a live dispatch, it considers the caller's own uncancelled `Waiting` row; it claims that row only if it is eligible for that worker (requirements, pin, and local run cap) and no older uncancelled live-owned row is eligible for the same worker. It returns `None` when no caller-owned row meets those conditions. A pinned, capability-blocked, or run-capped row never blocks younger work eligible for another worker. It mutates only the selected row to `Dispatching` and never holds the queue lock during SSH, observation refresh, lease acquisition, upload, or remote status work. Count the run cap under the same lock using same-run dispatches plus locally accepted/nonterminal same-run job records; a claim reserves its slot until reversion or terminal removal. `revert_dispatch` changes exactly matching dispatcher/job rows back to `Waiting` after lease busy or any pre-acceptance failure. `request_queue_cancel` removes a waiting row immediately, or persists `cancel_requested_at_millis` on a dispatching row and returns its dispatcher identity. Dispatch code rereads/checks that flag before snapshot, lease, upload, verify, and submit; after any race it uses the original-ID Phase 3 resolution before deciding whether remote cancellation is needed. `remove_after_terminal` removes only a durably accepted-and-terminal or durably abandoned row. `recover_dead_dispatches` changes identity-proven dead batch dispatchers to `Waiting`; it leaves every `task_turn` row untouched, including a dead owner. `remove_queued` is an internal waiting-only primitive. Keep project/worktree and project-level healthy worker names as separate canonical affinity records; malformed records fail closed. Persist `observations/<worker>.json` and a guarded per-worker refresh marker beneath the same rooted state tree; stale entries refresh single-flight with a two-second TTL and readers retain the observation age.
 
 - [ ] **Step 5: Run queue and local state tests**
 
@@ -351,7 +371,7 @@ git commit -m "feat: persist durable local scheduler queue"
 
 - [ ] **Step 1: Write failing CLI/orchestration tests**
 
-Pin `worker run -- npm test`, `worker run --worker mini-2 -- npm test`, `worker run --no-wait -- npm test`, and `worker run --worker mini-2 --no-wait -- npm test`. Record effects in this exact order: inspect/settings/requirements; concurrent fresh fleet probe; no-wait rejection before enqueue/snapshot; enqueue; recover dead dispatches; rank the oldest waiting row; persist `Dispatching`; snapshot; lease; upload/verify/submit; flush acceptance; follow logs. Assert pinned busy/unavailable workers are never silently rerouted; no later compatible waiting row is claimed before an older compatible waiting row; and up to three distinct worker rows may be dispatching simultaneously.
+Pin `worker run -- npm test`, `worker run --worker mini-2 -- npm test`, `worker run --no-wait -- npm test`, and `worker run --worker mini-2 --no-wait -- npm test`. Record effects in this exact order: inspect/settings/requirements; cached fleet admission observation (single-flight refresh when stale); no-wait rejection before enqueue/snapshot; enqueue; recover dead batch dispatches; owner-scoped per-worker FIFO claim; persist `Dispatching`; snapshot; lease; upload/verify/submit; flush acceptance; follow logs. Assert pinned busy/unavailable workers are never silently rerouted; a busy pinned head does not block a younger row eligible for another worker; an older live-owned row wins for the same worker; and up to three distinct worker rows may be dispatching simultaneously.
 
 - [ ] **Step 2: Run command tests to verify RED**
 
@@ -378,9 +398,9 @@ Omitted `--worker` becomes `Automatic`; supplied values must pass `Config::worke
 
 - [ ] **Step 4: Implement bounded scheduling and delegate submission**
 
-Probe configured workers concurrently with `WorkersService::inspect_with_requirements`; never reuse Doctor data. For a pin, rank only that health record. `NoEligible` plus no-wait returns `WorkerError::Capacity { code: "CAPACITY_BUSY", .. }` before enqueue. Waiting requests generate the original job/client identity, enqueue, and poll under one-second bounded waits; never hold queue lock during SSH, capture, rsync, or log follow.
+Admission reads configured-worker observations through the shared two-second cache, never Doctor data. A dispatcher that finds a stale worker observation owns that worker's single-flight refresh marker, obtains the fresh result outside the queue lock, canonically publishes the cache record, and releases the marker; other dispatchers read the cached record and age. For a pin, rank only that health record. `NoEligible` plus no-wait returns `WorkerError::Capacity { code: "CAPACITY_BUSY", .. }` before enqueue. Waiting requests generate the original job/client identity, enqueue, and poll under one-second bounded waits; never hold queue lock during SSH, cache refresh, capture, rsync, or log follow.
 
-When the head has a candidate, `claim_next` atomically persists its `Dispatching` owner/worker then the scheduler releases the queue lock and calls Phase 3 preparation/upload/lease/submit with the original identity and selected configured worker. A lease race or any pre-acceptance failure calls `revert_dispatch` for the same queue ID and dispatcher; no re-enqueue occurs. A durably accepted job remains dispatching until terminal or durable abandonment, when `remove_after_terminal` removes it. Command starts may occur out of order between independently dispatching workers, but admission consideration remains FIFO. Record affinity only after a fresh successful remote observation.
+When an owner-owned row has a per-worker FIFO candidate, `claim_next` atomically persists its `Dispatching` owner/worker and reserves any run-cap slot; the scheduler then releases the queue lock and calls Phase 3 preparation/upload/lease/submit with the original identity and selected configured worker. A lease race or any pre-acceptance failure calls `revert_dispatch` for the same queue ID and dispatcher; no re-enqueue occurs. A durably accepted job remains dispatching until terminal or durable abandonment, when `remove_after_terminal` removes it. Command starts may occur out of order between independently dispatching workers, but FIFO is preserved among rows eligible for each worker. Record affinity only after a fresh successful remote observation.
 
 - [ ] **Step 5: Run orchestration regressions**
 
@@ -537,7 +557,7 @@ Require unique canonical IDs and bound each host request to 100 IDs. Add fixed `
 
 - [ ] **Step 4: Implement recovery without a second authority**
 
-Before scheduler admission and `worker status` listing refresh, call `FleetReconciler::reconcile`. Load at most 100 newest local records, group known nonterminal/uncertain IDs by recorded worker, concurrently probe all workers, then request remote reconciliation for only those IDs. Persist authoritative status with `update_observation`; retain `UnknownRemote` on unavailable/invalid response. Remove affinity only after a fresh successful ineligible/unavailable probe, never an SSH failure.
+Before scheduler admission and `worker status` listing refresh, call `FleetReconciler::reconcile`. Load at most 100 newest local records, group known nonterminal/uncertain IDs by recorded worker, refresh/probe workers through the shared single-flight observation cache, then request remote reconciliation for only those IDs. Persist authoritative status with `update_observation`; retain `UnknownRemote` on unavailable/invalid response. Reconciliation and observation refresh happen outside the queue lock. Remove affinity only after a fresh successful ineligible/unavailable probe, never an SSH failure.
 
 Use remote durable status first, remote lease second, local waiting queue third; cached local observations cannot free capacity. Return partial worker errors but continue scheduling on other freshly eligible workers.
 
@@ -591,9 +611,23 @@ fn cancel_dispatch_race_has_one_terminal_outcome_and_zero_duplicate_launches() {
 fn automatic_placement_never_overrides_a_pinned_worker() {
     assert!(pinned_job_waits_when_only_another_worker_is_idle());
 }
+
+#[test]
+fn owner_scoped_per_worker_claim_leaves_another_live_owner_ahead() {
+    let result = run_owner_claim_ordering_race();
+    assert!(result.younger_owner_claim_is_none());
+    assert!(result.older_owner_claims_matching_worker());
+}
+
+#[test]
+fn run_cap_and_observation_refresh_are_atomic_under_competing_dispatchers() {
+    let result = run_cap_and_cache_race();
+    assert_eq!(result.accepted_claims_for_run(), 1);
+    assert_eq!(result.refreshes_for_stale_worker(), 1);
+}
 ```
 
-Run 100 deterministic interleavings for enqueue/claim, claim/lease, cancel/claim, cancel/launch, reboot/reconcile, and disconnect during acquire/upload/verify/submit. Each case must prove: one ID has zero/one launch; no worker has two leases; an older compatible entry is not bypassed; ambiguous owner records remain; cleanup precedes release; and no unavailable host triggers local execution.
+In `tests/scheduler_queue.rs`, add direct persistence tests for task-turn waiting ownership/adoption, owner-scoped claims, a busy pinned head not blocking a younger row for another worker, and a dead-owner `task_turn` surviving `recover_dead_dispatches`. In `tests/scheduler_concurrency.rs`, race two dispatchers against the final run-cap slot and race stale readers against one observation refresh marker; prove exactly one claim consumes the cap and one refresh publishes the canonical cache entry. Run 100 deterministic interleavings for enqueue/claim, claim/lease, cancel/claim, cancel/launch, reboot/reconcile, and disconnect during acquire/upload/verify/submit. Each case must prove: one ID has zero/one launch; no worker has two leases; an older eligible entry is not bypassed for the same worker; a pinned/capability-blocked row does not block another worker; ambiguous owner records remain; dead task-turn rows remain; cleanup precedes release; and no unavailable host triggers local execution.
 
 Add property tests for ranking permutation/determinism, queue sequence monotonicity, bounded fleet requests, and non-secret record serialization. Plant argv, shell, env-like values, project paths, and local hostnames; prove absence from queue/affinity records, human/JSON output, and mac-worker-generated errors.
 
@@ -605,7 +639,7 @@ Expected: FAIL until deterministic synchronization seams expose every required r
 
 - [ ] **Step 3: Add only inert test seams and close race windows**
 
-Add `#[doc(hidden)]` test-only barriers/fault points at queue publication, dispatch-to-lease handoff, remote-cancel handoff, and reconciliation response handling. Production defaults remain inert. Fix failures by retaining Task 1--6 authority rules; do not add background threads, hidden daemons, broad cleanup, or alternate retry/lifecycle state.
+Add `#[doc(hidden)]` test-only barriers/fault points at queue publication, owner-scoped claim/run-cap evaluation, observation-cache refresh publication, dispatch-to-lease handoff, remote-cancel handoff, and reconciliation response handling. Production defaults remain inert. Fix failures by retaining Task 1--6 authority rules; do not add background threads, hidden daemons, broad cleanup, or alternate retry/lifecycle state.
 
 - [ ] **Step 4: Run focused Phase 3/4 lifecycle suite**
 
@@ -657,13 +691,13 @@ worker status
 worker cancel <job-id>
 ```
 
-State: automatic runs queue FIFO for compatible configured workers; pins wait only for their named worker; no-wait returns `CAPACITY_BUSY`; log disconnect/Ctrl-C does not cancel; cancellation is explicit/targeted; remote source changes never return. State dashboard is Phase 4.5 and artifacts/fetch, caches, Docker, and general GC are later work.
+State: automatic runs queue per-worker FIFO for compatible configured workers; pins wait only for their named worker without blocking another worker; no-wait returns `CAPACITY_BUSY`; log disconnect/Ctrl-C does not cancel; cancellation is explicit/targeted; remote source changes never return. State that scheduler admission uses its local shared observation cache only as advisory input and the remote lease remains authoritative. State dashboard is Phase 4.5 and artifacts/fetch, caches, Docker, and general GC are later work.
 
 Create `docs/phase-four-validation.md` headings: `Commit and protocol`, `Automated gate`, `Three-worker setup`, `Automatic placement`, `FIFO fourth job`, `Pinned worker`, `No-wait capacity`, `Cancellation`, `Disconnect and reconciliation`, `Cleanup and privacy`, and `Remaining boundary`. Record only commit/version, shortened IDs, aliases, counts, states, durations, exits, and mac-worker-owned namespace fingerprints.
 
 - [ ] **Step 4: Perform sanitized three-Mac acceptance**
 
-With an isolated temporary clone/XDG roots and the same release helper installed on all configured workers: submit three bounded jobs without a pin and prove distinct leases; submit a fourth and prove FIFO/blocking reason; finish one and prove only head dispatches. Prove a pin waits despite another idle worker. Fill all slots and prove no-wait changes neither local snapshot nor remote namespace. Cancel one waiting and one running job, proving no SSH for the first and targeted cleanup/release for the second. Interrupt a follower/reconnect by original ID; stop SSH or reboot one worker and prove the other two continue while the affected job remains stale/unknown, not assumed lost.
+With an isolated temporary clone/XDG roots and the same release helper installed on all configured workers: submit three bounded jobs without a pin and prove distinct leases; submit a fourth and prove per-worker FIFO/blocking reason; finish one and prove only the eligible head dispatches. Prove a pin waits despite another idle worker while a younger compatible row may use that other worker. Fill all slots and prove no-wait changes neither local snapshot nor remote namespace. Cancel one waiting and one running job, proving no SSH for the first and targeted cleanup/release for the second. Interrupt a follower/reconnect by original ID; stop SSH or reboot one worker and prove the other two continue while the affected job remains stale/unknown, not assumed lost. Record the cache as scheduler-owned advisory evidence only; do not record raw probe payloads.
 
 - [ ] **Step 5: Run final local gate**
 
@@ -688,6 +722,6 @@ git commit -m "test: validate three-worker scheduler"
 
 ## Plan Self-Review Results
 
-- **Spec coverage:** Task 1 is start-now pure ranking; Task 2 is the single protocol-v3 probe adapter shared with Phase 4.5; Task 3 covers durable FIFO/dispatch recovery; Task 4 covers automatic selection, pins, and no-wait; Task 5 covers queued/running cancellation; Task 6 covers fleet/reboot/offline recovery; Task 7 covers concurrency/lifecycle/privacy; Task 8 covers docs and three-Mac acceptance. Dashboard, artifacts, caches, Docker, general GC, and Phase 5 hardening are intentionally absent.
+- **Spec coverage:** Task 1 is start-now pure ranking; Task 2 is the single protocol-v3 probe adapter shared with Phase 4.5; Task 3 covers durable canonical queue records, task-turn ownership, run references, per-worker FIFO, dispatch recovery, and shared admission observations; Task 4 covers automatic selection, pins, no-wait, and cached admission; Task 5 covers queued/running cancellation; Task 6 covers fleet/reboot/offline recovery; Task 7 covers concurrency/lifecycle/privacy; Task 8 covers docs and three-Mac acceptance. Dashboard, artifacts/fetch, Docker, general GC, and Phase 5 task command implementation are intentionally absent.
 - **Placeholder scan:** Clean: every task specifies files, interfaces, concrete assertions, RED/PASS commands, implementation boundary, and commit.
-- **Type consistency:** Task 1 defines `CandidateObservation`, `AffinityHints`, `WorkerPreference`, and `SchedulerPolicy`; Task 2 maps version-3 `WorkerHealth`/`ProbeResponse` into that observation; Task 3 persists preference/affinity and `Dispatching`; Task 4 consumes all three for `RunRequest`; Task 5 defines cancellation; Task 6 composes status into fleet reports; Tasks 7--8 consume prior public interfaces.
+- **Type consistency:** Task 1 defines `CandidateObservation`, `AffinityHints`, `WorkerPreference`, and `SchedulerPolicy`; Task 2 maps version-3 `WorkerHealth`/`ProbeResponse` into that observation; Task 3 persists preference/affinity, entry kind, owner, run reference, `Dispatching`, and observation cache records; Task 4 consumes them for `RunRequest`; Task 5 defines cancellation; Task 6 composes status and cache refreshes into fleet reports; Tasks 7--8 consume prior public interfaces.
