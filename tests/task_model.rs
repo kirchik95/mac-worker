@@ -378,7 +378,7 @@ fn runner_identity_wraps_process_identity() {
 }
 
 #[test]
-fn origin_and_push_parse_but_core_scope_rejects_them() {
+fn later_plan_source_and_publish_options_parse_but_core_scope_rejects_them() {
     let origin: TaskSource = serde_json::from_value(serde_json::json!({
         "kind": "origin",
         "url": "https://example.test/repo.git"
@@ -397,6 +397,12 @@ fn origin_and_push_parse_but_core_scope_rejects_them() {
     let mut push_fields = fields_with_prompt("Ship it".into());
     push_fields.publish = vec![PublishMode::Fetch, push];
     let error = TaskMeta::new(push_fields).unwrap_err();
+    assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
+    assert!(error.to_string().contains("later plan"), "{error}");
+
+    let mut branch_fields = fields_with_prompt("Ship it".into());
+    branch_fields.publish_branch = Some("feature/ship-it".parse().unwrap());
+    let error = TaskMeta::new(branch_fields).unwrap_err();
     assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
     assert!(error.to_string().contains("later plan"), "{error}");
 }

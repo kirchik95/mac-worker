@@ -536,6 +536,9 @@ impl TaskMeta {
         if self.publish.contains(&PublishMode::Push) {
             return Err(task_config("publish push is deferred to a later plan"));
         }
+        if self.publish_branch.is_some() {
+            return Err(task_config("publish branch is deferred to a later plan"));
+        }
         Ok(())
     }
 }
