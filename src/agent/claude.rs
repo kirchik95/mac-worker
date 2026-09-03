@@ -79,8 +79,7 @@ impl AgentAdapter for ClaudeAdapter {
             "assistant" => parse_assistant(&value),
             "result" => Some(AgentEvent::TurnEnd {
                 reason: value
-                    .get("terminal_reason")
-                    .or_else(|| value.get("subtype"))
+                    .get("subtype")
                     .and_then(Value::as_str)
                     .unwrap_or("completed")
                     .to_string(),

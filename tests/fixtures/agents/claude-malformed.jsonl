@@ -1,3 +1,3 @@
-{"type":"system","subtype":"init","cwd":"/workspace","session_id":"00000000-0000-4000-8000-000000000003","model":"claude-placeholder"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I finished, but this is not structured JSON."}]},"session_id":"00000000-0000-4000-8000-000000000003"}
-{"type":"result","subtype":"success","result":"I finished, but this is not structured JSON.","is_error":false,"session_id":"00000000-0000-4000-8000-000000000003","num_turns":1}
+{"type":"system","subtype":"init","cwd":"/workspace","session_id":"00000000-0000-4000-8000-000000000003","tools":["Bash","Read","Edit"],"mcp_servers":[],"model":"claude-placeholder","permissionMode":"bypassPermissions"}
+{"type":"assistant","message":{"id":"msg_placeholder","type":"message","role":"assistant","model":"claude-placeholder","content":[{"type":"text","text":"I finished, but this is not structured JSON."}]},"parent_tool_use_id":null,"session_id":"00000000-0000-4000-8000-000000000003"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":1000,"duration_api_ms":800,"num_turns":1,"result":"I finished, but this is not structured JSON.","session_id":"00000000-0000-4000-8000-000000000003","total_cost_usd":0.01,"usage":{"input_tokens":10,"output_tokens":8}}

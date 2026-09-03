@@ -20,6 +20,9 @@ fn params(policy: PermissionPolicy) -> TurnParams {
     }
 }
 
+// Claude fixtures are hand-derived from the documented stream-json
+// envelope (system/init, assistant, result). They were not captured
+// from a live Claude Code run.
 fn fixture(name: &str) -> String {
     fs::read_to_string(format!("tests/fixtures/agents/{name}"))
         .unwrap_or_else(|error| panic!("fixture {name} must be readable: {error}"))
