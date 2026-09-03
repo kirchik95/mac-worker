@@ -415,7 +415,7 @@ fn collect_cpu_counters() -> Option<CpuCounters> {
                 &raw mut count,
             )
         };
-        return cpu_counters_from_host_statistics(status, count, ticks);
+        cpu_counters_from_host_statistics(status, count, ticks)
     }
 
     #[cfg(not(target_os = "macos"))]
