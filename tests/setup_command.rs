@@ -131,11 +131,35 @@ fn valid_probe_json() -> Vec<u8> {
         "total_disk_bytes": 1_073_741_824_u64,
         "memory_pressure": "normal",
         "swap_used_bytes": 134_217_728_u64,
+        "available_memory_bytes": 12 * 1024 * 1024 * 1024_u64,
+        "cpu_counters": {
+            "user_ticks": 10,
+            "system_ticks": 20,
+            "idle_ticks": 30,
+            "nice_ticks": 40,
+        },
         "slot_state": "idle",
         "active_lease": null,
         "capabilities": ["darwin-arm64"],
     }))
     .unwrap()
+}
+
+#[test]
+fn canonical_setup_probe_fixture_carries_all_v3_scheduler_and_dashboard_facts() {
+    // Omitting either v3 fact here would leave setup verification untested against its full probe.
+    let probe: serde_json::Value = serde_json::from_slice(&valid_probe_json()).unwrap();
+
+    assert_eq!(probe["available_memory_bytes"], 12 * 1024 * 1024 * 1024_u64);
+    assert_eq!(
+        probe["cpu_counters"],
+        serde_json::json!({
+            "user_ticks": 10,
+            "system_ticks": 20,
+            "idle_ticks": 30,
+            "nice_ticks": 40,
+        })
+    );
 }
 
 fn expected_setup_json(expected: &[u8]) -> Vec<u8> {
