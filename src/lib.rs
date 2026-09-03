@@ -8,6 +8,9 @@ use std::{
 use cli::{Cli, Command, HiddenComponent, HostCommand};
 use client_state::ClientStateStore;
 use config::{Config, WorkerEntry};
+use dashboard::command::{
+    DashboardCommandRequest, SystemBrowserOpener, SystemDashboardLauncher, run_dashboard,
+};
 use doctor::{DoctorRequest, DoctorService};
 use error::WorkerError;
 use host_store::HostStore;
@@ -164,6 +167,9 @@ fn execute_with_context(
             let service = WorkersService::new(SshTransport::new(runner));
             Ok(CommandOutput::Workers(service.inspect(&config)))
         }
+        Command::Dashboard { .. } => Err(WorkerError::Protocol(
+            "public dashboard requires the stdio execution boundary".into(),
+        )),
         Command::Run { .. } => Err(WorkerError::Protocol(
             "public run requires the stdio execution boundary".into(),
         )),
@@ -440,6 +446,9 @@ pub fn run_with_stdio_in_context(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    if let Command::Dashboard { port, no_open } = cli.command {
+        return run_dashboard_command(cli.config, runtime, port, no_open, stdout, stderr);
+    }
     if matches!(cli.command, Command::Run { .. } | Command::Logs { .. }) {
         return run_public_streaming_command(cli, runner, runtime, stdout, stderr);
     }
@@ -452,6 +461,46 @@ pub fn run_with_stdio_in_context(
         stdout,
         stderr,
     )
+}
+
+fn run_dashboard_command(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    port: Option<u16>,
+    no_open: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        let config = std::sync::Arc::new(Config::load(&paths.config)?);
+        let client_state = std::sync::Arc::new(ClientStateStore::open(&paths.state)?);
+        let launcher = SystemDashboardLauncher::from_system(config, client_state);
+        let opener = SystemBrowserOpener;
+        let async_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(WorkerError::Io)?;
+        async_runtime.block_on(run_dashboard(
+            DashboardCommandRequest::new(port, no_open),
+            &launcher,
+            &opener,
+            Box::pin(async {
+                let _ = tokio::signal::ctrl_c().await;
+            }),
+            stdout,
+            stderr,
+        ))?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            write_error(stderr, &error);
+            error.exit_code()
+        }
+    }
 }
 
 #[doc(hidden)]

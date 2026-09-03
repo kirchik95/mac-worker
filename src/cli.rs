@@ -31,6 +31,12 @@ pub enum Command {
         includes: Vec<String>,
     },
     Workers,
+    Dashboard {
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
+        port: Option<u16>,
+        #[arg(long)]
+        no_open: bool,
+    },
     Run {
         #[arg(long, value_parser = non_empty_worker)]
         worker: String,
