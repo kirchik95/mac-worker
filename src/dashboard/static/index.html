@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Mac Worker · Machine Floor</title>
+    <link rel="stylesheet" href="/assets/dashboard.css">
+  </head>
+  <body>
+    <header class="status-rail">
+      <div class="brand-mark" aria-label="Mac Worker dashboard">
+        <span class="brand-mark__stamp" aria-hidden="true">MW</span>
+        <span>
+          <strong>Machine Floor</strong>
+          <small>Local worker control panel</small>
+        </span>
+      </div>
+      <div class="rail-status">
+        <span id="rail-state-indicator" class="rail-status__light" data-state="offline" aria-hidden="true"></span>
+        <span id="refresh-status" aria-live="polite">Awaiting first local snapshot…</span>
+      </div>
+      <p id="last-updated" class="rail-time">No observations yet</p>
+    </header>
+
+    <main>
+      <section class="floor-section floor-section--machines" aria-labelledby="workers-heading">
+        <div class="section-heading">
+          <div>
+            <p class="section-index">Bay 01</p>
+            <h1 id="workers-heading">Three-machine floor</h1>
+          </div>
+          <p>Slot state is authoritative. Host readings explain the load.</p>
+        </div>
+        <div id="worker-grid" data-testid="worker-grid" class="worker-grid">
+          <p class="empty-state">Waiting for worker observations…</p>
+        </div>
+      </section>
+
+      <div class="operations-grid">
+        <section class="floor-section" aria-labelledby="queue-heading">
+          <div class="section-heading section-heading--compact">
+            <div>
+              <p class="section-index">Rack 02</p>
+              <h2 id="queue-heading">Queue</h2>
+            </div>
+            <span class="section-key">FIFO</span>
+          </div>
+          <div id="queue-list" data-testid="queue-list" class="ticket-stack">
+            <p class="empty-state">Waiting for queue state…</p>
+          </div>
+        </section>
+
+        <section class="floor-section" aria-labelledby="active-heading">
+          <div class="section-heading section-heading--compact">
+            <div>
+              <p class="section-index">Bench 03</p>
+              <h2 id="active-heading">Active work</h2>
+            </div>
+            <span class="section-key">Live</span>
+          </div>
+          <div id="active-jobs" data-testid="active-jobs" class="ticket-stack">
+            <p class="empty-state">Waiting for active jobs…</p>
+          </div>
+        </section>
+      </div>
+
+      <section class="floor-section" aria-labelledby="history-heading">
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="section-index">Ledger 04</p>
+            <h2 id="history-heading">Recent tickets</h2>
+          </div>
+          <span class="section-key">Read only</span>
+        </div>
+        <div id="recent-jobs" data-testid="recent-jobs" class="ticket-stack ticket-stack--history">
+          <p class="empty-state">Waiting for retained history…</p>
+        </div>
+      </section>
+
+      <section class="floor-section detail-section" aria-labelledby="detail-heading">
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="section-index">Scope 05</p>
+            <h2 id="detail-heading">Job detail</h2>
+          </div>
+          <span class="section-key">Immutable record</span>
+        </div>
+        <div id="job-detail" data-testid="job-detail" class="job-detail">
+          <p class="empty-state">Select a ticket to inspect its durable record and logs.</p>
+        </div>
+
+        <div class="console-grid">
+          <figure class="console">
+            <figcaption><span>Standard output</span><code>stdout</code></figcaption>
+            <pre id="stdout-log" data-testid="stdout-log" tabindex="0" aria-label="Standard output log"></pre>
+          </figure>
+          <figure class="console">
+            <figcaption><span>Standard error</span><code>stderr</code></figcaption>
+            <pre id="stderr-log" data-testid="stderr-log" tabindex="0" aria-label="Standard error log"></pre>
+          </figure>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Loopback session</span>
+      <span>No controls · no telemetry · no external resources</span>
+    </footer>
+    <script type="module" src="/assets/dashboard.mjs"></script>
+  </body>
+</html>
