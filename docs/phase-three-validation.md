@@ -25,7 +25,7 @@ An isolated live run selected only `mini-1`. The record intentionally retains on
 
 | Required evidence | Sanitized record |
 | --- | --- |
-| Software commit | `d986eef6ebd9936c40c2d17b27aa9eb5c3ffd996`; final local gate passed. Setup verified the promoted helper, and a final SHA-256 equality check confirmed the installed helper matched the validated client release binary. |
+| Software commit | `fa89103528c0d6b66a660283a1e69fd068708ffc`; final local gate passed. Setup verified the promoted helper, and a final SHA-256 equality check confirmed the installed helper matched the validated client release binary. |
 | Worker protocol version | `2` from setup and ready-worker probes. |
 | Selected worker name | `mini-1` only. |
 | Sanitized command categories | Setup (including an idempotence control); successful literal-argv `printf`; shell sleep with disconnect/reconnect; `status <job-id>`; non-follow `logs <job-id>`; `logs -f` reconnect; concurrent capacity check; and the operator-selected literal-argv `/bin/sh -c 'exit 7'` case. |
@@ -40,6 +40,8 @@ An isolated live run selected only `mini-1`. The record intentionally retains on
 | Original isolated clone | Its baseline commit, intentional marker-only status/diff, and clean diff check were unchanged after all remote execution. |
 
 The live record states that the validated helper and client revisions matched, without recording installation locations or connection details. It records only sanitized command categories and outcomes; application output is not safe evidence by default because it may contain application-emitted secrets.
+
+Post-rebase smoke rerun: after rebasing this branch onto `main`, isolated setup, readiness, one literal-argv `printf` job, exact `status` and JSON `logs` retrieval, and idle/no-active-lease confirmation passed on `mini-1`.
 
 ## Phase 4 boundary
 
