@@ -2,10 +2,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        fs::PermissionsExt,
-    },
+    io::{self, Read},
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, Output},
     time::Duration,
@@ -20,6 +18,7 @@ use crate::{
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     project::ProjectContext,
     project_config::ProjectSettings,
+    rooted_fs::{EntryKind, RootedDir},
     task::{BaseOid, GitIdentity, TaskId},
 };
 
@@ -124,9 +123,16 @@ impl TransferRepo {
                     "the user repository object directory is missing",
                 )
             })?;
-        let path = cache_root.join("transfer").join(format!("{repo_id}.git"));
-        fs::create_dir_all(path.parent().expect("transfer path has a parent"))?;
-        if !path.join("HEAD").exists() {
+        let cache_root = if cache_root.is_absolute() {
+            cache_root.to_path_buf()
+        } else {
+            fs::canonicalize(cache_root).map_err(WorkerError::Io)?
+        };
+        let transfer_parent = cache_root.join("transfer");
+        let _transfer_ns = open_or_create_owner_only_dir(&transfer_parent)?;
+        let path = transfer_parent.join(format!("{repo_id}.git"));
+        let repo_dir = open_or_create_owner_only_dir(&path)?;
+        if !repo_dir.entry_exists("HEAD")? {
             run_system_git(
                 None,
                 &[
@@ -138,12 +144,10 @@ impl TransferRepo {
                 None,
             )?;
         }
-        let info = path.join("objects/info");
-        fs::create_dir_all(&info)?;
-        fs::write(
-            info.join("alternates"),
-            format!("{}\n", alternates_target.display()),
-        )?;
+        chmod_owner_only(&repo_dir)?;
+        let _scratch = repo_dir.open_child_directory(&relative("scratch")?, true)?;
+        let info = open_owner_only_subdir(&path, &["objects", "info"])?;
+        write_alternates_atomic(&info, &alternates_target)?;
         let transfer = Self {
             path,
             repo_id,
@@ -162,13 +166,29 @@ impl TransferRepo {
     }
 
     pub fn verify_alternates(&self) -> Result<(), WorkerError> {
-        let contents =
-            fs::read_to_string(self.path.join("objects/info/alternates")).map_err(|_| {
+        let root = RootedDir::open(&self.path)?;
+        let mut inspection = root
+            .inspect(&relative("objects/info/alternates")?)
+            .map_err(|_| {
                 git_error(
                     "BASE_UNAVAILABLE",
                     "the transfer repository alternates file is missing",
                 )
             })?;
+        if inspection.kind != EntryKind::RegularFile {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "the transfer repository alternates file is missing",
+            ));
+        }
+        let mut bytes = Vec::new();
+        inspection.read_to_end(&mut bytes)?;
+        let contents = String::from_utf8(bytes).map_err(|_| {
+            git_error(
+                "BASE_UNAVAILABLE",
+                "the transfer repository alternates file is missing",
+            )
+        })?;
         let target = PathBuf::from(contents.trim());
         if !target.is_dir() {
             return Err(git_error(
@@ -426,102 +446,103 @@ impl TransferRepo {
         let selection = InputSelector::new(runner)
             .select(context, &settings.snapshot)
             .map_err(map_selection)?;
-        let scratch = self
-            .path
-            .join("scratch")
-            .join(format!("index-{}", Uuid::new_v4()));
-        if let Some(parent) = scratch.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        self.transfer_git(
-            runner,
-            &[OsString::from("read-tree"), OsString::from("--empty")],
-            Some(&scratch),
-            None,
-        )?;
-        let mut dirty = DirtyReport {
-            modified: 0,
-            added: 0,
-            deleted: selection.tracked_deletions.len(),
-        };
-        for entry in &selection.entries {
-            if entry.kind == SelectedInputKind::EmptyDirectory {
-                continue;
-            }
-            match entry.origin {
-                crate::inputs::InputOrigin::Tracked => dirty.modified += 1,
-                crate::inputs::InputOrigin::IncludedUntracked
-                | crate::inputs::InputOrigin::IncludedIgnored => dirty.added += 1,
-            }
-            let absolute = context.root.join(entry.path.as_path());
-            let (mode, oid) = self.hash_worktree_entry(runner, &absolute)?;
-            let cacheinfo = format!("{mode},{oid},{}", entry.path.as_str());
+        let repo_root = RootedDir::open(&self.path)?;
+        let scratch_dir = repo_root.open_child_directory(&relative("scratch")?, true)?;
+        let index_name = format!("index-{}", Uuid::new_v4());
+        scratch_dir.write_new_private_file(&index_name, &[])?;
+        let scratch = self.path.join("scratch").join(&index_name);
+        let source = RootedDir::open(&context.root)?;
+        let captured = (|| {
             self.transfer_git(
                 runner,
-                &[
-                    OsString::from("update-index"),
-                    OsString::from("--add"),
-                    OsString::from("--cacheinfo"),
-                    OsString::from(cacheinfo),
-                ],
+                &[OsString::from("read-tree"), OsString::from("--empty")],
                 Some(&scratch),
                 None,
             )?;
-        }
-        let tree = parse_tree_id(&self.transfer_git(
-            runner,
-            &[OsString::from("write-tree")],
-            Some(&scratch),
-            None,
-        )?)?;
-        let _ = fs::remove_file(&scratch);
-        Ok(CapturedSelection { tree, dirty })
+            let mut dirty = DirtyReport {
+                modified: 0,
+                added: 0,
+                deleted: selection.tracked_deletions.len(),
+            };
+            for entry in &selection.entries {
+                if entry.kind == SelectedInputKind::EmptyDirectory {
+                    continue;
+                }
+                match entry.origin {
+                    crate::inputs::InputOrigin::Tracked => dirty.modified += 1,
+                    crate::inputs::InputOrigin::IncludedUntracked
+                    | crate::inputs::InputOrigin::IncludedIgnored => dirty.added += 1,
+                }
+                let (mode, oid) = self.hash_worktree_entry(runner, &source, &entry.path)?;
+                let cacheinfo = format!("{mode},{oid},{}", entry.path.as_str());
+                self.transfer_git(
+                    runner,
+                    &[
+                        OsString::from("update-index"),
+                        OsString::from("--add"),
+                        OsString::from("--cacheinfo"),
+                        OsString::from(cacheinfo),
+                    ],
+                    Some(&scratch),
+                    None,
+                )?;
+            }
+            let tree = parse_tree_id(&self.transfer_git(
+                runner,
+                &[OsString::from("write-tree")],
+                Some(&scratch),
+                None,
+            )?)?;
+            Ok(CapturedSelection { tree, dirty })
+        })();
+        let _ = scratch_dir.remove_owned_child(&index_name);
+        captured
     }
 
     fn hash_worktree_entry(
         &self,
         runner: &dyn ProcessRunner,
-        path: &Path,
+        source: &RootedDir,
+        path: &RelativePath,
     ) -> Result<(&'static str, String), WorkerError> {
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() {
-            let target = fs::read_link(path)?;
-            let bytes = target.as_os_str().as_bytes().to_vec();
-            let output = self.transfer_git(
-                runner,
-                &[
-                    OsString::from("hash-object"),
-                    OsString::from("-w"),
-                    OsString::from("--stdin"),
-                ],
-                None,
-                Some(bytes),
-            )?;
-            return Ok(("120000", parse_hex_oid(&output)?));
+        let mut inspection = source.inspect(path)?;
+        match inspection.kind {
+            EntryKind::Symlink => {
+                let target = source.read_symlink(path)?;
+                let output = self.transfer_git(
+                    runner,
+                    &[
+                        OsString::from("hash-object"),
+                        OsString::from("-w"),
+                        OsString::from("--stdin"),
+                    ],
+                    None,
+                    Some(target.into_bytes()),
+                )?;
+                Ok(("120000", parse_hex_oid(&output)?))
+            }
+            EntryKind::RegularFile => {
+                let mut bytes = Vec::new();
+                inspection.read_to_end(&mut bytes)?;
+                let mode = if inspection.mode & 0o111 != 0 {
+                    "100755"
+                } else {
+                    "100644"
+                };
+                let output = self.transfer_git(
+                    runner,
+                    &[
+                        OsString::from("hash-object"),
+                        OsString::from("-w"),
+                        OsString::from("--no-filters"),
+                        OsString::from("--stdin"),
+                    ],
+                    None,
+                    Some(bytes),
+                )?;
+                Ok((mode, parse_hex_oid(&output)?))
+            }
         }
-        if !metadata.is_file() {
-            return Err(task_config(
-                "selected input is not a regular file or symlink",
-            ));
-        }
-        let mode = if metadata.permissions().mode() & 0o111 != 0 {
-            "100755"
-        } else {
-            "100644"
-        };
-        let output = self.transfer_git(
-            runner,
-            &[
-                OsString::from("hash-object"),
-                OsString::from("-w"),
-                OsString::from("--no-filters"),
-                OsString::from("--"),
-                path.as_os_str().to_os_string(),
-            ],
-            None,
-            None,
-        )?;
-        Ok((mode, parse_hex_oid(&output)?))
     }
 
     fn commit_tree(
@@ -1188,6 +1209,73 @@ fn is_safe_worker_ref_component(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'))
+}
+
+fn relative(path: &str) -> Result<RelativePath, WorkerError> {
+    RelativePath::parse(path.as_bytes()).map_err(|_| {
+        git_error(
+            "BASE_UNAVAILABLE",
+            "a transfer cache path is not a safe relative path",
+        )
+    })
+}
+
+fn chmod_owner_only(dir: &RootedDir) -> io::Result<()> {
+    let result = unsafe { libc::fchmod(dir.raw_directory_fd(), 0o700) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn open_or_create_owner_only_dir(path: &Path) -> io::Result<RootedDir> {
+    let dir = match RootedDir::open(path) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => RootedDir::create(path)?,
+        Err(error) => return Err(error),
+    };
+    chmod_owner_only(&dir)?;
+    Ok(dir)
+}
+
+fn open_owner_only_subdir(root: &Path, components: &[&str]) -> Result<RootedDir, WorkerError> {
+    let mut current = root.to_path_buf();
+    let mut dir = RootedDir::open(root)?;
+    chmod_owner_only(&dir)?;
+    for component in components {
+        current.push(component);
+        dir = match RootedDir::open(&current) {
+            Ok(opened) => opened,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => RootedDir::create(&current)?,
+            Err(error) => return Err(WorkerError::Io(error)),
+        };
+        chmod_owner_only(&dir)?;
+    }
+    Ok(dir)
+}
+
+fn write_alternates_atomic(info: &RootedDir, target: &Path) -> Result<(), WorkerError> {
+    let bytes = format!("{}\n", target.display()).into_bytes();
+    if info.entry_exists("alternates")? {
+        let mut inspection = info.inspect(&relative("alternates")?)?;
+        if inspection.kind != EntryKind::RegularFile {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "alternates is not a regular file",
+            )
+            .into());
+        }
+        let mut current = Vec::new();
+        inspection.read_to_end(&mut current)?;
+        if current == bytes {
+            return Ok(());
+        }
+        info.replace_private_regular_exact("alternates", &current, &bytes)?;
+        return Ok(());
+    }
+    info.write_private_atomic_no_replace("alternates", &bytes)?;
+    Ok(())
 }
 
 fn git_error(code: &'static str, message: &str) -> WorkerError {

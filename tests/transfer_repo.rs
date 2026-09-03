@@ -678,3 +678,103 @@ impl ProcessRunner for RecordingRunner {
         SystemProcessRunner.run(request)
     }
 }
+
+#[test]
+fn open_or_create_rejects_a_symlinked_transfer_directory() {
+    let repo = repo_with_commits();
+    let cache = cache_root();
+    let repo_id = repo_id_for(&repo.common_dir()).unwrap();
+    let transfer_parent = cache.path().join("transfer");
+    fs::create_dir_all(&transfer_parent).unwrap();
+    let outside = cache.path().join("outside.git");
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, transfer_parent.join(format!("{repo_id}.git"))).unwrap();
+
+    let error = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap_err();
+    assert!(
+        matches!(error, WorkerError::Io(_) | WorkerError::Git { .. }),
+        "{error:?}"
+    );
+    assert!(
+        !outside.join("HEAD").exists(),
+        "a symlink transfer directory must not be initialized"
+    );
+    assert!(
+        !outside
+            .join("objects")
+            .join("info")
+            .join("alternates")
+            .exists(),
+        "alternates must not be written through a symlink"
+    );
+}
+
+#[test]
+fn alternates_write_does_not_follow_a_symlink() {
+    let repo = repo_with_commits();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let planted = cache.path().join("planted-alternates");
+    fs::write(&planted, b"keep-me\n").unwrap();
+    let alternates = transfer.path().join("objects/info/alternates");
+    fs::remove_file(&alternates).unwrap();
+    symlink(&planted, &alternates).unwrap();
+
+    let error = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap_err();
+    assert!(
+        matches!(error, WorkerError::Io(_) | WorkerError::Git { .. }),
+        "{error:?}"
+    );
+    assert_eq!(fs::read(&planted).unwrap(), b"keep-me\n");
+}
+
+#[test]
+fn worktree_hashing_does_not_follow_a_symlink_to_outside_bytes() {
+    let repo = repo_with_commits();
+    let outside = cache_root();
+    let secret = outside.path().join("SECRET_OUTSIDE");
+    fs::write(&secret, b"SECRET_OUTSIDE\n").unwrap();
+    symlink(&secret, repo.path().join("leak")).unwrap();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(
+            &runner(),
+            &repo.context(),
+            task_id(),
+            &settings_including(&["leak"]),
+            &identity(),
+        )
+        .unwrap();
+    let tree = transfer.tree_of(base.oid());
+    assert_eq!(tree.mode("leak"), "120000");
+    assert_eq!(tree.blob("leak"), secret.as_os_str().as_encoded_bytes());
+    assert_ne!(tree.blob("leak"), b"SECRET_OUTSIDE\n");
+}
+
+#[test]
+fn transfer_cache_directories_and_alternates_are_owner_only() {
+    let repo = repo_with_commits();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    for path in [
+        transfer.path().to_path_buf(),
+        transfer.path().join("objects"),
+        transfer.path().join("objects/info"),
+        transfer.path().join("scratch"),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o700,
+            "{} must be owner-only, got {mode:o}",
+            path.display()
+        );
+    }
+    let alternates = transfer.path().join("objects/info/alternates");
+    let mode = fs::metadata(&alternates).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "alternates must be owner-only, got {mode:o}");
+}
