@@ -952,6 +952,7 @@ pub struct QueueEntry {
     pub(crate) run: Option<QueueRunReference>,
     pub(crate) enqueue_owner: ProcessIdentity,
     pub(crate) state: QueueState,
+    pub(crate) preacceptance_abandoned_by: Option<ProcessIdentity>,
     pub(crate) cancel_requested_at_millis: Option<u64>,
     pub(crate) enqueued_at_millis: u64,
 }
@@ -984,6 +985,7 @@ impl QueueEntry {
             run,
             enqueue_owner: owner,
             state: QueueState::Waiting { owner },
+            preacceptance_abandoned_by: None,
             cancel_requested_at_millis: None,
             enqueued_at_millis,
         };
@@ -1011,6 +1013,19 @@ impl QueueEntry {
             return Err(protocol_error(
                 "queue cancellation timestamp predates enqueue timestamp",
             ));
+        }
+        if let Some(abandoned_by) = self.preacceptance_abandoned_by {
+            abandoned_by.validate()?;
+            if !matches!(self.state, QueueState::Dispatching { .. }) {
+                return Err(protocol_error(
+                    "pre-acceptance abandonment proof requires a dispatch reservation",
+                ));
+            }
+            if self.kind == QueueEntryKind::Batch && self.owner() != &abandoned_by {
+                return Err(protocol_error(
+                    "batch abandonment proof must match its immutable owner",
+                ));
+            }
         }
         if self.kind == QueueEntryKind::Batch && self.owner() != &self.enqueue_owner {
             return Err(protocol_error("batch queue ownership is not replaceable"));
@@ -1070,6 +1085,10 @@ impl QueueEntry {
         &self.state
     }
 
+    pub fn preacceptance_abandoned_by(&self) -> Option<&ProcessIdentity> {
+        self.preacceptance_abandoned_by.as_ref()
+    }
+
     pub fn is_cancel_requested(&self) -> bool {
         self.cancel_requested_at_millis.is_some()
     }
@@ -1088,17 +1107,37 @@ impl QueueEntry {
 
     pub(crate) fn adopt(&mut self, owner: ProcessIdentity) -> Result<(), WorkerError> {
         if self.kind != QueueEntryKind::TaskTurn {
-            return Err(protocol_error("only a waiting task turn can be adopted"));
+            return Err(protocol_error("only a task turn can be adopted"));
         }
         match &mut self.state {
             QueueState::Waiting {
                 owner: current_owner,
             } => *current_owner = owner,
-            QueueState::Dispatching { .. } => {
-                return Err(protocol_error("a dispatching queue row cannot be adopted"));
-            }
+            QueueState::Dispatching { dispatch_owner, .. } => *dispatch_owner = owner,
         }
         self.validate()
+    }
+
+    pub(crate) fn record_preacceptance_abandoned(
+        &mut self,
+        dispatch_owner: ProcessIdentity,
+    ) -> Result<bool, WorkerError> {
+        dispatch_owner.validate()?;
+        if !matches!(
+            self.state,
+            QueueState::Dispatching {
+                dispatch_owner: current,
+                ..
+            } if current == dispatch_owner
+        ) {
+            return Err(protocol_error("queue dispatch owner does not match"));
+        }
+        if self.preacceptance_abandoned_by.is_some() {
+            return Ok(false);
+        }
+        self.preacceptance_abandoned_by = Some(dispatch_owner);
+        self.validate()?;
+        Ok(true)
     }
 
     pub(crate) fn dispatch(
@@ -1116,6 +1155,11 @@ impl QueueEntry {
     }
 
     pub(crate) fn revert(&mut self, dispatch_owner: ProcessIdentity) -> Result<(), WorkerError> {
+        if self.preacceptance_abandoned_by.is_some() {
+            return Err(protocol_error(
+                "a proven abandoned queue row cannot be reverted",
+            ));
+        }
         match self.state {
             QueueState::Dispatching {
                 dispatch_owner: current,
@@ -1165,7 +1209,7 @@ impl QueueEntry {
 impl Serialize for QueueEntry {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("QueueEntry", 14)?;
+        let mut record = serializer.serialize_struct("QueueEntry", 15)?;
         record.serialize_field("queue_id", &self.queue_id)?;
         record.serialize_field("job_id", &self.job_id)?;
         record.serialize_field("client_id", &self.client_id)?;
@@ -1178,6 +1222,10 @@ impl Serialize for QueueEntry {
         record.serialize_field("run", &self.run)?;
         record.serialize_field("enqueue_owner", &self.enqueue_owner)?;
         record.serialize_field("state", &self.state)?;
+        record.serialize_field(
+            "preacceptance_abandoned_by",
+            &self.preacceptance_abandoned_by,
+        )?;
         record.serialize_field(
             "cancel_requested_at_millis",
             &self.cancel_requested_at_millis,
@@ -1204,6 +1252,7 @@ impl<'de> Deserialize<'de> for QueueEntry {
             run: Option<QueueRunReference>,
             enqueue_owner: ProcessIdentity,
             state: QueueState,
+            preacceptance_abandoned_by: Option<ProcessIdentity>,
             cancel_requested_at_millis: Option<u64>,
             enqueued_at_millis: u64,
         }
@@ -1221,6 +1270,7 @@ impl<'de> Deserialize<'de> for QueueEntry {
             run: wire.run,
             enqueue_owner: wire.enqueue_owner,
             state: wire.state,
+            preacceptance_abandoned_by: wire.preacceptance_abandoned_by,
             cancel_requested_at_millis: wire.cancel_requested_at_millis,
             enqueued_at_millis: wire.enqueued_at_millis,
         };

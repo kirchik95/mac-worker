@@ -26,7 +26,9 @@ use mac_worker::{
 };
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const OTHER_PROJECT_ID: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const OTHER_WORKTREE_ID: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const COMMAND_SECRET: &str = "PLANTED_EXACT_COMMAND_SECRET";
 const PATH_SECRET: &str = "/Users/alice/PLANTED_QUEUE_PATH";
@@ -175,19 +177,42 @@ fn local_record_with_uncertainty(
     status: Option<JobStatus>,
     uncertainty: RemoteUncertainty,
 ) -> LocalJobRecord {
+    local_record_with_binding(
+        store,
+        job_id,
+        worker,
+        PROJECT_ID,
+        WORKTREE_ID,
+        CommandSpec::argv(vec!["tool".into(), COMMAND_SECRET.into()]).unwrap(),
+        status,
+        uncertainty,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_record_with_binding(
+    store: &ClientStateStore,
+    job_id: JobId,
+    worker: &str,
+    project_id: &str,
+    worktree_id: &str,
+    command: CommandSpec,
+    status: Option<JobStatus>,
+    uncertainty: RemoteUncertainty,
+) -> LocalJobRecord {
     let material = RequestFingerprintMaterial::new(
         job_id,
         store.client_id(),
         LeaseToken::new(TOKEN_SECRET.parse().unwrap()),
         1_000,
         worker.into(),
-        PROJECT_ID.into(),
-        WORKTREE_ID.into(),
+        project_id.into(),
+        worktree_id.into(),
         DIGEST.into(),
         "packages/app".into(),
         30_000,
         "heavy".into(),
-        CommandSpec::argv(vec!["tool".into(), COMMAND_SECRET.into()]).unwrap(),
+        command,
     )
     .unwrap();
     LocalJobRecord::new(
@@ -197,6 +222,14 @@ fn local_record_with_uncertainty(
         uncertainty,
     )
     .unwrap()
+}
+
+fn install_local_record_as(fixture: &QueueFixture, job_id: JobId, record: &LocalJobRecord) {
+    let mut bytes = serde_json::to_vec(record).unwrap();
+    bytes.push(b'\n');
+    let path = fixture.root.join("jobs").join(format!("{job_id}.json"));
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 fn dispatching_batch(
@@ -252,6 +285,7 @@ fn queue_records_are_canonical_owner_only_and_contain_summaries_not_secrets() {
     assert!(text.contains(r#""kind":"batch""#));
     assert!(text.contains(r#""state":"waiting""#));
     assert!(text.contains(r#""command_summary":{"mode":"argv","arg_count":2}"#));
+    assert!(text.contains(r#""preacceptance_abandoned_by":null"#));
     for secret in [
         COMMAND_SECRET,
         PATH_SECRET,
@@ -871,9 +905,9 @@ fn three_rows_dispatch_only_to_three_distinct_workers() {
 }
 
 #[test]
-fn waiting_task_turn_can_be_adopted_but_batch_and_dispatching_rows_cannot() {
-    // Break caught: Phase 5 cannot hand a waiting turn to its runner, or can
-    // rewrite batch/dispatch authority after a claim.
+fn waiting_task_turn_owner_can_be_adopted() {
+    // Break caught: Phase 5 cannot hand a waiting turn to its replacement
+    // runner without changing FIFO identity.
     let fixture = open_queue();
     let initial = owner(470);
     let adopted = owner(471);
@@ -905,18 +939,364 @@ fn waiting_task_turn_can_be_adopted_but_batch_and_dispatching_rows_cannot() {
         .claim_next(adopted, &["mini-1".into()], 472)
         .unwrap()
         .unwrap();
-    assert!(fixture.store.adopt_row(task.job_id(), owner(472)).is_err());
+}
 
-    let batch = fixture
+#[test]
+fn dispatching_task_turn_adoption_preserves_reservation_and_cancellation() {
+    // Break caught: a replacement runner cannot take ownership of an in-flight
+    // task turn, or adoption loses the exact worker/claim/cancel state.
+    let fixture = open_queue();
+    let initial = owner(472);
+    let replacement = owner(473);
+    let task = fixture
         .store
-        .enqueue(queued(
+        .enqueue(queued_with(
             &fixture.store,
             "00000000000000000000000000000081",
             473,
             initial,
+            WorkerPreference::Automatic,
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run_reference("run-81", 2)),
         ))
         .unwrap();
-    assert!(fixture.store.adopt_row(batch.job_id(), adopted).is_err());
+    fixture
+        .store
+        .claim_next(initial, &["mini-1".into()], 474)
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .request_queue_cancel(task.job_id(), 475)
+        .unwrap()
+        .unwrap();
+
+    let adopted = fixture.store.adopt_row(task.job_id(), replacement).unwrap();
+
+    assert_eq!(*adopted.enqueue_owner(), initial);
+    assert_eq!(adopted.cancel_requested_at_millis(), Some(475));
+    assert!(matches!(
+        adopted.state(),
+        QueueState::Dispatching {
+            dispatch_owner,
+            selected_worker,
+            claimed_at_millis,
+        } if *dispatch_owner == replacement
+            && selected_worker == "mini-1"
+            && *claimed_at_millis == 474
+    ));
+    assert!(
+        fixture
+            .store
+            .remove_after_terminal(task.job_id(), initial)
+            .is_err()
+    );
+}
+
+#[test]
+fn batch_ownership_is_immutable_while_waiting_or_dispatching() {
+    // Break caught: the task-turn adoption rule is accidentally generalized to
+    // batch rows in either persistent state.
+    let waiting_fixture = open_queue();
+    let initial = owner(474);
+    let replacement = owner(475);
+    let waiting = waiting_fixture
+        .store
+        .enqueue(queued(
+            &waiting_fixture.store,
+            "00000000000000000000000000000082",
+            476,
+            initial,
+        ))
+        .unwrap();
+    assert!(
+        waiting_fixture
+            .store
+            .adopt_row(waiting.job_id(), replacement)
+            .is_err()
+    );
+    assert_eq!(
+        *waiting_fixture.store.queue_snapshot().unwrap().entries()[0].owner(),
+        initial
+    );
+
+    let dispatching_fixture = open_queue();
+    let dispatching = dispatching_fixture
+        .store
+        .enqueue(queued(
+            &dispatching_fixture.store,
+            "00000000000000000000000000000083",
+            477,
+            initial,
+        ))
+        .unwrap();
+    dispatching_fixture
+        .store
+        .claim_next(initial, &["mini-1".into()], 478)
+        .unwrap()
+        .unwrap();
+    assert!(
+        dispatching_fixture
+            .store
+            .adopt_row(dispatching.job_id(), replacement)
+            .is_err()
+    );
+    assert!(matches!(
+        dispatching_fixture.store.queue_snapshot().unwrap().entries()[0].state(),
+        QueueState::Dispatching { dispatch_owner, .. } if *dispatch_owner == initial
+    ));
+}
+
+#[test]
+fn preacceptance_abandonment_marker_is_row_owner_and_state_scoped() {
+    // Break caught: an unrelated caller or an unclaimed row can manufacture a
+    // durable abandonment proof and delete work it does not own.
+    let fixture = open_queue();
+    let dispatcher = owner(476);
+    let row = fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "000000000000000000000000000000b1",
+            479,
+            dispatcher,
+        ))
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .record_preacceptance_abandoned(row.job_id(), dispatcher)
+            .is_err()
+    );
+    fixture
+        .store
+        .claim_next(dispatcher, &["mini-1".into()], 480)
+        .unwrap()
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .record_preacceptance_abandoned(row.job_id(), owner(477))
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .record_preacceptance_abandoned(
+                "000000000000000000000000000000b2".parse().unwrap(),
+                dispatcher,
+            )
+            .is_err()
+    );
+    let error = fixture
+        .store
+        .remove_after_terminal(row.job_id(), dispatcher)
+        .unwrap_err();
+    assert_terminal_unproven(error);
+    assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 1);
+}
+
+#[test]
+fn proven_preacceptance_abandonment_is_idempotent_and_can_be_retired() {
+    // Break caught: a verified pre-acceptance abandonment cannot be made
+    // durable before queue retirement, or retry changes its provenance.
+    let fixture = open_queue();
+    let dispatcher = owner(478);
+    let row = dispatching_batch(
+        &fixture.store,
+        "000000000000000000000000000000b3",
+        dispatcher,
+        481,
+    );
+
+    let marked = fixture
+        .store
+        .record_preacceptance_abandoned(row.job_id(), dispatcher)
+        .unwrap();
+    assert_eq!(marked.preacceptance_abandoned_by(), Some(&dispatcher));
+    assert_eq!(
+        fixture
+            .store
+            .record_preacceptance_abandoned(row.job_id(), dispatcher)
+            .unwrap(),
+        marked
+    );
+    assert_eq!(
+        fixture
+            .store
+            .remove_after_terminal(row.job_id(), dispatcher)
+            .unwrap()
+            .job_id(),
+        row.job_id()
+    );
+    assert!(fixture.store.queue_snapshot().unwrap().entries().is_empty());
+}
+
+#[test]
+fn preacceptance_abandonment_marker_is_canonical_strict_and_never_waiting() {
+    // Break caught: the queue-local proof accepts ambiguous extension fields,
+    // leaks application data, or can be planted onto a waiting row.
+    let fixture = open_queue();
+    let dispatcher = owner(479);
+    let row = dispatching_batch(
+        &fixture.store,
+        "000000000000000000000000000000b4",
+        dispatcher,
+        483,
+    );
+    fixture
+        .store
+        .record_preacceptance_abandoned(row.job_id(), dispatcher)
+        .unwrap();
+    let path = fixture.root.join("queue/state.json");
+    let text = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+    assert!(
+        text.contains(r#""preacceptance_abandoned_by":{"pid":479,"start_time_micros":4790007}"#)
+    );
+    for secret in [COMMAND_SECRET, PATH_SECRET, DIGEST, TOKEN_SECRET] {
+        assert!(!text.contains(secret), "abandonment proof leaked {secret}");
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value["entries"][0]["preacceptance_abandoned_by"]["unknown"] = serde_json::json!(true);
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.push(b'\n');
+    fs::write(path, bytes).unwrap();
+    assert!(fixture.store.queue_snapshot().is_err());
+
+    let waiting_fixture = open_queue();
+    waiting_fixture
+        .store
+        .enqueue(queued(
+            &waiting_fixture.store,
+            "000000000000000000000000000000b5",
+            485,
+            dispatcher,
+        ))
+        .unwrap();
+    let path = waiting_fixture.root.join("queue/state.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["entries"][0]["preacceptance_abandoned_by"] = serde_json::json!({
+        "pid": dispatcher.pid(),
+        "start_time_micros": dispatcher.start_time_micros()
+    });
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.push(b'\n');
+    fs::write(path, bytes).unwrap();
+    assert!(waiting_fixture.store.queue_snapshot().is_err());
+}
+
+#[test]
+fn dead_batch_recovery_retires_persisted_abandonment_instead_of_reclaiming_it() {
+    // Break caught: a crash after proof publication lets recovery revert the
+    // abandoned batch to Waiting and execute it again.
+    let fixture = open_queue_with_owner_inspector(FixedOwnerInspector {
+        observation: ProcessObservation::Absent,
+    });
+    let dispatcher = owner(480);
+    let row = dispatching_batch(
+        &fixture.store,
+        "000000000000000000000000000000b6",
+        dispatcher,
+        486,
+    );
+    fixture
+        .store
+        .inject_write_failure_once(ClientStateWritePoint::AfterPublish);
+    assert!(
+        fixture
+            .store
+            .record_preacceptance_abandoned(row.job_id(), dispatcher)
+            .is_err()
+    );
+
+    let reopened = ClientStateStore::open_with_owner_inspector(
+        &fixture.root,
+        FixedOwnerInspector {
+            observation: ProcessObservation::Absent,
+        },
+    )
+    .unwrap();
+    let persisted = reopened.queue_snapshot().unwrap();
+    assert_eq!(
+        persisted.entries()[0].preacceptance_abandoned_by(),
+        Some(&dispatcher)
+    );
+    assert_eq!(
+        reopened.recover_dead_dispatches().unwrap(),
+        vec![row.job_id()]
+    );
+    assert!(reopened.queue_snapshot().unwrap().entries().is_empty());
+    assert!(
+        reopened
+            .claim_next(dispatcher, &["mini-1".into()], 488)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn abandoned_task_turn_proof_survives_dispatch_adoption_until_retirement() {
+    // Break caught: task-turn reownership erases abandonment proof or reverts
+    // the row into runnable work after the original runner dies.
+    let fixture = open_queue_with_owner_inspector(FixedOwnerInspector {
+        observation: ProcessObservation::Absent,
+    });
+    let initial = owner(481);
+    let replacement = owner(482);
+    let task = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "000000000000000000000000000000b7",
+            489,
+            initial,
+            WorkerPreference::Automatic,
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run_reference("run-b7", 2)),
+        ))
+        .unwrap();
+    fixture
+        .store
+        .claim_next(initial, &["mini-1".into()], 490)
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .request_queue_cancel(task.job_id(), 491)
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .record_preacceptance_abandoned(task.job_id(), initial)
+        .unwrap();
+
+    assert!(fixture.store.recover_dead_dispatches().unwrap().is_empty());
+    let adopted = fixture.store.adopt_row(task.job_id(), replacement).unwrap();
+    assert_eq!(adopted.preacceptance_abandoned_by(), Some(&initial));
+    assert_eq!(adopted.cancel_requested_at_millis(), Some(491));
+    assert!(matches!(
+        adopted.state(),
+        QueueState::Dispatching {
+            dispatch_owner,
+            selected_worker,
+            claimed_at_millis,
+        } if *dispatch_owner == replacement
+            && selected_worker == "mini-1"
+            && *claimed_at_millis == 490
+    ));
+    assert!(
+        fixture
+            .store
+            .revert_dispatch(task.job_id(), replacement)
+            .is_err()
+    );
+    fixture
+        .store
+        .remove_after_terminal(task.job_id(), replacement)
+        .unwrap();
+    assert!(fixture.store.queue_snapshot().unwrap().entries().is_empty());
 }
 
 #[test]
@@ -1274,6 +1654,74 @@ fn terminal_remove_rejects_remote_uncertainty_even_with_a_terminal_status() {
 
         assert_terminal_unproven(error);
         assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 1);
+    }
+}
+
+#[test]
+fn terminal_remove_rejects_every_same_client_record_binding_mismatch() {
+    // Break caught: terminal status under the queue filename is treated as
+    // authority even when its embedded immutable identity names another job,
+    // worker, project, worktree, or command summary.
+    #[derive(Clone, Copy)]
+    enum Mismatch {
+        JobId,
+        Worker,
+        Project,
+        Worktree,
+        Command,
+    }
+
+    for (target_id, mismatch) in [
+        ("0000000000000000000000000000009d", Mismatch::JobId),
+        ("0000000000000000000000000000009e", Mismatch::Worker),
+        ("0000000000000000000000000000009f", Mismatch::Project),
+        ("000000000000000000000000000000a0", Mismatch::Worktree),
+        ("000000000000000000000000000000a1", Mismatch::Command),
+    ] {
+        let fixture = open_queue();
+        let dispatcher = owner(600);
+        let dispatching = dispatching_batch(&fixture.store, target_id, dispatcher, 600);
+        let embedded_job_id = match mismatch {
+            Mismatch::JobId => "000000000000000000000000000000b0".parse().unwrap(),
+            _ => dispatching.job_id(),
+        };
+        let worker = match mismatch {
+            Mismatch::Worker => "mini-2",
+            _ => "mini-1",
+        };
+        let project_id = match mismatch {
+            Mismatch::Project => OTHER_PROJECT_ID,
+            _ => PROJECT_ID,
+        };
+        let worktree_id = match mismatch {
+            Mismatch::Worktree => OTHER_WORKTREE_ID,
+            _ => WORKTREE_ID,
+        };
+        let command = match mismatch {
+            Mismatch::Command => CommandSpec::argv(vec!["tool".into()]).unwrap(),
+            _ => CommandSpec::argv(vec!["tool".into(), COMMAND_SECRET.into()]).unwrap(),
+        };
+        let record = local_record_with_binding(
+            &fixture.store,
+            embedded_job_id,
+            worker,
+            project_id,
+            worktree_id,
+            command,
+            Some(JobStatus::succeeded(602, 10, 20).unwrap()),
+            RemoteUncertainty::None,
+        );
+        install_local_record_as(&fixture, dispatching.job_id(), &record);
+
+        let error = fixture
+            .store
+            .remove_after_terminal(dispatching.job_id(), dispatcher)
+            .unwrap_err();
+
+        assert_terminal_unproven(error);
+        let snapshot = fixture.store.queue_snapshot().unwrap();
+        assert_eq!(snapshot.entries().len(), 1);
+        assert_eq!(snapshot.entries()[0].job_id(), dispatching.job_id());
     }
 }
 

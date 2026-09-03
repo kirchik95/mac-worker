@@ -570,6 +570,26 @@ impl ClientStateStore {
         })
     }
 
+    pub fn record_preacceptance_abandoned(
+        &self,
+        job_id: JobId,
+        dispatch_owner: ProcessIdentity,
+    ) -> Result<QueueEntry, WorkerError> {
+        dispatch_owner.validate()?;
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            let changed = entry
+                .record_preacceptance_abandoned(dispatch_owner)
+                .map_err(|_| {
+                    queue_error(
+                        "QUEUE_ABANDONMENT_CONFLICT",
+                        "queue abandonment proof does not match the dispatch reservation",
+                    )
+                })?;
+            Ok((entry.clone(), changed))
+        })
+    }
+
     pub fn request_queue_cancel(
         &self,
         job_id: JobId,
@@ -623,17 +643,16 @@ impl ClientStateStore {
                     "queue dispatch owner does not match",
                 ));
             }
-            let name = job_file_name(job_id)?;
-            let record = read_job_optional(self.inner.jobs.as_raw_fd(), &name)?
-                .ok_or_else(terminal_unproven)?;
-            self.require_local_client(&record)
-                .map_err(|_| terminal_unproven())?;
-            if !record
-                .last_status()
-                .is_some_and(|status| status.state().is_terminal())
-                || !matches!(record.remote_uncertainty(), RemoteUncertainty::None)
+            if snapshot.entries[index]
+                .preacceptance_abandoned_by()
+                .is_none()
             {
-                return Err(terminal_unproven());
+                let name = job_file_name(job_id)?;
+                let record = read_job_optional(self.inner.jobs.as_raw_fd(), &name)?
+                    .ok_or_else(terminal_unproven)?;
+                if !terminal_record_matches(&snapshot.entries[index], &record) {
+                    return Err(terminal_unproven());
+                }
             }
             Ok((snapshot.entries.remove(index), true))
         })
@@ -642,11 +661,16 @@ impl ClientStateStore {
     pub fn recover_dead_dispatches(&self) -> Result<Vec<JobId>, WorkerError> {
         self.update_queue(|snapshot| {
             let mut recovered = Vec::new();
-            for entry in &mut snapshot.entries {
-                if entry.kind() != QueueEntryKind::Batch {
+            let mut index = 0;
+            while index < snapshot.entries.len() {
+                if snapshot.entries[index].kind() != QueueEntryKind::Batch {
+                    index += 1;
                     continue;
                 }
-                let QueueState::Dispatching { dispatch_owner, .. } = entry.state() else {
+                let QueueState::Dispatching { dispatch_owner, .. } =
+                    snapshot.entries[index].state()
+                else {
+                    index += 1;
                     continue;
                 };
                 let dispatch_owner = *dispatch_owner;
@@ -654,9 +678,17 @@ impl ClientStateStore {
                     self.inner.owner_inspector.observe(dispatch_owner),
                     ProcessObservation::Absent | ProcessObservation::Reused
                 ) {
-                    entry.revert(dispatch_owner)?;
-                    recovered.push(entry.job_id());
+                    recovered.push(snapshot.entries[index].job_id());
+                    if snapshot.entries[index]
+                        .preacceptance_abandoned_by()
+                        .is_some()
+                    {
+                        snapshot.entries.remove(index);
+                        continue;
+                    }
+                    snapshot.entries[index].revert(dispatch_owner)?;
                 }
+                index += 1;
             }
             let changed = !recovered.is_empty();
             Ok((recovered, changed))
@@ -1751,6 +1783,26 @@ fn terminal_unproven() -> WorkerError {
         "QUEUE_TERMINAL_UNPROVEN",
         "queue row has no durable terminal or abandonment proof",
     )
+}
+
+fn terminal_record_matches(entry: &QueueEntry, record: &LocalJobRecord) -> bool {
+    let QueueState::Dispatching {
+        selected_worker, ..
+    } = entry.state()
+    else {
+        return false;
+    };
+    let meta = record.meta();
+    meta.job_id() == entry.job_id()
+        && meta.client_id() == entry.client_id()
+        && meta.worker_name() == selected_worker
+        && meta.project_id() == entry.project_id()
+        && meta.worktree_id() == entry.worktree_id()
+        && meta.command_summary() == entry.command_summary()
+        && record
+            .last_status()
+            .is_some_and(|status| status.state().is_terminal())
+        && matches!(record.remote_uncertainty(), RemoteUncertainty::None)
 }
 
 fn require_same_immutable(
