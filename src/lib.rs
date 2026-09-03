@@ -70,6 +70,7 @@ pub mod requirements;
 pub mod rooted_fs;
 pub mod run;
 pub mod scheduler;
+pub mod scheduler_adapter;
 pub mod snapshot;
 pub mod supervisor;
 pub mod task;

@@ -19,7 +19,8 @@ use mac_worker::{
     output::CommandOutput,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::{
-        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth, WorkersReport,
+        CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
+        WorkersReport,
     },
     transport::{ProbeClock, SshTransport, WorkersService},
 };
@@ -876,7 +877,7 @@ fn protocol_mismatch_is_reported_as_unavailable() {
 }
 
 #[test]
-fn protocol_two_missing_occupancy_is_invalid_not_a_version_mismatch() {
+fn protocol_two_missing_occupancy_is_an_explicit_version_mismatch() {
     let response = br#"{"protocol_version":2,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":0,"capabilities":[]}"#.to_vec();
     let health = SshTransport::new(RecordingRunner::returning_json(response)).probe(&worker(
         "mini-1",
@@ -884,8 +885,11 @@ fn protocol_two_missing_occupancy_is_invalid_not_a_version_mismatch() {
         &[],
     ));
 
-    assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
-    assert!(health.probe.is_none());
+    assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
+    assert_eq!(
+        health.probe.as_ref().map(|probe| probe.protocol_version),
+        Some(2)
+    );
 }
 
 #[test]
@@ -902,7 +906,7 @@ fn protocol_two_without_supervision_capability_is_an_explicit_version_mismatch()
         health
             .error_message
             .as_deref()
-            .is_some_and(|message| message.contains("supervision"))
+            .is_some_and(|message| message.contains("protocol version"))
     );
     assert_eq!(
         health.probe.as_ref().map(|probe| probe.supervision_version),
@@ -1177,6 +1181,13 @@ fn human_workers_output_includes_all_parsed_health_facts() {
                 total_disk_bytes: 1_073_741_824,
                 memory_pressure: MemoryPressure::Warn,
                 swap_used_bytes: Some(134_217_728),
+                available_memory_bytes: Some(12 * 1024 * 1024 * 1024),
+                cpu_counters: Some(CpuCounters {
+                    user_ticks: 10,
+                    system_ticks: 20,
+                    idle_ticks: 30,
+                    nice_ticks: 40,
+                }),
                 slot_state: SlotState::Busy,
                 active_lease: Some(LeaseSummary {
                     job_id: "00000000000000000000000000000001".parse().unwrap(),
@@ -1229,6 +1240,8 @@ fn human_unavailable_worker_keeps_error_missing_capabilities_and_unknown_swap_vi
                 total_disk_bytes: 1_073_741_824,
                 memory_pressure: MemoryPressure::Unknown,
                 swap_used_bytes: None,
+                available_memory_bytes: None,
+                cpu_counters: None,
                 slot_state: SlotState::Idle,
                 active_lease: None,
                 capabilities: vec!["darwin-arm64".into()],

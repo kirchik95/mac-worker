@@ -2296,6 +2296,13 @@ fn ready_probe() -> ProbeResponse {
         total_disk_bytes: 250 * 1024 * 1024 * 1024,
         memory_pressure: MemoryPressure::Normal,
         swap_used_bytes: Some(0),
+        available_memory_bytes: Some(12 * 1024 * 1024 * 1024),
+        cpu_counters: Some(mac_worker::protocol::CpuCounters {
+            user_ticks: 10,
+            system_ticks: 20,
+            idle_ticks: 30,
+            nice_ticks: 40,
+        }),
         slot_state: mac_worker::lease::SlotState::Idle,
         active_lease: None,
         capabilities: vec!["declared-capability".into(), "project-capability".into()],

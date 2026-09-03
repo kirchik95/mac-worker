@@ -481,7 +481,7 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
     }
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct ProtocolTwoWithoutSupervision {
+    struct ProbeWithoutSupervision {
         protocol_version: u32,
         hostname: String,
         arch: String,
@@ -490,20 +490,48 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
         total_disk_bytes: u64,
         memory_pressure: crate::protocol::MemoryPressure,
         swap_used_bytes: Option<u64>,
+        #[serde(default)]
+        available_memory_bytes: Option<u64>,
+        #[serde(default)]
+        cpu_counters: Option<crate::protocol::CpuCounters>,
         slot_state: crate::lease::SlotState,
         active_lease: Option<crate::lease::LeaseSummary>,
         capabilities: Vec<String>,
     }
 
     let version: VersionOnly = serde_json::from_str(response)?;
+    let without_supervision = |legacy: ProbeWithoutSupervision| ProbeResponse {
+        protocol_version: legacy.protocol_version,
+        supervision_version: 0,
+        hostname: legacy.hostname,
+        arch: legacy.arch,
+        os_version: legacy.os_version,
+        free_disk_bytes: legacy.free_disk_bytes,
+        total_disk_bytes: legacy.total_disk_bytes,
+        memory_pressure: legacy.memory_pressure,
+        swap_used_bytes: legacy.swap_used_bytes,
+        available_memory_bytes: legacy.available_memory_bytes,
+        cpu_counters: legacy.cpu_counters,
+        slot_state: legacy.slot_state,
+        active_lease: legacy.active_lease,
+        capabilities: legacy.capabilities,
+    };
     if version.protocol_version == PROTOCOL_VERSION {
         match serde_json::from_str(response) {
             Ok(probe) => Ok(probe),
             Err(full_error) => {
-                let legacy: ProtocolTwoWithoutSupervision = match serde_json::from_str(response) {
+                let legacy: ProbeWithoutSupervision = match serde_json::from_str(response) {
                     Ok(legacy) => legacy,
                     Err(_) => return Err(full_error),
                 };
+                Ok(without_supervision(legacy))
+            }
+        }
+    } else {
+        match serde_json::from_str(response) {
+            Ok(legacy) => Ok(without_supervision(legacy)),
+            Err(_) => {
+                let legacy: LegacyProbe = serde_json::from_str(response)?;
                 Ok(ProbeResponse {
                     protocol_version: legacy.protocol_version,
                     supervision_version: 0,
@@ -511,31 +539,17 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
                     arch: legacy.arch,
                     os_version: legacy.os_version,
                     free_disk_bytes: legacy.free_disk_bytes,
-                    total_disk_bytes: legacy.total_disk_bytes,
+                    total_disk_bytes: 0,
                     memory_pressure: legacy.memory_pressure,
                     swap_used_bytes: legacy.swap_used_bytes,
-                    slot_state: legacy.slot_state,
-                    active_lease: legacy.active_lease,
+                    available_memory_bytes: None,
+                    cpu_counters: None,
+                    slot_state: crate::lease::SlotState::Idle,
+                    active_lease: None,
                     capabilities: legacy.capabilities,
                 })
             }
         }
-    } else {
-        let legacy: LegacyProbe = serde_json::from_str(response)?;
-        Ok(ProbeResponse {
-            protocol_version: legacy.protocol_version,
-            supervision_version: 0,
-            hostname: legacy.hostname,
-            arch: legacy.arch,
-            os_version: legacy.os_version,
-            free_disk_bytes: legacy.free_disk_bytes,
-            total_disk_bytes: 0,
-            memory_pressure: legacy.memory_pressure,
-            swap_used_bytes: legacy.swap_used_bytes,
-            slot_state: crate::lease::SlotState::Idle,
-            active_lease: None,
-            capabilities: legacy.capabilities,
-        })
     }
 }
 

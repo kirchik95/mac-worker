@@ -13,7 +13,7 @@ use crate::{
     lease::{LeaseService, SlotState},
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
-    protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
+    protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
 };
 
 const CONTROLLED_HOST_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -96,6 +96,13 @@ unsafe extern "C" {
         new_value: *mut c_void,
         new_length: usize,
     ) -> c_int;
+    fn mach_host_self() -> u32;
+    fn host_statistics64(
+        host_priv: u32,
+        flavor: c_int,
+        host_info_out: *mut c_int,
+        host_info_out_count: *mut u32,
+    ) -> c_int;
 }
 
 impl MemoryPressureQuery for SystemMemoryPressureQuery {
@@ -163,6 +170,7 @@ impl ProbeCollector {
         let mut response = Self::collect_with(
             &SystemCommandExecutor::default(),
             &SystemMemoryPressureQuery,
+            collect_cpu_counters(),
             &search_paths,
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -179,6 +187,7 @@ impl ProbeCollector {
     fn collect_with(
         executor: &impl CommandExecutor,
         memory_pressure_query: &impl MemoryPressureQuery,
+        cpu_counters: Option<CpuCounters>,
         search_paths: &[PathBuf],
         os: &str,
         arch: &str,
@@ -200,6 +209,7 @@ impl ProbeCollector {
         let (free_disk_bytes, total_disk_bytes) = parse_disk_bytes(&disk)?;
         let memory_pressure = collect_memory_pressure(memory_pressure_query);
         let swap_used_bytes = collect_swap_used_bytes(executor);
+        let available_memory_bytes = collect_available_memory_bytes(executor);
         let capabilities = collect_capabilities(executor, search_paths, os, &arch);
 
         Ok(ProbeResponse {
@@ -212,6 +222,8 @@ impl ProbeCollector {
             total_disk_bytes,
             memory_pressure,
             swap_used_bytes,
+            available_memory_bytes,
+            cpu_counters,
             slot_state: SlotState::Idle,
             active_lease: None,
             capabilities,
@@ -349,6 +361,80 @@ fn collect_swap_used_bytes(executor: &impl CommandExecutor) -> Option<u64> {
     parse_byte_quantity(used)
 }
 
+fn collect_available_memory_bytes(executor: &impl CommandExecutor) -> Option<u64> {
+    let output = executor.output(Path::new("/usr/bin/vm_stat"), &[]).ok()?;
+    if output.code != Some(0) {
+        return None;
+    }
+    let output = String::from_utf8(output.stdout).ok()?;
+    parse_available_memory_bytes(&output)
+}
+
+fn parse_available_memory_bytes(output: &str) -> Option<u64> {
+    let page_size = output
+        .lines()
+        .next()?
+        .split("page size of ")
+        .nth(1)?
+        .split(" bytes")
+        .next()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    if page_size == 0 {
+        return None;
+    }
+
+    let page_count = |label: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(label))?
+            .trim()
+            .trim_end_matches('.')
+            .parse::<u64>()
+            .ok()
+    };
+    let pages = page_count("Pages free:")?.checked_add(page_count("Pages speculative:")?)?;
+    pages.checked_mul(page_size)
+}
+
+fn collect_cpu_counters() -> Option<CpuCounters> {
+    #[cfg(target_os = "macos")]
+    {
+        const HOST_CPU_LOAD_INFO: c_int = 3;
+        const HOST_CPU_LOAD_INFO_COUNT: u32 = 4;
+        let mut ticks = [0_u32; HOST_CPU_LOAD_INFO_COUNT as usize];
+        let mut count = HOST_CPU_LOAD_INFO_COUNT;
+        // SAFETY: `ticks` is a live buffer sized for HOST_CPU_LOAD_INFO and `count` describes
+        // that buffer for the duration of the macOS kernel call.
+        let status = unsafe {
+            host_statistics64(
+                mach_host_self(),
+                HOST_CPU_LOAD_INFO,
+                ticks.as_mut_ptr().cast(),
+                &raw mut count,
+            )
+        };
+        return cpu_counters_from_host_statistics(status, count, ticks);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+fn cpu_counters_from_host_statistics(
+    status: i32,
+    count: u32,
+    ticks: [u32; 4],
+) -> Option<CpuCounters> {
+    (status == 0 && count == 4).then(|| CpuCounters {
+        user_ticks: u64::from(ticks[0]),
+        system_ticks: u64::from(ticks[1]),
+        idle_ticks: u64::from(ticks[2]),
+        nice_ticks: u64::from(ticks[3]),
+    })
+}
+
 fn parse_byte_quantity(value: &str) -> Option<u64> {
     let (number, multiplier) = match value.as_bytes().last().copied()? {
         b'K' | b'k' => (&value[..value.len() - 1], 1024_f64),
@@ -470,7 +556,8 @@ mod tests {
 
     use super::{
         CommandExecutor, MemoryPressureQuery, ProbeCollector, ProcessOutput, SystemCommandExecutor,
-        collect_json, collect_memory_pressure,
+        collect_json, collect_memory_pressure, cpu_counters_from_host_statistics,
+        parse_available_memory_bytes,
     };
     use crate::{
         error::{ProcessError, ProcessStream, WorkerError},
@@ -478,6 +565,51 @@ mod tests {
         process::ProcessPolicy,
         protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     };
+
+    #[test]
+    fn vm_stat_available_memory_includes_free_and_speculative_pages() {
+        // Dropping speculative pages would understate scheduler-available memory.
+        let output = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free:                               1048576.\nPages speculative:                         524288.\n";
+
+        assert_eq!(
+            parse_available_memory_bytes(output),
+            Some(6 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn malformed_or_overflowing_vm_stat_is_unavailable_not_zero() {
+        // Returning zero for bad host data would fabricate a scheduler fact.
+        assert_eq!(parse_available_memory_bytes("Pages free: 1.\n"), None);
+        assert_eq!(
+            parse_available_memory_bytes(
+                "Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 18446744073709551615.\nPages speculative: 1.\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn host_cpu_statistics_requires_success_and_complete_tick_count() {
+        // Accepting a failed or truncated host_statistics64 response would fabricate CPU data.
+        assert_eq!(
+            cpu_counters_from_host_statistics(0, 4, [10, 20, 30, 40]).map(|counters| (
+                counters.user_ticks,
+                counters.system_ticks,
+                counters.idle_ticks,
+                counters.nice_ticks
+            )),
+            Some((10, 20, 30, 40))
+        );
+        assert_eq!(
+            cpu_counters_from_host_statistics(1, 4, [10, 20, 30, 40]),
+            None
+        );
+        assert_eq!(
+            cpu_counters_from_host_statistics(0, 3, [10, 20, 30, 40]),
+            None
+        );
+    }
 
     fn host_test_policy(stdout_limit: usize, deadline: Duration) -> ProcessPolicy {
         ProcessPolicy {
@@ -688,6 +820,7 @@ mod tests {
         let response = ProbeCollector::collect_with(
             &FixtureExecutor::default(),
             &FixtureMemoryPressureQuery::available(1),
+            None,
             &[directory.path().to_path_buf()],
             "macos",
             "aarch64",
@@ -706,6 +839,8 @@ mod tests {
                 total_disk_bytes: 1000 * 1024,
                 memory_pressure: MemoryPressure::Warn,
                 swap_used_bytes: Some(1_610_612_736),
+                available_memory_bytes: None,
+                cpu_counters: None,
                 slot_state: SlotState::Idle,
                 active_lease: None,
                 capabilities: vec!["darwin-arm64".into(), "git".into(), "python".into()],
@@ -728,6 +863,7 @@ mod tests {
         let response = ProbeCollector::collect_with(
             &executor,
             &FixtureMemoryPressureQuery::available(0),
+            None,
             &[directory.path().to_path_buf()],
             "macos",
             "arm64",
@@ -796,6 +932,7 @@ mod tests {
                 ..FixtureExecutor::default()
             },
             &FixtureMemoryPressureQuery::unavailable(),
+            None,
             &[],
             "macos",
             "arm64",
@@ -819,6 +956,7 @@ mod tests {
                     ..FixtureExecutor::default()
                 },
                 &FixtureMemoryPressureQuery::available(0),
+                None,
                 &[],
                 "macos",
                 "arm64",
@@ -834,6 +972,7 @@ mod tests {
         let error = ProbeCollector::collect_with(
             &FixtureExecutor::default(),
             &FixtureMemoryPressureQuery::available(0),
+            None,
             &[],
             "macos",
             "",

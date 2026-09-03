@@ -1,5 +1,14 @@
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const SUPERVISION_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CpuCounters {
+    pub user_ticks: u64,
+    pub system_ticks: u64,
+    pub idle_ticks: u64,
+    pub nice_ticks: u64,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +22,10 @@ pub struct ProbeResponse {
     pub total_disk_bytes: u64,
     pub memory_pressure: MemoryPressure,
     pub swap_used_bytes: Option<u64>,
+    #[serde(default)]
+    pub available_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub cpu_counters: Option<CpuCounters>,
     pub slot_state: crate::lease::SlotState,
     pub active_lease: Option<crate::lease::LeaseSummary>,
     pub capabilities: Vec<String>,
@@ -149,8 +162,9 @@ pub fn missing_capabilities(required: &[String], probe: &ProbeResponse) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::{
-        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
-        SetupHostResult, SetupReport, WorkerHealth, WorkersReport, missing_capabilities,
+        CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse,
+        SUPERVISION_VERSION, SetupHostResult, SetupReport, WorkerHealth, WorkersReport,
+        missing_capabilities,
     };
 
     impl ProbeResponse {
@@ -165,6 +179,13 @@ mod tests {
                 total_disk_bytes: 1024 * 1024 * 1024,
                 memory_pressure: MemoryPressure::Normal,
                 swap_used_bytes: Some(128 * 1024 * 1024),
+                available_memory_bytes: Some(512 * 1024 * 1024),
+                cpu_counters: Some(CpuCounters {
+                    user_ticks: 1,
+                    system_ticks: 2,
+                    idle_ticks: 3,
+                    nice_ticks: 4,
+                }),
                 slot_state: crate::lease::SlotState::Idle,
                 active_lease: None,
                 capabilities: vec!["darwin-arm64".into(), "git".into()],
@@ -187,6 +208,8 @@ mod tests {
         assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(value["supervision_version"], SUPERVISION_VERSION);
         assert_eq!(value["arch"], "arm64");
+        assert_eq!(value["available_memory_bytes"], 512 * 1024 * 1024);
+        assert_eq!(value["cpu_counters"]["idle_ticks"], 3);
     }
 
     #[test]
