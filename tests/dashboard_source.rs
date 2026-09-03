@@ -119,6 +119,31 @@ fn adapter_uses_authoritative_status_only_for_active_or_uncertain_local_records(
 }
 
 #[test]
+fn active_status_collection_uses_one_shrinking_deadline() {
+    let fixture = Fixture::new(ready_report(job_id(99)));
+    let first = fixture.record(1, Some(JobState::Accepted), RemoteUncertainty::None);
+    let second = fixture.record(2, Some(JobState::Running), RemoteUncertainty::None);
+    for record in [&first, &second] {
+        fixture.state.create_job(record.clone()).unwrap();
+        fixture.remote.set_status(
+            record.meta().job_id(),
+            RemoteReply::Status(Box::new(status_response(record, JobState::Running))),
+        );
+    }
+    fixture.remote.set_status_delay(Duration::from_millis(20));
+
+    let jobs = fixture
+        .source()
+        .authoritative_active_jobs(Duration::from_secs(1));
+
+    assert_eq!(jobs.len(), 2);
+    let deadlines = fixture.remote.status_deadlines();
+    assert_eq!(deadlines.len(), 2);
+    assert!(deadlines[0] <= Duration::from_secs(1));
+    assert!(deadlines[1] < deadlines[0]);
+}
+
+#[test]
 fn typed_remote_job_not_found_stays_bounded_and_does_not_expose_transport_text() {
     let fixture = Fixture::new(ready_report(job_id(99)));
     let record = fixture.record(1, Some(JobState::Accepted), RemoteUncertainty::None);
@@ -343,6 +368,8 @@ struct RecordingRemote {
     statuses: Mutex<HashMap<JobId, RemoteReply>>,
     log: Mutex<Option<LogChunk>>,
     status_calls: Mutex<Vec<JobId>>,
+    status_deadlines: Mutex<Vec<Duration>>,
+    status_delay: Mutex<Duration>,
     log_calls: Mutex<Vec<(JobId, LogStream, u64, u32)>>,
     mutating_calls: Mutex<Vec<&'static str>>,
 }
@@ -360,6 +387,14 @@ impl RecordingRemote {
         self.status_calls.lock().unwrap().clone()
     }
 
+    fn status_deadlines(&self) -> Vec<Duration> {
+        self.status_deadlines.lock().unwrap().clone()
+    }
+
+    fn set_status_delay(&self, delay: Duration) {
+        *self.status_delay.lock().unwrap() = delay;
+    }
+
     fn log_calls(&self) -> Vec<(JobId, LogStream, u64, u32)> {
         self.log_calls.lock().unwrap().clone()
     }
@@ -372,6 +407,7 @@ impl RecordingRemote {
 impl DashboardRemoteReader for RecordingRemote {
     fn status(&self, _worker: &WorkerEntry, job_id: JobId) -> Result<StatusResponse, WorkerError> {
         self.status_calls.lock().unwrap().push(job_id);
+        std::thread::sleep(*self.status_delay.lock().unwrap());
         match self.statuses.lock().unwrap().get(&job_id).cloned() {
             Some(RemoteReply::Status(response)) => Ok(*response),
             Some(RemoteReply::Protocol(message)) => Err(WorkerError::Protocol(message)),
@@ -379,6 +415,16 @@ impl DashboardRemoteReader for RecordingRemote {
                 "JOB_NOT_FOUND: missing fake response".into(),
             )),
         }
+    }
+
+    fn status_with_deadline(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+        deadline: Duration,
+    ) -> Result<StatusResponse, WorkerError> {
+        self.status_deadlines.lock().unwrap().push(deadline);
+        self.status(worker, job_id)
     }
 
     fn log_chunk(

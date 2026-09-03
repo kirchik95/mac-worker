@@ -1,6 +1,6 @@
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -29,6 +29,7 @@ use crate::{
 };
 
 const MAX_LOG_LIMIT: u32 = 65_536;
+const ACTIVE_JOB_COLLECTION_DEADLINE_EXCEEDED: &str = "ACTIVE_JOB_COLLECTION_DEADLINE_EXCEEDED";
 
 pub trait DashboardWorkerReader: Send + Sync + 'static {
     fn inspect(&self, config: &Config, deadline: Duration) -> WorkersReport;
@@ -36,6 +37,14 @@ pub trait DashboardWorkerReader: Send + Sync + 'static {
 
 pub trait DashboardRemoteReader: Send + Sync + 'static {
     fn status(&self, worker: &WorkerEntry, job_id: JobId) -> Result<StatusResponse, WorkerError>;
+    fn status_with_deadline(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+        _deadline: Duration,
+    ) -> Result<StatusResponse, WorkerError> {
+        self.status(worker, job_id)
+    }
     fn log_chunk(
         &self,
         worker: &WorkerEntry,
@@ -90,6 +99,15 @@ impl DashboardRemoteReader for SystemDashboardRemoteReader {
         RemoteJobClient::new(self.runner.as_ref()).status(worker, job_id)
     }
 
+    fn status_with_deadline(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+        deadline: Duration,
+    ) -> Result<StatusResponse, WorkerError> {
+        RemoteJobClient::new(self.runner.as_ref()).status_with_deadline(worker, job_id, deadline)
+    }
+
     fn log_chunk(
         &self,
         worker: &WorkerEntry,
@@ -142,11 +160,15 @@ impl MacWorkerDashboardSource {
         }
     }
 
-    fn authoritative_job(&self, record: &LocalJobRecord) -> Result<DashboardJob, DashboardError> {
+    fn authoritative_job(
+        &self,
+        record: &LocalJobRecord,
+        deadline: Duration,
+    ) -> Result<DashboardJob, DashboardError> {
         let worker = self.worker_for(record)?;
         let response = self
             .remote
-            .status(worker, record.meta().job_id())
+            .status_with_deadline(worker, record.meta().job_id(), deadline)
             .map_err(map_remote_error)?;
         project_authoritative_job(record, &response)
     }
@@ -202,16 +224,26 @@ impl DashboardDataSource for MacWorkerDashboardSource {
 
     fn authoritative_active_jobs(
         &self,
-        _deadline: Duration,
+        deadline: Duration,
     ) -> Vec<Result<DashboardJob, DashboardError>> {
         let records = match self.local_jobs.list_jobs() {
             Ok(records) => records,
             Err(error) => return vec![Err(map_local_error(error))],
         };
+        let started = Instant::now();
         records
             .iter()
             .filter(|record| should_query_authoritative_status(record))
-            .map(|record| self.authoritative_job(record))
+            .map(|record| {
+                let remaining = deadline.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(DashboardError::new(
+                        ACTIVE_JOB_COLLECTION_DEADLINE_EXCEEDED,
+                        "active-job collection budget expired before remote status collection",
+                    ));
+                }
+                self.authoritative_job(record, remaining)
+            })
             .collect()
     }
 
