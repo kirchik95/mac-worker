@@ -408,9 +408,15 @@ fn non_utf8_unexpected_job_entries_fail_listing_without_removal() {
     let bad_path = state.join("jobs").join(&bad_name);
     if let Err(error) = fs::write(&bad_path, b"{}\n") {
         // APFS rejects non-UTF-8 directory entry creation at the kernel
-        // boundary. On filesystems that can represent it, the assertion below
-        // exercises the store's independent fail-closed check.
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        // boundary, as EPERM on some macOS releases and EILSEQ on others. On
+        // filesystems that can represent it, the assertion below exercises
+        // the store's independent fail-closed check.
+        let rejected_by_kernel = error.kind() == std::io::ErrorKind::PermissionDenied
+            || error.raw_os_error() == Some(libc::EILSEQ);
+        assert!(
+            rejected_by_kernel,
+            "unexpected error creating non-UTF-8 entry: {error:?}"
+        );
         return;
     }
 
