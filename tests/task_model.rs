@@ -330,6 +330,30 @@ fn local_task_record_never_persists_the_transfer_alternates_path() {
 }
 
 #[test]
+fn local_task_record_never_persists_prompt_content() {
+    let secret = "token=planted-secret at /Users/alice/.ssh/id_ed25519";
+    let prompt = format!("Investigate the deployment failure\n\n{secret}");
+    let record = LocalTaskRecord::new(
+        TaskMeta::new(fields_with_prompt(prompt)).expect("fixture meta"),
+        sample_status(),
+        None,
+        None,
+        None,
+        REPO_ID.to_owned(),
+        None,
+        true,
+        None,
+    )
+    .expect("fixture record");
+
+    let canonical = String::from_utf8(record.canonical_bytes().unwrap()).unwrap();
+
+    assert!(!canonical.contains("\"prompt\""));
+    assert!(!canonical.contains(secret));
+    assert!(!canonical.contains("/Users/alice/.ssh/id_ed25519"));
+}
+
+#[test]
 fn titles_use_the_first_non_empty_prompt_line() {
     let meta = TaskMeta::new(fields_with_prompt(
         "\n\nFix the tab\tlogin spec\nDetails".into(),

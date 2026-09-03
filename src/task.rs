@@ -172,6 +172,15 @@ impl TaskTitle {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    fn validate(&self) -> Result<(), WorkerError> {
+        if self.0.len() > MAX_TITLE_BYTES || self.0.chars().any(char::is_control) {
+            return Err(task_config(format!(
+                "task title exceeds {MAX_TITLE_BYTES} bytes or contains a control character"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,12 +433,12 @@ pub struct TaskMeta {
     env_profile: Option<String>,
     git_identity: GitIdentity,
     title: TaskTitle,
-    prompt: String,
     created_at_millis: u64,
 }
 
 impl TaskMeta {
     pub fn new(input: TaskMetaInput) -> Result<Self, WorkerError> {
+        validate_prompt(&input.prompt)?;
         let title = title_from_prompt(&input.prompt);
         let meta = Self {
             task_id: input.task_id,
@@ -448,7 +457,6 @@ impl TaskMeta {
             env_profile: input.env_profile,
             git_identity: input.git_identity,
             title,
-            prompt: input.prompt,
             created_at_millis: input.created_at_millis,
         };
         meta.validate()?;
@@ -457,10 +465,6 @@ impl TaskMeta {
 
     pub fn title(&self) -> &TaskTitle {
         &self.title
-    }
-
-    pub fn prompt(&self) -> &str {
-        &self.prompt
     }
 
     pub fn task_id(&self) -> TaskId {
@@ -509,11 +513,7 @@ impl TaskMeta {
     fn validate(&self) -> Result<(), WorkerError> {
         validate_hex_component(&self.project_id, "project ID")?;
         validate_hex_component(&self.worktree_id, "worktree ID")?;
-        if self.prompt.len() > MAX_PROMPT_BYTES {
-            return Err(task_config(format!(
-                "prompt exceeds {MAX_PROMPT_BYTES} bytes"
-            )));
-        }
+        self.title.validate()?;
         if let Some(model) = &self.model {
             validate_optional_text(model, MAX_IDENTITY_BYTES, "model")?;
         }
@@ -543,7 +543,7 @@ impl TaskMeta {
 impl Serialize for TaskMeta {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("TaskMeta", 18)?;
+        let mut record = serializer.serialize_struct("TaskMeta", 17)?;
         record.serialize_field("task_id", &self.task_id)?;
         record.serialize_field("run_id", &self.run_id)?;
         record.serialize_field("project_id", &self.project_id)?;
@@ -560,7 +560,6 @@ impl Serialize for TaskMeta {
         record.serialize_field("env_profile", &self.env_profile)?;
         record.serialize_field("git_identity", &self.git_identity)?;
         record.serialize_field("title", &self.title)?;
-        record.serialize_field("prompt", &self.prompt)?;
         record.serialize_field("created_at_millis", &self.created_at_millis)?;
         record.end()
     }
@@ -587,11 +586,10 @@ impl<'de> Deserialize<'de> for TaskMeta {
             env_profile: Option<String>,
             git_identity: GitIdentity,
             title: TaskTitle,
-            prompt: String,
             created_at_millis: u64,
         }
         let wire: Wire = deserialize_unique_object(deserializer)?;
-        let meta = TaskMeta::new(TaskMetaInput {
+        let meta = TaskMeta {
             task_id: wire.task_id,
             run_id: wire.run_id,
             project_id: wire.project_id,
@@ -607,13 +605,10 @@ impl<'de> Deserialize<'de> for TaskMeta {
             close_policy: wire.close_policy,
             env_profile: wire.env_profile,
             git_identity: wire.git_identity,
-            prompt: wire.prompt,
+            title: wire.title,
             created_at_millis: wire.created_at_millis,
-        })
-        .map_err(de::Error::custom)?;
-        if meta.title != wire.title {
-            return Err(de::Error::custom("task title does not match the prompt"));
-        }
+        };
+        meta.validate().map_err(de::Error::custom)?;
         Ok(meta)
     }
 }
@@ -1302,6 +1297,15 @@ fn title_from_prompt(prompt: &str) -> TaskTitle {
         .find(|line| !line.trim().is_empty())
         .unwrap_or("");
     TaskTitle(truncate_bytes(&escape_controls(line), MAX_TITLE_BYTES))
+}
+
+fn validate_prompt(prompt: &str) -> Result<(), WorkerError> {
+    if prompt.len() > MAX_PROMPT_BYTES {
+        return Err(task_config(format!(
+            "prompt exceeds {MAX_PROMPT_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn escape_controls(input: &str) -> String {
