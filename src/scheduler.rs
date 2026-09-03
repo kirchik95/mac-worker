@@ -58,8 +58,24 @@ impl CandidateObservation {
         &self.worker_name
     }
 
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
+
+    pub fn slot(&self) -> CandidateSlot {
+        self.slot
+    }
+
+    pub fn capabilities(&self) -> &[String] {
+        &self.capabilities
+    }
+
     pub fn available_memory_bytes(&self) -> Option<u64> {
         self.available_memory_bytes
+    }
+
+    pub fn free_disk_bytes(&self) -> u64 {
+        self.free_disk_bytes
     }
 }
 

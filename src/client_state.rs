@@ -693,14 +693,33 @@ impl ClientStateStore {
                     self.inner.owner_inspector.observe(dispatch_owner),
                     ProcessObservation::Absent | ProcessObservation::Reused
                 ) {
-                    recovered.push(snapshot.entries[index].job_id());
+                    let job_id = snapshot.entries[index].job_id();
                     if snapshot.entries[index]
                         .preacceptance_abandonment_proof()
                         .is_some()
                     {
+                        recovered.push(job_id);
                         snapshot.entries.remove(index);
                         continue;
                     }
+                    let name = job_file_name(job_id)?;
+                    if let Some(record) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? {
+                        self.require_local_client(&record)?;
+                        if terminal_record_matches(&snapshot.entries[index], &record) {
+                            recovered.push(job_id);
+                            snapshot.entries.remove(index);
+                            continue;
+                        }
+                        if !local_record_matches_queue_entry(&snapshot.entries[index], &record) {
+                            return Err(queue_error(
+                                "QUEUE_JOB_RECORD_MISMATCH",
+                                "local job metadata does not match its queue row",
+                            ));
+                        }
+                        index += 1;
+                        continue;
+                    }
+                    recovered.push(job_id);
                     snapshot.entries[index].revert(dispatch_owner)?;
                 }
                 index += 1;

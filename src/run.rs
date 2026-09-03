@@ -1,4 +1,6 @@
 use std::{
+    cell::Cell,
+    collections::HashSet,
     io::Write,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -15,11 +17,11 @@ use crate::{
     error::WorkerError,
     inputs::RelativePath,
     job::{
-        CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus, JsonEvent,
-        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LocalJobRecord,
-        LogChunk, LogCursor, LogStream, PreacceptanceDisposition, RemoteUncertainty,
-        RequestFingerprintMaterial, ResolveOrAbandonRequest, StatusResponse, SubmitRequest,
-        SubmitResponse, TerminalLogDrain,
+        AdmissionObservation, CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus,
+        JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
+        LocalJobRecord, LogChunk, LogCursor, LogStream, PreacceptanceDisposition, ProcessIdentity,
+        QueueEntry, QueueEntryKind, RemoteUncertainty, RequestFingerprintMaterial,
+        ResolveOrAbandonRequest, StatusResponse, SubmitRequest, SubmitResponse, TerminalLogDrain,
     },
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRunner},
@@ -30,6 +32,11 @@ use crate::{
     },
     protocol::PROTOCOL_VERSION,
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
+    scheduler::{
+        AffinityHints, CandidateObservation, SchedulerPolicy, Selection, WorkerPreference,
+    },
+    scheduler_adapter::SchedulerProbeAdapter,
+    supervisor::SystemProcessInspector,
     transfer::{
         HostOperation, RemoteJobClient, ResolutionRuntime, RsyncTransport, SshJsonTransport,
         TransferIdentity,
@@ -43,7 +50,8 @@ pub const STATUS_REFRESH_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequest {
-    pub worker: String,
+    pub preference: WorkerPreference,
+    pub wait_for_capacity: bool,
     pub project: PathBuf,
     pub cli_includes: Vec<String>,
     pub timeout: Option<Duration>,
@@ -153,7 +161,10 @@ pub trait JobFollower {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStage {
     InitialProjectInspection,
-    ExplicitWorkerProbe,
+    AdmissionObservation,
+    QueueEnqueue,
+    DeadDispatchRecovery,
+    QueueClaim,
     StableProjectReload,
     SnapshotSelectionAndCapture,
     LocalRecordPublication,
@@ -163,6 +174,7 @@ pub enum RunStage {
     JobSubmission,
     AcceptedOutputFlush,
     JobFollower,
+    QueueTerminalRemoval,
     SnapshotCleanup,
 }
 
@@ -180,6 +192,31 @@ impl RunObserver for NoopRunObserver {
 }
 
 static NOOP_RUN_OBSERVER: NoopRunObserver = NoopRunObserver;
+
+#[doc(hidden)]
+pub trait SchedulerRuntime: Send + Sync {
+    fn now_millis(&self) -> Result<u64, WorkerError>;
+    fn process_identity(&self) -> Result<ProcessIdentity, WorkerError>;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemSchedulerRuntime;
+
+impl SchedulerRuntime for SystemSchedulerRuntime {
+    fn now_millis(&self) -> Result<u64, WorkerError> {
+        current_time_millis()
+    }
+
+    fn process_identity(&self) -> Result<ProcessIdentity, WorkerError> {
+        SystemProcessInspector.identity_for_pid(std::process::id())
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+static SYSTEM_SCHEDULER_RUNTIME: SystemSchedulerRuntime = SystemSchedulerRuntime;
 
 const LOG_CHUNK_LIMIT: u32 = 65_536;
 const FOLLOW_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -211,6 +248,25 @@ pub struct RunService<'a> {
     follower: &'a dyn JobFollower,
     resolution_runtime: Option<&'a dyn ResolutionRuntime>,
     observer: &'a dyn RunObserver,
+    scheduler_runtime: &'a dyn SchedulerRuntime,
+}
+
+#[derive(Clone, Copy)]
+struct RunIdentity {
+    job_id: JobId,
+    lease_token: LeaseToken,
+    created_at_millis: u64,
+    dispatch_owner: ProcessIdentity,
+}
+
+struct AdmissionRound {
+    observations: Vec<CandidateObservation>,
+    refreshed_ready: HashSet<String>,
+}
+
+struct ClaimedRun {
+    identity: RunIdentity,
+    worker: WorkerEntry,
 }
 
 impl<'a> RunService<'a> {
@@ -230,6 +286,7 @@ impl<'a> RunService<'a> {
             follower,
             resolution_runtime: None,
             observer: &NOOP_RUN_OBSERVER,
+            scheduler_runtime: &SYSTEM_SCHEDULER_RUNTIME,
         }
     }
 
@@ -250,12 +307,19 @@ impl<'a> RunService<'a> {
             follower,
             resolution_runtime: Some(resolution_runtime),
             observer: &NOOP_RUN_OBSERVER,
+            scheduler_runtime: &SYSTEM_SCHEDULER_RUNTIME,
         }
     }
 
     #[doc(hidden)]
     pub fn with_observer(mut self, observer: &'a dyn RunObserver) -> Self {
         self.observer = observer;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_scheduler_runtime(mut self, runtime: &'a dyn SchedulerRuntime) -> Self {
+        self.scheduler_runtime = runtime;
         self
     }
 
@@ -277,17 +341,62 @@ impl<'a> RunService<'a> {
             });
         }
 
-        let worker = self
-            .config
-            .worker(&request.worker)
-            .ok_or_else(|| {
-                WorkerError::Config("WORKER_NOT_FOUND: worker is not configured".into())
-            })?
-            .clone();
-        self.require_eligible_worker(&worker, &initial.requirements)?;
-        self.observer.observe(RunStage::ExplicitWorkerProbe)?;
+        self.validate_preference(&request.preference)?;
+        let first_observed_at = self.scheduler_runtime.now_millis()?;
+        let first_round = self.observe_admission(&request.preference, first_observed_at)?;
+        self.observer.observe(RunStage::AdmissionObservation)?;
+        let affinity = self
+            .client_state
+            .affinity_hints(&initial.context.project_id, &initial.context.worktree_id)?;
+        if !request.wait_for_capacity
+            && matches!(
+                SchedulerPolicy::select(
+                    &first_round.observations,
+                    &initial.requirements,
+                    &request.preference,
+                    &affinity,
+                ),
+                Selection::NoEligible { .. }
+            )
+        {
+            return Err(capacity_busy());
+        }
 
-        let prepared = ProjectState::prepare_observed(
+        let identity = RunIdentity {
+            job_id: JobId::generate(),
+            lease_token: LeaseToken::generate(),
+            created_at_millis: self.scheduler_runtime.now_millis()?,
+            dispatch_owner: self.scheduler_runtime.process_identity()?,
+        };
+        let queue_entry = QueueEntry::new(
+            identity.job_id,
+            self.client_state.client_id(),
+            initial.context.project_id.clone(),
+            initial.context.worktree_id.clone(),
+            request.command.summary()?,
+            initial.requirements.clone(),
+            request.preference.clone(),
+            QueueEntryKind::Batch,
+            None,
+            identity.dispatch_owner,
+            identity.created_at_millis,
+        )?;
+        self.client_state.enqueue(queue_entry)?;
+        if let Err(error) = self.observer.observe(RunStage::QueueEnqueue) {
+            self.client_state.remove_queued(identity.job_id)?;
+            return Err(error);
+        }
+        if let Err(error) = self.client_state.recover_dead_dispatches() {
+            self.client_state.remove_queued(identity.job_id)?;
+            return Err(error);
+        }
+        if let Err(error) = self.observer.observe(RunStage::DeadDispatchRecovery) {
+            self.client_state.remove_queued(identity.job_id)?;
+            return Err(error);
+        }
+        let claimed = self.claim_worker(&request, &initial, identity, first_round)?;
+
+        let prepared = match ProjectState::prepare_observed(
             self.runner,
             &self.paths.cache,
             ProjectPreparationRequest {
@@ -304,10 +413,16 @@ impl<'a> RunService<'a> {
                     ProjectPreparationStage::SnapshotCleanup => RunStage::SnapshotCleanup,
                 })
             },
-        )
-        .map_err(project_preparation_error)?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.client_state
+                    .revert_dispatch(claimed.identity.job_id, claimed.identity.dispatch_owner)?;
+                return Err(project_preparation_error(error));
+            }
+        };
 
-        let primary = self.submit_prepared(request, worker, &prepared, json, stdout, stderr);
+        let primary = self.submit_prepared(request, claimed, &prepared, json, stdout, stderr);
         match prepared.cleanup_observed(&|stage| {
             debug_assert_eq!(stage, ProjectPreparationStage::SnapshotCleanup);
             self.observer.observe(RunStage::SnapshotCleanup)
@@ -317,92 +432,247 @@ impl<'a> RunService<'a> {
         }
     }
 
-    fn require_eligible_worker(
-        &self,
-        worker: &WorkerEntry,
-        project_requirements: &[String],
-    ) -> Result<(), WorkerError> {
-        let one_worker = Config {
-            version: self.config.version,
-            workers: vec![worker.clone()],
-        };
-        let report = WorkersService::new(SshTransport::new(self.runner))
-            .inspect_with_requirements(&one_worker, project_requirements);
-        let health = report
-            .workers
-            .into_iter()
-            .next()
-            .expect("one explicit worker produces one health result");
-        if !matches!(health.status, crate::protocol::HealthStatus::Ready)
-            || health.probe.is_none()
-            || !health.missing_capabilities.is_empty()
+    fn validate_preference(&self, preference: &WorkerPreference) -> Result<(), WorkerError> {
+        if let WorkerPreference::Pinned { worker } = preference
+            && self.config.worker(worker).is_none()
         {
-            let code = health
-                .error_code
-                .unwrap_or_else(|| "WORKER_UNAVAILABLE".into());
-            return Err(WorkerError::Unavailable(format!(
-                "{code}: explicit worker is not ready"
-            )));
-        }
-        let probe = health
-            .probe
-            .expect("ready worker health contains its validated probe");
-        if probe.slot_state != crate::lease::SlotState::Idle {
-            return Err(WorkerError::Capacity {
-                code: "CAPACITY_BUSY",
-                message: "the explicit worker heavy slot is busy".into(),
-            });
+            return Err(WorkerError::Config(
+                "WORKER_NOT_FOUND: worker is not configured".into(),
+            ));
         }
         Ok(())
+    }
+
+    fn observe_admission(
+        &self,
+        preference: &WorkerPreference,
+        observed_at_millis: u64,
+    ) -> Result<AdmissionRound, WorkerError> {
+        let mut observations = Vec::new();
+        let mut refreshed_ready = HashSet::new();
+        for worker in self
+            .config
+            .workers
+            .iter()
+            .filter(|worker| match preference {
+                WorkerPreference::Automatic => true,
+                WorkerPreference::Pinned { worker: pinned } => worker.name == *pinned,
+            })
+        {
+            let refreshed = Cell::new(false);
+            let cached = self.client_state.admission_observation(
+                &worker.name,
+                observed_at_millis,
+                || {
+                    refreshed.set(true);
+                    let one_worker = Config {
+                        version: self.config.version,
+                        workers: vec![worker.clone()],
+                    };
+                    let report =
+                        WorkersService::new(SshTransport::new(self.runner)).inspect(&one_worker);
+                    let candidate =
+                        SchedulerProbeAdapter::observations(&one_worker, &report.workers)?
+                            .into_iter()
+                            .next()
+                            .expect("one configured worker produces one scheduler observation");
+                    admission_from_candidate(candidate, observed_at_millis)
+                },
+            )?;
+            let candidate = candidate_from_admission(cached.observation())?;
+            if refreshed.get() && candidate.ready() {
+                refreshed_ready.insert(worker.name.clone());
+            }
+            observations.push(candidate);
+        }
+        Ok(AdmissionRound {
+            observations,
+            refreshed_ready,
+        })
+    }
+
+    fn claim_worker(
+        &self,
+        request: &RunRequest,
+        initial: &ProjectState,
+        identity: RunIdentity,
+        mut round: AdmissionRound,
+    ) -> Result<ClaimedRun, WorkerError> {
+        loop {
+            let affinity = match self
+                .client_state
+                .affinity_hints(&initial.context.project_id, &initial.context.worktree_id)
+            {
+                Ok(affinity) => affinity,
+                Err(error) => {
+                    self.client_state.remove_queued(identity.job_id)?;
+                    return Err(error);
+                }
+            };
+            let ranked_workers = ranked_worker_names(
+                &round.observations,
+                &initial.requirements,
+                &request.preference,
+                &affinity,
+            );
+            let claimed_at_millis = match self.scheduler_runtime.now_millis() {
+                Ok(now) => now,
+                Err(error) => {
+                    self.client_state.remove_queued(identity.job_id)?;
+                    return Err(error);
+                }
+            };
+            let claim = match self.client_state.claim_next(
+                identity.dispatch_owner,
+                &ranked_workers,
+                claimed_at_millis,
+            ) {
+                Ok(claim) => claim,
+                Err(error) => {
+                    self.client_state.remove_queued(identity.job_id)?;
+                    return Err(error);
+                }
+            };
+            if let Some(claim) = claim {
+                if claim.entry().job_id() != identity.job_id {
+                    self.client_state
+                        .revert_dispatch(claim.entry().job_id(), identity.dispatch_owner)?;
+                    self.client_state.remove_queued(identity.job_id)?;
+                    return Err(WorkerError::Queue {
+                        code: "QUEUE_CLAIM_CONFLICT",
+                        message: "scheduler claimed a different queue row".into(),
+                    });
+                }
+                let selected_worker = match claim.entry().state() {
+                    crate::job::QueueState::Dispatching {
+                        selected_worker, ..
+                    } => selected_worker.clone(),
+                    crate::job::QueueState::Waiting { .. } => {
+                        unreachable!("a successful queue claim is durably dispatching")
+                    }
+                };
+                if let Err(error) = self.observer.observe(RunStage::QueueClaim) {
+                    self.client_state
+                        .revert_dispatch(identity.job_id, identity.dispatch_owner)?;
+                    return Err(error);
+                }
+                if round.refreshed_ready.contains(&selected_worker)
+                    && let Err(error) = self.client_state.record_affinity(
+                        &initial.context.project_id,
+                        &initial.context.worktree_id,
+                        &selected_worker,
+                        claimed_at_millis,
+                    )
+                {
+                    self.client_state
+                        .revert_dispatch(identity.job_id, identity.dispatch_owner)?;
+                    return Err(error);
+                }
+                return match self.config.worker(&selected_worker) {
+                    Some(worker) => Ok(ClaimedRun {
+                        identity,
+                        worker: worker.clone(),
+                    }),
+                    None => {
+                        self.client_state
+                            .revert_dispatch(identity.job_id, identity.dispatch_owner)?;
+                        Err(WorkerError::Config(
+                            "WORKER_NOT_FOUND: worker is not configured".into(),
+                        ))
+                    }
+                };
+            }
+
+            if !request.wait_for_capacity {
+                self.client_state.remove_queued(identity.job_id)?;
+                return Err(capacity_busy());
+            }
+            self.scheduler_runtime.sleep(Duration::from_secs(1));
+            let observed_at_millis = match self.scheduler_runtime.now_millis() {
+                Ok(now) => now,
+                Err(error) => {
+                    self.client_state.remove_queued(identity.job_id)?;
+                    return Err(error);
+                }
+            };
+            round = match self.observe_admission(&request.preference, observed_at_millis) {
+                Ok(round) => round,
+                Err(error) => {
+                    self.client_state.remove_queued(identity.job_id)?;
+                    return Err(error);
+                }
+            };
+        }
     }
 
     fn submit_prepared(
         &self,
         request: RunRequest,
-        worker: WorkerEntry,
+        claimed: ClaimedRun,
         prepared: &PreparedProject,
         json: bool,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<RunCompletion, WorkerError> {
-        let timeout = request.timeout.unwrap_or(prepared.state.settings.timeout);
-        let timeout_millis = u64::try_from(timeout.as_millis()).map_err(|_| {
-            WorkerError::Config("run timeout is outside the supported range".into())
-        })?;
-        let resource_class = match prepared.state.settings.resource_class {
-            ResourceClass::Heavy => "heavy",
+        let ClaimedRun { identity, worker } = claimed;
+        let local = (|| {
+            let timeout = request.timeout.unwrap_or(prepared.state.settings.timeout);
+            let timeout_millis = u64::try_from(timeout.as_millis()).map_err(|_| {
+                WorkerError::Config("run timeout is outside the supported range".into())
+            })?;
+            let resource_class = match prepared.state.settings.resource_class {
+                ResourceClass::Heavy => "heavy",
+            };
+            let material = RequestFingerprintMaterial::new(
+                identity.job_id,
+                self.client_state.client_id(),
+                identity.lease_token,
+                identity.created_at_millis,
+                worker.name.clone(),
+                prepared.state.context.project_id.clone(),
+                prepared.state.context.worktree_id.clone(),
+                prepared.snapshot.digest.clone(),
+                prepared.snapshot.manifest.relative_working_dir.clone(),
+                timeout_millis,
+                resource_class.into(),
+                request.command,
+            )?;
+            let record = LocalJobRecord::new(
+                JobMeta::new(&material, material.fingerprint())?,
+                material.lease_token(),
+                None,
+                RemoteUncertainty::None,
+            )?;
+            let acquire = LeaseAcquireRequest::new(material.clone());
+            let transfer_identity = TransferIdentity::from_acquire_request(&acquire)?;
+            let verify = SnapshotVerifyRequest::new(
+                material.job_id(),
+                material.client_id(),
+                material.lease_token(),
+                material.fingerprint(),
+                material.project_id().into(),
+                material.worktree_id().into(),
+                material.manifest_digest().into(),
+            )?;
+            let submit = SubmitRequest::new(material.clone());
+            self.client_state.create_job(record.clone())?;
+            self.observer.observe(RunStage::LocalRecordPublication)?;
+            Ok::<_, WorkerError>((material, record, acquire, transfer_identity, verify, submit))
+        })();
+        let (material, record, acquire, transfer_identity, verify, submit) = match local {
+            Ok(local) => local,
+            Err(error) => {
+                self.client_state
+                    .revert_dispatch(identity.job_id, identity.dispatch_owner)?;
+                return Err(error);
+            }
         };
-        let created_at_millis = current_time_millis()?;
-        let material = RequestFingerprintMaterial::new(
-            JobId::generate(),
-            self.client_state.client_id(),
-            LeaseToken::generate(),
-            created_at_millis,
-            worker.name.clone(),
-            prepared.state.context.project_id.clone(),
-            prepared.state.context.worktree_id.clone(),
-            prepared.snapshot.digest.clone(),
-            prepared.snapshot.manifest.relative_working_dir.clone(),
-            timeout_millis,
-            resource_class.into(),
-            request.command,
-        )?;
-        let fingerprint = material.fingerprint();
-        let record = LocalJobRecord::new(
-            JobMeta::new(&material, fingerprint)?,
-            material.lease_token(),
-            None,
-            RemoteUncertainty::None,
-        )?;
-        self.client_state.create_job(record.clone())?;
-        self.observer.observe(RunStage::LocalRecordPublication)?;
 
         let transport = SshJsonTransport::new(self.runner);
         let remote = match self.resolution_runtime {
             Some(runtime) => RemoteJobClient::new_with_runtime(self.runner, runtime),
             None => RemoteJobClient::new(self.runner),
         };
-        let acquire = LeaseAcquireRequest::new(material.clone());
         let acquire_result: Result<LeaseAcquireResponse, WorkerError> = transport.request(
             &worker,
             HostOperation::LeaseAcquire,
@@ -414,34 +684,40 @@ impl<'a> RunService<'a> {
             Ok(LeaseAcquireResponse::ExistingAccepted { .. }) => {
                 match remote.status(&worker, material.job_id()) {
                     Ok(status) => status,
-                    Err(error) => {
-                        self.resolve_after_acceptance_evidence(&remote, &worker, &record, error)?
-                    }
+                    Err(error) => self.resolve_after_acceptance_evidence(
+                        &remote,
+                        &worker,
+                        &record,
+                        identity.dispatch_owner,
+                        error,
+                    )?,
                 }
             }
             Ok(LeaseAcquireResponse::Acquired { lease }) => {
                 if let Err(error) = require_exact_lease(&material, &lease) {
-                    self.resolve_after_error(&remote, &worker, &record, error)?
+                    self.resolve_after_error(
+                        &remote,
+                        &worker,
+                        &record,
+                        identity.dispatch_owner,
+                        error,
+                    )?
                 } else {
                     self.observer.observe(RunStage::LeaseAcquire)?;
-                    let identity = TransferIdentity::from_acquire_request(&acquire)?;
                     if let Err(error) = RsyncTransport::new(self.runner).upload(
                         &worker,
                         &prepared.snapshot,
-                        &identity,
+                        &transfer_identity,
                     ) {
-                        self.resolve_after_error(&remote, &worker, &record, error)?
+                        self.resolve_after_error(
+                            &remote,
+                            &worker,
+                            &record,
+                            identity.dispatch_owner,
+                            error,
+                        )?
                     } else {
                         self.observer.observe(RunStage::SnapshotUpload)?;
-                        let verify = SnapshotVerifyRequest::new(
-                            material.job_id(),
-                            material.client_id(),
-                            material.lease_token(),
-                            material.fingerprint(),
-                            material.project_id().into(),
-                            material.worktree_id().into(),
-                            material.manifest_digest().into(),
-                        )?;
                         let verified: Result<VerifiedSnapshotResponse, WorkerError> = transport
                             .request(
                                 &worker,
@@ -450,16 +726,25 @@ impl<'a> RunService<'a> {
                                 control_policy(),
                             );
                         match verified {
-                            Err(error) => {
-                                self.resolve_after_error(&remote, &worker, &record, error)?
-                            }
+                            Err(error) => self.resolve_after_error(
+                                &remote,
+                                &worker,
+                                &record,
+                                identity.dispatch_owner,
+                                error,
+                            )?,
                             Ok(response) => {
                                 if let Err(error) = require_exact_verification(&material, &response)
                                 {
-                                    self.resolve_after_error(&remote, &worker, &record, error)?
+                                    self.resolve_after_error(
+                                        &remote,
+                                        &worker,
+                                        &record,
+                                        identity.dispatch_owner,
+                                        error,
+                                    )?
                                 } else {
                                     self.observer.observe(RunStage::SnapshotVerification)?;
-                                    let submit = SubmitRequest::new(material.clone());
                                     let raw: Result<SubmitResponse, WorkerError> = transport
                                         .request(
                                             &worker,
@@ -480,18 +765,30 @@ impl<'a> RunService<'a> {
                                                         Ok(response) => response,
                                                         Err(error) => self
                                                             .resolve_after_acceptance_evidence(
-                                                                &remote, &worker, &record, error,
+                                                                &remote,
+                                                                &worker,
+                                                                &record,
+                                                                identity.dispatch_owner,
+                                                                error,
                                                             )?,
                                                     }
                                                 }
                                                 Err(error) => self
                                                     .resolve_after_acceptance_evidence(
-                                                        &remote, &worker, &record, error,
+                                                        &remote,
+                                                        &worker,
+                                                        &record,
+                                                        identity.dispatch_owner,
+                                                        error,
                                                     )?,
                                             }
                                         }
                                         Err(error) => self.resolve_after_error(
-                                            &remote, &worker, &record, error,
+                                            &remote,
+                                            &worker,
+                                            &record,
+                                            identity.dispatch_owner,
+                                            error,
                                         )?,
                                     }
                                 }
@@ -500,14 +797,26 @@ impl<'a> RunService<'a> {
                     }
                 }
             }
-            Err(error) => self.resolve_after_error(&remote, &worker, &record, error)?,
+            Err(error @ WorkerError::Capacity { .. }) => {
+                self.client_state
+                    .revert_dispatch(identity.job_id, identity.dispatch_owner)?;
+                return Err(error);
+            }
+            Err(error) => {
+                self.resolve_after_error(&remote, &worker, &record, identity.dispatch_owner, error)?
+            }
         };
 
         let accepted_status = match normalize_authoritative_status(&record, accepted) {
             Ok(status) => status,
             Err(error) => {
-                let resolved =
-                    self.resolve_after_acceptance_evidence(&remote, &worker, &record, error)?;
+                let resolved = self.resolve_after_acceptance_evidence(
+                    &remote,
+                    &worker,
+                    &record,
+                    identity.dispatch_owner,
+                    error,
+                )?;
                 normalize_authoritative_status(&record, resolved)
                     .map_err(|_| inconsistent_acceptance_evidence())?
             }
@@ -534,6 +843,9 @@ impl<'a> RunService<'a> {
         if !terminal_status.state().is_terminal() {
             return Err(inconsistent_terminal_outcome());
         }
+        self.client_state
+            .remove_after_terminal(identity.job_id, identity.dispatch_owner)?;
+        self.observer.observe(RunStage::QueueTerminalRemoval)?;
         let exit_code = terminal_exit_code(&terminal_status)?;
         Ok(RunCompletion {
             report: RunReport::new(
@@ -550,9 +862,10 @@ impl<'a> RunService<'a> {
         remote: &RemoteJobClient<'_>,
         worker: &WorkerEntry,
         record: &LocalJobRecord,
+        dispatch_owner: ProcessIdentity,
         original: WorkerError,
     ) -> Result<StatusResponse, WorkerError> {
-        self.resolve_disposition(remote, worker, record, original, false)
+        self.resolve_disposition(remote, worker, record, dispatch_owner, original, false)
     }
 
     fn resolve_after_acceptance_evidence(
@@ -560,9 +873,10 @@ impl<'a> RunService<'a> {
         remote: &RemoteJobClient<'_>,
         worker: &WorkerEntry,
         record: &LocalJobRecord,
+        dispatch_owner: ProcessIdentity,
         original: WorkerError,
     ) -> Result<StatusResponse, WorkerError> {
-        self.resolve_disposition(remote, worker, record, original, true)
+        self.resolve_disposition(remote, worker, record, dispatch_owner, original, true)
     }
 
     fn resolve_disposition(
@@ -570,32 +884,44 @@ impl<'a> RunService<'a> {
         remote: &RemoteJobClient<'_>,
         worker: &WorkerEntry,
         record: &LocalJobRecord,
+        dispatch_owner: ProcessIdentity,
         original: WorkerError,
         acceptance_evidence: bool,
     ) -> Result<StatusResponse, WorkerError> {
-        let resolution = ResolveOrAbandonRequest::try_from(record)?;
-        let disposition = match remote.resolve_preacceptance(worker, &resolution) {
-            Ok(disposition) => disposition,
+        let request = ResolveOrAbandonRequest::try_from(record)?;
+        let resolution = match remote.resolve_preacceptance_with_receipt(worker, &request) {
+            Ok(resolution) => resolution,
             Err(error) if !acceptance_evidence => return Err(error),
             Err(_) => {
                 self.persist_uncertainty(record, "ACCEPTANCE_EVIDENCE_CONFLICT", false)?;
                 return Err(inconsistent_acceptance_evidence());
             }
         };
-        match disposition {
-            PreacceptanceDisposition::Accepted(response) => Ok(response),
-            PreacceptanceDisposition::Abandoned if !acceptance_evidence => Err(original),
+        match resolution.disposition() {
+            PreacceptanceDisposition::Accepted(response) => Ok(response.clone()),
+            PreacceptanceDisposition::Abandoned if !acceptance_evidence => {
+                let receipt = resolution.abandonment_receipt().ok_or_else(|| {
+                    WorkerError::Protocol(
+                        "ABANDONMENT_PROOF_MISSING: remote abandonment lacked a receipt".into(),
+                    )
+                })?;
+                self.client_state
+                    .record_preacceptance_abandoned(receipt, dispatch_owner)?;
+                self.client_state
+                    .remove_after_terminal(record.meta().job_id(), dispatch_owner)?;
+                Err(original)
+            }
             PreacceptanceDisposition::Abandoned => {
                 self.persist_uncertainty(record, "ACCEPTANCE_EVIDENCE_CONFLICT", false)?;
                 Err(inconsistent_acceptance_evidence())
             }
             PreacceptanceDisposition::CleanupPending { code } => {
-                self.persist_uncertainty(record, &code, true)?;
-                Err(recovery_error(record, &code, true))
+                self.persist_uncertainty(record, code, true)?;
+                Err(recovery_error(record, code, true))
             }
             PreacceptanceDisposition::UnknownRemote { code } => {
-                self.persist_uncertainty(record, &code, false)?;
-                Err(recovery_error(record, &code, false))
+                self.persist_uncertainty(record, code, false)?;
+                Err(recovery_error(record, code, false))
             }
         }
     }
@@ -614,6 +940,62 @@ impl<'a> RunService<'a> {
         self.client_state
             .set_remote_uncertainty_if_same_immutable(record, uncertainty)?;
         Ok(())
+    }
+}
+
+fn admission_from_candidate(
+    candidate: CandidateObservation,
+    observed_at_millis: u64,
+) -> Result<AdmissionObservation, WorkerError> {
+    AdmissionObservation::new(
+        candidate.worker_name().to_owned(),
+        candidate.ready(),
+        candidate.slot(),
+        candidate.capabilities().to_vec(),
+        candidate.available_memory_bytes(),
+        candidate.free_disk_bytes(),
+        observed_at_millis,
+    )
+}
+
+fn candidate_from_admission(
+    observation: &AdmissionObservation,
+) -> Result<CandidateObservation, WorkerError> {
+    CandidateObservation::new(
+        observation.worker_name().to_owned(),
+        observation.ready(),
+        observation.slot(),
+        observation.capabilities().to_vec(),
+        observation.available_memory_bytes(),
+        observation.free_disk_bytes(),
+    )
+    .map_err(|_| WorkerError::Protocol("cached scheduler observation is invalid".into()))
+}
+
+fn ranked_worker_names(
+    observations: &[CandidateObservation],
+    requirements: &[String],
+    preference: &WorkerPreference,
+    affinity: &AffinityHints,
+) -> Vec<String> {
+    let considered = observations
+        .iter()
+        .filter(|observation| match preference {
+            WorkerPreference::Automatic => true,
+            WorkerPreference::Pinned { worker } => observation.worker_name() == worker,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    SchedulerPolicy::rank(&considered, requirements, affinity)
+        .into_iter()
+        .map(|candidate| candidate.worker_name().to_owned())
+        .collect()
+}
+
+fn capacity_busy() -> WorkerError {
+    WorkerError::Capacity {
+        code: "CAPACITY_BUSY",
+        message: "no eligible worker currently has an available heavy slot".into(),
     }
 }
 

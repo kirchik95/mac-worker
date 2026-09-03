@@ -39,7 +39,9 @@ pub enum Command {
     },
     Run {
         #[arg(long, value_parser = non_empty_worker)]
-        worker: String,
+        worker: Option<String>,
+        #[arg(long)]
+        no_wait: bool,
         #[arg(long)]
         project: Option<PathBuf>,
         #[arg(long = "include", value_parser = non_empty_pattern)]

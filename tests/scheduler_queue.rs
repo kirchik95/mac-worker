@@ -1894,6 +1894,133 @@ fn dead_batch_dispatch_is_first_persisted_waiting_and_pid_reuse_is_dead() {
 }
 
 #[test]
+fn dead_batch_recovery_preserves_bound_remote_evidence_and_uncertainty() {
+    // Break caught: generic dead-owner recovery demotes an accepted or
+    // ambiguous remote job to Waiting, allowing its dispatch reservation to be
+    // reused before reconciliation proves a terminal outcome.
+    let cases = vec![
+        (
+            "000000000000000000000000000000bf",
+            None,
+            RemoteUncertainty::None,
+        ),
+        (
+            "000000000000000000000000000000c0",
+            Some(JobStatus::accepted(1_010).unwrap()),
+            RemoteUncertainty::None,
+        ),
+        (
+            "000000000000000000000000000000c1",
+            Some(JobStatus::running(1_011, 21, 22, 23, 24).unwrap()),
+            RemoteUncertainty::None,
+        ),
+        (
+            "000000000000000000000000000000c2",
+            None,
+            RemoteUncertainty::unknown_remote("UNKNOWN_REMOTE").unwrap(),
+        ),
+        (
+            "000000000000000000000000000000c3",
+            None,
+            RemoteUncertainty::cleanup_pending("CLEANUP_INCOMPLETE").unwrap(),
+        ),
+    ];
+
+    for (index, (job_id, status, uncertainty)) in cases.into_iter().enumerate() {
+        let fixture = open_queue_with_owner_inspector(FixedOwnerInspector {
+            observation: ProcessObservation::Absent,
+        });
+        let dispatcher = owner(610 + index as u32);
+        let row = dispatching_batch(&fixture.store, job_id, dispatcher, 1_000 + index as u64);
+        fixture
+            .store
+            .create_job(local_record_with_uncertainty(
+                &fixture.store,
+                row.job_id(),
+                "mini-1",
+                status,
+                uncertainty,
+            ))
+            .unwrap();
+        let before = fixture.store.queue_snapshot().unwrap();
+
+        assert!(fixture.store.recover_dead_dispatches().unwrap().is_empty());
+        assert_eq!(fixture.store.queue_snapshot().unwrap(), before);
+    }
+}
+
+#[test]
+fn dead_batch_recovery_retires_a_bound_terminal_record() {
+    // Break caught: making recovery conservative also strands a row whose
+    // exact bound local record already proves safe terminal completion.
+    let fixture = open_queue_with_owner_inspector(FixedOwnerInspector {
+        observation: ProcessObservation::Absent,
+    });
+    let dispatcher = owner(620);
+    let row = dispatching_batch(
+        &fixture.store,
+        "000000000000000000000000000000c4",
+        dispatcher,
+        1_020,
+    );
+    fixture
+        .store
+        .create_job(local_record(
+            &fixture.store,
+            row.job_id(),
+            "mini-1",
+            Some(JobStatus::succeeded(1_021, 10, 20).unwrap()),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        fixture.store.recover_dead_dispatches().unwrap(),
+        vec![row.job_id()]
+    );
+    assert!(fixture.store.queue_snapshot().unwrap().entries().is_empty());
+}
+
+#[test]
+fn dead_batch_recovery_fails_closed_on_a_mismatched_local_record() {
+    // Break caught: recovery trusts a job filename without binding its durable
+    // identity to the queue row, and silently reopens or retires corrupt work.
+    let fixture = open_queue_with_owner_inspector(FixedOwnerInspector {
+        observation: ProcessObservation::Absent,
+    });
+    let dispatcher = owner(621);
+    let row = dispatching_batch(
+        &fixture.store,
+        "000000000000000000000000000000c5",
+        dispatcher,
+        1_030,
+    );
+    fixture
+        .store
+        .create_job(local_record_with_binding(
+            &fixture.store,
+            row.job_id(),
+            "mini-1",
+            OTHER_PROJECT_ID,
+            WORKTREE_ID,
+            CommandSpec::argv(vec!["tool".into(), COMMAND_SECRET.into()]).unwrap(),
+            Some(JobStatus::accepted(1_031).unwrap()),
+            RemoteUncertainty::None,
+        ))
+        .unwrap();
+    let before = fixture.store.queue_snapshot().unwrap();
+
+    let error = fixture.store.recover_dead_dispatches().unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Queue {
+            code: "QUEUE_JOB_RECORD_MISMATCH",
+            ..
+        }
+    ));
+    assert_eq!(fixture.store.queue_snapshot().unwrap(), before);
+}
+
+#[test]
 fn live_or_ambiguous_owner_is_never_recovered_as_abandoned() {
     // Break caught: uncertainty is interpreted as death and mutates a row still
     // owned by a possibly live dispatcher.

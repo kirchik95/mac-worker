@@ -34,6 +34,38 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
 }
 
 #[test]
+fn run_help_exposes_optional_pin_and_no_wait_scheduler_controls() {
+    // Break caught: the public grammar regresses to a mandatory worker or
+    // omits the immediate-capacity mode from discoverable help.
+    let mut command = Command::cargo_bin("worker").unwrap();
+    command.args(["run", "--help"]);
+
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--worker <WORKER>"))
+        .stdout(predicate::str::contains("--no-wait"));
+
+    for arguments in [
+        vec!["worker", "run", "--", "npm", "test"],
+        vec!["worker", "run", "--worker", "mini-2", "--", "npm", "test"],
+        vec!["worker", "run", "--no-wait", "--", "npm", "test"],
+        vec![
+            "worker",
+            "run",
+            "--worker",
+            "mini-2",
+            "--no-wait",
+            "--",
+            "npm",
+            "test",
+        ],
+    ] {
+        Cli::try_parse_from(arguments).expect("documented scheduler run form must parse");
+    }
+}
+
+#[test]
 fn doctor_parses_the_public_command_forms_without_resolving_the_project() {
     let cases = [
         (vec!["worker", "doctor"], false, None, Vec::<String>::new()),

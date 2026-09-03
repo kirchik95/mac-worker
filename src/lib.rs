@@ -30,6 +30,7 @@ use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnap
 use run::{
     LogsService, RunRequest, RunService, StatusService, SystemFollowRuntime, terminal_exit_code,
 };
+use scheduler::WorkerPreference;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use supervisor::{
     SUPERVISOR_LOCK_FD, Supervisor, SystemProcessInspector, SystemSupervisorLauncher,
@@ -316,6 +317,7 @@ fn run_public_streaming_body(
     match cli.command {
         Command::Run {
             worker,
+            no_wait,
             project,
             includes,
             timeout,
@@ -333,7 +335,11 @@ fn run_public_streaming_body(
             let service = RunService::with_follower(runner, &config, &paths, &client_state, &logs);
             let completion = service.submit_and_follow(
                 RunRequest {
-                    worker,
+                    preference: match worker {
+                        Some(worker) => WorkerPreference::Pinned { worker },
+                        None => WorkerPreference::Automatic,
+                    },
+                    wait_for_capacity: !no_wait,
                     project,
                     cli_includes: includes,
                     timeout,

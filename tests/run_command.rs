@@ -11,7 +11,7 @@ use std::{
     process::ExitStatus,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -27,23 +27,29 @@ use mac_worker::{
     config::{Config, WorkerEntry},
     error::WorkerError,
     job::{
-        ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobState, JobStatus, JsonEvent,
-        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LocalJobRecord,
-        LogChunk, LogChunkRequest, LogChunkResponse, LogStream, ProcessIdentity, RemoteUncertainty,
-        RequestFingerprintMaterial, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
-        StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
+        AdmissionObservation, ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobState,
+        JobStatus, JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
+        LocalJobRecord, LogChunk, LogChunkRequest, LogChunkResponse, LogStream, ProcessIdentity,
+        QueueEntry, QueueEntryKind, QueueState, RemoteUncertainty, RequestFingerprintMaterial,
+        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest, StatusResponse,
+        SubmitRequest, SubmitResponse,
     },
     lease::{LeaseSummary, SlotState},
     paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    project_state::ProjectState,
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     run::{
         FollowRuntime, JobFollower, LogsService, RunCompletion, RunObserver, RunReport, RunRequest,
         RunService, RunStage, STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT,
-        StatusReport, StatusRow, StatusService, SystemFollowRuntime,
+        SchedulerRuntime, StatusReport, StatusRow, StatusService, SystemFollowRuntime,
     },
     run_with_io_in_context,
+    scheduler::{CandidateSlot, WorkerPreference},
+    supervisor::{
+        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    },
     transfer::{HostOperation, RemoteJobClient, ResolutionRuntime},
 };
 use predicates::prelude::*;
@@ -163,6 +169,102 @@ impl ResolutionRuntime for ImmediateResolution {
 
     fn sleep(&self, _duration: Duration) {
         panic!("status lookup must not sleep")
+    }
+}
+
+struct TestSchedulerRuntime {
+    now_millis: AtomicU64,
+    owner: ProcessIdentity,
+    sleeps: Mutex<Vec<Duration>>,
+}
+
+impl TestSchedulerRuntime {
+    fn new(now_millis: u64, owner_seed: u32) -> Self {
+        Self {
+            now_millis: AtomicU64::new(now_millis),
+            owner: ProcessIdentity::new(owner_seed, u64::from(owner_seed) * 10_000 + 7).unwrap(),
+            sleeps: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn sleeps(&self) -> Vec<Duration> {
+        self.sleeps.lock().unwrap().clone()
+    }
+}
+
+impl SchedulerRuntime for TestSchedulerRuntime {
+    fn now_millis(&self) -> Result<u64, WorkerError> {
+        Ok(self.now_millis.load(Ordering::SeqCst))
+    }
+
+    fn process_identity(&self) -> Result<ProcessIdentity, WorkerError> {
+        Ok(self.owner)
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.sleeps.lock().unwrap().push(duration);
+        let millis = u64::try_from(duration.as_millis()).unwrap();
+        self.now_millis.fetch_add(millis, Ordering::SeqCst);
+    }
+}
+
+struct FailingSchedulerRuntime {
+    calls: AtomicUsize,
+    fail_on_call: usize,
+    owner: ProcessIdentity,
+}
+
+impl FailingSchedulerRuntime {
+    fn failing_on(fail_on_call: usize, owner_seed: u32) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            fail_on_call,
+            owner: ProcessIdentity::new(owner_seed, u64::from(owner_seed) * 10_000 + 7).unwrap(),
+        }
+    }
+}
+
+impl SchedulerRuntime for FailingSchedulerRuntime {
+    fn now_millis(&self) -> Result<u64, WorkerError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_on_call {
+            Err(WorkerError::Io(io::Error::other(
+                "planted scheduler clock failure",
+            )))
+        } else {
+            Ok(70_000 + call as u64)
+        }
+    }
+
+    fn process_identity(&self) -> Result<ProcessIdentity, WorkerError> {
+        Ok(self.owner)
+    }
+
+    fn sleep(&self, _duration: Duration) {
+        panic!("the failing no-wait scheduler must not sleep")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LiveOwnerInspector;
+
+impl ProcessInspector for LiveOwnerInspector {
+    fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+        ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7)
+    }
+
+    fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+        ProcessObservation::Matching {
+            process_group: expected.pid(),
+        }
+    }
+
+    fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
+        ProcessGroupObservation::Present
+    }
+
+    fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
+        ProcessGroupMembership::LeaderOnly
     }
 }
 
@@ -354,6 +456,7 @@ fn run_parses_literal_argv_and_explicit_shell_forms() {
     .unwrap();
     let WorkerCommand::Run {
         worker,
+        no_wait,
         project,
         includes,
         timeout,
@@ -363,7 +466,8 @@ fn run_parses_literal_argv_and_explicit_shell_forms() {
     else {
         panic!("run form must select run command");
     };
-    assert_eq!(worker, "mini-1");
+    assert_eq!(worker.as_deref(), Some("mini-1"));
+    assert!(!no_wait);
     assert_eq!(project, None);
     assert!(includes.is_empty());
     assert_eq!(timeout, None);
@@ -388,6 +492,7 @@ fn run_parses_literal_argv_and_explicit_shell_forms() {
     .unwrap();
     let WorkerCommand::Run {
         worker,
+        no_wait,
         project,
         includes,
         timeout,
@@ -397,7 +502,8 @@ fn run_parses_literal_argv_and_explicit_shell_forms() {
     else {
         panic!("run form must select run command");
     };
-    assert_eq!(worker, "mini-1");
+    assert_eq!(worker.as_deref(), Some("mini-1"));
+    assert!(!no_wait);
     assert_eq!(project, Some(PathBuf::from("/repo")));
     assert_eq!(includes, ["fixtures/generated/**"]);
     assert_eq!(timeout, Some(Duration::from_secs(45 * 60)));
@@ -415,6 +521,7 @@ fn run_parses_literal_argv_and_explicit_shell_forms() {
     .unwrap();
     let WorkerCommand::Run {
         worker,
+        no_wait,
         project,
         includes,
         timeout,
@@ -424,7 +531,8 @@ fn run_parses_literal_argv_and_explicit_shell_forms() {
     else {
         panic!("run form must select run command");
     };
-    assert_eq!(worker, "mini-1");
+    assert_eq!(worker.as_deref(), Some("mini-1"));
+    assert!(!no_wait);
     assert_eq!(project, None);
     assert!(includes.is_empty());
     assert_eq!(timeout, None);
@@ -432,13 +540,22 @@ fn run_parses_literal_argv_and_explicit_shell_forms() {
     assert!(argv.is_empty());
 
     let request = RunRequest {
-        worker,
+        preference: WorkerPreference::Pinned {
+            worker: worker.unwrap(),
+        },
+        wait_for_capacity: !no_wait,
         project: PathBuf::from("/path/to/worktree"),
         cli_includes: includes,
         timeout,
         command: CommandSpec::shell(shell.unwrap()).unwrap(),
     };
-    assert_eq!(request.worker, "mini-1");
+    assert_eq!(
+        request.preference,
+        WorkerPreference::Pinned {
+            worker: "mini-1".into()
+        }
+    );
+    assert!(request.wait_for_capacity);
 
     let cli = Cli::try_parse_from([
         "worker",
@@ -460,16 +577,65 @@ fn run_parses_literal_argv_and_explicit_shell_forms() {
 }
 
 #[test]
-fn run_rejects_missing_worker_empty_command_and_mutually_exclusive_modes() {
-    // Catches accidental implicit worker selection or ambiguous command mode.
+fn run_rejects_empty_worker_or_command_and_mutually_exclusive_modes() {
+    // Catches accepting an empty explicit pin or ambiguous command mode.
     for arguments in [
-        vec!["run", "--", "true"],
         vec!["run", "--worker", "", "--", "true"],
+        vec!["run"],
         vec!["run", "--worker", "mini-1"],
-        vec!["run", "--worker", "mini-1", "--shell", ""],
-        vec!["run", "--worker", "mini-1", "--shell", "true", "--", "echo"],
+        vec!["run", "--shell", ""],
+        vec!["run", "--shell", "true", "--", "echo"],
     ] {
         assert_usage(&arguments);
+    }
+}
+
+#[test]
+fn run_parses_automatic_pinned_wait_and_no_wait_forms() {
+    // Break caught: automatic scheduling still requires --worker, --no-wait is
+    // ignored, or an explicit pin is collapsed into the automatic form.
+    let cases = [
+        (vec!["worker", "run", "--", "npm", "test"], None, false),
+        (
+            vec!["worker", "run", "--worker", "mini-2", "--", "npm", "test"],
+            Some("mini-2"),
+            false,
+        ),
+        (
+            vec!["worker", "run", "--no-wait", "--", "npm", "test"],
+            None,
+            true,
+        ),
+        (
+            vec![
+                "worker",
+                "run",
+                "--worker",
+                "mini-2",
+                "--no-wait",
+                "--",
+                "npm",
+                "test",
+            ],
+            Some("mini-2"),
+            true,
+        ),
+    ];
+
+    for (arguments, expected_worker, expected_no_wait) in cases {
+        let cli = Cli::try_parse_from(arguments).expect("scheduler run form must parse");
+        let WorkerCommand::Run {
+            worker,
+            no_wait,
+            argv,
+            ..
+        } = cli.command
+        else {
+            panic!("scheduler form must select run command");
+        };
+        assert_eq!(worker.as_deref(), expected_worker);
+        assert_eq!(no_wait, expected_no_wait);
+        assert_eq!(argv, ["npm", "test"]);
     }
 }
 
@@ -2498,6 +2664,30 @@ impl ProcessRunner for RunScriptRunner {
                         .is_file(),
                     "the durable local identity must precede lease acquisition"
                 );
+                let persisted = ClientStateStore::open(&self.state_root)
+                    .unwrap()
+                    .load_job(material.job_id())
+                    .unwrap();
+                assert_eq!(persisted.meta().job_id(), material.job_id());
+                assert_eq!(persisted.lease_token(), material.lease_token());
+                assert_eq!(
+                    persisted.meta().created_at_millis(),
+                    material.created_at_millis()
+                );
+                let queue = ClientStateStore::open(&self.state_root)
+                    .unwrap()
+                    .queue_snapshot()
+                    .unwrap();
+                let queued = queue
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.job_id() == material.job_id())
+                    .expect("the original queue row must remain reserved during lease acquisition");
+                assert!(matches!(
+                    queued.state(),
+                    QueueState::Dispatching { selected_worker, .. }
+                        if selected_worker == material.worker_name()
+                ));
                 state.material = Some(material.clone());
                 if step == RunScriptStep::AcquireExisting {
                     canonical_process(&LeaseAcquireResponse::ExistingAccepted {
@@ -2633,7 +2823,11 @@ impl ProcessRunner for RunScriptRunner {
             }
             RunScriptStep::AuthoritativeFailure(operation, code) => {
                 assert_eq!(request.args.last().unwrap(), operation.command());
-                if operation == HostOperation::Submit {
+                if operation == HostOperation::LeaseAcquire {
+                    let acquire: LeaseAcquireRequest =
+                        serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                    state.material = Some(acquire.material().clone());
+                } else if operation == HostOperation::Submit {
                     let submit: SubmitRequest =
                         serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
                     assert_eq!(submit.material(), state.material.as_ref().unwrap());
@@ -3041,6 +3235,19 @@ impl RunObserver for RecordingRunObserver {
     }
 }
 
+struct CorruptAffinityAfterEnqueue {
+    path: PathBuf,
+}
+
+impl RunObserver for CorruptAffinityAfterEnqueue {
+    fn observe(&self, stage: RunStage) -> Result<(), WorkerError> {
+        if stage == RunStage::QueueEnqueue {
+            fs::write(&self.path, b"{")?;
+        }
+        Ok(())
+    }
+}
+
 impl JobFollower for ConcurrentTerminalFollower {
     fn follow(
         &self,
@@ -3104,7 +3311,10 @@ fn run_repo(settings: &[u8]) -> GitRepo {
 
 fn orchestration_request(repo: &GitRepo) -> RunRequest {
     RunRequest {
-        worker: "mini-1".into(),
+        preference: WorkerPreference::Pinned {
+            worker: "mini-1".into(),
+        },
+        wait_for_capacity: false,
         project: repo.root().to_path_buf(),
         cli_includes: Vec::new(),
         timeout: None,
@@ -3164,6 +3374,37 @@ fn run_with_script(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_scheduled_with_script(
+    temp: &tempfile::TempDir,
+    config: &Config,
+    request: RunRequest,
+    steps: impl IntoIterator<Item = RunScriptStep>,
+    follower: &dyn JobFollower,
+    resolution_runtime: Option<&dyn ResolutionRuntime>,
+    scheduler_runtime: &dyn SchedulerRuntime,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> (
+    Result<RunCompletion, WorkerError>,
+    RunScriptRunner,
+    ClientStateStore,
+) {
+    let paths = run_paths(temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(paths.state.clone(), steps);
+    let service = if let Some(runtime) = resolution_runtime {
+        RunService::with_follower_and_resolution_runtime(
+            &runner, config, &paths, &store, follower, runtime,
+        )
+    } else {
+        RunService::with_follower(&runner, config, &paths, &store, follower)
+    }
+    .with_scheduler_runtime(scheduler_runtime);
+    let result = service.submit_and_follow(request, false, stdout, stderr);
+    (result, runner, store)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_with_script_and_observer(
     repo: &GitRepo,
     temp: &tempfile::TempDir,
@@ -3195,10 +3436,13 @@ fn run_with_script_and_observer(
     (result, runner, store)
 }
 
-fn all_run_stages() -> [RunStage; 12] {
+fn all_run_stages() -> [RunStage; 16] {
     [
         RunStage::InitialProjectInspection,
-        RunStage::ExplicitWorkerProbe,
+        RunStage::AdmissionObservation,
+        RunStage::QueueEnqueue,
+        RunStage::DeadDispatchRecovery,
+        RunStage::QueueClaim,
         RunStage::StableProjectReload,
         RunStage::SnapshotSelectionAndCapture,
         RunStage::LocalRecordPublication,
@@ -3208,12 +3452,566 @@ fn all_run_stages() -> [RunStage; 12] {
         RunStage::JobSubmission,
         RunStage::AcceptedOutputFlush,
         RunStage::JobFollower,
+        RunStage::QueueTerminalRemoval,
         RunStage::SnapshotCleanup,
     ]
 }
 
 #[test]
-fn run_performs_the_exact_twelve_stage_order_against_one_worker() {
+fn no_wait_busy_pin_rejects_before_enqueue_snapshot_or_reroute() {
+    // Break caught: --no-wait queues/captures despite an ineligible pin, or a
+    // busy pin is silently rerouted to another configured SSH destination.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(10_000, 901);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut request = orchestration_request(&repo);
+    request.wait_for_capacity = false;
+
+    let (result, runner, store) = run_scheduled_with_script(
+        &temp,
+        &run_config(),
+        request,
+        [RunScriptStep::ProbeBusy],
+        &follower,
+        None,
+        &scheduler,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert!(matches!(
+        result.unwrap_err(),
+        WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            ..
+        }
+    ));
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert!(!run_paths(&temp).cache.join("snapshots").exists());
+    assert!(scheduler.sleeps().is_empty());
+    assert_eq!(runner.requests().len(), 1);
+    assert_eq!(runner.requests()[0].args[9], OsStr::new("mac1"));
+    assert!(
+        runner
+            .requests()
+            .iter()
+            .all(|request| !request.args.iter().any(|arg| arg == "poison-host"))
+    );
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    runner.assert_consumed();
+}
+
+#[test]
+fn invalid_pin_rejects_before_observation_or_durable_mutation() {
+    // Break caught: an unknown explicit pin reaches SSH, queue publication, or
+    // snapshot capture before configuration validation rejects it.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(15_000, 911);
+    let mut request = orchestration_request(&repo);
+    request.preference = WorkerPreference::Pinned {
+        worker: "missing-worker".into(),
+    };
+
+    let (result, runner, store) = run_scheduled_with_script(
+        &temp,
+        &run_config(),
+        request,
+        [],
+        &follower,
+        None,
+        &scheduler,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+
+    assert!(matches!(
+        result.unwrap_err(),
+        WorkerError::Config(message) if message.contains("WORKER_NOT_FOUND")
+    ));
+    assert!(runner.requests().is_empty());
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert!(!run_paths(&temp).cache.join("snapshots").exists());
+    assert!(scheduler.sleeps().is_empty());
+    runner.assert_consumed();
+}
+
+#[test]
+fn no_wait_claim_loss_removes_only_the_new_waiting_row() {
+    // Break caught: --no-wait snapshots after losing the atomic FIFO claim,
+    // deletes the older row, or leaves its own unserviceable row behind.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store =
+        ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwnerInspector).unwrap();
+    let initial = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let older_job = JobId::new(uuid::Uuid::from_u128(8_002));
+    store
+        .enqueue(
+            QueueEntry::new(
+                older_job,
+                store.client_id(),
+                initial.context.project_id.clone(),
+                initial.context.worktree_id.clone(),
+                CommandSpec::argv(vec!["older".into()])
+                    .unwrap()
+                    .summary()
+                    .unwrap(),
+                initial.requirements.clone(),
+                WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                QueueEntryKind::Batch,
+                None,
+                ProcessIdentity::new(802, 8_020_007).unwrap(),
+                59_000,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let runner = RunScriptRunner::new(paths.state.clone(), [RunScriptStep::ProbeReady]);
+    let config = config();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(60_000, 912);
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_scheduler_runtime(&scheduler);
+    let request = orchestration_request(&repo);
+
+    let error = service
+        .submit_and_follow(request, false, &mut Vec::new(), &mut Vec::new())
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            ..
+        }
+    ));
+    let queue = store.queue_snapshot().unwrap();
+    assert_eq!(queue.entries().len(), 1);
+    assert_eq!(queue.entries()[0].job_id(), older_job);
+    assert!(matches!(
+        queue.entries()[0].state(),
+        QueueState::Waiting { .. }
+    ));
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert!(!paths.cache.join("snapshots").exists());
+    assert!(scheduler.sleeps().is_empty());
+    runner.assert_consumed();
+}
+
+#[test]
+fn automatic_run_selects_the_eligible_worker_while_a_pin_never_reroutes() {
+    // Break caught: automatic mode keeps the Phase 3 explicit worker route, or
+    // pinned policy is discarded after observing the pinned worker busy.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(20_000, 902);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut request = orchestration_request(&repo);
+    request.preference = WorkerPreference::Automatic;
+
+    let (result, runner, store) = run_scheduled_with_script(
+        &temp,
+        &run_config(),
+        request,
+        [
+            RunScriptStep::ProbeBusy,
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &follower,
+        None,
+        &scheduler,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    let completion = result.unwrap();
+    let material = runner.material();
+    assert_eq!(completion.report.worker, "poison-worker");
+    assert_eq!(material.worker_name(), "poison-worker");
+    let requests = runner.requests();
+    assert_eq!(requests[0].args[9], OsStr::new("mac1"));
+    assert_eq!(requests[1].args[9], OsStr::new("poison-host"));
+    assert!(requests[2..].iter().all(|request| {
+        request.program == OsStr::new("/usr/bin/rsync")
+            || request
+                .args
+                .get(9)
+                .is_some_and(|argument| argument == "poison-host")
+    }));
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    let affinity = store
+        .affinity_hints(material.project_id(), material.worktree_id())
+        .unwrap();
+    assert_eq!(affinity.worktree_worker.as_deref(), Some("poison-worker"));
+    assert_eq!(affinity.project_worker.as_deref(), Some("poison-worker"));
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
+    runner.assert_consumed();
+}
+
+#[test]
+fn cached_ready_observation_is_consumed_without_claiming_fresh_affinity() {
+    // Break caught: a cache hit is mistaken for a remote refresh merely
+    // because its age is zero, causing unobserved affinity to be published.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    store
+        .admission_observation("mini-1", 25_000, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                CandidateSlot::Idle,
+                vec!["declared-capability".into(), "project-capability".into()],
+                Some(12 * 1024 * 1024 * 1024),
+                100 * 1024 * 1024 * 1024,
+                25_000,
+            )
+        })
+        .unwrap();
+    let runner = RunScriptRunner::new(
+        paths.state.clone(),
+        [
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+    );
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(25_000, 913);
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_scheduler_runtime(&scheduler);
+
+    let completion = service
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+    assert_eq!(completion.report.worker, "mini-1");
+    let material = runner.material();
+    let affinity = store
+        .affinity_hints(material.project_id(), material.worktree_id())
+        .unwrap();
+    assert_eq!(affinity.worktree_worker, None);
+    assert_eq!(affinity.project_worker, None);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    runner.assert_consumed();
+}
+
+#[test]
+fn shared_admission_cache_remains_project_neutral_across_requirement_sets() {
+    // Break caught: a project-specific missing requirement is cached as worker
+    // unavailability and incorrectly rejects a later compatible project.
+    let incompatible = run_repo(b"version = 1\nrequires = [\"missing-capability\"]\n");
+    let compatible = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(
+        paths.state.clone(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+    );
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(26_000, 914);
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_scheduler_runtime(&scheduler);
+
+    let incompatible_error = service
+        .submit_and_follow(
+            orchestration_request(&incompatible),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        incompatible_error,
+        WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            ..
+        }
+    ));
+
+    let completion = service
+        .submit_and_follow(
+            orchestration_request(&compatible),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+    assert_eq!(completion.report.worker, "mini-1");
+    assert_eq!(
+        runner
+            .requests()
+            .iter()
+            .filter(|request| request
+                .args
+                .last()
+                .is_some_and(|argument| argument == "~/.local/bin/worker host probe"))
+            .count(),
+        1
+    );
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    runner.assert_consumed();
+}
+
+#[test]
+fn post_enqueue_clock_failure_removes_the_new_waiting_row() {
+    // Break caught: failure obtaining the claim timestamp escapes after enqueue
+    // and strands this invocation's unclaimed durable row.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(paths.state.clone(), [RunScriptStep::ProbeReady]);
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = FailingSchedulerRuntime::failing_on(3, 915);
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_scheduler_runtime(&scheduler);
+
+    let error = service
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, WorkerError::Io(_)));
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert!(!paths.cache.join("snapshots").exists());
+    runner.assert_consumed();
+}
+
+#[test]
+fn post_enqueue_affinity_failure_removes_the_new_waiting_row() {
+    // Break caught: corrupt affinity state is discovered after enqueue and the
+    // scheduler returns without cleaning its still-unclaimed row.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let initial = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let observer = CorruptAffinityAfterEnqueue {
+        path: paths
+            .state
+            .join("affinity/projects")
+            .join(format!("{}.json", initial.context.project_id)),
+    };
+    let runner = RunScriptRunner::new(paths.state.clone(), [RunScriptStep::ProbeReady]);
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(27_000, 916);
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_scheduler_runtime(&scheduler)
+        .with_observer(&observer);
+
+    let error = service
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, WorkerError::Io(_)));
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    assert!(store.list_jobs().unwrap().is_empty());
+    assert!(!paths.cache.join("snapshots").exists());
+    runner.assert_consumed();
+}
+
+#[test]
+fn older_live_pin_wins_its_worker_without_blocking_another_worker() {
+    // Break caught: public orchestration bypasses owner-scoped per-worker FIFO,
+    // or a pinned head blocks younger automatic work on a distinct idle host.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store =
+        ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwnerInspector).unwrap();
+    let initial = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let older_job = JobId::new(uuid::Uuid::from_u128(8_001));
+    store
+        .enqueue(
+            QueueEntry::new(
+                older_job,
+                store.client_id(),
+                initial.context.project_id.clone(),
+                initial.context.worktree_id.clone(),
+                CommandSpec::argv(vec!["older".into()])
+                    .unwrap()
+                    .summary()
+                    .unwrap(),
+                initial.requirements.clone(),
+                WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                QueueEntryKind::Batch,
+                None,
+                ProcessIdentity::new(801, 8_010_007).unwrap(),
+                49_000,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let runner = RunScriptRunner::new(
+        paths.state.clone(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+    );
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(50_000, 905);
+    let mut request = orchestration_request(&repo);
+    request.preference = WorkerPreference::Automatic;
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_scheduler_runtime(&scheduler);
+
+    let completion = service
+        .submit_and_follow(request, false, &mut Vec::new(), &mut Vec::new())
+        .unwrap();
+
+    assert_eq!(completion.report.worker, "poison-worker");
+    let queue = store.queue_snapshot().unwrap();
+    assert_eq!(queue.entries().len(), 1);
+    assert_eq!(queue.entries()[0].job_id(), older_job);
+    assert!(matches!(
+        queue.entries()[0].state(),
+        QueueState::Waiting { .. }
+    ));
+    runner.assert_consumed();
+}
+
+#[test]
+fn waiting_dispatch_polls_with_only_bounded_one_second_sleeps() {
+    // Break caught: waiting mode snapshots while busy, busy-spins, sleeps for
+    // an unbounded interval, or fails to refresh the two-second cache.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(30_000, 903);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let mut request = orchestration_request(&repo);
+    request.wait_for_capacity = true;
+    let (result, runner, store) = run_scheduled_with_script(
+        &temp,
+        &config(),
+        request,
+        [
+            RunScriptStep::ProbeBusy,
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &follower,
+        None,
+        &scheduler,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(result.unwrap().exit_code, 0);
+    assert_eq!(scheduler.sleeps(), vec![Duration::from_secs(1); 3]);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    runner.assert_consumed();
+}
+
+#[test]
+fn authoritative_lease_capacity_reverts_the_exact_row_without_resolution() {
+    // Break caught: an authoritative no-mutation lease race is resolved as
+    // remote ambiguity, removes the row, or enqueues a replacement identity.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(40_000, 904);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let (result, runner, store) = run_scheduled_with_script(
+        &temp,
+        &config(),
+        orchestration_request(&repo),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::AuthoritativeFailure(HostOperation::LeaseAcquire, "CAPACITY_BUSY"),
+        ],
+        &follower,
+        None,
+        &scheduler,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert!(matches!(
+        result.unwrap_err(),
+        WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            ..
+        }
+    ));
+    let material = runner.material();
+    let queue = store.queue_snapshot().unwrap();
+    assert_eq!(queue.entries().len(), 1);
+    assert_eq!(queue.entries()[0].job_id(), material.job_id());
+    assert!(matches!(
+        queue.entries()[0].state(),
+        QueueState::Waiting { .. }
+    ));
+    assert_eq!(store.list_jobs().unwrap().len(), 1);
+    assert_eq!(runner.requests().len(), 2);
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    runner.assert_consumed();
+    assert_no_run_capture(&run_paths(&temp).cache);
+}
+
+#[test]
+fn run_performs_the_exact_scheduler_stage_order_against_one_worker() {
     // Break caught: any remote effect precedes durable identity, any stage is
     // reordered/duplicated, or terminal follower authority is not persisted.
     let repo = run_repo(b"version = 1\ntimeout = \"2m\"\n");
@@ -3243,6 +4041,7 @@ fn run_performs_the_exact_twelve_stage_order_against_one_worker() {
     assert_eq!(completion.exit_code, 7);
     assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
     assert_eq!(store.list_jobs().unwrap().len(), 1);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
     let persisted = store.load_job(completion.report.job_id).unwrap();
     assert_eq!(persisted.last_status().unwrap().state(), JobState::Failed);
     assert_eq!(persisted.last_status().unwrap().exit_code(), Some(7));
@@ -3269,7 +4068,7 @@ fn run_performs_the_exact_twelve_stage_order_against_one_worker() {
 }
 
 #[test]
-fn run_observer_records_the_exact_twelve_effect_boundaries() {
+fn run_observer_records_the_exact_scheduler_effect_boundaries() {
     let repo = run_repo(b"version = 1\n");
     let temp = tempfile::tempdir().unwrap();
     let follower = RecordingFollower::succeeding(0);
@@ -3391,6 +4190,7 @@ fn poisoned_run_boundary_stops_later_effects_and_cleans_each_owned_snapshot_once
                 | RunStage::JobSubmission
                 | RunStage::AcceptedOutputFlush
                 | RunStage::JobFollower
+                | RunStage::QueueTerminalRemoval
         ) {
             expected_trace.push(RunStage::SnapshotCleanup);
         }
@@ -3402,7 +4202,10 @@ fn poisoned_run_boundary_stops_later_effects_and_cleans_each_owned_snapshot_once
 
         let expected_remaining = match failed_stage {
             RunStage::InitialProjectInspection => 5,
-            RunStage::ExplicitWorkerProbe
+            RunStage::AdmissionObservation
+            | RunStage::QueueEnqueue
+            | RunStage::DeadDispatchRecovery
+            | RunStage::QueueClaim
             | RunStage::StableProjectReload
             | RunStage::SnapshotSelectionAndCapture
             | RunStage::LocalRecordPublication => 4,
@@ -3412,6 +4215,7 @@ fn poisoned_run_boundary_stops_later_effects_and_cleans_each_owned_snapshot_once
             RunStage::JobSubmission
             | RunStage::AcceptedOutputFlush
             | RunStage::JobFollower
+            | RunStage::QueueTerminalRemoval
             | RunStage::SnapshotCleanup => 0,
         };
         assert_eq!(
@@ -3421,20 +4225,17 @@ fn poisoned_run_boundary_stops_later_effects_and_cleans_each_owned_snapshot_once
         );
         assert_eq!(
             follower.calls.load(Ordering::SeqCst),
-            usize::from(matches!(
-                failed_stage,
-                RunStage::JobFollower | RunStage::SnapshotCleanup
-            )),
+            usize::from(index >= 13),
             "failed at {failed_stage:?}"
         );
         assert_eq!(
             store.list_jobs().unwrap().len(),
-            usize::from(index >= 4),
+            usize::from(index >= 7),
             "failed at {failed_stage:?}"
         );
         assert_eq!(
             observer.cleanup_count(),
-            usize::from(index >= 3),
+            usize::from(index >= 6),
             "failed at {failed_stage:?}"
         );
         assert_no_run_capture(&run_paths(&temp).cache);
@@ -3801,6 +4602,7 @@ fn run_reuses_one_identity_through_acquire_upload_verify_submit_and_resolution()
         records[0].meta().request_fingerprint(),
         &material.fingerprint()
     );
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
     runner.assert_consumed();
 }
 
@@ -3868,6 +4670,7 @@ fn accepted_resolution_continues_the_same_job() {
     let completion = result.unwrap();
     assert_eq!(completion.report.job_id, runner.material().job_id());
     assert_eq!(store.list_jobs().unwrap().len(), 1);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
     assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
     runner.assert_consumed();
 }
@@ -3911,6 +4714,7 @@ fn abandoned_preserves_original_typed_failure_without_persisting_abandoned() {
     let record = store.list_jobs().unwrap().pop().unwrap();
     assert!(record.last_status().is_none());
     assert_eq!(record.remote_uncertainty(), &RemoteUncertainty::None);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
     assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
     runner.assert_consumed();
 }
@@ -3977,6 +4781,13 @@ fn unknown_remote_and_cleanup_pending_persist_distinct_markers() {
         assert!(diagnostic.contains(&record.meta().job_id().to_string()));
         assert!(diagnostic.contains("worker status"));
         assert!(record.last_status().is_none());
+        let queue = store.queue_snapshot().unwrap();
+        assert_eq!(queue.entries().len(), 1);
+        assert_eq!(queue.entries()[0].job_id(), record.meta().job_id());
+        assert!(matches!(
+            queue.entries()[0].state(),
+            QueueState::Dispatching { .. }
+        ));
         runner.assert_consumed();
     }
 }
@@ -4174,7 +4985,7 @@ fn run_uses_cli_timeout_over_project_timeout_and_preserves_literal_argv() {
 #[test]
 fn run_probes_only_the_explicit_inventory_worker() {
     // Break caught: run fans out across inventory, accepts the SSH destination
-    // as a worker name, or omits project requirements from the one probe.
+    // as a worker name, or loses project requirements during policy ranking.
     let repo = run_repo(b"version = 1\nrequires = [\"project-capability\"]\n");
     let temp = tempfile::tempdir().unwrap();
     let follower = RecordingFollower::succeeding(0);
@@ -4373,6 +5184,10 @@ fn mismatched_acquire_and_verify_identity_responses_always_resolve_before_return
         let record = store.list_jobs().unwrap().pop().unwrap();
         assert!(record.last_status().is_none(), "{mismatch:?}");
         assert_eq!(record.remote_uncertainty(), &RemoteUncertainty::None);
+        assert!(
+            store.queue_snapshot().unwrap().entries().is_empty(),
+            "{mismatch:?}"
+        );
         runner.assert_consumed();
         assert_no_run_capture(&run_paths(&temp).cache);
     }
@@ -4391,7 +5206,7 @@ fn mismatched_acquire_and_verify_identity_responses_always_resolve_before_return
         let runtime = ImmediateResolution::new();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let (result, runner, _) = run_with_script(
+        let (result, runner, store) = run_with_script(
             &repo,
             &temp,
             [
@@ -4416,6 +5231,10 @@ fn mismatched_acquire_and_verify_identity_responses_always_resolve_before_return
                     ..
                 }
             ),
+            "{mismatch:?}"
+        );
+        assert!(
+            store.queue_snapshot().unwrap().entries().is_empty(),
             "{mismatch:?}"
         );
         runner.assert_consumed();
@@ -4465,6 +5284,7 @@ fn mismatched_mutation_responses_preserve_typed_resolution_outcomes() {
                 .state()
                 .is_terminal()
         );
+        assert!(store.queue_snapshot().unwrap().entries().is_empty());
         runner.assert_consumed();
     }
 
@@ -4521,6 +5341,13 @@ fn mismatched_mutation_responses_preserve_typed_resolution_outcomes() {
             ),
             !cleanup_pending
         );
+        let queue = store.queue_snapshot().unwrap();
+        assert_eq!(queue.entries().len(), 1);
+        assert_eq!(queue.entries()[0].job_id(), record.meta().job_id());
+        assert!(matches!(
+            queue.entries()[0].state(),
+            QueueState::Dispatching { .. }
+        ));
         runner.assert_consumed();
         assert_no_run_capture(&run_paths(&temp).cache);
     }
@@ -4592,6 +5419,7 @@ fn every_acceptance_evidence_failure_resolves_before_following_or_returning() {
         let record = store.list_jobs().unwrap().pop().unwrap();
         assert!(record.last_status().unwrap().state().is_terminal());
         assert_eq!(record.remote_uncertainty(), &RemoteUncertainty::None);
+        assert!(store.queue_snapshot().unwrap().entries().is_empty());
         runner.assert_consumed();
     }
 }
@@ -4658,6 +5486,13 @@ fn contradictory_or_uncertain_acceptance_evidence_is_durable_and_infrastructure(
         let record = store.list_jobs().unwrap().pop().unwrap();
         assert_eq!(record.remote_uncertainty().code(), Some(expected_code));
         assert!(record.last_status().is_none());
+        let queue = store.queue_snapshot().unwrap();
+        assert_eq!(queue.entries().len(), 1);
+        assert_eq!(queue.entries()[0].job_id(), record.meta().job_id());
+        assert!(matches!(
+            queue.entries()[0].state(),
+            QueueState::Dispatching { .. }
+        ));
         assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
         runner.assert_consumed();
     }
@@ -4737,6 +5572,12 @@ fn user_correctable_input_selection_failures_are_project_usage_errors() {
         }
     ));
     assert!(store.list_jobs().unwrap().is_empty());
+    let queue = store.queue_snapshot().unwrap();
+    assert_eq!(queue.entries().len(), 1);
+    assert!(matches!(
+        queue.entries()[0].state(),
+        QueueState::Waiting { .. }
+    ));
     assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
     runner.assert_consumed();
 }
@@ -4775,6 +5616,12 @@ fn operational_git_selection_failures_remain_snapshot_infrastructure_errors() {
     ));
     assert_eq!(error.exit_code(), 70);
     assert!(store.list_jobs().unwrap().is_empty());
+    let queue = store.queue_snapshot().unwrap();
+    assert_eq!(queue.entries().len(), 1);
+    assert!(matches!(
+        queue.entries()[0].state(),
+        QueueState::Waiting { .. }
+    ));
     assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
     runner.assert_consumed();
 }
@@ -4889,7 +5736,10 @@ fn linked_worktrees_submit_distinct_immutable_snapshots_under_the_same_project_i
     );
     let linked_result = linked_service.submit_and_follow(
         RunRequest {
-            worker: "mini-1".into(),
+            preference: WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            wait_for_capacity: true,
             project: linked_path.clone(),
             cli_includes: Vec::new(),
             timeout: None,
@@ -6464,7 +7314,8 @@ fn dispatcher_routes_run_and_logs_directly_to_live_writers() {
             runtime.config.clone(),
             false,
             WorkerCommand::Run {
-                worker: "mini-1".into(),
+                worker: Some("mini-1".into()),
+                no_wait: false,
                 project: None,
                 includes: Vec::new(),
                 timeout: None,
@@ -6841,7 +7692,8 @@ fn reserved_preexecution_exits_are_64_69_70_74_75() {
             artifacts_runtime.config,
             false,
             WorkerCommand::Run {
-                worker: "mini-1".into(),
+                worker: Some("mini-1".into()),
+                no_wait: false,
                 project: None,
                 includes: Vec::new(),
                 timeout: None,
@@ -6969,7 +7821,8 @@ fn reserved_preexecution_exits_are_64_69_70_74_75() {
             busy_runtime.config,
             false,
             WorkerCommand::Run {
-                worker: "mini-1".into(),
+                worker: Some("mini-1".into()),
+                no_wait: true,
                 project: None,
                 includes: Vec::new(),
                 timeout: None,
@@ -7074,7 +7927,8 @@ fn started_command_exits_0_7_64_143_are_preserved() {
             runtime.config,
             false,
             WorkerCommand::Run {
-                worker: "mini-1".into(),
+                worker: Some("mini-1".into()),
+                no_wait: false,
                 project: None,
                 includes: Vec::new(),
                 timeout: None,
@@ -7160,71 +8014,66 @@ fn full_public_forms_execute_without_exposing_hidden_host_commands() {
     let record = persist_log_job(&store, Some(JobStatus::succeeded(110, 0, 0).unwrap()));
     let job_id = record.meta().job_id().to_string();
     let forms = [
-        (
-            {
-                let mut cli = Cli::try_parse_from([
-                    "worker",
-                    "run",
-                    "--worker",
-                    "mini-1",
-                    "--",
-                    "npm",
-                    "test",
-                    "--",
-                    "--literal",
-                ])
-                .unwrap();
-                cli.config = Some(runtime.config.clone());
-                cli
-            },
-            RunScriptRunner::new(runtime.state.canonicalize().unwrap(), run_terminal_steps(0)),
-        ),
-        (
-            {
-                let mut cli = Cli::try_parse_from([
-                    "worker",
-                    "run",
-                    "--worker",
-                    "mini-1",
-                    "--project",
-                    project.as_str(),
-                    "--include",
-                    "tracked.txt",
-                    "--timeout",
-                    "45m",
-                    "--",
-                    "npm",
-                    "test",
-                ])
-                .unwrap();
-                cli.config = Some(runtime.config.clone());
-                cli
-            },
-            RunScriptRunner::new(runtime.state.canonicalize().unwrap(), run_terminal_steps(0)),
-        ),
-        (
-            {
-                let mut cli = Cli::try_parse_from([
-                    "worker",
-                    "run",
-                    "--worker",
-                    "mini-1",
-                    "--shell",
-                    "npm run build && npm test",
-                ])
-                .unwrap();
-                cli.config = Some(runtime.config.clone());
-                cli
-            },
-            RunScriptRunner::new(runtime.state.canonicalize().unwrap(), run_terminal_steps(0)),
-        ),
+        Cli::try_parse_from([
+            "worker",
+            "run",
+            "--worker",
+            "mini-1",
+            "--",
+            "npm",
+            "test",
+            "--",
+            "--literal",
+        ])
+        .unwrap(),
+        Cli::try_parse_from([
+            "worker",
+            "run",
+            "--worker",
+            "mini-1",
+            "--project",
+            project.as_str(),
+            "--include",
+            "tracked.txt",
+            "--timeout",
+            "45m",
+            "--",
+            "npm",
+            "test",
+        ])
+        .unwrap(),
+        Cli::try_parse_from([
+            "worker",
+            "run",
+            "--worker",
+            "mini-1",
+            "--shell",
+            "npm run build && npm test",
+        ])
+        .unwrap(),
     ];
-    for (cli, runner) in forms {
+    for (index, mut cli) in forms.into_iter().enumerate() {
+        let form_root = temp.path().join(format!("run-form-{index}"));
+        fs::create_dir(&form_root).unwrap();
+        let form_runtime = public_runtime(&form_root, repo.root());
+        let form_store = ClientStateStore::open(&form_runtime.state).unwrap();
+        let runner = RunScriptRunner::new(
+            form_runtime.state.canonicalize().unwrap(),
+            run_terminal_steps(0),
+        );
+        cli.config = Some(form_runtime.config.clone());
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let exit = dispatch(cli, &runner, &runtime.context, &mut stdout, &mut stderr);
+        let exit = dispatch(
+            cli,
+            &runner,
+            &form_runtime.context,
+            &mut stdout,
+            &mut stderr,
+        );
         assert_eq!(exit, 0);
         assert_no_hidden_host_leak(&stdout, &stderr);
+        assert_eq!(form_store.list_jobs().unwrap().len(), 1);
         runner.assert_consumed();
     }
 
@@ -7555,7 +8404,8 @@ fn public_diag_missing_config_is_sanitized_for_human_and_json() {
         for json in [false, true] {
             let command = match kind {
                 "run" => WorkerCommand::Run {
-                    worker: "mini-1".into(),
+                    worker: Some("mini-1".into()),
+                    no_wait: false,
                     project: None,
                     includes: Vec::new(),
                     timeout: None,
