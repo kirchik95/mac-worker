@@ -1,12 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    fs::File,
+    fs::{self, File},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
+        unix::{ffi::OsStrExt, fs::PermissionsExt},
     },
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -28,7 +29,8 @@ use crate::{
 };
 
 const MAX_HOST_FILE_BYTES: u64 = 1024 * 1024;
-const HOST_LAYOUT_VERSION: u32 = 1;
+pub const HOST_LAYOUT_VERSION: u32 = 2;
+const PREVIOUS_HOST_LAYOUT_VERSION: u32 = 1;
 const HOST_INSTALLATION_VERSION: u32 = 1;
 const INSTALLATION_PREFIX: &str = ".mac-worker-installation-";
 const HOST_LAYOUT_FILE: &str = "layout.json";
@@ -48,6 +50,8 @@ const OWNED_DIRECTORIES: &[&str] = &[
     "leases",
     "job-index",
     "locks",
+    "repos",
+    "tasks",
 ];
 
 #[doc(hidden)]
@@ -835,12 +839,20 @@ struct CleanupMarker {
 
 impl HostStore {
     pub fn open(root: &Path) -> Result<Self, WorkerError> {
-        Self::open_inner(root, None, true)?
+        Self::open_inner(root, None, true, false)?
             .ok_or_else(|| WorkerError::Protocol("host installation was not initialized".into()))
     }
 
     pub(crate) fn open_if_present(root: &Path) -> Result<Option<Self>, WorkerError> {
-        Self::open_inner(root, None, false)
+        Self::open_inner(root, None, false, false)
+    }
+
+    /// Migrate an initialized v1 host root to the current layout. This is
+    /// intentionally separate from `open`: normal host operations fail closed
+    /// until the setup flow invokes this command.
+    pub fn migrate_layout(root: &Path) -> Result<(), WorkerError> {
+        let _ = Self::open_inner(root, None, false, true)?;
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -848,7 +860,7 @@ impl HostStore {
         root: &Path,
         point: HostStoreWritePoint,
     ) -> Result<Self, WorkerError> {
-        Self::open_inner(root, Some(point), true)?
+        Self::open_inner(root, Some(point), true, false)?
             .ok_or_else(|| WorkerError::Protocol("host installation was not initialized".into()))
     }
 
@@ -870,6 +882,7 @@ impl HostStore {
         root: &Path,
         point: Option<HostStoreWritePoint>,
         create: bool,
+        migrate: bool,
     ) -> Result<Option<Self>, WorkerError> {
         if !root.is_absolute() {
             return Err(WorkerError::Protocol(
@@ -975,12 +988,33 @@ impl HostStore {
             inject_open_fault(point, HostStoreWritePoint::AfterHostRootCreate)?;
         }
         let initialized_layout = rooted.entry_exists(HOST_LAYOUT_FILE)?;
+        let stored_layout = if initialized_layout {
+            Some(read_json_strict_at::<HostLayoutIdentity>(
+                &rooted,
+                HOST_LAYOUT_FILE,
+            )?)
+        } else {
+            None
+        };
+        let needs_migration = stored_layout
+            .as_ref()
+            .is_some_and(|stored| stored.version != HOST_LAYOUT_VERSION);
+        if needs_migration && !migrate {
+            return Err(host_layout_outdated());
+        }
+        if needs_migration
+            && stored_layout
+                .as_ref()
+                .is_some_and(|stored| stored.version != PREVIOUS_HOST_LAYOUT_VERSION)
+        {
+            return Err(host_layout_outdated());
+        }
         if initialize == initialized_layout {
             return Err(WorkerError::Protocol(
                 "host root and layout initialization state disagree".into(),
             ));
         }
-        let namespaces = open_host_namespaces(&rooted, root_device, initialize)?;
+        let namespaces = open_host_namespaces(&rooted, root_device, initialize || needs_migration)?;
         inject_open_fault(point, HostStoreWritePoint::AfterHostNamespaces)?;
         let leases = namespaces
             .get("leases")
@@ -996,9 +1030,22 @@ impl HostStore {
         let layout = if initialized_layout {
             let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
             let current_layout = build_host_layout(&rooted, &namespaces, layout_file_identity)?;
-            let stored: HostLayoutIdentity = read_json_strict_at(&rooted, HOST_LAYOUT_FILE)?;
-            validate_host_layout(&stored, &current_layout)?;
-            stored
+            let stored = stored_layout.expect("initialized layout was read above");
+            if needs_migration {
+                let replacement = serde_json::to_vec(&current_layout).map_err(|error| {
+                    WorkerError::Protocol(format!(
+                        "failed to serialize migrated host layout: {error}"
+                    ))
+                })?;
+                let expected = serde_json::to_vec(&stored).map_err(|error| {
+                    WorkerError::Protocol(format!("failed to serialize host layout: {error}"))
+                })?;
+                rooted.rewrite_private_regular_exact(HOST_LAYOUT_FILE, &expected, &replacement)?;
+                current_layout
+            } else {
+                validate_host_layout(&stored, &current_layout)?;
+                stored
+            }
         } else {
             let layout_file_identity = rooted.write_private_atomic_no_replace_with_identity(
                 HOST_LAYOUT_FILE,
@@ -1822,6 +1869,38 @@ impl HostStore {
             .display_root
             .join("job-index")
             .join(format!("{job}.json")))
+    }
+
+    pub fn mirror(&self, project_id: &str) -> Result<RootedDir, WorkerError> {
+        self.validate_layout()?;
+        validate_digest(project_id, "project ID")?;
+        let repos = self.open_directory("repos", false)?;
+        let name = format!("{project_id}.git");
+        let mirror = if repos.entry_exists(&name)? {
+            repos.open_child_directory(&relative(&name)?, false)?
+        } else {
+            let mirror = repos.create_new_child_directory(&name)?;
+            if let Err(error) = initialize_mirror(&mirror) {
+                let _ = self.remove_owned_child_committed(&repos, &name);
+                return Err(error);
+            }
+            mirror
+        };
+        ensure_mirror_directory(&mirror)?;
+        Ok(mirror)
+    }
+
+    pub fn mirror_if_present(&self, project_id: &str) -> Result<Option<RootedDir>, WorkerError> {
+        self.validate_layout()?;
+        validate_digest(project_id, "project ID")?;
+        let repos = self.open_directory("repos", false)?;
+        let name = format!("{project_id}.git");
+        if !repos.entry_exists(&name)? {
+            return Ok(None);
+        }
+        let mirror = repos.open_child_directory(&relative(&name)?, false)?;
+        ensure_mirror_directory(&mirror)?;
+        Ok(Some(mirror))
     }
 
     pub fn begin_job(
@@ -3020,6 +3099,81 @@ fn build_host_layout(
     })
 }
 
+fn initialize_mirror(mirror: &RootedDir) -> Result<(), WorkerError> {
+    let output = Command::new("/usr/bin/git")
+        .args(["init", "--bare"])
+        .arg(mirror.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()?;
+    if !output.status.success() {
+        return Err(WorkerError::Git {
+            code: "BASE_UNAVAILABLE",
+            message: "failed to initialize the host mirror".into(),
+        });
+    }
+    ensure_mirror_directory(mirror)
+}
+
+fn ensure_mirror_directory(mirror: &RootedDir) -> Result<(), WorkerError> {
+    mirror.verify_descriptors_cloexec()?;
+    let metadata = fs::symlink_metadata(mirror.path())?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(WorkerError::Git {
+            code: "BASE_UNAVAILABLE",
+            message: "host mirror is not a private directory".into(),
+        });
+    }
+    fs::set_permissions(mirror.path(), fs::Permissions::from_mode(0o700))?;
+    let hooks = mirror.path().join("hooks");
+    match fs::symlink_metadata(&hooks) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(WorkerError::Git {
+                code: "BASE_UNAVAILABLE",
+                message: "host mirror hooks directory is unsafe".into(),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&hooks)?,
+        Err(error) => return Err(error.into()),
+    }
+    fs::set_permissions(&hooks, fs::Permissions::from_mode(0o700))?;
+    let hook = hooks.join("pre-receive");
+    if fs::symlink_metadata(&hook)
+        .map(|metadata| !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0)
+        .unwrap_or(false)
+    {
+        return Err(WorkerError::Git {
+            code: "BASE_UNAVAILABLE",
+            message: "host mirror pre-receive hook is unsafe".into(),
+        });
+    }
+    if fs::read(&hook).ok().as_deref() != Some(crate::git_transport::PRE_RECEIVE_HOOK.as_bytes()) {
+        fs::write(&hook, crate::git_transport::PRE_RECEIVE_HOOK)?;
+    }
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
+    configure_mirror(mirror.path())
+}
+
+fn configure_mirror(path: &Path) -> Result<(), WorkerError> {
+    for (key, value) in [("core.hooksPath", "hooks"), ("receive.denyDeletes", "true")] {
+        let output = Command::new("/usr/bin/git")
+            .args(["--git-dir"])
+            .arg(path)
+            .args(["config", key, value])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()?;
+        if !output.status.success() {
+            return Err(WorkerError::Git {
+                code: "BASE_UNAVAILABLE",
+                message: "failed to configure the host mirror".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn installation_names(parent: &RootedDir, root: &Path) -> Result<InstallationNames, WorkerError> {
     let root_component = root.file_name().ok_or_else(|| {
         WorkerError::Protocol("host data root must identify one directory entry".into())
@@ -3114,6 +3268,12 @@ fn validate_host_layout(
         ));
     }
     Ok(())
+}
+
+fn host_layout_outdated() -> WorkerError {
+    WorkerError::Unavailable(
+        "HOST_LAYOUT_OUTDATED: host layout requires worker setup migration".to_string(),
+    )
 }
 
 fn build_transfer_lock_identity(

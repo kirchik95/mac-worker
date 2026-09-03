@@ -1,23 +1,20 @@
 mod support;
 
 use std::{
-    ffi::OsString,
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
-    sync::Mutex,
     time::Duration,
 };
 
 use mac_worker::{
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    process::SystemProcessRunner,
     project::{ProjectContext, ProjectInspector},
     project_config::{ArtifactSettings, ProjectSettings, ResourceClass, SnapshotSettings},
     task::{BaseOid, GitIdentity, TaskId},
     transfer_repo::{BaseKind, RepositoryFingerprint, TransferRepo, repo_id_for},
 };
-use support::{GitRepo, create_directory};
+use support::{GitRepo, create_directory, recording_runner::RecordingRunner};
 use uuid::Uuid;
 
 fn runner() -> SystemProcessRunner {
@@ -617,7 +614,7 @@ fn write_commands_use_the_transfer_git_dir_and_ignore_user_index_lock() {
     repo.write("src/app.rs", b"changed\n");
     fs::write(repo.git_path("index.lock"), b"locked\n").unwrap();
     let cache = cache_root();
-    let recorder = RecordingRunner::default();
+    let recorder = RecordingRunner::passthrough();
     let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
     transfer
         .build_wip_base(
@@ -647,38 +644,6 @@ fn write_commands_use_the_transfer_git_dir_and_ignore_user_index_lock() {
         );
     }
 }
-
-#[derive(Default)]
-struct RecordingRunner {
-    writes: Mutex<Vec<Vec<OsString>>>,
-}
-
-impl RecordingRunner {
-    fn write_args(&self) -> Vec<Vec<OsString>> {
-        self.writes.lock().expect("lock").clone()
-    }
-}
-
-impl ProcessRunner for RecordingRunner {
-    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-        let args: Vec<String> = request
-            .args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        let writes = args.iter().any(|arg| {
-            matches!(
-                arg.as_str(),
-                "hash-object" | "update-index" | "write-tree" | "commit-tree" | "update-ref"
-            )
-        });
-        if writes {
-            self.writes.lock().expect("lock").push(request.args.clone());
-        }
-        SystemProcessRunner.run(request)
-    }
-}
-
 #[test]
 fn open_or_create_rejects_a_symlinked_transfer_directory() {
     let repo = repo_with_commits();

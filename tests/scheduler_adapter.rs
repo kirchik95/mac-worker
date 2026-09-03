@@ -2,7 +2,9 @@ use mac_worker::{
     config::{Config, WorkerEntry},
     error::WorkerError,
     lease::SlotState,
-    protocol::{CpuCounters, HealthStatus, MemoryPressure, ProbeResponse, WorkerHealth},
+    protocol::{
+        CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
+    },
     scheduler_adapter::SchedulerProbeAdapter,
 };
 
@@ -27,7 +29,7 @@ fn ready_health() -> WorkerHealth {
         ssh: "mac1".into(),
         status: HealthStatus::Ready,
         probe: Some(ProbeResponse {
-            protocol_version: 3,
+            protocol_version: PROTOCOL_VERSION,
             supervision_version: 2,
             hostname: "mini-1.local".into(),
             arch: "arm64".into(),

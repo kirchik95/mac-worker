@@ -154,11 +154,12 @@ fn symlink_entry(path: &str, target: &str) -> ManifestEntry {
 fn verify_request_bytes() -> Vec<u8> {
     format!(
         concat!(
-            r#"{{"protocol_version":3,"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","#,
+            r#"{{"protocol_version":{PROTOCOL_VERSION},"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","#,
             r#""lease_token":"{LEASE_TOKEN}","request_fingerprint":"{FINGERPRINT}","#,
             r#""project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
             r#""manifest_digest":"{MANIFEST_DIGEST}"}}"#,
         ),
+        PROTOCOL_VERSION = PROTOCOL_VERSION,
         JOB_ID = JOB_ID,
         CLIENT_ID = CLIENT_ID,
         LEASE_TOKEN = LEASE_TOKEN,
@@ -194,10 +195,11 @@ fn receipt_bytes() -> Vec<u8> {
 fn response_bytes() -> Vec<u8> {
     format!(
         concat!(
-            r#"{{"protocol_version":3,"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","#,
+            r#"{{"protocol_version":{PROTOCOL_VERSION},"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","#,
             r#""project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
             r#""manifest_digest":"{MANIFEST_DIGEST}","verified_at_millis":42,"cache_reused":false}}"#,
         ),
+        PROTOCOL_VERSION = PROTOCOL_VERSION,
         JOB_ID = JOB_ID,
         CLIENT_ID = CLIENT_ID,
         PROJECT_ID = PROJECT_ID,
@@ -1593,7 +1595,7 @@ fn hidden_snapshot_verify_failures_are_versioned() {
     assert_eq!(error.error().message(), "host request was invalid");
     assert_eq!(
         stdout,
-        br#"{"protocol_version":3,"error":{"code":"INVALID_REQUEST","message":"host request was invalid"}}
+        br#"{"protocol_version":4,"error":{"code":"INVALID_REQUEST","message":"host request was invalid"}}
 "#
     );
     let rendered = String::from_utf8(stdout).unwrap();

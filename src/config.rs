@@ -123,7 +123,7 @@ fn valid_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'))
 }
 
-fn valid_ssh_destination(value: &str) -> bool {
+pub(crate) fn valid_ssh_destination(value: &str) -> bool {
     value
         .as_bytes()
         .first()

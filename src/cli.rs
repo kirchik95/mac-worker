@@ -93,6 +93,22 @@ pub enum HostCommand {
     LeaseAcquire,
     #[command(name = "snapshot-verify")]
     SnapshotVerify,
+    #[command(name = "migrate-layout")]
+    MigrateLayout,
+    #[command(name = "receive-pack")]
+    ReceivePack {
+        job_id: HiddenComponent,
+        client_id: HiddenComponent,
+        lease_token: HiddenComponent,
+        request_fingerprint: HiddenComponent,
+        path: HiddenComponent,
+    },
+    #[command(name = "upload-pack")]
+    UploadPack {
+        task_id: HiddenComponent,
+        client_id: HiddenComponent,
+        path: HiddenComponent,
+    },
     #[command(name = "rsync-receive", trailing_var_arg = true)]
     RsyncReceive {
         job_id: HiddenComponent,

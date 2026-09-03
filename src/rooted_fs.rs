@@ -3,7 +3,7 @@ use std::{
     ffi::{CStr, CString},
     fmt,
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
@@ -766,6 +766,7 @@ pub struct RootedDir {
     parent: OwnedFd,
     root_name: CString,
     root_identity: FileIdentity,
+    display_path: PathBuf,
     // These immutable capability bindings are safe to share; each RootedDir
     // still owns fresh descriptors for its current root and direct parent.
     lineage: Vec<Arc<DirectoryBinding>>,
@@ -822,6 +823,14 @@ impl PrivateEntryIdentity {
 }
 
 impl RootedDir {
+    /// Returns the best-effort display path captured when this rooted handle
+    /// was opened. Security-sensitive operations continue to use the retained
+    /// descriptors; this is provided for child processes such as Git whose
+    /// interface accepts a filesystem path.
+    pub fn path(&self) -> &Path {
+        &self.display_path
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         let (parent_path, root_name) = split_root_path(path)?;
         let parent = open_directory_path(parent_path)?;
@@ -832,6 +841,7 @@ impl RootedDir {
             parent,
             root_name,
             root_identity,
+            display_path: path.to_path_buf(),
             lineage: Vec::new(),
             security_device: None,
         })
@@ -855,6 +865,7 @@ impl RootedDir {
             parent,
             root_name,
             root_identity,
+            display_path: path.to_path_buf(),
             lineage: Vec::new(),
             security_device: None,
         })
@@ -909,6 +920,7 @@ impl RootedDir {
                     parent: current,
                     root_name,
                     root_identity: FileIdentity::from_stat(&opened),
+                    display_path: path.to_path_buf(),
                     lineage,
                     security_device: None,
                 });
@@ -953,6 +965,7 @@ impl RootedDir {
             parent: reopen_directory(self.parent.as_raw_fd())?,
             root_name: self.root_name.clone(),
             root_identity: self.root_identity,
+            display_path: self.display_path.clone(),
             lineage: clone_lineage(&self.lineage),
             security_device: self.security_device,
         })
@@ -1099,6 +1112,7 @@ impl RootedDir {
             parent,
             root_name: name,
             root_identity: FileIdentity::from_stat(&opened),
+            display_path: self.display_path.join(path.as_path()),
             lineage,
             security_device,
         })
@@ -1107,6 +1121,7 @@ impl RootedDir {
     pub(crate) fn create_new_child_directory(&self, name: &str) -> io::Result<Self> {
         self.verify_root_name()?;
         let name = CString::new(name).map_err(interior_nul_error)?;
+        let display_path = self.display_path.join(name.to_string_lossy().as_ref());
         mkdir_at(self.root.as_raw_fd(), &name, 0o700)?;
         let root = open_directory_at(self.root.as_raw_fd(), &name)?;
         let opened = stat_fd(root.as_raw_fd())?;
@@ -1122,6 +1137,7 @@ impl RootedDir {
             parent: reopen_directory(self.root.as_raw_fd())?,
             root_name: name,
             root_identity: FileIdentity::from_stat(&opened),
+            display_path,
             lineage,
             security_device: self.security_device,
         })
@@ -1134,6 +1150,7 @@ impl RootedDir {
     ) -> io::Result<Self> {
         self.verify_root_name()?;
         let name = CString::new(name).map_err(interior_nul_error)?;
+        let display_path = self.display_path.join(name.to_string_lossy().as_ref());
         let path_stat = stat_at(self.root.as_raw_fd(), &name)?;
         require_private_directory_on_device(&path_stat, expected_device)?;
         let root = open_directory_at(self.root.as_raw_fd(), &name)?;
@@ -1147,6 +1164,7 @@ impl RootedDir {
             parent: reopen_directory(self.root.as_raw_fd())?,
             root_name: name,
             root_identity: FileIdentity::from_stat(&opened),
+            display_path,
             lineage: self.child_lineage()?,
             security_device: Some(expected_device),
         })
@@ -1735,6 +1753,50 @@ impl RootedDir {
         })?)?;
         let final_binding = stat_at(self.root.as_raw_fd(), &target)?;
         if !same_file(&final_binding, &replacement_opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
+    /// Rewrites an existing owner-only regular file without changing its
+    /// inode. This is used by the host-layout migration so the installation
+    /// identity can continue to bind the layout record to the same entry.
+    /// The caller supplies the exact bytes observed before the rewrite.
+    pub(crate) fn rewrite_private_regular_exact(
+        &self,
+        name: &str,
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        let target = CString::new(name).map_err(interior_nul_error)?;
+        let before = stat_at(self.root.as_raw_fd(), &target)?;
+        require_private_regular(&before)?;
+        let descriptor = open_regular_rw_at(self.root.as_raw_fd(), &target)?;
+        let mut file = File::from(descriptor);
+        let opened = stat_fd(file.as_raw_fd())?;
+        require_private_regular(&opened)?;
+        if !same_file(&before, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        let mut old_bytes = Vec::new();
+        file.read_to_end(&mut old_bytes)?;
+        let rebound = stat_at(self.root.as_raw_fd(), &target)?;
+        if old_bytes != expected
+            || !snapshot_metadata_stable(&before, &opened)
+            || !snapshot_metadata_stable(&before, &rebound)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(replacement)?;
+        file.sync_all()?;
+        let after = stat_fd(file.as_raw_fd())?;
+        let final_path = stat_at(self.root.as_raw_fd(), &target)?;
+        require_private_regular(&after)?;
+        require_private_regular(&final_path)?;
+        if !same_file(&before, &after) || !same_file(&before, &final_path) {
             return Err(os_error(libc::ESTALE));
         }
         cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })

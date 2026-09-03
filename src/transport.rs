@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    config::{Config, WorkerEntry},
+    config::{Config, WorkerEntry, valid_ssh_destination},
     error::{ProcessError, ProcessStream, WorkerError},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::{
@@ -183,6 +183,18 @@ impl<R: ProcessRunner> WorkersService<R> {
 impl<R: ProcessRunner> SshTransport<R> {
     pub fn new(runner: R) -> Self {
         Self { runner }
+    }
+
+    pub fn git_ssh_command(&self, worker: &WorkerEntry) -> Result<String, WorkerError> {
+        if !valid_ssh_destination(&worker.ssh) || worker.remote_binary != "~/.local/bin/worker" {
+            return Err(WorkerError::Transport {
+                code: "INVALID_REQUEST",
+                message: "worker transport configuration is invalid".into(),
+            });
+        }
+        Ok(format!(
+            "{SSH_PROGRAM} -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
+        ))
     }
 
     pub fn probe(&self, worker: &WorkerEntry) -> WorkerHealth {

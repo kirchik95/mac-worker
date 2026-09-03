@@ -13,6 +13,10 @@ use dashboard::command::{
 };
 use doctor::{DoctorRequest, DoctorService};
 use error::WorkerError;
+use git_transport::{
+    GitServerExecutor, HostGitService, ReceivePackComponents, SystemGitServerExecutor,
+    UploadPackComponents,
+};
 use host_store::HostStore;
 use install::Installer;
 use job::{
@@ -52,6 +56,7 @@ pub mod config;
 pub mod dashboard;
 pub mod doctor;
 pub mod error;
+pub mod git_transport;
 pub mod host_store;
 pub mod inputs;
 pub mod install;
@@ -270,6 +275,21 @@ fn execute_with_context(
             command: HostCommand::RsyncReceive { .. },
         } => Err(WorkerError::Protocol(
             "host rsync-receive requires the binary stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::MigrateLayout,
+        } => Err(WorkerError::Protocol(
+            "host migrate-layout requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::ReceivePack { .. },
+        } => Err(WorkerError::Protocol(
+            "host receive-pack requires the binary stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::UploadPack { .. },
+        } => Err(WorkerError::Protocol(
+            "host upload-pack requires the binary stdio execution boundary".into(),
         )),
     }
 }
@@ -610,6 +630,56 @@ pub fn run_with_rsync_executor_in_context(
     if matches!(
         &cli.command,
         Command::Host {
+            command: HostCommand::MigrateLayout
+        }
+    ) {
+        return run_host_migrate_layout(cli.config, runtime, stderr);
+    }
+    if let Command::Host {
+        command:
+            HostCommand::ReceivePack {
+                job_id,
+                client_id,
+                lease_token,
+                request_fingerprint,
+                path,
+            },
+    } = cli.command
+    {
+        return run_host_receive_pack(
+            cli.config,
+            runtime,
+            job_id,
+            client_id,
+            lease_token,
+            request_fingerprint,
+            path,
+            &SystemGitServerExecutor,
+            stderr,
+        );
+    }
+    if let Command::Host {
+        command:
+            HostCommand::UploadPack {
+                task_id,
+                client_id,
+                path,
+            },
+    } = cli.command
+    {
+        return run_host_upload_pack(
+            cli.config,
+            runtime,
+            task_id,
+            client_id,
+            path,
+            &SystemGitServerExecutor,
+            stderr,
+        );
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
             command: HostCommand::Cancel
         }
     ) {
@@ -922,6 +992,113 @@ fn run_host_supervise(
     match result {
         Ok(()) => 0,
         Err(error) => error.exit_code(),
+    }
+}
+
+fn run_host_migrate_layout(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        HostStore::migrate_layout(&paths.host_state_root())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            write_error(stderr, &error);
+            error.exit_code()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_host_receive_pack(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    job_id: HiddenComponent,
+    client_id: HiddenComponent,
+    lease_token: HiddenComponent,
+    request_fingerprint: HiddenComponent,
+    path: HiddenComponent,
+    executor: &dyn GitServerExecutor,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let components = ReceivePackComponents::new(
+            parse_host_component(job_id.expose(), "receiver job identity")?,
+            parse_host_component(client_id.expose(), "receiver client identity")?,
+            parse_host_component(lease_token.expose(), "receiver lease identity")?,
+            parse_host_component(request_fingerprint.expose(), "receiver fingerprint")?,
+        );
+        let paths = discover_paths(config_override, runtime)?;
+        let store = HostStore::open(&paths.host_state_root())?;
+        let never =
+            HostGitService::new(&store).receive_pack(&components, path.expose(), executor)?;
+        match never {}
+    })();
+    finish_git_server_command(result, stderr)
+}
+
+fn run_host_upload_pack(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    task_id: HiddenComponent,
+    client_id: HiddenComponent,
+    path: HiddenComponent,
+    executor: &dyn GitServerExecutor,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let components = UploadPackComponents::new(
+            parse_host_component(task_id.expose(), "upload task identity")?,
+            parse_host_component(client_id.expose(), "upload client identity")?,
+        );
+        let paths = discover_paths(config_override, runtime)?;
+        let store = HostStore::open(&paths.host_state_root())?;
+        let never =
+            HostGitService::new(&store).upload_pack(&components, path.expose(), executor)?;
+        match never {}
+    })();
+    finish_git_server_command(result, stderr)
+}
+
+fn parse_host_component<T>(value: &str, label: &str) -> Result<T, WorkerError>
+where
+    T: std::str::FromStr,
+{
+    value
+        .parse()
+        .map_err(|_| WorkerError::Protocol(format!("INVALID_COMPONENT: invalid {label}")))
+}
+
+fn finish_git_server_command(result: Result<(), WorkerError>, stderr: &mut dyn Write) -> u8 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            let code = public_git_server_error(&error);
+            if writeln!(stderr, "{code}").is_err() || stderr.flush().is_err() {
+                crate::error::ExitKind::Io as u8
+            } else {
+                error.exit_code()
+            }
+        }
+    }
+}
+
+fn public_git_server_error(error: &WorkerError) -> &'static str {
+    match error {
+        WorkerError::Protocol(message) if message.starts_with("INVALID_COMPONENT:") => {
+            "HOST_GIT_INVALID_COMPONENT"
+        }
+        WorkerError::Protocol(message) if message.starts_with("LEASE_IDENTITY_MISMATCH:") => {
+            "HOST_GIT_LEASE"
+        }
+        WorkerError::Task { .. } => "HOST_GIT_TASK",
+        WorkerError::Git { code, .. } => code,
+        WorkerError::Io(_) => "HOST_GIT_IO",
+        _ => "HOST_GIT_REJECTED",
     }
 }
 

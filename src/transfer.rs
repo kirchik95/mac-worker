@@ -251,6 +251,10 @@ impl TransferIdentity {
         self.client_id
     }
 
+    pub(crate) fn lease_token(&self) -> LeaseToken {
+        self.lease_token
+    }
+
     pub fn request_fingerprint(&self) -> &RequestFingerprint {
         &self.request_fingerprint
     }
@@ -1026,7 +1030,7 @@ fn validated_server_args(supplied: &[OsString]) -> Result<Vec<OsString>, WorkerE
     Ok(validated)
 }
 
-fn require_live_identity(
+pub(crate) fn require_live_identity(
     store: &HostStore,
     identity: &TransferIdentity,
 ) -> Result<LeaseRecord, WorkerError> {
@@ -1051,7 +1055,7 @@ fn require_live_identity(
     Ok(live)
 }
 
-fn require_receivable_disposition(
+pub(crate) fn require_receivable_disposition(
     store: &HostStore,
     live: &LeaseRecord,
 ) -> Result<(), WorkerError> {

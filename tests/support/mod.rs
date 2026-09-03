@@ -1,3 +1,5 @@
+pub mod recording_runner;
+
 use std::{
     fs,
     path::{Path, PathBuf},

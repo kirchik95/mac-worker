@@ -97,6 +97,10 @@ pub struct ImportReceipt {
 }
 
 impl ImportReceipt {
+    pub(crate) fn new(head: BaseOid, local_ref: String) -> Self {
+        Self { head, local_ref }
+    }
+
     pub fn head(&self) -> &BaseOid {
         &self.head
     }
