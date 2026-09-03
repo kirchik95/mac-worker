@@ -1462,15 +1462,15 @@ mod exec_inheritance_tests {
             .write_all(std::process::id().to_string().as_bytes())
             .unwrap();
 
+        assert_eq!(
+            unsafe { libc::fcntl(sentinel_fd, libc::F_GETFD) },
+            -1,
+            "unrelated inheritable fd survived exec"
+        );
         let mut arm_pipe = [-1; 2];
         assert_eq!(unsafe { libc::pipe(arm_pipe.as_mut_ptr()) }, 0);
         let arm_reader = unsafe { File::from_raw_fd(arm_pipe[0]) };
         let mut arm_writer = unsafe { File::from_raw_fd(arm_pipe[1]) };
-        assert_ne!(
-            arm_reader.as_raw_fd(),
-            sentinel_fd,
-            "inherited arm reader fd must not collide with the sentinel fd number"
-        );
         let writer_flags = unsafe { libc::fcntl(arm_writer.as_raw_fd(), libc::F_GETFD) };
         assert_ne!(writer_flags, -1);
         assert_eq!(
