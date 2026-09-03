@@ -193,7 +193,8 @@ fn codex_first_turn_reads_prompt_from_stdin_and_requests_schema() {
     assert_eq!(launch.program(), "codex");
     assert!(launch.args().starts_with(&["exec".into(), "--json".into()]));
     assert!(launch.args().windows(2).any(|w| w[0] == "-s" && w[1] == "workspace-write"));
-    assert!(launch.args().contains(&"--approve-for-me".into()));
+    assert!(launch.args().windows(2).any(|w| w[0] == "-c" && w[1] == "approval_policy=\"never\""));
+    assert!(!launch.args().contains(&"--approve-for-me".into()));            // incompatible with --sandbox in Codex 0.153
     assert!(launch.args().windows(2).any(|w| w[0] == "--output-schema" && w[1] == "{schema}"));
     assert!(launch.args().windows(2).any(|w| w[0] == "-o" && w[1] == "{last_message}"));
     assert_eq!(launch.args().last().map(String::as_str), Some("-"));
@@ -306,7 +307,7 @@ pub fn adapter_for(kind: AgentKind) -> &'static dyn AgentAdapter;
 pub fn render_shell(launch: &TurnLaunch) -> Result<String, AdapterError>;
 ```
 
-Arguments use the placeholders `{schema}` and `{last_message}`; `render_shell` prefixes `exec`, single-quotes every ordinary argument, and renders the two placeholders as the double-quoted environment references `"$MAC_WORKER_TURN_DIR/result.schema.json"` and `"$MAC_WORKER_TURN_DIR/last.md"`, so the string is identical for every worker and contains no paths. Codex first turn: `exec --json -o {last_message} --output-schema {schema} [-m MODEL] <policy> -` where `Workspace` is `-s workspace-write --approve-for-me -c sandbox_workspace_write.network_access=true` and `Unattended` is `--dangerously-bypass-approvals-and-sandbox`; Codex resume: `exec resume <ref> --json -o {last_message} --output-schema {schema} -c sandbox_mode="workspace-write" -c sandbox_workspace_write.network_access=true -c approval_policy="never" -` for `Workspace` (the spike records whether `--approve-for-me` has a configuration equivalent, which then replaces `approval_policy="never"`), and the `-c` equivalents of the bypass flag for `Unattended`; never `-C`, `-s`, or `--approve-for-me`. Claude first turn: `-p --output-format stream-json --session-id <seed> --json-schema <RESULT_SCHEMA_JSON> [--model] [--max-turns] [--max-budget-usd] --permission-mode bypassPermissions`; resume replaces `--session-id` with `--resume <ref>`; env names `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`. Adjust details to the spike record, never from memory. Result extraction prefers the last-message file, then the final assistant text; malformed JSON is `Unknown`.
+Arguments use the placeholders `{schema}` and `{last_message}`; `render_shell` prefixes `exec`, single-quotes every ordinary argument, and renders the two placeholders as the double-quoted environment references `"$MAC_WORKER_TURN_DIR/result.schema.json"` and `"$MAC_WORKER_TURN_DIR/last.md"`, so the string is identical for every worker and contains no paths. Codex first turn: `exec --json -o {last_message} --output-schema {schema} [-m MODEL] <policy> -` where `Workspace` is `-s workspace-write -c approval_policy="never" -c sandbox_workspace_write.network_access=true` (the spike showed `--approve-for-me` is incompatible with `--sandbox`) and `Unattended` is `--dangerously-bypass-approvals-and-sandbox`; Codex resume: `exec resume <ref> --json -o {last_message} --output-schema {schema} -c sandbox_mode="workspace-write" -c sandbox_workspace_write.network_access=true -c approval_policy="never" -` for `Workspace`, and the `-c` equivalents of the bypass flag for `Unattended`; never `-C`, `-s`, or `--approve-for-me`. Exit classification consults the structured status before the exit code, because a failing Codex turn can exit `0` with status `blocked`. Claude first turn: `-p --output-format stream-json --session-id <seed> --json-schema <RESULT_SCHEMA_JSON> [--model] [--max-turns] [--max-budget-usd] --permission-mode bypassPermissions`; resume replaces `--session-id` with `--resume <ref>`; env names `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`. Adjust details to the spike record, never from memory. Result extraction prefers the last-message file, then the final assistant text; malformed JSON is `Unknown`.
 
 - [ ] **Step 4: Run adapter tests to verify GREEN**
 
@@ -770,34 +771,44 @@ git commit -m "feat: build task bases in a transfer repository"
 
 **Interfaces:**
 - Consumes: `HostStore`, `RootedDir`, `LeaseRecord`, `TransferGuard`, `ProcessRunner`, Task 2 records, Task 3 mirror.
-- Produces: `TaskStore::{prepare, status, diff, close, load_meta, load_status, replace_status_after, bind_session, session}`, `SessionBinding`, `TaskPrepareRequest`, `TaskPrepareResponse`, `TaskStatusRequest`, `TaskStatusResponse`, `TaskDiffRequest`, `TaskDiffResponse`, `TaskCloseRequest`, `TaskCloseResponse`, `HostOperation::{TaskPrepare, TaskStatus, TaskDiff, TaskClose}`, hidden `host task-prepare|task-status|task-diff|task-close`, `MAX_DIFF_BYTES`.
+- Produces: `TaskStore::{prepare, status, diff, close, publish_branch_into_mirror, load_meta, load_status, replace_status_after, bind_session, session}`, `SessionBinding`, `TaskPrepareRequest`, `TaskPrepareResponse`, `TaskStatusRequest`, `TaskStatusResponse`, `TaskDiffRequest`, `TaskDiffResponse`, `TaskCloseRequest`, `TaskCloseResponse`, `HostOperation::{TaskPrepare, TaskStatus, TaskDiff, TaskClose}`, hidden `host task-prepare|task-status|task-diff|task-close`, `MAX_DIFF_BYTES`.
 
 - [ ] **Step 1: Write failing materialization tests**
 
 ```rust
 #[test]
-fn prepare_creates_worktree_on_task_branch_at_verified_base_under_lease() {
-    let (store, _) = store_with_mirror_containing(base_oid());
+fn prepare_creates_shared_clone_on_task_branch_at_verified_base_under_lease() {
+    let (store, mirror) = store_with_mirror_containing(base_oid());
     let response = TaskStore::new(&store, &runner()).prepare(&prepare_request(base_oid()), &transfer_guard()).unwrap();
     assert_eq!(response.head(), &base_oid());
     assert!(!response.reused());
     let workspace = store.task_workspace(&project_id(), task_id()).unwrap();
     assert_eq!(git(&workspace, ["rev-parse", "--abbrev-ref", "HEAD"]), format!("task/{}", task_id()));
-    assert!(workspace.join(".git").is_file());
+    assert!(workspace.join(".git").is_dir());                                     // own git dir inside the writable checkout
+    assert!(read(workspace.join(".git/objects/info/alternates")).trim().ends_with("objects"));
+    assert!(!git_ref_exists(&mirror, &format!("refs/heads/task/{}", task_id())));  // the mirror learns the branch only at publication
     assert_eq!(store.task_status(&project_id(), task_id()).unwrap().state(), TaskState::Active);
 }
 
 #[test]
 fn prepare_is_idempotent_on_retry_and_refuses_inconsistent_state() {
-    let (store, mirror) = store_with_mirror_containing(base_oid());
+    let (store, _) = store_with_mirror_containing(base_oid());
     TaskStore::new(&store, &runner()).prepare(&prepare_request(base_oid()), &transfer_guard()).unwrap();
     assert!(TaskStore::new(&store, &runner()).prepare(&prepare_request(base_oid()), &transfer_guard()).unwrap().reused());
-    remove_dir_all(store.task_workspace(&project_id(), task_id()).unwrap());       // crash after branch creation
-    assert!(TaskStore::new(&store, &runner()).prepare(&prepare_request(base_oid()), &transfer_guard()).unwrap().reused());
+    truncate_clone_to_partial(store.task_workspace(&project_id(), task_id()).unwrap());   // crash mid-clone: no valid HEAD
+    assert!(!TaskStore::new(&store, &runner()).prepare(&prepare_request(base_oid()), &transfer_guard()).unwrap().reused());
     commit_in_workspace(&store, task_id());
     let err = TaskStore::new(&store, &runner()).prepare(&prepare_request(other_oid()), &transfer_guard()).unwrap_err();
     assert_eq!(err.public_code(), "WORKTREE_INCONSISTENT");
-    assert!(git_ref_exists(&mirror, &format!("refs/heads/task/{}", task_id())));
+}
+
+#[test]
+fn codex_workspace_sandbox_can_commit_inside_the_shared_clone() {
+    // Runs only when `codex` is installed locally; otherwise it is skipped with a message.
+    let (store, _) = store_with_prepared_task();
+    let workspace = store.task_workspace(&project_id(), task_id()).unwrap();
+    let status = codex_sandbox_run(&workspace, "git -C . commit --allow-empty -m probe");
+    assert!(status.success(), "workspace-write sandbox must allow commits inside the clone");
 }
 
 #[test]
@@ -819,19 +830,19 @@ fn diff_uses_private_index_and_never_locks_the_workspace() {
 fn close_removes_only_the_workspace_and_discard_prunes_refs() {
     let (store, mirror) = store_with_prepared_task();
     commit_in_workspace(&store, task_id());
+    publish_branch_into_mirror(&store, task_id());                                 // what the publisher does at turn end
     TaskStore::new(&store, &runner()).close(&close_request(task_id(), false)).unwrap();
     assert!(store.task_workspace_if_present(&project_id(), task_id()).unwrap().is_none());
     assert!(store.task_dir(&project_id(), task_id()).unwrap().join("meta.json").exists());
     assert_eq!(store.task_status(&project_id(), task_id()).unwrap().state(), TaskState::Closed);
     assert!(git_ref_exists(&mirror, &format!("refs/heads/task/{}", task_id())));
-    assert!(git(&mirror, ["worktree", "list", "--porcelain"]).lines().all(|l| !l.contains(&task_id().to_string())));
     TaskStore::new(&store, &runner()).close(&close_request(task_id(), true)).unwrap();
     assert!(!git_ref_exists(&mirror, &format!("refs/heads/task/{}", task_id())));
     assert!(!git_ref_exists(&mirror, &format!("refs/mac-worker/bases/{}", task_id())));
 }
 ```
 
-Also test: two tasks on one mirror do not see each other's uncommitted work; `diff --stat` on a task with ignored files present works and `close` succeeds with ignored files present (`--force`); `status` on an unknown task is `TASK_NOT_FOUND`; `close` on a task with an active turn is `TASK_BUSY`; task meta, status, and session files are owner-only canonical JSON validated no-follow; symlinked `workspace` entries are refused; `bind_session` writes `session.json` once and a second binding with a different reference is rejected; `prepare` fails with `BASE_UNAVAILABLE` before any directory when the base is missing or not a commit; every DTO carries `protocol_version` and rejects unknown fields; diff output is measured after JSON escaping against `MAX_DIFF_BYTES = 512 * 1024`.
+Also test: two tasks on one mirror do not see each other's uncommitted work; `diff --stat` on a task with ignored files present works and `close` succeeds with ignored files present; `publish_branch_into_mirror` uses `git -C <mirror> fetch <workspace> +refs/heads/task/<id>:refs/heads/task/<id>` and succeeds although the mirror's pre-receive hook rejects client pushes to `refs/heads/*`; `status` on an unknown task is `TASK_NOT_FOUND`; `close` on a task with an active turn is `TASK_BUSY`; task meta, status, and session files are owner-only canonical JSON validated no-follow; symlinked `workspace` entries are refused; `bind_session` writes `session.json` once and a second binding with a different reference is rejected; `prepare` fails with `BASE_UNAVAILABLE` before any directory when the base is missing or not a commit; every DTO carries `protocol_version` and rejects unknown fields; diff output is measured after JSON escaping against `MAX_DIFF_BYTES = 512 * 1024`.
 
 - [ ] **Step 2: Run materialization tests to verify RED**
 
@@ -856,7 +867,7 @@ impl<'a> TaskStore<'a> {
 }
 ```
 
-`prepare` runs under the turn's transfer lock, verifies `git cat-file -t <base_oid>` is `commit` in the mirror, then: if the workspace exists on branch `task/<task_id>` with `HEAD == base_oid` and a clean `status --porcelain`, returns `reused`; if the branch exists without a workspace, runs `git worktree prune` and `git worktree add <workspace> task/<task_id>`; if neither exists, creates the task directory component by component and runs `git worktree add -b task/<task_id> <workspace> <base_oid>`; anything else is `WORKTREE_INCONSISTENT`. It writes `meta.json` and `status.json` (`Active`, worker name, turn 1 pending) and fsyncs. `diff` copies the workspace index (`git rev-parse --git-path index`) to an owner-only temporary file, runs `git diff [--stat] <base_oid>` with `GIT_INDEX_FILE` pointing at the copy and the isolated Git environment, bounds the escaped output to `MAX_DIFF_BYTES`, and reports truncation. `close` refuses while a turn is active, runs `git worktree remove --force` then `git worktree prune`, removes only `workspace/`, marks `Closed`; with `discard` it also deletes `refs/heads/task/<task_id>` and `refs/mac-worker/bases/<task_id>` and marks `Abandoned`. Add the four `HostOperation` variants with commands `~/.local/bin/worker host task-prepare|task-status|task-diff|task-close`, their `HostCommand` entries, and `src/lib.rs` dispatch through the `SshJsonTransport` stdin/stdout JSON boundary with its 1 MiB bounds.
+`prepare` runs under the turn's transfer lock, verifies `git cat-file -t <base_oid>` is `commit` in the mirror, then: if the workspace exists on branch `task/<task_id>` with `HEAD == base_oid` and a clean `status --porcelain`, returns `reused`; if a workspace directory exists without a valid `HEAD` (a crash mid-clone), removes it through the rooted filesystem layer and recreates it; if no workspace exists, creates the task directory component by component and runs `git clone --shared --no-checkout <mirror> <workspace>` then `git -C <workspace> checkout -b task/<task_id> <base_oid>`; anything else (a different branch, a different base, local changes) is `WORKTREE_INCONSISTENT`. The clone's `.git` lives inside the workspace so sandboxes that confine writes to the checkout can commit; the mirror receives the branch only when the publisher fetches it at turn end. It writes `meta.json` and `status.json` (`Active`, worker name, turn 1 pending) and fsyncs. `diff` copies the workspace index (`git rev-parse --git-path index`) to an owner-only temporary file, runs `git diff [--stat] <base_oid>` with `GIT_INDEX_FILE` pointing at the copy and the isolated Git environment, bounds the escaped output to `MAX_DIFF_BYTES`, and reports truncation. `close` refuses while a turn is active, removes only `workspace/` through the rooted filesystem layer, marks `Closed`; with `discard` it also deletes `refs/heads/task/<task_id>` and `refs/mac-worker/bases/<task_id>` from the mirror and marks `Abandoned`. Add the four `HostOperation` variants with commands `~/.local/bin/worker host task-prepare|task-status|task-diff|task-close`, their `HostCommand` entries, and `src/lib.rs` dispatch through the `SshJsonTransport` stdin/stdout JSON boundary with its 1 MiB bounds.
 
 - [ ] **Step 4: Run materialization tests to verify GREEN**
 
@@ -996,7 +1007,7 @@ fn publisher_commits_leftovers_binds_session_and_marks_task_open() {
 }
 ```
 
-Also test: the supervisor binds the session the moment the adapter's session-started event appears in the stream, so a turn cancelled or timed out before publication still has `session.json`; a mac-worker-generated Claude session is bound at turn acceptance; reconciliation of a `lost` turn re-extracts a missing binding from the recorded stream; publisher records `diff_stat`, `files_changed`, and `head_oid`; a clean workspace yields `agent_committed = true` and no extra commit; `timed_out` and `cancelled` turns publish and leave the task `Open` with the matching outcome; a `lost` turn (reconciliation) leaves the task `Open` with `TaskOutcome::Lost` and the workspace in place; `close_policy = done` plus outcome `Done` closes the task through `TaskStore::close` under the lease and keeps metadata; the turn's job directory contains `prompt.md` owner-only and no workspace; supervisor terminal cleanup for a turn removes nothing under `tasks/`; `TaskTurnRequest` prompt hash mismatch is rejected before acceptance and a repeated identical request is idempotent; a resumed turn without `session.json` fails with `SESSION_UNBOUND` before launch; a batch payload at version 2 carries `turn: null` and launches unchanged; `SUPERVISION_VERSION` and `EXECUTION_PAYLOAD_VERSION` fixtures are pinned; the prelaunch validator accepts the turn layout (`prompt.md`, `result.schema.json`, no `workspace`) and still rejects extra entries in batch jobs; turn cleanup tolerates the absent `workspace` entry and never touches `tasks/`; a workspace-write fallback for Claude is recorded as `permission_fallback`.
+Also test: the supervisor binds the session the moment the adapter's session-started event appears in the stream, so a turn cancelled or timed out before publication still has `session.json`; a mac-worker-generated Claude session is bound at turn acceptance; reconciliation of a `lost` turn re-extracts a missing binding from the recorded stream; the publisher fetches the result branch from the clone into the mirror at every terminal path that has a workspace, so `fetch` works after close; publisher records `diff_stat`, `files_changed`, and `head_oid`; a clean workspace yields `agent_committed = true` and no extra commit; `timed_out` and `cancelled` turns publish and leave the task `Open` with the matching outcome; a `lost` turn (reconciliation) leaves the task `Open` with `TaskOutcome::Lost` and the workspace in place; `close_policy = done` plus outcome `Done` closes the task through `TaskStore::close` under the lease and keeps metadata; the turn's job directory contains `prompt.md` owner-only and no workspace; supervisor terminal cleanup for a turn removes nothing under `tasks/`; `TaskTurnRequest` prompt hash mismatch is rejected before acceptance and a repeated identical request is idempotent; a resumed turn without `session.json` fails with `SESSION_UNBOUND` before launch; a batch payload at version 2 carries `turn: null` and launches unchanged; `SUPERVISION_VERSION` and `EXECUTION_PAYLOAD_VERSION` fixtures are pinned; the prelaunch validator accepts the turn layout (`prompt.md`, `result.schema.json`, no `workspace`) and still rejects extra entries in batch jobs; turn cleanup tolerates the absent `workspace` entry and never touches `tasks/`; a workspace-write fallback for Claude is recorded as `permission_fallback`.
 
 - [ ] **Step 2: Run turn tests to verify RED**
 
@@ -1034,7 +1045,7 @@ In `src/supervisor.rs` introduce a `#[doc(hidden)] pub struct LaunchPlan { progr
 
 In `src/host_store.rs` extend `publish_complete` to accept a `TurnReceipt` carrying the staging nonce that `begin_job_after` generated for this job, in place of a `WorkspaceReceipt`; `task-prepare` cannot mint it because the nonce is created inside `submit_turn`, a later host process, so `TaskPrepareResponse` stays informational. Extend the prelaunch validator with the turn layout set (`meta.json`, `status.json`, `execution.json`, `prompt.md`, `result.schema.json`, log files, no `workspace`); make `remove_job_mutable_scopes` tolerate the absent `workspace` entry; and keep every job cleanup path below the job directory, never touching `tasks/`.
 
-`TurnTerminalHook` is invoked from the supervisor's common status writer (`replace_status`, which wraps `replace_job_status_after`) whenever the new state is terminal, and from phase 4's host cancellation path in `job_service.rs` and lost-turn reconciliation; the named paths (child exit, timeout, prelaunch failure, ambiguous child, host cancel, lost reconciliation) are the test matrix, not the call sites, so the ambiguous-child writer that records `Lost` is covered too. The hook runs `TurnPublisher::publish` where a workspace exists and otherwise `TaskStore::replace_status_after` with the matching outcome; publication failure is recorded as `PUBLISH_FAILED` on the turn and the task stays `Open`. In `src/job_service.rs` add `submit_turn(TaskTurnRequest)`, which under the admission lock verifies that the task's `status.json` records this job ID as the prepared turn with `head == turn.base_oid` and state `Active`, mints the staging-bound `TurnReceipt`, verifies both digests, stores `prompt.md` and `result.schema.json`, requires `session.json` for `resume`, and otherwise reuses durable acceptance, idempotency, and launch. Add `HostOperation::TaskTurn` and hidden `host task-turn`.
+`TurnTerminalHook` is invoked from the supervisor's common status writer (`replace_status`, which wraps `replace_job_status_after`) whenever the new state is terminal, and from phase 4's host cancellation path in `job_service.rs` and lost-turn reconciliation; the named paths (child exit, timeout, prelaunch failure, ambiguous child, host cancel, lost reconciliation) are the test matrix, not the call sites, so the ambiguous-child writer that records `Lost` is covered too. The hook runs `TurnPublisher::publish` where a workspace exists and otherwise `TaskStore::replace_status_after` with the matching outcome. `publish` commits leftovers with the recorded identity, then brings the branch into the mirror with `git -C <mirror> fetch <workspace> +refs/heads/task/<task_id>:refs/heads/task/<task_id>` (a fetch, so the client-facing pre-receive hook does not apply), then records the diff summary, result, and session; publication failure is recorded as `PUBLISH_FAILED` on the turn and the task stays `Open`. In `src/job_service.rs` add `submit_turn(TaskTurnRequest)`, which under the admission lock verifies that the task's `status.json` records this job ID as the prepared turn with `head == turn.base_oid` and state `Active`, mints the staging-bound `TurnReceipt`, verifies both digests, stores `prompt.md` and `result.schema.json`, requires `session.json` for `resume`, and otherwise reuses durable acceptance, idempotency, and launch. Add `HostOperation::TaskTurn` and hidden `host task-turn`.
 
 - [ ] **Step 4: Run turn and supervisor regressions**
 

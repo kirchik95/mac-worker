@@ -1,6 +1,6 @@
 # mac-worker v2 design: agent tasks on the worker pool
 
-- Date: 2026-09-03 (revision 2.2, after three rounds of design review on the same day; see section 25)
+- Date: 2026-09-03 (revision 2.3, after three rounds of design review and the Task 0 spike on the same day; see section 25)
 - Status: draft for review
 - Repository: `mac-worker`
 - User-facing commands: `worker task ...`, extended `worker workers`, `worker dashboard`
@@ -73,7 +73,7 @@ The v1 document remains authoritative for batch jobs. For agent tasks this docum
 | v1 statement | v2 rule for agent tasks |
 |---|---|
 | §1, §4: no editing on a worker, no reverse synchronization | The agent edits its own workspace; results return only as Git objects fetched from the worker's mirror, never as an rsync of the workspace |
-| §9.2: the remote workspace contains no `.git` directory | A task workspace is a Git worktree attached to a per-project bare mirror on the worker |
+| §9.2: the remote workspace contains no `.git` directory | A task workspace is a shared clone of a per-project bare mirror on the worker, with its own `.git` inside the checkout |
 | §9.1: a sensitive path fails preflight even when tracked; only selected files leave the MacBook | The base commit's full history is transferred to the mirror and retained there for the branch retention period; `SENSITIVE_PATH` runs over the tree of the base commit, not over history |
 | §9.2: `SNAPSHOT_CHANGED` re-verification of a staged tree | The base commit is captured through a scratch index and verified by a second capture that must produce the same tree; a difference is `SNAPSHOT_CHANGED` |
 | §12: no stdin, clean per-job `HOME`, minimal environment, workspace removed at terminal state | A turn receives the prompt on stdin, runs with the worker account's real `HOME` and login-shell environment plus one named env profile, and leaves the task workspace in place |
@@ -306,7 +306,7 @@ tasks/<project_id>/<task_id>/
   meta.json                                     task identity, source, publish, limits, base, Git identity, title
   status.json                                   task state, turn history, last outcome, result summary, retention marks
   session.json                                  owner-only agent session binding
-  workspace/                                    git worktree on the result branch; absent after close
+  workspace/                                    shared clone of the mirror on the result branch; absent after close
 jobs/<project_id>/<worktree_id>/<turn_id>/      a v1 job directory: meta, status, stdout (the agent's event stream), stderr, prompt.md, result.schema.json, last.md, tail.log
 job-index/, leases/, incoming/, snapshots/      unchanged v1 namespaces
 ```
@@ -358,7 +358,7 @@ The mirror is created by the host on first use with `core.hooksPath` set in its 
 
 ### 10.4 Workspace creation
 
-The host creates `workspace/` with `git worktree add -b task/<task_id> <workspace> <base_oid>` from the mirror. Creation is idempotent for retries after a crash: an existing workspace whose branch is `task/<task_id>` and whose `HEAD` equals `base_oid` with no local changes is reused; an existing branch without a workspace is reattached after `git worktree prune`; any other inconsistency is `WORKTREE_INCONSISTENT` and no agent starts. The worktree is a normal checkout with a `.git` file, so the agent's `git status`, `git commit`, and history queries work. Worktrees of one mirror are independent; a task cannot see another task's uncommitted work.
+The host creates `workspace/` as a shared clone of the mirror: `git clone --shared --no-checkout <mirror> <workspace>` followed by `git checkout -b task/<task_id> <base_oid>`. The clone's `.git` directory lives inside the workspace and borrows objects from the mirror through alternates, so agent sandboxes that confine writes to the checkout (Codex's workspace-write sandbox denies writes to a linked worktree's Git directory under the mirror path, as the spike showed) can still stage and commit. Creation is idempotent for retries after a crash: an existing workspace on branch `task/<task_id>` whose `HEAD` equals `base_oid` with no local changes is reused; a partial clone without a valid `HEAD` is removed and recreated; any other inconsistency is `WORKTREE_INCONSISTENT` and no agent starts. The mirror receives the result branch only at publication (section 16). Workspaces of one mirror are independent; a task cannot see another task's uncommitted work.
 
 ### 10.5 Result import
 
@@ -384,7 +384,7 @@ Adapters never contain worker paths, credentials, or SSH details. They are unit-
 
 | Agent | First turn | Resume | Session binding | Structured result | Limits |
 |---|---|---|---|---|---|
-| Codex | `codex exec --json -C <workspace> -o <last-message> --output-schema <schema> [-m MODEL] <permission flags> -` with the prompt on stdin | `codex exec resume <session_ref> --json -o <last-message> --output-schema <schema> -c sandbox_mode="workspace-write" -c sandbox_workspace_write.network_access=true -c approval_policy="never" -` with the workspace as the working directory, because `resume` accepts no `-C`, `-s`, or `--approve-for-me`; the spike records whether `--approve-for-me` has a configuration equivalent, and the adapter uses it instead of `approval_policy="never"` when it does | captured from the thread-started event | `--output-schema` | timeout only |
+| Codex | `codex exec --json -C <workspace> -o <last-message> --output-schema <schema> [-m MODEL] <permission flags> -` with the prompt on stdin | `codex exec resume <session_ref> --json -o <last-message> --output-schema <schema> -c sandbox_mode="workspace-write" -c sandbox_workspace_write.network_access=true -c approval_policy="never" -` with the workspace as the working directory, because `resume` accepts no `-C`, `-s`, or `--approve-for-me`; the spike confirmed this form and that the resumed stream reports the same thread identifier | captured from the thread-started event | `--output-schema` | timeout only |
 | Claude Code | `claude -p --output-format stream-json --session-id <uuid> [--model] [--max-turns] [--max-budget-usd] <permission flags>` with the prompt on stdin | `claude -p --resume <uuid>` plus the same output and permission flags | generated by mac-worker before the first turn; `--max-turns` is accepted by the CLI although absent from its help text, and the spike confirms it | `--json-schema` | `--max-turns`, `--max-budget-usd`, timeout |
 | Cursor Agent | `cursor-agent -p --output-format stream-json --workspace <workspace> --trust --force [--model] --resume <chat_id> <argv pointer>` | same with the bound chat id | `cursor-agent create-chat` before the first turn returns the id | trailer convention | timeout only |
 | OpenCode | `opencode run --format json --dir <workspace> --auto [--model] <argv pointer>` | `opencode run --session <id> …` | captured from the JSON event stream | trailer convention | timeout only |
@@ -417,9 +417,9 @@ The supervisor keeps draining the agent's stdout for the whole turn, so the agen
 Turns are unattended, so an agent must never block on a permission prompt. Two policies exist per agent:
 
 - `unattended`: the agent's full bypass mode (Codex `--dangerously-bypass-approvals-and-sandbox`, Claude `--permission-mode bypassPermissions`, Cursor `--force`, OpenCode `--auto`).
-- `workspace`: the agent's native workspace-write sandbox with automatic approval where the agent offers one (Codex `-s workspace-write --approve-for-me` with network access enabled for the sandbox); other agents fall back to `unattended` and the fallback is recorded in the turn's metadata.
+- `workspace`: the agent's native workspace-write sandbox with approvals disabled (Codex `-s workspace-write -c approval_policy="never" -c sandbox_workspace_write.network_access=true`; the spike showed that `--approve-for-me` is incompatible with `--sandbox` and that `--ask-for-approval` is not accepted by `codex exec`, so the configuration override is the working form); other agents fall back to `unattended` and the fallback is recorded in the turn's metadata.
 
-The default is `workspace` for Codex and `unattended` for the rest, overridable in `.worker.toml`. A permission prompt that still appears is treated as a hang and ends with the turn timeout. The spike must confirm that Codex's workspace sandbox permits Git commits inside a linked worktree of the mirror, because the worktree's Git directory lives under the mirror path.
+The default is `workspace` for Codex and `unattended` for the rest, overridable in `.worker.toml`. A permission prompt that still appears is treated as a hang and ends with the turn timeout. The spike showed that Codex's workspace sandbox denies writes to a linked worktree's Git directory under the mirror path, which is why the task workspace is a shared clone with its own `.git` inside the writable checkout (section 10.4).
 
 ## 12. Task and turn lifecycle
 
@@ -535,15 +535,16 @@ mac-worker's own records list environment variable names, never values. Agent tr
 Every terminal path of a turn runs the publisher before the lease is released: the agent process exiting, the timeout, a prelaunch failure, an ambiguous child identity, host cancellation, and lost-turn reconciliation. The supervisor invokes it from its single status writer whenever a state becomes terminal, so no writer can be missed. Where no workspace exists yet, the publisher only records the outcome. A turn therefore can never leave its task `active`. At the end of every turn the publisher, running on the worker under the still-held lease:
 
 1. checks the workspace with `git status --porcelain`; if anything is uncommitted, creates a commit `mac-worker: uncommitted changes after turn <turn_id>` on the result branch with the recorded Git identity and records `agent_committed = false` for that turn;
-2. records the branch head, `git diff --stat` and the changed-file list against `base_oid`, bounded;
-3. extracts the structured result and the final assistant message from the recorded stream or tail, and verifies that the session binding recorded during the turn (section 11.2) is present, re-extracting it from the stream if it is not;
-4. if `publish` includes `push`, pushes the result branch to origin as `--publish-branch` with the account's credentials and a bounded timeout; a push failure is recorded as `PUBLISH_FAILED` and leaves the task `open` with the branch intact.
+2. publishes the branch into the mirror with `git -C <mirror> fetch <workspace> +refs/heads/task/<task_id>:refs/heads/task/<task_id>`, a fetch rather than a push so the client-facing pre-receive hook does not apply and the mirror stays the single fetch source for the client;
+3. records the branch head, `git diff --stat` and the changed-file list against `base_oid`, bounded;
+4. extracts the structured result and the final assistant message from the recorded stream or tail, and verifies that the session binding recorded during the turn (section 11.2) is present, re-extracting it from the stream if it is not;
+5. if `publish` includes `push`, pushes the result branch to origin as `--publish-branch` with the account's credentials and a bounded timeout; a push failure is recorded as `PUBLISH_FAILED` and leaves the task `open` with the branch intact.
 
 `fetch` on the MacBook imports the result as described in section 10.5.
 
 ## 17. Cleanup and disk management
 
-Closing a task removes the workspace with `git worktree remove --force` followed by `git worktree prune`, and keeps the task's metadata, session binding, turn job directories, and mirror branch. `close --discard` additionally deletes the mirror branch and the base ref and requests agent-native session deletion where the agent offers it (Codex has `codex delete <session>`). Worker reconciliation after a reboot marks turns without a live supervisor as `lost`, moves their tasks to `open` with `last_outcome = lost`, recovers a missing session binding from the recorded stream, prunes stale worktree registrations, and lets the user `close` or `say` after reviewing `diff`.
+Closing a task removes the workspace clone directory below the task directory through the rooted filesystem layer, and keeps the task's metadata, session binding, turn job directories, and mirror branch. `close --discard` additionally deletes the mirror branch and the base ref and requests agent-native session deletion where the agent offers it (Codex has `codex delete <session>`). Worker reconciliation after a reboot marks turns without a live supervisor as `lost`, moves their tasks to `open` with `last_outcome = lost`, recovers a missing session binding from the recorded stream, and lets the user `close` or `say` after reviewing `diff`.
 
 `worker gc` gains task candidates: open tasks past retention, task metadata and turn logs past job retention, result branches past branch retention, mirrors with no tasks and no refs younger than branch retention, and transfer repositories with no base refs. Every candidate is previewed with a size and reason. The mirror is never deleted while any task references it, and `git gc` on a mirror runs only through `worker gc --apply` with a bounded runtime.
 
@@ -595,7 +596,7 @@ Dashboard cancel and any mutating control remain deferred, as the dashboard desi
 - Adapter argv, environment, session binding, and result extraction against recorded event fixtures for all four agents, including malformed and truncated streams and the tail-retention path.
 - Transfer repository and base commit creation: the user's repository is byte-identical before and after (`HEAD`, index, working tree, refs, reflogs, configuration, hooks); `--wip` selection matches v1 input policy including `info/exclude` and `core.excludesFile`; objects are written only into the transfer repository; two clones of one origin get separate transfer repositories keyed by `repo_id`, and a missing alternates target fails before any transfer; the second-capture check fires `SNAPSHOT_CHANGED`; sensitive-path and untracked preflights fire; base refs are removed after push.
 - Host mirror commands: turn-keyed identity validation, hook enforcement with the account's global `core.hooksPath` set, deletions denied, upload-pack serves only the mirror and only for a task with metadata and a branch, no path escapes, ssh argv without a trailing `--`.
-- Materialization: base verification, idempotent worktree creation on retry, isolation between two tasks on one mirror, `WORKTREE_INCONSISTENT`, failure before any workspace when the base is missing.
+- Materialization: base verification, idempotent shared-clone creation on retry, isolation between two tasks on one mirror, `WORKTREE_INCONSISTENT`, failure before any workspace when the base is missing, commits inside the clone under Codex's workspace-write sandbox.
 - Turn lifecycle: stdin prompt delivery, login-shell environment with real `HOME`, Git identity export, exit classification, timeout, cancel, lost supervisor, log cap with tail retention, publisher commit of leftovers, idempotent re-publication, workspace preserved at terminal state.
 - Task state machine: every transition in section 12, `say` rejection while active, follow-up limits, hard pins, close-on-done, authority order after a killed follower, retention.
 - Runner: detach and handoff, handoff failure abandoning the task and releasing the base, ownership recorded in the waiting state, crash before and after acceptance, replacement only by mutating commands, `list` and `status` never mutating or spawning, `wait` completing a batch whose shell exited, parking behind the per-worker cap, backoff, the shared observation cache with single-flight refresh, `worker run` never reaping `task_turn` rows, re-enqueue of a `queued` task without a row, no runner for terminal tasks.
@@ -720,3 +721,11 @@ Revision 2.2 incorporates the re-review of the implementation plan against the p
 - `--no-wait` is persisted with the task and honoured by the runner's first claim.
 - Claims are owner-scoped so a runner can never be handed another task's row, and every turn's composed prompt is persisted locally until the worker holds it, so a replacement runner can still submit a follow-up.
 - The layout migration is a hidden host command run by the setup script; the turn acceptance receipt is minted by the acceptance step itself, because the staging nonce it must carry exists only there; the stdout pump stops at the process-group-absence proof rather than pipe EOF; and the terminal hook lives in the supervisor's single status writer so the ambiguous-child path is covered.
+
+Revision 2.3 incorporates the Task 0 spike record (`docs/agent-task-spike.md`):
+
+- The task workspace is a shared clone of the mirror rather than a linked worktree: Codex's workspace-write sandbox denied writes to a linked worktree's Git directory under the mirror path, so no commit was possible. The publisher now brings the result branch into the mirror with a fetch at turn end.
+- Codex's `workspace` policy uses `-c approval_policy="never"` because `--approve-for-me` is incompatible with `--sandbox` in the installed CLI; `--ask-for-approval` is not accepted by `codex exec`.
+- Confirmed for Codex: the `thread.started` event carries the session identifier, the `-o` file holds the schema-shaped result, resume after `TERM` keeps the session and both edits, `codex delete --force` removes the canonical session, and a failing turn can exit `0` with structured status `blocked`, which is why exit classification consults the structured status first.
+- Git's automatic identity fallback produced a commit on a worker without a configured identity, confirming that the launcher must export the recorded identity.
+- Claude Code is deferred on the workers by operator decision for now; its adapter is encoded from help text and unverified live. The memory profile remains unproven because the offline Cargo cache on the worker could not run the suite; it is re-measured during phase 5 acceptance.
