@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt,
     str::FromStr,
 };
@@ -939,6 +939,209 @@ impl<'de> Deserialize<'de> for WorkerPreference {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueAbandonmentProof {
+    queue_id: QueueId,
+    job_id: JobId,
+    client_id: ClientId,
+    selected_worker: String,
+    project_id: String,
+    worktree_id: String,
+    command_summary: CommandSummary,
+    request_fingerprint: RequestFingerprint,
+    claimed_at_millis: u64,
+    recorded_by: ProcessIdentity,
+}
+
+impl QueueAbandonmentProof {
+    pub(crate) fn from_resolution(
+        entry: &QueueEntry,
+        request: &ResolveOrAbandonRequest,
+        recorded_by: ProcessIdentity,
+    ) -> Result<Self, WorkerError> {
+        request.validate()?;
+        recorded_by.validate()?;
+        let QueueState::Dispatching {
+            dispatch_owner,
+            selected_worker,
+            claimed_at_millis,
+        } = entry.state()
+        else {
+            return Err(protocol_error(
+                "pre-acceptance abandonment proof requires a dispatch reservation",
+            ));
+        };
+        if *dispatch_owner != recorded_by {
+            return Err(protocol_error("queue dispatch owner does not match"));
+        }
+        if request.job_id() != entry.job_id()
+            || request.client_id() != entry.client_id()
+            || request.worker_name() != selected_worker
+            || request.project_id() != entry.project_id()
+            || request.worktree_id() != entry.worktree_id()
+            || request.command_summary() != entry.command_summary()
+        {
+            return Err(protocol_error(
+                "abandonment resolution does not match the queue reservation",
+            ));
+        }
+        let proof = Self {
+            queue_id: entry.queue_id(),
+            job_id: entry.job_id(),
+            client_id: entry.client_id(),
+            selected_worker: selected_worker.clone(),
+            project_id: entry.project_id().into(),
+            worktree_id: entry.worktree_id().into(),
+            command_summary: entry.command_summary().clone(),
+            request_fingerprint: request.request_fingerprint().clone(),
+            claimed_at_millis: *claimed_at_millis,
+            recorded_by,
+        };
+        proof.validate_against(entry)?;
+        Ok(proof)
+    }
+
+    fn validate(&self) -> Result<(), WorkerError> {
+        QueueId::new(self.queue_id.value())?;
+        validate_worker_name(&self.selected_worker)?;
+        validate_hex_component(&self.project_id, "abandonment proof project ID")?;
+        validate_hex_component(&self.worktree_id, "abandonment proof worktree ID")?;
+        self.command_summary.validate()?;
+        self.recorded_by.validate()?;
+        if self.claimed_at_millis == 0 {
+            return Err(protocol_error(
+                "abandonment proof claim timestamp must be positive",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_against(&self, entry: &QueueEntry) -> Result<(), WorkerError> {
+        self.validate()?;
+        let QueueState::Dispatching {
+            selected_worker,
+            claimed_at_millis,
+            ..
+        } = entry.state()
+        else {
+            return Err(protocol_error(
+                "pre-acceptance abandonment proof requires a dispatch reservation",
+            ));
+        };
+        if self.queue_id != entry.queue_id()
+            || self.job_id != entry.job_id()
+            || self.client_id != entry.client_id()
+            || self.selected_worker != *selected_worker
+            || self.project_id != entry.project_id()
+            || self.worktree_id != entry.worktree_id()
+            || self.command_summary != *entry.command_summary()
+            || self.claimed_at_millis != *claimed_at_millis
+        {
+            return Err(protocol_error(
+                "abandonment proof does not match its queue reservation",
+            ));
+        }
+        if entry.kind() == QueueEntryKind::Batch && self.recorded_by != *entry.owner() {
+            return Err(protocol_error(
+                "batch abandonment proof must match its immutable owner",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn queue_id(&self) -> QueueId {
+        self.queue_id
+    }
+
+    pub fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    pub fn selected_worker(&self) -> &str {
+        &self.selected_worker
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn worktree_id(&self) -> &str {
+        &self.worktree_id
+    }
+
+    pub fn command_summary(&self) -> &CommandSummary {
+        &self.command_summary
+    }
+
+    pub fn request_fingerprint(&self) -> &RequestFingerprint {
+        &self.request_fingerprint
+    }
+
+    pub fn claimed_at_millis(&self) -> u64 {
+        self.claimed_at_millis
+    }
+
+    pub fn recorded_by(&self) -> &ProcessIdentity {
+        &self.recorded_by
+    }
+}
+
+impl Serialize for QueueAbandonmentProof {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("QueueAbandonmentProof", 10)?;
+        record.serialize_field("queue_id", &self.queue_id)?;
+        record.serialize_field("job_id", &self.job_id)?;
+        record.serialize_field("client_id", &self.client_id)?;
+        record.serialize_field("selected_worker", &self.selected_worker)?;
+        record.serialize_field("project_id", &self.project_id)?;
+        record.serialize_field("worktree_id", &self.worktree_id)?;
+        record.serialize_field("command_summary", &self.command_summary)?;
+        record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
+        record.serialize_field("claimed_at_millis", &self.claimed_at_millis)?;
+        record.serialize_field("recorded_by", &self.recorded_by)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for QueueAbandonmentProof {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            queue_id: QueueId,
+            job_id: JobId,
+            client_id: ClientId,
+            selected_worker: String,
+            project_id: String,
+            worktree_id: String,
+            command_summary: CommandSummary,
+            request_fingerprint: RequestFingerprint,
+            claimed_at_millis: u64,
+            recorded_by: ProcessIdentity,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let proof = Self {
+            queue_id: wire.queue_id,
+            job_id: wire.job_id,
+            client_id: wire.client_id,
+            selected_worker: wire.selected_worker,
+            project_id: wire.project_id,
+            worktree_id: wire.worktree_id,
+            command_summary: wire.command_summary,
+            request_fingerprint: wire.request_fingerprint,
+            claimed_at_millis: wire.claimed_at_millis,
+            recorded_by: wire.recorded_by,
+        };
+        proof.validate().map_err(de::Error::custom)?;
+        Ok(proof)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueEntry {
     pub(crate) queue_id: QueueId,
     pub(crate) job_id: JobId,
@@ -952,7 +1155,7 @@ pub struct QueueEntry {
     pub(crate) run: Option<QueueRunReference>,
     pub(crate) enqueue_owner: ProcessIdentity,
     pub(crate) state: QueueState,
-    pub(crate) preacceptance_abandoned_by: Option<ProcessIdentity>,
+    pub(crate) preacceptance_abandonment_proof: Option<QueueAbandonmentProof>,
     pub(crate) cancel_requested_at_millis: Option<u64>,
     pub(crate) enqueued_at_millis: u64,
 }
@@ -985,7 +1188,7 @@ impl QueueEntry {
             run,
             enqueue_owner: owner,
             state: QueueState::Waiting { owner },
-            preacceptance_abandoned_by: None,
+            preacceptance_abandonment_proof: None,
             cancel_requested_at_millis: None,
             enqueued_at_millis,
         };
@@ -1014,18 +1217,8 @@ impl QueueEntry {
                 "queue cancellation timestamp predates enqueue timestamp",
             ));
         }
-        if let Some(abandoned_by) = self.preacceptance_abandoned_by {
-            abandoned_by.validate()?;
-            if !matches!(self.state, QueueState::Dispatching { .. }) {
-                return Err(protocol_error(
-                    "pre-acceptance abandonment proof requires a dispatch reservation",
-                ));
-            }
-            if self.kind == QueueEntryKind::Batch && self.owner() != &abandoned_by {
-                return Err(protocol_error(
-                    "batch abandonment proof must match its immutable owner",
-                ));
-            }
+        if let Some(proof) = &self.preacceptance_abandonment_proof {
+            proof.validate_against(self)?;
         }
         if self.kind == QueueEntryKind::Batch && self.owner() != &self.enqueue_owner {
             return Err(protocol_error("batch queue ownership is not replaceable"));
@@ -1085,8 +1278,8 @@ impl QueueEntry {
         &self.state
     }
 
-    pub fn preacceptance_abandoned_by(&self) -> Option<&ProcessIdentity> {
-        self.preacceptance_abandoned_by.as_ref()
+    pub fn preacceptance_abandonment_proof(&self) -> Option<&QueueAbandonmentProof> {
+        self.preacceptance_abandonment_proof.as_ref()
     }
 
     pub fn is_cancel_requested(&self) -> bool {
@@ -1120,22 +1313,28 @@ impl QueueEntry {
 
     pub(crate) fn record_preacceptance_abandoned(
         &mut self,
-        dispatch_owner: ProcessIdentity,
+        proof: QueueAbandonmentProof,
     ) -> Result<bool, WorkerError> {
-        dispatch_owner.validate()?;
+        proof.validate_against(self)?;
         if !matches!(
             self.state,
             QueueState::Dispatching {
                 dispatch_owner: current,
                 ..
-            } if current == dispatch_owner
+            } if current == proof.recorded_by
         ) {
             return Err(protocol_error("queue dispatch owner does not match"));
         }
-        if self.preacceptance_abandoned_by.is_some() {
-            return Ok(false);
+        if let Some(existing) = &self.preacceptance_abandonment_proof {
+            return if existing == &proof {
+                Ok(false)
+            } else {
+                Err(protocol_error(
+                    "queue row already has a different abandonment proof",
+                ))
+            };
         }
-        self.preacceptance_abandoned_by = Some(dispatch_owner);
+        self.preacceptance_abandonment_proof = Some(proof);
         self.validate()?;
         Ok(true)
     }
@@ -1155,7 +1354,7 @@ impl QueueEntry {
     }
 
     pub(crate) fn revert(&mut self, dispatch_owner: ProcessIdentity) -> Result<(), WorkerError> {
-        if self.preacceptance_abandoned_by.is_some() {
+        if self.preacceptance_abandonment_proof.is_some() {
             return Err(protocol_error(
                 "a proven abandoned queue row cannot be reverted",
             ));
@@ -1223,8 +1422,8 @@ impl Serialize for QueueEntry {
         record.serialize_field("enqueue_owner", &self.enqueue_owner)?;
         record.serialize_field("state", &self.state)?;
         record.serialize_field(
-            "preacceptance_abandoned_by",
-            &self.preacceptance_abandoned_by,
+            "preacceptance_abandonment_proof",
+            &self.preacceptance_abandonment_proof,
         )?;
         record.serialize_field(
             "cancel_requested_at_millis",
@@ -1252,7 +1451,7 @@ impl<'de> Deserialize<'de> for QueueEntry {
             run: Option<QueueRunReference>,
             enqueue_owner: ProcessIdentity,
             state: QueueState,
-            preacceptance_abandoned_by: Option<ProcessIdentity>,
+            preacceptance_abandonment_proof: Option<QueueAbandonmentProof>,
             cancel_requested_at_millis: Option<u64>,
             enqueued_at_millis: u64,
         }
@@ -1270,7 +1469,7 @@ impl<'de> Deserialize<'de> for QueueEntry {
             run: wire.run,
             enqueue_owner: wire.enqueue_owner,
             state: wire.state,
-            preacceptance_abandoned_by: wire.preacceptance_abandoned_by,
+            preacceptance_abandonment_proof: wire.preacceptance_abandonment_proof,
             cancel_requested_at_millis: wire.cancel_requested_at_millis,
             enqueued_at_millis: wire.enqueued_at_millis,
         };
@@ -1291,6 +1490,7 @@ impl QueueSnapshot {
         let mut previous_timestamp = 0;
         let mut jobs = HashSet::new();
         let mut dispatch_workers = BTreeSet::new();
+        let mut run_caps = HashMap::new();
         for entry in &self.entries {
             entry.validate()?;
             let queue_id = entry.queue_id.value();
@@ -1304,6 +1504,14 @@ impl QueueSnapshot {
             }
             if !jobs.insert(entry.job_id) {
                 return Err(protocol_error("queue contains a duplicate job ID"));
+            }
+            if let Some(run) = entry.run()
+                && let Some(existing) = run_caps.insert(run.run_id().clone(), run.max_parallel())
+                && existing != run.max_parallel()
+            {
+                return Err(protocol_error(
+                    "queue contains conflicting maximum parallelism for one run ID",
+                ));
             }
             if let QueueState::Dispatching {
                 selected_worker, ..

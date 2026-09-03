@@ -23,8 +23,9 @@ use crate::{
     error::WorkerError,
     job::{
         AdmissionObservation, CachedAdmissionObservation, ClientId, JobId, JobState, JobStatus,
-        LocalJobRecord, ProcessIdentity, QueueCancel, QueueClaim, QueueEntry, QueueEntryKind,
-        QueueSnapshot, QueueState, RemoteUncertainty,
+        LocalJobRecord, ProcessIdentity, QueueAbandonmentProof, QueueCancel, QueueClaim,
+        QueueEntry, QueueEntryKind, QueueSnapshot, QueueState, RemoteUncertainty,
+        ResolveOrAbandonRequest,
     },
     scheduler::AffinityHints,
     supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
@@ -572,20 +573,28 @@ impl ClientStateStore {
 
     pub fn record_preacceptance_abandoned(
         &self,
-        job_id: JobId,
+        request: &ResolveOrAbandonRequest,
         dispatch_owner: ProcessIdentity,
     ) -> Result<QueueEntry, WorkerError> {
+        request.validate()?;
         dispatch_owner.validate()?;
         self.update_queue(|snapshot| {
-            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            let name = job_file_name(request.job_id())?;
+            let record = read_job_optional(self.inner.jobs.as_raw_fd(), &name)?
+                .ok_or_else(abandonment_conflict)?;
+            self.require_local_client(&record)
+                .map_err(|_| abandonment_conflict())?;
+            let durable_request = ResolveOrAbandonRequest::from_local_record(&record)
+                .map_err(|_| abandonment_conflict())?;
+            if &durable_request != request {
+                return Err(abandonment_conflict());
+            }
+            let entry = find_queue_entry_mut(snapshot, request.job_id())?;
+            let proof = QueueAbandonmentProof::from_resolution(entry, request, dispatch_owner)
+                .map_err(|_| abandonment_conflict())?;
             let changed = entry
-                .record_preacceptance_abandoned(dispatch_owner)
-                .map_err(|_| {
-                    queue_error(
-                        "QUEUE_ABANDONMENT_CONFLICT",
-                        "queue abandonment proof does not match the dispatch reservation",
-                    )
-                })?;
+                .record_preacceptance_abandoned(proof)
+                .map_err(|_| abandonment_conflict())?;
             Ok((entry.clone(), changed))
         })
     }
@@ -644,7 +653,7 @@ impl ClientStateStore {
                 ));
             }
             if snapshot.entries[index]
-                .preacceptance_abandoned_by()
+                .preacceptance_abandonment_proof()
                 .is_none()
             {
                 let name = job_file_name(job_id)?;
@@ -680,7 +689,7 @@ impl ClientStateStore {
                 ) {
                     recovered.push(snapshot.entries[index].job_id());
                     if snapshot.entries[index]
-                        .preacceptance_abandoned_by()
+                        .preacceptance_abandonment_proof()
                         .is_some()
                     {
                         snapshot.entries.remove(index);
@@ -926,6 +935,12 @@ impl ClientStateStore {
             }
             let name = job_file_name(sibling.job_id())?;
             if let Some(record) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? {
+                if record.meta().job_id() != sibling.job_id() {
+                    return Err(queue_error(
+                        "QUEUE_JOB_RECORD_MISMATCH",
+                        "local run job identity does not match its queue row",
+                    ));
+                }
                 self.require_local_client(&record)?;
                 if record
                     .last_status()
@@ -1782,6 +1797,13 @@ fn terminal_unproven() -> WorkerError {
     queue_error(
         "QUEUE_TERMINAL_UNPROVEN",
         "queue row has no durable terminal or abandonment proof",
+    )
+}
+
+fn abandonment_conflict() -> WorkerError {
+    queue_error(
+        "QUEUE_ABANDONMENT_CONFLICT",
+        "queue abandonment proof does not match the rooted request and dispatch reservation",
     )
 }
 
