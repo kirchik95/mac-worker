@@ -387,7 +387,7 @@ proptest! {
 }
 ```
 
-Also test: unknown and duplicate JSON fields are rejected; `TaskLimits` bounds (`max_followups` 0..=100, default 10); `GitIdentity` bounds name and email to 256 bytes each and rejects control characters and `<`/`>`; `RunProgress` counts by state; `TaskSummary` contains no prompt, session, or path fields; titles are the first non-empty prompt line bounded to 120 bytes with control characters escaped; `RunnerIdentity` wraps `ProcessIdentity`; `TaskSource::Origin` and `PublishMode::Push` parse but `TaskMeta::validate_core_scope` rejects them with `TASK_CONFIG_INVALID` naming the later plan; every new `WorkerError` variant maps to the exit kind in Step 3.
+Also test: unknown and duplicate JSON fields are rejected; `TaskLimits` bounds (`max_followups` 0..=100, default 10); `GitIdentity` bounds name and email to 256 bytes each and rejects control characters and `<`/`>`; `RunProgress` counts by state; `TaskSummary` contains no prompt, session, or path fields; titles are an explicit optional field, and when absent they are the first non-empty prompt line after the shared redaction boundary (home paths, `~`-prefixed paths, and token-like strings removed) then bounded to 120 bytes with control characters escaped; `RunnerIdentity` wraps `ProcessIdentity`; `TaskSource::Origin` and `PublishMode::Push` parse but `TaskMeta::validate_core_scope` rejects them with `TASK_CONFIG_INVALID` naming the later plan; every new `WorkerError` variant maps to the exit kind in Step 3.
 
 - [ ] **Step 2: Run model tests to verify RED**
 

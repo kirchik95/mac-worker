@@ -315,6 +315,8 @@ The agent's stdout is its raw event stream; the turn's `stdout` log holds it unc
 
 Local state below the v1 state root adds `tasks/<task_id>.json`, `runs/<run_id>.json`, `runners/<task_id>/<turn_id>.log`, and, for a turn awaiting acceptance, the owner-only composed prompt `turns/<task_id>/<turn_id>/prompt.md`, which is removed once the worker holds it. The transfer repository lives below the v1 cache root as `transfer/<repo_id>.git`; the task record stores its alternates target, which is verified to exist before every transfer operation. The user's repository receives exactly one write per fetch: `refs/remotes/mac-worker/<worker>/task/<task_id>` and the objects it needs. mac-worker never creates local branches, checks anything out, or touches the user's index, `HEAD`, hooks, or configuration.
 
+The task title is an explicit optional field (already present on the batch file; `worker task submit --title` follows in a later task). When it is absent the title is derived from the first non-empty prompt line and then passed through the shared redaction boundary, so a secret or machine-local path in that line cannot leak into task metadata, queue rows, JSON output, or the dashboard.
+
 No cleanup or path construction accepts caller-supplied paths. Every component above is a validated identifier.
 
 ## 10. Code transfer contract
