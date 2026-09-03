@@ -412,14 +412,20 @@ impl<'a> CancelService<'a> {
             .resolve_preacceptance_with_receipt(worker, &resolution)?;
         match resolved.disposition() {
             PreacceptanceDisposition::Accepted(authoritative) => {
-                // The original-ID resolution must agree with the one immutable
-                // local record before a typed cancel can target the host.
-                let _ = normalize_authoritative_status(record, authoritative.clone())?;
-                let response = self.cancel_accepted(worker, record)?;
-                self.persist_cancel_response(record, response.clone(), dispatch_owner)?;
+                // Original-ID acceptance is durable before cancellation. A
+                // lost cancel reply must not let later abandonment erase the
+                // only exact evidence that this identity reached the host.
+                let accepted_record =
+                    persist_resolved_acceptance(self.client_state, record, authoritative)?;
+                let response = match terminal_cancel_response(&accepted_record)? {
+                    Some(response) => response,
+                    None => self.cancel_accepted(worker, &accepted_record)?,
+                };
+                self.persist_cancel_response(&accepted_record, response.clone(), dispatch_owner)?;
                 Ok(CancelReport::RemoteCancelled { response })
             }
             PreacceptanceDisposition::Abandoned => {
+                reject_local_abandonment_after_acceptance_evidence(self.client_state, record)?;
                 if let Some(owner) = dispatch_owner {
                     let receipt = resolved.abandonment_receipt().ok_or_else(|| {
                         WorkerError::Protocol(
@@ -428,7 +434,8 @@ impl<'a> CancelService<'a> {
                     })?;
                     self.client_state
                         .record_preacceptance_abandoned(receipt, owner)?;
-                    self.remove_terminal_queue_row(record.meta().job_id(), owner)?;
+                    self.client_state
+                        .remove_after_terminal(record.meta().job_id(), owner)?;
                 }
                 Ok(CancelReport::QueuedCancelled {
                     job_id: record.meta().job_id(),
@@ -455,6 +462,7 @@ impl<'a> CancelService<'a> {
                 "CANCEL_RESPONSE_INVALID: host cancellation did not return a terminal status"
                     .into(),
             )),
+            Err(error) if !is_ambiguous_cancel_transport_error(&error) => Err(error),
             Err(_) => {
                 // A lost cancel response is never retried blindly. Re-resolve
                 // the original job ID and accept only an exact terminal
@@ -498,27 +506,9 @@ impl<'a> CancelService<'a> {
                     "CANCEL_RESPONSE_INVALID: cancellation status was not terminal".into(),
                 ));
             }
-            self.remove_terminal_queue_row(persisted.meta().job_id(), owner)?;
+            retire_terminal_queue_row(self.client_state, &persisted, owner)?;
         }
         Ok(())
-    }
-
-    fn remove_terminal_queue_row(
-        &self,
-        job_id: JobId,
-        dispatch_owner: ProcessIdentity,
-    ) -> Result<(), WorkerError> {
-        match self
-            .client_state
-            .remove_after_terminal(job_id, dispatch_owner)
-        {
-            Ok(_) => Ok(()),
-            Err(WorkerError::Queue {
-                code: "QUEUE_NOT_FOUND",
-                ..
-            }) => Ok(()),
-            Err(error) => Err(error),
-        }
     }
 
     fn persist_cancel_uncertainty<T>(
@@ -967,7 +957,7 @@ impl<'a> RunService<'a> {
             None => RemoteJobClient::new(self.runner),
         };
         if self.cancel_after_local_record(&remote, &worker, &record, identity.dispatch_owner)? {
-            return Err(dispatch_cancelled());
+            return self.cancellation_handoff(&record, identity.dispatch_owner);
         }
         let acquire_result: Result<LeaseAcquireResponse, WorkerError> = transport.request(
             &worker,
@@ -984,7 +974,7 @@ impl<'a> RunService<'a> {
                     &record,
                     identity.dispatch_owner,
                 )? {
-                    return Err(dispatch_cancelled());
+                    return self.cancellation_handoff(&record, identity.dispatch_owner);
                 }
                 match remote.status(&worker, material.job_id()) {
                     Ok(status) => status,
@@ -1014,7 +1004,7 @@ impl<'a> RunService<'a> {
                         &record,
                         identity.dispatch_owner,
                     )? {
-                        return Err(dispatch_cancelled());
+                        return self.cancellation_handoff(&record, identity.dispatch_owner);
                     }
                     if let Err(error) = RsyncTransport::new(self.runner).upload(
                         &worker,
@@ -1036,7 +1026,7 @@ impl<'a> RunService<'a> {
                             &record,
                             identity.dispatch_owner,
                         )? {
-                            return Err(dispatch_cancelled());
+                            return self.cancellation_handoff(&record, identity.dispatch_owner);
                         }
                         let verified: Result<VerifiedSnapshotResponse, WorkerError> = transport
                             .request(
@@ -1071,7 +1061,10 @@ impl<'a> RunService<'a> {
                                         &record,
                                         identity.dispatch_owner,
                                     )? {
-                                        return Err(dispatch_cancelled());
+                                        return self.cancellation_handoff(
+                                            &record,
+                                            identity.dispatch_owner,
+                                        );
                                     }
                                     let raw: Result<SubmitResponse, WorkerError> = transport
                                         .request(
@@ -1140,7 +1133,7 @@ impl<'a> RunService<'a> {
         // handing the record to the follower so the dispatch owner, rather
         // than a bounded waiting caller, resolves and fences that exact job.
         if self.cancel_after_local_record(&remote, &worker, &record, identity.dispatch_owner)? {
-            return Err(dispatch_cancelled());
+            return self.cancellation_handoff(&record, identity.dispatch_owner);
         }
 
         let accepted_status = match normalize_authoritative_status(&record, accepted) {
@@ -1158,8 +1151,21 @@ impl<'a> RunService<'a> {
             }
         };
         let accepted_record = persist_authoritative(self.client_state, &record, accepted_status)?;
+        if let Some(completion) =
+            terminal_handoff_before_follow(self.client_state, &record, identity.dispatch_owner)?
+        {
+            return Ok(completion);
+        }
         write_accepted(&accepted_record, json, stdout)?;
         self.observer.observe(RunStage::AcceptedOutputFlush)?;
+        if self.cancel_after_local_record(&remote, &worker, &record, identity.dispatch_owner)? {
+            return self.cancellation_handoff(&record, identity.dispatch_owner);
+        }
+        if let Some(completion) =
+            terminal_handoff_before_follow(self.client_state, &record, identity.dispatch_owner)?
+        {
+            return Ok(completion);
+        }
 
         let terminal = self
             .follower
@@ -1179,8 +1185,7 @@ impl<'a> RunService<'a> {
         if !terminal_status.state().is_terminal() {
             return Err(inconsistent_terminal_outcome());
         }
-        self.client_state
-            .remove_after_terminal(identity.job_id, identity.dispatch_owner)?;
+        retire_terminal_queue_row(self.client_state, &terminal_record, identity.dispatch_owner)?;
         self.observer.observe(RunStage::QueueTerminalRemoval)?;
         let exit_code = terminal_exit_code(&terminal_status)?;
         Ok(RunCompletion {
@@ -1217,60 +1222,76 @@ impl<'a> RunService<'a> {
         let resolved = remote.resolve_preacceptance_with_receipt(worker, &resolution)?;
         match resolved.disposition() {
             PreacceptanceDisposition::Accepted(authoritative) => {
-                let _ = normalize_authoritative_status(record, authoritative.clone())?;
-                let request = CancelRequest::from_local_record(record)?;
+                let accepted_record =
+                    persist_resolved_acceptance(self.client_state, record, authoritative)?;
+                if accepted_record
+                    .last_status()
+                    .is_some_and(|status| status.state().is_terminal())
+                {
+                    retire_terminal_queue_row(self.client_state, &accepted_record, dispatch_owner)?;
+                    return Ok(true);
+                }
+                let request = CancelRequest::from_local_record(&accepted_record)?;
                 let response = match remote.cancel(worker, &request) {
                     Ok(response) if response.status().status().state().is_terminal() => response,
                     Ok(_) => {
-                        self.persist_uncertainty(record, "CANCEL_RESPONSE_INVALID", false)?;
-                        return Err(recovery_error(record, "CANCEL_RESPONSE_INVALID", false));
+                        self.persist_uncertainty(
+                            &accepted_record,
+                            "CANCEL_RESPONSE_INVALID",
+                            false,
+                        )?;
+                        return Err(recovery_error(
+                            &accepted_record,
+                            "CANCEL_RESPONSE_INVALID",
+                            false,
+                        ));
                     }
-                    Err(_) => match remote.status(worker, record.meta().job_id()) {
+                    Err(error) if !is_ambiguous_cancel_transport_error(&error) => {
+                        return Err(error);
+                    }
+                    Err(_) => match remote.status(worker, accepted_record.meta().job_id()) {
                         Ok(status) => {
-                            let status = normalize_authoritative_status(record, status)?;
+                            let status = normalize_authoritative_status(&accepted_record, status)?;
                             if status.state().is_terminal() {
                                 CancelResponse::new(StatusResponse::new(
-                                    record.meta().clone(),
+                                    accepted_record.meta().clone(),
                                     status,
                                 )?)?
                             } else {
                                 self.persist_uncertainty(
-                                    record,
+                                    &accepted_record,
                                     "CANCEL_TRANSPORT_AMBIGUOUS",
                                     false,
                                 )?;
                                 return Err(recovery_error(
-                                    record,
+                                    &accepted_record,
                                     "CANCEL_TRANSPORT_AMBIGUOUS",
                                     false,
                                 ));
                             }
                         }
                         Err(_) => {
-                            self.persist_uncertainty(record, "CANCEL_TRANSPORT_AMBIGUOUS", false)?;
+                            self.persist_uncertainty(
+                                &accepted_record,
+                                "CANCEL_TRANSPORT_AMBIGUOUS",
+                                false,
+                            )?;
                             return Err(recovery_error(
-                                record,
+                                &accepted_record,
                                 "CANCEL_TRANSPORT_AMBIGUOUS",
                                 false,
                             ));
                         }
                     },
                 };
-                let status = normalize_authoritative_status(record, response.status().clone())?;
-                let persisted = persist_authoritative(self.client_state, record, status)?;
-                match self
-                    .client_state
-                    .remove_after_terminal(persisted.meta().job_id(), dispatch_owner)
-                {
-                    Ok(_) => Ok(true),
-                    Err(WorkerError::Queue {
-                        code: "QUEUE_NOT_FOUND",
-                        ..
-                    }) => Ok(true),
-                    Err(error) => Err(error),
-                }
+                let status =
+                    normalize_authoritative_status(&accepted_record, response.status().clone())?;
+                let persisted = persist_authoritative(self.client_state, &accepted_record, status)?;
+                retire_terminal_queue_row(self.client_state, &persisted, dispatch_owner)?;
+                Ok(true)
             }
             PreacceptanceDisposition::Abandoned => {
+                reject_local_abandonment_after_acceptance_evidence(self.client_state, record)?;
                 let receipt = resolved.abandonment_receipt().ok_or_else(|| {
                     WorkerError::Protocol(
                         "ABANDONMENT_PROOF_MISSING: remote abandonment lacked a receipt".into(),
@@ -1360,6 +1381,20 @@ impl<'a> RunService<'a> {
                 Err(recovery_error(record, code, false))
             }
         }
+    }
+
+    fn cancellation_handoff(
+        &self,
+        record: &LocalJobRecord,
+        dispatch_owner: ProcessIdentity,
+    ) -> Result<RunCompletion, WorkerError> {
+        // A cancellation request is not authority to overwrite an already
+        // terminal exact remote outcome. The cancellation path has already
+        // persisted and retired any such result, so return it with its normal
+        // terminal exit semantics. If no durable terminal exists, this is the
+        // normal cancellation/abandonment handoff.
+        terminal_handoff_before_follow(self.client_state, record, dispatch_owner)?
+            .ok_or_else(dispatch_cancelled)
     }
 
     fn persist_uncertainty(
@@ -1537,6 +1572,122 @@ fn persist_authoritative(
         ConditionalStatusUpdate::Applied(record) => Ok(record),
         ConditionalStatusUpdate::Conflict(_) => Err(local_status_conflict()),
     }
+}
+
+fn persist_resolved_acceptance(
+    client_state: &ClientStateStore,
+    record: &LocalJobRecord,
+    authoritative: &StatusResponse,
+) -> Result<LocalJobRecord, WorkerError> {
+    let status = normalize_authoritative_status(record, authoritative.clone())?;
+    persist_authoritative(client_state, record, status)
+}
+
+fn terminal_cancel_response(
+    record: &LocalJobRecord,
+) -> Result<Option<CancelResponse>, WorkerError> {
+    let Some(status) = record.last_status().cloned() else {
+        return Ok(None);
+    };
+    if !status.state().is_terminal() {
+        return Ok(None);
+    }
+    Ok(Some(CancelResponse::new(StatusResponse::new(
+        record.meta().clone(),
+        status,
+    )?)?))
+}
+
+fn reject_local_abandonment_after_acceptance_evidence(
+    client_state: &ClientStateStore,
+    record: &LocalJobRecord,
+) -> Result<(), WorkerError> {
+    if record.last_status().is_none() {
+        return Ok(());
+    }
+    client_state.set_remote_uncertainty_if_same_immutable(
+        record,
+        RemoteUncertainty::unknown_remote("ACCEPTANCE_EVIDENCE_CONFLICT")?,
+    )?;
+    Err(inconsistent_acceptance_evidence())
+}
+
+fn retire_terminal_queue_row(
+    client_state: &ClientStateStore,
+    terminal_record: &LocalJobRecord,
+    dispatch_owner: ProcessIdentity,
+) -> Result<(), WorkerError> {
+    if !terminal_record
+        .last_status()
+        .is_some_and(|status| status.state().is_terminal())
+    {
+        return Err(inconsistent_terminal_outcome());
+    }
+    match client_state.remove_after_terminal(terminal_record.meta().job_id(), dispatch_owner) {
+        Ok(_) => Ok(()),
+        Err(
+            error @ WorkerError::Queue {
+                code: "QUEUE_NOT_FOUND",
+                ..
+            },
+        ) => {
+            // A concurrent canceller may already have retired the exact row.
+            // Accept that idempotently only when the same complete terminal
+            // record remains durable; a missing row alone is never proof.
+            let current = load_exact_job(client_state, terminal_record.meta().job_id())?;
+            if current == *terminal_record {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn terminal_handoff_before_follow(
+    client_state: &ClientStateStore,
+    expected: &LocalJobRecord,
+    dispatch_owner: ProcessIdentity,
+) -> Result<Option<RunCompletion>, WorkerError> {
+    let current = load_exact_job(client_state, expected.meta().job_id())?;
+    if !same_immutable(&current, expected) {
+        return Err(job_id_conflict());
+    }
+    let Some(status) = current.last_status().cloned() else {
+        return Ok(None);
+    };
+    if !status.state().is_terminal() {
+        return Ok(None);
+    }
+    retire_terminal_queue_row(client_state, &current, dispatch_owner)?;
+    if status.state() == JobState::Cancelled {
+        return Err(dispatch_cancelled());
+    }
+    Ok(Some(RunCompletion {
+        report: RunReport::new(
+            current.meta().job_id(),
+            current.meta().worker_name().into(),
+            status.clone(),
+        )?,
+        exit_code: terminal_exit_code(&status)?,
+    }))
+}
+
+fn is_ambiguous_cancel_transport_error(error: &WorkerError) -> bool {
+    matches!(
+        error,
+        WorkerError::Transport {
+            code: "SSH_UNAVAILABLE"
+                | "SSH_TIMEOUT"
+                | "SSH_LAUNCH_FAILED"
+                | "HOST_REQUEST_FAILED"
+                | "SSH_RESPONSE_TOO_LARGE"
+                | "SSH_DIAGNOSTIC_TOO_LARGE"
+                | "INVALID_RESPONSE",
+            ..
+        }
+    )
 }
 
 fn write_accepted(

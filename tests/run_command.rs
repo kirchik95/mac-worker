@@ -300,6 +300,15 @@ fn transport_failure() -> Result<ProcessResult, WorkerError> {
     })
 }
 
+fn launch_reply_loss() -> Result<ProcessResult, WorkerError> {
+    // The transport maps this post-dispatch loss to SSH_LAUNCH_FAILED. It
+    // remains ambiguous because the host may already have accepted and acted
+    // on the complete cancel request before its reply is lost locally.
+    Err(WorkerError::Io(io::Error::other(
+        "injected post-dispatch reply loss",
+    )))
+}
+
 fn authoritative_protocol_failure(code: &str, message: &str) -> Result<ProcessResult, WorkerError> {
     let mut stdout = serde_json::to_vec(&HostControlError::new(code, message).unwrap()).unwrap();
     stdout.push(b'\n');
@@ -3046,6 +3055,7 @@ struct RecordingFollower {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FollowerOutcome {
     Exit(u8),
+    Cancelled,
     Signal(u32),
     Infrastructure,
     Nonterminal,
@@ -3145,6 +3155,10 @@ impl JobFollower for RecordingFollower {
         let status = match self.outcome {
             FollowerOutcome::Exit(0) => JobStatus::succeeded(updated, 0, 0).unwrap(),
             FollowerOutcome::Exit(code) => JobStatus::failed(updated, code, 0, 0).unwrap(),
+            FollowerOutcome::Cancelled => JobStatus::accepted(record.meta().created_at_millis())
+                .unwrap()
+                .into_prelaunch_cancelled(record.meta().created_at_millis() + 1, 0, 0)
+                .unwrap(),
             FollowerOutcome::Signal(signal) => JobStatus::new(
                 JobState::Failed,
                 updated,
@@ -3243,6 +3257,13 @@ struct CancelAtSubmissionObserver {
     requests: AtomicUsize,
 }
 
+struct CancelAtAcceptedOutputObserver<'a> {
+    store: ClientStateStore,
+    runner: &'a RunScriptRunner,
+    config: &'a Config,
+    requests: AtomicUsize,
+}
+
 impl RecordingRunObserver {
     fn recording() -> Self {
         Self {
@@ -3321,6 +3342,32 @@ impl RunObserver for CancelAtSubmissionObserver {
             })?;
         self.store
             .request_queue_cancel(entry.job_id(), entry.enqueued_at_millis())?;
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl RunObserver for CancelAtAcceptedOutputObserver<'_> {
+    fn observe(&self, stage: RunStage) -> Result<(), WorkerError> {
+        if stage != RunStage::AcceptedOutputFlush {
+            return Ok(());
+        }
+        let job_id = self
+            .store
+            .queue_snapshot()?
+            .entries()
+            .first()
+            .ok_or_else(|| WorkerError::Queue {
+                code: "QUEUE_NOT_FOUND",
+                message: "accepted-output observer found no durable queue row".into(),
+            })?
+            .job_id();
+        let report = CancelService::new(self.runner, self.config, &self.store).cancel(job_id)?;
+        if !matches!(report, CancelReport::RemoteCancelled { .. }) {
+            return Err(WorkerError::Protocol(
+                "CANCEL_RESPONSE_INVALID: accepted-output cancellation was not remote".into(),
+            ));
+        }
         self.requests.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -3752,6 +3799,204 @@ fn cancel_transport_loss_is_resolved_only_by_original_id_status() {
 }
 
 #[test]
+fn cancel_launch_reply_loss_is_resolved_only_by_original_id_status() {
+    // Break caught: SSH_LAUNCH_FAILED is also used for a response loss after
+    // an already-dispatched request, so treating it as a preflight failure
+    // loses the original-ID-only reconciliation path.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(
+        &store,
+        901_026,
+        100,
+        Some(JobStatus::accepted(100).unwrap()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(record.clone()).unwrap();
+    let accepted =
+        StatusResponse::new(record.meta().clone(), JobStatus::accepted(100).unwrap()).unwrap();
+    let cancelled = JobStatus::accepted(100)
+        .unwrap()
+        .into_prelaunch_cancelled(101, 0, 0)
+        .unwrap();
+    let terminal = StatusResponse::new(record.meta().clone(), cancelled.clone()).unwrap();
+    let runner = RecordingRunner::returning(vec![
+        status_result(&accepted),
+        launch_reply_loss(),
+        status_result(&terminal),
+    ]);
+    let config = config();
+
+    let report = CancelService::new(&runner, &config, &store)
+        .cancel(record.meta().job_id())
+        .unwrap();
+
+    assert!(matches!(report, CancelReport::RemoteCancelled { .. }));
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 3);
+    assert_resolution_status_call(&requests[0], record.meta().job_id());
+    assert_control_call(&requests[1], HostOperation::Cancel, Duration::from_secs(30));
+    assert_status_call(
+        &requests[2],
+        Duration::from_secs(30),
+        record.meta().job_id(),
+    );
+    assert_eq!(
+        store
+            .load_job(record.meta().job_id())
+            .unwrap()
+            .last_status(),
+        Some(&cancelled)
+    );
+}
+
+#[test]
+fn cancel_preserves_a_typed_host_failure_without_status_fallback() {
+    // Break caught: a nonzero canonical host response is incorrectly treated
+    // as a lost reply, allowing a later terminal status to mask the host's
+    // authoritative cancellation failure.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(
+        &store,
+        901_021,
+        100,
+        Some(JobStatus::accepted(100).unwrap()),
+        RemoteUncertainty::None,
+    );
+    store.create_job(record.clone()).unwrap();
+    let accepted =
+        StatusResponse::new(record.meta().clone(), JobStatus::accepted(100).unwrap()).unwrap();
+    let cancelled = JobStatus::accepted(100)
+        .unwrap()
+        .into_prelaunch_cancelled(101, 0, 0)
+        .unwrap();
+    let terminal = StatusResponse::new(record.meta().clone(), cancelled).unwrap();
+    let runner = RecordingRunner::returning(vec![
+        status_result(&accepted),
+        authoritative_protocol_failure("JOB_ID_CONFLICT", "exact cancellation conflict"),
+        status_result(&terminal),
+    ]);
+    let config = config();
+
+    let error = CancelService::new(&runner, &config, &store)
+        .cancel(record.meta().job_id())
+        .unwrap_err();
+
+    assert!(
+        matches!(error, WorkerError::Protocol(ref message) if message == "JOB_ID_CONFLICT: exact cancellation conflict"),
+        "{error}"
+    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 2);
+    assert_resolution_status_call(&requests[0], record.meta().job_id());
+    assert_control_call(&requests[1], HostOperation::Cancel, Duration::from_secs(30));
+    assert_eq!(
+        store
+            .load_job(record.meta().job_id())
+            .unwrap()
+            .last_status(),
+        record.last_status()
+    );
+}
+
+#[test]
+fn cancel_persists_resolved_acceptance_before_an_ambiguous_cancel_result() {
+    // Break caught: an accepted resolution exists only in memory while the
+    // cancel reply is lost, allowing a later Abandoned result to erase the
+    // only durable evidence that remote acceptance occurred.
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let record = test_record(&store, 901_022, 100, None, RemoteUncertainty::None);
+    store.create_job(record.clone()).unwrap();
+    let accepted_status = JobStatus::accepted(101).unwrap();
+    let accepted = StatusResponse::new(record.meta().clone(), accepted_status.clone()).unwrap();
+    let runner = RecordingRunner::returning(vec![
+        status_result(&accepted),
+        transport_failure(),
+        status_result(&accepted),
+    ]);
+    let config = config();
+
+    let error = CancelService::new(&runner, &config, &store)
+        .cancel(record.meta().job_id())
+        .unwrap_err();
+
+    assert!(
+        matches!(error, WorkerError::Protocol(ref message) if message.starts_with("CANCEL_TRANSPORT_AMBIGUOUS:")),
+        "{error}"
+    );
+    let persisted = store.load_job(record.meta().job_id()).unwrap();
+    assert_eq!(persisted.last_status(), Some(&accepted_status));
+    assert_eq!(
+        persisted.remote_uncertainty().code(),
+        Some("CANCEL_TRANSPORT_AMBIGUOUS")
+    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 3);
+    assert_resolution_status_call(&requests[0], record.meta().job_id());
+    assert_control_call(&requests[1], HostOperation::Cancel, Duration::from_secs(30));
+    assert_status_call(
+        &requests[2],
+        Duration::from_secs(30),
+        record.meta().job_id(),
+    );
+}
+
+#[test]
+fn cancel_rejects_abandoned_resolution_against_durable_acceptance_evidence() {
+    // Break caught: a local accepted/running/terminal observation is silently
+    // downgraded to a queued cancellation when remote resolution says
+    // Abandoned, instead of retaining a recovery-required contradiction.
+    let cases = [
+        (901_023, JobStatus::accepted(100).unwrap()),
+        (901_024, JobStatus::running(101, 11, 12, 13, 14).unwrap()),
+        (901_025, JobStatus::succeeded(102, 0, 0).unwrap()),
+    ];
+
+    for (id, status) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let store = state_store(&temp);
+        let record = test_record(
+            &store,
+            id,
+            100,
+            Some(status.clone()),
+            RemoteUncertainty::None,
+        );
+        store.create_job(record.clone()).unwrap();
+        let runner = RecordingRunner::returning(vec![
+            authoritative_protocol_failure("JOB_ABANDONED", "exact remote abandonment"),
+            status_result(&ResolveOrAbandonResponse::abandoned()),
+        ]);
+        let config = config();
+
+        let error = CancelService::new(&runner, &config, &store)
+            .cancel(record.meta().job_id())
+            .unwrap_err();
+
+        assert!(
+            matches!(error, WorkerError::Protocol(ref message) if message.starts_with("ACCEPTANCE_EVIDENCE_CONFLICT:")),
+            "{error}"
+        );
+        let persisted = store.load_job(record.meta().job_id()).unwrap();
+        assert_eq!(persisted.last_status(), Some(&status));
+        assert_eq!(
+            persisted.remote_uncertainty().code(),
+            Some("ACCEPTANCE_EVIDENCE_CONFLICT")
+        );
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 2);
+        assert_resolution_status_call(&requests[0], record.meta().job_id());
+        assert_control_call(
+            &requests[1],
+            HostOperation::ResolveOrAbandon,
+            Duration::from_secs(30),
+        );
+    }
+}
+
+#[test]
 fn cancel_unknown_remote_record_is_recovery_required_and_never_guessed_cancelled() {
     let temp = tempfile::tempdir().unwrap();
     let store = state_store(&temp);
@@ -3897,6 +4142,183 @@ fn dispatch_owner_cancels_an_acceptance_that_races_submit_completion() {
     assert_eq!(requests.len(), 7);
     assert_resolution_status_call(&requests[5], record.meta().job_id());
     assert_control_call(&requests[6], HostOperation::Cancel, Duration::from_secs(30));
+    runner.assert_consumed();
+}
+
+#[test]
+fn dispatch_owner_preserves_terminal_outcome_that_wins_a_submit_cancel_race() {
+    // Break caught: after a cancellation request, original-ID resolution can
+    // prove the exact job already failed, but the dispatcher overwrites that
+    // authoritative terminal outcome with a generic cancellation error.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(
+        paths.state.clone(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+            RunScriptStep::StatusTerminal {
+                exit_code: 7,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        ],
+    );
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let observer = CancelAtSubmissionObserver {
+        store: store.clone(),
+        requests: AtomicUsize::new(0),
+    };
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_observer(&observer);
+
+    let completion = service
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+    assert_eq!(completion.exit_code, 7);
+    assert_eq!(completion.report.status.state(), JobState::Failed);
+    assert_eq!(observer.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    let record = store.list_jobs().unwrap().pop().unwrap();
+    assert_eq!(
+        record.last_status().map(JobStatus::state),
+        Some(JobState::Failed)
+    );
+    runner.assert_consumed();
+}
+
+#[test]
+fn dispatch_cancel_preserves_a_typed_host_failure_without_status_fallback() {
+    // Break caught: the dispatch-owner cancellation path turns an
+    // authoritative host failure into a later terminal status instead of
+    // retaining the exact cancellation error and queue recovery state.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(
+        paths.state.clone(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+            RunScriptStep::StatusAccepted,
+            RunScriptStep::AuthoritativeFailure(HostOperation::Cancel, "CLEANUP_PROOF_MISSING"),
+            RunScriptStep::StatusTerminal {
+                exit_code: 0,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        ],
+    );
+    let config = run_config();
+    let follower = RecordingFollower::succeeding(0);
+    let observer = CancelAtSubmissionObserver {
+        store: store.clone(),
+        requests: AtomicUsize::new(0),
+    };
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_observer(&observer);
+
+    let error = service
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, WorkerError::Protocol(ref message) if message == "CLEANUP_PROOF_MISSING: authoritative admission failure"),
+        "{error}"
+    );
+    assert_eq!(observer.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    let record = store.list_jobs().unwrap().pop().unwrap();
+    assert_eq!(
+        record.last_status().map(JobStatus::state),
+        Some(JobState::Accepted)
+    );
+    assert_eq!(store.queue_snapshot().unwrap().entries().len(), 1);
+    assert_eq!(runner.requests().len(), 7);
+}
+
+#[test]
+fn dispatch_does_not_follow_after_public_cancel_retires_a_terminal_row() {
+    // Break caught: a public canceller can finish the exact terminal update
+    // after the dispatcher's final pre-acceptance check, while the dispatcher
+    // still starts a follower and then mistakes its already-retired row for a
+    // queue failure.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RunScriptRunner::new(
+        paths.state.clone(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+            RunScriptStep::StatusAccepted,
+            RunScriptStep::CancelPrelaunch,
+        ],
+    );
+    let config = run_config();
+    let follower = RecordingFollower::terminal(FollowerOutcome::Cancelled, false);
+    let observer = CancelAtAcceptedOutputObserver {
+        store: store.clone(),
+        runner: &runner,
+        config: &config,
+        requests: AtomicUsize::new(0),
+    };
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_observer(&observer);
+
+    let error = service
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            WorkerError::Queue {
+                code: "CANCELLED",
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(observer.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    let record = store.list_jobs().unwrap().pop().unwrap();
+    assert_eq!(
+        record.last_status().map(JobStatus::state),
+        Some(JobState::Cancelled)
+    );
     runner.assert_consumed();
 }
 
