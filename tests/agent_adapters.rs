@@ -369,6 +369,28 @@ fn structured_results_cover_needs_input_and_blocked() {
 }
 
 #[test]
+fn structured_results_reject_schema_violations_as_unknown() {
+    let malformed = [
+        r#"{"status":"done","summary":"ok","unexpected":true}"#,
+        r#"{"status":"done"}"#,
+        r#"{"status":"done","summary":7}"#,
+        r#"{"status":"done","summary":"ok","questions":["q",7]}"#,
+        r#"{"status":"not_a_status","summary":"ok"}"#,
+    ];
+
+    for kind in [AgentKind::Codex, AgentKind::Claude] {
+        let adapter = adapter_for(kind);
+        for result in malformed {
+            assert_eq!(
+                adapter.extract_result("", Some(result)).unwrap().status(),
+                ResultStatus::Unknown,
+                "{kind:?} accepted {result}",
+            );
+        }
+    }
+}
+
+#[test]
 fn extract_result_prefers_the_last_message_file() {
     let adapter = adapter_for(AgentKind::Codex);
     let result = adapter

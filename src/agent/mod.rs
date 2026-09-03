@@ -7,6 +7,7 @@ use claude::ClaudeAdapter;
 use codex::CodexAdapter;
 use cursor::CursorAdapter;
 use opencode::OpencodeAdapter;
+use serde::Deserialize;
 use serde_json::Value;
 
 pub const MAX_SUMMARY_BYTES: usize = 512;
@@ -452,21 +453,35 @@ fn resolve_structured_result(
 
 fn parse_structured_result(text: &str) -> Option<StructuredResult> {
     let value = extract_json_object(text)?;
-    let status = match value.get("status").and_then(Value::as_str) {
-        Some("done") => ResultStatus::Done,
-        Some("needs_input") => ResultStatus::NeedsInput,
-        Some("blocked") => ResultStatus::Blocked,
-        _ => ResultStatus::Unknown,
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum WireStatus {
+        Done,
+        NeedsInput,
+        Blocked,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Wire {
+        status: WireStatus,
+        summary: String,
+        #[serde(default)]
+        questions: Vec<String>,
+        #[serde(default)]
+        files_changed: Vec<String>,
+    }
+
+    let wire = serde_json::from_value::<Wire>(value).ok()?;
+    let status = match wire.status {
+        WireStatus::Done => ResultStatus::Done,
+        WireStatus::NeedsInput => ResultStatus::NeedsInput,
+        WireStatus::Blocked => ResultStatus::Blocked,
     };
     Some(StructuredResult {
         status,
-        summary: value
-            .get("summary")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        questions: string_array(&value, "questions"),
-        files_changed: string_array(&value, "files_changed"),
+        summary: wire.summary,
+        questions: wire.questions,
+        files_changed: wire.files_changed,
     })
 }
 
@@ -484,17 +499,6 @@ fn extract_json_object(text: &str) -> Option<Value> {
         Ok(value) if value.is_object() => Some(value),
         _ => None,
     }
-}
-
-fn string_array(value: &Value, key: &str) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect()
 }
 
 fn json_i32(value: &Value, key: &str) -> Option<i32> {
