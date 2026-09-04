@@ -180,6 +180,7 @@ impl FetchReport {
 pub struct ReconcileReport {
     replaced_runners: usize,
     started_runners: usize,
+    repaired_rows: usize,
 }
 
 impl ReconcileReport {
@@ -189,6 +190,10 @@ impl ReconcileReport {
 
     pub fn started_runners(&self) -> usize {
         self.started_runners
+    }
+
+    pub fn repaired_rows(&self) -> usize {
+        self.repaired_rows
     }
 }
 
@@ -936,10 +941,11 @@ impl<'a> TaskClient<'a> {
         let owner = current_process_identity()?;
 
         // A task-turn row is owned by its runner in both waiting and
-        // dispatching states.  Unlike legacy batch rows it must never be
-        // reaped just because the owner disappeared: the next mutating
-        // command adopts it and either resumes the accepted turn or retries
-        // the pre-acceptance handoff.
+        // dispatching states.  A dead owner is normally adopted so the next
+        // runner can resume the accepted turn or retry the pre-acceptance
+        // handoff.  A dispatching row whose task is already non-active is the
+        // terminal-cleanup exception: repair it under the queue lock instead
+        // of leaving a stale reservation that blocks close or say.
         for entry in self.client_state.queue_snapshot()?.entries().iter() {
             if entry.kind() != QueueEntryKind::TaskTurn
                 || matches!(entry.state(), QueueState::Parked)
@@ -955,6 +961,22 @@ impl<'a> TaskClient<'a> {
                     ProcessObservation::Absent | ProcessObservation::Reused
                 )
             {
+                if matches!(entry.state(), QueueState::Dispatching { .. })
+                    && let Some(task_id) = self.terminal_task_for_turn(entry.job_id())?
+                {
+                    self.client_state.adopt_row(entry.job_id(), owner)?;
+                    if self
+                        .client_state
+                        .remove_task_turn_after_terminal(entry.job_id(), owner)?
+                        .is_some()
+                    {
+                        let _ = self
+                            .client_state
+                            .remove_turn_prompt(task_id, entry.job_id());
+                        report.repaired_rows += 1;
+                    }
+                    continue;
+                }
                 self.client_state.adopt_row(entry.job_id(), owner)?;
             }
         }
@@ -1579,6 +1601,32 @@ impl<'a> TaskClient<'a> {
                 .with_status(response.status().clone())?
                 .with_status_observed_at(Some(observed_at))?,
         )
+    }
+
+    fn terminal_task_for_turn(&self, turn_id: TurnId) -> Result<Option<TaskId>, WorkerError> {
+        let Some(task_id) = self.client_state.task_id_for_turn(turn_id)? else {
+            return Ok(None);
+        };
+        let record = self.client_state.load_task(task_id)?;
+        let recorded_turn_is_terminal = record
+            .status()
+            .turns()
+            .iter()
+            .find(|turn| turn.turn_id() == turn_id)
+            .is_some_and(|turn| turn.terminal().is_some());
+        let task_state = record.status().state();
+        if task_state == TaskState::Active {
+            return Ok(None);
+        }
+        let task_is_terminal_or_open = matches!(
+            task_state,
+            TaskState::Open | TaskState::Closed | TaskState::Abandoned | TaskState::Lost
+        );
+        if recorded_turn_is_terminal || task_is_terminal_or_open {
+            Ok(Some(task_id))
+        } else {
+            Ok(None)
+        }
     }
 
     fn enqueue_missing_turn(

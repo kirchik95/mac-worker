@@ -891,14 +891,16 @@ fn run_task_subcommand(
                         "protocol_version": PROTOCOL_VERSION,
                         "replaced_runners": report.replaced_runners(),
                         "started_runners": report.started_runners(),
+                        "repaired_rows": report.repaired_rows(),
                     }),
                 )?;
             } else {
                 writeln!(
                     stdout,
-                    "runners: {} replaced, {} started",
+                    "runners: {} replaced, {} started; task rows: {} repaired",
                     report.replaced_runners(),
-                    report.started_runners()
+                    report.started_runners(),
+                    report.repaired_rows()
                 )?;
                 stdout.flush()?;
             }
