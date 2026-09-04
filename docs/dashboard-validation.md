@@ -35,3 +35,40 @@ The queued job and active jobs were explicitly terminalized during cleanup. The 
 ## Final gate
 
 The browser-client suite (`16` tests), focused dashboard Rust suites (`62` tests), formatting check, and lint check passed. The parallel full-suite attempt surfaced two timing-sensitive failures; each passed its required isolated `--test-threads=1` rerun, and the complete serial full suite completed without a failure marker. The locked release build and diff check passed.
+
+## Phase 5e automated local evidence
+
+This section records the local documentation and dashboard-task gate for the phase-5e implementation. It uses fixtures and local test servers only; this worktree did not contact a worker or execute the live acceptance.
+
+| Check | Sanitized result |
+| --- | --- |
+| Focused Rust projection/privacy/route suites (`task_view`, `dashboard_tasks`, `dashboard_web`) | Passed (20 tests: 5 + 6 + 9) |
+| Browser client suite (`tests/dashboard_client.mjs`) | Passed (20 tests) |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed |
+| `cargo test --locked --all-targets` | Passed after required isolation (serial all-targets: 0 failures; timing-sensitive case: 1/1) |
+| `cargo build --locked --release` | Passed |
+| `git diff --check` | Passed |
+
+## Phase 5e live acceptance (operator-only; not run here)
+
+Every row below is a record skeleton for the sanitized three-worker acceptance. Replace an evidence cell only after the operator runs the gate against the matched release/client revision. The record may contain only shortened IDs, state names, counts, durations, outcome categories, revision/protocol matches, and privacy-safe pass/fail observations. Never add worker hostnames or SSH strings, local paths, prompts, environment values, credentials, session references, raw logs, or raw diagnostics.
+
+| Acceptance item | Evidence |
+| --- | --- |
+| 1. Loopback endpoint and no worker-side listener | PENDING LIVE RUN |
+| 2. Idle three-worker cards with current readiness | PENDING LIVE RUN |
+| 3. Three active task turns mapped to titles/agents and worker cards | PENDING LIVE RUN |
+| 4. Queued task-turn and batch rows with FIFO position, pin/run-cap fields, and blocking reason | PENDING LIVE RUN |
+| 5. Browser run/state/worker/agent filters without a network mutation | PENDING LIVE RUN |
+| 6. Task detail result card, questions, changed files, diff stat, and turn timeline | PENDING LIVE RUN |
+| 7. Active-turn stdout/stderr reconnect with exact 1-second cursors and no duplication | PENDING LIVE RUN |
+| 8. Stale remote status and dead runner presentation without recovery | PENDING LIVE RUN |
+| 9. Dashboard shutdown preserving task/turn status and zero mutation | PENDING LIVE RUN |
+| 10. Non-loopback rejection, privacy scan, and CLI/snapshot JSON parity | PENDING LIVE RUN |
+
+### Operator checklist
+
+1. Start `worker dashboard --no-open`, then inspect the worker cards, run-progress cards, queue, tasks table, selected task detail/timeline, and active stdout/stderr panes. Exercise the run/state/worker/agent filters locally.
+2. Compare the task rows and run progress with `worker --json task list --run <run-id>`, compare selected state with `worker --json task status <task-id>`, compare the result with `worker --json task result <task-id>`, and inspect reconnect behavior with `worker task logs <task-id>`. Keep task turns distinct from legacy `worker status`/`worker logs` jobs.
+3. Note only shortened task/run/turn IDs, state and last-outcome categories, task/queue/worker/byte counts, observed durations and polling cadence, revision/protocol matches, and pass/fail results. For privacy checks, record hit counts or a pass/fail result—not the values found. Record zero dashboard mutation calls and unchanged task/turn status after shutdown.

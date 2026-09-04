@@ -79,17 +79,30 @@ worker dashboard --no-open
 worker dashboard --port 9173
 ```
 
-The dashboard binds `127.0.0.1` only. It is read-only and ephemeral: it polls rather than pushes updates and keeps no metrics database. Its API does not expose command, environment, or path secrets. Application logs can contain application-emitted secrets, so the local user viewing dashboard logs must already be trusted to see them.
+The dashboard binds `127.0.0.1` only and validates the request `Host` against that loopback listener. It is read-only and ephemeral: it polls rather than pushes updates and keeps no database. API JSON responses use `Cache-Control: no-store`; the server also sends a restrictive CSP, `nosniff`, and `no-referrer` headers and does not enable CORS.
+
+The phase-5e tasks view is a read-only extension of this observer for durable agent tasks and named runs:
+
+- The tasks table shows title, agent, state, worker, runner state, turn count, last outcome, run position, branch, freshness, and age.
+- Run, state, worker, and agent filters are local browser filters; they do not make network requests.
+- Run cards show top-level and per-run progress. Queue rows retain the scheduler's batch/task-turn kind, pin, run cap, FIFO position, and Phase-4 blocking reason.
+- Task detail shows the safe result summary, questions, changed files, diff stat, base/head IDs, turn timeline, runner liveness, and the exact `worker task fetch <task-id>` command.
+
+The snapshot endpoint is `GET /api/v1/snapshot`. Task detail is `GET /api/v1/tasks/<task-id>`, and a turn log is read with `GET /api/v1/tasks/<task-id>/turns/<turn-id>/logs?stream=stdout|stderr&offset=<byte-offset>&limit=<bytes>`. Task IDs and turn IDs must be canonical typed identifiers; the existing legacy `/api/v1/jobs/...` detail and log routes remain separate. Snapshot polling runs every two seconds. A selected active task turn polls stdout and stderr independently every one second with byte cursors and decoder state; each log request is bounded to `1..=65,536` bytes and polling stops at the terminal stream lengths.
+
+`worker task list --json` and the dashboard snapshot use the same `tasks`, `runs`, and `progress` projection. The CLI adds its protocol-version envelope; the snapshot flattens the projection beside its worker, queue, and legacy-job fields.
+
+The dashboard only observes local records, process liveness, cached worker observations, and bounded remote status/log reads. It never starts or recovers a runner, reconciles, cancels, closes, fetches a result, or sends a task message. Prompts and prompt-file contents, environment profiles and values, credentials, session references, complete paths, raw host diagnostics, and unbounded output are not exposed in task rows, queue rows, JSON, detail, or timeline data. Changed files remain repository-relative or become `[path]`; log chunks are bounded base64 bytes and browser content is rendered as text only. Application log content is trusted text for the local operator and may contain application-emitted secrets.
 
 ## Phase 5
 
-Phase 5 adds agent tasks: submit a prompt instead of a command, run a headless coding agent on a Mac mini, and collect the result as a Git branch. On this branch those commands are **not** in the CLI. `src/cli.rs` still has `setup`, `doctor`, `workers` (no `--refresh`), `dashboard`, `run`, `status`, and `logs` only. The forms below are the contract for the execution core (plan Tasks 7 to 10). Do not type them against a worker until they exist in the binary you are running.
+Phase 5 adds agent tasks: submit a prompt instead of a command, run a headless coding agent on a Mac mini, and collect the result as a Git branch. The task lifecycle commands are available in this branch, and phase 5e adds the read-only dashboard tasks view described above. The dashboard does not replace the task CLI or add mutation controls.
 
 The orchestrator loop is documented in [`.claude/skills/pool-dispatch/SKILL.md`](.claude/skills/pool-dispatch/SKILL.md). How to write a brief is in [`.claude/skills/pool-task-authoring/SKILL.md`](.claude/skills/pool-task-authoring/SKILL.md). The three-Mac live procedure is [docs/phase-five-acceptance-runbook.md](docs/phase-five-acceptance-runbook.md); the sanitized record template is [docs/phase-five-validation.md](docs/phase-five-validation.md).
 
 Prepare each worker first using the [macOS worker setup guide](docs/setup-macos-worker.md). After a helper that migrates the host layout or collects agent facts for the first time, rerun `worker setup` on every worker.
 
-When the task commands exist:
+Task commands:
 
 ```text
 worker task submit --agent codex --prompt-file tasks/fix-login.md
@@ -150,6 +163,6 @@ opencode = "unattended"
 
 Claude Code is deferred on the workers by operator decision. When it is enabled, put its token in an owner-only profile on each worker (`~/.config/mac-worker/env/agents.env`, mode `0600`) with `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. Codex uses its file-based login and needs no profile. mac-worker never creates, uploads, or prints a profile.
 
-These remain later phases, not this execution core: `source = origin`, `publish = push`, Cursor Agent, OpenCode, retention through `worker gc`, and the dashboard tasks view. The batch-file example above shows those later keys so a future override is valid TOML; this core must reject them at preflight.
+These remain later phases, not this execution core or the phase-5e observer: `source = origin`, `publish = push`, Cursor Agent, OpenCode, and retention through `worker gc`. The batch-file example above shows those later keys so a future override is valid TOML; this core must reject them at preflight.
 
 Agent turns run with the worker account's full access: its files, processes, caches, agent configuration, and any credentials that account holds. A task workspace is not a security boundary. Only dispatch trusted prompts.
