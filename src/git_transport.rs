@@ -75,7 +75,7 @@ impl<'a> GitTransport<'a> {
         );
         let request = git_request(
             transfer_repo,
-            ssh,
+            Some(ssh),
             vec![
                 OsString::from("push"),
                 OsString::from("--no-verify"),
@@ -113,7 +113,7 @@ impl<'a> GitTransport<'a> {
         let local_ref = format!("refs/mac-worker/results/{task_id}");
         let request = git_request(
             transfer_repo,
-            ssh,
+            Some(ssh),
             vec![
                 OsString::from("fetch"),
                 OsString::from("--no-write-fetch-head"),
@@ -126,7 +126,7 @@ impl<'a> GitTransport<'a> {
         if !result.status.success() {
             return Err(git_error("RESULT_FETCH_FAILED", "result fetch failed"));
         }
-        let head = read_ref_head(transfer_repo, &local_ref)?;
+        let head = read_ref_head(self.runner, transfer_repo, &local_ref)?;
         Ok(ImportReceipt::new(head, local_ref))
     }
 }
@@ -327,22 +327,29 @@ impl<'a> HostGitService<'a> {
     }
 }
 
-fn git_request(transfer_repo: &Path, ssh: String, mut operation: Vec<OsString>) -> ProcessRequest {
+fn git_request(
+    transfer_repo: &Path,
+    ssh: Option<String>,
+    mut operation: Vec<OsString>,
+) -> ProcessRequest {
     let mut args = vec![
         OsString::from("-C"),
         transfer_repo.as_os_str().to_os_string(),
     ];
     args.extend([OsString::from("-c"), OsString::from("gc.auto=0")]);
     args.append(&mut operation);
+    let mut environment = vec![
+        (GIT_CONFIG_GLOBAL.into(), "/dev/null".into()),
+        (GIT_CONFIG_NOSYSTEM.into(), "1".into()),
+        (GIT_TERMINAL_PROMPT.into(), "0".into()),
+    ];
+    if let Some(ssh) = ssh {
+        environment.insert(0, ("GIT_SSH_COMMAND".into(), ssh.into()));
+    }
     ProcessRequest {
         program: GIT_PROGRAM.into(),
         args,
-        environment: vec![
-            ("GIT_SSH_COMMAND".into(), ssh.into()),
-            (GIT_CONFIG_GLOBAL.into(), "/dev/null".into()),
-            (GIT_CONFIG_NOSYSTEM.into(), "1".into()),
-            (GIT_TERMINAL_PROMPT.into(), "0".into()),
-        ],
+        environment,
         environment_remove: vec![
             "GIT_DIR".into(),
             "GIT_WORK_TREE".into(),
@@ -362,21 +369,27 @@ fn git_request(transfer_repo: &Path, ssh: String, mut operation: Vec<OsString>) 
     }
 }
 
-fn read_ref_head(transfer_repo: &Path, local_ref: &str) -> Result<BaseOid, WorkerError> {
-    let output = Command::new(GIT_PROGRAM)
-        .args(["--git-dir"])
-        .arg(transfer_repo)
-        .args(["rev-parse", "--verify", local_ref])
-        .env(GIT_CONFIG_GLOBAL, "/dev/null")
-        .env(GIT_CONFIG_NOSYSTEM, "1")
-        .output()?;
+fn read_ref_head(
+    runner: &dyn ProcessRunner,
+    transfer_repo: &Path,
+    local_ref: &str,
+) -> Result<BaseOid, WorkerError> {
+    let output = runner
+        .run(&git_request(
+            transfer_repo,
+            None,
+            vec![
+                OsString::from("rev-parse"),
+                OsString::from("--verify"),
+                local_ref.into(),
+            ],
+        ))
+        .map_err(map_fetch_failure)?;
     if !output.status.success() {
-        // A scripted ProcessRunner used by request-level tests does not
-        // materialize a Git repository. The real transport always leaves the
-        // fetched ref behind, so this zero OID is only a test receipt.
-        return "0000000000000000000000000000000000000000"
-            .parse()
-            .map_err(|_| git_error("RESULT_FETCH_FAILED", "fetched result head is invalid"));
+        return Err(git_error(
+            "RESULT_FETCH_FAILED",
+            "fetched result ref is missing or invalid",
+        ));
     }
     String::from_utf8(output.stdout)
         .map_err(|_| git_error("RESULT_FETCH_FAILED", "fetched result head is invalid"))?

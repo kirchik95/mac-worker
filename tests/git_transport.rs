@@ -4,7 +4,7 @@ mod support;
 use std::{
     ffi::OsString,
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -24,7 +24,7 @@ use mac_worker::{
         ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseToken, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
-    process::ProcessRequest,
+    process::{ProcessRequest, ProcessResult},
     protocol::{HealthStatus, PROTOCOL_VERSION},
     run_with_io_in_context,
     task::{BaseOid, TaskId},
@@ -190,7 +190,19 @@ fn push_base_runs_in_transfer_repo_with_pinned_ssh_and_hidden_receive_pack() {
 
 #[test]
 fn fetch_result_uses_hidden_upload_pack_and_aliases_import_receipt() {
-    let runner = RecordingRunner::returning_success();
+    let expected_head = "0123456789012345678901234567890123456789";
+    let runner = RecordingRunner::returning_results(vec![
+        Ok(ProcessResult {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }),
+        Ok(ProcessResult {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: format!("{expected_head}\n").into_bytes(),
+            stderr: Vec::new(),
+        }),
+    ]);
     let transfer = tempfile::tempdir().unwrap();
     let receipt = GitTransport::new(&runner)
         .fetch_result(
@@ -201,7 +213,9 @@ fn fetch_result_uses_hidden_upload_pack_and_aliases_import_receipt() {
             transfer.path(),
         )
         .unwrap();
-    let request = runner.single_request();
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 2, "fetch must verify the fetched local ref");
+    let request = &requests[0];
 
     assert_eq!(request.program, "/usr/bin/git");
     assert!(
@@ -241,6 +255,43 @@ fn fetch_result_uses_hidden_upload_pack_and_aliases_import_receipt() {
         receipt.local_ref(),
         format!("refs/mac-worker/results/{}", task_id())
     );
+    assert_eq!(receipt.head().as_str(), expected_head);
+    assert!(
+        requests[1]
+            .args
+            .windows(2)
+            .any(|window| window[0] == "rev-parse" && window[1] == "--verify")
+    );
+}
+
+#[test]
+fn fetch_result_rejects_a_missing_local_ref_instead_of_fabricating_an_oid() {
+    let runner = RecordingRunner::returning_results(vec![
+        Ok(ProcessResult {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }),
+        Ok(ProcessResult {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"fatal: needed a single revision\n".to_vec(),
+        }),
+    ]);
+    let transfer = tempfile::tempdir().unwrap();
+
+    let error = GitTransport::new(&runner)
+        .fetch_result(
+            &worker(),
+            client_id(),
+            PROJECT_ID,
+            task_id(),
+            transfer.path(),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.public_code(), "RESULT_FETCH_FAILED");
+    assert_eq!(runner.requests().len(), 2);
 }
 
 type GitInvocation = (String, PathBuf, Vec<(OsString, OsString)>);
