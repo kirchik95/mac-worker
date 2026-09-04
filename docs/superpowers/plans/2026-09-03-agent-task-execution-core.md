@@ -1521,7 +1521,7 @@ Expected: all pass with zero warnings.
 
 - [ ] **Step 4: Run three-Mac live acceptance**
 
-Install the release helper on all three workers with `worker setup` (which performs the layout migration), verify `worker workers` shows protocol 4, `agent:codex` on every worker, and `agent:claude@agents` on the workers with an env profile, then execute spec section 20.2 items 1 to 5 and 7 to 10 (item 6 belongs to the later plan) with an isolated clone and isolated XDG roots, including the submitting shell exiting before completion. Record only sanitized evidence in `docs/phase-five-validation.md`: shortened identifiers, sanitized command categories, terminal states, exit results, durations, before/after fingerprints of mac-worker-owned namespaces and of the isolated clone, and the helper/client revision match.
+Install the release helper on all three workers with `worker setup` (which performs the layout migration), verify `worker workers` shows protocol 4 and `agent:codex` on every worker (`agent:claude@agents` only once the operator re-enables Claude on the workers), then execute spec section 20.2 items 1 to 5 and 7 to 10 as amended for the Codex-only core (item 6 belongs to the later plan; in this core `publish = push` is refused at preflight with `TASK_CONFIG_INVALID`, so item 5 records that code) with an isolated clone and isolated XDG roots, including the submitting shell exiting before completion. Record only sanitized evidence in `docs/phase-five-validation.md`: shortened identifiers, sanitized command categories, terminal states, exit results, durations, before/after fingerprints of mac-worker-owned namespaces and of the isolated clone, and the helper/client revision match.
 
 - [ ] **Step 5: Commit documentation and evidence**
 

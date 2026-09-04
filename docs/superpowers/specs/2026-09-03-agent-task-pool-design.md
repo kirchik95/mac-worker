@@ -618,9 +618,9 @@ Against the three configured workers, with sanitized records only:
 5. `--wip` base: the user's repository is byte-identical after submission; the result branch contains the temporary commit; `push` is refused at preflight for it.
 6. `source = origin` and `publish = push` route only to workers with the declared origin capability; the pushed branch appears on origin under `--publish-branch`.
 7. Disconnect during `logs -f` and during `submit --wait`, plus a killed runner mid-turn: exactly one turn ran, the next command replaces the runner, and status and logs reconnect by the original identifiers.
-8. Dashboard shows every state above truthfully and its shutdown changes nothing.
+8. Dashboard shows every state above truthfully through its worker cards, queue, and job views (turns are jobs), and its shutdown changes nothing; the dedicated tasks view is phase 5e and is not required here.
 9. Retained metadata contains no planted secret values and no complete local paths.
-10. The Claude and Cursor adapters succeed from a locked-keychain SSH session using env profiles only, and a worker without a Git identity produces correctly attributed commits.
+10. A worker without a Git identity produces correctly attributed commits. The locked-keychain proof for Claude Code and Cursor Agent through env profiles moves to the phase 5d acceptance, because Claude is deferred on the workers by operator decision and Cursor is wired in phase 5d.
 
 ### 20.3 Go/no-go thresholds
 
@@ -644,7 +644,7 @@ Then:
 5. **Phase 5d: publication and capabilities.** Profile-keyed agent authentication probes, origin capabilities, `source = origin`, `publish = push`, Cursor and OpenCode adapters, retention through `gc`.
 6. **Phase 5e: dashboard extension.**
 
-The v2 execution core is complete when acceptance in section 20.2 passes for Codex and Claude on the three configured workers. Cursor and OpenCode may follow without a new design review; the items in section 22 may not.
+The v2 execution core is complete when acceptance in section 20.2 passes for Codex on the three configured workers; Claude joins that acceptance when the operator re-enables it on the workers. Cursor and OpenCode may follow without a new design review; the items in section 22 may not.
 
 ## 22. Deferred designs
 

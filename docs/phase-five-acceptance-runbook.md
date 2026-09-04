@@ -238,7 +238,7 @@ The fetched result branch must contain the temporary WIP commit. Then refuse pus
   --publish push --prompt-file tasks/accept-wip.md
 ```
 
-Expect a preflight error, no task record, no remote mutation. Record the public code (`PUBLISH_REQUIRES_COMMITTED_BASE` and/or `TASK_CONFIG_INVALID` naming the later plan — see the operator questions in the docs commit report).
+Expect a preflight error, no task record, no remote mutation. In this core `publish = push` is refused before the base check, so the public code to record is `TASK_CONFIG_INVALID` naming the later plan; `PUBLISH_REQUIRES_COMMITTED_BASE` is the expected code once phase 5d enables `push` (operator decision, 2026-09-04).
 
 ## 8. Item 7 — disconnect, `submit --wait`, killed runner
 
