@@ -689,6 +689,12 @@ impl<'a> TurnPublisher<'a> {
             read_optional_text(turn_dir, "last.md", crate::task::MAX_PROMPT_BYTES as u64)?;
         let adapter = crate::agent::adapter_for(meta.agent());
         let session = ensure_session_binding(self.store, meta, &stream, tail.as_deref(), adapter)?;
+        if session.is_none() && terminal == TurnTerminal::Succeeded {
+            return Err(turn_error(
+                "PUBLISH_FAILED",
+                "successful turn did not bind an agent session",
+            ));
+        }
         let structured = adapter
             .extract_result(&stream, last_message.as_deref().or(tail.as_deref()))
             .map_err(|error| turn_error("PUBLISH_FAILED", error.to_string()))?;

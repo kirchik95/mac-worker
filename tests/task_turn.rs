@@ -460,3 +460,137 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
     assert_eq!(retry.task().state(), TaskState::Open);
     assert_eq!(retry.task().last_outcome(), Some(&TaskOutcome::Done));
 }
+
+#[test]
+fn successful_codex_turn_without_a_bound_session_fails_publication() {
+    let temp = tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"base\n");
+    source.commit_all("base");
+    let base_oid: BaseOid = String::from_utf8(source.git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    let mirror_path = mirror.path().to_string_lossy().into_owned();
+    let base_ref = format!("HEAD:refs/mac-worker/bases/{}", task_id());
+    assert!(
+        source
+            .git(&["push", &mirror_path, &base_ref])
+            .status
+            .success()
+    );
+
+    let prompt = "turn prompt";
+    let turn_limits = TurnLimits::new(30_000, None, None).unwrap();
+    let turn = TurnMaterial::from_prompt(
+        task_id(),
+        1,
+        AgentKind::Codex,
+        None,
+        PermissionPolicy::Workspace,
+        turn_limits.clone(),
+        base_oid.clone(),
+        prompt,
+        None,
+        Uuid::from_u128(2),
+        false,
+    )
+    .unwrap();
+    let launch = TurnLaunch::new(
+        "/bin/sh",
+        vec![
+            "-c".into(),
+            "printf changed > agent.txt; printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"done\\\",\\\"summary\\\":\\\"ok\\\",\\\"questions\\\":[],\\\"files_changed\\\":[]}\"}}'".into(),
+        ],
+        PromptDelivery::Stdin,
+        Vec::new(),
+        false,
+    );
+    let seed_material = RequestFingerprintMaterial::new(
+        JobId::new(Uuid::from_u128(3)),
+        ClientId::new(Uuid::from_u128(4)),
+        LeaseToken::new(Uuid::from_u128(5)),
+        100,
+        "test-worker".into(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        turn.digest(),
+        String::new(),
+        30_000,
+        "heavy".into(),
+        CommandSpec::shell("true".into()).unwrap(),
+    )
+    .unwrap();
+    let seed_lease =
+        LeaseRecord::new(&seed_material, seed_material.fingerprint(), 100, 30_100).unwrap();
+    let projected = turn.v1_material(&seed_lease, &launch).unwrap();
+    LeaseService::new(&store)
+        .acquire(
+            &LeaseAcquireRequest::new(projected.clone()),
+            &AdmissionFacts {
+                free_disk_bytes: 100 * 1024 * 1024 * 1024,
+                total_disk_bytes: 200 * 1024 * 1024 * 1024,
+                memory_pressure: MemoryPressure::Normal,
+                swap_used_bytes: Some(0),
+            },
+            100,
+        )
+        .unwrap();
+
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id: task_id(),
+        run_id: None,
+        project_id: PROJECT_ID.into(),
+        worktree_id: WORKTREE_ID.into(),
+        agent: AgentKind::Codex,
+        model: None,
+        policy: PermissionPolicy::Workspace,
+        source: TaskSource::Local { wip: false },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid,
+        limits: TaskLimits::new(turn_limits, 3).unwrap(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+        prompt: prompt.into(),
+        created_at_millis: 100,
+    })
+    .unwrap();
+    let admission = store
+        .admission_lock(JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    let transfer = store
+        .transfer_lock_after(&admission, JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
+        .prepare(
+            &TaskPrepareRequest::new(meta, JobId::new(Uuid::from_u128(3)), "test-worker"),
+            &transfer,
+        )
+        .unwrap();
+    drop(transfer);
+    drop(admission);
+
+    let request =
+        TaskTurnRequest::new(mac_worker::job::SubmitRequest::new(projected), turn, prompt);
+    let launcher = InlineTurnLauncher {
+        store: store.clone(),
+        fault: None,
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "PUBLISH_FAILED");
+    let status = store.task_status(PROJECT_ID, task_id()).unwrap();
+    assert_eq!(status.state(), TaskState::Open);
+    assert!(!status.session_present());
+    assert!(matches!(
+        status.last_outcome(),
+        Some(TaskOutcome::Failed { .. })
+    ));
+}
