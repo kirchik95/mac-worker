@@ -49,3 +49,5 @@ A scoped scan of retained job metadata and logs, excluding immutable snapshot tr
 ## Remaining boundary
 
 This acceptance covers Phase 4's three-worker scheduling contract: automatic placement, FIFO waiting, pin behavior, no-wait admission, explicit cancellation, follower reconnection, and one-worker reconciliation. Dashboard work is Phase 4.5. Artifact transfer/fetch, package caches, Docker profiles, general garbage collection, and other later-phase controls remain outside this validation.
+
+Post-rebase smoke on `71b7e9a3c0dcaa187ca7f32880d9d0d3588d205f`: mini-1 setup, automatic placement, status/log access, and terminal lease release passed.
