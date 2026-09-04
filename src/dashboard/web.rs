@@ -20,8 +20,10 @@ use crate::{
         service::{
             Clock, DashboardDataSource, DashboardService, DashboardSnapshotRequest, MonotonicClock,
         },
+        task::DashboardTaskSource,
     },
     job::{JobId, LogStream},
+    task::{TaskId, TurnId},
 };
 
 const MAX_LOG_LIMIT: u32 = 65_536;
@@ -45,6 +47,7 @@ pub trait DashboardLogSource: Send + Sync + 'static {
 pub struct DashboardHttpState<S, C, M> {
     pub service: Arc<DashboardService<S, C, M>>,
     pub log_source: Arc<dyn DashboardLogSource>,
+    pub task_source: Arc<dyn DashboardTaskSource>,
 }
 
 pub struct DashboardHttpServer {
@@ -141,6 +144,11 @@ where
         .route("/assets/dashboard.css", get(stylesheet))
         .route("/assets/dashboard.mjs", get(script))
         .route("/api/v1/snapshot", get(snapshot::<S, C, M>))
+        .route(
+            "/api/v1/tasks/{task_id}/turns/{turn_id}/logs",
+            get(task_log_chunk::<S, C, M>),
+        )
+        .route("/api/v1/tasks/{task_id}", get(task_detail::<S, C, M>))
         .route("/api/v1/jobs/{job_id}", get(job_detail::<S, C, M>))
         .route("/api/v1/jobs/{job_id}/logs", get(log_chunk::<S, C, M>))
         .fallback(not_found)
@@ -299,6 +307,73 @@ where
     }
 }
 
+async fn task_detail<S, C, M>(
+    State(state): State<AppState<S, C, M>>,
+    Path(raw_task_id): Path<String>,
+) -> Response
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
+    let task_id = match parse_task_id(&raw_task_id) {
+        Ok(task_id) => task_id,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
+    };
+    let task_source = Arc::clone(&state.dashboard.task_source);
+    match tokio::task::spawn_blocking(move || task_source.task_detail(task_id)).await {
+        Ok(Ok(detail)) => api_json(StatusCode::OK, detail),
+        Ok(Err(error)) => task_source_error(error),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::new(
+                "DASHBOARD_TASK_HANDLER_FAILED",
+                "dashboard task lookup failed",
+            ),
+        ),
+    }
+}
+
+async fn task_log_chunk<S, C, M>(
+    State(state): State<AppState<S, C, M>>,
+    Path((raw_task_id, raw_turn_id)): Path<(String, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> Response
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
+    let task_id = match parse_task_id(&raw_task_id) {
+        Ok(task_id) => task_id,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
+    };
+    let turn_id = match parse_turn_id(&raw_turn_id) {
+        Ok(turn_id) => turn_id,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
+    };
+    let query = match parse_log_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
+    };
+    let task_source = Arc::clone(&state.dashboard.task_source);
+    match tokio::task::spawn_blocking(move || {
+        task_source.read_task_log(task_id, turn_id, query.stream, query.offset, query.limit)
+    })
+    .await
+    {
+        Ok(Ok(chunk)) => api_json(StatusCode::OK, chunk),
+        Ok(Err(error)) => task_source_error(error),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::new(
+                "DASHBOARD_TASK_HANDLER_FAILED",
+                "dashboard task log lookup failed",
+            ),
+        ),
+    }
+}
+
 async fn not_found() -> Response {
     api_error(
         StatusCode::NOT_FOUND,
@@ -338,6 +413,24 @@ fn source_error(error: ApiError) -> Response {
     api_error(status, error)
 }
 
+fn task_source_error(error: ApiError) -> Response {
+    let (status, message) = match error.code.as_str() {
+        "TASK_NOT_FOUND" => (
+            StatusCode::NOT_FOUND,
+            "task is not available in the dashboard source",
+        ),
+        "TURN_NOT_FOUND" => (
+            StatusCode::NOT_FOUND,
+            "turn is not available in the requested task",
+        ),
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            "dashboard task source is unavailable",
+        ),
+    };
+    api_error(status, ApiError::new(error.code, message))
+}
+
 fn api_error_from_dashboard(error: DashboardError) -> ApiError {
     ApiError::new(error.code, error.message)
 }
@@ -346,6 +439,18 @@ fn parse_job_id(raw_job_id: &str) -> Result<JobId, ApiError> {
     raw_job_id
         .parse()
         .map_err(|_| ApiError::new("INVALID_JOB_ID", "job ID must be a canonical identifier"))
+}
+
+fn parse_task_id(raw_task_id: &str) -> Result<TaskId, ApiError> {
+    raw_task_id
+        .parse()
+        .map_err(|_| ApiError::new("INVALID_TASK_ID", "task ID must be a canonical identifier"))
+}
+
+fn parse_turn_id(raw_turn_id: &str) -> Result<TurnId, ApiError> {
+    raw_turn_id
+        .parse()
+        .map_err(|_| ApiError::new("INVALID_TURN_ID", "turn ID must be a canonical identifier"))
 }
 
 struct LogQuery {

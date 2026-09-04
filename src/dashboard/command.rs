@@ -9,6 +9,7 @@ use crate::{
             DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource,
             MacWorkerLogSource, SystemDashboardRemoteReader, SystemDashboardWorkerReader,
         },
+        task::{DashboardTaskSource, MacWorkerTaskSource},
         web::{DashboardHttpServer, DashboardHttpState},
     },
     error::WorkerError,
@@ -60,6 +61,11 @@ impl SystemDashboardLauncher {
             Arc::clone(&local_jobs),
             Arc::clone(&remote),
         );
+        let task_source: Arc<dyn DashboardTaskSource> = Arc::new(MacWorkerTaskSource::new(
+            Arc::clone(&config),
+            Arc::clone(&local_jobs),
+            Arc::clone(&remote),
+        ));
         let log_source = Arc::new(MacWorkerLogSource::new(config, local_jobs, remote));
         Self {
             state: Arc::new(DashboardHttpState {
@@ -69,6 +75,7 @@ impl SystemDashboardLauncher {
                     SystemMonotonicClock::new(),
                 )),
                 log_source,
+                task_source,
             }),
         }
     }

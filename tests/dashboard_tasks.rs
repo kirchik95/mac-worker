@@ -16,6 +16,7 @@ use mac_worker::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
         },
         source::{DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource},
+        task::{DashboardTaskSource, MacWorkerTaskSource},
     },
     error::WorkerError,
     job::{
@@ -34,6 +35,7 @@ use mac_worker::{
         TaskStatus, TurnId, TurnSummary,
     },
     task_store::{TaskStatusRequest, TaskStatusResponse},
+    task_view::TaskListJson,
 };
 use uuid::Uuid;
 
@@ -124,6 +126,61 @@ fn active_worker_card_maps_turn_identity_to_task_title_and_agent() {
     assert_eq!(active.title, "Repair login");
     assert_eq!(active.agent, "codex");
     assert_eq!(active.turn_number, 1);
+}
+
+#[test]
+fn dashboard_snapshot_and_cli_task_list_keep_the_same_projection_fields() {
+    let snapshot = DashboardTaskHarness::active_local_task()
+        .snapshot()
+        .unwrap();
+    let cli = serde_json::to_value(TaskListJson::new(
+        PROTOCOL_VERSION,
+        snapshot.task_view.clone(),
+    ))
+    .unwrap();
+    let snapshot_json = serde_json::to_value(snapshot).unwrap();
+
+    assert_eq!(cli["tasks"], snapshot_json["tasks"]);
+    assert_eq!(cli["runs"], snapshot_json["runs"]);
+    assert_eq!(cli["progress"], snapshot_json["progress"]);
+    assert_eq!(cli["protocol_version"], PROTOCOL_VERSION);
+}
+
+#[test]
+fn task_source_uses_typed_ids_and_stale_detail_without_mutation() {
+    let harness = DashboardTaskHarness::active_local_task().with_remote_failure("SSH_UNAVAILABLE");
+    let source = MacWorkerTaskSource::new(
+        Arc::clone(&harness.config),
+        Arc::clone(&harness.state),
+        Arc::clone(&harness.remote) as Arc<dyn DashboardRemoteReader>,
+    );
+    let detail = source.task_detail(harness.task_id()).unwrap();
+    assert_eq!(
+        detail.task.freshness,
+        mac_worker::task_view::TaskFreshness::Stale
+    );
+
+    let turn_id = harness
+        .state
+        .load_task(harness.task_id())
+        .unwrap()
+        .status()
+        .turns()[0]
+        .turn_id();
+    harness
+        .state
+        .write_turn_prompt(harness.task_id(), turn_id, SECRET)
+        .unwrap();
+    let chunk = source
+        .read_task_log(harness.task_id(), turn_id, LogStream::Stdout, 3, 4)
+        .unwrap();
+    assert_eq!(chunk.offset(), 3);
+    assert_eq!(chunk.next_offset(), 7);
+    assert_eq!(
+        harness.remote.log_requests(),
+        vec![(turn_id, LogStream::Stdout, 3, 4)]
+    );
+    assert_eq!(harness.mutation_calls(), 0);
 }
 
 #[derive(Clone)]
@@ -373,6 +430,7 @@ impl QueueHarness {
 struct FakeRemote {
     task_status: Mutex<Option<Result<TaskStatusResponse, String>>>,
     task_status_calls: AtomicUsize,
+    log_requests: Mutex<Vec<(JobId, LogStream, u64, u32)>>,
     mutation_calls: AtomicUsize,
 }
 
@@ -393,6 +451,10 @@ impl FakeRemote {
             None => Err(WorkerError::Protocol("TASK_NOT_FOUND".into())),
         }
     }
+
+    fn log_requests(&self) -> Vec<(JobId, LogStream, u64, u32)> {
+        self.log_requests.lock().unwrap().clone()
+    }
 }
 
 impl DashboardRemoteReader for FakeRemote {
@@ -403,12 +465,16 @@ impl DashboardRemoteReader for FakeRemote {
     fn log_chunk(
         &self,
         _worker: &WorkerEntry,
-        _job_id: JobId,
-        _stream: LogStream,
-        _offset: u64,
-        _limit: u32,
+        job_id: JobId,
+        stream: LogStream,
+        offset: u64,
+        limit: u32,
     ) -> Result<LogChunk, WorkerError> {
-        Err(WorkerError::Protocol("JOB_NOT_FOUND".into()))
+        self.log_requests
+            .lock()
+            .unwrap()
+            .push((job_id, stream, offset, limit));
+        LogChunk::new(stream, offset, b"data".to_vec())
     }
 
     fn task_status(

@@ -22,9 +22,14 @@ use mac_worker::{
         service::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
         },
+        task::DashboardTaskSource,
         web::{DashboardHttpServer, DashboardHttpState, DashboardLogSource},
     },
     job::{JobId, LogStream},
+    task::{BaseOid, BranchName, RunId, RunnerState, TaskId, TaskState, TurnId, TurnTerminal},
+    task_view::{
+        TaskDetailProjection, TaskFreshness, TaskListRow, TaskTimelineEvent, TaskTurnProjection,
+    },
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -119,6 +124,105 @@ async fn router_projects_typed_detail_and_log_routes_and_preserves_not_found() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_detail_route_returns_safe_detail_and_preserves_legacy_routes() {
+    let task_source = Arc::new(FixtureTaskSource::with_detail(fixture_detail()));
+    let (server, _logs) = started_server_with_task_source(Arc::clone(&task_source)).await;
+    let host = listener_host(&server);
+    let task_id = fixture_task_id();
+
+    let response = request(&host, &format!("/api/v1/tasks/{task_id}"), &host);
+    assert_eq!(response.status, 200);
+    assert_security(&response);
+    assert_eq!(response.header("cache-control"), Some("no-store"));
+    let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(json["task"]["task_id"], task_id.to_string());
+    assert!(json["task"]["prompt"].is_null());
+    assert!(
+        json["fetch_command"]
+            .as_str()
+            .unwrap()
+            .starts_with("worker task fetch ")
+    );
+
+    let legacy = request(&host, &format!("/api/v1/jobs/{}", job_id(1)), &host);
+    assert_eq!(legacy.status, 200);
+    assert_security(&legacy);
+    assert_eq!(task_source.detail_calls(), 1);
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_log_route_validates_turn_membership_and_byte_ranges() {
+    let task_source = Arc::new(FixtureTaskSource::with_log_chunk());
+    let (server, _logs) = started_server_with_task_source(Arc::clone(&task_source)).await;
+    let host = listener_host(&server);
+    let task_id = fixture_task_id();
+    let turn_id = fixture_turn_id();
+
+    let good = request(
+        &host,
+        &format!("/api/v1/tasks/{task_id}/turns/{turn_id}/logs?stream=stdout&offset=3&limit=4"),
+        &host,
+    );
+    assert_eq!(good.status, 200);
+    assert_security(&good);
+    let json: serde_json::Value = serde_json::from_slice(&good.body).unwrap();
+    assert_eq!(json["offset"], 3);
+    assert_eq!(json["next_offset"], 7);
+    assert_eq!(
+        task_source.log_requests(),
+        vec![(task_id, turn_id, LogStream::Stdout, 3, 4)]
+    );
+
+    let invalid_id = request(&host, "/api/v1/tasks/not-an-id", &host);
+    assert_eq!(invalid_id.status, 400);
+    assert_eq!(error_code(&invalid_id), "INVALID_TASK_ID");
+
+    let missing_turn = request(
+        &host,
+        &format!(
+            "/api/v1/tasks/{task_id}/turns/018f0f4a6b5c7d8e9f00112233445568/logs?stream=stdout&offset=0&limit=1"
+        ),
+        &host,
+    );
+    assert_eq!(missing_turn.status, 404);
+    assert_eq!(error_code(&missing_turn), "TURN_NOT_FOUND");
+
+    let invalid_range = request(
+        &host,
+        &format!("/api/v1/tasks/{task_id}/turns/{turn_id}/logs?stream=stdout&offset=0&limit=0"),
+        &host,
+    );
+    assert_eq!(invalid_range.status, 400);
+    assert_eq!(error_code(&invalid_range), "INVALID_LOG_RANGE");
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_routes_keep_loopback_security_and_issue_no_mutations() {
+    let task_source = Arc::new(FixtureTaskSource::with_detail(fixture_detail()));
+    let (server, _logs) = started_server_with_task_source(Arc::clone(&task_source)).await;
+    let host = listener_host(&server);
+
+    let response = request(
+        &host,
+        &format!("/api/v1/tasks/{}", fixture_task_id()),
+        "evil.example",
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(error_code(&response), "INVALID_HOST");
+    assert_security(&response);
+    assert_eq!(response.header("cache-control"), Some("no-store"));
+    assert_eq!(task_source.detail_calls(), 0);
+    assert_eq!(task_source.log_calls(), 0);
+    assert_eq!(task_source.mutation_calls(), 0);
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_rejects_a_host_that_does_not_match_the_actual_loopback_listener() {
     let (server, _logs) = started_server().await;
     let host = listener_host(&server);
@@ -144,6 +248,7 @@ async fn http_fixture_preserves_mixed_freshness_fifo_terminal_cursors_and_read_o
             FixedMonotonic,
         )),
         log_source: logs,
+        task_source: Arc::new(FixtureTaskSource::default()),
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     let host = listener_host(&server);
@@ -206,6 +311,7 @@ async fn two_http_clients_share_one_in_flight_snapshot_refresh() {
             monotonic.clone(),
         )),
         log_source: Arc::new(RecordingLogs::new(job(job_id(1)))),
+        task_source: Arc::new(FixtureTaskSource::default()),
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     let host = listener_host(&server);
@@ -233,12 +339,19 @@ async fn two_http_clients_share_one_in_flight_snapshot_refresh() {
 }
 
 async fn started_server() -> (DashboardHttpServer, Arc<RecordingLogs>) {
+    started_server_with_task_source(Arc::new(FixtureTaskSource::default())).await
+}
+
+async fn started_server_with_task_source(
+    task_source: Arc<FixtureTaskSource>,
+) -> (DashboardHttpServer, Arc<RecordingLogs>) {
     let source = FakeSource;
     let service = Arc::new(DashboardService::new(source, FixedClock, FixedMonotonic));
     let logs = Arc::new(RecordingLogs::new(job(job_id(1))));
     let state = Arc::new(DashboardHttpState {
         service,
         log_source: logs.clone(),
+        task_source,
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     (server, logs)
@@ -777,6 +890,172 @@ impl DashboardLogSource for RecordingLogs {
         }
         DashboardLogChunk::from_bytes(stream, offset, b"hello".to_vec())
             .map_err(|_| ApiError::new("LOG_UNAVAILABLE", "log is unavailable"))
+    }
+}
+
+type TaskLogRequest = (TaskId, TurnId, LogStream, u64, u32);
+
+#[derive(Default)]
+struct FixtureTaskSource {
+    detail: Option<Result<TaskDetailProjection, ApiError>>,
+    log_chunk: Option<Result<DashboardLogChunk, ApiError>>,
+    detail_calls: AtomicUsize,
+    log_calls: AtomicUsize,
+    seen_log_requests: Mutex<Vec<TaskLogRequest>>,
+    mutation_calls: AtomicUsize,
+}
+
+impl FixtureTaskSource {
+    fn with_detail(detail: TaskDetailProjection) -> Self {
+        Self {
+            detail: Some(Ok(detail)),
+            ..Self::default()
+        }
+    }
+
+    fn with_log_chunk() -> Self {
+        let chunk = DashboardLogChunk::from_bytes(LogStream::Stdout, 3, b"data".to_vec())
+            .map_err(|_| ApiError::new("LOG_UNAVAILABLE", "log is unavailable"));
+        Self {
+            detail: Some(Ok(fixture_detail())),
+            log_chunk: Some(chunk),
+            ..Self::default()
+        }
+    }
+
+    fn detail_calls(&self) -> usize {
+        self.detail_calls.load(Ordering::SeqCst)
+    }
+
+    fn log_calls(&self) -> usize {
+        self.log_calls.load(Ordering::SeqCst)
+    }
+
+    fn log_requests(&self) -> Vec<TaskLogRequest> {
+        self.seen_log_requests.lock().unwrap().clone()
+    }
+
+    fn mutation_calls(&self) -> usize {
+        self.mutation_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl DashboardTaskSource for FixtureTaskSource {
+    fn task_detail(&self, task_id: TaskId) -> Result<TaskDetailProjection, ApiError> {
+        self.detail_calls.fetch_add(1, Ordering::SeqCst);
+        match self.detail.clone() {
+            Some(Ok(detail)) if detail.task.task_id == task_id => Ok(detail),
+            Some(Ok(_)) | None => Err(ApiError::new(
+                "TASK_NOT_FOUND",
+                "task is not present in the fixture",
+            )),
+            Some(Err(error)) => Err(error),
+        }
+    }
+
+    fn read_task_log(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        stream: LogStream,
+        offset: u64,
+        limit: u32,
+    ) -> Result<DashboardLogChunk, ApiError> {
+        self.log_calls.fetch_add(1, Ordering::SeqCst);
+        self.seen_log_requests
+            .lock()
+            .unwrap()
+            .push((task_id, turn_id, stream, offset, limit));
+        if task_id != fixture_task_id() {
+            return Err(ApiError::new(
+                "TASK_NOT_FOUND",
+                "task is not present in the fixture",
+            ));
+        }
+        if turn_id != fixture_turn_id() {
+            return Err(ApiError::new(
+                "TURN_NOT_FOUND",
+                "turn is not present in the requested task",
+            ));
+        }
+        self.log_chunk.clone().unwrap_or_else(|| {
+            Err(ApiError::new(
+                "TASK_SOURCE_FAILED",
+                "task log source is unavailable",
+            ))
+        })
+    }
+}
+
+fn fixture_task_id() -> TaskId {
+    "018f0f4a6b5c7d8e9f00112233445566"
+        .parse()
+        .expect("valid task ID fixture")
+}
+
+fn fixture_turn_id() -> TurnId {
+    "018f0f4a6b5c7d8e9f00112233445567"
+        .parse()
+        .expect("valid turn ID fixture")
+}
+
+fn fixture_detail() -> TaskDetailProjection {
+    let task_id = fixture_task_id();
+    let turn_id = fixture_turn_id();
+    let run_id: RunId = "118f0f4a6b5c7d8e9f00112233445566"
+        .parse()
+        .expect("valid run ID fixture");
+    let turn = TaskTurnProjection {
+        turn_number: 1,
+        turn_id,
+        terminal: Some(TurnTerminal::Succeeded),
+        outcome: None,
+        agent_committed: Some(true),
+        log_truncated: false,
+        started_at_millis: Some(1_000),
+        ended_at_millis: Some(2_000),
+    };
+    TaskDetailProjection {
+        task: TaskListRow {
+            task_id,
+            run_id: Some(run_id),
+            run_position: Some(1),
+            title: "Repair login".into(),
+            agent: "codex".into(),
+            state: TaskState::Active,
+            last_outcome: None,
+            worker: Some("mini-1".into()),
+            branch: BranchName::for_task(task_id),
+            turn_count: 1,
+            runner: Some(RunnerState::Live),
+            freshness: TaskFreshness::Current,
+            created_at_millis: 900,
+            updated_at_millis: 1_500,
+            active_turn_id: Some(turn_id),
+        },
+        project_id: "a".repeat(64),
+        worktree_id: "b".repeat(64),
+        base_oid: Some(
+            "0123456789abcdef0123456789abcdef01234567"
+                .parse::<BaseOid>()
+                .expect("valid base OID fixture"),
+        ),
+        head_oid: None,
+        session_present: true,
+        summary: Some("safe summary".into()),
+        questions: vec!["safe question".into()],
+        files_changed: vec!["src/login.rs".into()],
+        diff_stat: Some("1 file changed".into()),
+        fetch_command: format!("worker task fetch {task_id}"),
+        turns: vec![turn.clone()],
+        timeline: vec![TaskTimelineEvent {
+            turn_number: turn.turn_number,
+            turn_id: turn.turn_id,
+            outcome: turn.outcome.clone(),
+            started_at_millis: turn.started_at_millis,
+            ended_at_millis: turn.ended_at_millis,
+            terminal: turn.terminal,
+        }],
     }
 }
 

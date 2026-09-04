@@ -16,10 +16,13 @@ use mac_worker::{
         service::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
         },
+        task::DashboardTaskSource,
         web::{DashboardHttpServer, DashboardHttpState, DashboardLogSource},
     },
     error::WorkerError,
     job::{JobId, LogStream},
+    task::{TaskId, TurnId},
+    task_view::TaskDetailProjection,
 };
 use tokio::sync::oneshot;
 
@@ -169,6 +172,7 @@ struct RecordingLauncher {
     requests: Mutex<Vec<DashboardCommandRequest>>,
     source: ReadOnlySource,
     logs: Arc<ReadOnlyLogs>,
+    task_source: Arc<ReadOnlyTaskSource>,
     started: Mutex<Option<oneshot::Sender<String>>>,
 }
 
@@ -178,6 +182,7 @@ impl RecordingLauncher {
             requests: Mutex::new(Vec::new()),
             source: ReadOnlySource::default(),
             logs: Arc::new(ReadOnlyLogs::default()),
+            task_source: Arc::new(ReadOnlyTaskSource::default()),
             started: Mutex::new(started),
         }
     }
@@ -192,6 +197,11 @@ impl RecordingLauncher {
             0,
             "dashboard launch, browser requests, disconnects, and shutdown must not invoke fake submit, cancel, retry, delete, or lease operations"
         );
+        assert_eq!(
+            self.task_source.mutation_count(),
+            0,
+            "dashboard task routes must remain read-only"
+        );
     }
 }
 
@@ -203,11 +213,13 @@ impl DashboardLauncher for RecordingLauncher {
         self.requests.lock().unwrap().push(request);
         let source = self.source.clone();
         let logs = Arc::clone(&self.logs);
+        let task_source = Arc::clone(&self.task_source);
         let started = self.started.lock().unwrap().take();
         Box::pin(async move {
             let state = Arc::new(DashboardHttpState {
                 service: Arc::new(DashboardService::new(source, FixedClock, FixedClock)),
                 log_source: logs,
+                task_source,
             });
             let server = DashboardHttpServer::bind(Some(0), state)
                 .await
@@ -287,6 +299,41 @@ impl DashboardLogSource for ReadOnlyLogs {
         Err(ApiError::new(
             "JOB_NOT_FOUND",
             "job is not present in fake state",
+        ))
+    }
+}
+
+#[derive(Default)]
+struct ReadOnlyTaskSource {
+    mutation_count: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadOnlyTaskSource {
+    fn mutation_count(&self) -> usize {
+        self.mutation_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl DashboardTaskSource for ReadOnlyTaskSource {
+    fn task_detail(&self, _task_id: TaskId) -> Result<TaskDetailProjection, ApiError> {
+        Err(ApiError::new(
+            "TASK_NOT_FOUND",
+            "task is not present in fake state",
+        ))
+    }
+
+    fn read_task_log(
+        &self,
+        _task_id: TaskId,
+        _turn_id: TurnId,
+        _stream: LogStream,
+        _offset: u64,
+        _limit: u32,
+    ) -> Result<DashboardLogChunk, ApiError> {
+        Err(ApiError::new(
+            "TURN_NOT_FOUND",
+            "turn is not present in fake state",
         ))
     }
 }
