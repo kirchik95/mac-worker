@@ -997,6 +997,60 @@ impl ClientStateStore {
         })
     }
 
+    /// Drops only the exact affinity records for this local project/worktree
+    /// when they still name `worker`. A successful fresh probe may establish
+    /// that a worker is reachable but no longer eligible; that advisory fact
+    /// must not keep steering later scheduling attempts to the worker.
+    pub fn remove_affinity_if_matches(
+        &self,
+        project_id: &str,
+        worktree_id: &str,
+        worker: &str,
+    ) -> Result<(), WorkerError> {
+        validate_affinity_key(project_id, "project ID")?;
+        validate_affinity_key(worktree_id, "worktree ID")?;
+        validate_state_worker_name(worker)?;
+        let project_name = project_affinity_name(project_id)?;
+        let worktree_name = worktree_affinity_name(project_id, worktree_id)?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let project = read_project_affinity_optional(
+            self.inner.affinity_projects.as_raw_fd(),
+            &project_name,
+        )?;
+        let worktree = read_worktree_affinity_optional(
+            self.inner.affinity_worktrees.as_raw_fd(),
+            &worktree_name,
+        )?;
+        if project
+            .as_ref()
+            .is_some_and(|record| record.project_id != project_id)
+            || worktree.as_ref().is_some_and(|record| {
+                record.project_id != project_id || record.worktree_id != worktree_id
+            })
+        {
+            return Err(invalid_state(
+                "affinity filename and record identity differ",
+            ));
+        }
+        if project
+            .as_ref()
+            .is_some_and(|record| record.worker == worker)
+        {
+            unlink_at(self.inner.affinity_projects.as_raw_fd(), &project_name, 0)
+                .map_err(WorkerError::Io)?;
+            sync_directory(self.inner.affinity_projects.as_raw_fd())?;
+        }
+        if worktree
+            .as_ref()
+            .is_some_and(|record| record.worker == worker)
+        {
+            unlink_at(self.inner.affinity_worktrees.as_raw_fd(), &worktree_name, 0)
+                .map_err(WorkerError::Io)?;
+            sync_directory(self.inner.affinity_worktrees.as_raw_fd())?;
+        }
+        Ok(())
+    }
+
     pub fn admission_observation<F>(
         &self,
         worker: &str,
@@ -1172,16 +1226,18 @@ impl ClientStateStore {
                         worker: worker.clone(),
                     }));
                 }
-                let missing = entry
-                    .requirements()
+                let mut missing = rejections
                     .iter()
-                    .filter(|requirement| {
-                        observations
-                            .iter()
-                            .all(|observation| !observation.capabilities().contains(*requirement))
+                    .filter_map(|rejection| match rejection {
+                        CandidateRejection::MissingCapabilities { missing, .. } => {
+                            Some(missing.iter().cloned())
+                        }
+                        _ => None,
                     })
-                    .cloned()
+                    .flatten()
                     .collect::<Vec<_>>();
+                missing.sort();
+                missing.dedup();
                 if !missing.is_empty() {
                     return Ok(Some(QueueBlockingReason::CapabilityMissing { missing }));
                 }

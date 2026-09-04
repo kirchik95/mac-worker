@@ -511,6 +511,86 @@ fn queue_rows_expose_advisory_blocking_reasons_from_cached_observations_only() {
 }
 
 #[test]
+fn queue_blocking_reason_without_cached_observations_is_no_eligible_worker() {
+    // Break caught: an empty cache vacuously claims every requested capability
+    // is absent instead of honestly reporting missing eligibility information.
+    let fixture = open_queue();
+    let config = Config {
+        version: 1,
+        workers: vec![queue_worker("mini-a")],
+    };
+    let entry = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "000000000000000000000000000000f5",
+            16,
+            owner(245),
+            WorkerPreference::Automatic,
+            vec!["gpu".into()],
+            QueueEntryKind::Batch,
+            None,
+        ))
+        .unwrap();
+
+    let rows = fixture
+        .store
+        .queue_rows_with_blocking_reasons(&config)
+        .unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.entry().job_id() == entry.job_id())
+        .unwrap();
+    assert_eq!(
+        row.blocking_reason(),
+        Some(&QueueBlockingReason::NoEligibleWorker)
+    );
+}
+
+#[test]
+fn queue_blocking_reason_uses_pinned_policy_rejections_for_capabilities() {
+    // Break caught: an unpinned worker advertising the capability masks the
+    // pinned worker's capability incompatibility in the dashboard view.
+    let fixture = open_queue();
+    let config = Config {
+        version: 1,
+        workers: vec![queue_worker("mini-a"), queue_worker("mini-b")],
+    };
+    cache_observation(&fixture.store, "mini-a", &[], 17);
+    cache_observation(&fixture.store, "mini-b", &["gpu"], 17);
+    let entry = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "000000000000000000000000000000f6",
+            17,
+            owner(246),
+            WorkerPreference::Pinned {
+                worker: "mini-a".into(),
+            },
+            vec!["gpu".into()],
+            QueueEntryKind::Batch,
+            None,
+        ))
+        .unwrap();
+
+    let rows = fixture
+        .store
+        .queue_rows_with_blocking_reasons(&config)
+        .unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.entry().job_id() == entry.job_id())
+        .unwrap();
+    assert_eq!(
+        row.blocking_reason(),
+        Some(&QueueBlockingReason::CapabilityMissing {
+            missing: vec!["gpu".into()],
+        })
+    );
+}
+
+#[test]
 fn queue_records_are_canonical_owner_only_and_contain_summaries_not_secrets() {
     // Break caught: queue persistence retains exact inputs or publishes
     // permissive/non-canonical state that another invocation can misread.

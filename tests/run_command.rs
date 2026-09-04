@@ -28,11 +28,12 @@ use mac_worker::{
     error::WorkerError,
     job::{
         AdmissionObservation, CancelRequest, CancelResponse, ClientId, CommandSpec,
-        HostControlError, JobId, JobMeta, JobState, JobStatus, JsonEvent, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseRecord, LeaseToken, LocalJobRecord, LogChunk, LogChunkRequest,
-        LogChunkResponse, LogStream, ProcessIdentity, QueueEntry, QueueEntryKind, QueueState,
-        RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
-        ResolveOrAbandonResponse, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
+        FleetReconcileJobResult, FleetReconcileRequest, FleetReconcileResponse, HostControlError,
+        JobId, JobMeta, JobState, JobStatus, JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse,
+        LeaseRecord, LeaseToken, LocalJobRecord, LogChunk, LogChunkRequest, LogChunkResponse,
+        LogStream, ProcessIdentity, QueueEntry, QueueEntryKind, QueueState, RemoteUncertainty,
+        RequestFingerprintMaterial, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
+        StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
     },
     lease::{LeaseSummary, SlotState},
     paths::PathLayout,
@@ -2339,6 +2340,8 @@ const STOCK_RSYNC_STATS: &[u8] = b"Number of files: 2\nNumber of files transferr
 enum RunScriptStep {
     ProbeReady,
     ProbeBusy,
+    ProbeMiniOneReadyElseBusy,
+    ReconcileOrBusy,
     ProbeUnavailable,
     Acquire,
     AcquireMismatch(LeaseMismatch),
@@ -2662,6 +2665,65 @@ impl ProcessRunner for RunScriptRunner {
                     created_at_millis: 10,
                 });
                 canonical_process(&probe)
+            }
+            RunScriptStep::ProbeMiniOneReadyElseBusy => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    "~/.local/bin/worker host probe"
+                );
+                let mut probe = ready_probe();
+                if request.args.iter().any(|argument| argument == "mac2") {
+                    probe.slot_state = SlotState::Busy;
+                    probe.active_lease = Some(LeaseSummary {
+                        job_id: JOB_ID.parse().unwrap(),
+                        project_id: "a".repeat(64),
+                        worktree_id: "b".repeat(64),
+                        created_at_millis: 10,
+                    });
+                }
+                canonical_process(&probe)
+            }
+            RunScriptStep::ReconcileOrBusy => {
+                if request.args.last().unwrap() == HostOperation::Reconcile.command() {
+                    let reconcile: FleetReconcileRequest =
+                        serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                    let store = ClientStateStore::open(&self.state_root).unwrap();
+                    let results = reconcile
+                        .known_job_ids()
+                        .iter()
+                        .map(|job_id| FleetReconcileJobResult::Status {
+                            status: Box::new(
+                                StatusResponse::new(
+                                    store.load_job(*job_id).unwrap().meta().clone(),
+                                    JobStatus::accepted(1_001).unwrap(),
+                                )
+                                .unwrap(),
+                            ),
+                        })
+                        .collect();
+                    state
+                        .steps
+                        .push_front(RunScriptStep::ProbeMiniOneReadyElseBusy);
+                    canonical_process(&FleetReconcileResponse::new(results).unwrap())
+                } else {
+                    assert_eq!(
+                        request.args.last().unwrap(),
+                        "~/.local/bin/worker host probe"
+                    );
+                    let mut probe = ready_probe();
+                    if request.args.iter().any(|argument| argument == "mac1") {
+                        state.steps.push_front(RunScriptStep::ReconcileOrBusy);
+                    } else {
+                        probe.slot_state = SlotState::Busy;
+                        probe.active_lease = Some(LeaseSummary {
+                            job_id: JOB_ID.parse().unwrap(),
+                            project_id: "a".repeat(64),
+                            worktree_id: "b".repeat(64),
+                            created_at_millis: 10,
+                        });
+                    }
+                    canonical_process(&probe)
+                }
             }
             RunScriptStep::ProbeUnavailable => {
                 assert_eq!(
@@ -3644,6 +3706,66 @@ fn no_wait_busy_pin_rejects_before_enqueue_snapshot_or_reroute() {
 }
 
 #[test]
+fn no_wait_busy_pin_never_reconciles_a_recoverable_existing_job() {
+    // Break caught: --no-wait performs mutating fleet repair before returning
+    // CAPACITY_BUSY for a different pinned worker.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    store
+        .create_job(test_record(
+            &store,
+            909,
+            1_000,
+            None,
+            RemoteUncertainty::None,
+        ))
+        .unwrap();
+    let runner = RunScriptRunner::new(paths.state.clone(), [RunScriptStep::ReconcileOrBusy]);
+    let config = Config {
+        version: 1,
+        workers: vec![
+            run_config().workers[0].clone(),
+            WorkerEntry {
+                name: "mini-2".into(),
+                ssh: "mac2".into(),
+                slots: 1,
+                capabilities: Vec::new(),
+                remote_binary: "~/.local/bin/worker".into(),
+            },
+        ],
+    };
+    let scheduler = TestSchedulerRuntime::new(10_000, 902);
+    let follower = RecordingFollower::succeeding(0);
+    let service = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_scheduler_runtime(&scheduler);
+    let mut request = orchestration_request(&repo);
+    request.preference = WorkerPreference::Pinned {
+        worker: "mini-2".into(),
+    };
+
+    let error = service
+        .submit_and_follow(request, false, &mut Vec::new(), &mut Vec::new())
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            ..
+        }
+    ));
+    assert!(runner.requests().iter().all(|request| {
+        request
+            .args
+            .last()
+            .is_none_or(|argument| argument != OsStr::new(HostOperation::Reconcile.command()))
+    }));
+    runner.assert_consumed();
+}
+
+#[test]
 fn cancel_removes_waiting_entry_without_ssh_or_snapshot() {
     // Break caught: public cancellation reaches a worker or creates a snapshot
     // after the queue lock proves this row is still waiting.
@@ -4611,6 +4733,51 @@ fn automatic_run_selects_the_eligible_worker_while_a_pin_never_reroutes() {
     assert_eq!(affinity.worktree_worker.as_deref(), Some("poison-worker"));
     assert_eq!(affinity.project_worker.as_deref(), Some("poison-worker"));
     assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
+    runner.assert_consumed();
+}
+
+#[test]
+fn automatic_fifo_admission_skips_an_unavailable_worker_and_claims_the_next_compatible_row() {
+    // Break caught: one failed fresh worker observation prevents a later
+    // compatible worker from claiming and admitting the FIFO row.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(20_100, 903);
+    let mut request = orchestration_request(&repo);
+    request.preference = WorkerPreference::Automatic;
+
+    let (result, runner, store) = run_scheduled_with_script(
+        &temp,
+        &run_config(),
+        request,
+        [
+            RunScriptStep::ProbeUnavailable,
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &follower,
+        None,
+        &scheduler,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+
+    let completion = result.unwrap();
+    assert_eq!(completion.report.worker, "poison-worker");
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    assert_eq!(
+        runner
+            .requests()
+            .iter()
+            .filter(|request| request.args.last()
+                == Some(&OsString::from(HostOperation::LeaseAcquire.command())))
+            .count(),
+        1
+    );
     runner.assert_consumed();
 }
 

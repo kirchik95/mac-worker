@@ -31,7 +31,7 @@ use crate::{
         PreparedProject, ProjectPreparationError, ProjectPreparationRequest,
         ProjectPreparationStage, ProjectState,
     },
-    protocol::{HealthStatus, PROTOCOL_VERSION, WorkerHealth},
+    protocol::{HealthStatus, PROTOCOL_VERSION, SUPERVISION_VERSION, WorkerHealth},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     scheduler::{
         AffinityHints, CandidateObservation, SchedulerPolicy, Selection, WorkerPreference,
@@ -178,10 +178,21 @@ impl FleetReconciler<'_> {
             }
         };
         let candidate = candidate_from_admission(cached.observation())?;
-        let probe = fresh_health
-            .into_inner()
-            .unwrap_or_else(|| cached_health(worker, cached.observation()));
-        if !candidate.ready() {
+        let fresh_health = fresh_health.into_inner();
+        let fresh_reachable = fresh_health
+            .as_ref()
+            .is_some_and(fresh_current_protocol_probe);
+        let probe = fresh_health.unwrap_or_else(|| cached_health(worker, cached.observation()));
+        if fresh_reachable && !candidate.ready() {
+            for record in &records {
+                self.client_state.remove_affinity_if_matches(
+                    record.meta().project_id(),
+                    record.meta().worktree_id(),
+                    &worker.name,
+                )?;
+            }
+        }
+        if !candidate.ready() && !fresh_reachable {
             self.retain_unknown(&records, "UNAVAILABLE")?;
             return Ok(FleetWorkerReport {
                 worker: worker.name.clone(),
@@ -202,6 +213,7 @@ impl FleetReconciler<'_> {
             Ok(response) => {
                 let mut jobs = Vec::new();
                 let mut error_code = None;
+                let mut invalid_response = false;
                 for result in response.results() {
                     let record = records
                         .iter()
@@ -211,10 +223,22 @@ impl FleetReconciler<'_> {
                         FleetReconcileJobResult::Status { status }
                             if status.meta() == record.meta() =>
                         {
-                            let _ = self
+                            match self
                                 .client_state
-                                .reconcile_authoritative_status(record, status.status().clone())?;
-                            jobs.push((**status).clone());
+                                .reconcile_authoritative_status(record, status.status().clone())?
+                            {
+                                ConditionalStatusUpdate::Applied(_) => {
+                                    jobs.push((**status).clone())
+                                }
+                                ConditionalStatusUpdate::Conflict(_) => {
+                                    self.retain_unknown(
+                                        std::slice::from_ref(record),
+                                        "INVALID_RESPONSE",
+                                    )?;
+                                    error_code.get_or_insert_with(|| "INVALID_RESPONSE".into());
+                                    invalid_response = true;
+                                }
+                            }
                         }
                         FleetReconcileJobResult::Error { error, .. } => {
                             let code = error.error().code();
@@ -224,13 +248,18 @@ impl FleetReconciler<'_> {
                         FleetReconcileJobResult::Status { .. } => {
                             self.retain_unknown(std::slice::from_ref(record), "INVALID_RESPONSE")?;
                             error_code.get_or_insert_with(|| "INVALID_RESPONSE".into());
+                            invalid_response = true;
                         }
                     }
                 }
                 Ok(FleetWorkerReport {
                     worker: worker.name.clone(),
                     probe,
-                    outcome: FleetOutcome::Reconciled,
+                    outcome: if invalid_response {
+                        FleetOutcome::InvalidResponse
+                    } else {
+                        FleetOutcome::Reconciled
+                    },
                     jobs,
                     error_code,
                 })
@@ -261,6 +290,13 @@ impl FleetReconciler<'_> {
         }
         Ok(())
     }
+}
+
+fn fresh_current_protocol_probe(health: &WorkerHealth) -> bool {
+    health.probe.as_ref().is_some_and(|probe| {
+        probe.protocol_version == PROTOCOL_VERSION
+            && probe.supervision_version == SUPERVISION_VERSION
+    })
 }
 
 fn cached_health(worker: &WorkerEntry, observation: &AdmissionObservation) -> WorkerHealth {
@@ -842,12 +878,14 @@ impl<'a> RunService<'a> {
         }
 
         self.validate_preference(&request.preference)?;
-        FleetReconciler {
-            config: self.config,
-            client_state: self.client_state,
-            remote: RemoteJobClient::new(self.runner),
+        if request.wait_for_capacity {
+            FleetReconciler {
+                config: self.config,
+                client_state: self.client_state,
+                remote: RemoteJobClient::new(self.runner),
+            }
+            .reconcile()?;
         }
-        .reconcile()?;
         let first_observed_at = self.scheduler_runtime.now_millis()?;
         let first_round = self.observe_admission(&request.preference, first_observed_at)?;
         self.observer.observe(RunStage::AdmissionObservation)?;

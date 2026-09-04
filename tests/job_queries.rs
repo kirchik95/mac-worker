@@ -5205,6 +5205,31 @@ fn hidden_query_endpoints_are_argument_free_and_return_one_canonical_typed_line(
 }
 
 #[test]
+fn host_reconcile_replays_an_indexed_terminal_status_without_discovery_or_mutation() {
+    // Break caught: the fleet endpoint scans beyond the supplied ID, changes a
+    // terminal record, or gives a different answer on a repeated recovery.
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, submit, expected) = endpoint_runtime_and_completed_job(&temp);
+    let request = FleetReconcileRequest::new(vec![submit.material().job_id()]).unwrap();
+    let input = serde_json::to_vec(&request).unwrap();
+
+    let (first_exit, first_stdout, first_stderr) =
+        run_query_endpoint(&runtime, "reconcile", input.clone());
+    let (second_exit, second_stdout, second_stderr) =
+        run_query_endpoint(&runtime, "reconcile", input);
+
+    assert_eq!(first_exit, 0);
+    assert_eq!(second_exit, 0);
+    assert!(first_stderr.is_empty());
+    assert!(second_stderr.is_empty());
+    assert_eq!(first_stdout, second_stdout);
+    let response: FleetReconcileResponse =
+        serde_json::from_slice(first_stdout.strip_suffix(b"\n").unwrap()).unwrap();
+    assert_eq!(response.results().len(), 1);
+    assert_eq!(response.results()[0].status(), Some(&expected));
+}
+
+#[test]
 fn every_query_endpoint_rejects_noncanonical_or_unbounded_input_with_typed_stdout_only() {
     // Break caught: one endpoint accepts a duplicate/unknown/version/trailing
     // request shape or reflects malformed/oversized input through stderr.
