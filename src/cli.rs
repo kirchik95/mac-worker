@@ -37,6 +37,10 @@ pub enum Command {
         #[arg(long)]
         no_open: bool,
     },
+    #[command(
+        override_usage = "worker run [--worker NAME] [--no-wait] -- COMMAND",
+        about = "Run a command on an automatically selected compatible worker, or pin one with --worker"
+    )]
     Run {
         #[arg(long, value_parser = non_empty_worker)]
         worker: Option<String>,

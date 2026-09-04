@@ -48,6 +48,7 @@ fn cancel_parses_one_job_id_and_exposes_no_hidden_arguments() {
     command
         .assert()
         .success()
+        .stdout(predicate::str::contains("Usage: worker cancel"))
         .stdout(predicate::str::contains("<JOB_ID>"))
         .stdout(predicate::str::contains("host").not());
 
@@ -63,16 +64,21 @@ fn cancel_parses_one_job_id_and_exposes_no_hidden_arguments() {
 
 #[test]
 fn run_help_exposes_optional_pin_and_no_wait_scheduler_controls() {
-    // Break caught: the public grammar regresses to a mandatory worker or
-    // omits the immediate-capacity mode from discoverable help.
+    // Break caught: the public grammar regresses to a mandatory worker, hides
+    // automatic selection, or omits immediate-capacity mode from discoverable
+    // help.
     let mut command = Command::cargo_bin("worker").unwrap();
     command.args(["run", "--help"]);
 
     command
         .assert()
         .success()
+        .stdout(predicate::str::contains(
+            "worker run [--worker NAME] [--no-wait] -- COMMAND",
+        ))
         .stdout(predicate::str::contains("--worker <WORKER>"))
-        .stdout(predicate::str::contains("--no-wait"));
+        .stdout(predicate::str::contains("--no-wait"))
+        .stdout(predicate::str::contains("automatically"));
 
     for arguments in [
         vec!["worker", "run", "--", "npm", "test"],
@@ -91,6 +97,61 @@ fn run_help_exposes_optional_pin_and_no_wait_scheduler_controls() {
     ] {
         Cli::try_parse_from(arguments).expect("documented scheduler run form must parse");
     }
+}
+
+#[test]
+fn public_help_excludes_unimplemented_later_phase_commands() {
+    // Break caught: a future-phase control plane becomes discoverable before
+    // its contract, lifecycle, and privacy boundaries are implemented.
+    let mut command = Command::cargo_bin("worker").unwrap();
+    command.arg("--help");
+
+    let forbidden = predicate::str::contains("fetch")
+        .or(predicate::str::contains("artifacts"))
+        .or(predicate::str::contains("cache"))
+        .or(predicate::str::contains("Docker"))
+        .or(predicate::str::contains("garbage collection"));
+
+    command.assert().success().stdout(forbidden.not());
+}
+
+#[test]
+fn run_rejects_an_unconfigured_worker_pin_before_remote_work() {
+    // Break caught: an arbitrary raw hostname is treated as a worker target
+    // rather than being rejected against the configured inventory.
+    let root = tempfile::tempdir().unwrap();
+    let root_path = std::fs::canonicalize(root.path()).unwrap();
+    let config = root_path.join("config.toml");
+    for directory in ["config", "state", "cache", "data"] {
+        std::fs::create_dir_all(root_path.join(directory)).unwrap();
+    }
+    std::fs::write(
+        &config,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+    )
+    .unwrap();
+
+    let mut command = Command::cargo_bin("worker").unwrap();
+    command
+        .env("XDG_CONFIG_HOME", root_path.join("config"))
+        .env("XDG_STATE_HOME", root_path.join("state"))
+        .env("XDG_CACHE_HOME", root_path.join("cache"))
+        .env("XDG_DATA_HOME", root_path.join("data"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "run",
+            "--worker",
+            "raw-hostname",
+            "--",
+            "/usr/bin/true",
+        ]);
+
+    command
+        .assert()
+        .code(64)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("WORKER_NOT_FOUND"));
 }
 
 #[test]

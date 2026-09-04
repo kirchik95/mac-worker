@@ -16,7 +16,7 @@ cp config.example.toml ~/.config/mac-worker/config.toml
 ./target/release/worker --json workers | jq .
 ```
 
-`worker setup mini-1` installs the current helper for that configured worker. `worker workers` lists configured workers and performs bounded read-only SSH health probes; it may report a worker unavailable before setup. In Phase 3, `worker run` requires one of those worker names explicitly.
+`worker setup mini-1` installs the current helper for that configured worker. `worker workers` lists configured workers and performs bounded read-only SSH health probes; it may report a worker unavailable before setup. Phase 3 required an explicit worker name; Phase 4 adds automatic scheduling when the pin is omitted.
 
 Run trusted, non-interactive batch commands from a Git worktree:
 
@@ -36,6 +36,22 @@ Before submission, the client captures a verified immutable snapshot rather than
 Human log streaming writes raw application bytes to stdout or stderr. With `--json`, `run` and `logs` emit versioned NDJSON events; log chunks are base64-encoded instead of appearing as raw bytes. mac-worker avoids adding secret values to its own diagnostics, but application logs can contain secrets emitted by the application.
 
 Phase 3 deliberately does not provide automatic scheduling or queueing, cancellation, artifact transfer, package caches, Docker profiles, safe garbage collection, or a dashboard. Any configured artifact collection causes `worker run` to reject the job during preflight with `ARTIFACTS_UNSUPPORTED`, rather than running the command and silently discarding requested outputs.
+
+## Phase 4: automatic scheduling, cancellation, and reconciliation
+
+Use the scheduler with a literal command vector:
+
+```bash
+worker run -- npm test
+worker run --no-wait -- npm test
+worker run --worker mini-2 -- npm test
+worker status
+worker cancel <job-id>
+```
+
+An automatic run is admitted to a compatible configured worker and queues in that worker's FIFO order. `--worker NAME` pins the run to that worker; a pinned run waits only for its named worker and does not block compatible work on another worker. `--no-wait` returns `CAPACITY_BUSY` when no eligible slot is immediately available and does not publish a queue row, snapshot, local job record, lease, or other remote mutation. Cancellation is explicit and targeted: it can cancel a waiting row locally or cancel a running job on its recorded worker. Disconnecting a log follower or pressing Ctrl-C does not cancel an accepted job; reconnect with its original job ID. Source changes made in a remote workspace are never returned to the local worktree.
+
+Scheduler admission uses the local shared observation cache only as advisory input. The remote lease remains authoritative, so a stale or unavailable cache observation cannot free capacity or prove that a worker is idle. The dashboard is Phase 4.5. Artifact transfer/fetch, package caches, Docker profiles, and general garbage collection are later work and are not public Phase 4 commands.
 
 ## Validate a project locally
 
