@@ -12,12 +12,15 @@ use crate::{
     dashboard::{
         cache::{Observation, ObservationCache},
         model::{
-            CollectionSummary, DASHBOARD_API_VERSION, DashboardError, DashboardJob,
-            DashboardJobState, DashboardQueueEntry, DashboardSlotState, DashboardSnapshot,
-            DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
+            CollectionSummary, DASHBOARD_API_VERSION, DashboardActiveTask, DashboardError,
+            DashboardJob, DashboardJobState, DashboardQueueEntry, DashboardSlotState,
+            DashboardSnapshot, DashboardWorker, Freshness, SlotSummary, SystemSummary,
+            WorkerHealth,
         },
     },
     job::JobId,
+    task::TaskState,
+    task_view::TaskListProjection,
 };
 
 pub const MAX_RECENT_TERMINAL_JOBS: usize = 100;
@@ -120,6 +123,21 @@ pub enum WorkerObservationResult {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardTaskCollection {
+    pub projection: TaskListProjection,
+    pub errors: Vec<DashboardError>,
+}
+
+impl DashboardTaskCollection {
+    pub fn empty() -> Self {
+        Self {
+            projection: TaskListProjection::empty(),
+            errors: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct DashboardSnapshotRequest;
 
@@ -132,6 +150,12 @@ pub trait DashboardDataSource: Send + Sync + 'static {
         deadline: Duration,
     ) -> Vec<Result<DashboardJob, DashboardError>>;
     fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError>;
+    fn task_projection(
+        &self,
+        _deadline: Duration,
+    ) -> Result<DashboardTaskCollection, DashboardError> {
+        Ok(DashboardTaskCollection::empty())
+    }
 }
 
 pub trait DashboardQueueReader: Send + Sync + 'static {
@@ -284,7 +308,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
     fn collect_snapshot(&self, deadline: u64) -> Result<DashboardSnapshot, DashboardError> {
         let mut errors = Vec::new();
         let configured = self.collect_configured_workers(&mut errors);
-        let workers = self.collect_workers(&configured, deadline, &mut errors);
+        let mut workers = self.collect_workers(&configured, deadline, &mut errors);
         let local_jobs = dedupe_local_jobs(self.collect_local_jobs(&mut errors), &mut errors);
         let (remote_jobs, remote_duplicates) =
             dedupe_remote_jobs(self.collect_remote_jobs(deadline, &mut errors), &mut errors);
@@ -295,6 +319,8 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             &workers,
             &mut errors,
         );
+        let task_view = self.collect_tasks(deadline, &mut errors);
+        enrich_active_tasks(&mut workers, &task_view);
         let queue = match self.source.queue_entries() {
             Ok(queue) => queue,
             Err(error) => {
@@ -313,11 +339,28 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                 freshness: Freshness::Current,
                 errors,
             },
+            task_view,
             workers,
             queue,
             active_jobs,
             recent_jobs,
         })
+    }
+
+    fn collect_tasks(&self, deadline: u64, errors: &mut Vec<DashboardError>) -> TaskListProjection {
+        let remaining = remaining_duration(&self.monotonic, deadline);
+        match self.source.task_projection(remaining) {
+            Ok(collection) => {
+                for error in collection.errors {
+                    push_error(errors, error);
+                }
+                collection.projection
+            }
+            Err(error) => {
+                push_error(errors, error);
+                DashboardTaskCollection::empty().projection
+            }
+        }
     }
 
     fn collect_configured_workers(&self, errors: &mut Vec<DashboardError>) -> Vec<String> {
@@ -526,11 +569,34 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                 freshness: Freshness::Offline,
                 errors: vec![timeout],
             },
+            task_view: DashboardTaskCollection::empty().projection,
             workers: Vec::new(),
             queue: Vec::new(),
             active_jobs: Vec::new(),
             recent_jobs: Vec::new(),
         }
+    }
+}
+
+fn enrich_active_tasks(workers: &mut [DashboardWorker], task_view: &TaskListProjection) {
+    for worker in workers {
+        worker.active_task = None;
+        let Some(active_turn_id) = worker.slot.active_job_id else {
+            continue;
+        };
+        let Some(task) = task_view.tasks.iter().find(|task| {
+            task.state == TaskState::Active && task.active_turn_id == Some(active_turn_id)
+        }) else {
+            continue;
+        };
+        worker.active_task = Some(DashboardActiveTask {
+            task_id: task.task_id,
+            title: task.title.clone(),
+            agent: task.agent.clone(),
+            turn_number: task.turn_count,
+            started_at_millis: None,
+            runner: task.runner,
+        });
     }
 }
 
@@ -674,6 +740,7 @@ fn offline_worker(worker_name: &str, error: DashboardError) -> DashboardWorker {
             cpu_busy_percent: None,
         },
         error: Some(error),
+        active_task: None,
     }
 }
 

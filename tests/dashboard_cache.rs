@@ -321,6 +321,7 @@ fn observation(
                 cpu_busy_percent: Some(75.0),
             },
             error: None,
+            active_task: None,
         },
         observed_at_millis,
         cpu_counters,

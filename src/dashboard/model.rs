@@ -6,7 +6,11 @@ use serde::{
     ser::{Error as _, SerializeStruct},
 };
 
-use crate::job::{JobId, LogChunk, LogStream, MAX_LOG_CHUNK_BYTES};
+use crate::{
+    job::{JobId, LogChunk, LogStream, MAX_LOG_CHUNK_BYTES},
+    task::{RunId, RunProgress, RunnerState, TaskId, TurnId},
+    task_view::TaskListProjection,
+};
 
 pub const DASHBOARD_API_VERSION: u32 = 1;
 pub const MAX_ERROR_MESSAGE_CHARS: usize = 512;
@@ -25,10 +29,29 @@ pub struct DashboardSnapshot {
     pub revision: u64,
     pub generated_at_millis: u64,
     pub collection: CollectionSummary,
+    #[serde(flatten)]
+    pub task_view: TaskListProjection,
     pub workers: Vec<DashboardWorker>,
     pub queue: Vec<DashboardQueueEntry>,
     pub active_jobs: Vec<DashboardJob>,
     pub recent_jobs: Vec<DashboardJob>,
+}
+
+impl TaskListProjection {
+    pub fn empty() -> Self {
+        Self {
+            tasks: Vec::new(),
+            runs: Vec::new(),
+            progress: RunProgress {
+                total: 0,
+                queued: 0,
+                active: 0,
+                open: 0,
+                closed: 0,
+                failed_like: 0,
+            },
+        }
+    }
 }
 
 fn serialize_dashboard_api_version<S>(api_version: &u32, serializer: S) -> Result<S::Ok, S::Error>
@@ -68,6 +91,36 @@ pub struct DashboardWorker {
     pub missing_capabilities: Vec<String>,
     pub system: SystemSummary,
     pub error: Option<DashboardError>,
+    pub active_task: Option<DashboardActiveTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardActiveTask {
+    pub task_id: TaskId,
+    pub title: String,
+    pub agent: String,
+    pub turn_number: u32,
+    pub started_at_millis: Option<u64>,
+    pub runner: Option<RunnerState>,
+}
+
+impl Serialize for DashboardActiveTask {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut record = serializer.serialize_struct("DashboardActiveTask", 6)?;
+        record.serialize_field("task_id", &self.task_id)?;
+        record.serialize_field(
+            "title",
+            &sanitize_bounded(&self.title, MAX_PROJECT_LABEL_CHARS),
+        )?;
+        record.serialize_field(
+            "agent",
+            &sanitize_bounded(&self.agent, MAX_PROJECT_LABEL_CHARS),
+        )?;
+        record.serialize_field("turn_number", &self.turn_number)?;
+        record.serialize_field("started_at_millis", &self.started_at_millis)?;
+        record.serialize_field("runner", &self.runner)?;
+        record.end()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,6 +208,12 @@ where
 pub struct DashboardQueueEntry {
     pub position: u32,
     pub job_id: JobId,
+    pub entry_kind: DashboardQueueEntryKind,
+    pub task_id: Option<TaskId>,
+    pub turn_id: Option<TurnId>,
+    pub run_id: Option<RunId>,
+    pub run_max_parallel: Option<u32>,
+    pub pinned_worker: Option<String>,
     pub project_id: String,
     pub worktree_id: String,
     pub project_label: Option<String>,
@@ -164,11 +223,30 @@ pub struct DashboardQueueEntry {
     pub blocking_code: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DashboardQueueEntryKind {
+    Batch,
+    TaskTurn,
+}
+
 impl Serialize for DashboardQueueEntry {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut record = serializer.serialize_struct("DashboardQueueEntry", 9)?;
+        let mut record = serializer.serialize_struct("DashboardQueueEntry", 15)?;
         record.serialize_field("position", &self.position)?;
         record.serialize_field("job_id", &self.job_id)?;
+        record.serialize_field("entry_kind", &self.entry_kind)?;
+        record.serialize_field("task_id", &self.task_id)?;
+        record.serialize_field("turn_id", &self.turn_id)?;
+        record.serialize_field("run_id", &self.run_id)?;
+        record.serialize_field("run_max_parallel", &self.run_max_parallel)?;
+        record.serialize_field(
+            "pinned_worker",
+            &self
+                .pinned_worker
+                .as_deref()
+                .map(|worker| sanitize_bounded(worker, MAX_PROJECT_LABEL_CHARS)),
+        )?;
         record.serialize_field("project_id", &self.project_id)?;
         record.serialize_field("worktree_id", &self.worktree_id)?;
         record.serialize_field(
@@ -180,8 +258,15 @@ impl Serialize for DashboardQueueEntry {
         )?;
         record.serialize_field("command_summary", &self.command_summary)?;
         record.serialize_field("created_at_millis", &self.created_at_millis)?;
-        record.serialize_field("requirements", &self.requirements)?;
-        record.serialize_field("blocking_code", &self.blocking_code)?;
+        record.serialize_field(
+            "requirements",
+            &self
+                .requirements
+                .iter()
+                .map(|requirement| sanitize_bounded(requirement, MAX_PROJECT_LABEL_CHARS))
+                .collect::<Vec<_>>(),
+        )?;
+        record.serialize_field("blocking_code", &sanitize_error_code(&self.blocking_code))?;
         record.end()
     }
 }

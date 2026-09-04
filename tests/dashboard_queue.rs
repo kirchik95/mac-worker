@@ -1,6 +1,9 @@
 use mac_worker::{
     dashboard::{
-        model::{DashboardCommandMode, DashboardCommandSummary, DashboardJob, DashboardJobState},
+        model::{
+            DashboardCommandMode, DashboardCommandSummary, DashboardJob, DashboardJobState,
+            DashboardQueueEntryKind,
+        },
         queue::{PhaseFourQueueEntry, PhaseFourQueueReader, SchedulerQueueAdapter},
     },
     job::JobId,
@@ -46,6 +49,12 @@ fn queue_adapter_projects_only_the_safe_queue_fields() {
         rows: vec![PhaseFourQueueEntry {
             position: 1,
             job,
+            entry_kind: DashboardQueueEntryKind::Batch,
+            task_id: None,
+            turn_id: None,
+            run_id: None,
+            run_max_parallel: None,
+            pinned_worker: None,
             requirements: vec!["swift".into()],
             blocking_code: "NO_COMPATIBLE_IDLE_WORKER".into(),
         }],
@@ -79,6 +88,12 @@ fn phase_four_entry(position: u32, id: u128, blocking_code: &str) -> PhaseFourQu
     PhaseFourQueueEntry {
         position,
         job: queue_job(id),
+        entry_kind: DashboardQueueEntryKind::Batch,
+        task_id: None,
+        turn_id: None,
+        run_id: None,
+        run_max_parallel: None,
+        pinned_worker: None,
         requirements: vec!["swift".into()],
         blocking_code: blocking_code.into(),
     }

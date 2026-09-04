@@ -4,4 +4,5 @@ pub mod model;
 pub mod queue;
 pub mod service;
 pub mod source;
+pub mod task;
 pub mod web;

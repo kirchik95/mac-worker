@@ -738,11 +738,20 @@ impl<'a> RemoteJobClient<'a> {
         worker: &WorkerEntry,
         request: &TaskStatusRequest,
     ) -> Result<TaskStatusResponse, WorkerError> {
+        self.task_status_with_deadline(worker, request, MAX_CONTROL_DEADLINE)
+    }
+
+    pub fn task_status_with_deadline(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskStatusRequest,
+        deadline: Duration,
+    ) -> Result<TaskStatusResponse, WorkerError> {
         let response: TaskStatusResponse = self.transport.request(
             worker,
             HostOperation::TaskStatus,
             request,
-            control_policy(MAX_CONTROL_DEADLINE),
+            control_policy(deadline),
         )?;
         if response.protocol_version() != crate::protocol::PROTOCOL_VERSION {
             return Err(invalid_remote_response());

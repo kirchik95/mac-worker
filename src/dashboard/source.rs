@@ -14,7 +14,11 @@ use crate::{
             DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
         },
         queue::ClientStateDashboardQueueReader,
-        service::{DashboardDataSource, DashboardQueueReader, WorkerObservationResult},
+        service::{
+            DashboardDataSource, DashboardQueueReader, DashboardTaskCollection,
+            WorkerObservationResult,
+        },
+        task::collect_task_projection,
         web::DashboardLogSource,
     },
     error::WorkerError,
@@ -25,6 +29,7 @@ use crate::{
         CpuCounters as ProbeCpuCounters, HealthStatus, MemoryPressure,
         WorkerHealth as ProbeWorkerHealth, WorkersReport,
     },
+    task_store::{TaskStatusRequest, TaskStatusResponse},
     transfer::RemoteJobClient,
     transport::{SshTransport, WorkersService},
 };
@@ -45,6 +50,23 @@ pub trait DashboardRemoteReader: Send + Sync + 'static {
         _deadline: Duration,
     ) -> Result<StatusResponse, WorkerError> {
         self.status(worker, job_id)
+    }
+    fn task_status(
+        &self,
+        _worker: &WorkerEntry,
+        _request: &TaskStatusRequest,
+    ) -> Result<TaskStatusResponse, WorkerError> {
+        Err(WorkerError::Unavailable(
+            "TASK_STATUS_UNSUPPORTED: task status reader is unavailable".into(),
+        ))
+    }
+    fn task_status_with_deadline(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskStatusRequest,
+        _deadline: Duration,
+    ) -> Result<TaskStatusResponse, WorkerError> {
+        self.task_status(worker, request)
     }
     fn log_chunk(
         &self,
@@ -107,6 +129,24 @@ impl DashboardRemoteReader for SystemDashboardRemoteReader {
         deadline: Duration,
     ) -> Result<StatusResponse, WorkerError> {
         RemoteJobClient::new(self.runner.as_ref()).status_with_deadline(worker, job_id, deadline)
+    }
+
+    fn task_status(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskStatusRequest,
+    ) -> Result<TaskStatusResponse, WorkerError> {
+        RemoteJobClient::new(self.runner.as_ref()).task_status(worker, request)
+    }
+
+    fn task_status_with_deadline(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskStatusRequest,
+        deadline: Duration,
+    ) -> Result<TaskStatusResponse, WorkerError> {
+        RemoteJobClient::new(self.runner.as_ref())
+            .task_status_with_deadline(worker, request, deadline)
     }
 
     fn log_chunk(
@@ -251,6 +291,18 @@ impl DashboardDataSource for MacWorkerDashboardSource {
     ) -> Result<Vec<crate::dashboard::model::DashboardQueueEntry>, DashboardError> {
         self.queue.ordered_pending()
     }
+
+    fn task_projection(
+        &self,
+        deadline: Duration,
+    ) -> Result<DashboardTaskCollection, DashboardError> {
+        collect_task_projection(
+            &self.config,
+            &self.local_jobs,
+            self.remote.as_ref(),
+            deadline,
+        )
+    }
 }
 
 pub struct MacWorkerLogSource {
@@ -373,6 +425,7 @@ pub fn project_worker(
                 cpu_busy_percent: None,
             },
             error: None,
+            active_task: None,
         },
         observed_at_millis,
         cpu_counters: probe.cpu_counters.clone().and_then(cache_counters),

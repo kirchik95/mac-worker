@@ -2,11 +2,12 @@ use mac_worker::{
     dashboard::model::{
         ApiError, ArtifactStatus, CollectionSummary, DASHBOARD_API_VERSION, DashboardCommandMode,
         DashboardCommandSummary, DashboardError, DashboardJob, DashboardJobState,
-        DashboardLogChunk, DashboardMemoryPressure, DashboardQueueEntry, DashboardSlotState,
-        DashboardSnapshot, DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
-        project_label_or_fallback,
+        DashboardLogChunk, DashboardMemoryPressure, DashboardQueueEntry, DashboardQueueEntryKind,
+        DashboardSlotState, DashboardSnapshot, DashboardWorker, Freshness, SlotSummary,
+        SystemSummary, WorkerHealth, project_label_or_fallback,
     },
     job::{JobId, LogStream},
+    task_view::TaskListProjection,
 };
 
 const JOB_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -75,6 +76,7 @@ fn snapshot_v1_serializes_the_complete_projection_contract() {
                         "cpu_busy_percent": null,
                     },
                     "error": null,
+                    "active_task": null,
                 },
                 {
                     "name": "mini-observed",
@@ -100,11 +102,28 @@ fn snapshot_v1_serializes_the_complete_projection_contract() {
                         "code": "PROBE_PARTIAL",
                         "message": "swap measurement unavailable",
                     },
+                    "active_task": null,
                 },
             ],
+            "tasks": [],
+            "runs": [],
+            "progress": {
+                "total": 0,
+                "queued": 0,
+                "active": 0,
+                "open": 0,
+                "closed": 0,
+                "failed_like": 0,
+            },
             "queue": [{
                 "position": 1,
                 "job_id": "11111111111111111111111111111111",
+                "entry_kind": "batch",
+                "task_id": null,
+                "turn_id": null,
+                "run_id": null,
+                "run_max_parallel": null,
+                "pinned_worker": null,
                 "project_id": "queue-project-id",
                 "worktree_id": "queue-worktree-id",
                 "project_label": "Queued Project",
@@ -334,6 +353,7 @@ fn fixture_snapshot() -> DashboardSnapshot {
             freshness: Freshness::Current,
             errors: Vec::new(),
         },
+        task_view: TaskListProjection::empty(),
         workers: vec![DashboardWorker {
             name: "mini-a".into(),
             health: WorkerHealth::Ready,
@@ -355,6 +375,7 @@ fn fixture_snapshot() -> DashboardSnapshot {
                 cpu_busy_percent: None,
             },
             error: None,
+            active_task: None,
         }],
         queue: Vec::new(),
         active_jobs: Vec::new(),
@@ -374,6 +395,7 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
                 "worker observation timed out",
             )],
         },
+        task_view: TaskListProjection::empty(),
         workers: vec![
             DashboardWorker {
                 name: "mini-unobserved".into(),
@@ -396,6 +418,7 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
                     cpu_busy_percent: None,
                 },
                 error: None,
+                active_task: None,
             },
             DashboardWorker {
                 name: "mini-observed".into(),
@@ -421,11 +444,18 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
                     "PROBE_PARTIAL",
                     "swap measurement unavailable",
                 )),
+                active_task: None,
             },
         ],
         queue: vec![DashboardQueueEntry {
             position: 1,
             job_id: "11111111111111111111111111111111".parse().unwrap(),
+            entry_kind: DashboardQueueEntryKind::Batch,
+            task_id: None,
+            turn_id: None,
+            run_id: None,
+            run_max_parallel: None,
+            pinned_worker: None,
             project_id: "queue-project-id".into(),
             worktree_id: "queue-worktree-id".into(),
             project_label: Some("Queued Project".into()),

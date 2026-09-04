@@ -14,8 +14,9 @@ use mac_worker::{
         model::{
             CollectionSummary, DASHBOARD_API_VERSION, DashboardCommandMode,
             DashboardCommandSummary, DashboardError, DashboardJob, DashboardJobState,
-            DashboardMemoryPressure, DashboardQueueEntry, DashboardSlotState, DashboardSnapshot,
-            DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
+            DashboardMemoryPressure, DashboardQueueEntry, DashboardQueueEntryKind,
+            DashboardSlotState, DashboardSnapshot, DashboardWorker, Freshness, SlotSummary,
+            SystemSummary, WorkerHealth,
         },
         service::{
             Clock, DashboardDataSource, DashboardDeadlines, DashboardQueueReader, DashboardService,
@@ -25,6 +26,7 @@ use mac_worker::{
         },
     },
     job::JobId,
+    task_view::TaskListProjection,
 };
 
 #[test]
@@ -994,6 +996,7 @@ fn observation(worker_name: &str, observed_at_millis: u64, hostname: &str) -> Ob
                 cpu_busy_percent: None,
             },
             error: None,
+            active_task: None,
         },
         observed_at_millis,
         cpu_counters: None,
@@ -1033,6 +1036,7 @@ fn offline_worker(worker_name: &str, error_code: &str) -> DashboardWorker {
             error_code,
             "worker observation timestamp was not newer",
         )),
+        active_task: None,
     }
 }
 
@@ -1087,6 +1091,12 @@ fn queue_entry(position: u32, id: u128) -> DashboardQueueEntry {
     DashboardQueueEntry {
         position,
         job_id: job_id(id),
+        entry_kind: DashboardQueueEntryKind::Batch,
+        task_id: None,
+        turn_id: None,
+        run_id: None,
+        run_max_parallel: None,
+        pinned_worker: None,
         project_id: format!("project-{id}"),
         worktree_id: format!("worktree-{id}"),
         project_label: Some(format!("Queue {id}")),
@@ -1132,6 +1142,7 @@ fn empty_timeout_snapshot(generated_at_millis: u64) -> DashboardSnapshot {
                 "dashboard refresh wait timed out",
             )],
         },
+        task_view: TaskListProjection::empty(),
         workers: Vec::new(),
         queue: Vec::new(),
         active_jobs: Vec::new(),

@@ -6,13 +6,14 @@ use crate::{
     dashboard::{
         model::{
             DashboardCommandMode, DashboardCommandSummary, DashboardError, DashboardJob,
-            DashboardQueueEntry,
+            DashboardQueueEntry, DashboardQueueEntryKind,
         },
         service::DashboardQueueReader,
     },
     error::WorkerError,
-    job::{CommandSummary, QueueState},
+    job::{CommandSummary, QueueEntryKind, QueueState},
     scheduler::QueueBlockingReason,
+    task::{RunId, TaskId, TurnId},
 };
 
 /// A queue row already projected by the phase-4 scheduler boundary.
@@ -24,6 +25,12 @@ use crate::{
 pub struct PhaseFourQueueEntry {
     pub position: u32,
     pub job: DashboardJob,
+    pub entry_kind: DashboardQueueEntryKind,
+    pub task_id: Option<TaskId>,
+    pub turn_id: Option<TurnId>,
+    pub run_id: Option<RunId>,
+    pub run_max_parallel: Option<u32>,
+    pub pinned_worker: Option<String>,
     pub requirements: Vec<String>,
     pub blocking_code: String,
 }
@@ -65,9 +72,42 @@ impl DashboardQueueReader for ClientStateDashboardQueueReader {
                     )
                 })?;
                 let entry = row.entry();
+                let (entry_kind, task_id, turn_id) = match entry.kind() {
+                    QueueEntryKind::Batch => (DashboardQueueEntryKind::Batch, None, None),
+                    QueueEntryKind::TaskTurn => {
+                        let turn_id = entry.job_id();
+                        let task_id = self
+                            .state
+                            .task_id_for_turn(turn_id)
+                            .map_err(map_local_queue_error)?;
+                        (DashboardQueueEntryKind::TaskTurn, task_id, Some(turn_id))
+                    }
+                };
+                let (run_id, run_max_parallel) = match entry.run() {
+                    Some(run) => (
+                        Some(run.run_id().as_str().parse::<RunId>().map_err(|_| {
+                            DashboardError::new(
+                                "QUEUE_RUN_ID_INVALID",
+                                "queued task run identifier is invalid",
+                            )
+                        })?),
+                        Some(run.max_parallel()),
+                    ),
+                    None => (None, None),
+                };
+                let pinned_worker = match entry.preference() {
+                    crate::scheduler::WorkerPreference::Pinned { worker } => Some(worker.clone()),
+                    crate::scheduler::WorkerPreference::Automatic => None,
+                };
                 Ok(DashboardQueueEntry {
                     position,
                     job_id: entry.job_id(),
+                    entry_kind,
+                    task_id,
+                    turn_id,
+                    run_id,
+                    run_max_parallel,
+                    pinned_worker,
                     project_id: entry.project_id().to_owned(),
                     worktree_id: entry.worktree_id().to_owned(),
                     project_label: None,
@@ -116,17 +156,34 @@ impl<R: PhaseFourQueueReader + Send + Sync + 'static> DashboardQueueReader
 }
 
 fn project_queue_entry(entry: PhaseFourQueueEntry) -> Result<DashboardQueueEntry, DashboardError> {
-    let job = entry.job;
+    let PhaseFourQueueEntry {
+        position,
+        job,
+        entry_kind,
+        task_id,
+        turn_id,
+        run_id,
+        run_max_parallel,
+        pinned_worker,
+        requirements,
+        blocking_code,
+    } = entry;
     Ok(DashboardQueueEntry {
-        position: entry.position,
+        position,
         job_id: job.job_id,
+        entry_kind,
+        task_id,
+        turn_id,
+        run_id,
+        run_max_parallel,
+        pinned_worker,
         project_id: job.project_id,
         worktree_id: job.worktree_id,
         project_label: job.project_label,
         command_summary: job.command_summary,
         created_at_millis: job.created_at_millis,
-        requirements: entry.requirements,
-        blocking_code: entry.blocking_code,
+        requirements,
+        blocking_code,
     })
 }
 
