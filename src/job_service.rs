@@ -1327,6 +1327,7 @@ impl<'a> JobService<'a> {
             "result.schema.json",
             "status.json",
             "stderr.log",
+            "supervisor.log",
             "stdout.log",
             "tail.log",
             "tmp",
@@ -1427,7 +1428,7 @@ impl<'a> JobService<'a> {
                     .map_err(|_| job_id_conflict("final mutable directory is unsafe"))?;
             }
         }
-        for log in ["stdout.log", "stderr.log"] {
+        for log in ["stdout.log", "stderr.log", "supervisor.log"] {
             if job.entry_exists(log)? {
                 let file = job
                     .open_private_append(log)
@@ -1456,11 +1457,18 @@ impl<'a> JobService<'a> {
         .into_iter()
         .map(String::from)
         .collect::<std::collections::BTreeSet<_>>();
-        Ok(Some(if names == complete && !turn_payload {
-            ResolutionFinal::Complete
-        } else {
-            ResolutionFinal::Incomplete(job)
-        }))
+        let complete_with_supervisor_log = complete
+            .iter()
+            .cloned()
+            .chain(std::iter::once(String::from("supervisor.log")))
+            .collect::<std::collections::BTreeSet<_>>();
+        Ok(Some(
+            if (names == complete || names == complete_with_supervisor_log) && !turn_payload {
+                ResolutionFinal::Complete
+            } else {
+                ResolutionFinal::Incomplete(job)
+            },
+        ))
     }
 
     fn require_resolution_accepted_after(
@@ -2379,7 +2387,12 @@ impl<'a> JobService<'a> {
             .into_iter()
             .map(String::from)
             .collect::<std::collections::BTreeSet<_>>();
-            if names != expected {
+            let expected_with_supervisor_log = expected
+                .iter()
+                .cloned()
+                .chain(std::iter::once(String::from("supervisor.log")))
+                .collect::<std::collections::BTreeSet<_>>();
+            if names != expected && names != expected_with_supervisor_log {
                 return Err(WorkerError::Protocol(
                     "unindexed final job has an unsafe top-level layout".into(),
                 ));
@@ -2397,6 +2410,14 @@ impl<'a> JobService<'a> {
                 if length != 0 {
                     return Err(WorkerError::Protocol(
                         "unindexed prelaunch job log is not empty".into(),
+                    ));
+                }
+            }
+            if job.entry_exists("supervisor.log")? {
+                let file = job.open_private_append("supervisor.log")?;
+                if job.validate_private_append_binding("supervisor.log", &file)? != 0 {
+                    return Err(WorkerError::Protocol(
+                        "unindexed prelaunch supervisor log is not empty".into(),
                     ));
                 }
             }
@@ -2450,6 +2471,8 @@ fn materialize_control_files(
         file.sync_all()?;
         consume_job_fault(store, after_sync)?;
     }
+    let supervisor_log = root.write_new_private_file("supervisor.log", &[])?;
+    supervisor_log.sync_all()?;
     write_new_canonical_json(
         store,
         root,
@@ -2497,6 +2520,8 @@ fn materialize_turn_control_files(
         let file = root.write_new_private_file(name, &[])?;
         file.sync_all()?;
     }
+    let supervisor_log = root.write_new_private_file("supervisor.log", &[])?;
+    supervisor_log.sync_all()?;
     let prompt_file = root.write_new_private_file("prompt.md", prompt.as_bytes())?;
     prompt_file.sync_all()?;
     drop(prompt_file);
@@ -2565,7 +2590,12 @@ fn validate_indexed_prelaunch_job(
     .into_iter()
     .map(String::from)
     .collect::<std::collections::BTreeSet<_>>();
-    if names != expected {
+    let expected_with_supervisor_log = expected
+        .iter()
+        .cloned()
+        .chain(std::iter::once(String::from("supervisor.log")))
+        .collect::<std::collections::BTreeSet<_>>();
+    if names != expected && names != expected_with_supervisor_log {
         return Err(WorkerError::Protocol(
             "indexed prelaunch job has an unsafe top-level layout".into(),
         ));
@@ -2580,6 +2610,16 @@ fn validate_indexed_prelaunch_job(
                 "indexed prelaunch job log is not empty".into(),
             ));
         }
+    }
+    if job.entry_exists("supervisor.log")?
+        && job.validate_private_append_binding(
+            "supervisor.log",
+            &job.open_private_append("supervisor.log")?,
+        )? != 0
+    {
+        return Err(WorkerError::Protocol(
+            "indexed prelaunch supervisor log is not empty".into(),
+        ));
     }
     Ok(())
 }
@@ -2614,7 +2654,12 @@ pub(crate) fn validate_indexed_turn_prelaunch_job(
     .into_iter()
     .map(String::from)
     .collect::<std::collections::BTreeSet<_>>();
-    if names != expected {
+    let expected_with_supervisor_log = expected
+        .iter()
+        .cloned()
+        .chain(std::iter::once(String::from("supervisor.log")))
+        .collect::<std::collections::BTreeSet<_>>();
+    if names != expected && names != expected_with_supervisor_log {
         return Err(WorkerError::Protocol(
             "indexed prelaunch turn has an unsafe top-level layout".into(),
         ));
@@ -2640,6 +2685,16 @@ pub(crate) fn validate_indexed_turn_prelaunch_job(
                 "indexed prelaunch turn log is not empty".into(),
             ));
         }
+    }
+    if job.entry_exists("supervisor.log")?
+        && job.validate_private_append_binding(
+            "supervisor.log",
+            &job.open_private_append("supervisor.log")?,
+        )? != 0
+    {
+        return Err(WorkerError::Protocol(
+            "indexed prelaunch supervisor log is not empty".into(),
+        ));
     }
     Ok(())
 }

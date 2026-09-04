@@ -11,7 +11,10 @@ use std::{
 };
 
 use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, PromptDelivery, TurnLaunch, TurnLimits},
+    agent::{
+        AgentKind, PermissionPolicy, PromptDelivery, TurnLaunch, TurnLimits, TurnParams,
+        adapter_for,
+    },
     error::WorkerError,
     host_store::HostStore,
     job::{
@@ -668,6 +671,132 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
         .unwrap();
     assert_eq!(retry.task().state(), TaskState::Open);
     assert_eq!(retry.task().last_outcome(), Some(&TaskOutcome::Done));
+}
+
+#[test]
+fn resumed_codex_turn_stays_alive_and_publishes_after_needs_input() {
+    let first_script = r#"printf '%s\n' '{"type":"thread.started","thread_id":"session-resume"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"needs_input\",\"summary\":\"need details\",\"questions\":[\"Which detail?\"],\"files_changed\":[]}"}}'"#;
+    let (temp, store, first_request, _) = prepared_task_turn(first_script);
+    let launcher = InlineTurnLauncher {
+        store: store.clone(),
+        fault: None,
+    };
+    let first = JobService::new(&store, &launcher)
+        .submit_turn(first_request.clone())
+        .expect("first turn should publish needs_input");
+    assert_eq!(first.task().state(), TaskState::Open);
+    assert_eq!(first.task().last_outcome(), Some(&TaskOutcome::NeedsInput));
+    assert!(first.task().session_present());
+    let base_oid = first
+        .task()
+        .head_oid()
+        .cloned()
+        .expect("first turn should retain its workspace head");
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let fake_codex = fake_bin.join("codex");
+    fs::write(
+        &fake_codex,
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"thread.started","thread_id":"session-resume"}'
+/bin/sleep 0.1
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"resumed\",\"questions\":[],\"files_changed\":[]}"}}'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let resume_prompt = "resume prompt";
+    let resume_job_id = JobId::new(Uuid::from_u128(6));
+    let resume_turn = TurnMaterial::from_prompt(
+        task_id(),
+        2,
+        AgentKind::Codex,
+        None,
+        PermissionPolicy::Workspace,
+        first_request.turn().limits().clone(),
+        base_oid.clone(),
+        resume_prompt,
+        None,
+        resume_job_id.as_uuid(),
+        true,
+    )
+    .unwrap();
+    let params = TurnParams {
+        kind: resume_turn.agent(),
+        model: resume_turn.model().map(str::to_owned),
+        policy: resume_turn.policy(),
+        limits: resume_turn.limits().clone(),
+        session_seed: resume_turn.session_seed(),
+    };
+    let launch = adapter_for(AgentKind::Codex)
+        .resume_turn(&params, "session-resume")
+        .unwrap();
+    let launch = TurnLaunch::new(
+        fake_codex.to_string_lossy(),
+        launch.args().to_vec(),
+        launch.prompt_delivery(),
+        launch.env_names().to_vec(),
+        launch.permission_fallback(),
+    );
+    let seed_material = RequestFingerprintMaterial::new(
+        resume_job_id,
+        ClientId::new(Uuid::from_u128(4)),
+        LeaseToken::new(Uuid::from_u128(7)),
+        200,
+        "test-worker".into(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        resume_turn.digest(),
+        String::new(),
+        30_000,
+        "heavy".into(),
+        CommandSpec::shell("true".into()).unwrap(),
+    )
+    .unwrap();
+    let seed_lease =
+        LeaseRecord::new(&seed_material, seed_material.fingerprint(), 200, 30_200).unwrap();
+    let projected = resume_turn.v1_material(&seed_lease, &launch).unwrap();
+    let admission_facts = AdmissionFacts {
+        free_disk_bytes: 100 * 1024 * 1024 * 1024,
+        total_disk_bytes: 200 * 1024 * 1024 * 1024,
+        memory_pressure: MemoryPressure::Normal,
+        swap_used_bytes: Some(0),
+    };
+    LeaseService::new(&store)
+        .acquire(
+            &LeaseAcquireRequest::new(projected.clone()),
+            &admission_facts,
+            200,
+        )
+        .unwrap();
+
+    let (meta, prepared) = TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
+        .prepare_resume(
+            PROJECT_ID,
+            task_id(),
+            resume_job_id,
+            2,
+            "test-worker",
+            &base_oid,
+        )
+        .unwrap();
+    assert_eq!(meta.agent(), AgentKind::Codex);
+    assert_eq!(prepared.state(), TaskState::Active);
+
+    let resume_request = TaskTurnRequest::new(
+        mac_worker::job::SubmitRequest::new(projected),
+        resume_turn,
+        resume_prompt,
+    );
+    let resumed = JobService::new(&store, &launcher)
+        .submit_turn(resume_request)
+        .unwrap_or_else(|error| panic!("resumed turn should publish done: {error}"));
+    assert_eq!(resumed.task().state(), TaskState::Open);
+    assert_eq!(resumed.task().last_outcome(), Some(&TaskOutcome::Done));
+    assert!(resumed.task().session_present());
+    assert_eq!(resumed.task().turns().len(), 2);
 }
 
 #[test]

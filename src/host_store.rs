@@ -3984,15 +3984,24 @@ fn validate_terminal_job_basis(
     .into_iter()
     .map(String::from)
     .collect::<BTreeSet<_>>();
-    let mut terminal_variants = vec![retained.clone()];
+    let retained_with_supervisor_log = retained
+        .iter()
+        .cloned()
+        .chain(std::iter::once(String::from("supervisor.log")))
+        .collect::<BTreeSet<_>>();
+    let mut terminal_variants = vec![retained.clone(), retained_with_supervisor_log.clone()];
     if is_turn {
         let mut with_last_message = retained.clone();
         with_last_message.insert("last.md".into());
         terminal_variants.push(with_last_message);
+        let mut with_last_message_and_supervisor_log = retained_with_supervisor_log.clone();
+        with_last_message_and_supervisor_log.insert("last.md".into());
+        terminal_variants.push(with_last_message_and_supervisor_log);
     }
     let mut allowed = retained
         .iter()
         .cloned()
+        .chain(std::iter::once(String::from("supervisor.log")))
         .chain(if is_turn {
             Some(String::from("last.md"))
         } else {

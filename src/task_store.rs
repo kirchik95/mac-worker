@@ -1078,7 +1078,9 @@ impl<'a> TaskStore<'a> {
         let task = self.open_existing_task(project_id, task_id)?;
         if task.entry_exists("session.json")? {
             let existing: SessionBinding = read_record(&task, "session.json")?;
-            if existing != binding {
+            if existing.agent() != binding.agent()
+                || existing.session_ref() != binding.session_ref()
+            {
                 return Err(task_error(
                     "TASK_SESSION_CONFLICT",
                     "task already has a different session binding",

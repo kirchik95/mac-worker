@@ -48,6 +48,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CHILD_TRANSITION_RETRY: Duration = Duration::from_millis(250);
 const SUPERVISOR_IDENTITY_RETRY: Duration = Duration::from_millis(250);
 const TERM_GRACE: Duration = Duration::from_secs(10);
+const SUPERVISOR_LOG_NAME: &str = "supervisor.log";
+const MAX_SUPERVISOR_LOG_BYTES: u64 = 1024;
 pub(crate) const SUPERVISOR_LOCK_FD: RawFd = 3;
 
 pub(crate) fn validate_detached_supervisor_context() -> Result<(), WorkerError> {
@@ -977,6 +979,66 @@ pub struct Supervisor<'a> {
     fault: Option<SupervisorFaultPoint>,
 }
 
+struct SupervisorErrorLog {
+    job: RootedDir,
+    file: File,
+}
+
+impl SupervisorErrorLog {
+    fn prepare(store: &HostStore, job_id: JobId) -> Result<Option<Self>, WorkerError> {
+        let Some(lease) = LeaseService::new(store).load()? else {
+            return Ok(None);
+        };
+        if lease.job_id() != job_id {
+            return Ok(None);
+        }
+        let job = store.open_directory(
+            &format!(
+                "jobs/{}/{}/{}",
+                lease.project_id(),
+                lease.worktree_id(),
+                lease.job_id()
+            ),
+            false,
+        )?;
+        let file = match job.open_private_append(SUPERVISOR_LOG_NAME) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let file = job.write_new_private_file(SUPERVISOR_LOG_NAME, &[])?;
+                file.sync_all()?;
+                job.sync_root()?;
+                file
+            }
+            Err(error) => return Err(WorkerError::Io(error)),
+        };
+        Ok(Some(Self { job, file }))
+    }
+
+    fn record(&mut self, error: &WorkerError) {
+        let code = error.public_code();
+        let line = format!("error_code={code}\n");
+        let line = line.as_bytes();
+        if line.len() as u64 > MAX_SUPERVISOR_LOG_BYTES {
+            return;
+        }
+        let Ok(current) = self
+            .job
+            .validate_private_append_binding(SUPERVISOR_LOG_NAME, &self.file)
+        else {
+            return;
+        };
+        let Some(end) = current.checked_add(line.len() as u64) else {
+            return;
+        };
+        if end > MAX_SUPERVISOR_LOG_BYTES {
+            return;
+        }
+        if self.file.write_all(line).is_ok() && self.file.sync_all().is_ok() {
+            let _ = self.job.sync_root();
+        }
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorFaultPoint {
@@ -1017,7 +1079,20 @@ impl<'a> Supervisor<'a> {
         }
     }
 
-    pub fn run_with_guard(
+    pub fn run_with_guard(&self, job_id: JobId, guard: SupervisorGuard) -> Result<(), WorkerError> {
+        let mut error_log = SupervisorErrorLog::prepare(self.store, job_id)
+            .ok()
+            .flatten();
+        let result = self.run_with_guard_inner(job_id, guard);
+        if let Err(error) = &result
+            && let Some(error_log) = error_log.as_mut()
+        {
+            error_log.record(error);
+        }
+        result
+    }
+
+    fn run_with_guard_inner(
         &self,
         job_id: JobId,
         mut guard: SupervisorGuard,

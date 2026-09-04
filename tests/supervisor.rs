@@ -972,6 +972,7 @@ fn submit_publishes_complete_job_before_index_and_is_idempotent_after_identity()
             "meta.json",
             "status.json",
             "stderr.log",
+            "supervisor.log",
             "stdout.log",
             "tmp",
             "workspace",
@@ -2546,6 +2547,49 @@ fn running_status_failure_reaps_the_post_go_child_and_retains_lease() {
     assert!(!job.join("execution.json").exists());
     assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
     assert!(job.join("workspace").is_dir());
+}
+
+#[test]
+fn supervisor_retains_a_sanitized_error_before_terminal_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host_with_command(
+        &temp.path().join("supervisor-error-log"),
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = FaultingInlineSupervisorLauncher {
+        store: store.clone(),
+        point: SupervisorFaultPoint::AfterRunningStatus,
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("injected supervisor fault"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(job.join("supervisor.log")).unwrap(),
+        b"error_code=IO\n"
+    );
+    assert!(fs::read(job.join("supervisor.log")).unwrap().len() <= 1024);
+    assert_eq!(
+        serde_json::from_slice::<JobStatus>(&fs::read(job.join("status.json")).unwrap())
+            .unwrap()
+            .state(),
+        JobState::Running
+    );
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert!(
+        !fs::read(job.join("supervisor.log"))
+            .unwrap()
+            .windows(temp.path().to_string_lossy().len())
+            .any(|window| window == temp.path().to_string_lossy().as_bytes())
+    );
 }
 
 #[test]
