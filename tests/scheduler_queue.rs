@@ -2176,16 +2176,55 @@ fn dead_batch_dispatch_is_first_persisted_waiting_and_pid_reuse_is_dead() {
 }
 
 #[test]
+fn dead_batch_recovery_reverts_statusless_publication_and_frees_the_reservation() {
+    // Break caught: a crash after local-record publication leaves the row
+    // Dispatching, so the selected worker stays reserved forever.
+    let fixture = open_queue_with_owner_inspector(FixedOwnerInspector {
+        observation: ProcessObservation::Absent,
+    });
+    let dispatcher = owner(609);
+    let row = dispatching_batch(
+        &fixture.store,
+        "000000000000000000000000000000bf",
+        dispatcher,
+        1_000,
+    );
+    fixture
+        .store
+        .create_job(local_record(&fixture.store, row.job_id(), "mini-1", None))
+        .unwrap();
+
+    assert_eq!(
+        fixture.store.recover_dead_dispatches().unwrap(),
+        vec![row.job_id()]
+    );
+    let snapshot = fixture.store.queue_snapshot().unwrap();
+    assert_eq!(snapshot.entries().len(), 1);
+    assert!(matches!(
+        snapshot.entries()[0].state(),
+        QueueState::Waiting { owner } if *owner == dispatcher
+    ));
+    let claimed = fixture
+        .store
+        .claim_next(dispatcher, &["mini-1".into()], 1_002)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.entry().job_id(), row.job_id());
+    assert!(matches!(
+        claimed.entry().state(),
+        QueueState::Dispatching {
+            selected_worker,
+            ..
+        } if selected_worker == "mini-1"
+    ));
+}
+
+#[test]
 fn dead_batch_recovery_preserves_bound_remote_evidence_and_uncertainty() {
     // Break caught: generic dead-owner recovery demotes an accepted or
     // ambiguous remote job to Waiting, allowing its dispatch reservation to be
     // reused before reconciliation proves a terminal outcome.
     let cases = vec![
-        (
-            "000000000000000000000000000000bf",
-            None,
-            RemoteUncertainty::None,
-        ),
         (
             "000000000000000000000000000000c0",
             Some(JobStatus::accepted(1_010).unwrap()),

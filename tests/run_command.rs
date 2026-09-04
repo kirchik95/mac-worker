@@ -3453,6 +3453,17 @@ impl RecordingRunObserver {
     }
 }
 
+struct PanicAfterLocalRecordPublication;
+
+impl RunObserver for PanicAfterLocalRecordPublication {
+    fn observe(&self, stage: RunStage) -> Result<(), WorkerError> {
+        if stage == RunStage::LocalRecordPublication {
+            panic!("injected crash after local-record publication");
+        }
+        Ok(())
+    }
+}
+
 impl RunObserver for RecordingRunObserver {
     fn observe(&self, stage: RunStage) -> Result<(), WorkerError> {
         self.stages.lock().unwrap().push(stage);
@@ -5630,6 +5641,84 @@ fn no_wait_lease_capacity_busy_exits_clean_without_local_residue() {
     assert!(scheduler.sleeps().is_empty());
     runner.assert_consumed();
     assert_no_run_capture(&run_paths(&temp).cache);
+}
+
+#[test]
+fn crash_after_local_record_publication_is_recovered_on_the_next_pass() {
+    // Break caught: dying after create_job and before dispatch handoff strands
+    // the Dispatching reservation so a later scheduler pass cannot proceed.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let paths = run_paths(&temp);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let config = config();
+    let crashed_runner = RunScriptRunner::new(paths.state.clone(), [RunScriptStep::ProbeReady]);
+    let crashed_follower = RecordingFollower::succeeding(0);
+    let crashed_scheduler = TestSchedulerRuntime::new(50_000, 906);
+    let crash = PanicAfterLocalRecordPublication;
+    let crashed =
+        RunService::with_follower(&crashed_runner, &config, &paths, &store, &crashed_follower)
+            .with_scheduler_runtime(&crashed_scheduler)
+            .with_observer(&crash);
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crashed.submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    }));
+    assert!(
+        panicked.is_err(),
+        "local-record publication crash point was not injected"
+    );
+    let stranded = store.queue_snapshot().unwrap();
+    assert_eq!(stranded.entries().len(), 1);
+    assert!(matches!(
+        stranded.entries()[0].state(),
+        QueueState::Dispatching { .. }
+    ));
+    let unpublished = store.list_jobs().unwrap();
+    assert_eq!(unpublished.len(), 1);
+    assert!(unpublished[0].last_status().is_none());
+    assert_eq!(
+        unpublished[0].remote_uncertainty(),
+        &RemoteUncertainty::None
+    );
+
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(60_000, 907);
+    let runner = RunScriptRunner::new(
+        paths.state.clone(),
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+    );
+    let completion = RunService::with_follower(&runner, &config, &paths, &store, &follower)
+        .with_scheduler_runtime(&scheduler)
+        .submit_and_follow(
+            orchestration_request(&repo),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+    assert_eq!(completion.exit_code, 0);
+    assert_eq!(completion.report.worker, "mini-1");
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
+    let leftover = store.queue_snapshot().unwrap();
+    assert_eq!(leftover.entries().len(), 1);
+    assert!(matches!(
+        leftover.entries()[0].state(),
+        QueueState::Waiting { .. }
+    ));
+    runner.assert_consumed();
 }
 
 #[test]

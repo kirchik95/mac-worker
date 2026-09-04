@@ -925,6 +925,12 @@ impl ClientStateStore {
                                 "local job metadata does not match its queue row",
                             ));
                         }
+                        if record_has_remote_evidence(&record) {
+                            index += 1;
+                            continue;
+                        }
+                        recovered.push(job_id);
+                        snapshot.entries[index].revert(dispatch_owner)?;
                         index += 1;
                         continue;
                     }
@@ -2183,6 +2189,10 @@ fn abandonment_conflict() -> WorkerError {
         "QUEUE_ABANDONMENT_CONFLICT",
         "queue abandonment proof does not match the rooted request and dispatch reservation",
     )
+}
+
+fn record_has_remote_evidence(record: &LocalJobRecord) -> bool {
+    record.last_status().is_some() || record.remote_uncertainty() != &RemoteUncertainty::None
 }
 
 fn terminal_record_matches(entry: &QueueEntry, record: &LocalJobRecord) -> bool {
