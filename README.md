@@ -53,13 +53,44 @@ Doctor inspects the Git worktree, probes configured workers read-only, creates a
 
 `UNTRACKED_INPUT` means local inputs are not covered by an explicit policy. Commit them, ignore or remove them when appropriate, or include only the exact file or narrow project-owned subtree needed by the command. Do not use a catch-all include. `SENSITIVE_PATH` means a conventional credential path is selected: remove it from the project input and use a documented example file or separately provisioned worker configuration. If the name is intentionally non-secret, review it and add only that exact relative path to `snapshot.allow_sensitive` in `.worker.toml`; Doctor will emit a content-free warning.
 
-## Phase 4 and Phase 5
+## Phase 4
 
 Phase 4 adds automatic scheduling and queueing across the configured workers, cancellation, and a local loopback dashboard. `worker dashboard` is available today. Automatic worker selection, the FIFO queue, and cancellation are planned and are not in the current CLI.
 
-Phase 5 adds agent tasks: submit a prompt instead of a command, run a headless coding agent on a Mac mini, and collect the result as a Git branch. The following are planned and are not in the current CLI: `worker task …` (including `worker task reconcile`) and `worker workers --refresh`. Prepare each worker first using the [macOS worker setup guide](docs/setup-macos-worker.md). After a helper that migrates the host layout or collects agent facts for the first time, rerun `worker setup` on every worker.
+```bash
+./target/release/worker dashboard
+./target/release/worker dashboard --no-open
+./target/release/worker dashboard --port 9173
+```
 
-When those commands exist, a batch file looks like this:
+The dashboard binds `127.0.0.1` only. It is read-only and ephemeral. It does not replace CLI operations.
+
+## Phase 5
+
+Phase 5 adds agent tasks: submit a prompt instead of a command, run a headless coding agent on a Mac mini, and collect the result as a Git branch. On this branch those commands are **not** in the CLI. `src/cli.rs` still has `setup`, `doctor`, `workers` (no `--refresh`), `dashboard`, `run`, `status`, and `logs` only. The forms below are the contract for the execution core (plan Tasks 7 to 10). Do not type them against a worker until they exist in the binary you are running.
+
+The orchestrator loop is documented in [`.claude/skills/pool-dispatch/SKILL.md`](.claude/skills/pool-dispatch/SKILL.md). How to write a brief is in [`.claude/skills/pool-task-authoring/SKILL.md`](.claude/skills/pool-task-authoring/SKILL.md). The three-Mac live procedure is [docs/phase-five-acceptance-runbook.md](docs/phase-five-acceptance-runbook.md); the sanitized record template is [docs/phase-five-validation.md](docs/phase-five-validation.md).
+
+Prepare each worker first using the [macOS worker setup guide](docs/setup-macos-worker.md). After a helper that migrates the host layout or collects agent facts for the first time, rerun `worker setup` on every worker.
+
+When the task commands exist:
+
+```text
+worker task submit --agent codex --prompt-file tasks/fix-login.md
+worker task batch tasks/sprint.toml --max-parallel 3
+worker task list --run <run_id> --json
+worker task wait --run <run_id>
+worker task say <task_id> --message-file answer.md --wait
+worker task result <task_id> --json
+worker task fetch <task_id>
+worker task close <task_id>
+worker task reconcile
+worker workers --refresh
+```
+
+`worker workers --refresh` recollects agent, profile, and Git-identity facts. `worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks without submitting anything.
+
+A batch file looks like this:
 
 ```toml
 version = 1
@@ -103,8 +134,6 @@ opencode = "unattended"
 
 Claude Code is deferred on the workers by operator decision. When it is enabled, put its token in an owner-only profile on each worker (`~/.config/mac-worker/env/agents.env`, mode `0600`) with `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. Codex uses its file-based login and needs no profile. mac-worker never creates, uploads, or prints a profile.
 
-`worker workers --refresh` and `worker task reconcile` are planned: refresh recollects agent, profile, and Git-identity facts; reconcile re-owns dead runners and re-enqueues orphaned tasks without submitting anything.
-
-These remain later phases, not this execution core: `source = origin`, `publish = push`, Cursor Agent, OpenCode, retention through `worker gc`, and the dashboard tasks view.
+These remain later phases, not this execution core: `source = origin`, `publish = push`, Cursor Agent, OpenCode, retention through `worker gc`, and the dashboard tasks view. The batch-file example above shows those later keys so a future override is valid TOML; this core must reject them at preflight.
 
 Agent turns run with the worker account's full access: its files, processes, caches, agent configuration, and any credentials that account holds. A task workspace is not a security boundary. Only dispatch trusted prompts.

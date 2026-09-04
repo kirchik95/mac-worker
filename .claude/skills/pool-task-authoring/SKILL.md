@@ -12,7 +12,7 @@ Use this skill to turn an objective into tasks that a headless coding agent can 
 - Make each task one independent unit of work.
 - Fit the task in one turn, about 45 minutes.
 - Use one repository per task.
-- Do not run concurrent tasks that share files.
+- Do not run concurrent tasks that share files. If several tasks share one repository, each brief must name the other tasks' files as forbidden.
 - Split by ownership and dependency, not by arbitrary file count.
 - Make the final state testable by a command, an assertion, or an explicit artifact.
 
@@ -45,20 +45,30 @@ Every brief should contain these parts, in this order:
 2. **Where to work:** the repository, base choice, and the task's working boundary.
 3. **Boundaries:** files or areas allowed, forbidden files, and actions the agent must not take. State that it must not switch branches, push, open a merge request, or touch another worktree unless the task explicitly requires it.
 4. **Exact steps:** the implementation sequence. Prefer failing tests first, minimal implementation, focused verification, then the final check.
-5. **Gate:** exact verification commands and the acceptance condition.
+5. **Gate:** exact verification commands and the acceptance condition. If any of those commands is timing-sensitive, require a serial rerun under load.
 6. **Report:** the required final message, including changed files, tests, commit hash, and any blocker or unverified claim.
 
 Tell the agent to commit completed work with a descriptive message. A successful task is not complete merely because files changed: the requested behavior must be verified and the commit must exist.
 
 The prompt preamble already tells the agent to work in a dedicated task branch, commit, avoid interactive questions, and finish with a structured result. Keep task-specific instructions concrete and do not put secrets in the prompt.
 
+## Headless-run lessons
+
+These constraints come from live headless turns. Keep the brief itself tool-agnostic; the failure modes apply to every agent in the pool.
+
+- **The first prompt can be swallowed.** After startup some agents drop the first stdin payload. Put the complete assignment in `--prompt-file` and treat that file as the only copy of the work. Do not rely on a later `say` to deliver the objective, and do not split the assignment across a "warmup" message and a real one.
+- **A zero process exit is not success.** Some agents, including Codex, exit `0` while the structured status is `blocked`. Read `status` from the result envelope. Return `done` only when that field is `done` and the gate passed. Treat `blocked` as a failed turn even when the CLI exited zero.
+- **Headless agents cannot ask questions.** There is no TTY and no permission prompt. Every decision the agent needs must be in the brief: names, paths, commands, acceptance numbers, and what to do on the obvious branches. If a decision is genuinely missing, the agent must finish the turn with `needs_input` or `blocked` and a concrete question. Do not write "ask me if unsure."
+- **Name forbidden files when several tasks share a repository.** "Do not edit unrelated files" is not enough. List the exact paths or directories another in-flight task owns, and list the paths this task must not touch. Two tasks on one repository are still one-repo-per-task only if their write sets are disjoint and each brief says so.
+- **Timing-sensitive tests need a serial rerun under load.** A single green run in an idle worktree is not the gate when the change can race. Say so in the Gate: run the focused tests once, then rerun them serially (not in a wide parallel harness) while other work is in flight, and treat a flake on that rerun as `blocked`.
+
 ## Read The Result
 
-Expect one of these structured statuses:
+Expect one of these structured statuses. The process exit status is not enough; read the envelope.
 
 - `done`: the requested work and gate completed. Fetch the result branch.
 - `needs_input`: the agent has a bounded question needed for the next turn. Answer it with a follow-up message, or close the task if the decision is out of scope.
-- `blocked`: the agent could not complete the task. Read its result and logs, then write a follow-up that removes the concrete blocker, or close with discard.
+- `blocked`: the agent could not complete the task, including the case where the process exited zero. Read its result and logs, then write a follow-up that removes the concrete blocker, or close with discard.
 
 If the turn fails, inspect the structured result and logs before authoring a follow-up. A follow-up should contain the missing decision, file, command, or constraint. Do not repeat the same prompt. If the problem is a task boundary or dependency, split or reorder the work instead.
 
