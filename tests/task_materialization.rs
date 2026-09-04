@@ -263,6 +263,61 @@ fn prepare_is_idempotent_on_retry_and_refuses_inconsistent_state() {
 }
 
 #[test]
+fn resume_reuses_the_published_workspace_and_appends_one_active_turn() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    acquire_lease(&store);
+    prepare_task(&store, base_oid.clone());
+    TaskStore::new(&store, &SystemProcessRunner)
+        .publish_branch_into_mirror(PROJECT_ID, task_id())
+        .unwrap();
+    TaskStore::new(&store, &SystemProcessRunner)
+        .bind_session(
+            PROJECT_ID,
+            task_id(),
+            SessionBinding::new(AgentKind::Codex, "session-1", 101).unwrap(),
+        )
+        .unwrap();
+
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    let error = TaskStore::new(&store, &SystemProcessRunner)
+        .prepare_resume(
+            PROJECT_ID,
+            task_id(),
+            JobId::new(Uuid::from_u128(11)),
+            2,
+            "mini-2",
+            &base_oid,
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_TURN_CONFLICT");
+    let resumed = TaskStore::new(&store, &SystemProcessRunner)
+        .prepare_resume(
+            PROJECT_ID,
+            task_id(),
+            JobId::new(Uuid::from_u128(11)),
+            2,
+            "mini-1",
+            &base_oid,
+        )
+        .unwrap();
+
+    assert_eq!(resumed.0.task_id(), task_id());
+    assert_eq!(resumed.1.state(), TaskState::Active);
+    assert!(resumed.1.session_present());
+    assert_eq!(resumed.1.turns().len(), 2);
+    assert_eq!(resumed.1.turns()[1].turn_number(), 2);
+    assert_eq!(
+        resumed.1.turns()[1].turn_id(),
+        JobId::new(Uuid::from_u128(11))
+    );
+    assert_eq!(
+        git(&workspace, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        format!("task/{}", task_id())
+    );
+    assert_eq!(git(&workspace, &["rev-parse", "HEAD"]), base_oid.as_str());
+}
+
+#[test]
 fn diff_uses_private_index_and_bounds_escaped_output() {
     let (_temp, store, base_oid) = store_with_mirror();
     acquire_lease(&store);

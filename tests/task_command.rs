@@ -1,5 +1,8 @@
 use clap::Parser;
-use mac_worker::cli::{Cli, Command, TaskCommand};
+use mac_worker::{
+    cli::{Cli, Command, TaskCommand},
+    task_client::BatchFile,
+};
 
 #[test]
 fn task_commands_parse_the_documented_forms() {
@@ -112,4 +115,90 @@ fn task_submit_allows_attached_no_wait_to_fail_after_the_probe() {
     else {
         panic!("expected task submit command");
     };
+}
+
+#[test]
+fn batch_file_accepts_documented_top_level_defaults_and_prompt_files() {
+    let parsed: BatchFile = toml::from_str(
+        r#"
+version = 1
+agent = "codex"
+base = "main"
+source = "local"
+publish = ["fetch"]
+timeout = "45m"
+
+[[tasks]]
+title = "Flaky login spec"
+prompt_file = "tasks/fix-flaky-login.md"
+
+[[tasks]]
+title = "Extract billing client"
+prompt = "Move the billing client"
+agent = "claude"
+"#,
+    )
+    .expect("documented batch syntax must parse");
+
+    assert_eq!(parsed.version, 1);
+    assert_eq!(parsed.defaults.agent, "codex");
+    assert_eq!(parsed.defaults.base, "main");
+    assert_eq!(parsed.defaults.source, "local");
+    assert_eq!(parsed.defaults.publish, vec!["fetch"]);
+    assert_eq!(parsed.tasks.len(), 2);
+    assert_eq!(
+        parsed.tasks[0]
+            .prompt_file
+            .as_deref()
+            .and_then(|path| path.to_str()),
+        Some("tasks/fix-flaky-login.md")
+    );
+    assert_eq!(
+        parsed.tasks[1].prompt.as_deref(),
+        Some("Move the billing client")
+    );
+}
+
+#[test]
+fn batch_file_defaults_to_version_one_and_local_fetch() {
+    let parsed: BatchFile = toml::from_str(
+        r#"
+[[tasks]]
+prompt = "x"
+"#,
+    )
+    .expect("minimal batch syntax must parse");
+
+    assert_eq!(parsed.version, 1);
+    assert_eq!(parsed.defaults.source, "local");
+    assert_eq!(parsed.defaults.publish, vec!["fetch"]);
+}
+
+#[test]
+fn batch_file_rejects_unknown_keys_and_conflicting_defaults() {
+    let unknown = toml::from_str::<BatchFile>(
+        r#"
+version = 1
+unexpected = true
+
+[[tasks]]
+prompt = "x"
+"#,
+    );
+    assert!(unknown.is_err(), "unknown batch keys must be rejected");
+
+    let conflicting = toml::from_str::<BatchFile>(
+        r#"
+agent = "codex"
+[defaults]
+base = "main"
+
+[[tasks]]
+prompt = "x"
+"#,
+    );
+    assert!(
+        conflicting.is_err(),
+        "mixed top-level and [defaults] keys must be rejected"
+    );
 }

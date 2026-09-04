@@ -1273,13 +1273,27 @@ impl ClientStateStore {
         let Some(run) = candidate.run() else {
             return Ok(true);
         };
+        let tasks = self.list_tasks()?;
+        let active_task_turns = tasks
+            .iter()
+            .filter(|task| {
+                task.meta()
+                    .run_id()
+                    .is_some_and(|run_id| run_id.to_string() == run.run_id().as_str())
+                    && task.status().state() == crate::task::TaskState::Active
+            })
+            .filter_map(|task| task.status().turns().last().map(|turn| turn.turn_id()))
+            .collect::<HashSet<_>>();
         let mut active = HashSet::new();
         for sibling in snapshot.entries().iter().filter(|entry| {
             entry
                 .run()
                 .is_some_and(|other| other.run_id() == run.run_id())
         }) {
-            if matches!(sibling.state(), QueueState::Dispatching { .. }) {
+            if matches!(sibling.state(), QueueState::Dispatching { .. })
+                && (sibling.kind() != QueueEntryKind::TaskTurn
+                    || !active_task_turns.contains(&sibling.job_id()))
+            {
                 active.insert(sibling.job_id().to_string());
             }
             let name = job_file_name(sibling.job_id())?;
@@ -1301,7 +1315,7 @@ impl ClientStateStore {
         // Task turns do not create legacy job records. Their local Active
         // status is nevertheless an accepted turn and must consume the same
         // run slot while the queue lock is held.
-        for task in self.list_tasks()? {
+        for task in tasks {
             if task
                 .meta()
                 .run_id()

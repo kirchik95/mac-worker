@@ -28,7 +28,7 @@ use crate::{
         ProcessObservation, ReconciliationRuntime, SystemReconciliationRuntime,
         reconcile_orphan_processes, terminate_exact_recorded_group,
     },
-    task_store::TaskStore,
+    task_store::{TaskCancelRequest, TaskStore},
     turn::{
         TaskTurnRequest, TaskTurnResponse, TerminalPath, TurnReceipt, TurnSection, TurnTerminalHook,
     },
@@ -484,12 +484,41 @@ impl<'a> JobService<'a> {
             .ok_or_else(|| protocol_code("LEASE_MISSING", "matching task lease is absent"))?;
         require_exact_lease(&lease, &submit)?;
 
-        let (meta, prepared_status) =
-            task_store.prepared_turn(material.project_id(), turn.task_id(), job_id)?;
+        let (meta, prepared_status) = {
+            let current = task_store.load_status(material.project_id(), turn.task_id())?;
+            let meta = task_store.load_meta(material.project_id(), turn.task_id())?;
+            let prepared = current.state() == crate::task::TaskState::Active
+                && current.turns().last().is_some_and(|pending| {
+                    pending.turn_id() == job_id && pending.terminal().is_none()
+                });
+            if prepared {
+                (meta, current)
+            } else if turn.resume() && current.state() == crate::task::TaskState::Open {
+                task_store.prepare_resume(
+                    material.project_id(),
+                    turn.task_id(),
+                    job_id,
+                    turn.turn_number(),
+                    lease.worker_name(),
+                    turn.base_oid(),
+                )?
+            } else {
+                return Err(protocol_code(
+                    "TASK_BUSY",
+                    "task does not have the requested prepared active turn",
+                ));
+            }
+        };
         let pending_turn = prepared_status
             .turns()
             .last()
             .ok_or_else(|| protocol_code("REQUEST_CONFLICT", "prepared turn history is absent"))?;
+        if prepared_status.worker() != Some(lease.worker_name()) {
+            return Err(protocol_code(
+                "TASK_TURN_CONFLICT",
+                "turn worker does not match the task's selected worker",
+            ));
+        }
         if material.worktree_id() != meta.worktree_id()
             || turn.turn_number() != pending_turn.turn_number()
             || turn.agent() != meta.agent()
@@ -758,7 +787,7 @@ impl<'a> JobService<'a> {
         let job = current.directory;
         let meta = current.meta;
 
-        let cancelled = if status.child_identity().is_none() {
+        if status.child_identity().is_none() {
             // This is the accepted/no-child launch fence. There is no process
             // identity to signal; publish the deliberate no-child terminal
             // form before any mutable data is removed.
@@ -776,7 +805,16 @@ impl<'a> JobService<'a> {
                 &status,
                 &cancelled,
             )?;
-            cancelled
+            let publication = self.publish_cancelled_task_turn(lease, &job, &meta);
+            drop(supervisor);
+            drop(admission);
+            let cleanup = self.cleanup_and_release_reconciled(lease, &job, &cancelled);
+            if let Err(error) = publication {
+                let _ = cleanup;
+                return Err(error);
+            }
+            cleanup?;
+            cancel_response(meta, cancelled)
         } else {
             // Do not keep admission across the bounded group proof. The
             // supervisor capability remains held so a natural terminal write
@@ -799,15 +837,110 @@ impl<'a> JobService<'a> {
                 &status,
                 &cancelled,
             )?;
+            let publication = self.publish_cancelled_task_turn(lease, &job, &meta);
             drop(supervisor);
-            self.cleanup_and_release_reconciled(lease, &job, &cancelled)?;
-            return cancel_response(meta, cancelled);
-        };
+            let cleanup = self.cleanup_and_release_reconciled(lease, &job, &cancelled);
+            if let Err(error) = publication {
+                let _ = cleanup;
+                return Err(error);
+            }
+            cleanup?;
+            cancel_response(meta, cancelled)
+        }
+    }
 
-        drop(supervisor);
+    /// Publishes a task turn when the host-side accepted job is cancelled.
+    /// Ordinary supervisor terminal paths already invoke this hook; the
+    /// explicit cancellation path has to do so before it removes the job
+    /// payload and releases the lease.
+    fn publish_cancelled_task_turn(
+        &self,
+        lease: &LeaseRecord,
+        job: &RootedDir,
+        meta: &JobMeta,
+    ) -> Result<(), WorkerError> {
+        if !job.entry_exists("execution.json")? {
+            return Ok(());
+        }
+        let payload: ExecutionPayload = read_canonical_json(job, "execution.json")?;
+        payload.validate_for_durable_job(lease, meta)?;
+        let Some(section) = payload.turn() else {
+            return Ok(());
+        };
+        let task_store = TaskStore::new(self.store, &SystemProcessRunner);
+        let task_status = task_store.load_status(section.project_id(), section.turn().task_id())?;
+        let pending = task_status.state() == crate::task::TaskState::Active
+            && task_status
+                .turns()
+                .last()
+                .is_some_and(|turn| turn.turn_id() == lease.job_id() && turn.terminal().is_none());
+        if !pending {
+            return Ok(());
+        }
+        TurnTerminalHook
+            .invoke(
+                self.store,
+                job,
+                meta,
+                section,
+                crate::task::TurnTerminal::Cancelled,
+                TerminalPath::HostCancel,
+                None,
+                false,
+            )
+            .map(|_| ())
+    }
+
+    /// Cancels the active turn identified by a task ID and turn ID. The host
+    /// resolves the task's private accepted-job identity, then delegates to
+    /// the existing exact lease/supervisor cancellation protocol.
+    pub fn cancel_task(
+        &self,
+        request: TaskCancelRequest,
+    ) -> Result<crate::task_store::TaskCancelResponse, WorkerError> {
+        request.validate()?;
+        let task_store = TaskStore::new(self.store, &SystemProcessRunner);
+        let initial = task_store.load_status(request.project_id(), request.task_id())?;
+        if initial.state() == crate::task::TaskState::Open
+            && initial.turns().last().is_some_and(|turn| {
+                turn.turn_id() == request.turn_id() && turn.terminal().is_some()
+            })
+        {
+            return Ok(crate::task_store::TaskCancelResponse::new(initial));
+        }
+        if initial.state() != crate::task::TaskState::Active
+            || !initial.turns().last().is_some_and(|turn| {
+                turn.turn_id() == request.turn_id() && turn.terminal().is_none()
+            })
+        {
+            return Err(protocol_code(
+                "TASK_CLOSED",
+                "task does not have the requested active turn",
+            ));
+        }
+        let meta = task_store.load_meta(request.project_id(), request.task_id())?;
+        let admission = self.store.admission_lock(request.turn_id())?;
+        let lease = self
+            .leases
+            .load_after(&admission, request.turn_id())?
+            .filter(|lease| lease.job_id() == request.turn_id())
+            .ok_or_else(|| protocol_code("TASK_NOT_FOUND", "active task lease is absent"))?;
+        if lease.project_id() != meta.project_id() || lease.worktree_id() != meta.worktree_id() {
+            return Err(protocol_code(
+                "TASK_TURN_CONFLICT",
+                "active task lease does not match task metadata",
+            ));
+        }
+        let cancel = CancelRequest::new(
+            request.turn_id(),
+            lease.client_id(),
+            lease.lease_token(),
+            lease.request_fingerprint().clone(),
+        )?;
         drop(admission);
-        self.cleanup_and_release_reconciled(lease, &job, &cancelled)?;
-        cancel_response(meta, cancelled)
+        self.cancel(cancel)?;
+        let status = task_store.load_status(request.project_id(), request.task_id())?;
+        Ok(crate::task_store::TaskCancelResponse::new(status))
     }
 
     fn read_cancel_authority_after(

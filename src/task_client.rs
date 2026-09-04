@@ -4,7 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLimits, adapter_for},
@@ -31,7 +31,7 @@ use crate::{
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
     transport::{SshTransport, WorkersService},
-    turn_runner::{DetachedRunnerExecutor, RunnerExecutor, TurnRunner},
+    turn_runner::{DetachedRunnerExecutor, RunnerExecutor, TurnRunner, adopt_row_with_retry},
 };
 
 const TASK_COMMAND: &str = "task-turn";
@@ -73,6 +73,7 @@ pub struct TaskReport {
     status: TaskStatus,
     events: Vec<serde_json::Value>,
     runner: Option<RunnerState>,
+    exit_code: Option<u8>,
 }
 
 impl TaskReport {
@@ -94,6 +95,10 @@ impl TaskReport {
 
     pub fn runner(&self) -> Option<RunnerState> {
         self.runner
+    }
+
+    pub fn exit_code(&self) -> Option<u8> {
+        self.exit_code
     }
 }
 
@@ -213,12 +218,131 @@ impl RunReport {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct BatchFile {
-    #[serde(default)]
+    pub version: u32,
     pub defaults: BatchDefaults,
     pub tasks: Vec<BatchTask>,
+}
+
+impl<'de> Deserialize<'de> for BatchFile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(default = "default_batch_version")]
+            version: u32,
+            #[serde(default)]
+            defaults: Option<BatchDefaults>,
+            #[serde(default)]
+            agent: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            base: Option<String>,
+            #[serde(default)]
+            wip: Option<bool>,
+            #[serde(default)]
+            timeout: Option<String>,
+            #[serde(default)]
+            max_turns: Option<u32>,
+            #[serde(default)]
+            max_budget_usd_cents: Option<u64>,
+            #[serde(default)]
+            max_followups: Option<u32>,
+            #[serde(default)]
+            close_on: Option<String>,
+            #[serde(default)]
+            env_profile: Option<String>,
+            #[serde(default)]
+            worker: Option<String>,
+            #[serde(default)]
+            source: Option<String>,
+            #[serde(default)]
+            publish: Option<Vec<String>>,
+            #[serde(default)]
+            publish_branch: Option<String>,
+            tasks: Vec<BatchTask>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let has_flat_defaults = [
+            wire.agent.is_some(),
+            wire.model.is_some(),
+            wire.base.is_some(),
+            wire.wip.is_some(),
+            wire.timeout.is_some(),
+            wire.max_turns.is_some(),
+            wire.max_budget_usd_cents.is_some(),
+            wire.max_followups.is_some(),
+            wire.close_on.is_some(),
+            wire.env_profile.is_some(),
+            wire.worker.is_some(),
+            wire.source.is_some(),
+            wire.publish.is_some(),
+            wire.publish_branch.is_some(),
+        ]
+        .into_iter()
+        .any(|present| present);
+        if wire.defaults.is_some() && has_flat_defaults {
+            return Err(serde::de::Error::custom(
+                "batch defaults must use either a [defaults] table or top-level keys, not both",
+            ));
+        }
+
+        let mut defaults = wire.defaults.unwrap_or_default();
+        if let Some(agent) = wire.agent {
+            defaults.agent = agent;
+        }
+        if wire.model.is_some() {
+            defaults.model = wire.model;
+        }
+        if let Some(base) = wire.base {
+            defaults.base = base;
+        }
+        if let Some(wip) = wire.wip {
+            defaults.wip = wip;
+        }
+        if wire.timeout.is_some() {
+            defaults.timeout = wire.timeout;
+        }
+        if wire.max_turns.is_some() {
+            defaults.max_turns = wire.max_turns;
+        }
+        if wire.max_budget_usd_cents.is_some() {
+            defaults.max_budget_usd_cents = wire.max_budget_usd_cents;
+        }
+        if wire.max_followups.is_some() {
+            defaults.max_followups = wire.max_followups;
+        }
+        if wire.close_on.is_some() {
+            defaults.close_on = wire.close_on;
+        }
+        if wire.env_profile.is_some() {
+            defaults.env_profile = wire.env_profile;
+        }
+        if wire.worker.is_some() {
+            defaults.worker = wire.worker;
+        }
+        if let Some(source) = wire.source {
+            defaults.source = source;
+        }
+        if let Some(publish) = wire.publish {
+            defaults.publish = publish;
+        }
+        if wire.publish_branch.is_some() {
+            defaults.publish_branch = wire.publish_branch;
+        }
+
+        Ok(Self {
+            version: wire.version,
+            defaults,
+            tasks: wire.tasks,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -246,6 +370,12 @@ pub struct BatchDefaults {
     pub env_profile: Option<String>,
     #[serde(default)]
     pub worker: Option<String>,
+    #[serde(default = "default_source_name")]
+    pub source: String,
+    #[serde(default = "default_publish_modes")]
+    pub publish: Vec<String>,
+    #[serde(default)]
+    pub publish_branch: Option<String>,
 }
 
 impl Default for BatchDefaults {
@@ -262,6 +392,9 @@ impl Default for BatchDefaults {
             close_on: None,
             env_profile: None,
             worker: None,
+            source: default_source_name(),
+            publish: default_publish_modes(),
+            publish_branch: None,
         }
     }
 }
@@ -269,7 +402,10 @@ impl Default for BatchDefaults {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchTask {
-    pub prompt: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub prompt_file: Option<PathBuf>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -294,6 +430,12 @@ pub struct BatchTask {
     pub env_profile: Option<String>,
     #[serde(default)]
     pub worker: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub publish: Option<Vec<String>>,
+    #[serde(default)]
+    pub publish_branch: Option<String>,
 }
 
 pub struct TaskClient<'a> {
@@ -330,6 +472,13 @@ impl<'a> TaskClient<'a> {
         Self::new(runner, config, paths, client_state, &DetachedRunnerExecutor)
     }
 
+    pub fn default_task_agent(&self, project: &Path) -> Result<AgentKind, WorkerError> {
+        let settings = ProjectState::load(self.runner, project, &[])?.settings.task;
+        let agent = parse_agent(&settings.default_agent)?;
+        validate_task_agent(agent)?;
+        Ok(agent)
+    }
+
     pub fn submit(
         &self,
         request: TaskSubmitRequest,
@@ -364,12 +513,7 @@ impl<'a> TaskClient<'a> {
     ) -> Result<TaskReport, WorkerError> {
         self.reconcile_runners()?;
         validate_prompt(&request.prompt)?;
-        if request.agent != AgentKind::Codex {
-            return Err(task_error(
-                "AGENT_UNSUPPORTED",
-                "this client accepts Codex tasks only",
-            ));
-        }
+        validate_task_agent(request.agent)?;
         validate_preference(self.config, &request.preference)?;
 
         let initial = ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
@@ -557,6 +701,7 @@ impl<'a> TaskClient<'a> {
             .run(task_id, turn_id, Some(&mut follow))?;
             report.status = outcome.status().clone();
             report.events.extend(outcome.events().iter().cloned());
+            report.exit_code = Some(outcome.exit_code());
         }
         Ok(report)
     }
@@ -917,7 +1062,8 @@ impl<'a> TaskClient<'a> {
             }
             TaskState::Open => {}
         }
-        if record.status().turns().len() as u32 >= record.meta().limits().max_followups {
+        let followups = record.status().turns().len().saturating_sub(1) as u32;
+        if followups >= record.meta().limits().max_followups {
             return Err(task_error(
                 "FOLLOWUP_LIMIT",
                 "task follow-up limit has been reached",
@@ -925,12 +1071,77 @@ impl<'a> TaskClient<'a> {
         }
         let worker = task_worker(self.config, record.status())?.name.clone();
         let turn_id = TurnId::generate();
+        let turn_number = u32::try_from(record.status().turns().len())
+            .ok()
+            .and_then(|turns| turns.checked_add(1))
+            .ok_or_else(|| task_error("TASK_INCONSISTENT", "turn history is too long"))?;
+        let base_oid = record
+            .status()
+            .head_oid()
+            .cloned()
+            .unwrap_or_else(|| record.meta().base_oid().clone());
+        let composed_prompt =
+            compose_turn_prompt(task_id, turn_number, &base_oid, None, &message, true);
+        validate_prompt(&composed_prompt)?;
         self.client_state
-            .write_turn_prompt(task_id, turn_id, &message)?;
-        let replacement = record.with_runner(None)?;
-        self.client_state.update_task(replacement)?;
-        let entry = self.enqueue_followup(&record, turn_id, worker)?;
-        self.start_runner(task_id, turn_id)?;
+            .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
+        let pending = TurnSummary::new(
+            turn_number,
+            turn_id,
+            None,
+            None,
+            None,
+            false,
+            Some(current_time_millis()?),
+            None,
+        );
+        let active = TaskStatus::new(
+            TaskState::Active,
+            record.status().last_outcome().cloned(),
+            Some(worker.clone()),
+            true,
+            Some(base_oid),
+            record.status().summary().map(str::to_owned),
+            record.status().questions().to_vec(),
+            record.status().files_changed().to_vec(),
+            record.status().diff_stat().map(str::to_owned),
+            record
+                .status()
+                .turns()
+                .iter()
+                .cloned()
+                .chain([pending])
+                .collect(),
+            current_time_millis()?,
+        )?;
+        let active_record = record.with_status(active)?.with_runner(None)?;
+        if let Err(error) = self.client_state.update_task(active_record) {
+            let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
+            return Err(error);
+        }
+        let entry = match self.enqueue_followup(&record, turn_id, worker) {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.rollback_followup(&record, task_id, turn_id);
+                return Err(error);
+            }
+        };
+        let should_start = attached || self.live_runner_count()? < self.config.workers.len();
+        if should_start {
+            if let Err(error) = self.start_runner(task_id, turn_id) {
+                return Err(self.fail_handoff(
+                    task_id,
+                    turn_id,
+                    self.transfer_for_record(&record)?,
+                    error,
+                ));
+            }
+        } else {
+            if let Err(error) = self.client_state.park_row(entry.job_id()) {
+                self.rollback_followup(&record, task_id, turn_id);
+                return Err(error);
+            }
+        }
         let mut report = self.report_for(task_id)?;
         report.events.push(event_task_created(&report));
         if attached {
@@ -944,6 +1155,7 @@ impl<'a> TaskClient<'a> {
             .run(task_id, entry.job_id(), Some(stdout))?;
             report.status = outcome.status().clone();
             report.events.extend(outcome.events().iter().cloned());
+            report.exit_code = Some(outcome.exit_code());
         }
         Ok(report)
     }
@@ -951,40 +1163,106 @@ impl<'a> TaskClient<'a> {
     pub fn cancel(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
-        if let Some(turn_id) = pending_turn_id(record.status())
-            && let Some(job) = self.client_state.load_job_optional(turn_id)?
-        {
+        if matches!(
+            record.status().state(),
+            TaskState::Closed | TaskState::Abandoned | TaskState::Lost
+        ) {
+            return self.report_for(task_id);
+        }
+
+        let queue_entry = self.client_state.queue_entry_for_task_turn(task_id)?;
+        let turn_id = pending_turn_id(record.status())
+            .or_else(|| queue_entry.as_ref().map(QueueEntry::job_id));
+        let Some(turn_id) = turn_id else {
+            return self.report_for(task_id);
+        };
+
+        // Keep the legacy path available for older local records; task turns
+        // never create one of these records and use the task-specific host
+        // cancellation protocol below.
+        if let Some(job) = self.client_state.load_job_optional(turn_id)? {
             let worker = task_worker(self.config, record.status())?;
             let response = RemoteJobClient::new(self.runner)
                 .cancel(worker, &crate::job::CancelRequest::from_local_record(&job)?)?;
             self.client_state
                 .update_observation(turn_id, response.status().status().clone())?;
+            let status = TaskStatus::new(
+                TaskState::Open,
+                Some(TaskOutcome::Cancelled),
+                Some(response.status().meta().worker_name().to_owned()),
+                record.status().session_present(),
+                record.status().head_oid().cloned(),
+                record.status().summary().map(str::to_owned),
+                record.status().questions().to_vec(),
+                record.status().files_changed().to_vec(),
+                record.status().diff_stat().map(str::to_owned),
+                record.status().turns().to_vec(),
+                current_time_millis()?,
+            )?;
             self.client_state
-                .update_task(record.with_status(TaskStatus::new(
-                    TaskState::Open,
-                    Some(TaskOutcome::Cancelled),
-                    response.status().meta().worker_name().to_owned().into(),
-                    record.status().session_present(),
-                    record.status().head_oid().cloned(),
-                    record.status().summary().map(str::to_owned),
-                    record.status().questions().to_vec(),
-                    record.status().files_changed().to_vec(),
-                    record.status().diff_stat().map(str::to_owned),
-                    record.status().turns().to_vec(),
-                    current_time_millis()?,
-                )?)?)?;
+                .update_task(record.with_status(status)?.with_runner(None)?)?;
             return self.report_for(task_id);
         }
-        if let Some(turn_id) = pending_turn_id(record.status()) {
-            if self.client_state.queue_entry(turn_id)?.is_some() {
-                let _ = self.client_state.remove_queued(turn_id)?;
-                let status = abandoned_status(record.status(), "CANCELLED")?;
-                self.client_state.update_task(
-                    record
-                        .with_status(status)?
-                        .with_abandon_code(Some("CANCELLED".to_owned()))?,
-                )?;
+
+        let entry = self.client_state.queue_entry(turn_id)?;
+        let prompt_exists = self.client_state.read_turn_prompt(task_id, turn_id).is_ok();
+        if entry.as_ref().is_some_and(|entry| {
+            matches!(
+                entry.state(),
+                QueueState::Waiting { .. } | QueueState::Parked
+            )
+        }) || prompt_exists
+        {
+            match self
+                .client_state
+                .request_queue_cancel(turn_id, current_time_millis()?)?
+            {
+                Some(crate::job::QueueCancel::RemovedWaiting { .. }) => {
+                    let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
+                    if record.status().state() == TaskState::Queued {
+                        let status = abandoned_status(record.status(), "CANCELLED")?;
+                        self.client_state.update_task(
+                            record
+                                .with_status(status)?
+                                .with_abandon_code(Some("CANCELLED".to_owned()))?,
+                        )?;
+                        let _ = self.release_task_base(&record);
+                    } else if record.status().state() == TaskState::Active {
+                        let status = cancelled_followup_status(record.status())?;
+                        self.client_state
+                            .update_task(record.with_status(status)?.with_runner(None)?)?;
+                    }
+                    return self.report_for(task_id);
+                }
+                Some(crate::job::QueueCancel::RequestedDispatch { .. }) => {
+                    return Err(task_error("TASK_BUSY", "task turn is being dispatched"));
+                }
+                None if entry.is_some() => {
+                    return Err(task_error(
+                        "TASK_INCONSISTENT",
+                        "task queue turn disappeared",
+                    ));
+                }
+                None => {}
             }
+        }
+
+        if record.status().state() == TaskState::Active {
+            let worker = task_worker(self.config, record.status())?;
+            let response = RemoteJobClient::new(self.runner).task_cancel(
+                worker,
+                &crate::task_store::TaskCancelRequest::new(
+                    record.meta().project_id(),
+                    task_id,
+                    turn_id,
+                ),
+            )?;
+            let status = response.status().clone();
+            self.client_state
+                .update_task(record.with_status(status)?.with_runner(None)?)?;
+            self.retire_task_turn(task_id, turn_id)?;
+            let updated = self.client_state.load_task(task_id)?;
+            self.release_task_base(&updated)?;
         }
         self.report_for(task_id)
     }
@@ -1056,24 +1334,34 @@ impl<'a> TaskClient<'a> {
                 format!("invalid batch file: {error}"),
             )
         })?;
+        if batch.version != 1 {
+            return Err(task_error(
+                "TASK_CONFIG_INVALID",
+                format!("unsupported batch version {}; expected 1", batch.version),
+            ));
+        }
         if batch.tasks.is_empty() {
             return Err(task_error("TASK_CONFIG_INVALID", "batch has no tasks"));
         }
-        let max_parallel = max_parallel.unwrap_or(1);
-        if max_parallel == 0 {
-            return Err(task_error(
-                "TASK_CONFIG_INVALID",
-                "batch max_parallel must be positive",
-            ));
-        }
+        let max_parallel = resolve_batch_max_parallel(max_parallel, self.config.workers.len())?;
         let run_id = RunId::generate();
         let created = current_time_millis()?;
+        let batch_dir = file.parent().unwrap_or_else(|| Path::new("."));
+        let project = self.current_project()?;
         let mut requests = Vec::with_capacity(batch.tasks.len());
         for task in &batch.tasks {
             requests.push((
-                self.batch_request(&batch.defaults, task, run_id)?,
+                self.batch_request(&batch.defaults, task, batch_dir, &project, run_id)?,
                 task.title.clone(),
             ));
+        }
+        let settings = ProjectState::load(self.runner, &project, &[])?
+            .settings
+            .task;
+        for (request, _) in &requests {
+            validate_prompt(&request.prompt)?;
+            validate_preference(self.config, &request.preference)?;
+            let _ = effective_task_limits(&request.limits, &settings)?;
         }
         let task_ids = requests
             .iter()
@@ -1098,43 +1386,46 @@ impl<'a> TaskClient<'a> {
         &self,
         defaults: &BatchDefaults,
         task: &BatchTask,
+        batch_dir: &Path,
+        project: &Path,
         run_id: RunId,
     ) -> Result<TaskSubmitRequest, WorkerError> {
+        validate_batch_scope(defaults, task)?;
         let agent = parse_agent(task.agent.as_deref().unwrap_or(&defaults.agent))?;
-        if agent != AgentKind::Codex {
-            return Err(task_error(
-                "AGENT_UNSUPPORTED",
-                "this client accepts Codex tasks only",
-            ));
-        }
+        validate_task_agent(agent)?;
         let timeout = task
             .timeout
             .as_deref()
             .or(defaults.timeout.as_deref())
-            .map(|value| humantime::parse_duration(value))
+            .map(humantime::parse_duration)
             .transpose()
             .map_err(|_| task_error("TASK_CONFIG_INVALID", "batch timeout is invalid"))?;
-        let mut limits = TaskLimits::default();
-        if let Some(timeout) = timeout {
-            limits = TaskLimits::new(
-                TurnLimits::new(
-                    timeout.as_millis().try_into().map_err(|_| {
-                        task_error("TASK_CONFIG_INVALID", "batch timeout is too large")
-                    })?,
-                    task.max_turns.or(defaults.max_turns),
-                    task.max_budget_usd_cents.or(defaults.max_budget_usd_cents),
-                )
-                .map_err(WorkerError::from)?,
-                task.max_followups
-                    .or(defaults.max_followups)
-                    .unwrap_or(limits.max_followups),
-            )?;
-        }
+        let default_limits = TaskLimits::default();
+        let timeout_millis = timeout
+            .map(|timeout| {
+                timeout
+                    .as_millis()
+                    .try_into()
+                    .map_err(|_| task_error("TASK_CONFIG_INVALID", "batch timeout is too large"))
+            })
+            .transpose()?
+            .unwrap_or(default_limits.turn.timeout_millis);
+        let limits = TaskLimits::new(
+            TurnLimits::new(
+                timeout_millis,
+                task.max_turns.or(defaults.max_turns),
+                task.max_budget_usd_cents.or(defaults.max_budget_usd_cents),
+            )
+            .map_err(WorkerError::from)?,
+            task.max_followups
+                .or(defaults.max_followups)
+                .unwrap_or(default_limits.max_followups),
+        )?;
         Ok(TaskSubmitRequest {
             agent,
             model: task.model.clone().or_else(|| defaults.model.clone()),
-            prompt: task.prompt.clone(),
-            project: self.current_project()?,
+            prompt: read_batch_prompt(task, batch_dir)?,
+            project: project.to_path_buf(),
             base: task.base.clone().unwrap_or_else(|| defaults.base.clone()),
             wip: task.wip.unwrap_or(defaults.wip),
             cli_includes: Vec::new(),
@@ -1162,6 +1453,8 @@ impl<'a> TaskClient<'a> {
         turn_id: TurnId,
         worker: String,
     ) -> Result<QueueEntry, WorkerError> {
+        let project = ProjectState::load(self.runner, &self.current_project()?, &[])?;
+        require_project_match(&project, record.meta())?;
         let now = current_time_millis()?;
         let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
         let preference = WorkerPreference::Pinned { worker };
@@ -1181,13 +1474,43 @@ impl<'a> TaskClient<'a> {
             record.meta().project_id().to_owned(),
             record.meta().worktree_id().to_owned(),
             command.summary()?,
-            task_requirements(&[], record.meta().agent(), record.meta().env_profile()),
+            task_requirements(
+                &project.requirements,
+                record.meta().agent(),
+                record.meta().env_profile(),
+            ),
             preference,
             QueueEntryKind::TaskTurn,
             run,
             current_process_identity()?,
             now,
         )?)
+    }
+
+    fn retire_task_turn(&self, task_id: TaskId, turn_id: TurnId) -> Result<(), WorkerError> {
+        if let Some(entry) = self.client_state.queue_entry(turn_id)? {
+            let owner = entry
+                .owner_opt()
+                .copied()
+                .unwrap_or(current_process_identity()?);
+            let _ = self
+                .client_state
+                .remove_task_turn_after_terminal(turn_id, owner)?;
+        }
+        let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
+        Ok(())
+    }
+
+    fn rollback_followup(&self, record: &LocalTaskRecord, task_id: TaskId, turn_id: TurnId) {
+        let _ = self.client_state.remove_queued(turn_id);
+        let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
+        let _ = self.client_state.update_task(record.clone());
+    }
+
+    fn transfer_for_record(&self, record: &LocalTaskRecord) -> Result<TransferRepo, WorkerError> {
+        let project = ProjectState::load(self.runner, &self.current_project()?, &[])?;
+        require_project_match(&project, record.meta())?;
+        TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
     }
 
     fn refresh_task_status(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
@@ -1204,6 +1527,23 @@ impl<'a> TaskClient<'a> {
                 record.meta().task_id(),
             ),
         )?;
+        if let Some(pending) = pending_turn_id(record.status())
+            && record.status().state() == TaskState::Active
+            && self
+                .client_state
+                .read_turn_prompt(record.meta().task_id(), pending)
+                .is_ok()
+            && !response
+                .status()
+                .turns()
+                .last()
+                .is_some_and(|turn| turn.turn_id() == pending)
+        {
+            // A follow-up is locally active before the host accepts its
+            // task-turn job. The host still reports the previous Open turn
+            // during that interval; do not erase the pending local turn.
+            return Ok(());
+        }
         let observed_at = response.status().updated_at_millis();
         self.client_state.update_task(
             record
@@ -1272,9 +1612,8 @@ impl<'a> TaskClient<'a> {
         let identity = self.executor.start(self.paths, task_id, turn_id)?;
         self.client_state
             .record_runner(task_id, Some(identity.clone()))?;
-        if let Err(error) = self
-            .client_state
-            .adopt_row(turn_id, identity.process_identity())
+        if let Err(error) =
+            adopt_row_with_retry(self.client_state, turn_id, identity.process_identity())
         {
             // The runner record and queue owner are one hand-off.  If the
             // queue row disappeared or was concurrently claimed, do not
@@ -1328,6 +1667,7 @@ impl<'a> TaskClient<'a> {
             status: record.status().clone(),
             events: Vec::new(),
             runner: self.client_state.runner_liveness(task_id)?,
+            exit_code: None,
         })
     }
 
@@ -1352,6 +1692,7 @@ impl<'a> TaskClient<'a> {
             status,
             events: Vec::new(),
             runner: self.client_state.runner_liveness(record.meta().task_id())?,
+            exit_code: None,
         })
     }
 
@@ -1598,6 +1939,45 @@ fn abandoned_status(status: &TaskStatus, reason: &str) -> Result<TaskStatus, Wor
     )
 }
 
+fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerError> {
+    let Some(last) = status.turns().last() else {
+        return Err(task_error(
+            "TASK_INCONSISTENT",
+            "cancelled follow-up has no turn record",
+        ));
+    };
+    if last.terminal().is_some() {
+        return Ok(status.clone());
+    }
+    let ended_at = current_time_millis()?;
+    let replacement = TurnSummary::new(
+        last.turn_number(),
+        last.turn_id(),
+        Some(crate::task::TurnTerminal::Cancelled),
+        Some(TaskOutcome::Cancelled),
+        Some(false),
+        false,
+        last.started_at_millis().or(Some(ended_at)),
+        Some(ended_at),
+    );
+    let mut turns = status.turns().to_vec();
+    let _ = turns.pop();
+    turns.push(replacement);
+    TaskStatus::new(
+        TaskState::Open,
+        Some(TaskOutcome::Cancelled),
+        status.worker().map(str::to_owned),
+        status.session_present(),
+        status.head_oid().cloned(),
+        status.summary().map(str::to_owned),
+        status.questions().to_vec(),
+        status.files_changed().to_vec(),
+        status.diff_stat().map(str::to_owned),
+        turns,
+        ended_at,
+    )
+}
+
 fn task_requirements(project: &[String], agent: AgentKind, profile: Option<&str>) -> Vec<String> {
     let mut requirements = project.to_vec();
     let name = agent_name(agent);
@@ -1680,6 +2060,66 @@ fn parse_agent(value: &str) -> Result<AgentKind, WorkerError> {
     }
 }
 
+fn read_batch_prompt(task: &BatchTask, batch_dir: &Path) -> Result<String, WorkerError> {
+    match (&task.prompt, &task.prompt_file) {
+        (Some(prompt), None) => Ok(prompt.clone()),
+        (None, Some(path)) => {
+            std::fs::read_to_string(batch_dir.join(path)).map_err(WorkerError::Io)
+        }
+        _ => Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "each batch task requires exactly one of prompt or prompt_file",
+        )),
+    }
+}
+
+fn validate_batch_scope(defaults: &BatchDefaults, task: &BatchTask) -> Result<(), WorkerError> {
+    let source = task.source.as_deref().unwrap_or(&defaults.source);
+    if source != "local" {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "source origin is deferred to a later plan (TASK_CONFIG_INVALID)",
+        ));
+    }
+
+    let publish = task.publish.as_ref().unwrap_or(&defaults.publish);
+    if publish.iter().any(|mode| mode == "push") || task.publish_branch.is_some() {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "publish push and publish_branch are deferred to a later plan (TASK_CONFIG_INVALID)",
+        ));
+    }
+    if publish != &["fetch".to_owned()] {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "publish must contain only fetch in this phase (TASK_CONFIG_INVALID)",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_batch_max_parallel(
+    requested: Option<u32>,
+    configured_workers: usize,
+) -> Result<u32, WorkerError> {
+    let max_parallel = match requested {
+        Some(value) => value,
+        None => u32::try_from(configured_workers).map_err(|_| {
+            task_error(
+                "TASK_CONFIG_INVALID",
+                "configured worker count is too large for batch max_parallel",
+            )
+        })?,
+    };
+    if max_parallel == 0 {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "batch max_parallel must be positive",
+        ));
+    }
+    Ok(max_parallel)
+}
+
 fn agent_name(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Codex => "codex",
@@ -1689,8 +2129,22 @@ fn agent_name(agent: AgentKind) -> &'static str {
     }
 }
 
+fn validate_task_agent(agent: AgentKind) -> Result<(), WorkerError> {
+    match agent {
+        AgentKind::Codex | AgentKind::Claude => Ok(()),
+        AgentKind::Cursor => Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "agent cursor is deferred to a later plan",
+        )),
+        AgentKind::Opencode => Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "agent opencode is deferred to a later plan",
+        )),
+    }
+}
+
 fn parse_close_policy(value: Option<&str>) -> Result<ClosePolicy, WorkerError> {
-    match value.unwrap_or("never") {
+    match value.unwrap_or("done") {
         "done" => Ok(ClosePolicy::Done),
         "never" => Ok(ClosePolicy::Never),
         _ => Err(task_error(
@@ -1780,6 +2234,35 @@ fn default_agent_name() -> String {
     "codex".into()
 }
 
+fn default_batch_version() -> u32 {
+    1
+}
+
 fn default_base_name() -> String {
     "HEAD".into()
+}
+
+fn default_source_name() -> String {
+    "local".into()
+}
+
+fn default_publish_modes() -> Vec<String> {
+    vec!["fetch".into()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_batch_max_parallel;
+
+    #[test]
+    fn batch_parallelism_defaults_to_the_configured_worker_count() {
+        assert_eq!(resolve_batch_max_parallel(None, 3).unwrap(), 3);
+        assert_eq!(resolve_batch_max_parallel(Some(2), 3).unwrap(), 2);
+    }
+
+    #[test]
+    fn batch_parallelism_rejects_zero_workers_or_a_zero_override() {
+        assert!(resolve_batch_max_parallel(None, 0).is_err());
+        assert!(resolve_batch_max_parallel(Some(0), 3).is_err());
+    }
 }

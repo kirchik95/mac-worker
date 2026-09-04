@@ -30,8 +30,9 @@ use crate::{
     rooted_fs::RootedDir,
     snapshot::Snapshot,
     task_store::{
-        TaskCloseRequest, TaskCloseResponse, TaskDiffRequest, TaskDiffResponse, TaskPrepareRequest,
-        TaskPrepareResponse, TaskStatusRequest, TaskStatusResponse,
+        TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse,
+        TaskDiffRequest, TaskDiffResponse, TaskPrepareRequest, TaskPrepareResponse,
+        TaskSessionRequest, TaskSessionResponse, TaskStatusRequest, TaskStatusResponse,
     },
     turn::{TaskTurnRequest, TaskTurnResponse},
 };
@@ -63,6 +64,8 @@ pub enum HostOperation {
     TaskStatus,
     TaskDiff,
     TaskClose,
+    TaskSession,
+    TaskCancel,
     TaskTurn,
     RefreshFacts,
     Cancel,
@@ -82,6 +85,8 @@ impl HostOperation {
             Self::TaskStatus => "~/.local/bin/worker host task-status",
             Self::TaskDiff => "~/.local/bin/worker host task-diff",
             Self::TaskClose => "~/.local/bin/worker host task-close",
+            Self::TaskSession => "~/.local/bin/worker host task-session",
+            Self::TaskCancel => "~/.local/bin/worker host task-cancel",
             Self::TaskTurn => "~/.local/bin/worker host task-turn",
             Self::RefreshFacts => "~/.local/bin/worker host refresh-facts",
             Self::Cancel => "~/.local/bin/worker host cancel",
@@ -770,6 +775,40 @@ impl<'a> RemoteJobClient<'a> {
         let response: TaskCloseResponse = self.transport.request(
             worker,
             HostOperation::TaskClose,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        if response.protocol_version() != crate::protocol::PROTOCOL_VERSION {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
+    }
+
+    pub fn task_session(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskSessionRequest,
+    ) -> Result<TaskSessionResponse, WorkerError> {
+        let response: TaskSessionResponse = self.transport.request(
+            worker,
+            HostOperation::TaskSession,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        if response.protocol_version() != crate::protocol::PROTOCOL_VERSION {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
+    }
+
+    pub fn task_cancel(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskCancelRequest,
+    ) -> Result<TaskCancelResponse, WorkerError> {
+        let response: TaskCancelResponse = self.transport.request(
+            worker,
+            HostOperation::TaskCancel,
             request,
             control_policy(MAX_CONTROL_DEADLINE),
         )?;

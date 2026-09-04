@@ -176,6 +176,7 @@ fn agent_exit_kind(code: &str) -> ExitKind {
 fn task_exit_kind(code: &str) -> ExitKind {
     match code {
         "RUNNER_HANDOFF_FAILED" => ExitKind::Io,
+        "WAIT_TIMEOUT" => ExitKind::Infrastructure,
         _ => ExitKind::Usage,
     }
 }
@@ -255,6 +256,16 @@ mod tests {
     fn command_exit_preserves_the_child_status_exactly() {
         assert_eq!(WorkerError::CommandExit { code: 7 }.exit_code(), 7);
         assert_eq!(WorkerError::CommandExit { code: 143 }.exit_code(), 143);
+    }
+
+    #[test]
+    fn task_wait_timeout_uses_the_infrastructure_exit_code() {
+        let error = WorkerError::Task {
+            code: "WAIT_TIMEOUT",
+            message: "task wait timed out without cancelling the task".into(),
+        };
+        assert_eq!(error.public_code(), "WAIT_TIMEOUT");
+        assert_eq!(error.exit_code(), 70);
     }
 
     #[test]

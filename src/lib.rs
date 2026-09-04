@@ -44,7 +44,8 @@ use supervisor::{
 };
 use task_client::{TaskClient, TaskListFilter, TaskSubmitRequest, WaitSelector};
 use task_store::{
-    TaskCloseRequest, TaskDiffRequest, TaskPrepareRequest, TaskStatusRequest, TaskStore,
+    TaskCancelRequest, TaskCloseRequest, TaskDiffRequest, TaskPrepareRequest, TaskSessionRequest,
+    TaskStatusRequest, TaskStore,
 };
 use transfer::{
     HostTransferService, RemoteJobClient, RsyncServerExecutor, SystemRsyncServerExecutor,
@@ -337,6 +338,16 @@ fn execute_with_context(
             command: HostCommand::TaskClose,
         } => Err(WorkerError::Protocol(
             "host task-close requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::TaskSession,
+        } => Err(WorkerError::Protocol(
+            "host task-session requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::TaskCancel,
+        } => Err(WorkerError::Protocol(
+            "host task-cancel requires the stdio execution boundary".into(),
         )),
         Command::Host {
             command: HostCommand::TaskTurn,
@@ -727,12 +738,17 @@ fn run_task_subcommand(
             )?;
             let prompt = read_prompt(prompt, prompt_file)?;
             let limits = make_task_limits(timeout, max_turns, max_budget, max_followups)?;
+            let project = project.unwrap_or(runtime.current_dir()?);
+            let task_agent = match agent.as_deref() {
+                Some(agent) => parse_task_agent(agent)?,
+                None => client.default_task_agent(&project)?,
+            };
             let report = client.submit_titled(
                 TaskSubmitRequest {
-                    agent: parse_task_agent(agent.as_deref().unwrap_or("codex"))?,
+                    agent: task_agent,
                     model,
                     prompt,
-                    project: project.unwrap_or(runtime.current_dir()?),
+                    project,
                     base,
                     wip,
                     cli_includes: includes,
@@ -752,7 +768,7 @@ fn run_task_subcommand(
             )?;
             write_task_report(&report, json, stdout)?;
             Ok(if wait {
-                report.status().last_outcome().map_or(0, |_| 0)
+                report.exit_code().unwrap_or(0)
             } else {
                 0
             })
@@ -820,7 +836,11 @@ fn run_task_subcommand(
             let message = read_prompt(message, message_file)?;
             let report = client.say(task_id, message, wait, stdout, stderr)?;
             write_task_report(&report, json, stdout)?;
-            Ok(0)
+            Ok(if wait {
+                report.exit_code().unwrap_or(0)
+            } else {
+                0
+            })
         }
         TaskCommand::Cancel { task_id } => {
             let report = client.cancel(task_id)?;
@@ -908,13 +928,15 @@ fn validate_task_scope_options(
     if source.is_some_and(|source| source != "local") {
         return Err(WorkerError::Task {
             code: "TASK_CONFIG_INVALID",
-            message: "only source=local is supported in this phase".into(),
+            message: "source origin is deferred to a later plan (TASK_CONFIG_INVALID)".into(),
         });
     }
     if publish.is_some_and(|publish| publish != "fetch") || publish_branch.is_some() {
         return Err(WorkerError::Task {
             code: "TASK_CONFIG_INVALID",
-            message: "only publish=fetch is supported in this phase".into(),
+            message:
+                "publish push and publish_branch are deferred to a later plan (TASK_CONFIG_INVALID)"
+                    .into(),
         });
     }
     Ok(())
@@ -934,7 +956,7 @@ fn parse_task_agent(value: &str) -> Result<crate::agent::AgentKind, WorkerError>
 }
 
 fn parse_task_close_policy(value: Option<&str>) -> Result<crate::task::ClosePolicy, WorkerError> {
-    match value.unwrap_or("never") {
+    match value.unwrap_or("done") {
         "done" => Ok(crate::task::ClosePolicy::Done),
         "never" => Ok(crate::task::ClosePolicy::Never),
         _ => Err(WorkerError::Task {
@@ -1002,6 +1024,7 @@ fn write_task_report(
                 "status": report.status(),
                 "runner": report.runner(),
                 "events": report.events(),
+                "exit_code": report.exit_code(),
             }),
         )
     } else {
@@ -1240,6 +1263,22 @@ pub fn run_with_rsync_executor_in_context(
         }
     ) {
         return run_host_task_close(cli.config, runtime, runner, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::TaskSession
+        }
+    ) {
+        return run_host_task_session(cli.config, runtime, runner, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::TaskCancel
+        }
+    ) {
+        return run_host_task_cancel(cli.config, runtime, stdin, stdout);
     }
     if matches!(
         &cli.command,
@@ -1596,6 +1635,42 @@ fn run_host_task_close(
         stdin,
         stdout,
         |request: TaskCloseRequest, store, runner| TaskStore::new(store, runner).close(&request),
+    )
+}
+
+fn run_host_task_session(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_task_control_endpoint(
+        config_override,
+        runtime,
+        runner,
+        stdin,
+        stdout,
+        |request: TaskSessionRequest, store, runner| {
+            TaskStore::new(store, runner).session_info(&request)
+        },
+    )
+}
+
+fn run_host_task_cancel(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_control_endpoint(
+        config_override,
+        runtime,
+        stdin,
+        stdout,
+        |request: TaskCancelRequest, store, launcher| {
+            JobService::new(store, launcher).cancel_task(request)
+        },
     )
 }
 
@@ -2143,7 +2218,15 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::{config::Config, error::WorkerError, paths::PathLayout};
+    use crate::{config::Config, error::WorkerError, paths::PathLayout, task::ClosePolicy};
+
+    #[test]
+    fn task_close_policy_defaults_to_done() {
+        assert_eq!(
+            super::parse_task_close_policy(None).unwrap(),
+            ClosePolicy::Done
+        );
+    }
 
     #[test]
     fn explicit_config_overrides_xdg_and_home() {

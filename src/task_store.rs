@@ -122,6 +122,130 @@ impl<'de> Deserialize<'de> for SessionBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct TaskSessionRequest {
+    protocol_version: u32,
+    project_id: String,
+    task_id: TaskId,
+}
+
+impl TaskSessionRequest {
+    pub fn new(project_id: impl Into<String>, task_id: TaskId) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            project_id: project_id.into(),
+            task_id,
+        }
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), WorkerError> {
+        ensure_protocol(self.protocol_version)?;
+        validate_project_id(&self.project_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSessionResponse {
+    protocol_version: u32,
+    binding: SessionBinding,
+}
+
+impl TaskSessionResponse {
+    pub fn new(binding: SessionBinding) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            binding,
+        }
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn binding(&self) -> &SessionBinding {
+        &self.binding
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCancelRequest {
+    protocol_version: u32,
+    project_id: String,
+    task_id: TaskId,
+    turn_id: JobId,
+}
+
+impl TaskCancelRequest {
+    pub fn new(project_id: impl Into<String>, task_id: TaskId, turn_id: JobId) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            project_id: project_id.into(),
+            task_id,
+            turn_id,
+        }
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub fn turn_id(&self) -> JobId {
+        self.turn_id
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), WorkerError> {
+        ensure_protocol(self.protocol_version)?;
+        validate_project_id(&self.project_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCancelResponse {
+    protocol_version: u32,
+    status: TaskStatus,
+}
+
+impl TaskCancelResponse {
+    pub fn new(status: TaskStatus) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            status,
+        }
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn status(&self) -> &TaskStatus {
+        &self.status
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskPrepareRequest {
     protocol_version: u32,
     meta: TaskMeta,
@@ -628,6 +752,168 @@ impl<'a> TaskStore<'a> {
             ));
         }
         Ok((meta, status))
+    }
+
+    /// Reopens an existing task workspace for a follow-up turn without
+    /// recreating it from the original base. The caller must already hold
+    /// the exact task-turn lease; this method is the host-side durable
+    /// transition from Open back to Active.
+    pub fn prepare_resume(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        turn_id: JobId,
+        turn_number: u32,
+        worker: &str,
+        base_oid: &BaseOid,
+    ) -> Result<(TaskMeta, TaskStatus), WorkerError> {
+        validate_project_id(project_id)?;
+        validate_worker_name(worker)?;
+        if turn_number == 0 {
+            return Err(task_error(
+                "REQUEST_CONFLICT",
+                "resumed turn number must be positive",
+            ));
+        }
+
+        let task = self.open_existing_task(project_id, task_id)?;
+        let meta = self.read_meta(&task)?;
+        let current = self.read_status(&task)?;
+        match current.state() {
+            TaskState::Open => {}
+            TaskState::Active => {
+                if current
+                    .turns()
+                    .last()
+                    .is_some_and(|turn| turn.turn_id() == turn_id && turn.terminal().is_none())
+                {
+                    if current.worker() != Some(worker) {
+                        return Err(task_error(
+                            "TASK_TURN_CONFLICT",
+                            "resumed turn worker does not match the task session worker",
+                        ));
+                    }
+                    return Ok((meta, current));
+                }
+                return Err(task_error("TASK_BUSY", "task already has an active turn"));
+            }
+            TaskState::Queued => {
+                return Err(task_error(
+                    "TASK_BUSY",
+                    "task is still queued for its first turn",
+                ));
+            }
+            TaskState::Closed | TaskState::Abandoned | TaskState::Lost => {
+                return Err(task_error(
+                    "TASK_CLOSED",
+                    "closed task cannot accept a follow-up turn",
+                ));
+            }
+        }
+
+        if current.worker() != Some(worker) {
+            return Err(task_error(
+                "TASK_TURN_CONFLICT",
+                "resumed turn worker does not match the task session worker",
+            ));
+        }
+
+        let binding = self.session(project_id, task_id)?.ok_or_else(|| {
+            task_error(
+                "SESSION_UNBOUND",
+                "resumed turn requires a bound agent session",
+            )
+        })?;
+        if binding.agent() != meta.agent() {
+            return Err(task_error(
+                "TASK_SESSION_INVALID",
+                "bound session belongs to another agent",
+            ));
+        }
+
+        let workspace = self.open_workspace(&task)?;
+        let branch = self
+            .git_workspace_query(workspace.path(), vec!["rev-parse", "--abbrev-ref", "HEAD"])
+            .map_err(|error| task_error("WORKTREE_INCONSISTENT", error))?;
+        let head = self
+            .git_workspace_query(workspace.path(), vec!["rev-parse", "HEAD"])
+            .map_err(|error| task_error("WORKTREE_INCONSISTENT", error))?;
+        let expected_head = current
+            .head_oid()
+            .unwrap_or_else(|| meta.base_oid())
+            .as_str();
+        if branch != format!("task/{task_id}") || head != expected_head || base_oid.as_str() != head
+        {
+            return Err(task_error(
+                "WORKTREE_INCONSISTENT",
+                "task workspace branch or head does not match the resumable task",
+            ));
+        }
+        let clean = self
+            .git_workspace_query(
+                workspace.path(),
+                vec!["status", "--porcelain=v1", "--untracked-files=all"],
+            )
+            .map_err(|error| task_error("WORKTREE_INCONSISTENT", error))?;
+        if !clean.is_empty() {
+            return Err(task_error(
+                "WORKTREE_INCONSISTENT",
+                "task workspace contains local changes before resume",
+            ));
+        }
+
+        let expected_turn_number = u32::try_from(current.turns().len())
+            .ok()
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| task_error("TASK_INCONSISTENT", "turn history is too long"))?;
+        if turn_number != expected_turn_number {
+            return Err(task_error(
+                "REQUEST_CONFLICT",
+                "resumed turn number does not follow task history",
+            ));
+        }
+        let pending = TurnSummary::new(
+            turn_number,
+            turn_id,
+            None,
+            None,
+            None,
+            false,
+            Some(now_millis()?),
+            None,
+        );
+        let next = TaskStatus::new(
+            TaskState::Active,
+            current.last_outcome().cloned(),
+            Some(worker.to_owned()),
+            true,
+            Some(head.parse::<BaseOid>().map_err(|_| {
+                task_error(
+                    "WORKTREE_INCONSISTENT",
+                    "task workspace head is not a valid commit ID",
+                )
+            })?),
+            current.summary().map(str::to_owned),
+            current.questions().to_vec(),
+            current.files_changed().to_vec(),
+            current.diff_stat().map(str::to_owned),
+            current.turns().iter().cloned().chain([pending]).collect(),
+            now_millis()?,
+        )?;
+        replace_status_bytes(&task, current, next.clone())?;
+        task.sync_root()?;
+        Ok((meta, next))
+    }
+
+    pub fn session_info(
+        &self,
+        request: &TaskSessionRequest,
+    ) -> Result<TaskSessionResponse, WorkerError> {
+        request.validate()?;
+        let binding = self
+            .session(request.project_id(), request.task_id())?
+            .ok_or_else(|| task_error("SESSION_UNBOUND", "task has no bound agent session"))?;
+        Ok(TaskSessionResponse::new(binding))
     }
 
     #[allow(clippy::too_many_arguments)]

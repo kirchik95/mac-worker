@@ -14,9 +14,16 @@ use std::{
 };
 
 use mac_worker::{
+    agent::AgentKind,
+    client_state::ClientStateStore,
+    config::Config,
     error::{ExitKind, WorkerError},
+    paths::PathLayout,
+    process::SystemProcessRunner,
     project_config::{ProjectSettings, ResourceClass},
     requirements::RequirementDetector,
+    task_client::TaskClient,
+    turn_runner::InlineRunnerExecutor,
 };
 use tempfile::tempdir;
 
@@ -70,6 +77,33 @@ max_followups = 7
         let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
         assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
     }
+}
+
+#[test]
+fn task_client_uses_the_project_default_agent_when_cli_omits_one() {
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        b"version = 1\n[task]\ndefault_agent = \"claude\"\n",
+    );
+    let state_root = tempdir().unwrap();
+    let state_root_path = state_root.path().canonicalize().unwrap();
+    let paths = PathLayout {
+        config: repo.root().join("config.toml"),
+        state: state_root_path.join("state"),
+        cache: state_root_path.join("cache"),
+        data: state_root_path.join("data"),
+    };
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let config = Config::parse(include_str!("../config.example.toml")).unwrap();
+    let runner = SystemProcessRunner;
+    let executor = InlineRunnerExecutor;
+    let client = TaskClient::new(&runner, &config, &paths, &state, &executor);
+
+    assert_eq!(
+        client.default_task_agent(repo.root()).unwrap(),
+        AgentKind::Claude
+    );
 }
 
 #[test]

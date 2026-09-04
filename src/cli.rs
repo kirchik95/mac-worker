@@ -23,6 +23,7 @@ pub struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     Setup {
         hosts: Vec<String>,
@@ -92,6 +93,7 @@ pub enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum TaskCommand {
     #[command(about = "Submit a prompt as a durable agent task")]
     Submit {
@@ -252,6 +254,10 @@ pub enum HostCommand {
     TaskDiff,
     #[command(name = "task-close")]
     TaskClose,
+    #[command(name = "task-session")]
+    TaskSession,
+    #[command(name = "task-cancel")]
+    TaskCancel,
     #[command(name = "task-turn")]
     TaskTurn,
     #[command(name = "receive-pack")]
