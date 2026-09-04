@@ -379,6 +379,16 @@ where
         })
         .collect::<Vec<_>>();
 
+    // Agents are resolved and launched the way turns launch them: through the
+    // account's login shell. Launchers such as an npm-installed `codex` need
+    // that `PATH` (for `node`) even when the helper itself runs with a bare
+    // environment, so the login `PATH` is captured once and applied to every
+    // version and authentication probe. Profile entries are appended after it
+    // and therefore win on conflict.
+    let login_environment = login_path(runner)
+        .map(|path| vec![(OsString::from("PATH"), path)])
+        .unwrap_or_default();
+
     let mut agents = Vec::new();
     for kind in [
         AgentKind::Codex,
@@ -390,15 +400,17 @@ where
         let Some(binary) = resolve_binary(runner, adapter.binary()) else {
             continue;
         };
-        let version = run_version(runner, &binary);
-        let auth = run_auth(runner, &binary, kind, Vec::new());
+        let version = run_version(runner, &binary, login_environment.clone());
+        let auth = run_auth(runner, &binary, kind, login_environment.clone());
         let auth_by_profile = profiles
             .iter()
             .filter(|profile| profile.profile_is_secure())
             .map(|profile| {
+                let mut environment = login_environment.clone();
+                environment.extend(profile.profile_entries());
                 (
                     profile.profile_name().to_owned(),
-                    run_auth(runner, &binary, kind, profile.profile_entries()),
+                    run_auth(runner, &binary, kind, environment),
                 )
             })
             .collect();
@@ -464,12 +476,42 @@ fn resolve_binary(runner: &dyn ProcessRunner, binary: &str) -> Option<OsString> 
     Some(OsString::from(path))
 }
 
-fn run_version(runner: &dyn ProcessRunner, binary: &OsString) -> Option<String> {
+/// The login shell's `PATH`, as the turn launcher would see it. `None` when
+/// the shell fails, times out, or reports something that is not a plain
+/// path list; callers then probe with the helper's own environment.
+fn login_path(runner: &dyn ProcessRunner) -> Option<OsString> {
+    let result = run_process(
+        runner,
+        OsString::from("zsh"),
+        vec![OsString::from("-lc"), OsString::from("printf %s \"$PATH\"")],
+        Vec::new(),
+    )?;
+    if !result.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(result.stdout).ok()?;
+    let path = path.trim_end_matches(['\n', '\r']);
+    if path.is_empty()
+        || path.len() > PROBE_OUTPUT_LIMIT
+        || path
+            .chars()
+            .any(|character| character.is_control() || character == '\0')
+    {
+        return None;
+    }
+    Some(OsString::from(path))
+}
+
+fn run_version(
+    runner: &dyn ProcessRunner,
+    binary: &OsString,
+    environment: Vec<(OsString, OsString)>,
+) -> Option<String> {
     let result = run_process(
         runner,
         binary.clone(),
         vec![OsString::from("--version")],
-        Vec::new(),
+        environment,
     )?;
     if !result.status.success() {
         return None;

@@ -21,7 +21,10 @@ enum Scenario {
     NetworkCodex,
     AmbiguousOpenCode,
     InvalidUtf8Cursor,
+    LoginPathUnavailable,
 }
+
+const LOGIN_PATH: &str = "/opt/tools:/usr/local/bin:/usr/bin:/bin";
 
 struct FakeProcessRunner {
     scenario: Scenario,
@@ -58,6 +61,13 @@ impl ProcessRunner for FakeProcessRunner {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
+        if program == "zsh" && args == ["-lc", "printf %s \"$PATH\""] {
+            assert!(request.environment.is_empty());
+            return match self.scenario {
+                Scenario::LoginPathUnavailable => Ok(failure(b"zsh: login shell failed\n")),
+                _ => Ok(success(LOGIN_PATH.as_bytes())),
+            };
+        }
         if program == "zsh" && args == ["-lc", "command -v codex"] {
             return Ok(success(b"/opt/tools/codex\n"));
         }
@@ -268,7 +278,10 @@ fn checks_use_two_second_four_kib_bounds_and_never_apply_insecure_profiles() {
         })
         .collect::<Vec<_>>();
     assert_eq!(claude_auth.len(), 2);
-    assert!(claude_auth[0].environment.is_empty());
+    assert_eq!(
+        claude_auth[0].environment,
+        vec![(OsString::from("PATH"), OsString::from(LOGIN_PATH))]
+    );
     assert_eq!(
         claude_auth[1]
             .environment
@@ -432,5 +445,65 @@ fn profile_values_are_available_to_the_runner_but_not_to_dto_debug_output() {
             .requests()
             .iter()
             .any(|request| { request.environment.iter().any(|(_, value)| value == SECRET) })
+    );
+}
+
+#[test]
+fn version_and_auth_probes_run_with_the_login_shell_path_and_profiles_win() {
+    let runner = FakeProcessRunner::new(Scenario::AllAgents);
+    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    assert_eq!(facts.agents.len(), 4);
+
+    let requests = runner.requests();
+    let launches = requests
+        .iter()
+        .filter(|request| request.program.to_string_lossy().starts_with("/opt/tools/"))
+        .collect::<Vec<_>>();
+    assert!(!launches.is_empty());
+    for request in &launches {
+        assert_eq!(
+            request.environment.first(),
+            Some(&(OsString::from("PATH"), OsString::from(LOGIN_PATH))),
+            "{request:?}"
+        );
+    }
+
+    // A profile that sets PATH is applied after the login PATH, so it wins.
+    let path_profile = EnvProfile {
+        name: "path-override".into(),
+        secure: true,
+        entries: vec![(OsString::from("PATH"), OsString::from("/profile/bin"))],
+    };
+    let runner = FakeProcessRunner::new(Scenario::AllAgents);
+    collect_agent_facts_at(&runner, &[path_profile], COLLECTED_AT);
+    let overridden = runner
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request.program.to_string_lossy().ends_with("/codex")
+                && request.args == [OsString::from("login"), OsString::from("status")]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(overridden.len(), 2);
+    assert_eq!(
+        overridden[1].environment,
+        vec![
+            (OsString::from("PATH"), OsString::from(LOGIN_PATH)),
+            (OsString::from("PATH"), OsString::from("/profile/bin")),
+        ]
+    );
+}
+
+#[test]
+fn an_unavailable_login_shell_path_falls_back_to_the_helper_environment() {
+    let runner = FakeProcessRunner::new(Scenario::LoginPathUnavailable);
+    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    assert_eq!(facts.agents.len(), 4);
+    assert!(
+        runner
+            .requests()
+            .iter()
+            .filter(|request| request.program.to_string_lossy().starts_with("/opt/tools/"))
+            .all(|request| !has_environment(request, "PATH"))
     );
 }
