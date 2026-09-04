@@ -1,47 +1,51 @@
 # Phase 4 validation record
 
-This record separates automated fake-transport evidence from live observations of the configured Mac workers. It contains only commit/version data, shortened identifiers, aliases, counts, states, durations, exits, and fingerprints of mac-worker-owned namespaces. It intentionally omits raw probe payloads, raw command output and logs, complete paths, repository origins, credentials, and environment values.
+This record separates automated local evidence from live observations of the configured Mac workers. All live commands were executed directly from an isolated terminal environment. It contains only revision and version data, shortened identifiers, logical worker aliases, counts, states, result categories, and fingerprints of mac-worker-owned namespaces. It intentionally omits raw payloads, command output and logs, complete paths, repository origins, credentials, and environment values.
 
 ## Commit and protocol
 
-The reproducible validation revision is Task 8 commit `814f89526ce154e7afba5b1ea26993cfc564435d`, with client version `0.1.0`; the authorized `src/cli.rs` Clap help metadata is part of that commit. The isolated acceptance release was built from the same source contents immediately before the commit, with no source-affecting change between build and commit, so no separate binary digest is needed. SSH preflight reached all three aliases, but fresh setup returned the typed result `UNKNOWN_INSTALLATION_STATE` for `mini-1`/`mac1`, `mini-2`/`mac2`, and `mini-3`/`mac3`, with exit `70` for each worker and the aggregate command. No worker protocol version was accepted.
+The live acceptance release was built from `cc2939a5565c` (client version `0.1.0`, protocol version `3`). Direct SSH preflight reached all three configured logical workers. Fresh setup exited `0` for `3/3`: each installed the release helper, reported protocol version `3`, and became `ready`. The helper version was `0.1.0` on every worker and its release-binary identity matched the client build.
 
 ## Automated gate
 
-The focused CLI-help RED→GREEN gate is automated local evidence and does not exercise live workers. It passed `11/11` tests after the minimal Clap metadata change. The final local gate also passed each command with exit `0`: `cargo fmt --all --check`; `cargo test --locked --all-targets` (`1,041` passed, `0` failed, `0` ignored); `cargo clippy --locked --all-targets -- -D warnings`; `cargo build --locked --release` (version `0.1.0`); and `git diff --check`.
+The final local gate passed each command with exit `0`: `cargo fmt --all --check`; `cargo test --locked --all-targets`; `cargo clippy --locked --all-targets -- -D warnings`; `cargo build --locked --release`; and `git diff --check`. The automated suite is local evidence; the following sections record the separate live acceptance observations.
 
 ## Three-worker setup
 
-SSH preflight: `3/3` aliases exited `0`. Fresh setup returned `UNKNOWN_INSTALLATION_STATE` (exit `70`) for `mini-1`/`mac1`, `mini-2`/`mac2`, and `mini-3`/`mac3`; all three reported `installed=false` and no protocol version. The live attempt stopped immediately at this setup result. There was no retry, repair, cleanup, rename, deletion, or remote run.
+The workers began in `ready`/`idle` state with no active lease and the required `darwin-arm64` capability. Setup installed the helper at protocol `3` on all `3/3` workers. Baseline mac-worker namespace fingerprints were recorded before submissions: `mini-1` `1f7e51668912cbb6` (`227` files), `mini-2` `e3b0c44298fc1c14` (`0` files), and `mini-3` `e3b0c44298fc1c14` (`0` files).
 
 ## Automatic placement
 
-Not proven: setup stopped the live attempt before any unpinned job was submitted; no distinct-lease count exists.
+Three concurrent compatible bounded jobs were accepted as three distinct leases: `acec120c1069…` on `mini-1`, `f165ce99404c…` on `mini-2`, and `6c923a002645…` on `mini-3`. The fleet inventory concurrently reported all three workers `busy`, each with the corresponding distinct active job identifier. This demonstrates automatic placement across the three independent one-slot workers.
 
 ## FIFO fourth job
 
-Not proven: the live setup gate stopped before a fourth job could be submitted.
+With all three slots held by pinned bounded jobs, a fourth compatible job, `14aff6a46428…`, entered the queue at position `1` with blocking reason `no_eligible_worker`. After the holding job on `mini-1` was cancelled, that original queued identifier was accepted on `mini-1`; no replacement submission was made. This is the observed fourth-job FIFO handoff.
 
 ## Pinned worker
 
-Not proven: the live setup gate stopped before a pinned or younger compatible job could be submitted.
+With `mini-1` idle and `mini-2`/`mini-3` busy, the older job `317e657089ee…` pinned to `mini-2` remained queued at position `1` with reason `pinned_worker_busy`. A younger compatible unpinned job, `587afd0cb1a2…`, was accepted on the idle `mini-1`. The pinned row therefore waited for its target without blocking unrelated compatible capacity.
 
 ## No-wait capacity
 
-Not proven: the live setup gate stopped before slots could be occupied. No live `CAPACITY_BUSY` exit or before/after namespace comparison was attempted.
+While every slot was occupied, a compatible `--no-wait` submission exited `75` with result category `CAPACITY_BUSY`. It created neither an accepted lease nor a queue row: the pre-existing queue count remained `1` before and after the attempt. The relevant namespace fingerprints were unchanged across the attempt: `mini-1` `8bbb889f46f7098f`, `mini-2` `14a30e9c62e1b63d`, and `mini-3` `8f209073b0f2309a`.
 
 ## Cancellation
 
-Not proven: the live setup gate stopped before waiting or running cancellation could be exercised.
+Waiting cancellation was exercised on queued job `cf7e6cef26ed…`: it reached the terminal `cancelled` state without a remote execution attempt. Running cancellation was exercised on accepted job `6c923a002645…`; the public cancellation command exited `0` and the job became terminal `cancelled`. Subsequent bounded cleanup cancellations left no active lease or queued row.
 
 ## Disconnect and reconciliation
 
-Not proven: the live setup gate stopped before follower reconnect, one-worker outage, or reconciliation could be exercised. No cache value is treated as lease evidence.
+For accepted job `ad4aefbe70a7…` pinned to `mini-1`, the local follower was terminated while its remote lease remained active. Reattaching to the job completed under the same original identifier, with `0` new acceptance events and one terminal status event.
+
+For the one-worker outage observation, active jobs were held on all three workers and the follower for `mini-3` was terminated. After the bounded observation interval, that worker was reported unavailable with category `SSH_UNAVAILABLE`; a fleet status reconciliation recorded the active `mini-3` job as `running` with uncertainty `unknown_remote` and category `UNAVAILABLE`, rather than declaring it lost. Normal reachability was restored, all three jobs were cancelled, and the final inventory reported `3/3 ready`, `3/3 idle`, and no active lease.
 
 ## Cleanup and privacy
 
-Not proven live: setup stopped before acceptance fingerprints or retained-job privacy checks could be taken. No raw payloads, logs, paths, origins, credentials, or environment values were recorded; the isolated clone was not used for a remote run.
+The final safe status had `0` queued, `0` active, and `19` terminal records, with no omitted rows. Final mac-worker namespace fingerprints were `mini-1` `f74db9eb97f15d86` (`419` files), `mini-2` `38eb8bd899a61ba4` (`170` files), and `mini-3` `00c8345d610fc8f6` (`157` files). The installed helper identity still matched the release build on every worker.
+
+A scoped scan of retained job metadata and logs, excluding immutable snapshot trees, found `0` acceptance-marker hits and `0` generic absolute-local-path signatures across the retained record sets (`137`, `57`, and `47` files respectively). The isolated clone remained at `cc2939a5565c` with only its intentional marker change; its marker-diff fingerprint remained `8476d436dadee12e` and `git diff --check` passed. No source, origin, credential, environment, or raw probe data was retained in this record.
 
 ## Remaining boundary
 
-The local implementation and fake-transport tests cover automatic placement, per-worker FIFO, pins, no-wait admission, explicit cancellation, fleet reconciliation, and the one-slot remote lease contract. Live three-worker behavior remains not proven because fresh setup exited `70` with `3/3` workers uninstalled. Dashboard is Phase 4.5. Artifact transfer/fetch, package caches, Docker profiles, general garbage collection, and other later-phase controls remain outside this validation.
+This acceptance covers Phase 4's three-worker scheduling contract: automatic placement, FIFO waiting, pin behavior, no-wait admission, explicit cancellation, follower reconnection, and one-worker reconciliation. Dashboard work is Phase 4.5. Artifact transfer/fetch, package caches, Docker profiles, general garbage collection, and other later-phase controls remain outside this validation.
