@@ -138,6 +138,16 @@ fn env_profile_requires_owner_only_regular_file_and_does_not_debug_values() {
         EnvProfile::load(&path).unwrap_err().public_code(),
         "ENV_PROFILE_INVALID"
     );
+
+    let hardlinked = directory.path().join("hardlinked.env");
+    let alias = directory.path().join("hardlinked-alias.env");
+    fs::write(&hardlinked, "CLAUDE_CODE_OAUTH_TOKEN=secret-value\n").unwrap();
+    fs::set_permissions(&hardlinked, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(&hardlinked, &alias).unwrap();
+    assert_eq!(
+        EnvProfile::load(&hardlinked).unwrap_err().public_code(),
+        "ENV_PROFILE_PERMISSIONS"
+    );
 }
 
 #[test]

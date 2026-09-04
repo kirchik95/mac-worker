@@ -1,8 +1,10 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    fmt, fs,
-    os::unix::fs::MetadataExt,
+    fmt,
+    fs::OpenOptions,
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
 };
 
@@ -1032,7 +1034,17 @@ impl EnvProfile {
     }
 
     pub fn load(path: &Path) -> Result<Self, WorkerError> {
-        let metadata = fs::symlink_metadata(path).map_err(|error| {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| {
+                turn_error(
+                    "ENV_PROFILE_PERMISSIONS",
+                    format!("cannot open env profile: {error}"),
+                )
+            })?;
+        let metadata = file.metadata().map_err(|error| {
             turn_error(
                 "ENV_PROFILE_PERMISSIONS",
                 format!("cannot inspect env profile: {error}"),
@@ -1041,18 +1053,22 @@ impl EnvProfile {
         if !metadata.file_type().is_file()
             || metadata.mode() & 0o7777 != 0o600
             || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
         {
             return Err(turn_error(
                 "ENV_PROFILE_PERMISSIONS",
                 "env profile must be an owner-only regular file",
             ));
         }
-        let bytes = fs::read(path).map_err(|error| {
-            turn_error(
-                "ENV_PROFILE_PERMISSIONS",
-                format!("cannot read env profile: {error}"),
-            )
-        })?;
+        let mut bytes = Vec::new();
+        file.take(MAX_ENV_PROFILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                turn_error(
+                    "ENV_PROFILE_PERMISSIONS",
+                    format!("cannot read env profile: {error}"),
+                )
+            })?;
         if bytes.len() as u64 > MAX_ENV_PROFILE_BYTES {
             return Err(turn_error(
                 "ENV_PROFILE_INVALID",
