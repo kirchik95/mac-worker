@@ -1,18 +1,25 @@
 use std::{
-    collections::BTreeSet, os::unix::process::ExitStatusExt, process::ExitStatus, sync::Mutex,
+    collections::BTreeSet,
+    fs,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    process::ExitStatus,
+    sync::Mutex,
+    time::Duration,
 };
 
 use mac_worker::{
     client_state::ClientStateStore,
     config::{Config, WorkerEntry},
+    error::ProcessError,
     job::{
-        CommandSpec, FleetReconcileJobResult, FleetReconcileRequest, FleetReconcileResponse, JobId,
-        JobMeta, JobStatus, LeaseToken, LocalJobRecord, RemoteUncertainty,
-        RequestFingerprintMaterial, StatusResponse,
+        AdmissionObservation, CommandSpec, FleetReconcileJobResult, FleetReconcileRequest,
+        FleetReconcileResponse, JobId, JobMeta, JobStatus, LeaseToken, LocalJobRecord,
+        RemoteUncertainty, RequestFingerprintMaterial, StatusResponse,
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     run::{FleetOutcome, FleetReconciler},
+    scheduler::CandidateSlot,
     transfer::{HostOperation, RemoteJobClient},
 };
 
@@ -73,6 +80,7 @@ struct FleetRunner {
     statuses: Vec<(JobId, StatusResponse)>,
     reconciled_hosts: Mutex<BTreeSet<String>>,
     unavailable_hosts: BTreeSet<String>,
+    reconcile_timeout_hosts: BTreeSet<String>,
 }
 
 impl FleetRunner {
@@ -130,7 +138,13 @@ impl ProcessRunner for FleetRunner {
             );
         }
         assert_eq!(command, "~/.local/bin/worker host reconcile");
-        self.reconciled_hosts.lock().unwrap().insert(host);
+        self.reconciled_hosts.lock().unwrap().insert(host.clone());
+        if self.reconcile_timeout_hosts.contains(&host) {
+            return Err(ProcessError::DeadlineExceeded {
+                deadline: Duration::from_secs(5),
+            }
+            .into());
+        }
         let reconcile: FleetReconcileRequest =
             serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
         let results = reconcile
@@ -187,6 +201,7 @@ fn fleet_fixture() -> (
             statuses,
             reconciled_hosts: Mutex::new(BTreeSet::new()),
             unavailable_hosts: BTreeSet::from(["mini-1".into()]),
+            reconcile_timeout_hosts: BTreeSet::new(),
         },
         ids,
     )
@@ -306,6 +321,7 @@ fn conflicting_remote_status_is_uncertain_and_not_reported_as_reconciled() {
         statuses: vec![(id, remote)],
         reconciled_hosts: Mutex::new(BTreeSet::new()),
         unavailable_hosts: BTreeSet::new(),
+        reconcile_timeout_hosts: BTreeSet::new(),
     };
     let config = Config {
         version: 1,
@@ -419,6 +435,7 @@ fn terminal_recovery_matrix_is_authoritative_and_repeatable() {
             )],
             reconciled_hosts: Mutex::new(BTreeSet::new()),
             unavailable_hosts: BTreeSet::new(),
+            reconcile_timeout_hosts: BTreeSet::new(),
         };
         let config = Config {
             version: 1,
@@ -452,4 +469,118 @@ fn terminal_recovery_matrix_is_authoritative_and_repeatable() {
         .unwrap();
         assert!(second.workers().is_empty(), "row {index}");
     }
+}
+
+#[test]
+fn stale_admission_cache_is_refreshed_before_repairing_a_known_job() {
+    // Break caught: a stale advisory observation suppresses the fresh probe
+    // that establishes whether it is safe to contact the recorded worker.
+    let (_directory, store, _config, mut runner, ids) = fleet_fixture();
+    runner.unavailable_hosts.clear();
+    let config = Config {
+        version: 1,
+        workers: vec![worker("mini-1")],
+    };
+    let stale = AdmissionObservation::new(
+        "mini-1".into(),
+        true,
+        CandidateSlot::Idle,
+        Vec::new(),
+        Some(1),
+        1,
+        1,
+    )
+    .unwrap();
+    store
+        .admission_observation("mini-1", 1, || Ok(stale))
+        .unwrap();
+
+    let report = FleetReconciler {
+        config: &config,
+        client_state: &store,
+        remote: RemoteJobClient::new(&runner),
+    }
+    .reconcile()
+    .unwrap();
+
+    assert_eq!(report.workers()[0].outcome(), FleetOutcome::Reconciled);
+    assert!(report.workers()[0].probe.probe.is_some());
+    assert_eq!(report.workers()[0].jobs[0].meta().job_id(), ids[0]);
+}
+
+#[test]
+fn reconcile_timeout_retains_remote_uncertainty_and_affinity() {
+    // Break caught: a timed-out remote control call is treated as proof that a
+    // known job or its advisory affinity may be discarded.
+    let (_directory, store, _config, mut runner, ids) = fleet_fixture();
+    runner.unavailable_hosts.clear();
+    runner.reconcile_timeout_hosts.insert("mini-2".into());
+    let config = Config {
+        version: 1,
+        workers: vec![worker("mini-2")],
+    };
+    store
+        .record_affinity(PROJECT_ID, WORKTREE_ID, "mini-2", 1_001)
+        .unwrap();
+
+    let report = FleetReconciler {
+        config: &config,
+        client_state: &store,
+        remote: RemoteJobClient::new(&runner),
+    }
+    .reconcile()
+    .unwrap();
+
+    assert_eq!(report.workers()[0].outcome(), FleetOutcome::Unavailable);
+    assert!(matches!(
+        store.load_job(ids[1]).unwrap().remote_uncertainty(),
+        RemoteUncertainty::UnknownRemote { .. }
+    ));
+    let affinity = store.affinity_hints(PROJECT_ID, WORKTREE_ID).unwrap();
+    assert_eq!(affinity.worktree_worker.as_deref(), Some("mini-2"));
+    assert_eq!(affinity.project_worker.as_deref(), Some("mini-2"));
+}
+
+#[test]
+fn cross_client_local_record_stops_fleet_recovery_before_remote_contact() {
+    // Break caught: a copied job record from another client is used as a
+    // recovery selector, crossing the local lifecycle authority boundary.
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let local_root = root.join("local-state");
+    let foreign_root = root.join("foreign-state");
+    let store = ClientStateStore::open(&local_root).unwrap();
+    let foreign = ClientStateStore::open(&foreign_root).unwrap();
+    let id = job_id(501);
+    foreign
+        .create_job(local_record(&foreign, id, "mini-1"))
+        .unwrap();
+    let local_file = local_root.join("jobs").join(format!("{id}.json"));
+    fs::copy(
+        foreign_root.join("jobs").join(format!("{id}.json")),
+        &local_file,
+    )
+    .unwrap();
+    fs::set_permissions(&local_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let runner = FleetRunner {
+        statuses: Vec::new(),
+        reconciled_hosts: Mutex::new(BTreeSet::new()),
+        unavailable_hosts: BTreeSet::new(),
+        reconcile_timeout_hosts: BTreeSet::new(),
+    };
+    let config = Config {
+        version: 1,
+        workers: vec![worker("mini-1")],
+    };
+
+    let error = FleetReconciler {
+        config: &config,
+        client_state: &store,
+        remote: RemoteJobClient::new(&runner),
+    }
+    .reconcile()
+    .unwrap_err();
+
+    assert!(error.to_string().contains("CLIENT_ID_MISMATCH"));
+    assert!(runner.reconciled_hosts.lock().unwrap().is_empty());
 }

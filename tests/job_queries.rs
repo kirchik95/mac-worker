@@ -5080,10 +5080,7 @@ fn payload_and_log_binding_failures_preserve_evidence_and_the_exact_lease() {
 fn endpoint_runtime_and_completed_job(
     temp: &tempfile::TempDir,
 ) -> (RuntimeContext, SubmitRequest, StatusResponse) {
-    let home = temp.path().join("home");
-    fs::create_dir(&home).unwrap();
-    let environment = BTreeMap::from([("HOME".into(), home.as_os_str().to_os_string())]);
-    let paths = PathLayout::discover(None, &environment, &home).unwrap();
+    let (runtime, paths) = endpoint_runtime_and_paths(temp);
     let (store, _lease, submit) = prepared_host_with_command(
         &paths.host_state_root(),
         CommandSpec::argv(vec!["/usr/bin/printf".into(), "endpoint-log".into()]).unwrap(),
@@ -5102,10 +5099,17 @@ fn endpoint_runtime_and_completed_job(
         completed.status().clone(),
     )
     .unwrap();
+    (runtime, submit, response)
+}
+
+fn endpoint_runtime_and_paths(temp: &tempfile::TempDir) -> (RuntimeContext, PathLayout) {
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let environment = BTreeMap::from([("HOME".into(), home.as_os_str().to_os_string())]);
+    let paths = PathLayout::discover(None, &environment, &home).unwrap();
     (
         RuntimeContext::isolated(environment, home, temp.path().to_path_buf()),
-        submit,
-        response,
+        paths,
     )
 }
 
@@ -5227,6 +5231,73 @@ fn host_reconcile_replays_an_indexed_terminal_status_without_discovery_or_mutati
         serde_json::from_slice(first_stdout.strip_suffix(b"\n").unwrap()).unwrap();
     assert_eq!(response.results().len(), 1);
     assert_eq!(response.results()[0].status(), Some(&expected));
+}
+
+#[test]
+fn fleet_recovery_delegates_an_exact_nonindexed_crash_record_to_phase_three_reconciliation() {
+    // Break caught: the fleet host operation bypasses Phase 3's exact
+    // pre-index repair path instead of reconciling the supplied ID.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    let (store, lease, _submit) = unindexed_identityless_job(&root);
+    assert!(!store.job_index(lease.job_id()).unwrap().exists());
+    let launches = Arc::new(AtomicUsize::new(0));
+    let supervisor = identity(41_004);
+    let launcher = HoldingRecordingLauncher {
+        launches: Arc::clone(&launches),
+        job_path: store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap(),
+        identity: supervisor,
+        guard: Mutex::new(None),
+    };
+
+    let response = JobService::new(&store, &launcher)
+        .reconcile_job(lease.job_id())
+        .unwrap();
+
+    assert_eq!(response.meta().job_id(), lease.job_id());
+    assert_eq!(response.status().supervisor_identity(), Some(supervisor));
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert!(store.job_index(lease.job_id()).unwrap().is_file());
+    drop(launcher.guard.lock().unwrap().take());
+}
+
+#[test]
+fn host_reconcile_returns_per_job_errors_for_corrupt_status_or_lease() {
+    // Break caught: fleet recovery masks corrupt durable authority as a
+    // successful status, or mutates the corrupt evidence while reporting it.
+    for (label, target) in [("status", "status.json"), ("lease", "lease.json")] {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, paths) = endpoint_runtime_and_paths(&temp);
+        let (store, lease, _submit) = indexed_identityless_job(&paths.host_state_root());
+        let path = if label == "status" {
+            store
+                .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                .unwrap()
+                .join(target)
+        } else {
+            paths.host_state_root().join("leases/heavy").join(target)
+        };
+        replace_bytes(&path, b"{").unwrap();
+        let request = FleetReconcileRequest::new(vec![lease.job_id()]).unwrap();
+
+        let (exit, stdout, stderr) =
+            run_query_endpoint(&runtime, "reconcile", serde_json::to_vec(&request).unwrap());
+
+        assert_eq!(exit, 0, "{label}");
+        assert!(stderr.is_empty(), "{label}");
+        let response: FleetReconcileResponse =
+            serde_json::from_slice(stdout.strip_suffix(b"\n").unwrap()).unwrap();
+        assert_eq!(response.results().len(), 1, "{label}");
+        assert_eq!(response.results()[0].job_id(), lease.job_id(), "{label}");
+        assert_eq!(
+            response.results()[0].error().unwrap().error().code(),
+            "JOB_STATE_INVALID",
+            "{label}"
+        );
+        assert_eq!(fs::read(path).unwrap(), b"{", "{label}");
+    }
 }
 
 #[test]
