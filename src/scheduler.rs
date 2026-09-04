@@ -100,6 +100,17 @@ pub enum WorkerPreference {
     Pinned { worker: String },
 }
 
+/// Advisory explanation for a waiting queue row.  This is derived only from
+/// the persisted admission cache and local queue state; it never grants
+/// capacity or changes remote lifecycle authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueBlockingReason {
+    PinnedWorkerBusy { worker: String },
+    CapabilityMissing { missing: Vec<String> },
+    RunCap,
+    NoEligibleWorker,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CandidateRejection {
     DuplicateIdentity { name: String },

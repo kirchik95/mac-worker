@@ -16,7 +16,8 @@ use error::WorkerError;
 use host_store::HostStore;
 use install::Installer;
 use job::{
-    CancelRequest, CommandSpec, HostControlError, JsonEvent, LeaseAcquireRequest, LogChunkRequest,
+    CancelRequest, CommandSpec, FleetReconcileJobResult, FleetReconcileRequest,
+    FleetReconcileResponse, HostControlError, JsonEvent, LeaseAcquireRequest, LogChunkRequest,
     LogChunkResponse, ResolveOrAbandonRequest, StatusRequest, SubmitRequest,
 };
 use job_service::JobService;
@@ -28,8 +29,8 @@ use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport};
 use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnapshotResponse};
 use run::{
-    CancelService, LogsService, RunRequest, RunService, StatusService, SystemFollowRuntime,
-    terminal_exit_code,
+    CancelService, FleetReconciler, LogsService, RunRequest, RunService, StatusService,
+    SystemFollowRuntime, terminal_exit_code,
 };
 use scheduler::WorkerPreference;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -185,6 +186,14 @@ fn execute_with_context(
             let paths = discover_paths(cli.config, runtime)?;
             let config = Config::load(&paths.config)?;
             let client_state = ClientStateStore::open(&paths.state)?;
+            if job_id.is_none() {
+                FleetReconciler {
+                    config: &config,
+                    client_state: &client_state,
+                    remote: RemoteJobClient::new(runner),
+                }
+                .reconcile()?;
+            }
             let remote = RemoteJobClient::new(runner);
             let service = StatusService {
                 config: &config,
@@ -235,6 +244,11 @@ fn execute_with_context(
             command: HostCommand::Cancel,
         } => Err(WorkerError::Protocol(
             "host cancel requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::Reconcile,
+        } => Err(WorkerError::Protocol(
+            "host reconcile requires the stdio execution boundary".into(),
         )),
         Command::Host {
             command: HostCommand::SnapshotVerify,
@@ -600,6 +614,14 @@ pub fn run_with_rsync_executor_in_context(
     ) {
         return run_host_cancel(cli.config, runtime, stdin, stdout);
     }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::Reconcile
+        }
+    ) {
+        return run_host_reconcile(cli.config, runtime, stdin, stdout);
+    }
     if let Command::Host {
         command:
             HostCommand::RsyncReceive {
@@ -776,6 +798,40 @@ fn run_host_cancel(
         stdin,
         stdout,
         |request: CancelRequest, store, launcher| JobService::new(store, launcher).cancel(request),
+    )
+}
+
+fn run_host_reconcile(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_control_endpoint(
+        config_override,
+        runtime,
+        stdin,
+        stdout,
+        |request: FleetReconcileRequest, store, launcher| {
+            request.validate()?;
+            let service = JobService::new(store, launcher);
+            FleetReconcileResponse::new(
+                request
+                    .known_job_ids()
+                    .iter()
+                    .copied()
+                    .map(|job_id| match service.reconcile_job(job_id) {
+                        Ok(status) => FleetReconcileJobResult::Status {
+                            status: Box::new(status),
+                        },
+                        Err(error) => FleetReconcileJobResult::Error {
+                            job_id,
+                            error: versioned_host_error(&error),
+                        },
+                    })
+                    .collect(),
+            )
+        },
     )
 }
 

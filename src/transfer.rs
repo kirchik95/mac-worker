@@ -18,11 +18,12 @@ use crate::{
     error::{ProcessError, ProcessStream, WorkerError},
     host_store::{HostStore, JobDisposition},
     job::{
-        CancelRequest, CancelResponse, ClientId, CommandSummary, HostControlError, JobId,
-        LeaseAcquireRequest, LeaseRecord, LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse,
-        LogStream, MAX_LOG_CHUNK_BYTES, PreacceptanceDisposition, RequestFingerprint,
-        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest,
-        StatusResponse, SubmitRequest, SubmitResponse,
+        CancelRequest, CancelResponse, ClientId, CommandSummary, FleetReconcileRequest,
+        FleetReconcileResponse, HostControlError, JobId, LeaseAcquireRequest, LeaseRecord,
+        LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse, LogStream, MAX_LOG_CHUNK_BYTES,
+        PreacceptanceDisposition, RequestFingerprint, ResolveOrAbandonOutcome,
+        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest, StatusResponse,
+        SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
@@ -54,6 +55,7 @@ pub enum HostOperation {
     LogChunk,
     ResolveOrAbandon,
     Cancel,
+    Reconcile,
 }
 
 impl HostOperation {
@@ -66,6 +68,7 @@ impl HostOperation {
             Self::LogChunk => "~/.local/bin/worker host log-chunk",
             Self::ResolveOrAbandon => "~/.local/bin/worker host resolve-or-abandon",
             Self::Cancel => "~/.local/bin/worker host cancel",
+            Self::Reconcile => "~/.local/bin/worker host reconcile",
         }
     }
 }
@@ -667,12 +670,43 @@ impl<'a> RemoteJobClient<'a> {
         }
     }
 
+    pub(crate) fn process_runner(&self) -> &'a dyn ProcessRunner {
+        self.transport.runner
+    }
+
     pub fn status(
         &self,
         worker: &WorkerEntry,
         job_id: JobId,
     ) -> Result<StatusResponse, WorkerError> {
         self.status_with_deadline(worker, job_id, MAX_CONTROL_DEADLINE)
+    }
+
+    pub fn reconcile(
+        &self,
+        worker: &WorkerEntry,
+        request: &FleetReconcileRequest,
+    ) -> Result<FleetReconcileResponse, WorkerError> {
+        request.validate()?;
+        let response: FleetReconcileResponse = self.transport.request(
+            worker,
+            HostOperation::Reconcile,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        response.validate().map_err(|_| invalid_remote_response())?;
+        if response.results().len() != request.known_job_ids().len()
+            || response.results().iter().any(|result| {
+                !request.known_job_ids().contains(&result.job_id())
+                    || result.status().is_some_and(|status| {
+                        status.meta().worker_name() != worker.name
+                            || status.meta().job_id() != result.job_id()
+                    })
+            })
+        {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
     }
 
     pub fn cancel(

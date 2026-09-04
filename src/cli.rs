@@ -80,6 +80,7 @@ pub enum HostCommand {
     #[command(name = "resolve-or-abandon")]
     ResolveOrAbandon,
     Cancel,
+    Reconcile,
     Submit,
     Supervise {
         job_id: HiddenComponent,

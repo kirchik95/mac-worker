@@ -27,9 +27,10 @@ use mac_worker::{
     host_store::{HostStore, HostStoreWritePoint, JobDisposition, SupervisorGuard},
     inputs::RelativePath,
     job::{
-        CancelRequest, CancelResponse, ClientId, CommandSpec, HostControlError, JobId, JobMeta,
-        JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
-        LogChunk, LogChunkRequest, LogChunkResponse, LogCursor, LogStream, ProcessIdentity,
+        CancelRequest, CancelResponse, ClientId, CommandSpec, FleetReconcileJobResult,
+        FleetReconcileRequest, FleetReconcileResponse, HostControlError, JobId, JobMeta, JobState,
+        JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk,
+        LogChunkRequest, LogChunkResponse, LogCursor, LogStream, ProcessIdentity,
         RequestFingerprintMaterial, ResolveOrAbandonOutcome, ResolveOrAbandonRequest,
         ResolveOrAbandonResponse, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
         TerminalLogDrain,
@@ -5156,6 +5157,11 @@ fn hidden_query_endpoints_are_argument_free_and_return_one_canonical_typed_line(
     .unwrap();
     let expected_resolve =
         mac_worker::job::ResolveOrAbandonResponse::accepted(expected_status.clone()).unwrap();
+    let reconcile = FleetReconcileRequest::new(vec![job_id]).unwrap();
+    let expected_reconcile = FleetReconcileResponse::new(vec![FleetReconcileJobResult::Status {
+        status: Box::new(expected_status.clone()),
+    }])
+    .unwrap();
     let cases = [
         (
             "status",
@@ -5176,6 +5182,11 @@ fn hidden_query_endpoints_are_argument_free_and_return_one_canonical_typed_line(
             "cancel",
             serde_json::to_vec(&cancel).unwrap(),
             serde_json::to_vec(&CancelResponse::new(expected_status.clone()).unwrap()).unwrap(),
+        ),
+        (
+            "reconcile",
+            serde_json::to_vec(&reconcile).unwrap(),
+            serde_json::to_vec(&expected_reconcile).unwrap(),
         ),
     ];
 
@@ -5219,6 +5230,10 @@ fn every_query_endpoint_rejects_noncanonical_or_unbounded_input_with_typed_stdou
         ),
         ("resolve-or-abandon", serde_json::to_vec(&resolve).unwrap()),
         ("cancel", serde_json::to_vec(&cancel).unwrap()),
+        (
+            "reconcile",
+            serde_json::to_vec(&FleetReconcileRequest::new(vec![job_id]).unwrap()).unwrap(),
+        ),
     ];
     for (command, valid) in valid {
         let mut wrong_version: serde_json::Value = serde_json::from_slice(&valid).unwrap();

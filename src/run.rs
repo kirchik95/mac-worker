@@ -1,6 +1,6 @@
 use std::{
-    cell::Cell,
-    collections::HashSet,
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, HashSet},
     io::Write,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -17,12 +17,12 @@ use crate::{
     error::WorkerError,
     inputs::RelativePath,
     job::{
-        AdmissionObservation, CancelRequest, CancelResponse, CommandSpec, CommandSummary, JobId,
-        JobMeta, JobState, JobStatus, JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseRecord, LeaseToken, LocalJobRecord, LogChunk, LogCursor, LogStream,
-        PreacceptanceDisposition, ProcessIdentity, QueueCancel, QueueEntry, QueueEntryKind,
-        RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest, StatusResponse,
-        SubmitRequest, SubmitResponse, TerminalLogDrain,
+        AdmissionObservation, CancelRequest, CancelResponse, CommandSpec, CommandSummary,
+        FleetReconcileJobResult, FleetReconcileRequest, JobId, JobMeta, JobState, JobStatus,
+        JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
+        LocalJobRecord, LogChunk, LogCursor, LogStream, PreacceptanceDisposition, ProcessIdentity,
+        QueueCancel, QueueEntry, QueueEntryKind, RemoteUncertainty, RequestFingerprintMaterial,
+        ResolveOrAbandonRequest, StatusResponse, SubmitRequest, SubmitResponse, TerminalLogDrain,
     },
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRunner},
@@ -31,7 +31,7 @@ use crate::{
         PreparedProject, ProjectPreparationError, ProjectPreparationRequest,
         ProjectPreparationStage, ProjectState,
     },
-    protocol::PROTOCOL_VERSION,
+    protocol::{HealthStatus, PROTOCOL_VERSION, WorkerHealth},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     scheduler::{
         AffinityHints, CandidateObservation, SchedulerPolicy, Selection, WorkerPreference,
@@ -49,6 +49,247 @@ pub const STATUS_LIST_LIMIT: usize = 100;
 pub const STATUS_REFRESH_LIMIT: usize = 16;
 pub const STATUS_REFRESH_DEADLINE: Duration = Duration::from_secs(5);
 const DISPATCH_CANCEL_OBSERVE_DEADLINE: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetOutcome {
+    Reconciled,
+    Unavailable,
+    InvalidResponse,
+}
+
+#[derive(Debug, Clone)]
+pub struct FleetWorkerReport {
+    pub worker: String,
+    pub probe: WorkerHealth,
+    pub outcome: FleetOutcome,
+    pub jobs: Vec<StatusResponse>,
+    pub error_code: Option<String>,
+}
+
+impl FleetWorkerReport {
+    pub fn outcome(&self) -> FleetOutcome {
+        self.outcome
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FleetReconcileReport {
+    pub generated_at_millis: u64,
+    pub workers: Vec<FleetWorkerReport>,
+}
+
+impl FleetReconcileReport {
+    pub fn workers(&self) -> &[FleetWorkerReport] {
+        &self.workers
+    }
+}
+
+/// Bounded recovery composition. Remote durable status is authoritative; this
+/// service merely refreshes the local observation of explicitly known jobs.
+pub struct FleetReconciler<'a> {
+    pub config: &'a Config,
+    pub client_state: &'a ClientStateStore,
+    pub remote: RemoteJobClient<'a>,
+}
+
+impl FleetReconciler<'_> {
+    pub fn reconcile(&self) -> Result<FleetReconcileReport, WorkerError> {
+        let generated_at_millis = current_time_millis()?;
+        let mut records = self.client_state.list_jobs()?;
+        records.sort_by(|left, right| {
+            right
+                .meta()
+                .created_at_millis()
+                .cmp(&left.meta().created_at_millis())
+                .then_with(|| {
+                    left.meta()
+                        .job_id()
+                        .to_string()
+                        .cmp(&right.meta().job_id().to_string())
+                })
+        });
+        records.truncate(STATUS_LIST_LIMIT);
+
+        let mut by_worker = BTreeMap::<String, Vec<LocalJobRecord>>::new();
+        for record in records.into_iter().filter(eligible_for_list_refresh) {
+            by_worker
+                .entry(record.meta().worker_name().to_owned())
+                .or_default()
+                .push(record);
+        }
+
+        let mut workers = Vec::new();
+        for worker in &self.config.workers {
+            if let Some(records) = by_worker.remove(&worker.name) {
+                workers.push(self.reconcile_worker(worker, records, generated_at_millis)?);
+            }
+        }
+        for (_, records) in by_worker {
+            self.retain_unknown(&records, "WORKER_NOT_FOUND")?;
+        }
+        Ok(FleetReconcileReport {
+            generated_at_millis,
+            workers,
+        })
+    }
+
+    fn reconcile_worker(
+        &self,
+        worker: &WorkerEntry,
+        records: Vec<LocalJobRecord>,
+        now_millis: u64,
+    ) -> Result<FleetWorkerReport, WorkerError> {
+        let fresh_health = RefCell::new(None);
+        let cached = self
+            .client_state
+            .admission_observation(&worker.name, now_millis, || {
+                let one_worker = Config {
+                    version: self.config.version,
+                    workers: vec![worker.clone()],
+                };
+                let health = WorkersService::new(SshTransport::new(self.remote.process_runner()))
+                    .inspect(&one_worker)
+                    .workers
+                    .into_iter()
+                    .next()
+                    .expect("one configured worker produces one health record");
+                let candidate = SchedulerProbeAdapter::observations(
+                    &one_worker,
+                    std::slice::from_ref(&health),
+                )?
+                .into_iter()
+                .next()
+                .expect("one configured worker produces one scheduler observation");
+                *fresh_health.borrow_mut() = Some(health);
+                admission_from_candidate(candidate, now_millis)
+            });
+        let cached = match cached {
+            Ok(cached) => cached,
+            Err(error) => {
+                let code = error.public_code();
+                self.retain_unknown(&records, &code)?;
+                return Ok(FleetWorkerReport {
+                    worker: worker.name.clone(),
+                    probe: unavailable_health(worker, &code),
+                    outcome: FleetOutcome::InvalidResponse,
+                    jobs: Vec::new(),
+                    error_code: Some(code),
+                });
+            }
+        };
+        let candidate = candidate_from_admission(cached.observation())?;
+        let probe = fresh_health
+            .into_inner()
+            .unwrap_or_else(|| cached_health(worker, cached.observation()));
+        if !candidate.ready() {
+            self.retain_unknown(&records, "UNAVAILABLE")?;
+            return Ok(FleetWorkerReport {
+                worker: worker.name.clone(),
+                probe,
+                outcome: FleetOutcome::Unavailable,
+                jobs: Vec::new(),
+                error_code: Some("UNAVAILABLE".into()),
+            });
+        }
+
+        let request = FleetReconcileRequest::new(
+            records
+                .iter()
+                .map(|record| record.meta().job_id())
+                .collect(),
+        )?;
+        match self.remote.reconcile(worker, &request) {
+            Ok(response) => {
+                let mut jobs = Vec::new();
+                let mut error_code = None;
+                for result in response.results() {
+                    let record = records
+                        .iter()
+                        .find(|record| record.meta().job_id() == result.job_id())
+                        .expect("remote response was validated against the request");
+                    match result {
+                        FleetReconcileJobResult::Status { status }
+                            if status.meta() == record.meta() =>
+                        {
+                            let _ = self
+                                .client_state
+                                .reconcile_authoritative_status(record, status.status().clone())?;
+                            jobs.push((**status).clone());
+                        }
+                        FleetReconcileJobResult::Error { error, .. } => {
+                            let code = error.error().code();
+                            self.retain_unknown(std::slice::from_ref(record), code)?;
+                            error_code.get_or_insert_with(|| code.to_owned());
+                        }
+                        FleetReconcileJobResult::Status { .. } => {
+                            self.retain_unknown(std::slice::from_ref(record), "INVALID_RESPONSE")?;
+                            error_code.get_or_insert_with(|| "INVALID_RESPONSE".into());
+                        }
+                    }
+                }
+                Ok(FleetWorkerReport {
+                    worker: worker.name.clone(),
+                    probe,
+                    outcome: FleetOutcome::Reconciled,
+                    jobs,
+                    error_code,
+                })
+            }
+            Err(error) => {
+                let code = error.public_code();
+                self.retain_unknown(&records, &code)?;
+                Ok(FleetWorkerReport {
+                    worker: worker.name.clone(),
+                    probe,
+                    outcome: if code == "INVALID_RESPONSE" {
+                        FleetOutcome::InvalidResponse
+                    } else {
+                        FleetOutcome::Unavailable
+                    },
+                    jobs: Vec::new(),
+                    error_code: Some(code),
+                })
+            }
+        }
+    }
+
+    fn retain_unknown(&self, records: &[LocalJobRecord], code: &str) -> Result<(), WorkerError> {
+        let uncertainty = RemoteUncertainty::unknown_remote(code)?;
+        for record in records {
+            self.client_state
+                .set_remote_uncertainty_if_same_immutable(record, uncertainty.clone())?;
+        }
+        Ok(())
+    }
+}
+
+fn cached_health(worker: &WorkerEntry, observation: &AdmissionObservation) -> WorkerHealth {
+    WorkerHealth {
+        name: worker.name.clone(),
+        ssh: worker.ssh.clone(),
+        status: if observation.ready() {
+            HealthStatus::Ready
+        } else {
+            HealthStatus::Unavailable
+        },
+        probe: None,
+        missing_capabilities: Vec::new(),
+        error_code: None,
+        error_message: None,
+    }
+}
+
+fn unavailable_health(worker: &WorkerEntry, code: &str) -> WorkerHealth {
+    WorkerHealth {
+        name: worker.name.clone(),
+        ssh: worker.ssh.clone(),
+        status: HealthStatus::Unavailable,
+        probe: None,
+        missing_capabilities: Vec::new(),
+        error_code: Some(code.into()),
+        error_message: None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequest {
@@ -601,6 +842,12 @@ impl<'a> RunService<'a> {
         }
 
         self.validate_preference(&request.preference)?;
+        FleetReconciler {
+            config: self.config,
+            client_state: self.client_state,
+            remote: RemoteJobClient::new(self.runner),
+        }
+        .reconcile()?;
         let first_observed_at = self.scheduler_runtime.now_millis()?;
         let first_round = self.observe_admission(&request.preference, first_observed_at)?;
         self.observer.observe(RunStage::AdmissionObservation)?;

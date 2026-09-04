@@ -3512,6 +3512,124 @@ impl StatusResponse {
     }
 }
 
+pub const MAX_FLEET_RECONCILE_IDS: usize = 100;
+
+/// Fixed, bounded host request.  It is deliberately only a set of known job
+/// IDs: no path, namespace, or worker-wide discovery input is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetReconcileRequest {
+    pub known_job_ids: Vec<JobId>,
+}
+
+impl FleetReconcileRequest {
+    pub fn new(known_job_ids: Vec<JobId>) -> Result<Self, WorkerError> {
+        let request = Self { known_job_ids };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.known_job_ids.len() > MAX_FLEET_RECONCILE_IDS {
+            return Err(protocol_error(
+                "fleet reconciliation request exceeds 100 job IDs",
+            ));
+        }
+        for (index, job_id) in self.known_job_ids.iter().enumerate() {
+            if self.known_job_ids[..index].contains(job_id) {
+                return Err(protocol_error(
+                    "fleet reconciliation request contains duplicate job IDs",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn known_job_ids(&self) -> &[JobId] {
+        &self.known_job_ids
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FleetReconcileJobResult {
+    Status {
+        status: Box<StatusResponse>,
+    },
+    Error {
+        job_id: JobId,
+        error: HostControlError,
+    },
+}
+
+impl FleetReconcileJobResult {
+    pub fn job_id(&self) -> JobId {
+        match self {
+            Self::Status { status } => status.meta().job_id(),
+            Self::Error { job_id, .. } => *job_id,
+        }
+    }
+
+    pub fn status(&self) -> Option<&StatusResponse> {
+        match self {
+            Self::Status { status } => Some(status),
+            Self::Error { .. } => None,
+        }
+    }
+
+    pub fn error(&self) -> Option<&HostControlError> {
+        match self {
+            Self::Status { .. } => None,
+            Self::Error { error, .. } => Some(error),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        match self {
+            Self::Status { status } => status.validate(),
+            Self::Error { error, .. } => error.validate(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetReconcileResponse {
+    pub results: Vec<FleetReconcileJobResult>,
+}
+
+impl FleetReconcileResponse {
+    pub fn new(results: Vec<FleetReconcileJobResult>) -> Result<Self, WorkerError> {
+        let response = Self { results };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.results.len() > MAX_FLEET_RECONCILE_IDS {
+            return Err(protocol_error(
+                "fleet reconciliation response exceeds 100 job IDs",
+            ));
+        }
+        for (index, result) in self.results.iter().enumerate() {
+            result.validate()?;
+            if self.results[..index]
+                .iter()
+                .any(|prior| prior.job_id() == result.job_id())
+            {
+                return Err(protocol_error(
+                    "fleet reconciliation response contains duplicate job IDs",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn results(&self) -> &[FleetReconcileJobResult] {
+        &self.results
+    }
+}
+
 /// Fixed-operation request for cancelling exactly one accepted job.  Unlike
 /// the general request envelopes it intentionally has no protocol-version
 /// field: the operation is bound by the immutable accepted identity, while

@@ -18,7 +18,7 @@ use std::{
 
 use mac_worker::{
     client_state::{ClientStateStore, ClientStateWritePoint},
-    config::WorkerEntry,
+    config::{Config, WorkerEntry},
     error::{ProcessError, WorkerError},
     job::{
         AdmissionObservation, CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus,
@@ -28,7 +28,7 @@ use mac_worker::{
         ResolveOrAbandonResponse, RunId,
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner},
-    scheduler::{CandidateSlot, WorkerPreference},
+    scheduler::{CandidateSlot, QueueBlockingReason, WorkerPreference},
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
     },
@@ -157,6 +157,38 @@ fn cache_observation(store: &ClientStateStore, worker: &str, capabilities: &[&st
         true,
         CandidateSlot::Idle,
         capabilities.iter().map(|value| (*value).into()).collect(),
+        Some(8 * 1024 * 1024 * 1024),
+        64 * 1024 * 1024 * 1024,
+        now,
+    )
+    .unwrap();
+    store
+        .admission_observation(worker, now, || Ok(observation))
+        .unwrap();
+}
+
+fn cache_unavailable_observation(store: &ClientStateStore, worker: &str, now: u64) {
+    let observation = AdmissionObservation::new(
+        worker.into(),
+        false,
+        CandidateSlot::Busy,
+        Vec::new(),
+        None,
+        0,
+        now,
+    )
+    .unwrap();
+    store
+        .admission_observation(worker, now, || Ok(observation))
+        .unwrap();
+}
+
+fn cache_busy_observation(store: &ClientStateStore, worker: &str, now: u64) {
+    let observation = AdmissionObservation::new(
+        worker.into(),
+        true,
+        CandidateSlot::Busy,
+        Vec::new(),
         Some(8 * 1024 * 1024 * 1024),
         64 * 1024 * 1024 * 1024,
         now,
@@ -350,6 +382,132 @@ fn assert_terminal_unproven(error: WorkerError) {
             ..
         }
     ));
+}
+
+#[test]
+fn queue_rows_expose_advisory_blocking_reasons_from_cached_observations_only() {
+    // Break caught: a dashboard-facing read refreshes/probes or mutates queue
+    // state, or reinterprets the scheduler's policy independently.
+    let fixture = open_queue();
+    let config = Config {
+        version: 1,
+        workers: vec![
+            queue_worker("mini-a"),
+            queue_worker("mini-b"),
+            queue_worker("mini-c"),
+        ],
+    };
+    cache_observation(&fixture.store, "mini-a", &[], 10);
+    cache_busy_observation(&fixture.store, "mini-b", 10);
+    cache_unavailable_observation(&fixture.store, "mini-c", 10);
+
+    let reservation = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "000000000000000000000000000000f0",
+            10,
+            owner(240),
+            WorkerPreference::Automatic,
+            Vec::new(),
+            QueueEntryKind::Batch,
+            Some(run_reference("run-cap", 1)),
+        ))
+        .unwrap();
+    fixture
+        .store
+        .claim_next(owner(240), &["mini-a".into()], 11)
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "000000000000000000000000000000f1",
+            12,
+            owner(241),
+            WorkerPreference::Automatic,
+            Vec::new(),
+            QueueEntryKind::Batch,
+            Some(run_reference("run-cap", 1)),
+        ))
+        .unwrap();
+    let pinned_busy = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "000000000000000000000000000000f2",
+            13,
+            owner(242),
+            WorkerPreference::Pinned {
+                worker: "mini-b".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::Batch,
+            None,
+        ))
+        .unwrap();
+    let capability_missing = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "000000000000000000000000000000f3",
+            14,
+            owner(243),
+            WorkerPreference::Automatic,
+            vec!["gpu".into()],
+            QueueEntryKind::Batch,
+            None,
+        ))
+        .unwrap();
+    let no_eligible_worker = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "000000000000000000000000000000f4",
+            15,
+            owner(244),
+            WorkerPreference::Pinned {
+                worker: "mini-c".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::Batch,
+            None,
+        ))
+        .unwrap();
+
+    let rows = fixture
+        .store
+        .queue_rows_with_blocking_reasons(&config)
+        .unwrap();
+    let reason_for = |job_id| {
+        rows.iter()
+            .find(|row| row.entry().job_id() == job_id)
+            .unwrap()
+            .blocking_reason()
+    };
+
+    assert_eq!(reason_for(reservation.job_id()), None);
+    assert_eq!(
+        reason_for("000000000000000000000000000000f1".parse().unwrap()),
+        Some(&QueueBlockingReason::RunCap)
+    );
+    assert_eq!(
+        reason_for(pinned_busy.job_id()),
+        Some(&QueueBlockingReason::PinnedWorkerBusy {
+            worker: "mini-b".into()
+        })
+    );
+    assert_eq!(
+        reason_for(capability_missing.job_id()),
+        Some(&QueueBlockingReason::CapabilityMissing {
+            missing: vec!["gpu".into()]
+        })
+    );
+    assert_eq!(
+        reason_for(no_eligible_worker.job_id()),
+        Some(&QueueBlockingReason::NoEligibleWorker)
+    );
 }
 
 #[test]

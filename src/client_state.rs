@@ -20,6 +20,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
+    config::Config,
     error::WorkerError,
     job::{
         AdmissionObservation, CachedAdmissionObservation, ClientId, JobId, JobState, JobStatus,
@@ -27,7 +28,10 @@ use crate::{
         QueueEntry, QueueEntryKind, QueueSnapshot, QueueState, RemoteUncertainty,
         ResolveOrAbandonRequest,
     },
-    scheduler::{AffinityHints, WorkerPreference},
+    scheduler::{
+        AffinityHints, CandidateObservation, CandidateRejection, QueueBlockingReason,
+        SchedulerPolicy, Selection, WorkerPreference,
+    },
     supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
     transfer::PreacceptanceAbandonmentReceipt,
 };
@@ -104,6 +108,25 @@ pub(crate) enum ObservationRelation {
     RemoteAdvances,
     CurrentAtLeastRemote,
     Conflict,
+}
+
+/// One durable queue row plus its advisory, cache-derived blocking reason.
+/// A `None` reason means the row is dispatching or is eligible according to
+/// the cached policy facts; it is not an admission decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueRowWithBlockingReason {
+    entry: QueueEntry,
+    blocking_reason: Option<QueueBlockingReason>,
+}
+
+impl QueueRowWithBlockingReason {
+    pub fn entry(&self) -> &QueueEntry {
+        &self.entry
+    }
+
+    pub fn blocking_reason(&self) -> Option<&QueueBlockingReason> {
+        self.blocking_reason.as_ref()
+    }
 }
 
 /// Durable observation of the row that a public cancellation previously
@@ -465,6 +488,60 @@ impl ClientStateStore {
         let snapshot = read_queue_snapshot(self.inner.queue.as_raw_fd())?.0;
         require_queue_client(&snapshot, self.inner.client_id)?;
         Ok(snapshot)
+    }
+
+    /// Read the durable queue and last cached admission observations without
+    /// refreshing either.  This is a dashboard-compatible advisory view, not
+    /// a scheduler admission path.
+    pub fn queue_rows_with_blocking_reasons(
+        &self,
+        config: &Config,
+    ) -> Result<Vec<QueueRowWithBlockingReason>, WorkerError> {
+        let _lock = QueueLock::acquire(
+            self.inner.root.as_raw_fd(),
+            self.inner.queue.as_raw_fd(),
+            &self.inner.sync_counts,
+        )?;
+        let snapshot = read_queue_snapshot(self.inner.queue.as_raw_fd())?.0;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        let observations = config
+            .workers
+            .iter()
+            .map(|worker| {
+                read_observation_optional(self.inner.observations.as_raw_fd(), &worker.name)?
+                    .map(|observation| {
+                        CandidateObservation::new(
+                            observation.worker_name().to_owned(),
+                            observation.ready(),
+                            observation.slot(),
+                            observation.capabilities().to_vec(),
+                            observation.available_memory_bytes(),
+                            observation.free_disk_bytes(),
+                        )
+                        .map_err(|_| {
+                            WorkerError::Protocol("cached scheduler observation is invalid".into())
+                        })
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, WorkerError>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        snapshot
+            .entries()
+            .iter()
+            .cloned()
+            .map(|entry| {
+                let blocking_reason =
+                    self.queue_blocking_reason(&snapshot, &entry, &observations)?;
+                Ok(QueueRowWithBlockingReason {
+                    entry,
+                    blocking_reason,
+                })
+            })
+            .collect()
     }
 
     pub fn adopt_row(
@@ -1064,6 +1141,53 @@ impl ClientStateStore {
             }
         }
         Ok(active.len() < run.max_parallel() as usize)
+    }
+
+    fn queue_blocking_reason(
+        &self,
+        snapshot: &QueueSnapshot,
+        entry: &QueueEntry,
+        observations: &[CandidateObservation],
+    ) -> Result<Option<QueueBlockingReason>, WorkerError> {
+        if !matches!(entry.state(), QueueState::Waiting { .. }) {
+            return Ok(None);
+        }
+        match SchedulerPolicy::select(
+            observations,
+            entry.requirements(),
+            entry.preference(),
+            &AffinityHints::none(),
+        ) {
+            Selection::Selected(_) if !self.run_has_capacity(snapshot, entry)? => {
+                Ok(Some(QueueBlockingReason::RunCap))
+            }
+            Selection::Selected(_) => Ok(None),
+            Selection::NoEligible { rejections } => {
+                if let WorkerPreference::Pinned { worker } = entry.preference()
+                    && rejections.iter().any(|rejection| {
+                        matches!(rejection, CandidateRejection::Busy { name } if name == worker)
+                    })
+                {
+                    return Ok(Some(QueueBlockingReason::PinnedWorkerBusy {
+                        worker: worker.clone(),
+                    }));
+                }
+                let missing = entry
+                    .requirements()
+                    .iter()
+                    .filter(|requirement| {
+                        observations
+                            .iter()
+                            .all(|observation| !observation.capabilities().contains(*requirement))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    return Ok(Some(QueueBlockingReason::CapabilityMissing { missing }));
+                }
+                Ok(Some(QueueBlockingReason::NoEligibleWorker))
+            }
+        }
     }
 
     pub fn create_job(&self, record: LocalJobRecord) -> Result<(), WorkerError> {
