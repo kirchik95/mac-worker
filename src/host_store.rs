@@ -4,7 +4,7 @@ use std::{
     fs::File,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
+        unix::{ffi::OsStrExt, process::CommandExt},
     },
     path::{Path, PathBuf},
     process::Command,
@@ -3193,12 +3193,7 @@ fn build_host_layout(
 }
 
 fn initialize_mirror(mirror: &RootedDir) -> Result<(), WorkerError> {
-    let output = Command::new("/usr/bin/git")
-        .args(["init", "--bare"])
-        .arg(mirror.path())
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()?;
+    let output = run_git_in_mirror(mirror, &["init", "--bare", "."])?;
     if !output.status.success() {
         return Err(WorkerError::Git {
             code: "BASE_UNAVAILABLE",
@@ -3228,18 +3223,12 @@ fn ensure_mirror_directory(mirror: &RootedDir) -> Result<(), WorkerError> {
         Err(error) => return Err(error.into()),
     }
     hooks.set_private_regular_mode("pre-receive", 0o700)?;
-    configure_mirror(mirror.path())
+    configure_mirror(mirror)
 }
 
-fn configure_mirror(path: &Path) -> Result<(), WorkerError> {
+fn configure_mirror(mirror: &RootedDir) -> Result<(), WorkerError> {
     for (key, value) in [("core.hooksPath", "hooks"), ("receive.denyDeletes", "true")] {
-        let output = Command::new("/usr/bin/git")
-            .args(["--git-dir"])
-            .arg(path)
-            .args(["config", key, value])
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()?;
+        let output = run_git_in_mirror(mirror, &["--git-dir", ".", "config", key, value])?;
         if !output.status.success() {
             return Err(WorkerError::Git {
                 code: "BASE_UNAVAILABLE",
@@ -3248,6 +3237,30 @@ fn configure_mirror(path: &Path) -> Result<(), WorkerError> {
         }
     }
     Ok(())
+}
+
+fn run_git_in_mirror(
+    mirror: &RootedDir,
+    arguments: &[&str],
+) -> Result<std::process::Output, WorkerError> {
+    mirror.verify_descriptors_cloexec()?;
+    let directory_fd = mirror.raw_directory_fd();
+    let mut command = Command::new("/usr/bin/git");
+    command
+        .args(arguments)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(directory_fd) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output()?;
+    mirror.verify_bound()?;
+    Ok(output)
 }
 
 fn installation_names(parent: &RootedDir, root: &Path) -> Result<InstallationNames, WorkerError> {

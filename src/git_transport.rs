@@ -399,13 +399,30 @@ fn read_ref_head(
 }
 
 fn git_ref_exists(mirror: &RootedDir, reference: &str) -> Result<bool, WorkerError> {
-    let output = Command::new(GIT_PROGRAM)
-        .args(["--git-dir"])
-        .arg(mirror.path())
-        .args(["show-ref", "--verify", "--quiet", reference])
+    mirror.verify_descriptors_cloexec()?;
+    let directory_fd = mirror.raw_directory_fd();
+    let mut command = Command::new(GIT_PROGRAM);
+    command
+        .args([
+            "--git-dir",
+            ".",
+            "show-ref",
+            "--verify",
+            "--quiet",
+            reference,
+        ])
         .env(GIT_CONFIG_GLOBAL, "/dev/null")
-        .env(GIT_CONFIG_NOSYSTEM, "1")
-        .output()?;
+        .env(GIT_CONFIG_NOSYSTEM, "1");
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(directory_fd) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output()?;
+    mirror.verify_bound()?;
     Ok(output.status.success())
 }
 
