@@ -1299,6 +1299,38 @@ impl ClientStateStore {
         }
     }
 
+    /// Removes a local job record that never obtained remote status or
+    /// uncertainty. Lease-busy and other pre-acceptance retries must not leave
+    /// a reservation-bound identity behind when the authoritative host refused
+    /// admission without mutation.
+    pub fn remove_unpublished_job(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<LocalJobRecord>, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let name = job_file_name(job_id)?;
+        let Some(record) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? else {
+            return Ok(None);
+        };
+        if record.meta().job_id() != job_id {
+            return Err(invalid_state("job filename and record identity differ"));
+        }
+        self.require_local_client(&record)?;
+        if record.last_status().is_some() || record.remote_uncertainty() != &RemoteUncertainty::None
+        {
+            return Err(WorkerError::Protocol(
+                "JOB_RECORD_NOT_UNPUBLISHED: local job record already has remote evidence".into(),
+            ));
+        }
+        unlink_at(self.inner.jobs.as_raw_fd(), &name, 0).map_err(WorkerError::Io)?;
+        sync_counted(
+            self.inner.jobs.as_raw_fd(),
+            &self.inner.sync_counts,
+            SyncKind::Jobs,
+        )?;
+        Ok(Some(record))
+    }
+
     pub fn create_job(&self, record: LocalJobRecord) -> Result<(), WorkerError> {
         record.validate()?;
         self.require_local_client(&record)?;

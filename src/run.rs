@@ -992,7 +992,7 @@ impl<'a> RunService<'a> {
             self.client_state.remove_queued(identity.job_id)?;
             return Err(error);
         }
-        let claimed = self.claim_worker(&request, &initial, identity, first_round)?;
+        let mut claimed = self.claim_worker(&request, &initial, identity, first_round)?;
         if self.cancel_before_local_record(&claimed)? {
             return Err(dispatch_cancelled());
         }
@@ -1023,7 +1023,37 @@ impl<'a> RunService<'a> {
             }
         };
 
-        let primary = self.submit_prepared(request, claimed, &prepared, json, stdout, stderr);
+        let primary = loop {
+            match self.submit_prepared(&request, claimed, &prepared, json, stdout, stderr) {
+                Ok(completion) => break Ok(completion),
+                Err(WorkerError::Capacity { .. }) if request.wait_for_capacity => {
+                    self.scheduler_runtime.sleep(Duration::from_secs(1));
+                    let observed_at_millis = match self.scheduler_runtime.now_millis() {
+                        Ok(now) => now,
+                        Err(error) => {
+                            self.client_state.remove_queued(identity.job_id)?;
+                            break Err(error);
+                        }
+                    };
+                    let round =
+                        match self.observe_admission(&request.preference, observed_at_millis) {
+                            Ok(round) => round,
+                            Err(error) => {
+                                self.client_state.remove_queued(identity.job_id)?;
+                                break Err(error);
+                            }
+                        };
+                    claimed = match self.claim_worker(&request, &initial, identity, round) {
+                        Ok(claimed) => claimed,
+                        Err(error) => break Err(error),
+                    };
+                    if self.cancel_before_local_record(&claimed)? {
+                        break Err(dispatch_cancelled());
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
         match prepared.cleanup_observed(&|stage| {
             debug_assert_eq!(stage, ProjectPreparationStage::SnapshotCleanup);
             self.observer.observe(RunStage::SnapshotCleanup)
@@ -1229,7 +1259,7 @@ impl<'a> RunService<'a> {
 
     fn submit_prepared(
         &self,
-        request: RunRequest,
+        request: &RunRequest,
         claimed: ClaimedRun,
         prepared: &PreparedProject,
         json: bool,
@@ -1257,7 +1287,7 @@ impl<'a> RunService<'a> {
                 prepared.snapshot.manifest.relative_working_dir.clone(),
                 timeout_millis,
                 resource_class.into(),
-                request.command,
+                request.command.clone(),
             )?;
             let record = LocalJobRecord::new(
                 JobMeta::new(&material, material.fingerprint())?,
@@ -1464,6 +1494,10 @@ impl<'a> RunService<'a> {
             Err(error @ WorkerError::Capacity { .. }) => {
                 self.client_state
                     .revert_dispatch(identity.job_id, identity.dispatch_owner)?;
+                self.client_state.remove_unpublished_job(identity.job_id)?;
+                if !request.wait_for_capacity {
+                    self.client_state.remove_queued(identity.job_id)?;
+                }
                 return Err(error);
             }
             Err(error) => {

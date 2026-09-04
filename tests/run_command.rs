@@ -5537,9 +5537,63 @@ fn waiting_dispatch_polls_with_only_bounded_one_second_sleeps() {
 }
 
 #[test]
-fn authoritative_lease_capacity_reverts_the_exact_row_without_resolution() {
-    // Break caught: an authoritative no-mutation lease race is resolved as
-    // remote ambiguity, removes the row, or enqueues a replacement identity.
+fn waiting_lease_capacity_busy_resumes_fifo_and_executes_once() {
+    // Break caught: an authoritative CAPACITY_BUSY lease returns immediately
+    // in waiting mode instead of reverting and resuming FIFO polling.
+    let repo = run_repo(b"version = 1\n");
+    let temp = tempfile::tempdir().unwrap();
+    let follower = RecordingFollower::succeeding(0);
+    let scheduler = TestSchedulerRuntime::new(40_000, 904);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut request = orchestration_request(&repo);
+    request.wait_for_capacity = true;
+
+    let (result, runner, store) = run_scheduled_with_script(
+        &temp,
+        &config(),
+        request,
+        [
+            RunScriptStep::ProbeReady,
+            RunScriptStep::AuthoritativeFailure(HostOperation::LeaseAcquire, "CAPACITY_BUSY"),
+            RunScriptStep::Acquire,
+            RunScriptStep::Upload,
+            RunScriptStep::Verify,
+            RunScriptStep::SubmitAccepted,
+        ],
+        &follower,
+        None,
+        &scheduler,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    let completion = result.unwrap();
+    assert_eq!(completion.exit_code, 0);
+    assert_eq!(follower.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(scheduler.sleeps(), vec![Duration::from_secs(1)]);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    let lease_attempts = runner
+        .events()
+        .into_iter()
+        .filter(|event| event.contains("LeaseAcquire") || event == "Acquire")
+        .count();
+    assert_eq!(lease_attempts, 2);
+    assert_eq!(
+        runner
+            .events()
+            .into_iter()
+            .filter(|event| event == "SubmitAccepted")
+            .count(),
+        1
+    );
+    runner.assert_consumed();
+}
+
+#[test]
+fn no_wait_lease_capacity_busy_exits_clean_without_local_residue() {
+    // Break caught: --no-wait lease CAPACITY_BUSY leaves a waiting queue row,
+    // unpublished local job, or dispatch reservation behind.
     let repo = run_repo(b"version = 1\n");
     let temp = tempfile::tempdir().unwrap();
     let follower = RecordingFollower::succeeding(0);
@@ -5569,17 +5623,11 @@ fn authoritative_lease_capacity_reverts_the_exact_row_without_resolution() {
             ..
         }
     ));
-    let material = runner.material();
-    let queue = store.queue_snapshot().unwrap();
-    assert_eq!(queue.entries().len(), 1);
-    assert_eq!(queue.entries()[0].job_id(), material.job_id());
-    assert!(matches!(
-        queue.entries()[0].state(),
-        QueueState::Waiting { .. }
-    ));
-    assert_eq!(store.list_jobs().unwrap().len(), 1);
+    assert!(store.queue_snapshot().unwrap().entries().is_empty());
+    assert!(store.list_jobs().unwrap().is_empty());
     assert_eq!(runner.requests().len(), 2);
     assert_eq!(follower.calls.load(Ordering::SeqCst), 0);
+    assert!(scheduler.sleeps().is_empty());
     runner.assert_consumed();
     assert_no_run_capture(&run_paths(&temp).cache);
 }
