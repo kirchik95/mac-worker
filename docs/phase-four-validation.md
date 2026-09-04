@@ -4,7 +4,7 @@ This record separates automated fake-transport evidence from live observations o
 
 ## Commit and protocol
 
-The isolated acceptance release was built from source commit `d971783d3b94` with client version `0.1.0` and the authorized Clap help metadata change. SSH preflight reached all three aliases, but fresh setup exited `70` for `3/3` workers before any acceptance case could start; no worker protocol version was accepted.
+The reproducible validation revision is Task 8 commit `814f89526ce154e7afba5b1ea26993cfc564435d`, with client version `0.1.0`; the authorized `src/cli.rs` Clap help metadata is part of that commit. The isolated acceptance release was built from the same source contents immediately before the commit, with no source-affecting change between build and commit, so no separate binary digest is needed. SSH preflight reached all three aliases, but fresh setup returned the typed result `UNKNOWN_INSTALLATION_STATE` for `mini-1`/`mac1`, `mini-2`/`mac2`, and `mini-3`/`mac3`, with exit `70` for each worker and the aggregate command. No worker protocol version was accepted.
 
 ## Automated gate
 
@@ -12,11 +12,11 @@ The focused CLI-help RED→GREEN gate is automated local evidence and does not e
 
 ## Three-worker setup
 
-SSH preflight: `3/3` aliases exited `0`. Fresh setup: aliases `mini-1`/`mac1`, `mini-2`/`mac2`, and `mini-3`/`mac3` all reported `installed=false`, no protocol version, and the aggregate command exited `70`. The live acceptance stopped at this gate; no retry, repair, or worker-data cleanup was performed.
+SSH preflight: `3/3` aliases exited `0`. Fresh setup returned `UNKNOWN_INSTALLATION_STATE` (exit `70`) for `mini-1`/`mac1`, `mini-2`/`mac2`, and `mini-3`/`mac3`; all three reported `installed=false` and no protocol version. The live attempt stopped immediately at this setup result. There was no retry, repair, cleanup, rename, deletion, or remote run.
 
 ## Automatic placement
 
-Not proven: setup did not complete, so no live unpinned jobs were submitted and no distinct-lease count exists.
+Not proven: setup stopped the live attempt before any unpinned job was submitted; no distinct-lease count exists.
 
 ## FIFO fourth job
 
