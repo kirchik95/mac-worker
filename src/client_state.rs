@@ -1675,6 +1675,7 @@ impl ClientStateStore {
     pub fn list_tasks(&self) -> Result<Vec<LocalTaskRecord>, WorkerError> {
         let tasks = self.tasks_dir()?;
         let mut names = tasks.list_names().map_err(WorkerError::Io)?;
+        names.retain(|name| name.as_slice() != ROOTED_FS_NAMESPACE);
         names.sort();
         names
             .into_iter()
@@ -1761,6 +1762,7 @@ impl ClientStateStore {
     pub fn list_runs(&self) -> Result<Vec<RunRecord>, WorkerError> {
         let runs = self.runs_dir()?;
         let mut names = runs.list_names().map_err(WorkerError::Io)?;
+        names.retain(|name| name.as_slice() != ROOTED_FS_NAMESPACE);
         names.sort();
         names
             .into_iter()
@@ -3946,6 +3948,12 @@ fn read_open_regular(descriptor: OwnedFd) -> Result<(Vec<u8>, FileIdentity), Wor
     Ok((bytes, identity))
 }
 
+/// The private operation namespace `RootedDir` keeps beside the entries it
+/// writes atomically. It is normally removed after each operation, but a
+/// process that dies mid-write leaves it behind; it is never client state and
+/// every listing and validation here ignores it.
+const ROOTED_FS_NAMESPACE: &[u8] = b".mac-worker-rooted-fs";
+
 fn directory_entries(directory: RawFd) -> Result<Vec<CString>, WorkerError> {
     let independent = open_directory_at(directory, c".")?;
     let independent = independent.into_raw_fd();
@@ -3969,7 +3977,10 @@ fn directory_entries(directory: RawFd) -> Result<Vec<CString>, WorkerError> {
             return Ok(entries);
         }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+        if name.to_bytes() != b"."
+            && name.to_bytes() != b".."
+            && name.to_bytes() != ROOTED_FS_NAMESPACE
+        {
             entries.push(name.to_owned());
         }
     }

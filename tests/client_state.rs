@@ -1779,3 +1779,48 @@ fn queue_update_crash_after_publication_is_a_complete_canonical_replacement() {
             if selected_worker == "mini-1"
     ));
 }
+
+#[test]
+fn leftover_rooted_fs_namespaces_never_brick_the_state_root() {
+    // Catches treating RootedDir's private `.mac-worker-rooted-fs` namespace,
+    // which a process dying mid-write leaves behind, as an unexpected entry:
+    // every later command then failed with a bare I/O error.
+    let fixture = tempfile::tempdir().unwrap();
+    let state = temp_root(&fixture).join("state");
+    let store = ClientStateStore::open(&state).unwrap();
+    let record = fresh_record(&store);
+    store.create_job(record.clone()).unwrap();
+    drop(store);
+
+    for relative in [
+        "",
+        "jobs",
+        "tasks",
+        "runs",
+        "runners",
+        "turns",
+        "queue",
+        "observations",
+        "affinity",
+        "affinity/projects",
+        "affinity/worktrees",
+    ] {
+        let namespace = state.join(relative).join(".mac-worker-rooted-fs");
+        fs::create_dir(&namespace).unwrap();
+        fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let store = ClientStateStore::open(&state).unwrap();
+    assert_eq!(
+        store
+            .list_jobs()
+            .unwrap()
+            .iter()
+            .map(|job| job.meta().job_id())
+            .collect::<Vec<_>>(),
+        vec![record.meta().job_id()]
+    );
+    assert!(store.list_tasks().unwrap().is_empty());
+    assert!(store.list_runs().unwrap().is_empty());
+    assert_eq!(store.load_job(record.meta().job_id()).unwrap(), record);
+}
