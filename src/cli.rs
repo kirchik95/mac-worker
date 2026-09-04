@@ -2,7 +2,10 @@ use std::{convert::Infallible, ffi::OsString, fmt, path::PathBuf, str::FromStr, 
 
 use clap::{Parser, Subcommand};
 
-use crate::job::JobId;
+use crate::{
+    job::JobId,
+    task::{RunId, TaskId},
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -71,11 +74,152 @@ pub enum Command {
     Cancel {
         job_id: JobId,
     },
+    #[command(about = "Submit and manage durable agent tasks")]
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+    #[command(hide = true)]
+    Runner {
+        task_id: HiddenComponent,
+        turn_id: HiddenComponent,
+    },
     #[command(hide = true)]
     Host {
         #[command(subcommand)]
         command: HostCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TaskCommand {
+    #[command(about = "Submit a prompt as a durable agent task")]
+    Submit {
+        #[arg(long, value_parser = non_empty_text)]
+        agent: Option<String>,
+        #[arg(long, value_parser = non_empty_text)]
+        model: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "prompt_file",
+            required_unless_present = "prompt_file"
+        )]
+        prompt: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "prompt",
+            required_unless_present = "prompt"
+        )]
+        prompt_file: Option<PathBuf>,
+        #[arg(long, value_parser = non_empty_text)]
+        title: Option<String>,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long, default_value = "HEAD", value_parser = non_empty_text)]
+        base: String,
+        #[arg(long)]
+        wip: bool,
+        #[arg(long = "include", value_parser = non_empty_pattern)]
+        includes: Vec<String>,
+        #[arg(long, value_parser = supported_duration)]
+        timeout: Option<Duration>,
+        #[arg(long)]
+        max_turns: Option<u32>,
+        #[arg(long)]
+        max_budget: Option<u64>,
+        #[arg(long)]
+        max_followups: Option<u32>,
+        #[arg(long, value_parser = non_empty_text)]
+        close_on: Option<String>,
+        #[arg(long, value_parser = non_empty_text)]
+        env_profile: Option<String>,
+        #[arg(long, value_parser = non_empty_worker)]
+        worker: Option<String>,
+        #[arg(long, value_parser = non_empty_text)]
+        source: Option<String>,
+        #[arg(long, value_parser = non_empty_text)]
+        publish: Option<String>,
+        #[arg(long, value_parser = non_empty_text)]
+        publish_branch: Option<String>,
+        #[arg(long)]
+        no_wait: bool,
+        #[arg(long)]
+        wait: bool,
+    },
+    #[command(about = "Submit a validated TOML batch")]
+    Batch {
+        file: PathBuf,
+        #[arg(long, value_parser = non_empty_text)]
+        name: Option<String>,
+        #[arg(long)]
+        max_parallel: Option<u32>,
+        #[arg(long)]
+        wait: bool,
+    },
+    List {
+        #[arg(long)]
+        run: Option<RunId>,
+        #[arg(long, value_parser = non_empty_text)]
+        state: Option<String>,
+        #[arg(long)]
+        full: bool,
+    },
+    Status {
+        task_id: TaskId,
+        #[arg(long)]
+        full: bool,
+    },
+    Logs {
+        task_id: TaskId,
+        #[arg(long)]
+        turn: Option<u32>,
+        #[arg(short = 'f', long)]
+        follow: bool,
+        #[arg(long)]
+        raw: bool,
+    },
+    Diff {
+        task_id: TaskId,
+        #[arg(long)]
+        stat: bool,
+    },
+    Say {
+        task_id: TaskId,
+        #[arg(
+            long,
+            conflicts_with = "message_file",
+            required_unless_present = "message_file"
+        )]
+        message: Option<String>,
+        #[arg(long, conflicts_with = "message", required_unless_present = "message")]
+        message_file: Option<PathBuf>,
+        #[arg(long)]
+        wait: bool,
+    },
+    Cancel {
+        task_id: TaskId,
+    },
+    Result {
+        task_id: TaskId,
+    },
+    Fetch {
+        task_id: TaskId,
+    },
+    Close {
+        task_id: TaskId,
+        #[arg(long)]
+        discard: bool,
+    },
+    Wait {
+        #[arg(long)]
+        task_id: Option<TaskId>,
+        #[arg(long)]
+        run: Option<RunId>,
+        #[arg(long, value_parser = supported_duration)]
+        timeout: Option<Duration>,
+    },
+    Reconcile,
 }
 
 #[derive(Debug, Subcommand)]
@@ -177,6 +321,14 @@ fn non_empty_worker(value: &str) -> Result<String, String> {
 fn non_empty_shell(value: &str) -> Result<String, String> {
     if value.is_empty() {
         Err("shell command must not be empty".into())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn non_empty_text(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err("value must not be empty".into())
     } else {
         Ok(value.to_owned())
     }

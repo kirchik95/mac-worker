@@ -1,4 +1,6 @@
 pub mod recording_runner;
+#[allow(dead_code)]
+pub mod task_harness;
 
 use std::{
     fs,

@@ -531,6 +531,7 @@ fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_w
                         selected_worker, ..
                     } => selected_worker.to_owned(),
                     QueueState::Waiting { .. } => panic!("a successful claim must be dispatching"),
+                    QueueState::Parked => panic!("a successful claim cannot be parked"),
                 },
             ))
         })

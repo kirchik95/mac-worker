@@ -11,7 +11,9 @@ use mac_worker::{
     error::WorkerError,
     process::SystemProcessRunner,
     project::{ProjectContext, ProjectInspector},
-    project_config::{ArtifactSettings, ProjectSettings, ResourceClass, SnapshotSettings},
+    project_config::{
+        ArtifactSettings, ProjectSettings, ResourceClass, SnapshotSettings, TaskSettings,
+    },
     task::{BaseOid, GitIdentity, TaskId},
     transfer_repo::{BaseKind, RepositoryFingerprint, TransferRepo, repo_id_for},
 };
@@ -50,6 +52,15 @@ fn settings_including(patterns: &[&str]) -> ProjectSettings {
         artifacts: ArtifactSettings {
             include: Vec::new(),
             max_total_bytes: None,
+        },
+        task: TaskSettings {
+            source: "local".into(),
+            publish: vec!["fetch".into()],
+            env_profile: None,
+            default_agent: "codex".into(),
+            timeout: Duration::from_secs(45 * 60),
+            max_followups: 10,
+            permissions: std::collections::BTreeMap::new(),
         },
     }
 }

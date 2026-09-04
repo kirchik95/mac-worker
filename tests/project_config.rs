@@ -38,6 +38,38 @@ fn absent_project_settings_file_uses_v1_defaults() {
     assert_eq!(settings.snapshot.allow_sensitive, Vec::<String>::new());
     assert_eq!(settings.artifacts.include, Vec::<String>::new());
     assert_eq!(settings.artifacts.max_total_bytes, None);
+    assert_eq!(settings.task.default_agent, "codex");
+    assert_eq!(settings.task.timeout, Duration::from_secs(45 * 60));
+    assert_eq!(settings.task.max_followups, 10);
+}
+
+#[test]
+fn project_task_settings_parse_defaults_and_reject_deferred_capabilities() {
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        br#"version = 1
+[task]
+source = "local"
+publish = ["fetch"]
+default_agent = "codex"
+timeout = "45m"
+max_followups = 7
+"#,
+    );
+    let settings = ProjectSettings::load(repo.root(), &[]).unwrap();
+    assert_eq!(settings.task.max_followups, 7);
+
+    for task in [
+        "[task]\nsource = \"origin\"\n",
+        "[task]\npublish = [\"push\"]\n",
+        "[task]\nunknown = true\n",
+    ] {
+        let repo = GitRepo::init();
+        repo.write(".worker.toml", task.as_bytes());
+        let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
+        assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
+    }
 }
 
 #[test]

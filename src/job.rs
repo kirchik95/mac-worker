@@ -819,6 +819,10 @@ pub enum QueueState {
         selected_worker: String,
         claimed_at_millis: u64,
     },
+    /// A task-turn row that is waiting for a runner slot. Parked rows are
+    /// deliberately ownerless; the oldest parked row is adopted before it
+    /// can enter the normal owner-scoped queue.
+    Parked,
 }
 
 impl QueueState {
@@ -826,11 +830,22 @@ impl QueueState {
         match self {
             Self::Waiting { owner } => owner,
             Self::Dispatching { dispatch_owner, .. } => dispatch_owner,
+            Self::Parked => panic!("parked queue rows do not have an owner"),
+        }
+    }
+
+    pub fn owner_opt(&self) -> Option<&ProcessIdentity> {
+        match self {
+            Self::Waiting { owner } => Some(owner),
+            Self::Dispatching { dispatch_owner, .. } => Some(dispatch_owner),
+            Self::Parked => None,
         }
     }
 
     fn validate(&self, enqueued_at_millis: u64) -> Result<(), WorkerError> {
-        self.owner().validate()?;
+        if let Some(owner) = self.owner_opt() {
+            owner.validate()?;
+        }
         if let Self::Dispatching {
             selected_worker,
             claimed_at_millis,
@@ -870,6 +885,11 @@ impl Serialize for QueueState {
                 record.serialize_field("claimed_at_millis", claimed_at_millis)?;
                 record.end()
             }
+            Self::Parked => {
+                let mut record = serializer.serialize_struct("QueueState", 1)?;
+                record.serialize_field("state", "parked")?;
+                record.end()
+            }
         }
     }
 }
@@ -887,6 +907,7 @@ impl<'de> Deserialize<'de> for QueueState {
                 selected_worker: String,
                 claimed_at_millis: u64,
             },
+            Parked {},
         }
         let state = match Wire::deserialize(deserializer)? {
             Wire::Waiting { owner } => Self::Waiting { owner },
@@ -899,6 +920,7 @@ impl<'de> Deserialize<'de> for QueueState {
                 selected_worker,
                 claimed_at_millis,
             },
+            Wire::Parked {} => Self::Parked,
         };
         state.validate(0).map_err(de::Error::custom)?;
         Ok(state)
@@ -1223,7 +1245,7 @@ impl QueueEntry {
         if let Some(proof) = &self.preacceptance_abandonment_proof {
             proof.validate_against(self)?;
         }
-        if self.kind == QueueEntryKind::Batch && self.owner() != &self.enqueue_owner {
+        if self.kind == QueueEntryKind::Batch && self.owner_opt() != Some(&self.enqueue_owner) {
             return Err(protocol_error("batch queue ownership is not replaceable"));
         }
         Ok(())
@@ -1277,6 +1299,12 @@ impl QueueEntry {
         self.state.owner()
     }
 
+    /// Returns the durable owner, if this row is not parked. Unlike
+    /// [`Self::owner`], this is safe for callers inspecting all queue rows.
+    pub fn owner_opt(&self) -> Option<&ProcessIdentity> {
+        self.state.owner_opt()
+    }
+
     pub fn state(&self) -> &QueueState {
         &self.state
     }
@@ -1310,7 +1338,33 @@ impl QueueEntry {
                 owner: current_owner,
             } => *current_owner = owner,
             QueueState::Dispatching { dispatch_owner, .. } => *dispatch_owner = owner,
+            QueueState::Parked => {
+                return Err(protocol_error("a parked task turn must be unparked first"));
+            }
         }
+        self.validate()
+    }
+
+    pub(crate) fn park(&mut self) -> Result<(), WorkerError> {
+        if self.kind != QueueEntryKind::TaskTurn {
+            return Err(protocol_error("only a task turn can be parked"));
+        }
+        if self.preacceptance_abandonment_proof.is_some() {
+            return Err(protocol_error("an abandoned queue row cannot be parked"));
+        }
+        if !matches!(self.state, QueueState::Waiting { .. }) {
+            return Err(protocol_error("only a waiting task turn can be parked"));
+        }
+        self.state = QueueState::Parked;
+        self.validate()
+    }
+
+    pub(crate) fn unpark(&mut self, owner: ProcessIdentity) -> Result<(), WorkerError> {
+        owner.validate()?;
+        if self.kind != QueueEntryKind::TaskTurn || !matches!(self.state, QueueState::Parked) {
+            return Err(protocol_error("only a parked task turn can be unparked"));
+        }
+        self.state = QueueState::Waiting { owner };
         self.validate()
     }
 
@@ -1372,6 +1426,7 @@ impl QueueEntry {
                 };
                 self.validate()
             }
+            QueueState::Parked => Err(protocol_error("a parked queue row is not dispatching")),
             _ => Err(protocol_error("queue dispatch owner does not match")),
         }
     }
@@ -4645,6 +4700,35 @@ pub enum JsonEvent {
         protocol_version: u32,
         response: Box<StatusResponse>,
     },
+    TaskCreated {
+        protocol_version: u32,
+        task_id: crate::task::TaskId,
+        run_id: Option<crate::task::RunId>,
+        title: String,
+    },
+    TaskState {
+        protocol_version: u32,
+        task_id: crate::task::TaskId,
+        status: crate::task::TaskStatus,
+    },
+    TurnAccepted {
+        protocol_version: u32,
+        task_id: crate::task::TaskId,
+        turn_id: crate::task::TurnId,
+        worker: String,
+    },
+    TurnTerminal {
+        protocol_version: u32,
+        task_id: crate::task::TaskId,
+        turn_id: crate::task::TurnId,
+        outcome: crate::task::TaskOutcome,
+    },
+    ResultImported {
+        protocol_version: u32,
+        task_id: crate::task::TaskId,
+        head_oid: crate::task::BaseOid,
+        local_ref: String,
+    },
     Error {
         protocol_version: u32,
         code: String,
@@ -4669,6 +4753,35 @@ impl Serialize for JsonEvent {
             Status {
                 protocol_version: u32,
                 response: &'a StatusResponse,
+            },
+            TaskCreated {
+                protocol_version: u32,
+                task_id: crate::task::TaskId,
+                run_id: &'a Option<crate::task::RunId>,
+                title: &'a str,
+            },
+            TaskState {
+                protocol_version: u32,
+                task_id: crate::task::TaskId,
+                status: &'a crate::task::TaskStatus,
+            },
+            TurnAccepted {
+                protocol_version: u32,
+                task_id: crate::task::TaskId,
+                turn_id: crate::task::TurnId,
+                worker: &'a str,
+            },
+            TurnTerminal {
+                protocol_version: u32,
+                task_id: crate::task::TaskId,
+                turn_id: crate::task::TurnId,
+                outcome: &'a crate::task::TaskOutcome,
+            },
+            ResultImported {
+                protocol_version: u32,
+                task_id: crate::task::TaskId,
+                head_oid: &'a crate::task::BaseOid,
+                local_ref: &'a str,
             },
             Error {
                 protocol_version: u32,
@@ -4700,6 +4813,64 @@ impl Serialize for JsonEvent {
             } => Wire::Status {
                 protocol_version: *protocol_version,
                 response,
+            }
+            .serialize(serializer),
+            Self::TaskCreated {
+                protocol_version,
+                task_id,
+                run_id,
+                title,
+            } => Wire::TaskCreated {
+                protocol_version: *protocol_version,
+                task_id: *task_id,
+                run_id,
+                title,
+            }
+            .serialize(serializer),
+            Self::TaskState {
+                protocol_version,
+                task_id,
+                status,
+            } => Wire::TaskState {
+                protocol_version: *protocol_version,
+                task_id: *task_id,
+                status,
+            }
+            .serialize(serializer),
+            Self::TurnAccepted {
+                protocol_version,
+                task_id,
+                turn_id,
+                worker,
+            } => Wire::TurnAccepted {
+                protocol_version: *protocol_version,
+                task_id: *task_id,
+                turn_id: *turn_id,
+                worker,
+            }
+            .serialize(serializer),
+            Self::TurnTerminal {
+                protocol_version,
+                task_id,
+                turn_id,
+                outcome,
+            } => Wire::TurnTerminal {
+                protocol_version: *protocol_version,
+                task_id: *task_id,
+                turn_id: *turn_id,
+                outcome,
+            }
+            .serialize(serializer),
+            Self::ResultImported {
+                protocol_version,
+                task_id,
+                head_oid,
+                local_ref,
+            } => Wire::ResultImported {
+                protocol_version: *protocol_version,
+                task_id: *task_id,
+                head_oid,
+                local_ref,
             }
             .serialize(serializer),
             Self::Error {
@@ -4740,6 +4911,48 @@ impl JsonEvent {
                 response.validate()?;
                 *protocol_version
             }
+            Self::TaskCreated {
+                protocol_version,
+                title,
+                ..
+            } => {
+                validate_non_nul(title, 120, "task title")?;
+                *protocol_version
+            }
+            Self::TaskState {
+                protocol_version,
+                status,
+                ..
+            } => {
+                serde_json::to_vec(status)
+                    .map_err(|_| protocol_error("task status event is invalid"))?;
+                *protocol_version
+            }
+            Self::TurnAccepted {
+                protocol_version,
+                worker,
+                ..
+            } => {
+                validate_non_nul(worker, 128, "worker name")?;
+                *protocol_version
+            }
+            Self::TurnTerminal {
+                protocol_version,
+                outcome,
+                ..
+            } => {
+                serde_json::to_vec(outcome)
+                    .map_err(|_| protocol_error("turn terminal event is invalid"))?;
+                *protocol_version
+            }
+            Self::ResultImported {
+                protocol_version,
+                local_ref,
+                ..
+            } => {
+                validate_non_nul(local_ref, 512, "result ref")?;
+                *protocol_version
+            }
             Self::Error {
                 protocol_version,
                 code,
@@ -4774,6 +4987,35 @@ impl<'de> Deserialize<'de> for JsonEvent {
                 protocol_version: u32,
                 response: Box<StatusResponse>,
             },
+            TaskCreated {
+                protocol_version: u32,
+                task_id: crate::task::TaskId,
+                run_id: Option<crate::task::RunId>,
+                title: String,
+            },
+            TaskState {
+                protocol_version: u32,
+                task_id: crate::task::TaskId,
+                status: crate::task::TaskStatus,
+            },
+            TurnAccepted {
+                protocol_version: u32,
+                task_id: crate::task::TaskId,
+                turn_id: crate::task::TurnId,
+                worker: String,
+            },
+            TurnTerminal {
+                protocol_version: u32,
+                task_id: crate::task::TaskId,
+                turn_id: crate::task::TurnId,
+                outcome: crate::task::TaskOutcome,
+            },
+            ResultImported {
+                protocol_version: u32,
+                task_id: crate::task::TaskId,
+                head_oid: crate::task::BaseOid,
+                local_ref: String,
+            },
             Error {
                 protocol_version: u32,
                 code: String,
@@ -4802,6 +5044,59 @@ impl<'de> Deserialize<'de> for JsonEvent {
             } => Self::Status {
                 protocol_version,
                 response,
+            },
+            Wire::TaskCreated {
+                protocol_version,
+                task_id,
+                run_id,
+                title,
+            } => Self::TaskCreated {
+                protocol_version,
+                task_id,
+                run_id,
+                title,
+            },
+            Wire::TaskState {
+                protocol_version,
+                task_id,
+                status,
+            } => Self::TaskState {
+                protocol_version,
+                task_id,
+                status,
+            },
+            Wire::TurnAccepted {
+                protocol_version,
+                task_id,
+                turn_id,
+                worker,
+            } => Self::TurnAccepted {
+                protocol_version,
+                task_id,
+                turn_id,
+                worker,
+            },
+            Wire::TurnTerminal {
+                protocol_version,
+                task_id,
+                turn_id,
+                outcome,
+            } => Self::TurnTerminal {
+                protocol_version,
+                task_id,
+                turn_id,
+                outcome,
+            },
+            Wire::ResultImported {
+                protocol_version,
+                task_id,
+                head_oid,
+                local_ref,
+            } => Self::ResultImported {
+                protocol_version,
+                task_id,
+                head_oid,
+                local_ref,
             },
             Wire::Error {
                 protocol_version,

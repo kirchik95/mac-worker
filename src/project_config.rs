@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, Read},
     os::unix::fs::OpenOptionsExt,
@@ -24,6 +24,22 @@ pub struct ProjectSettings {
     pub timeout: Duration,
     pub snapshot: SnapshotSettings,
     pub artifacts: ArtifactSettings,
+    pub task: TaskSettings,
+}
+
+/// The part of `.worker.toml` that controls the phase-five task client.
+/// Values stay textual at this boundary so project configuration remains
+/// independent from the wire/task model; the client maps them to the typed
+/// task enums after all project policy has been validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSettings {
+    pub source: String,
+    pub publish: Vec<String>,
+    pub env_profile: Option<String>,
+    pub default_agent: String,
+    pub timeout: Duration,
+    pub max_followups: u32,
+    pub permissions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +75,8 @@ struct RawProjectSettings {
     snapshot: RawSnapshotSettings,
     #[serde(default)]
     artifacts: RawArtifactSettings,
+    #[serde(default)]
+    task: RawTaskSettings,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -81,11 +99,49 @@ struct RawArtifactSettings {
     max_total_bytes: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTaskSettings {
+    #[serde(default = "default_task_source")]
+    source: String,
+    #[serde(default = "default_task_publish")]
+    publish: Vec<String>,
+    #[serde(default)]
+    env_profile: Option<String>,
+    #[serde(default = "default_task_agent")]
+    default_agent: String,
+    #[serde(default = "default_task_timeout")]
+    timeout: String,
+    #[serde(default = "default_task_max_followups")]
+    max_followups: u32,
+    #[serde(default = "default_task_permissions")]
+    permissions: BTreeMap<String, String>,
+}
+
+impl Default for RawTaskSettings {
+    fn default() -> Self {
+        Self {
+            source: default_task_source(),
+            publish: default_task_publish(),
+            env_profile: None,
+            default_agent: default_task_agent(),
+            timeout: default_task_timeout(),
+            max_followups: default_task_max_followups(),
+            permissions: default_task_permissions(),
+        }
+    }
+}
+
 impl ProjectSettings {
     pub fn load(root: &Path, cli_includes: &[String]) -> Result<Self, WorkerError> {
         let raw = match read_project_config(root)? {
-            Some(contents) => toml::from_str(&contents)
-                .map_err(|_| WorkerError::Config("invalid project configuration".into()))?,
+            Some(contents) => toml::from_str(&contents).map_err(|_| {
+                if contents.contains("[task]") {
+                    task_config("invalid [task] configuration")
+                } else {
+                    WorkerError::Config("invalid project configuration".into())
+                }
+            })?,
             None => default_project_settings(),
         };
 
@@ -121,6 +177,8 @@ impl ProjectSettings {
         validate_patterns(&raw.artifacts.include, "artifact include")?;
         validate_patterns(cli_includes, "CLI include")?;
 
+        let task = validate_task_settings(raw.task)?;
+
         Ok(Self {
             requires: raw.requires,
             resource_class,
@@ -137,6 +195,7 @@ impl ProjectSettings {
                 include: raw.artifacts.include,
                 max_total_bytes: raw.artifacts.max_total_bytes,
             },
+            task,
         })
     }
 }
@@ -210,6 +269,108 @@ fn default_resource_class() -> String {
 
 fn default_timeout() -> String {
     DEFAULT_TIMEOUT.to_owned()
+}
+
+fn default_task_source() -> String {
+    "local".to_owned()
+}
+
+fn default_task_publish() -> Vec<String> {
+    vec!["fetch".to_owned()]
+}
+
+fn default_task_agent() -> String {
+    "codex".to_owned()
+}
+
+fn default_task_timeout() -> String {
+    "45m".to_owned()
+}
+
+fn default_task_max_followups() -> u32 {
+    10
+}
+
+fn default_task_permissions() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("codex".to_owned(), "workspace".to_owned()),
+        ("claude".to_owned(), "unattended".to_owned()),
+        ("cursor".to_owned(), "unattended".to_owned()),
+        ("opencode".to_owned(), "unattended".to_owned()),
+    ])
+}
+
+fn validate_task_settings(raw: RawTaskSettings) -> Result<TaskSettings, WorkerError> {
+    if raw.source != "local" {
+        return Err(task_config(
+            "source origin is deferred to a later plan (TASK_CONFIG_INVALID)",
+        ));
+    }
+    let mut publish = Vec::new();
+    for mode in raw.publish {
+        if mode != "fetch" {
+            return Err(task_config(
+                "publish push is deferred to a later plan (TASK_CONFIG_INVALID)",
+            ));
+        }
+        if !publish.iter().any(|existing| existing == &mode) {
+            publish.push(mode);
+        }
+    }
+    if publish != ["fetch"] {
+        return Err(task_config(
+            "publish fetch is required for every task (TASK_CONFIG_INVALID)",
+        ));
+    }
+    validate_task_text(&raw.default_agent, "task default agent")?;
+    if let Some(profile) = &raw.env_profile {
+        validate_task_text(profile, "task environment profile")?;
+    }
+    let timeout = humantime::parse_duration(&raw.timeout)
+        .map_err(|_| task_config("task timeout must be a valid duration (TASK_CONFIG_INVALID)"))?;
+    if timeout.is_zero() || timeout > Duration::from_secs(24 * 60 * 60) {
+        return Err(task_config(
+            "task timeout must be greater than zero and at most 24h (TASK_CONFIG_INVALID)",
+        ));
+    }
+    if raw.max_followups > 100 {
+        return Err(task_config(
+            "task max_followups must be at most 100 (TASK_CONFIG_INVALID)",
+        ));
+    }
+    for (agent, policy) in &raw.permissions {
+        validate_task_text(agent, "task permission agent")?;
+        if !matches!(policy.as_str(), "workspace" | "unattended") {
+            return Err(task_config(
+                "task permission must be workspace or unattended (TASK_CONFIG_INVALID)",
+            ));
+        }
+    }
+    Ok(TaskSettings {
+        source: raw.source,
+        publish,
+        env_profile: raw.env_profile,
+        default_agent: raw.default_agent,
+        timeout,
+        max_followups: raw.max_followups,
+        permissions: raw.permissions,
+    })
+}
+
+fn validate_task_text(value: &str, field: &str) -> Result<(), WorkerError> {
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(task_config(format!(
+            "{field} is empty, too long, or contains a control character (TASK_CONFIG_INVALID)"
+        )));
+    }
+    Ok(())
+}
+
+fn task_config(message: impl Into<String>) -> WorkerError {
+    WorkerError::Task {
+        code: "TASK_CONFIG_INVALID",
+        message: message.into(),
+    }
 }
 
 fn validate_requirements(requires: &[String]) -> Result<(), WorkerError> {

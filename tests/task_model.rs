@@ -243,6 +243,7 @@ fn nested_duplicate_json_fields_are_rejected() {
 #[test]
 fn task_limits_bound_followups_and_default_to_ten() {
     assert_eq!(TaskLimits::default().max_followups, 10);
+    assert_eq!(TaskLimits::default().turn.timeout_millis, 45 * 60 * 1000);
     assert!(TaskLimits::new(turn_limits(), 0).is_ok());
     assert!(TaskLimits::new(turn_limits(), MAX_FOLLOWUPS).is_ok());
     assert_eq!(

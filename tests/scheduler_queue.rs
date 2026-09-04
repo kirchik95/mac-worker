@@ -1274,6 +1274,7 @@ fn three_rows_dispatch_only_to_three_distinct_workers() {
                 selected_worker, ..
             } => Some(selected_worker.clone()),
             QueueState::Waiting { .. } => None,
+            QueueState::Parked => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(workers, ["mini-1", "mini-2", "mini-3"]);

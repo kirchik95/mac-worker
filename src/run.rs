@@ -1253,6 +1253,9 @@ impl<'a> RunService<'a> {
                     crate::job::QueueState::Waiting { .. } => {
                         unreachable!("a successful queue claim is durably dispatching")
                     }
+                    crate::job::QueueState::Parked => {
+                        unreachable!("a successful queue claim cannot return a parked row")
+                    }
                 };
                 if let Err(error) = self.observer.observe(RunStage::QueueClaim) {
                     self.client_state

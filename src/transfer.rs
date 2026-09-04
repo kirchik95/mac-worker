@@ -29,6 +29,10 @@ use crate::{
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     rooted_fs::RootedDir,
     snapshot::Snapshot,
+    task_store::{
+        TaskCloseRequest, TaskCloseResponse, TaskDiffRequest, TaskDiffResponse, TaskPrepareRequest,
+        TaskPrepareResponse, TaskStatusRequest, TaskStatusResponse,
+    },
     turn::{TaskTurnRequest, TaskTurnResponse},
 };
 
@@ -689,6 +693,90 @@ impl<'a> RemoteJobClient<'a> {
 
     pub(crate) fn process_runner(&self) -> &'a dyn ProcessRunner {
         self.transport.runner
+    }
+
+    pub fn lease_acquire(
+        &self,
+        worker: &WorkerEntry,
+        request: &LeaseAcquireRequest,
+    ) -> Result<crate::job::LeaseAcquireResponse, WorkerError> {
+        request.validate()?;
+        let response: crate::job::LeaseAcquireResponse = self.transport.request(
+            worker,
+            HostOperation::LeaseAcquire,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        response.validate().map_err(|_| invalid_remote_response())?;
+        Ok(response)
+    }
+
+    pub fn task_prepare(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskPrepareRequest,
+    ) -> Result<TaskPrepareResponse, WorkerError> {
+        let response: TaskPrepareResponse = self.transport.request(
+            worker,
+            HostOperation::TaskPrepare,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        if response.protocol_version() != crate::protocol::PROTOCOL_VERSION {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
+    }
+
+    pub fn task_status(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskStatusRequest,
+    ) -> Result<TaskStatusResponse, WorkerError> {
+        let response: TaskStatusResponse = self.transport.request(
+            worker,
+            HostOperation::TaskStatus,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        if response.protocol_version() != crate::protocol::PROTOCOL_VERSION {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
+    }
+
+    pub fn task_diff(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskDiffRequest,
+    ) -> Result<TaskDiffResponse, WorkerError> {
+        let response: TaskDiffResponse = self.transport.request(
+            worker,
+            HostOperation::TaskDiff,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        if response.protocol_version() != crate::protocol::PROTOCOL_VERSION {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
+    }
+
+    pub fn task_close(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskCloseRequest,
+    ) -> Result<TaskCloseResponse, WorkerError> {
+        let response: TaskCloseResponse = self.transport.request(
+            worker,
+            HostOperation::TaskClose,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        if response.protocol_version() != crate::protocol::PROTOCOL_VERSION {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
     }
 
     pub fn status(

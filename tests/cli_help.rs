@@ -23,7 +23,7 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
         .stdout(predicate::str::contains("cancel"))
         .stdout(predicate::str::contains("host").not());
 
-    for public_command in ["dashboard", "run", "status", "logs", "cancel"] {
+    for public_command in ["dashboard", "run", "status", "logs", "cancel", "task"] {
         let mut command = Command::cargo_bin("worker").unwrap();
         command.args([public_command, "--help"]);
         command
@@ -32,6 +32,20 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
             .stdout(predicate::str::contains(public_command))
             .stdout(predicate::str::contains("Usage:"));
     }
+}
+
+#[test]
+fn task_help_exposes_lifecycle_commands_and_keeps_runner_hidden() {
+    let mut command = Command::cargo_bin("worker").unwrap();
+    command.args(["task", "--help"]);
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("submit"))
+        .stdout(predicate::str::contains("batch"))
+        .stdout(predicate::str::contains("say"))
+        .stdout(predicate::str::contains("reconcile"))
+        .stdout(predicate::str::contains("runner").not());
 }
 
 #[test]

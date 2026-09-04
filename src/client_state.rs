@@ -8,7 +8,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::ffi::OsStrExt,
     },
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     str::FromStr,
     sync::{
         Arc, Condvar, LazyLock, Mutex, Weak,
@@ -28,11 +28,13 @@ use crate::{
         QueueEntry, QueueEntryKind, QueueSnapshot, QueueState, RemoteUncertainty,
         ResolveOrAbandonRequest,
     },
+    rooted_fs::RootedDir,
     scheduler::{
         AffinityHints, CandidateObservation, CandidateRejection, QueueBlockingReason,
         SchedulerPolicy, Selection, WorkerPreference,
     },
     supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
+    task::{LocalTaskRecord, RunId, RunRecord, RunnerIdentity, RunnerState, TaskId, TurnId},
     transfer::PreacceptanceAbandonmentReceipt,
 };
 
@@ -53,6 +55,10 @@ const AFFINITY_NAME: &CStr = c"affinity";
 const AFFINITY_PROJECTS_NAME: &CStr = c"projects";
 const AFFINITY_WORKTREES_NAME: &CStr = c"worktrees";
 const OBSERVATIONS_NAME: &CStr = c"observations";
+const TASKS_NAME: &CStr = c"tasks";
+const RUNS_NAME: &CStr = c"runs";
+const TURNS_NAME: &CStr = c"turns";
+const RUNNERS_NAME: &CStr = c"runners";
 const OBSERVATION_TTL_MILLIS: u64 = 2_000;
 
 #[doc(hidden)]
@@ -159,6 +165,7 @@ pub(crate) enum DispatchCancellationObservation {
 }
 
 struct ClientStateInner {
+    state_root: PathBuf,
     root: OwnedFd,
     jobs: OwnedFd,
     operations: OwnedFd,
@@ -419,6 +426,34 @@ impl ClientStateStore {
             SyncKind::Root,
             &creation_race,
         )?;
+        let tasks = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            TASKS_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
+        let runs = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            RUNS_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
+        let turns = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            TURNS_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
+        let runners = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            RUNNERS_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
         let _lock =
             StateLock::acquire_with_creation_race(root.as_raw_fd(), &sync_counts, &creation_race)?;
         require_same_device(
@@ -431,6 +466,10 @@ impl ClientStateStore {
                 affinity_projects.as_raw_fd(),
                 affinity_worktrees.as_raw_fd(),
                 observations.as_raw_fd(),
+                tasks.as_raw_fd(),
+                runs.as_raw_fd(),
+                turns.as_raw_fd(),
+                runners.as_raw_fd(),
             ],
         )?;
         validate_root_entries(root.as_raw_fd())?;
@@ -458,6 +497,7 @@ impl ClientStateStore {
 
         Ok(Self {
             inner: Arc::new(ClientStateInner {
+                state_root: state_root.to_path_buf(),
                 root,
                 jobs,
                 operations,
@@ -765,6 +805,10 @@ impl ClientStateStore {
                         true,
                     ))
                 }
+                QueueState::Parked => {
+                    snapshot.entries.remove(index);
+                    Ok((Some(QueueCancel::RemovedWaiting { job_id }), true))
+                }
             }
         })
     }
@@ -804,6 +848,7 @@ impl ClientStateStore {
                     ));
                 }
                 QueueState::Waiting { .. } => DispatchCancellationObservation::NotRequested,
+                QueueState::Parked => DispatchCancellationObservation::NotRequested,
             };
             Ok((observation, false))
         })
@@ -1235,7 +1280,7 @@ impl ClientStateStore {
                 .is_some_and(|other| other.run_id() == run.run_id())
         }) {
             if matches!(sibling.state(), QueueState::Dispatching { .. }) {
-                active.insert(sibling.job_id());
+                active.insert(sibling.job_id().to_string());
             }
             let name = job_file_name(sibling.job_id())?;
             if let Some(record) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? {
@@ -1249,8 +1294,21 @@ impl ClientStateStore {
                 if record.last_status().is_some_and(|status| {
                     matches!(status.state(), JobState::Accepted | JobState::Running)
                 }) {
-                    active.insert(sibling.job_id());
+                    active.insert(sibling.job_id().to_string());
                 }
+            }
+        }
+        // Task turns do not create legacy job records. Their local Active
+        // status is nevertheless an accepted turn and must consume the same
+        // run slot while the queue lock is held.
+        for task in self.list_tasks()? {
+            if task
+                .meta()
+                .run_id()
+                .is_some_and(|run_id| run_id.to_string() == run.run_id().as_str())
+                && task.status().state() == crate::task::TaskState::Active
+            {
+                active.insert(task.meta().task_id().to_string());
             }
         }
         Ok(active.len() < run.max_parallel() as usize)
@@ -1405,6 +1463,14 @@ impl ClientStateStore {
         Ok(record)
     }
 
+    pub fn load_job_optional(&self, job_id: JobId) -> Result<Option<LocalJobRecord>, WorkerError> {
+        match self.load_job(job_id) {
+            Ok(record) => Ok(Some(record)),
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn update_job(&self, replacement: LocalJobRecord) -> Result<(), WorkerError> {
         replacement.validate()?;
         self.require_local_client(&replacement)?;
@@ -1539,6 +1605,397 @@ impl ClientStateStore {
                 Ok(record)
             })
             .collect()
+    }
+
+    /// Persists a task record in the client-owned task registry. Task records
+    /// deliberately live outside the legacy job registry: their prompt and
+    /// runner log are separate owner-only files and never become public job
+    /// metadata.
+    pub fn create_task(&self, record: LocalTaskRecord) -> Result<(), WorkerError> {
+        let task_id = record.meta().task_id();
+        let bytes = task_record_bytes(&record)?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let tasks = self.tasks_dir()?;
+        let name = task_file_name(task_id)?;
+        match tasks.write_private_atomic_no_replace(&name, &bytes) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = read_task_from_dir(&tasks, &name, task_id)?;
+                if existing == record {
+                    Ok(())
+                } else {
+                    Err(queue_error(
+                        "TASK_ID_CONFLICT",
+                        "task ID is already present with different metadata",
+                    ))
+                }
+            }
+            Err(error) => Err(WorkerError::Io(error)),
+        }
+    }
+
+    pub fn load_task(&self, task_id: TaskId) -> Result<LocalTaskRecord, WorkerError> {
+        let tasks = self.tasks_dir()?;
+        let name = task_file_name(task_id)?;
+        read_task_from_dir(&tasks, &name, task_id)
+    }
+
+    pub fn update_task(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
+        let task_id = replacement.meta().task_id();
+        let bytes = task_record_bytes(&replacement)?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let tasks = self.tasks_dir()?;
+        let name = task_file_name(task_id)?;
+        let old = tasks
+            .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
+            .map_err(WorkerError::Io)?;
+        let existing = parse_task_record(&old)?;
+        if existing.meta().task_id() != task_id {
+            return Err(invalid_state("task filename and record identity differ"));
+        }
+        tasks
+            .replace_private_regular_exact(&name, &old, &bytes)
+            .map_err(WorkerError::Io)
+    }
+
+    pub fn list_tasks(&self) -> Result<Vec<LocalTaskRecord>, WorkerError> {
+        let tasks = self.tasks_dir()?;
+        let mut names = tasks.list_names().map_err(WorkerError::Io)?;
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let text = std::str::from_utf8(&name)
+                    .map_err(|_| invalid_state("task registry contains a non-UTF-8 entry"))?;
+                let id_text = text
+                    .strip_suffix(".json")
+                    .ok_or_else(|| invalid_state("task registry contains an unexpected entry"))?;
+                let task_id = id_text.parse::<TaskId>().map_err(|_| {
+                    invalid_state("task registry contains an invalid task filename")
+                })?;
+                read_task_from_dir(&tasks, text, task_id)
+            })
+            .collect()
+    }
+
+    pub fn record_runner(
+        &self,
+        task_id: TaskId,
+        runner: Option<RunnerIdentity>,
+    ) -> Result<LocalTaskRecord, WorkerError> {
+        let record = self.load_task(task_id)?;
+        let replacement = record.with_runner(runner)?;
+        self.update_task(replacement.clone())?;
+        Ok(replacement)
+    }
+
+    pub fn runner_liveness(&self, task_id: TaskId) -> Result<Option<RunnerState>, WorkerError> {
+        let record = self.load_task(task_id)?;
+        let Some(runner) = record.runner() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            match self
+                .inner
+                .owner_inspector
+                .observe(runner.process_identity())
+            {
+                ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous => {
+                    RunnerState::Live
+                }
+                ProcessObservation::Absent | ProcessObservation::Reused => RunnerState::Dead,
+            },
+        ))
+    }
+
+    /// Observes a durable process identity without changing local state.
+    /// Reconciliation uses the store's inspector so injected inspectors and
+    /// normal runner views share one process authority.
+    pub fn process_observation(&self, identity: ProcessIdentity) -> ProcessObservation {
+        self.inner.owner_inspector.observe(identity)
+    }
+
+    pub fn create_run(&self, record: RunRecord) -> Result<(), WorkerError> {
+        let run_id = record.run_id();
+        let bytes = run_record_bytes(&record)?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let runs = self.runs_dir()?;
+        let name = run_file_name(run_id)?;
+        match runs.write_private_atomic_no_replace(&name, &bytes) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = read_run_from_dir(&runs, &name, run_id)?;
+                if existing == record {
+                    Ok(())
+                } else {
+                    Err(queue_error(
+                        "RUN_ID_CONFLICT",
+                        "run ID is already present with different metadata",
+                    ))
+                }
+            }
+            Err(error) => Err(WorkerError::Io(error)),
+        }
+    }
+
+    pub fn load_run(&self, run_id: RunId) -> Result<RunRecord, WorkerError> {
+        let runs = self.runs_dir()?;
+        let name = run_file_name(run_id)?;
+        read_run_from_dir(&runs, &name, run_id)
+    }
+
+    pub fn list_runs(&self) -> Result<Vec<RunRecord>, WorkerError> {
+        let runs = self.runs_dir()?;
+        let mut names = runs.list_names().map_err(WorkerError::Io)?;
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let text = std::str::from_utf8(&name)
+                    .map_err(|_| invalid_state("run registry contains a non-UTF-8 entry"))?;
+                let id_text = text
+                    .strip_suffix(".json")
+                    .ok_or_else(|| invalid_state("run registry contains an unexpected entry"))?;
+                let run_id = id_text
+                    .parse::<RunId>()
+                    .map_err(|_| invalid_state("run registry contains an invalid run filename"))?;
+                read_run_from_dir(&runs, text, run_id)
+            })
+            .collect()
+    }
+
+    pub fn queue_entry(&self, job_id: JobId) -> Result<Option<QueueEntry>, WorkerError> {
+        Ok(self
+            .queue_snapshot()?
+            .entries()
+            .iter()
+            .find(|entry| entry.job_id() == job_id)
+            .cloned())
+    }
+
+    /// Finds a queued task turn by its owner-only turn directory. Task-turn
+    /// queue rows intentionally contain only the opaque turn/job ID, so the
+    /// local prompt namespace is the durable task-to-turn mapping.
+    pub fn queue_entry_for_task_turn(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<QueueEntry>, WorkerError> {
+        let turn_ids = self.turn_ids_for_task(task_id)?;
+        let snapshot = self.queue_snapshot()?;
+        Ok(snapshot
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry.kind() == QueueEntryKind::TaskTurn && turn_ids.contains(&entry.job_id())
+            })
+            .cloned())
+    }
+
+    /// Returns every durable turn directory for a task.  A prompt file is
+    /// removed as soon as the host accepts a turn, so the directory itself is
+    /// the stable task-to-turn locator for both queued and accepted turns.
+    pub fn turn_ids_for_task(&self, task_id: TaskId) -> Result<Vec<TurnId>, WorkerError> {
+        let turns = self.turns_dir()?;
+        let task_dir =
+            match turns.open_child_directory(&relative_path(&task_id.to_string())?, false) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(WorkerError::Io(error)),
+            };
+        let mut turn_ids = task_dir
+            .list_names()
+            .map_err(WorkerError::Io)?
+            .into_iter()
+            .filter_map(|name| std::str::from_utf8(&name).ok()?.parse::<TurnId>().ok())
+            .collect::<Vec<_>>();
+        turn_ids.sort_by_key(|turn_id| turn_id.to_string());
+        Ok(turn_ids)
+    }
+
+    /// Finds the task owning a turn directory.  This is used to start the
+    /// oldest parked row without putting task metadata in the shared queue.
+    pub fn task_id_for_turn(&self, turn_id: TurnId) -> Result<Option<TaskId>, WorkerError> {
+        for task_id in self
+            .list_tasks()?
+            .into_iter()
+            .map(|task| task.meta().task_id())
+        {
+            if self.turn_ids_for_task(task_id)?.contains(&turn_id) {
+                return Ok(Some(task_id));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn park_row(&self, job_id: JobId) -> Result<QueueEntry, WorkerError> {
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            entry.park()?;
+            Ok((entry.clone(), true))
+        })
+    }
+
+    pub fn unpark_oldest(&self, owner: ProcessIdentity) -> Result<Option<QueueEntry>, WorkerError> {
+        owner.validate()?;
+        self.update_queue(|snapshot| {
+            let Some(entry) = snapshot
+                .entries
+                .iter_mut()
+                .filter(|entry| matches!(entry.state(), QueueState::Parked))
+                .min_by_key(|entry| entry.queue_id())
+            else {
+                return Ok((None, false));
+            };
+            entry.unpark(owner)?;
+            Ok((Some(entry.clone()), true))
+        })
+    }
+
+    /// Removes a task-turn row after the runner has durably observed a
+    /// terminal task status. Unlike the legacy job retirement path this does
+    /// not consult the jobs directory, because task turns intentionally have
+    /// no public local job record.
+    pub fn remove_task_turn_after_terminal(
+        &self,
+        turn_id: TurnId,
+        owner: ProcessIdentity,
+    ) -> Result<Option<QueueEntry>, WorkerError> {
+        owner.validate()?;
+        self.update_queue(|snapshot| {
+            let Some(index) = snapshot
+                .entries
+                .iter()
+                .position(|entry| entry.job_id() == turn_id)
+            else {
+                return Ok((None, false));
+            };
+            let entry = &snapshot.entries[index];
+            if entry.kind() != QueueEntryKind::TaskTurn {
+                return Err(queue_error(
+                    "QUEUE_KIND_CONFLICT",
+                    "queue row is not a task turn",
+                ));
+            }
+            match entry.state() {
+                QueueState::Waiting { owner: current } if *current != owner => {
+                    return Err(queue_error(
+                        "QUEUE_OWNER_MISMATCH",
+                        "task turn owner does not match",
+                    ));
+                }
+                QueueState::Dispatching {
+                    dispatch_owner: current,
+                    ..
+                } if *current != owner => {
+                    return Err(queue_error(
+                        "QUEUE_OWNER_MISMATCH",
+                        "task turn dispatch owner does not match",
+                    ));
+                }
+                QueueState::Waiting { .. }
+                | QueueState::Dispatching { .. }
+                | QueueState::Parked => {}
+            }
+            Ok((Some(snapshot.entries.remove(index)), true))
+        })
+    }
+
+    pub fn write_turn_prompt(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        prompt: &str,
+    ) -> Result<(), WorkerError> {
+        if prompt.len() > crate::task::MAX_PROMPT_BYTES {
+            return Err(queue_error(
+                "TASK_PROMPT_TOO_LARGE",
+                "task prompt is too large",
+            ));
+        }
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let turns = self.turns_dir()?;
+        let task_dir = turns
+            .open_child_directory(&relative_path(&task_id.to_string())?, true)
+            .map_err(WorkerError::Io)?;
+        let turn_dir = task_dir
+            .open_child_directory(&relative_path(&turn_id.to_string())?, true)
+            .map_err(WorkerError::Io)?;
+        turn_dir
+            .write_private_atomic_no_replace("prompt.md", prompt.as_bytes())
+            .map_err(WorkerError::Io)
+    }
+
+    pub fn read_turn_prompt(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<String, WorkerError> {
+        let turns = self.turns_dir()?;
+        let task_dir = turns
+            .open_child_directory(&relative_path(&task_id.to_string())?, false)
+            .map_err(WorkerError::Io)?;
+        let turn_dir = task_dir
+            .open_child_directory(&relative_path(&turn_id.to_string())?, false)
+            .map_err(WorkerError::Io)?;
+        let bytes = turn_dir
+            .read_private_regular("prompt.md", crate::task::MAX_PROMPT_BYTES as u64)
+            .map_err(WorkerError::Io)?;
+        String::from_utf8(bytes).map_err(|_| invalid_state("task prompt is not valid UTF-8"))
+    }
+
+    pub fn remove_turn_prompt(&self, task_id: TaskId, turn_id: TurnId) -> Result<(), WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let turns = self.turns_dir()?;
+        let task_dir = turns
+            .open_child_directory(&relative_path(&task_id.to_string())?, false)
+            .map_err(WorkerError::Io)?;
+        let turn_dir = task_dir
+            .open_child_directory(&relative_path(&turn_id.to_string())?, false)
+            .map_err(WorkerError::Io)?;
+        match turn_dir.remove_owned_regular("prompt.md") {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WorkerError::Io(error)),
+        }
+    }
+
+    pub fn open_runner_log(&self, task_id: TaskId, turn_id: TurnId) -> Result<File, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let runners = self.runners_dir()?;
+        let task_dir = runners
+            .open_child_directory(&relative_path(&task_id.to_string())?, true)
+            .map_err(WorkerError::Io)?;
+        let name = format!("{turn_id}.log");
+        if !task_dir.entry_exists(&name).map_err(WorkerError::Io)? {
+            task_dir
+                .write_private_atomic_no_replace(&name, &[])
+                .map_err(WorkerError::Io)?;
+        }
+        task_dir.open_private_append(&name).map_err(WorkerError::Io)
+    }
+
+    fn tasks_dir(&self) -> Result<RootedDir, WorkerError> {
+        let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
+        root.open_child_directory(&relative_path(TASKS_NAME.to_str().unwrap())?, false)
+            .map_err(WorkerError::Io)
+    }
+
+    fn runs_dir(&self) -> Result<RootedDir, WorkerError> {
+        let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
+        root.open_child_directory(&relative_path(RUNS_NAME.to_str().unwrap())?, false)
+            .map_err(WorkerError::Io)
+    }
+
+    fn turns_dir(&self) -> Result<RootedDir, WorkerError> {
+        let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
+        root.open_child_directory(&relative_path(TURNS_NAME.to_str().unwrap())?, false)
+            .map_err(WorkerError::Io)
+    }
+
+    fn runners_dir(&self) -> Result<RootedDir, WorkerError> {
+        let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
+        root.open_child_directory(&relative_path(RUNNERS_NAME.to_str().unwrap())?, false)
+            .map_err(WorkerError::Io)
     }
 
     #[doc(hidden)]
@@ -2222,6 +2679,10 @@ fn local_record_matches_queue_entry(entry: &QueueEntry, record: &LocalJobRecord)
             WorkerPreference::Automatic => true,
             WorkerPreference::Pinned { worker } => meta.worker_name() == worker,
         },
+        QueueState::Parked => match entry.preference() {
+            WorkerPreference::Automatic => true,
+            WorkerPreference::Pinned { worker } => meta.worker_name() == worker,
+        },
     };
     meta.job_id() == entry.job_id()
         && meta.client_id() == entry.client_id()
@@ -2439,6 +2900,93 @@ fn read_job_with_identity(
 fn job_file_name(job_id: JobId) -> Result<CString, WorkerError> {
     CString::new(format!("{job_id}.json"))
         .map_err(|_| invalid_state("job ID produced an invalid filename"))
+}
+
+fn task_file_name(task_id: TaskId) -> Result<String, WorkerError> {
+    let name = format!("{task_id}.json");
+    if name.as_bytes().contains(&0) {
+        return Err(invalid_state("task ID produced an invalid filename"));
+    }
+    Ok(name)
+}
+
+fn run_file_name(run_id: RunId) -> Result<String, WorkerError> {
+    let name = format!("{run_id}.json");
+    if name.as_bytes().contains(&0) {
+        return Err(invalid_state("run ID produced an invalid filename"));
+    }
+    Ok(name)
+}
+
+fn relative_path(value: &str) -> Result<crate::inputs::RelativePath, WorkerError> {
+    crate::inputs::RelativePath::parse(value.as_bytes())
+        .map_err(|_| invalid_state("state path is not a safe relative path"))
+}
+
+fn task_record_bytes(record: &LocalTaskRecord) -> Result<Vec<u8>, WorkerError> {
+    record
+        .canonical_bytes()
+        .map_err(|_| invalid_state("task record cannot be serialized"))
+}
+
+fn run_record_bytes(record: &RunRecord) -> Result<Vec<u8>, WorkerError> {
+    record
+        .canonical_bytes()
+        .map_err(|_| invalid_state("run record cannot be serialized"))
+}
+
+fn parse_task_record(bytes: &[u8]) -> Result<LocalTaskRecord, WorkerError> {
+    if bytes.len() > MAX_STATE_FILE_BYTES {
+        return Err(invalid_state("task record is too large"));
+    }
+    let record: LocalTaskRecord =
+        serde_json::from_slice(bytes).map_err(|_| invalid_state("task record is corrupt"))?;
+    if task_record_bytes(&record)? != bytes {
+        return Err(invalid_state("task record is not canonical JSON"));
+    }
+    Ok(record)
+}
+
+fn parse_run_record(bytes: &[u8]) -> Result<RunRecord, WorkerError> {
+    if bytes.len() > MAX_STATE_FILE_BYTES {
+        return Err(invalid_state("run record is too large"));
+    }
+    let record: RunRecord =
+        serde_json::from_slice(bytes).map_err(|_| invalid_state("run record is corrupt"))?;
+    if run_record_bytes(&record)? != bytes {
+        return Err(invalid_state("run record is not canonical JSON"));
+    }
+    Ok(record)
+}
+
+fn read_task_from_dir(
+    directory: &RootedDir,
+    name: &str,
+    task_id: TaskId,
+) -> Result<LocalTaskRecord, WorkerError> {
+    let bytes = directory
+        .read_private_regular(name, MAX_STATE_FILE_BYTES as u64)
+        .map_err(WorkerError::Io)?;
+    let record = parse_task_record(&bytes)?;
+    if record.meta().task_id() != task_id {
+        return Err(invalid_state("task filename and record identity differ"));
+    }
+    Ok(record)
+}
+
+fn read_run_from_dir(
+    directory: &RootedDir,
+    name: &str,
+    run_id: RunId,
+) -> Result<RunRecord, WorkerError> {
+    let bytes = directory
+        .read_private_regular(name, MAX_STATE_FILE_BYTES as u64)
+        .map_err(WorkerError::Io)?;
+    let record = parse_run_record(&bytes)?;
+    if record.run_id() != run_id {
+        return Err(invalid_state("run filename and record identity differ"));
+    }
+    Ok(record)
 }
 
 struct OperationFile {
@@ -3164,7 +3712,7 @@ fn validate_root_entries(root: RawFd) -> Result<(), WorkerError> {
     for entry in directory_entries(root)? {
         match entry.to_bytes() {
             b"client-id" | b"jobs" | b".mac-worker-state" | b"jobs.lock" | b"queue"
-            | b"affinity" | b"observations" => {}
+            | b"affinity" | b"observations" | b"tasks" | b"runs" | b"turns" | b"runners" => {}
             bytes if std::str::from_utf8(bytes).is_err() => {
                 return Err(invalid_state("state root contains a non-UTF-8 entry"));
             }

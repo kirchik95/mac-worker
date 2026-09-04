@@ -13,13 +13,14 @@ use crate::{
     error::WorkerError,
     job::{JobId, ProcessIdentity},
     redaction::RedactionBoundary,
+    scheduler::WorkerPreference,
 };
 
 pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
 pub const MAX_TITLE_BYTES: usize = 120;
 pub const MAX_FOLLOWUPS: u32 = 100;
 pub const DEFAULT_MAX_FOLLOWUPS: u32 = 10;
-const DEFAULT_TURN_TIMEOUT_MILLIS: u64 = 30 * 60 * 1000;
+const DEFAULT_TURN_TIMEOUT_MILLIS: u64 = 45 * 60 * 1000;
 const MAX_IDENTITY_BYTES: usize = 256;
 const MAX_HEX_ID_BYTES: usize = 64;
 
@@ -217,6 +218,10 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Closed | Self::Abandoned | Self::Lost)
+    }
+
     pub fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
@@ -678,6 +683,58 @@ pub struct TaskSummary {
     updated_at_millis: u64,
 }
 
+impl TaskSummary {
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub fn run_id(&self) -> Option<RunId> {
+        self.run_id
+    }
+
+    pub fn agent(&self) -> AgentKind {
+        self.agent
+    }
+
+    pub fn title(&self) -> &TaskTitle {
+        &self.title
+    }
+
+    pub fn state(&self) -> TaskState {
+        self.state
+    }
+
+    pub fn last_outcome(&self) -> Option<&TaskOutcome> {
+        self.last_outcome.as_ref()
+    }
+
+    pub fn worker(&self) -> Option<&str> {
+        self.worker.as_deref()
+    }
+
+    pub fn turns(&self) -> u32 {
+        self.turns
+    }
+
+    pub fn runner(&self) -> Option<RunnerState> {
+        self.runner
+    }
+
+    pub fn updated_at_millis(&self) -> u64 {
+        self.updated_at_millis
+    }
+
+    /// Replaces the advisory runner state used by read-only client views.
+    ///
+    /// The durable task record only stores the runner identity.  Callers that
+    /// project a summary can therefore attach the result of a process-table
+    /// observation without changing the task record itself.
+    pub fn with_runner_state(mut self, runner: Option<RunnerState>) -> Self {
+        self.runner = runner;
+        self
+    }
+}
+
 impl Serialize for TaskSummary {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut record = serializer.serialize_struct("TaskSummary", 10)?;
@@ -1012,6 +1069,35 @@ impl LocalTaskRecord {
         self.pinned_worker.as_deref()
     }
 
+    pub fn preference(&self) -> WorkerPreference {
+        match &self.pinned_worker {
+            Some(worker) => WorkerPreference::Pinned {
+                worker: worker.clone(),
+            },
+            None => WorkerPreference::Automatic,
+        }
+    }
+
+    pub fn status_observed_at_millis(&self) -> Option<u64> {
+        self.status_observed_at_millis
+    }
+
+    pub fn runner(&self) -> Option<&RunnerIdentity> {
+        self.runner.as_ref()
+    }
+
+    pub fn fetched_head(&self) -> Option<&BaseOid> {
+        self.fetched_head.as_ref()
+    }
+
+    pub fn wait_for_capacity(&self) -> bool {
+        self.wait_for_capacity
+    }
+
+    pub fn abandon_code(&self) -> Option<&str> {
+        self.abandon_code.as_deref()
+    }
+
     pub fn repo_id(&self) -> &str {
         &self.repo_id
     }
@@ -1033,6 +1119,79 @@ impl LocalTaskRecord {
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
+    }
+
+    pub fn with_status(&self, status: TaskStatus) -> Result<Self, WorkerError> {
+        Self::new(
+            self.meta.clone(),
+            status,
+            self.status_observed_at_millis,
+            self.runner.clone(),
+            self.fetched_head.clone(),
+            self.repo_id.clone(),
+            self.pinned_worker.clone(),
+            self.wait_for_capacity,
+            self.abandon_code.clone(),
+        )
+    }
+
+    pub fn with_status_observed_at(
+        &self,
+        observed_at_millis: Option<u64>,
+    ) -> Result<Self, WorkerError> {
+        Self::new(
+            self.meta.clone(),
+            self.status.clone(),
+            observed_at_millis,
+            self.runner.clone(),
+            self.fetched_head.clone(),
+            self.repo_id.clone(),
+            self.pinned_worker.clone(),
+            self.wait_for_capacity,
+            self.abandon_code.clone(),
+        )
+    }
+
+    pub fn with_runner(&self, runner: Option<RunnerIdentity>) -> Result<Self, WorkerError> {
+        Self::new(
+            self.meta.clone(),
+            self.status.clone(),
+            self.status_observed_at_millis,
+            runner,
+            self.fetched_head.clone(),
+            self.repo_id.clone(),
+            self.pinned_worker.clone(),
+            self.wait_for_capacity,
+            self.abandon_code.clone(),
+        )
+    }
+
+    pub fn with_fetched_head(&self, fetched_head: Option<BaseOid>) -> Result<Self, WorkerError> {
+        Self::new(
+            self.meta.clone(),
+            self.status.clone(),
+            self.status_observed_at_millis,
+            self.runner.clone(),
+            fetched_head,
+            self.repo_id.clone(),
+            self.pinned_worker.clone(),
+            self.wait_for_capacity,
+            self.abandon_code.clone(),
+        )
+    }
+
+    pub fn with_abandon_code(&self, abandon_code: Option<String>) -> Result<Self, WorkerError> {
+        Self::new(
+            self.meta.clone(),
+            self.status.clone(),
+            self.status_observed_at_millis,
+            self.runner.clone(),
+            self.fetched_head.clone(),
+            self.repo_id.clone(),
+            self.pinned_worker.clone(),
+            self.wait_for_capacity,
+            abandon_code,
+        )
     }
 
     fn validate(&self) -> Result<(), WorkerError> {
@@ -1127,6 +1286,26 @@ impl RunRecord {
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
+    }
+
+    pub fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn task_ids(&self) -> &[TaskId] {
+        &self.task_ids
+    }
+
+    pub fn max_parallel(&self) -> u32 {
+        self.max_parallel
+    }
+
+    pub fn created_at_millis(&self) -> u64 {
+        self.created_at_millis
     }
 
     fn validate(&self) -> Result<(), WorkerError> {

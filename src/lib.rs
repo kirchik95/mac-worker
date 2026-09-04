@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
 };
 
-use cli::{Cli, Command, HiddenComponent, HostCommand};
+use cli::{Cli, Command, HiddenComponent, HostCommand, TaskCommand};
 use client_state::ClientStateStore;
 use config::{Config, WorkerEntry};
 use dashboard::command::{
@@ -42,6 +42,7 @@ use supervisor::{
     SUPERVISOR_LOCK_FD, Supervisor, SystemProcessInspector, SystemSupervisorLauncher,
     validate_detached_supervisor_context,
 };
+use task_client::{TaskClient, TaskListFilter, TaskSubmitRequest, WaitSelector};
 use task_store::{
     TaskCloseRequest, TaskDiffRequest, TaskPrepareRequest, TaskStatusRequest, TaskStore,
 };
@@ -51,6 +52,7 @@ use transfer::{
 };
 use transport::{SshTransport, WorkersService};
 use turn::TaskTurnRequest;
+use turn_runner::{DetachedRunnerExecutor, InlineRunnerExecutor, TurnRunner};
 
 pub mod agent;
 pub mod agent_facts;
@@ -86,11 +88,13 @@ pub mod scheduler_adapter;
 pub mod snapshot;
 pub mod supervisor;
 pub mod task;
+pub mod task_client;
 pub mod task_store;
 pub mod transfer;
 pub mod transfer_repo;
 pub mod transport;
 pub mod turn;
+pub mod turn_runner;
 
 #[doc(hidden)]
 #[derive(Debug, Clone)]
@@ -198,6 +202,12 @@ fn execute_with_context(
         )),
         Command::Run { .. } => Err(WorkerError::Protocol(
             "public run requires the stdio execution boundary".into(),
+        )),
+        Command::Task { .. } => Err(WorkerError::Protocol(
+            "public task commands require the stdio execution boundary".into(),
+        )),
+        Command::Runner { .. } => Err(WorkerError::Protocol(
+            "hidden runner requires the stdio execution boundary".into(),
         )),
         Command::Status { job_id } => {
             let paths = discover_paths(cli.config, runtime)?;
@@ -554,6 +564,9 @@ pub fn run_with_stdio_in_context(
     if matches!(cli.command, Command::Run { .. } | Command::Logs { .. }) {
         return run_public_streaming_command(cli, runner, runtime, stdout, stderr);
     }
+    if matches!(&cli.command, Command::Task { .. } | Command::Runner { .. }) {
+        return run_task_command(cli, runner, runtime, stdout, stderr);
+    }
     run_with_rsync_executor_in_context(
         cli,
         runner,
@@ -602,6 +615,573 @@ fn run_dashboard_command(
             write_error(stderr, &error);
             error.exit_code()
         }
+    }
+}
+
+static DETACHED_TASK_EXECUTOR: DetachedRunnerExecutor = DetachedRunnerExecutor;
+static INLINE_TASK_EXECUTOR: InlineRunnerExecutor = InlineRunnerExecutor;
+
+fn run_task_command(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    runtime: &RuntimeContext,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let json = cli.json;
+    let result = (|| -> Result<u8, WorkerError> {
+        let paths = discover_paths(cli.config, runtime)?;
+        let config = Config::load(&paths.config)?;
+        let client_state = ClientStateStore::open(&paths.state)?;
+        let command = cli.command;
+        let inline = matches!(
+            &command,
+            Command::Task {
+                command: TaskCommand::Submit { wait: true, .. }
+            } | Command::Task {
+                command: TaskCommand::Say { wait: true, .. }
+            }
+        );
+        let executor: &'static dyn turn_runner::RunnerExecutor = if inline {
+            &INLINE_TASK_EXECUTOR
+        } else {
+            &DETACHED_TASK_EXECUTOR
+        };
+        let client = TaskClient::new(runner, &config, &paths, &client_state, executor);
+
+        match command {
+            Command::Runner { task_id, turn_id } => {
+                let task_id = task_id
+                    .expose()
+                    .parse::<crate::task::TaskId>()
+                    .map_err(|_| WorkerError::Protocol("invalid runner task ID".into()))?;
+                let turn_id = turn_id
+                    .expose()
+                    .parse::<crate::task::TurnId>()
+                    .map_err(|_| WorkerError::Protocol("invalid runner turn ID".into()))?;
+                let outcome = TurnRunner::new(runner, &config, &paths, &client_state, executor)
+                    .run(task_id, turn_id, Some(stdout))?;
+                Ok(outcome.exit_code())
+            }
+            Command::Task { command } => {
+                run_task_subcommand(command, &client, runtime, json, stdout, stderr)
+            }
+            _ => Err(WorkerError::Protocol(
+                "task dispatcher received a non-task command".into(),
+            )),
+        }
+    })();
+
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            if json {
+                match write_json_error_event(stdout, &error) {
+                    Ok(()) => error.exit_code(),
+                    Err(_) => crate::error::ExitKind::Io as u8,
+                }
+            } else {
+                write_public_diagnostic(stderr, &error);
+                error.exit_code()
+            }
+        }
+    }
+}
+
+fn run_task_subcommand(
+    command: TaskCommand,
+    client: &TaskClient<'_>,
+    runtime: &RuntimeContext,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<u8, WorkerError> {
+    match command {
+        TaskCommand::Submit {
+            agent,
+            model,
+            prompt,
+            prompt_file,
+            title,
+            project,
+            base,
+            wip,
+            includes,
+            timeout,
+            max_turns,
+            max_budget,
+            max_followups,
+            close_on,
+            env_profile,
+            worker,
+            source,
+            publish,
+            publish_branch,
+            no_wait,
+            wait,
+        } => {
+            validate_task_scope_options(
+                source.as_deref(),
+                publish.as_deref(),
+                publish_branch.as_deref(),
+            )?;
+            let prompt = read_prompt(prompt, prompt_file)?;
+            let limits = make_task_limits(timeout, max_turns, max_budget, max_followups)?;
+            let report = client.submit_titled(
+                TaskSubmitRequest {
+                    agent: parse_task_agent(agent.as_deref().unwrap_or("codex"))?,
+                    model,
+                    prompt,
+                    project: project.unwrap_or(runtime.current_dir()?),
+                    base,
+                    wip,
+                    cli_includes: includes,
+                    limits,
+                    close_policy: parse_task_close_policy(close_on.as_deref())?,
+                    env_profile,
+                    preference: worker.map_or(WorkerPreference::Automatic, |worker| {
+                        WorkerPreference::Pinned { worker }
+                    }),
+                    wait_for_capacity: !no_wait,
+                    attached: wait,
+                    run_id: None,
+                },
+                title,
+                stdout,
+                stderr,
+            )?;
+            write_task_report(&report, json, stdout)?;
+            Ok(if wait {
+                report.status().last_outcome().map_or(0, |_| 0)
+            } else {
+                0
+            })
+        }
+        TaskCommand::Batch {
+            file,
+            name,
+            max_parallel,
+            wait,
+        } => {
+            let report = client.batch(&file, name, max_parallel, stdout)?;
+            write_run_report(&report, json, stdout)?;
+            if wait {
+                let waited = client.wait(WaitSelector::Run(report.run_id()), None)?;
+                if json {
+                    write_json_line(
+                        stdout,
+                        &serde_json::json!({
+                            "protocol_version": PROTOCOL_VERSION,
+                            "run_id": report.run_id().to_string(),
+                            "task_ids": waited.task_ids(),
+                            "exit_code": waited.exit_code(),
+                        }),
+                    )?;
+                }
+                Ok(waited.exit_code())
+            } else {
+                Ok(0)
+            }
+        }
+        TaskCommand::List { run, state, full } => {
+            let filter = TaskListFilter {
+                run_id: run,
+                state: state.as_deref().map(parse_task_state).transpose()?,
+                full,
+            };
+            let report = client.list(filter)?;
+            write_task_list_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        TaskCommand::Status { task_id, full: _ } => {
+            let report = client.status(task_id)?;
+            write_task_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        TaskCommand::Logs {
+            task_id,
+            turn,
+            follow,
+            raw,
+        } => {
+            client.logs(task_id, turn, follow, raw, stdout, stderr)?;
+            Ok(0)
+        }
+        TaskCommand::Diff { task_id, stat } => {
+            client.diff(task_id, stat, stdout)?;
+            Ok(0)
+        }
+        TaskCommand::Say {
+            task_id,
+            message,
+            message_file,
+            wait,
+        } => {
+            let message = read_prompt(message, message_file)?;
+            let report = client.say(task_id, message, wait, stdout, stderr)?;
+            write_task_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        TaskCommand::Cancel { task_id } => {
+            let report = client.cancel(task_id)?;
+            write_task_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        TaskCommand::Result { task_id } => {
+            let report = client.result(task_id)?;
+            write_task_result_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        TaskCommand::Fetch { task_id } => {
+            let report = client.fetch(task_id)?;
+            write_fetch_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        TaskCommand::Close { task_id, discard } => {
+            let report = client.close(task_id, discard)?;
+            write_task_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        TaskCommand::Wait {
+            task_id,
+            run,
+            timeout,
+        } => {
+            let selector = match (task_id, run) {
+                (Some(task_id), None) => WaitSelector::Task(task_id),
+                (None, Some(run)) => WaitSelector::Run(run),
+                _ => {
+                    return Err(WorkerError::Task {
+                        code: "TASK_CONFIG_INVALID",
+                        message: "wait requires exactly one of --task-id or --run".into(),
+                    });
+                }
+            };
+            let report = client.wait(selector, timeout)?;
+            write_wait_report(&report, json, stdout)?;
+            Ok(report.exit_code())
+        }
+        TaskCommand::Reconcile => {
+            let report = client.reconcile_runners()?;
+            if json {
+                write_json_line(
+                    stdout,
+                    &serde_json::json!({
+                        "protocol_version": PROTOCOL_VERSION,
+                        "replaced_runners": report.replaced_runners(),
+                        "started_runners": report.started_runners(),
+                    }),
+                )?;
+            } else {
+                writeln!(
+                    stdout,
+                    "runners: {} replaced, {} started",
+                    report.replaced_runners(),
+                    report.started_runners()
+                )?;
+                stdout.flush()?;
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn read_prompt(
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+) -> Result<String, WorkerError> {
+    match (prompt, prompt_file) {
+        (Some(prompt), None) => Ok(prompt),
+        (None, Some(path)) => std::fs::read_to_string(path).map_err(WorkerError::Io),
+        _ => Err(WorkerError::Task {
+            code: "TASK_CONFIG_INVALID",
+            message: "exactly one prompt source is required".into(),
+        }),
+    }
+}
+
+fn validate_task_scope_options(
+    source: Option<&str>,
+    publish: Option<&str>,
+    publish_branch: Option<&str>,
+) -> Result<(), WorkerError> {
+    if source.is_some_and(|source| source != "local") {
+        return Err(WorkerError::Task {
+            code: "TASK_CONFIG_INVALID",
+            message: "only source=local is supported in this phase".into(),
+        });
+    }
+    if publish.is_some_and(|publish| publish != "fetch") || publish_branch.is_some() {
+        return Err(WorkerError::Task {
+            code: "TASK_CONFIG_INVALID",
+            message: "only publish=fetch is supported in this phase".into(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_task_agent(value: &str) -> Result<crate::agent::AgentKind, WorkerError> {
+    match value {
+        "codex" => Ok(crate::agent::AgentKind::Codex),
+        "claude" => Ok(crate::agent::AgentKind::Claude),
+        "cursor" => Ok(crate::agent::AgentKind::Cursor),
+        "opencode" => Ok(crate::agent::AgentKind::Opencode),
+        _ => Err(WorkerError::Task {
+            code: "AGENT_UNSUPPORTED",
+            message: "unknown agent".into(),
+        }),
+    }
+}
+
+fn parse_task_close_policy(value: Option<&str>) -> Result<crate::task::ClosePolicy, WorkerError> {
+    match value.unwrap_or("never") {
+        "done" => Ok(crate::task::ClosePolicy::Done),
+        "never" => Ok(crate::task::ClosePolicy::Never),
+        _ => Err(WorkerError::Task {
+            code: "TASK_CONFIG_INVALID",
+            message: "close_on must be done or never".into(),
+        }),
+    }
+}
+
+fn make_task_limits(
+    timeout: Option<std::time::Duration>,
+    max_turns: Option<u32>,
+    max_budget: Option<u64>,
+    max_followups: Option<u32>,
+) -> Result<crate::task::TaskLimits, WorkerError> {
+    let defaults = crate::task::TaskLimits::default();
+    let timeout_millis = timeout
+        .map(|timeout| {
+            u64::try_from(timeout.as_millis()).map_err(|_| WorkerError::Task {
+                code: "TASK_CONFIG_INVALID",
+                message: "timeout is too large".into(),
+            })
+        })
+        .transpose()?
+        .unwrap_or(defaults.turn.timeout_millis);
+    let turn = crate::agent::TurnLimits::new(
+        timeout_millis,
+        max_turns.or(defaults.turn.max_turns),
+        max_budget.or(defaults.turn.max_budget_usd_cents),
+    )
+    .map_err(|error| WorkerError::Task {
+        code: "TASK_CONFIG_INVALID",
+        message: error.to_string(),
+    })?;
+    crate::task::TaskLimits::new(turn, max_followups.unwrap_or(defaults.max_followups))
+}
+
+fn parse_task_state(value: &str) -> Result<crate::task::TaskState, WorkerError> {
+    match value {
+        "queued" => Ok(crate::task::TaskState::Queued),
+        "active" => Ok(crate::task::TaskState::Active),
+        "open" => Ok(crate::task::TaskState::Open),
+        "closed" => Ok(crate::task::TaskState::Closed),
+        "abandoned" => Ok(crate::task::TaskState::Abandoned),
+        "lost" => Ok(crate::task::TaskState::Lost),
+        _ => Err(WorkerError::Task {
+            code: "TASK_CONFIG_INVALID",
+            message: "unknown task state".into(),
+        }),
+    }
+}
+
+fn write_task_report(
+    report: &task_client::TaskReport,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        write_json_line(
+            stdout,
+            &serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "task_id": report.task_id().to_string(),
+                "run_id": report.run_id().map(|id| id.to_string()),
+                "status": report.status(),
+                "runner": report.runner(),
+                "events": report.events(),
+            }),
+        )
+    } else {
+        let worker = report.status().worker().unwrap_or("unassigned");
+        writeln!(
+            stdout,
+            "task {}: {} ({worker})",
+            report.task_id(),
+            task_state_name(report.status().state())
+        )?;
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+fn write_task_list_report(
+    report: &task_client::TaskListReport,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        write_json_line(
+            stdout,
+            &serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "tasks": report.tasks(),
+                "progress": report.progress(),
+            }),
+        )
+    } else {
+        for task in report.tasks() {
+            writeln!(
+                stdout,
+                "{}: {} ({})",
+                task.task_id(),
+                task_state_name(task.state()),
+                task.worker().unwrap_or("unassigned")
+            )?;
+        }
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+fn write_task_result_report(
+    report: &task_client::TaskResultReport,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        write_json_line(
+            stdout,
+            &serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "task_id": report.task_id().to_string(),
+                "status": report.status(),
+                "branch": report.branch(),
+                "fetch": report.fetch_instruction(),
+            }),
+        )
+    } else {
+        writeln!(
+            stdout,
+            "task {}: {}",
+            report.task_id(),
+            task_state_name(report.status().state())
+        )?;
+        if let Some(summary) = report.status().summary() {
+            writeln!(stdout, "summary: {summary}")?;
+        }
+        if !report.status().questions().is_empty() {
+            writeln!(
+                stdout,
+                "questions: {}",
+                report.status().questions().join("; ")
+            )?;
+        }
+        if !report.status().files_changed().is_empty() {
+            writeln!(
+                stdout,
+                "files: {}",
+                report.status().files_changed().join(", ")
+            )?;
+        }
+        writeln!(stdout, "branch: {}", report.branch())?;
+        writeln!(stdout, "fetch: {}", report.fetch_instruction())?;
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+fn write_fetch_report(
+    report: &task_client::FetchReport,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        write_json_line(
+            stdout,
+            &serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "task_id": report.task_id().to_string(),
+                "head_oid": report.head(),
+                "local_ref": report.local_ref(),
+            }),
+        )
+    } else {
+        writeln!(
+            stdout,
+            "{} -> {} ({})",
+            report.task_id(),
+            report.local_ref(),
+            report.head()
+        )?;
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+fn write_wait_report(
+    report: &task_client::WaitReport,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        write_json_line(
+            stdout,
+            &serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "task_ids": report.task_ids(),
+                "exit_code": report.exit_code(),
+            }),
+        )
+    } else {
+        writeln!(stdout, "wait complete (exit {})", report.exit_code())?;
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+fn write_run_report(
+    report: &task_client::RunReport,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        write_json_line(
+            stdout,
+            &serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "run_id": report.run_id().to_string(),
+                "task_ids": report.task_ids(),
+            }),
+        )
+    } else {
+        writeln!(stdout, "run {}", report.run_id())?;
+        for task_id in report.task_ids() {
+            writeln!(stdout, "  task {task_id}")?;
+        }
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+fn write_json_line(stdout: &mut dyn Write, value: &serde_json::Value) -> Result<(), WorkerError> {
+    serde_json::to_writer(&mut *stdout, value)
+        .map_err(|error| WorkerError::Io(io::Error::other(error)))?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn task_state_name(state: crate::task::TaskState) -> &'static str {
+    match state {
+        crate::task::TaskState::Queued => "queued",
+        crate::task::TaskState::Active => "active",
+        crate::task::TaskState::Open => "open",
+        crate::task::TaskState::Closed => "closed",
+        crate::task::TaskState::Abandoned => "abandoned",
+        crate::task::TaskState::Lost => "lost",
     }
 }
 
