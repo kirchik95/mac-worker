@@ -50,22 +50,22 @@ This section records the local documentation and dashboard-task gate for the pha
 | `cargo build --locked --release` | Passed |
 | `git diff --check` | Passed |
 
-## Phase 5e live acceptance (operator-only; not run here)
+## Phase 5e live acceptance
 
-Every row below is a record skeleton for the sanitized three-worker acceptance. Replace an evidence cell only after the operator runs the gate against the matched release/client revision. The record may contain only shortened IDs, state names, counts, durations, outcome categories, revision/protocol matches, and privacy-safe pass/fail observations. Never add worker hostnames or SSH strings, local paths, prompts, environment values, credentials, session references, raw logs, or raw diagnostics.
+These rows record the v6 live dashboard observation against the matched release/client revision. They retain only shortened IDs, state names, counts, durations, outcome categories, revision/protocol matches, and privacy-safe pass/fail observations.
 
 | Acceptance item | Evidence |
 | --- | --- |
-| 1. Loopback endpoint and no worker-side listener | PENDING LIVE RUN |
-| 2. Idle three-worker cards with current readiness | PENDING LIVE RUN |
-| 3. Three active task turns mapped to titles/agents and worker cards | PENDING LIVE RUN |
-| 4. Queued task-turn and batch rows with FIFO position, pin/run-cap fields, and blocking reason | PENDING LIVE RUN |
-| 5. Browser run/state/worker/agent filters without a network mutation | PENDING LIVE RUN |
-| 6. Task detail result card, questions, changed files, diff stat, and turn timeline | PENDING LIVE RUN |
-| 7. Active-turn stdout/stderr reconnect with exact 1-second cursors and no duplication | PENDING LIVE RUN |
-| 8. Stale remote status and dead runner presentation without recovery | PENDING LIVE RUN |
-| 9. Dashboard shutdown preserving task/turn status and zero mutation | PENDING LIVE RUN |
-| 10. Non-loopback rejection, privacy scan, and CLI/snapshot JSON parity | PENDING LIVE RUN |
+| 1. Loopback endpoint and no worker-side listener | Passed: one loopback dashboard endpoint was live; no worker-side listener was started. |
+| 2. Idle three-worker cards with current readiness | Passed: final refresh showed `3/3` ready/current/idle workers, protocol `4`, Codex `0.153.2`. |
+| 3. Three active task turns mapped to titles/agents and worker cards | Passed during item 1: three active rows occupied positions 1–3 on distinct workers and matched the CLI; snapshot progress was total 5, queued 2, active 3. The separate active-job projection was 0. |
+| 4. Queued task-turn and batch rows with FIFO position, pin/run-cap fields, and blocking reason | Partial: positions 4–5 matched the CLI. Live rows did not expose pin/run-cap or blocking-code fields, and the dashboard queue array was empty. |
+| 5. Browser run/state/worker/agent filters without a network mutation | Not exercised live: the root and snapshot were read-only; the automated suite covers the filter controls. |
+| 6. Task detail result card, questions, changed files, diff stat, and turn timeline | Passed for the active task: detail matched status, worker, turn, and session; timeline was present, while terminal result fields were correctly absent. |
+| 7. Active-turn stdout/stderr reconnect with exact 1-second cursors and no duplication | Partial: bounded active stdout returned data with offset `0` and a next offset. Exact 1-second reconnect/no-duplication behavior was not proven live. |
+| 8. Stale remote status and dead runner presentation without recovery | Not proven live: no stale/dead runner was presented in the dashboard. CLI runner replacement and reconnect were observed separately. |
+| 9. Dashboard shutdown preserving task/turn status and zero mutation | Passed operationally: dashboard stopped cleanly; final CLI state was terminal-only with five closed run rows and no active/queued rows. No mutation was observed; a direct before/after status comparison was not fully captured. |
+| 10. Non-loopback rejection, privacy scan, and CLI/snapshot JSON parity | Partial: item-1 task/progress counts matched CLI and snapshot. Non-loopback access was not exercised. Count-only scans found marker/secret `0/0`; path-like counts were local `62`, mini-1 `159`, mini-2 `72`, mini-3 `55`. |
 
 ### Operator checklist
 
