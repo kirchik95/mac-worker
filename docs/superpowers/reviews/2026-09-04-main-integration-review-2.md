@@ -8,7 +8,7 @@ The review used the task-pool and dashboard specifications, the two earlier
 review reports, dispatch and error boundaries, and the relevant focused test
 suites. Closed findings from the earlier reports are not repeated here.
 
-The review found six issues: three major findings and one minor finding were
+The review found six issues: two major findings and one minor finding were
 fixed on this branch; three major findings remain deferred because their
 correct repairs require files the brief protects. The required dashboard suites
 passed outside the restricted terminal sandbox, where the loopback listener is
