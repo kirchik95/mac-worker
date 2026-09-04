@@ -193,6 +193,7 @@ impl<'a> TurnRunner<'a> {
         turn_id: TurnId,
         mut follow: Option<&mut dyn Write>,
     ) -> Result<TurnOutcomeReport, WorkerError> {
+        ignore_sigpipe();
         // Legacy batch dispatch recovery deliberately skips task-turn rows,
         // but keeping the call here preserves the runner's recovery stage
         // and lets future mixed queues repair old rows without touching the
@@ -935,10 +936,7 @@ impl<'a> TurnRunner<'a> {
                 let bytes = chunk.decoded_bytes()?;
                 if !bytes.is_empty() {
                     log.file.write_all(&bytes).map_err(WorkerError::Io)?;
-                    if let Some(stdout) = follow.as_deref_mut() {
-                        stdout.write_all(&bytes).map_err(WorkerError::Io)?;
-                        stdout.flush().map_err(WorkerError::Io)?;
-                    }
+                    write_follower(follow, &bytes);
                 }
                 offsets[index] = chunk.next_offset();
             }
@@ -1153,16 +1151,30 @@ fn append_event(
     follow: &mut Option<&mut dyn Write>,
     event: serde_json::Value,
 ) -> Result<(), WorkerError> {
-    let line = serde_json::to_vec(&event)
+    let mut line = serde_json::to_vec(&event)
         .map_err(|error| task_error("TASK_EVENT_INVALID", error.to_string()))?;
+    line.push(b'\n');
     log.file.write_all(&line).map_err(WorkerError::Io)?;
-    log.file.write_all(b"\n").map_err(WorkerError::Io)?;
-    if let Some(stdout) = follow.as_deref_mut() {
-        stdout.write_all(&line).map_err(WorkerError::Io)?;
-        stdout.write_all(b"\n").map_err(WorkerError::Io)?;
-        stdout.flush().map_err(WorkerError::Io)?;
-    }
+    write_follower(follow, &line);
     Ok(())
+}
+
+fn write_follower(follow: &mut Option<&mut dyn Write>, bytes: &[u8]) {
+    let failed = follow
+        .as_deref_mut()
+        .is_some_and(|writer| writer.write_all(bytes).is_err() || writer.flush().is_err());
+    if failed {
+        *follow = None;
+    }
+}
+
+fn ignore_sigpipe() {
+    // Rust normally installs SIG_IGN for SIGPIPE. Keep that invariant for
+    // callers embedding the runner so a closed follower is reported by its
+    // writer instead of terminating the process.
+    unsafe {
+        let _ = libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
 }
 
 fn require_exact_lease(
