@@ -1,10 +1,12 @@
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
     net::TcpStream,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
     time::Duration,
 };
 
@@ -14,8 +16,8 @@ use mac_worker::{
         model::{
             ApiError, DASHBOARD_API_VERSION, DashboardCommandMode, DashboardCommandSummary,
             DashboardError, DashboardJob, DashboardJobState, DashboardLogChunk,
-            DashboardMemoryPressure, DashboardSlotState, DashboardWorker, Freshness, SlotSummary,
-            SystemSummary, WorkerHealth,
+            DashboardMemoryPressure, DashboardQueueEntry, DashboardSlotState, DashboardWorker,
+            Freshness, SlotSummary, SystemSummary, WorkerHealth,
         },
         service::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
@@ -129,6 +131,107 @@ async fn router_rejects_a_host_that_does_not_match_the_actual_loopback_listener(
     server.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_fixture_preserves_mixed_freshness_fifo_terminal_cursors_and_read_only_lifecycle() {
+    let mutations = MutationRecorder::default();
+    let terminal = terminal_job(job_id(3));
+    let source = FixtureSource::new(terminal.clone(), mutations);
+    let logs = Arc::new(FixtureLogs::new(terminal.clone()));
+    let state = Arc::new(DashboardHttpState {
+        service: Arc::new(DashboardService::new(
+            source.clone(),
+            FixedClock,
+            FixedMonotonic,
+        )),
+        log_source: logs,
+    });
+    let server = DashboardHttpServer::bind(None, state).await.unwrap();
+    let host = listener_host(&server);
+
+    let warm = request(&host, "/api/v1/snapshot", &host);
+    assert_eq!(warm.status, 200);
+
+    let snapshot = request(&host, "/api/v1/snapshot", &host);
+    assert_eq!(snapshot.status, 200);
+    let snapshot_json: serde_json::Value = serde_json::from_slice(&snapshot.body).unwrap();
+    assert_eq!(snapshot_json["workers"].as_array().unwrap().len(), 3);
+    assert_eq!(snapshot_json["workers"][0]["freshness"], "current");
+    assert_eq!(snapshot_json["workers"][1]["freshness"], "current");
+    assert_eq!(snapshot_json["workers"][2]["freshness"], "stale");
+    assert_eq!(snapshot_json["workers"][2]["observed_at_millis"], 1_000);
+    assert_eq!(snapshot_json["queue"][0]["position"], 1);
+    assert_eq!(
+        snapshot_json["queue"][0]["blocking_code"],
+        "NO_COMPATIBLE_IDLE_WORKER"
+    );
+
+    let recent = &snapshot_json["recent_jobs"][0];
+    assert_eq!(recent["project_label"], serde_json::Value::Null);
+    assert_eq!(recent["final_stdout_bytes"], 5);
+    assert_eq!(recent["final_stderr_bytes"], 3);
+
+    let detail = request(&host, &format!("/api/v1/jobs/{}", terminal.job_id), &host);
+    assert_eq!(detail.status, 200);
+    let detail_json: serde_json::Value = serde_json::from_slice(&detail.body).unwrap();
+    assert_eq!(detail_json["project_label"], serde_json::Value::Null);
+
+    let stdout_first = log_request(&host, terminal.job_id, "stdout", 0);
+    let stdout_second = log_request(&host, terminal.job_id, "stdout", 3);
+    let stderr_first = log_request(&host, terminal.job_id, "stderr", 0);
+    let stderr_second = log_request(&host, terminal.job_id, "stderr", 2);
+    assert_log_chunk(&stdout_first, 0, 3, "YWJj");
+    assert_log_chunk(&stdout_second, 3, 5, "ZGU=");
+    assert_log_chunk(&stderr_first, 0, 2, "eHk=");
+    assert_log_chunk(&stderr_second, 2, 3, "eg==");
+
+    let mut disconnected_client = TcpStream::connect(&host).unwrap();
+    disconnected_client
+        .write_all(b"GET /api/v1/snapshot HTTP/1.1\r\nHost: ")
+        .unwrap();
+    drop(disconnected_client);
+
+    server.shutdown().await.unwrap();
+    source.assert_no_mutations();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_http_clients_share_one_in_flight_snapshot_refresh() {
+    let gate = Arc::new(CollectionGate::default());
+    let source = CoalescingSource::new(Arc::clone(&gate));
+    let monotonic = CountingMonotonic::default();
+    let state = Arc::new(DashboardHttpState {
+        service: Arc::new(DashboardService::new(
+            source.clone(),
+            FixedClock,
+            monotonic.clone(),
+        )),
+        log_source: Arc::new(RecordingLogs::new(job(job_id(1)))),
+    });
+    let server = DashboardHttpServer::bind(None, state).await.unwrap();
+    let host = listener_host(&server);
+
+    let first_host = host.clone();
+    let first = thread::spawn(move || request(&first_host, "/api/v1/snapshot", &first_host));
+    gate.wait_until_entered();
+
+    let second_host = host.clone();
+    let second = thread::spawn(move || request(&second_host, "/api/v1/snapshot", &second_host));
+    monotonic.wait_for_calls(3);
+    gate.release();
+
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
+    assert_eq!(first.status, 200);
+    assert_eq!(second.status, 200);
+    let first_json: serde_json::Value = serde_json::from_slice(&first.body).unwrap();
+    let second_json: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
+    assert_eq!(first_json["revision"], 1);
+    assert_eq!(second_json["revision"], 1);
+    assert_eq!(source.collect_calls(), 1);
+
+    server.shutdown().await.unwrap();
+}
+
 async fn started_server() -> (DashboardHttpServer, Arc<RecordingLogs>) {
     let source = FakeSource;
     let service = Arc::new(DashboardService::new(source, FixedClock, FixedMonotonic));
@@ -162,6 +265,22 @@ fn request(address: &str, path: &str, host: &str) -> HttpResponse {
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).unwrap();
     HttpResponse::parse(raw)
+}
+
+fn log_request(address: &str, job_id: JobId, stream: &str, offset: u64) -> serde_json::Value {
+    let response = request(
+        address,
+        &format!("/api/v1/jobs/{job_id}/logs?stream={stream}&offset={offset}&limit=65536"),
+        address,
+    );
+    assert_eq!(response.status, 200);
+    serde_json::from_slice(&response.body).unwrap()
+}
+
+fn assert_log_chunk(chunk: &serde_json::Value, offset: u64, next_offset: u64, data: &str) {
+    assert_eq!(chunk["offset"], offset);
+    assert_eq!(chunk["next_offset"], next_offset);
+    assert_eq!(chunk["data"], data);
 }
 
 struct HttpResponse {
@@ -306,6 +425,299 @@ impl MonotonicClock for FixedMonotonic {
     }
 }
 
+#[derive(Clone)]
+struct FixtureSource {
+    observations: Arc<Mutex<VecDeque<Vec<WorkerObservationResult>>>>,
+    terminal: DashboardJob,
+    mutations: MutationRecorder,
+}
+
+impl FixtureSource {
+    fn new(terminal: DashboardJob, mutations: MutationRecorder) -> Self {
+        Self {
+            observations: Arc::new(Mutex::new(VecDeque::from([
+                vec![
+                    WorkerObservationResult::Current(worker_observation("mini-1", 1_000)),
+                    WorkerObservationResult::Current(worker_observation("mini-2", 1_000)),
+                    WorkerObservationResult::Current(worker_observation("mini-3", 1_000)),
+                ],
+                vec![
+                    WorkerObservationResult::Current(worker_observation("mini-1", 1_001)),
+                    WorkerObservationResult::Current(worker_observation("mini-2", 1_001)),
+                    WorkerObservationResult::Failed {
+                        worker_name: "mini-3".into(),
+                        error: DashboardError::new(
+                            "WORKER_UNAVAILABLE",
+                            "worker observation is unavailable",
+                        ),
+                    },
+                ],
+            ]))),
+            terminal,
+            mutations,
+        }
+    }
+
+    fn assert_no_mutations(&self) {
+        self.mutations.assert_no_calls();
+    }
+}
+
+impl DashboardDataSource for FixtureSource {
+    fn configured_workers(&self) -> Result<Vec<String>, DashboardError> {
+        Ok(vec!["mini-1".into(), "mini-2".into(), "mini-3".into()])
+    }
+
+    fn collect_workers(&self, _deadline: Duration) -> Vec<WorkerObservationResult> {
+        self.observations
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("fixture contains an observation row for each snapshot")
+    }
+
+    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
+        Ok(vec![self.terminal.clone()])
+    }
+
+    fn authoritative_active_jobs(
+        &self,
+        _deadline: Duration,
+    ) -> Vec<Result<DashboardJob, DashboardError>> {
+        Vec::new()
+    }
+
+    fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
+        Ok(vec![DashboardQueueEntry {
+            position: 1,
+            job_id: job_id(4),
+            project_id: "queued-project".into(),
+            worktree_id: "queued-worktree".into(),
+            project_label: None,
+            command_summary: DashboardCommandSummary {
+                mode: DashboardCommandMode::Argv,
+                arg_count: Some(2),
+            },
+            created_at_millis: 1_001,
+            requirements: vec!["darwin-arm64".into()],
+            blocking_code: "NO_COMPATIBLE_IDLE_WORKER".into(),
+        }])
+    }
+}
+
+#[derive(Clone)]
+struct MutationRecorder(Arc<MutationState>);
+
+#[derive(Default)]
+struct MutationState {
+    submit_calls: AtomicUsize,
+    cancel_calls: AtomicUsize,
+    retry_calls: AtomicUsize,
+    delete_calls: AtomicUsize,
+    lease_calls: AtomicUsize,
+}
+
+impl Default for MutationRecorder {
+    fn default() -> Self {
+        Self(Arc::new(MutationState::default()))
+    }
+}
+
+impl MutationRecorder {
+    fn assert_no_calls(&self) {
+        assert_eq!(
+            [
+                self.0.submit_calls.load(Ordering::SeqCst),
+                self.0.cancel_calls.load(Ordering::SeqCst),
+                self.0.retry_calls.load(Ordering::SeqCst),
+                self.0.delete_calls.load(Ordering::SeqCst),
+                self.0.lease_calls.load(Ordering::SeqCst),
+            ],
+            [0; 5],
+            "dashboard requests, disconnects, and shutdown must not invoke fake submit, cancel, retry, delete, or lease operations"
+        );
+    }
+}
+
+struct FixtureLogs {
+    terminal: DashboardJob,
+}
+
+impl FixtureLogs {
+    fn new(terminal: DashboardJob) -> Self {
+        Self { terminal }
+    }
+}
+
+impl DashboardLogSource for FixtureLogs {
+    fn job_detail(&self, job_id: JobId) -> Result<DashboardJob, ApiError> {
+        (job_id == self.terminal.job_id)
+            .then(|| self.terminal.clone())
+            .ok_or_else(|| ApiError::new("JOB_NOT_FOUND", "job is not retained"))
+    }
+
+    fn read_log(
+        &self,
+        job_id: JobId,
+        stream: LogStream,
+        offset: u64,
+        _limit: u32,
+    ) -> Result<DashboardLogChunk, ApiError> {
+        if job_id != self.terminal.job_id {
+            return Err(ApiError::new("JOB_NOT_FOUND", "job is not retained"));
+        }
+        let bytes = match (stream, offset) {
+            (LogStream::Stdout, 0) => b"abc".to_vec(),
+            (LogStream::Stdout, 3) => b"de".to_vec(),
+            (LogStream::Stderr, 0) => b"xy".to_vec(),
+            (LogStream::Stderr, 2) => b"z".to_vec(),
+            _ => Vec::new(),
+        };
+        DashboardLogChunk::from_bytes(stream, offset, bytes)
+            .map_err(|_| ApiError::new("LOG_UNAVAILABLE", "log is unavailable"))
+    }
+}
+
+#[derive(Clone)]
+struct CoalescingSource {
+    gate: Arc<CollectionGate>,
+    collect_calls: Arc<AtomicUsize>,
+}
+
+impl CoalescingSource {
+    fn new(gate: Arc<CollectionGate>) -> Self {
+        Self {
+            gate,
+            collect_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn collect_calls(&self) -> usize {
+        self.collect_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl DashboardDataSource for CoalescingSource {
+    fn configured_workers(&self) -> Result<Vec<String>, DashboardError> {
+        Ok(vec!["mini-1".into()])
+    }
+
+    fn collect_workers(&self, _deadline: Duration) -> Vec<WorkerObservationResult> {
+        self.collect_calls.fetch_add(1, Ordering::SeqCst);
+        self.gate.enter_and_wait();
+        vec![WorkerObservationResult::Current(worker_observation(
+            "mini-1", 1_000,
+        ))]
+    }
+
+    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
+        Ok(Vec::new())
+    }
+
+    fn authoritative_active_jobs(
+        &self,
+        _deadline: Duration,
+    ) -> Vec<Result<DashboardJob, DashboardError>> {
+        Vec::new()
+    }
+
+    fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Default)]
+struct CollectionGate {
+    state: Mutex<CollectionGateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct CollectionGateState {
+    entered: bool,
+    released: bool,
+}
+
+impl CollectionGate {
+    fn enter_and_wait(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.entered = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        let mut state = self.state.lock().unwrap();
+        while !state.entered {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Clone, Default)]
+struct CountingMonotonic(Arc<CountingMonotonicState>);
+
+#[derive(Default)]
+struct CountingMonotonicState {
+    calls: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl CountingMonotonic {
+    fn wait_for_calls(&self, minimum: usize) {
+        let mut calls = self.0.calls.lock().unwrap();
+        while *calls < minimum {
+            calls = self.0.changed.wait(calls).unwrap();
+        }
+    }
+}
+
+impl MonotonicClock for CountingMonotonic {
+    fn now_millis(&self) -> u64 {
+        let mut calls = self.0.calls.lock().unwrap();
+        *calls += 1;
+        self.0.changed.notify_all();
+        0
+    }
+}
+
+fn worker_observation(name: &str, observed_at_millis: u64) -> Observation {
+    Observation {
+        worker: DashboardWorker {
+            name: name.into(),
+            health: WorkerHealth::Ready,
+            freshness: Freshness::Current,
+            observed_at_millis: Some(observed_at_millis),
+            hostname: Some(format!("{name}.local")),
+            slot: SlotSummary {
+                state: DashboardSlotState::Idle,
+                capacity: 1,
+                active_job_id: None,
+            },
+            capabilities: vec!["darwin-arm64".into()],
+            missing_capabilities: Vec::new(),
+            system: SystemSummary {
+                free_disk_bytes: Some(10),
+                total_disk_bytes: Some(100),
+                memory_pressure: Some(DashboardMemoryPressure::Normal),
+                swap_used_bytes: Some(0),
+                cpu_busy_percent: None,
+            },
+            error: None,
+        },
+        observed_at_millis,
+        cpu_counters: None,
+    }
+}
+
 struct RecordingLogs {
     job: DashboardJob,
     detail_calls: AtomicUsize,
@@ -383,6 +795,16 @@ fn job(job_id: JobId) -> DashboardJob {
         artifact_status: None,
         remote_uncertainty: None,
     }
+}
+
+fn terminal_job(job_id: JobId) -> DashboardJob {
+    let mut job = job(job_id);
+    job.project_label = None;
+    job.state = DashboardJobState::Succeeded;
+    job.exit_code = Some(0);
+    job.final_stdout_bytes = Some(5);
+    job.final_stderr_bytes = Some(3);
+    job
 }
 
 fn job_id(value: u128) -> JobId {

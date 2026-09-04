@@ -91,7 +91,7 @@ async fn no_open_prints_loopback_url_without_invoking_browser() {
         vec![DashboardCommandRequest::new(None, true)]
     );
     assert!(opener.urls().is_empty());
-    assert_eq!(launcher.mutation_count(), 0);
+    launcher.assert_no_mutations();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -114,11 +114,11 @@ async fn default_command_opens_the_exact_loopback_url_once() {
 
     assert_eq!(opener.urls(), vec![result.url.clone()]);
     assert!(warnings.is_empty());
-    assert_eq!(launcher.mutation_count(), 0);
+    launcher.assert_no_mutations();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn opener_failure_is_a_bounded_warning_while_the_server_remains_usable() {
+async fn dashboard_lifecycle_stays_read_only_after_a_browser_client_disconnects() {
     let (started_sender, started_receiver) = oneshot::channel();
     let launcher = RecordingLauncher::new(Some(started_sender));
     let opener = RecordingOpener::fails();
@@ -143,6 +143,12 @@ async fn opener_failure_is_a_bounded_warning_while_the_server_remains_usable() {
             result = &mut dashboard => panic!("dashboard stopped before the server became usable: {result:?}"),
         };
         assert_eq!(request_status(&url, "/"), 200);
+        let host = url.strip_prefix("http://").unwrap();
+        let mut disconnected_client = TcpStream::connect(host).unwrap();
+        disconnected_client
+            .write_all(b"GET /api/v1/snapshot HTTP/1.1\r\nHost: ")
+            .unwrap();
+        drop(disconnected_client);
         shutdown_sender.send(()).unwrap();
         (dashboard.as_mut().await.unwrap(), url)
     };
@@ -156,7 +162,7 @@ async fn opener_failure_is_a_bounded_warning_while_the_server_remains_usable() {
         String::from_utf8(output).unwrap(),
         format!("{}\n", result.url)
     );
-    assert_eq!(launcher.mutation_count(), 0);
+    launcher.assert_no_mutations();
 }
 
 struct RecordingLauncher {
@@ -180,8 +186,12 @@ impl RecordingLauncher {
         self.requests.lock().unwrap().clone()
     }
 
-    fn mutation_count(&self) -> usize {
-        self.source.mutation_count() + self.logs.mutation_count()
+    fn assert_no_mutations(&self) {
+        assert_eq!(
+            self.source.mutation_count() + self.logs.mutation_count(),
+            0,
+            "dashboard launch, browser requests, disconnects, and shutdown must not invoke fake submit, cancel, retry, delete, or lease operations"
+        );
     }
 }
 

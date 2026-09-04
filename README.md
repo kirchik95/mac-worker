@@ -69,17 +69,17 @@ Doctor inspects the Git worktree, probes configured workers read-only, creates a
 
 `UNTRACKED_INPUT` means local inputs are not covered by an explicit policy. Commit them, ignore or remove them when appropriate, or include only the exact file or narrow project-owned subtree needed by the command. Do not use a catch-all include. `SENSITIVE_PATH` means a conventional credential path is selected: remove it from the project input and use a documented example file or separately provisioned worker configuration. If the name is intentionally non-secret, review it and add only that exact relative path to `snapshot.allow_sensitive` in `.worker.toml`; Doctor will emit a content-free warning.
 
-## Phase 4
+## Local dashboard
 
-Phase 4 adds automatic scheduling and queueing across the configured workers, cancellation, and a local loopback dashboard. `worker dashboard` is available today. Automatic worker selection, the FIFO queue, and cancellation are planned and are not in the current CLI.
+`worker dashboard` is a local observer for the configured fleet. It is not a scheduler or a replacement for CLI operations such as `worker run`, `worker status`, `worker logs`, or `worker cancel`.
 
 ```bash
-./target/release/worker dashboard
-./target/release/worker dashboard --no-open
-./target/release/worker dashboard --port 9173
+worker dashboard
+worker dashboard --no-open
+worker dashboard --port 9173
 ```
 
-The dashboard binds `127.0.0.1` only. It is read-only and ephemeral. It does not replace CLI operations.
+The dashboard binds `127.0.0.1` only. It is read-only and ephemeral: it polls rather than pushes updates and keeps no metrics database. Its API does not expose command, environment, or path secrets. Application logs can contain application-emitted secrets, so the local user viewing dashboard logs must already be trusted to see them.
 
 ## Phase 5
 
