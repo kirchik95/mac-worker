@@ -191,6 +191,7 @@ fn execute_with_context(
                     config: &config,
                     client_state: &client_state,
                     remote: RemoteJobClient::new(runner),
+                    reconcile_observer: None,
                 }
                 .reconcile()?;
             }

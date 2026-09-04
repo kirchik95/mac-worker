@@ -256,11 +256,19 @@ proptest! {
     }
 
     #[test]
-    fn ranking_is_invariant_under_input_permutation(input in arbitrary_health_sets()) {
+    fn ranking_is_invariant_under_arbitrary_permutations(
+        pair in arbitrary_health_sets().prop_flat_map(|input| {
+            let original = input.clone();
+            prop::collection::vec(any::<u64>(), input.len()).prop_map(move |keys| {
+                let mut keyed = input.clone().into_iter().zip(keys).collect::<Vec<_>>();
+                keyed.sort_by_key(|(_, key)| *key);
+                (original.clone(), keyed.into_iter().map(|(value, _)| value).collect::<Vec<_>>())
+            })
+        })
+    ) {
+        let (input, permuted) = pair;
         let forward = SchedulerPolicy::rank(&input, &[], &AffinityHints::none());
-        let mut reversed_input = input;
-        reversed_input.reverse();
-        let reversed = SchedulerPolicy::rank(&reversed_input, &[], &AffinityHints::none());
+        let reversed = SchedulerPolicy::rank(&permuted, &[], &AffinityHints::none());
         prop_assert_eq!(forward, reversed);
     }
 }

@@ -42,6 +42,7 @@ const OTHER_WORKTREE_ID: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 const DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const COMMAND_SECRET: &str = "PLANTED_EXACT_COMMAND_SECRET";
 const PATH_SECRET: &str = "/Users/alice/PLANTED_QUEUE_PATH";
+const ENV_SECRET: &str = "PLANTED_QUEUE_ENV_LIKE_VALUE";
 const TOKEN_SECRET: &str = "dddddddddddddddddddddddddddddddd";
 
 #[derive(Clone, Copy)]
@@ -597,16 +598,52 @@ fn queue_records_are_canonical_owner_only_and_contain_summaries_not_secrets() {
     // Break caught: queue persistence retains exact inputs or publishes
     // permissive/non-canonical state that another invocation can misread.
     let fixture = open_queue();
-    let entry = queued(
-        &fixture.store,
-        "00000000000000000000000000000001",
-        10,
+    let entry = QueueEntry::new(
+        "00000000000000000000000000000001".parse().unwrap(),
+        fixture.store.client_id(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        CommandSpec::argv(vec![
+            "tool".into(),
+            COMMAND_SECRET.into(),
+            PATH_SECRET.into(),
+            ENV_SECRET.into(),
+        ])
+        .unwrap()
+        .summary()
+        .unwrap(),
+        Vec::new(),
+        WorkerPreference::Automatic,
+        QueueEntryKind::Batch,
+        None,
         owner(10),
-    );
+        10,
+    )
+    .unwrap();
 
     let persisted = fixture.store.enqueue(entry).unwrap();
+    fixture
+        .store
+        .record_affinity(PROJECT_ID, WORKTREE_ID, "mini-a", 11)
+        .unwrap();
     let bytes = fs::read(fixture.root.join("queue/state.json")).unwrap();
     let text = String::from_utf8(bytes.clone()).unwrap();
+    let affinity = [
+        fs::read_to_string(
+            fixture
+                .root
+                .join("affinity/projects")
+                .join(format!("{PROJECT_ID}.json")),
+        )
+        .unwrap(),
+        fs::read_to_string(
+            fixture
+                .root
+                .join("affinity/worktrees")
+                .join(format!("{PROJECT_ID}-{WORKTREE_ID}.json")),
+        )
+        .unwrap(),
+    ];
 
     assert_eq!(persisted.queue_id().value(), 1);
     assert_eq!(
@@ -617,17 +654,22 @@ fn queue_records_are_canonical_owner_only_and_contain_summaries_not_secrets() {
     assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
     assert!(text.contains(r#""kind":"batch""#));
     assert!(text.contains(r#""state":"waiting""#));
-    assert!(text.contains(r#""command_summary":{"mode":"argv","arg_count":2}"#));
+    assert!(text.contains(r#""command_summary":{"mode":"argv","arg_count":4}"#));
     assert!(text.contains(r#""preacceptance_abandonment_proof":null"#));
     for secret in [
         COMMAND_SECRET,
         PATH_SECRET,
+        ENV_SECRET,
         DIGEST,
         TOKEN_SECRET,
         "prompt text",
         "session_id",
     ] {
         assert!(!text.contains(secret), "queue leaked {secret}");
+        assert!(
+            affinity.iter().all(|record| !record.contains(secret)),
+            "affinity leaked {secret}"
+        );
     }
     assert_eq!(mode(fixture.root.join("queue")), 0o700);
     assert_eq!(mode(fixture.root.join("queue/state.json")), 0o600);

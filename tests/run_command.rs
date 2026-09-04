@@ -42,10 +42,10 @@ use mac_worker::{
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     run::{
-        CancelReport, CancelService, FollowRuntime, JobFollower, LogsService, RunCompletion,
-        RunObserver, RunReport, RunRequest, RunService, RunStage, STATUS_LIST_LIMIT,
-        STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT, SchedulerRuntime, StatusReport, StatusRow,
-        StatusService, SystemFollowRuntime,
+        CancelObserver, CancelReport, CancelService, CancelStage, FollowRuntime, JobFollower,
+        LogsService, RunCompletion, RunObserver, RunReport, RunRequest, RunService, RunStage,
+        STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT, SchedulerRuntime,
+        StatusReport, StatusRow, StatusService, SystemFollowRuntime,
     },
     run_with_io_in_context,
     scheduler::{CandidateSlot, WorkerPreference},
@@ -805,7 +805,6 @@ fn status_row_serialization_omits_private_identity_and_payload() {
             "job_id",
             "manifest_digest",
             "project_id",
-            "relative_working_dir",
             "remote_uncertainty",
             "status",
             "worker",
@@ -3326,6 +3325,17 @@ struct CancelAtAcceptedOutputObserver<'a> {
     requests: AtomicUsize,
 }
 
+#[derive(Default)]
+struct CountingCancelObserver(AtomicUsize);
+
+impl CancelObserver for CountingCancelObserver {
+    fn observe(&self, stage: CancelStage) -> Result<(), WorkerError> {
+        assert_eq!(stage, CancelStage::RemoteCancelHandoff);
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 impl RecordingRunObserver {
     fn recording() -> Self {
         Self {
@@ -3636,7 +3646,7 @@ fn run_with_script_and_observer(
     (result, runner, store)
 }
 
-fn all_run_stages() -> [RunStage; 16] {
+fn all_run_stages() -> [RunStage; 17] {
     [
         RunStage::InitialProjectInspection,
         RunStage::AdmissionObservation,
@@ -3646,6 +3656,7 @@ fn all_run_stages() -> [RunStage; 16] {
         RunStage::StableProjectReload,
         RunStage::SnapshotSelectionAndCapture,
         RunStage::LocalRecordPublication,
+        RunStage::DispatchToLeaseHandoff,
         RunStage::LeaseAcquire,
         RunStage::SnapshotUpload,
         RunStage::SnapshotVerification,
@@ -3836,7 +3847,9 @@ fn cancel_resolves_the_original_record_then_sends_one_exact_typed_remote_request
     let runner =
         RecordingRunner::returning(vec![status_result(&accepted), status_result(&response)]);
     let config = config();
+    let observer = CountingCancelObserver::default();
     let report = CancelService::new(&runner, &config, &store)
+        .with_cancel_observer(&observer)
         .cancel(record.meta().job_id())
         .unwrap();
 
@@ -3862,6 +3875,7 @@ fn cancel_resolves_the_original_record_then_sends_one_exact_typed_remote_request
     let wire: Value = serde_json::from_slice(requests[1].stdin.as_deref().unwrap()).unwrap();
     assert_eq!(wire.as_object().unwrap().len(), 4);
     assert!(wire.get("protocol_version").is_none());
+    assert_eq!(observer.0.load(Ordering::SeqCst), 1);
     assert_eq!(
         store
             .load_job(record.meta().job_id())
@@ -3869,6 +3883,53 @@ fn cancel_resolves_the_original_record_then_sends_one_exact_typed_remote_request
             .last_status(),
         Some(&cancelled)
     );
+}
+
+#[test]
+fn remote_cancel_handoff_matrix_uses_one_typed_request_per_id_across_100_cases() {
+    // Break caught: a cancel handoff can duplicate the remote mutation or
+    // switch to a different identity while interleavings vary by job ID.
+    for case in 0..100_u128 {
+        let temp = tempfile::tempdir().unwrap();
+        let store = state_store(&temp);
+        let created_at = 1_000 + case as u64;
+        let record = test_record(
+            &store,
+            91_000 + case,
+            created_at,
+            Some(JobStatus::accepted(created_at).unwrap()),
+            RemoteUncertainty::None,
+        );
+        store.create_job(record.clone()).unwrap();
+        let cancelled = JobStatus::accepted(created_at)
+            .unwrap()
+            .into_prelaunch_cancelled(created_at + 1, 0, 0)
+            .unwrap();
+        let accepted = StatusResponse::new(
+            record.meta().clone(),
+            JobStatus::accepted(created_at).unwrap(),
+        )
+        .unwrap();
+        let response =
+            CancelResponse::new(StatusResponse::new(record.meta().clone(), cancelled).unwrap())
+                .unwrap();
+        let runner =
+            RecordingRunner::returning(vec![status_result(&accepted), status_result(&response)]);
+        let observer = CountingCancelObserver::default();
+
+        let report = CancelService::new(&runner, &config(), &store)
+            .with_cancel_observer(&observer)
+            .cancel(record.meta().job_id())
+            .unwrap();
+        assert!(
+            matches!(report, CancelReport::RemoteCancelled { .. }),
+            "case {case}"
+        );
+        assert_eq!(observer.0.load(Ordering::SeqCst), 1, "case {case}");
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 2, "case {case}");
+        assert_control_call(&requests[1], HostOperation::Cancel, Duration::from_secs(30));
+    }
 }
 
 #[test]
@@ -5301,6 +5362,7 @@ fn poisoned_run_boundary_stops_later_effects_and_cleans_each_owned_snapshot_once
             failed_stage,
             RunStage::SnapshotSelectionAndCapture
                 | RunStage::LocalRecordPublication
+                | RunStage::DispatchToLeaseHandoff
                 | RunStage::LeaseAcquire
                 | RunStage::SnapshotUpload
                 | RunStage::SnapshotVerification
@@ -5325,7 +5387,8 @@ fn poisoned_run_boundary_stops_later_effects_and_cleans_each_owned_snapshot_once
             | RunStage::QueueClaim
             | RunStage::StableProjectReload
             | RunStage::SnapshotSelectionAndCapture
-            | RunStage::LocalRecordPublication => 4,
+            | RunStage::LocalRecordPublication
+            | RunStage::DispatchToLeaseHandoff => 4,
             RunStage::LeaseAcquire => 3,
             RunStage::SnapshotUpload => 2,
             RunStage::SnapshotVerification => 1,
@@ -5342,7 +5405,7 @@ fn poisoned_run_boundary_stops_later_effects_and_cleans_each_owned_snapshot_once
         );
         assert_eq!(
             follower.calls.load(Ordering::SeqCst),
-            usize::from(index >= 13),
+            usize::from(index >= 14),
             "failed at {failed_stage:?}"
         );
         assert_eq!(
@@ -8692,8 +8755,9 @@ fn json_stream_errors_use_stdout_only_and_writer_failure_is_74() {
 fn human_status_and_json_status_share_the_same_sanitized_report() {
     // Break caught: human status invents fields, omits the shared DTO, or
     // renders planted command/path/token/SSH values.
-    let command_secret = "printf TASK9_COMMAND_SECRET";
-    let planted_path = "/Users/alice/PLANTED_PROJECT_PATH";
+    let command_secret = "printf TASK9_COMMAND_SECRET PLANTED_ENV_LIKE_VALUE";
+    let planted_path = "workspace/PLANTED_PROJECT_PATH";
+    let planted_env = "PLANTED_ENV_LIKE_VALUE";
     let temp = tempfile::tempdir().unwrap();
     let runtime = public_runtime(temp.path(), temp.path());
     let store = ClientStateStore::open(&runtime.state).unwrap();
@@ -8704,7 +8768,7 @@ fn human_status_and_json_status_share_the_same_sanitized_report() {
         PROJECT_ID,
         WORKTREE_ID,
         MANIFEST_DIGEST,
-        "packages/app",
+        planted_path,
         30_000,
         "heavy",
         CommandSpec::shell(command_secret.into()).unwrap(),
@@ -8757,7 +8821,14 @@ fn human_status_and_json_status_share_the_same_sanitized_report() {
     );
     let human = String::from_utf8(stdout.clone()).unwrap();
     assert!(human.contains("1 older jobs omitted"));
-    for secret in [command_secret, planted_path, CLIENT_ID, LEASE_TOKEN, "mac1"] {
+    for secret in [
+        command_secret,
+        planted_path,
+        planted_env,
+        CLIENT_ID,
+        LEASE_TOKEN,
+        "mac1",
+    ] {
         assert!(!human.contains(secret), "human status leaked {secret}");
     }
 
@@ -8790,7 +8861,14 @@ fn human_status_and_json_status_share_the_same_sanitized_report() {
         report.jobs[0].manifest_digest
     );
     let encoded = String::from_utf8(stdout).unwrap();
-    for secret in [command_secret, planted_path, CLIENT_ID, LEASE_TOKEN, "mac1"] {
+    for secret in [
+        command_secret,
+        planted_path,
+        planted_env,
+        CLIENT_ID,
+        LEASE_TOKEN,
+        "mac1",
+    ] {
         assert!(!encoded.contains(secret), "JSON status leaked {secret}");
     }
 }
@@ -9442,8 +9520,9 @@ fn public_diag_json_error_keeps_exit_and_rejects_oversized_internal_payload() {
     let planted_path = "/Users/alice/PLANTED_PUBLIC_PATH";
     let planted_secret = "PLANTED_PUBLIC_SECRET";
     let planted_argv = "printf TASK9_COMMAND_SECRET";
+    let planted_host = "planted-local-mac.example";
     let planted = format!(
-        "{} {planted_path} {planted_secret} {planted_argv} {CLIENT_ID} {LEASE_TOKEN}",
+        "{} {planted_path} {planted_secret} {planted_argv} {planted_host} {CLIENT_ID} {LEASE_TOKEN}",
         "X".repeat(3900)
     );
     assert!(planted.len() <= 4096);
@@ -9490,6 +9569,7 @@ fn public_diag_json_error_keeps_exit_and_rejects_oversized_internal_payload() {
         planted_path,
         planted_secret,
         planted_argv,
+        planted_host,
         CLIENT_ID,
         LEASE_TOKEN,
         &"X".repeat(32),

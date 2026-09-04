@@ -57,6 +57,17 @@ pub enum FleetOutcome {
     InvalidResponse,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetReconcileStage {
+    ResponseHandling,
+}
+
+#[doc(hidden)]
+pub trait FleetReconcileObserver {
+    fn observe(&self, stage: FleetReconcileStage) -> Result<(), WorkerError>;
+}
+
 #[derive(Debug, Clone)]
 pub struct FleetWorkerReport {
     pub worker: String,
@@ -90,9 +101,17 @@ pub struct FleetReconciler<'a> {
     pub config: &'a Config,
     pub client_state: &'a ClientStateStore,
     pub remote: RemoteJobClient<'a>,
+    #[doc(hidden)]
+    pub reconcile_observer: Option<&'a dyn FleetReconcileObserver>,
 }
 
-impl FleetReconciler<'_> {
+impl<'a> FleetReconciler<'a> {
+    #[doc(hidden)]
+    pub fn with_reconcile_observer(mut self, observer: &'a dyn FleetReconcileObserver) -> Self {
+        self.reconcile_observer = Some(observer);
+        self
+    }
+
     pub fn reconcile(&self) -> Result<FleetReconcileReport, WorkerError> {
         let generated_at_millis = current_time_millis()?;
         let mut records = self.client_state.list_jobs()?;
@@ -211,6 +230,9 @@ impl FleetReconciler<'_> {
         )?;
         match self.remote.reconcile(worker, &request) {
             Ok(response) => {
+                if let Some(observer) = self.reconcile_observer {
+                    observer.observe(FleetReconcileStage::ResponseHandling)?;
+                }
                 let mut jobs = Vec::new();
                 let mut error_code = None;
                 let mut invalid_response = false;
@@ -365,6 +387,7 @@ pub struct StatusRow {
     pub worktree_id: String,
     pub manifest_digest: String,
     pub command_summary: CommandSummary,
+    #[serde(skip_serializing)]
     pub relative_working_dir: String,
     pub created_at_millis: u64,
     pub status: Option<JobStatus>,
@@ -447,6 +470,7 @@ pub enum RunStage {
     StableProjectReload,
     SnapshotSelectionAndCapture,
     LocalRecordPublication,
+    DispatchToLeaseHandoff,
     LeaseAcquire,
     SnapshotUpload,
     SnapshotVerification,
@@ -471,6 +495,27 @@ impl RunObserver for NoopRunObserver {
 }
 
 static NOOP_RUN_OBSERVER: NoopRunObserver = NoopRunObserver;
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelStage {
+    RemoteCancelHandoff,
+}
+
+#[doc(hidden)]
+pub trait CancelObserver {
+    fn observe(&self, stage: CancelStage) -> Result<(), WorkerError>;
+}
+
+struct NoopCancelObserver;
+
+impl CancelObserver for NoopCancelObserver {
+    fn observe(&self, _stage: CancelStage) -> Result<(), WorkerError> {
+        Ok(())
+    }
+}
+
+static NOOP_CANCEL_OBSERVER: NoopCancelObserver = NoopCancelObserver;
 
 #[doc(hidden)]
 pub trait SchedulerRuntime: Send + Sync {
@@ -534,6 +579,7 @@ pub struct CancelService<'a> {
     client_state: &'a ClientStateStore,
     remote: RemoteJobClient<'a>,
     scheduler_runtime: &'a dyn SchedulerRuntime,
+    observer: &'a dyn CancelObserver,
 }
 
 pub struct RunService<'a> {
@@ -576,12 +622,19 @@ impl<'a> CancelService<'a> {
             client_state,
             remote: RemoteJobClient::new(runner),
             scheduler_runtime: &SYSTEM_SCHEDULER_RUNTIME,
+            observer: &NOOP_CANCEL_OBSERVER,
         }
     }
 
     #[doc(hidden)]
     pub fn with_scheduler_runtime(mut self, runtime: &'a dyn SchedulerRuntime) -> Self {
         self.scheduler_runtime = runtime;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_cancel_observer(mut self, observer: &'a dyn CancelObserver) -> Self {
+        self.observer = observer;
         self
     }
 
@@ -733,6 +786,7 @@ impl<'a> CancelService<'a> {
         record: &LocalJobRecord,
     ) -> Result<CancelResponse, WorkerError> {
         let request = CancelRequest::from_local_record(record)?;
+        self.observer.observe(CancelStage::RemoteCancelHandoff)?;
         match self.remote.cancel(worker, &request) {
             Ok(response) if response.status().status().state().is_terminal() => Ok(response),
             Ok(_) => Err(WorkerError::Protocol(
@@ -883,6 +937,7 @@ impl<'a> RunService<'a> {
                 config: self.config,
                 client_state: self.client_state,
                 remote: RemoteJobClient::new(self.runner),
+                reconcile_observer: None,
             }
             .reconcile()?;
         }
@@ -1244,6 +1299,7 @@ impl<'a> RunService<'a> {
         if self.cancel_after_local_record(&remote, &worker, &record, identity.dispatch_owner)? {
             return self.cancellation_handoff(&record, identity.dispatch_owner);
         }
+        self.observer.observe(RunStage::DispatchToLeaseHandoff)?;
         let acquire_result: Result<LeaseAcquireResponse, WorkerError> = transport.request(
             &worker,
             HostOperation::LeaseAcquire,

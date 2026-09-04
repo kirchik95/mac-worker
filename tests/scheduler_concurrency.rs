@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -149,9 +150,72 @@ fn fifty_simultaneous_clients_preserve_sequence_and_never_reserve_two_slots_per_
             claimed_workers.push(selected_worker.to_owned());
         }
     }
-    claimed_workers.sort();
-    claimed_workers.dedup();
-    assert_eq!(claimed_workers, ["mini-a", "mini-b", "mini-c"]);
+    assert_eq!(claimed_workers.len(), 3);
+    let reservation_counts = claimed_workers
+        .iter()
+        .fold(BTreeMap::new(), |mut counts, worker| {
+            *counts.entry(worker.as_str()).or_insert(0_usize) += 1;
+            counts
+        });
+    assert_eq!(
+        reservation_counts,
+        BTreeMap::from([("mini-a", 1), ("mini-b", 1), ("mini-c", 1)]),
+        "one worker must never hold two queue reservations"
+    );
+    assert_eq!(
+        claimed_workers,
+        ["mini-a", "mini-b", "mini-c"],
+        "claims retain worker-order events instead of deduplicating them"
+    );
+}
+
+#[test]
+fn queue_publication_and_claim_interleavings_preserve_fifo_reservations() {
+    // Break caught: publication outside the queue lock lets a later claimant
+    // observe an unsequenced row or reserve one worker twice.
+    for schedule in 0..100_u128 {
+        let (_directory, store, entered, release) =
+            gated_store(ClientStateConcurrencyPoint::QueuePublication);
+        let first_owner = owner(20_000 + schedule as u32 * 2);
+        let second_owner = owner(20_001 + schedule as u32 * 2);
+        let first_store = Arc::clone(&store);
+        let first = thread::spawn(move || {
+            first_store.enqueue(queued(
+                &first_store,
+                10_000 + schedule * 2,
+                first_owner,
+                WorkerPreference::Automatic,
+                None,
+            ))
+        });
+        entered.recv().unwrap();
+        let second_store = Arc::clone(&store);
+        let second = thread::spawn(move || {
+            second_store.enqueue(queued(
+                &second_store,
+                10_001 + schedule * 2,
+                second_owner,
+                WorkerPreference::Automatic,
+                None,
+            ))
+        });
+        release.send(()).unwrap();
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+
+        let snapshot = store.queue_snapshot().unwrap();
+        assert_eq!(snapshot.entries(), &[first.clone(), second.clone()]);
+        let first_claim = store
+            .claim_next(first_owner, &["mini-a".into()], 101)
+            .unwrap()
+            .expect("first published row claims its worker");
+        let second_claim = store
+            .claim_next(second_owner, &["mini-b".into()], 101)
+            .unwrap()
+            .expect("second published row claims another worker");
+        assert_eq!(first_claim.entry().job_id(), first.job_id());
+        assert_eq!(second_claim.entry().job_id(), second.job_id());
+    }
 }
 
 #[test]
@@ -205,44 +269,54 @@ fn run_cap_and_observation_refresh_are_atomic_under_competing_dispatchers() {
         assert_eq!(claims, 1, "interleaving {interleaving}");
     }
 
-    let (_directory, store, entered, release) =
-        gated_store(ClientStateConcurrencyPoint::ObservationRefreshPublication);
-    let refreshes = Arc::new(AtomicUsize::new(0));
-    let first_store = Arc::clone(&store);
-    let first_refreshes = Arc::clone(&refreshes);
-    let first = thread::spawn(move || {
-        first_store.admission_observation("mini-a", 10_000, || {
-            first_refreshes.fetch_add(1, Ordering::SeqCst);
-            AdmissionObservation::new(
-                "mini-a".into(),
-                true,
-                CandidateSlot::Idle,
-                Vec::new(),
-                Some(10),
-                20,
-                10_000,
-            )
-        })
-    });
-    entered.recv().unwrap();
-    let second_store = Arc::clone(&store);
-    let second_refreshes = Arc::clone(&refreshes);
-    let second = thread::spawn(move || {
-        second_store.admission_observation("mini-a", 10_000, || {
-            second_refreshes.fetch_add(1, Ordering::SeqCst);
-            AdmissionObservation::new(
-                "mini-a".into(),
-                true,
-                CandidateSlot::Idle,
-                Vec::new(),
-                Some(10),
-                20,
-                10_000,
-            )
-        })
-    });
-    release.send(()).unwrap();
-    first.join().unwrap().unwrap();
-    second.join().unwrap().unwrap();
-    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    for schedule in 0..100 {
+        let (directory, store, entered, release) =
+            gated_store(ClientStateConcurrencyPoint::ObservationRefreshPublication);
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let first_store = Arc::clone(&store);
+        let first_refreshes = Arc::clone(&refreshes);
+        let first = thread::spawn(move || {
+            first_store.admission_observation("mini-a", 10_000 + schedule, || {
+                first_refreshes.fetch_add(1, Ordering::SeqCst);
+                AdmissionObservation::new(
+                    "mini-a".into(),
+                    true,
+                    CandidateSlot::Idle,
+                    Vec::new(),
+                    Some(10),
+                    20,
+                    10_000 + schedule,
+                )
+            })
+        });
+        entered.recv().unwrap();
+        let second_store = Arc::clone(&store);
+        let second_refreshes = Arc::clone(&refreshes);
+        let second = thread::spawn(move || {
+            second_store.admission_observation("mini-a", 10_000 + schedule, || {
+                second_refreshes.fetch_add(1, Ordering::SeqCst);
+                AdmissionObservation::new(
+                    "mini-a".into(),
+                    true,
+                    CandidateSlot::Idle,
+                    Vec::new(),
+                    Some(10),
+                    20,
+                    10_000 + schedule,
+                )
+            })
+        });
+        release.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1, "schedule {schedule}");
+        let bytes = std::fs::read(directory.path().join("state/observations/mini-a.json")).unwrap();
+        let observation: AdmissionObservation = serde_json::from_slice(&bytes).unwrap();
+        let mut canonical = serde_json::to_vec(&observation).unwrap();
+        canonical.push(b'\n');
+        assert_eq!(
+            bytes, canonical,
+            "schedule {schedule} publishes canonical bytes"
+        );
+    }
 }

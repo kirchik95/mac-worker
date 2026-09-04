@@ -18,10 +18,11 @@ use mac_worker::{
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
-    run::{FleetOutcome, FleetReconciler},
+    run::{FleetOutcome, FleetReconcileObserver, FleetReconcileStage, FleetReconciler},
     scheduler::CandidateSlot,
     transfer::{HostOperation, RemoteJobClient},
 };
+use proptest::prelude::*;
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -217,6 +218,21 @@ fn fleet_request_is_bounded_and_rejects_duplicate_canonical_job_ids() {
     );
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn fleet_requests_accept_every_varying_unique_input_within_the_bound(
+        values in prop::collection::btree_set(any::<u128>(), 0..=100)
+    ) {
+        let ids = values.into_iter().map(job_id).collect::<Vec<_>>();
+        prop_assert!(FleetReconcileRequest::new(ids).is_ok());
+    }
+}
+
 #[test]
 fn one_unavailable_worker_does_not_block_other_reconciliation_or_queue_progress() {
     let (_directory, store, config, runner, _ids) = fleet_fixture();
@@ -224,6 +240,7 @@ fn one_unavailable_worker_does_not_block_other_reconciliation_or_queue_progress(
         config: &config,
         client_state: &store,
         remote: RemoteJobClient::new(&runner),
+        reconcile_observer: None,
     }
     .reconcile()
     .unwrap();
@@ -237,6 +254,61 @@ fn one_unavailable_worker_does_not_block_other_reconciliation_or_queue_progress(
     );
 }
 
+#[derive(Default)]
+struct CountingFleetObserver(Mutex<usize>);
+
+impl FleetReconcileObserver for CountingFleetObserver {
+    fn observe(&self, stage: FleetReconcileStage) -> Result<(), mac_worker::error::WorkerError> {
+        assert_eq!(stage, FleetReconcileStage::ResponseHandling);
+        *self.0.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn reconciliation_response_handoff_is_observable_without_changing_authority() {
+    let (_directory, store, config, runner, _ids) = fleet_fixture();
+    let observer = CountingFleetObserver::default();
+    let report = FleetReconciler {
+        config: &config,
+        client_state: &store,
+        remote: RemoteJobClient::new(&runner),
+        reconcile_observer: None,
+    }
+    .with_reconcile_observer(&observer)
+    .reconcile()
+    .unwrap();
+
+    assert_eq!(report.workers().len(), 3);
+    assert_eq!(*observer.0.lock().unwrap(), 2);
+}
+
+#[test]
+fn reconciliation_response_handoff_matrix_preserves_one_authoritative_update_per_case() {
+    // Break caught: reconciliation response handling bypasses the durable
+    // status CAS or processes a response more than once for a known row.
+    for case in 0..100 {
+        let (_directory, store, config, runner, ids) = fleet_fixture();
+        let observer = CountingFleetObserver::default();
+        let report = FleetReconciler {
+            config: &config,
+            client_state: &store,
+            remote: RemoteJobClient::new(&runner),
+            reconcile_observer: None,
+        }
+        .with_reconcile_observer(&observer)
+        .reconcile()
+        .unwrap();
+
+        assert_eq!(*observer.0.lock().unwrap(), 2, "case {case}");
+        assert_eq!(report.workers().len(), 3, "case {case}");
+        assert!(
+            store.load_job(ids[1]).unwrap().last_status().is_some(),
+            "case {case}"
+        );
+    }
+}
+
 #[test]
 fn failed_probe_is_not_evidence_that_a_retained_job_is_lost() {
     let (_directory, store, config, runner, ids) = fleet_fixture();
@@ -247,6 +319,7 @@ fn failed_probe_is_not_evidence_that_a_retained_job_is_lost() {
         config: &config,
         client_state: &store,
         remote: RemoteJobClient::new(&runner),
+        reconcile_observer: None,
     }
     .reconcile()
     .unwrap();
@@ -279,6 +352,7 @@ fn fresh_protocol_compatible_capability_mismatch_still_repairs_known_jobs_and_cl
         config: &config,
         client_state: &store,
         remote: RemoteJobClient::new(&runner),
+        reconcile_observer: None,
     }
     .reconcile()
     .unwrap();
@@ -332,6 +406,7 @@ fn conflicting_remote_status_is_uncertain_and_not_reported_as_reconciled() {
         config: &config,
         client_state: &store,
         remote: RemoteJobClient::new(&runner),
+        reconcile_observer: None,
     }
     .reconcile()
     .unwrap();
@@ -369,6 +444,7 @@ fn immutable_metadata_mismatch_is_uncertain_and_not_reported_as_reconciled() {
         config: &config,
         client_state: &store,
         remote: RemoteJobClient::new(&runner),
+        reconcile_observer: None,
     }
     .reconcile()
     .unwrap();
@@ -446,6 +522,7 @@ fn terminal_recovery_matrix_is_authoritative_and_repeatable() {
             config: &config,
             client_state: &store,
             remote: RemoteJobClient::new(&runner),
+            reconcile_observer: None,
         }
         .reconcile()
         .unwrap();
@@ -464,6 +541,7 @@ fn terminal_recovery_matrix_is_authoritative_and_repeatable() {
             config: &config,
             client_state: &store,
             remote: RemoteJobClient::new(&runner),
+            reconcile_observer: None,
         }
         .reconcile()
         .unwrap();
@@ -499,6 +577,7 @@ fn stale_admission_cache_is_refreshed_before_repairing_a_known_job() {
         config: &config,
         client_state: &store,
         remote: RemoteJobClient::new(&runner),
+        reconcile_observer: None,
     }
     .reconcile()
     .unwrap();
@@ -527,6 +606,7 @@ fn reconcile_timeout_retains_remote_uncertainty_and_affinity() {
         config: &config,
         client_state: &store,
         remote: RemoteJobClient::new(&runner),
+        reconcile_observer: None,
     }
     .reconcile()
     .unwrap();
@@ -577,6 +657,7 @@ fn cross_client_local_record_stops_fleet_recovery_before_remote_contact() {
         config: &config,
         client_state: &store,
         remote: RemoteJobClient::new(&runner),
+        reconcile_observer: None,
     }
     .reconcile()
     .unwrap_err();
