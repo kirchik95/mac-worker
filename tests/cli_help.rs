@@ -49,6 +49,32 @@ fn task_help_exposes_lifecycle_commands_and_keeps_runner_hidden() {
 }
 
 #[test]
+fn task_help_keeps_the_released_option_names_discoverable() {
+    let mut submit = Command::cargo_bin("worker").unwrap();
+    submit.args(["task", "submit", "--help"]);
+    submit
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--max-budget <MAX_BUDGET>"))
+        .stdout(predicate::str::contains("--max-budget-usd").not());
+
+    let mut batch = Command::cargo_bin("worker").unwrap();
+    batch.args(["task", "batch", "--help"]);
+    batch
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--name <NAME>"))
+        .stdout(predicate::str::contains("--run-name").not());
+
+    let mut wait = Command::cargo_bin("worker").unwrap();
+    wait.args(["task", "wait", "--help"]);
+    wait.assert()
+        .success()
+        .stdout(predicate::str::contains("--task-id <TASK_ID>"))
+        .stdout(predicate::str::contains("--run <RUN>"));
+}
+
+#[test]
 fn cancel_parses_one_job_id_and_exposes_no_hidden_arguments() {
     let job_id = "018f0f4a6b5c7d8e9f00112233445566";
     let cli = Cli::try_parse_from(["worker", "cancel", job_id]).unwrap();

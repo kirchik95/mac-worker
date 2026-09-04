@@ -9,45 +9,45 @@ This skill is the mechanical task loop. One task is one independent unit of work
 
 The CLI is the only interface. The skill contains no scheduling logic.
 
-**Command availability on this branch:** `src/cli.rs` exposes `worker workers` and `worker dashboard` today. Every `worker task …` form, and `worker workers --refresh`, is still absent. Those forms are the phase 5c contract; do not replace them with direct worker access, SSH, or another tool.
+**Command availability:** the release exposes `worker task …` and `worker workers --refresh`. Verify the exact installed grammar with `worker task --help` and the relevant subcommand help before dispatching; do not replace a rejected public form with direct worker access, SSH, or another tool.
 
 ## Grammar
 
-Exact public grammar (spec section 7.1). Forms marked *phase 5c* are not in this binary yet.
+Exact public grammar in the current release. The execution-core scope restrictions below still apply.
 
 ```text
-worker task submit [options] (--prompt TEXT | --prompt-file PATH)   # phase 5c
-worker task batch FILE [--run-name NAME] [--max-parallel N]         # phase 5c
-worker task list [--run RUN_ID] [--state STATE]                     # phase 5c
-worker task status TASK_ID                                          # phase 5c
-worker task logs [-f] TASK_ID [--turn N] [--raw]                    # phase 5c
-worker task diff TASK_ID [--stat]                                   # phase 5c
-worker task say TASK_ID (--message TEXT | --message-file PATH) [--wait]  # phase 5c
-worker task cancel TASK_ID                                          # phase 5c
-worker task result TASK_ID                                          # phase 5c
-worker task fetch TASK_ID                                           # phase 5c
-worker task close TASK_ID [--discard]                               # phase 5c
-worker task wait (TASK_ID... | --run RUN_ID) [--timeout DURATION]   # phase 5c
-worker task reconcile     # phase 5c; re-own dead runners and re-enqueue orphaned tasks without submitting anything
-worker workers [--refresh]  # `worker workers` exists; `--refresh` is phase 5c
-worker dashboard          # exists; the tasks-and-runs view is a later phase
+worker task submit [options] (--prompt TEXT | --prompt-file PATH)
+worker task batch FILE [--name NAME] [--max-parallel N] [--wait]
+worker task list [--run RUN_ID] [--state STATE] [--full]
+worker task status TASK_ID [--full]
+worker task logs [-f] TASK_ID [--turn N] [--raw]
+worker task diff TASK_ID [--stat]
+worker task say TASK_ID (--message TEXT | --message-file PATH) [--wait]
+worker task cancel TASK_ID
+worker task result TASK_ID
+worker task fetch TASK_ID
+worker task close TASK_ID [--discard]
+worker task wait (--task-id TASK_ID | --run RUN_ID) [--timeout DURATION]
+worker task reconcile     # re-own dead runners and re-enqueue orphaned tasks without submitting anything
+worker workers [--refresh]
+worker dashboard          # the tasks-and-runs view is a later phase
 ```
 
 `submit` options:
 
 ```text
---agent codex|claude|cursor|opencode     required
+--agent codex|claude|cursor|opencode     optional; defaults from [task].default_agent
 --model ID                               optional, agent-specific
 --project PATH                           default: current worktree
 --base REF                               default: HEAD
 --wip                                    include uncommitted changes as a temporary base commit
 --include PATTERN                        untracked inputs for --wip, same policy as v1
 --source local|origin                    default from .worker.toml, else local
---publish fetch|push                     repeatable; default from .worker.toml, else fetch
+--publish fetch|push                     one CLI value; default from .worker.toml, else fetch
 --publish-branch NAME                    origin branch name used only by publish = push
 --timeout DURATION                       per turn; default 45m; max 24h
 --max-turns N                            agent-internal turn cap where supported
---max-budget-usd AMOUNT                  where supported
+--max-budget CENTS                       where supported
 --max-followups N                        follow-up turns allowed after the first; default 10
 --close-on done|never                    default done
 --env-profile NAME                       overrides .worker.toml
@@ -90,6 +90,12 @@ Or block until the run completes:
 
 ```text
 worker task wait --run <id>
+```
+
+For one task, use the release form:
+
+```text
+worker task wait --task-id <id>
 ```
 
 Inspect one task without mutating it:

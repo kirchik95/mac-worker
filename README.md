@@ -96,7 +96,7 @@ The dashboard only observes local records, process liveness, cached worker obser
 
 ## Phase 5
 
-Phase 5 adds agent tasks: submit a prompt instead of a command, run a headless coding agent on a Mac mini, and collect the result as a Git branch. The task lifecycle commands are available in this branch, and phase 5e adds the read-only dashboard tasks view described above. The dashboard does not replace the task CLI or add mutation controls.
+Phase 5 adds agent tasks: submit a prompt instead of a command, run a headless coding agent on a Mac mini, and collect the result as a Git branch. This release exposes the `worker task` family and `worker workers --refresh`; verify the exact installed grammar with `worker task --help` and the relevant subcommand help before dispatching. The task lifecycle commands are available in this branch, and phase 5e adds the read-only dashboard tasks view described above. The dashboard does not replace the task CLI or add mutation controls.
 
 The orchestrator loop is documented in [`.claude/skills/pool-dispatch/SKILL.md`](.claude/skills/pool-dispatch/SKILL.md). How to write a brief is in [`.claude/skills/pool-task-authoring/SKILL.md`](.claude/skills/pool-task-authoring/SKILL.md). The three-Mac live procedure is [docs/phase-five-acceptance-runbook.md](docs/phase-five-acceptance-runbook.md); the sanitized record template is [docs/phase-five-validation.md](docs/phase-five-validation.md).
 
@@ -119,6 +119,8 @@ worker workers --refresh
 
 `worker workers --refresh` recollects agent, profile, and Git-identity facts. `worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks without submitting anything.
 
+For an individual task, use `worker task wait --task-id <task_id>`; `worker task wait --run <run_id>` waits for every task in a run.
+
 A batch file looks like this:
 
 ```toml
@@ -138,9 +140,8 @@ title = "Extract billing client"
 prompt = """
 Move the billing HTTP client into packages/billing-client …
 """
-agent = "claude"
-publish = ["fetch", "push"]
-publish_branch = "feat/billing-client"
+agent = "codex"
+publish = ["fetch"]
 ```
 
 Top-level keys are defaults; each task may override them. Project defaults live in `.worker.toml`:
