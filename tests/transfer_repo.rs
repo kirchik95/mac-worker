@@ -8,6 +8,7 @@ use std::{
 };
 
 use mac_worker::{
+    error::WorkerError,
     process::SystemProcessRunner,
     project::{ProjectContext, ProjectInspector},
     project_config::{ArtifactSettings, ProjectSettings, ResourceClass, SnapshotSettings},
