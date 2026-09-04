@@ -3365,6 +3365,66 @@ fn affinity_records_keep_worktree_and_project_fallbacks_separate_and_strict() {
 }
 
 #[test]
+fn observation_refresh_loser_records_the_winner_timestamp() {
+    // Break caught: a dispatcher that loses the single-flight refresh records
+    // the time it started waiting, so the next TTL check treats a fresh
+    // observation as stale.
+    let fixture = open_queue();
+    let store = Arc::new(fixture.store.clone());
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let leader = {
+        let store = Arc::clone(&store);
+        let refreshes = Arc::clone(&refreshes);
+        thread::spawn(move || {
+            store.admission_observation("mini-1", 1_000, || {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                AdmissionObservation::new(
+                    "mini-1".into(),
+                    true,
+                    CandidateSlot::Idle,
+                    vec!["rust".into()],
+                    Some(16),
+                    32,
+                    2_500,
+                )
+            })
+        })
+    };
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let loser_refreshes = Arc::clone(&refreshes);
+    let loser_store = Arc::clone(&store);
+    let loser = thread::spawn(move || {
+        loser_store.admission_observation("mini-1", 1_000, || {
+            loser_refreshes.fetch_add(100, Ordering::SeqCst);
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                CandidateSlot::Idle,
+                vec![],
+                None,
+                0,
+                1_000,
+            )
+        })
+    });
+    thread::sleep(Duration::from_millis(50));
+    release_tx.send(()).unwrap();
+    let winner = leader.join().unwrap().unwrap();
+    let loser = loser.join().unwrap().unwrap();
+    assert_eq!(winner.observation().observed_at_millis(), 2_500);
+    assert_eq!(winner.age_millis(), 0);
+    assert_eq!(loser.observation().observed_at_millis(), 2_500);
+    assert_eq!(loser.age_millis(), 0);
+    assert_eq!(loser.observation().capabilities(), &["rust"]);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn stale_observation_refresh_is_single_flight_and_loser_keeps_age() {
     // Break caught: every dispatcher probes the same stale worker, or a loser
     // blocks instead of returning cached facts with their age.

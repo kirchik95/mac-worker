@@ -182,7 +182,7 @@ impl<'a> FleetReconciler<'a> {
                 .next()
                 .expect("one configured worker produces one scheduler observation");
                 *fresh_health.borrow_mut() = Some(health);
-                admission_from_candidate(candidate, now_millis)
+                admission_from_candidate(candidate, current_time_millis()?)
             });
         let cached = match cached {
             Ok(cached) => cached,
@@ -1178,7 +1178,8 @@ impl<'a> RunService<'a> {
                             .into_iter()
                             .next()
                             .expect("one configured worker produces one scheduler observation");
-                    admission_from_candidate(candidate, observed_at_millis)
+                    let taken_at = self.scheduler_runtime.now_millis()?;
+                    admission_from_candidate(candidate, taken_at)
                 },
             )?;
             let candidate = candidate_from_admission(cached.observation())?;

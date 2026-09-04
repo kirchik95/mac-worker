@@ -1113,7 +1113,7 @@ impl ClientStateStore {
         let cached = {
             let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
             read_observation_optional(self.inner.observations.as_raw_fd(), worker)?
-                .map(|observation| CachedAdmissionObservation::new(observation, now_millis))
+                .map(|observation| cached_admission(observation, now_millis))
                 .transpose()?
         };
         if cached
@@ -1149,7 +1149,7 @@ impl ClientStateStore {
         let current = {
             let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
             read_observation_optional(self.inner.observations.as_raw_fd(), worker)?
-                .map(|observation| CachedAdmissionObservation::new(observation, now_millis))
+                .map(|observation| cached_admission(observation, now_millis))
                 .transpose()?
         };
         if current
@@ -1168,7 +1168,7 @@ impl ClientStateStore {
                 "refreshed observation belongs to another worker",
             ));
         }
-        let cached = CachedAdmissionObservation::new(observation.clone(), now_millis)?;
+        let cached = cached_admission(observation.clone(), now_millis)?;
         let bytes = canonical_json_bytes(&observation, "admission observation")?;
         {
             let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
@@ -2168,6 +2168,14 @@ fn validate_state_worker_name(value: &str) -> Result<(), WorkerError> {
         ));
     }
     Ok(())
+}
+
+fn cached_admission(
+    observation: AdmissionObservation,
+    now_millis: u64,
+) -> Result<CachedAdmissionObservation, WorkerError> {
+    let observed_at = observation.observed_at_millis();
+    CachedAdmissionObservation::new(observation, now_millis.max(observed_at))
 }
 
 fn queue_error(code: &'static str, message: &'static str) -> WorkerError {
