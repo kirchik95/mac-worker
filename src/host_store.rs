@@ -31,6 +31,7 @@ use crate::{
 
 const MAX_HOST_FILE_BYTES: u64 = 1024 * 1024;
 pub const HOST_LAYOUT_VERSION: u32 = 2;
+pub type StagingNonce = [u8; 16];
 const PREVIOUS_HOST_LAYOUT_VERSION: u32 = 1;
 const HOST_INSTALLATION_VERSION: u32 = 1;
 const INSTALLATION_PREFIX: &str = ".mac-worker-installation-";
@@ -613,6 +614,10 @@ pub struct StagedJob {
     snapshot_digest: Option<String>,
     receipt_nonce: [u8; 16],
     guard: AdmissionGuard,
+}
+
+pub(crate) trait PublicationReceipt {
+    fn validate_for(&self, staged: &StagedJob) -> Result<(), WorkerError>;
 }
 
 #[allow(dead_code)] // Task 7 consumes the snapshot-bound opaque receipt.
@@ -2208,7 +2213,11 @@ impl HostStore {
         if let Some(job) = job {
             job.verify_bound()?;
             for name in ["workspace", "home", "tmp"] {
-                self.remove_owned_child_committed(job, name)?;
+                if job.entry_exists(name)? {
+                    self.remove_owned_child_committed(job, name)?;
+                } else {
+                    job.resume_pending_owned_child_cleanup(name)?;
+                }
             }
             job.sync_root()?;
         }
@@ -2839,6 +2848,16 @@ impl HostStore {
         self.open_directory(&format!("tasks/{project_id}/{task_id}"), create)
     }
 
+    pub(crate) fn open_task_workspace(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+    ) -> Result<RootedDir, WorkerError> {
+        let task = self.open_task_directory(project_id, task_id, false)?;
+        task.open_child_directory(&relative("workspace")?, false)
+            .map_err(WorkerError::Io)
+    }
+
     fn root_identity(&self) -> Result<HostRootIdentity, WorkerError> {
         self.inner.root.verify_bound()?;
         let metadata = self.inner.root.root_metadata()?;
@@ -2883,9 +2902,15 @@ impl HostStore {
         ))? {
             self.resume_job_replace_stages(&job)?;
             for name in ["workspace", "home", "tmp"] {
-                self.remove_owned_child_committed(&job, name)?;
+                if job.entry_exists(name)? {
+                    self.remove_owned_child_committed(&job, name)?;
+                } else {
+                    job.resume_pending_owned_child_cleanup(name)?;
+                }
             }
-            self.remove_owned_regular_committed(&job, "execution.json")?;
+            if job.entry_exists("execution.json")? {
+                self.remove_owned_regular_committed(&job, "execution.json")?;
+            }
         }
         let leases = self.open_directory("leases", false)?;
         self.remove_job_owned_lease_stages(&leases, lease.job_id())?;
@@ -3640,6 +3665,22 @@ impl StagedJob {
         &self.root
     }
 
+    pub(crate) fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    pub(crate) fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub(crate) fn worktree_id(&self) -> &str {
+        &self.worktree_id
+    }
+
+    pub(crate) fn receipt_nonce(&self) -> StagingNonce {
+        self.receipt_nonce
+    }
+
     pub(crate) fn create_workspace_tree(&self) -> Result<RootedDir, WorkerError> {
         if self.root.entry_exists("workspace")? {
             return Err(WorkerError::Protocol(
@@ -3684,29 +3725,20 @@ impl StagedJob {
         })
     }
 
-    pub(crate) fn publish_complete(
+    pub(crate) fn publish_complete<R: PublicationReceipt>(
         self,
-        receipt: WorkspaceReceipt,
+        receipt: R,
     ) -> Result<PublishedJob, WorkerError> {
         self.publish_complete_with_commit_hooks(receipt, || Ok(()), || Ok(()))
     }
 
-    pub(crate) fn publish_complete_with_commit_hooks(
+    pub(crate) fn publish_complete_with_commit_hooks<R: PublicationReceipt>(
         mut self,
-        receipt: WorkspaceReceipt,
+        receipt: R,
         after_rename: impl FnOnce() -> std::io::Result<()>,
         after_parent_sync: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<PublishedJob, WorkerError> {
-        if receipt.job_id != self.job_id
-            || receipt.nonce != self.receipt_nonce
-            || receipt.project_id != self.project_id
-            || receipt.worktree_id != self.worktree_id
-            || self.snapshot_digest.as_deref() != Some(receipt.manifest_digest.as_str())
-        {
-            return Err(WorkerError::Protocol(
-                "workspace receipt does not match staged job".into(),
-            ));
-        }
+        receipt.validate_for(&self)?;
         if self.final_parent.entry_exists(&self.final_name)? {
             return Err(protocol_code(
                 "JOB_ID_CONFLICT",
@@ -3729,6 +3761,22 @@ impl StagedJob {
         };
         published.validate()?;
         Ok(published)
+    }
+}
+
+impl PublicationReceipt for WorkspaceReceipt {
+    fn validate_for(&self, staged: &StagedJob) -> Result<(), WorkerError> {
+        if self.job_id != staged.job_id
+            || self.nonce != staged.receipt_nonce
+            || self.project_id != staged.project_id
+            || self.worktree_id != staged.worktree_id
+            || staged.snapshot_digest.as_deref() != Some(self.manifest_digest.as_str())
+        {
+            return Err(WorkerError::Protocol(
+                "workspace receipt does not match staged job".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -3916,25 +3964,50 @@ fn validate_terminal_job_basis(
             })
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
-    let retained = [
-        ".mac-worker-rooted-fs",
-        "meta.json",
-        "status.json",
-        "stdout.log",
-        "stderr.log",
-    ]
+    let is_turn = job.entry_exists("prompt.md")?;
+    let retained = if is_turn {
+        vec![
+            ".mac-worker-rooted-fs",
+            "meta.json",
+            "prompt.md",
+            "result.schema.json",
+            "status.json",
+            "stderr.log",
+            "stdout.log",
+            "tail.log",
+        ]
+    } else {
+        vec![
+            ".mac-worker-rooted-fs",
+            "meta.json",
+            "status.json",
+            "stdout.log",
+            "stderr.log",
+        ]
+    }
     .into_iter()
     .map(String::from)
     .collect::<BTreeSet<_>>();
+    let mut terminal_variants = vec![retained.clone()];
+    if is_turn {
+        let mut with_last_message = retained.clone();
+        with_last_message.insert("last.md".into());
+        terminal_variants.push(with_last_message);
+    }
     let mut allowed = retained
         .iter()
         .cloned()
+        .chain(if is_turn {
+            Some(String::from("last.md"))
+        } else {
+            None
+        })
         .chain(["workspace", "home", "tmp"].into_iter().map(String::from))
         .collect::<BTreeSet<_>>();
     if prelaunch_cancelled {
         allowed.insert("execution.json".into());
     }
-    if (require_mutable_absent && names != retained)
+    if (require_mutable_absent && !terminal_variants.contains(&names))
         || (!require_mutable_absent && !names.is_subset(&allowed))
     {
         return Err(WorkerError::Protocol(

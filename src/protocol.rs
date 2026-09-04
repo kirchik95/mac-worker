@@ -1,5 +1,5 @@
 pub const PROTOCOL_VERSION: u32 = 4;
-pub const SUPERVISION_VERSION: u32 = 2;
+pub const SUPERVISION_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

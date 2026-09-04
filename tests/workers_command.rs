@@ -923,7 +923,7 @@ fn task7_only_supervision_helper_is_rejected_after_query_capability_bump() {
     let runner = RecordingRunner::returning_json(serde_json::to_vec(&response).unwrap());
     let health = SshTransport::new(runner).probe(&worker("mini-1", "mac1", &[]));
 
-    assert_eq!(mac_worker::protocol::SUPERVISION_VERSION, 2);
+    assert_eq!(mac_worker::protocol::SUPERVISION_VERSION, 3);
     assert_eq!(health.status, HealthStatus::Unavailable);
     assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
     assert_eq!(

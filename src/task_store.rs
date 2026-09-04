@@ -2,7 +2,7 @@ use std::{
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::ser::SerializeStruct;
@@ -16,7 +16,9 @@ use crate::{
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::PROTOCOL_VERSION,
     rooted_fs::RootedDir,
-    task::{BaseOid, TaskId, TaskMeta, TaskState, TaskStatus},
+    task::{
+        BaseOid, TaskId, TaskMeta, TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal,
+    },
 };
 
 const GIT_PROGRAM: &str = "/usr/bin/git";
@@ -425,7 +427,7 @@ impl<'a> TaskStore<'a> {
         self.ensure_meta(&task, meta)?;
 
         let (reused, _workspace) = self.prepare_workspace(&task, &mirror, meta)?;
-        self.ensure_active_status(&task, meta, request.worker())?;
+        self.ensure_active_status(&task, meta, request.worker(), request.job_id())?;
         task.sync_root()?;
         Ok(TaskPrepareResponse::new(meta.base_oid().clone(), reused))
     }
@@ -604,6 +606,108 @@ impl<'a> TaskStore<'a> {
     ) -> Result<TaskStatus, WorkerError> {
         let task = self.open_existing_task(project_id, task_id)?;
         self.read_status(&task)
+    }
+
+    pub fn prepared_turn(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        turn_id: JobId,
+    ) -> Result<(TaskMeta, TaskStatus), WorkerError> {
+        let task = self.open_existing_task(project_id, task_id)?;
+        let meta = self.read_meta(&task)?;
+        let status = self.read_status(&task)?;
+        let pending = status
+            .turns()
+            .last()
+            .filter(|turn| turn.turn_id() == turn_id && turn.terminal().is_none());
+        if status.state() != TaskState::Active || pending.is_none() {
+            return Err(task_error(
+                "TASK_BUSY",
+                "task does not have the requested prepared active turn",
+            ));
+        }
+        Ok((meta, status))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_turn(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        turn_id: JobId,
+        terminal: TurnTerminal,
+        outcome: TaskOutcome,
+        agent_committed: bool,
+        log_truncated: bool,
+        head_oid: Option<BaseOid>,
+        summary: Option<String>,
+        questions: Vec<String>,
+        files_changed: Vec<String>,
+        diff_stat: Option<String>,
+        close: bool,
+    ) -> Result<TaskStatus, WorkerError> {
+        let task = self.open_existing_task(project_id, task_id)?;
+        let current = self.read_status(&task)?;
+        if let Some(last) = current.turns().last()
+            && last.turn_id() == turn_id
+            && last.terminal().is_some()
+        {
+            return Ok(current);
+        }
+        let Some(last) = current.turns().last() else {
+            return Err(task_error(
+                "TASK_INCONSISTENT",
+                "turn completion has no prepared turn record",
+            ));
+        };
+        if last.turn_id() != turn_id || last.terminal().is_some() {
+            return Err(task_error(
+                "TASK_BUSY",
+                "turn completion does not match the active turn",
+            ));
+        }
+        let ended_at = now_millis()?;
+        let mut turns = current.turns().to_vec();
+        let replacement = TurnSummary::new(
+            last.turn_number(),
+            turn_id,
+            Some(terminal),
+            Some(outcome.clone()),
+            Some(agent_committed),
+            log_truncated,
+            last.started_at_millis().or(Some(ended_at)),
+            Some(ended_at),
+        );
+        let _ = turns.pop();
+        turns.push(replacement);
+        let next_state = if close {
+            TaskState::Closed
+        } else {
+            TaskState::Open
+        };
+        let next = TaskStatus::new(
+            next_state,
+            Some(outcome),
+            current.worker().map(str::to_owned),
+            current.session_present(),
+            head_oid.or_else(|| current.head_oid().cloned()),
+            summary.or_else(|| current.summary().map(str::to_owned)),
+            if questions.is_empty() {
+                current.questions().to_vec()
+            } else {
+                questions
+            },
+            if files_changed.is_empty() {
+                current.files_changed().to_vec()
+            } else {
+                files_changed
+            },
+            diff_stat.or_else(|| current.diff_stat().map(str::to_owned)),
+            turns,
+            ended_at,
+        )?;
+        replace_status_bytes(&task, current, next)
     }
 
     pub fn bind_session(
@@ -800,6 +904,7 @@ impl<'a> TaskStore<'a> {
         task: &RootedDir,
         meta: &TaskMeta,
         worker: &str,
+        turn_id: JobId,
     ) -> Result<(), WorkerError> {
         if task.entry_exists("status.json")? {
             let status: TaskStatus = read_record(task, "status.json")?;
@@ -809,6 +914,41 @@ impl<'a> TaskStore<'a> {
                     "task is already terminal",
                 ));
             }
+            if status.state() == TaskState::Active
+                && let Some(last) = status.turns().last()
+                && last.terminal().is_none()
+                && last.turn_id() != turn_id
+            {
+                return Err(task_error("TASK_BUSY", "task already has an active turn"));
+            }
+            if status.state() == TaskState::Active
+                && status
+                    .turns()
+                    .last()
+                    .is_some_and(|turn| turn.turn_id() == turn_id && turn.terminal().is_none())
+            {
+                return Ok(());
+            }
+            let turn_number = u32::try_from(status.turns().len())
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| task_error("TASK_INCONSISTENT", "turn history is too long"))?;
+            let pending =
+                TurnSummary::new(turn_number, turn_id, None, None, None, false, None, None);
+            let next = TaskStatus::new(
+                TaskState::Active,
+                status.last_outcome().cloned(),
+                Some(worker.to_owned()),
+                status.session_present(),
+                status.head_oid().cloned(),
+                status.summary().map(str::to_owned),
+                status.questions().to_vec(),
+                status.files_changed().to_vec(),
+                status.diff_stat().map(str::to_owned),
+                status.turns().iter().cloned().chain([pending]).collect(),
+                status.updated_at_millis(),
+            )?;
+            replace_status_bytes(task, status, next)?;
             return Ok(());
         }
         let status = TaskStatus::new(
@@ -821,7 +961,16 @@ impl<'a> TaskStore<'a> {
             Vec::new(),
             Vec::new(),
             None,
-            Vec::new(),
+            vec![TurnSummary::new(
+                1,
+                turn_id,
+                None,
+                None,
+                None,
+                false,
+                Some(meta.created_at_millis()),
+                None,
+            )],
             meta.created_at_millis(),
         )?;
         write_record_once(task, "status.json", &status)
@@ -921,6 +1070,15 @@ impl<'a> TaskStore<'a> {
     fn read_status(&self, task: &RootedDir) -> Result<TaskStatus, WorkerError> {
         read_record(task, "status.json").map_err(map_task_not_found)
     }
+}
+
+fn now_millis() -> Result<u64, WorkerError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| task_error("TASK_CLOCK_INVALID", "system clock precedes the Unix epoch"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| task_error("TASK_CLOCK_INVALID", "system clock is outside the range"))
 }
 
 fn git_request(

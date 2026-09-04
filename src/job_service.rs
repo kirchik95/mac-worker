@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 
 use crate::{
     error::WorkerError,
@@ -20,15 +21,20 @@ use crate::{
         StatusResponse, SubmitRequest, SubmitResponse,
     },
     lease::LeaseService,
+    process::SystemProcessRunner,
     remote_snapshot::{RemoteSnapshotService, VerifiedRemoteSnapshot},
     rooted_fs::{RootedDir, is_log_offset_beyond_eof},
     supervisor::{
         ProcessObservation, ReconciliationRuntime, SystemReconciliationRuntime,
         reconcile_orphan_processes, terminate_exact_recorded_group,
     },
+    task_store::TaskStore,
+    turn::{
+        TaskTurnRequest, TaskTurnResponse, TerminalPath, TurnReceipt, TurnSection, TurnTerminalHook,
+    },
 };
 
-const EXECUTION_PAYLOAD_VERSION: u32 = 1;
+pub(crate) const EXECUTION_PAYLOAD_VERSION: u32 = 2;
 const MAX_HOST_JSON_BYTES: u64 = 1024 * 1024;
 const CANCEL_SUPERVISOR_HANDOFF_DEADLINE: Duration = Duration::from_secs(5);
 const CANCEL_SUPERVISOR_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -42,6 +48,7 @@ pub(crate) struct ExecutionPayload {
     request_fingerprint: RequestFingerprint,
     lease_token: LeaseToken,
     command: CommandSpec,
+    turn: Option<TurnSection>,
 }
 
 impl fmt::Debug for ExecutionPayload {
@@ -58,6 +65,13 @@ impl fmt::Debug for ExecutionPayload {
 
 impl ExecutionPayload {
     fn new(request: &SubmitRequest) -> Result<Self, WorkerError> {
+        Self::new_with_turn(request, None)
+    }
+
+    pub(crate) fn new_with_turn(
+        request: &SubmitRequest,
+        turn: Option<TurnSection>,
+    ) -> Result<Self, WorkerError> {
         request.validate()?;
         let material = request.material();
         let payload = Self {
@@ -67,12 +81,52 @@ impl ExecutionPayload {
             request_fingerprint: request.request_fingerprint().clone(),
             lease_token: material.lease_token(),
             command: material.command().clone(),
+            turn,
         };
-        payload.validate_for(request)?;
+        if let Some(turn) = &payload.turn {
+            payload.validate_for_turn(request, turn)?;
+        } else {
+            payload.validate_for(request)?;
+        }
         Ok(payload)
     }
 
     fn validate_for(&self, request: &SubmitRequest) -> Result<(), WorkerError> {
+        request.validate()?;
+        if self.version != EXECUTION_PAYLOAD_VERSION
+            || self.job_id != request.material().job_id()
+            || self.client_id != request.material().client_id()
+            || self.request_fingerprint != *request.request_fingerprint()
+            || self.lease_token != request.material().lease_token()
+            || self.command != *request.material().command()
+            || self.turn.is_some()
+        {
+            return Err(protocol_code(
+                "JOB_ID_CONFLICT",
+                "execution payload does not match the immutable request",
+            ));
+        }
+        self.command.validate()
+    }
+
+    pub(crate) fn validate_for_turn(
+        &self,
+        request: &SubmitRequest,
+        section: &TurnSection,
+    ) -> Result<(), WorkerError> {
+        self.validate_for_common(request)?;
+        if self.turn.as_ref() != Some(section)
+            || section.turn().digest() != request.material().manifest_digest()
+        {
+            return Err(protocol_code(
+                "JOB_ID_CONFLICT",
+                "execution payload turn does not match the immutable request",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_for_common(&self, request: &SubmitRequest) -> Result<(), WorkerError> {
         request.validate()?;
         if self.version != EXECUTION_PAYLOAD_VERSION
             || self.job_id != request.material().job_id()
@@ -128,6 +182,15 @@ impl ExecutionPayload {
                 "execution payload does not match durable job identity",
             ));
         }
+        if let Some(turn) = &self.turn
+            && (turn.project_id() != meta.project_id()
+                || turn.turn().digest() != meta.manifest_digest())
+        {
+            return Err(protocol_code(
+                "JOB_ID_CONFLICT",
+                "execution payload turn does not match durable job metadata",
+            ));
+        }
         self.command.validate()
     }
 
@@ -135,7 +198,15 @@ impl ExecutionPayload {
         &self.command
     }
 
+    pub(crate) fn turn(&self) -> Option<&TurnSection> {
+        self.turn.as_ref()
+    }
+
     fn validate_for_resolution(&self, identity: &ResolutionIdentity) -> Result<(), WorkerError> {
+        let turn_matches = self.turn.as_ref().is_none_or(|section| {
+            section.project_id() == identity.project_id()
+                && section.turn().digest() == identity.manifest_digest()
+        });
         let material = RequestFingerprintMaterial::new(
             self.job_id,
             self.client_id,
@@ -157,6 +228,7 @@ impl ExecutionPayload {
             && self.request_fingerprint == *identity.request_fingerprint()
             && material.fingerprint() == self.request_fingerprint
             && self.command.summary()? == *identity.command_summary()
+            && turn_matches
         {
             Ok(())
         } else {
@@ -311,6 +383,254 @@ impl<'a> JobService<'a> {
                 WorkerError::Protocol("system clock is outside the supported range".into())
             })?;
         self.submit_at(request, now)
+    }
+
+    pub fn submit_turn(&self, request: TaskTurnRequest) -> Result<TaskTurnResponse, WorkerError> {
+        request.validate()?;
+        let submit = request.submit().clone();
+        let turn = request.turn().clone();
+        let material = submit.material();
+        if material.project_id().is_empty() {
+            return Err(protocol_code("REQUEST_CONFLICT", "turn project is invalid"));
+        }
+        let job_id = material.job_id();
+        let task_store = TaskStore::new(self.store, &SystemProcessRunner);
+        let admission = self.store.admission_lock(job_id)?;
+        // A completed first turn is still an idempotent replay. Check the
+        // immutable job index before asking the task store for a pending
+        // turn, because the latter is deliberately no longer pending after
+        // publication.
+        if let Some(disposition) = self.store.disposition(job_id)? {
+            require_matching_accepted(&disposition, &submit)?;
+            let task_status = task_store.load_status(material.project_id(), turn.task_id())?;
+            if let Some(lease) = self
+                .leases
+                .load_after(&admission, job_id)?
+                .filter(|lease| lease.job_id() == job_id)
+            {
+                require_exact_lease(&lease, &submit)?;
+                let (meta, status) = self.read_exact_job(&submit, &lease)?;
+                if status.state().is_terminal() {
+                    let authoritative =
+                        self.status_from_accepted_after(admission, disposition, true)?;
+                    return Ok(TaskTurnResponse::new(
+                        SubmitResponse::Existing {
+                            status: authoritative.response.status().clone(),
+                        },
+                        task_store.load_status(material.project_id(), turn.task_id())?,
+                    ));
+                }
+                if status.state() == JobState::Accepted
+                    && status.supervisor_identity().is_none()
+                    && status.child_identity().is_none()
+                {
+                    let job = self.store.open_directory(
+                        &format!(
+                            "jobs/{}/{}/{}",
+                            material.project_id(),
+                            material.worktree_id(),
+                            material.job_id()
+                        ),
+                        false,
+                    )?;
+                    let payload: ExecutionPayload = read_canonical_json(&job, "execution.json")?;
+                    let section = payload.turn().cloned().ok_or_else(|| {
+                        protocol_code(
+                            "JOB_ID_CONFLICT",
+                            "accepted turn job has no durable turn section",
+                        )
+                    })?;
+                    payload.validate_for_turn(&submit, &section)?;
+                    if section.turn() != &turn {
+                        return Err(protocol_code(
+                            "REQUEST_CONFLICT",
+                            "accepted turn job belongs to another turn",
+                        ));
+                    }
+                    let supervisor = self
+                        .store
+                        .supervisor_lock_after(&admission, job_id, false)?;
+                    drop(admission);
+                    let submit_response = match supervisor {
+                        Some(guard) => {
+                            self.launch_and_observe(job_id, guard, &submit, &lease, false, meta)?
+                        }
+                        None => SubmitResponse::Existing { status },
+                    };
+                    return Ok(TaskTurnResponse::new(
+                        submit_response,
+                        task_store.load_status(material.project_id(), turn.task_id())?,
+                    ));
+                }
+                drop(admission);
+                return Ok(TaskTurnResponse::new(
+                    SubmitResponse::Existing { status },
+                    task_status,
+                ));
+            }
+            let authoritative = self.status_from_accepted_after(admission, disposition, true)?;
+            return Ok(TaskTurnResponse::new(
+                SubmitResponse::Existing {
+                    status: authoritative.response.status().clone(),
+                },
+                task_store.load_status(material.project_id(), turn.task_id())?,
+            ));
+        }
+
+        let lease = self
+            .leases
+            .load_after(&admission, job_id)?
+            .filter(|lease| lease.job_id() == job_id)
+            .ok_or_else(|| protocol_code("LEASE_MISSING", "matching task lease is absent"))?;
+        require_exact_lease(&lease, &submit)?;
+
+        let (meta, prepared_status) =
+            task_store.prepared_turn(material.project_id(), turn.task_id(), job_id)?;
+        let pending_turn = prepared_status
+            .turns()
+            .last()
+            .ok_or_else(|| protocol_code("REQUEST_CONFLICT", "prepared turn history is absent"))?;
+        if material.worktree_id() != meta.worktree_id()
+            || turn.turn_number() != pending_turn.turn_number()
+            || turn.agent() != meta.agent()
+            || turn.model() != meta.model()
+            || turn.policy() != meta.policy()
+            || turn.limits() != &meta.limits().turn
+            || turn.env_profile() != meta.env_profile()
+            || turn.base_oid() != prepared_status.head_oid().unwrap_or(meta.base_oid())
+        {
+            return Err(protocol_code(
+                "REQUEST_CONFLICT",
+                "turn does not match the prepared task",
+            ));
+        }
+        if turn.resume()
+            && task_store
+                .session(material.project_id(), turn.task_id())?
+                .is_none()
+        {
+            return Err(protocol_code(
+                "SESSION_UNBOUND",
+                "resumed turn requires a bound agent session",
+            ));
+        }
+        let section =
+            TurnSection::new(turn.clone(), meta.project_id(), meta.git_identity().clone())?;
+        if let Some((job_meta, initial_status)) =
+            self.read_repairable_turn_final(&submit, &lease, &section)?
+        {
+            let published = self.store.reopen_published_after(
+                admission,
+                material.project_id(),
+                material.worktree_id(),
+                job_id,
+            )?;
+            self.store.record_accepted_after(
+                &published,
+                &submit,
+                &initial_status,
+                job_meta.created_at_millis(),
+            )?;
+            if turn.agent() == crate::agent::AgentKind::Claude && !turn.resume() {
+                task_store.bind_session(
+                    material.project_id(),
+                    turn.task_id(),
+                    crate::task_store::SessionBinding::new(
+                        crate::agent::AgentKind::Claude,
+                        turn.session_seed().to_string(),
+                        now_millis()?,
+                    )?,
+                )?;
+            }
+            let supervisor =
+                self.store
+                    .supervisor_lock_after(published.admission_guard(), job_id, false)?;
+            drop(published);
+            let submit_response = match supervisor {
+                Some(guard) => {
+                    self.launch_and_observe(job_id, guard, &submit, &lease, true, job_meta)?
+                }
+                None => SubmitResponse::Accepted {
+                    meta: Box::new(job_meta),
+                    status: initial_status,
+                },
+            };
+            return Ok(TaskTurnResponse::new(
+                submit_response,
+                task_store.load_status(material.project_id(), turn.task_id())?,
+            ));
+        }
+        let staged = self.store.begin_job_after(
+            admission,
+            material.project_id(),
+            material.worktree_id(),
+            job_id,
+        )?;
+        let receipt = TurnReceipt::new(
+            job_id,
+            turn.task_id(),
+            turn.base_oid().clone(),
+            staged.receipt_nonce(),
+        );
+        let job_meta = JobMeta::new(
+            &submit.material().clone(),
+            submit.request_fingerprint().clone(),
+        )?;
+        let initial_status = JobStatus::accepted(material.created_at_millis())?;
+        materialize_turn_control_files(
+            self.store,
+            staged.rooted_dir(),
+            &submit,
+            request.prompt(),
+            &job_meta,
+            &initial_status,
+            &section,
+        )?;
+        let published = staged.publish_complete_with_commit_hooks(
+            receipt,
+            || {
+                consume_job_fault(
+                    self.store,
+                    crate::host_store::HostStoreWritePoint::AfterJobRename,
+                )
+            },
+            || {
+                consume_job_fault(
+                    self.store,
+                    crate::host_store::HostStoreWritePoint::AfterJobPublish,
+                )
+            },
+        )?;
+        self.store
+            .record_accepted_after(&published, &submit, &initial_status, now_millis()?)?;
+        if turn.agent() == crate::agent::AgentKind::Claude && !turn.resume() {
+            task_store.bind_session(
+                material.project_id(),
+                turn.task_id(),
+                crate::task_store::SessionBinding::new(
+                    crate::agent::AgentKind::Claude,
+                    turn.session_seed().to_string(),
+                    now_millis()?,
+                )?,
+            )?;
+        }
+        let supervisor =
+            self.store
+                .supervisor_lock_after(published.admission_guard(), job_id, false)?;
+        drop(published);
+        let submit_response = match supervisor {
+            Some(guard) => {
+                self.launch_and_observe(job_id, guard, &submit, &lease, true, job_meta)?
+            }
+            None => SubmitResponse::Accepted {
+                meta: Box::new(job_meta),
+                status: initial_status,
+            },
+        };
+        Ok(TaskTurnResponse::new(
+            submit_response,
+            task_store.load_status(material.project_id(), turn.task_id())?,
+        ))
     }
 
     pub fn status(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
@@ -851,9 +1171,13 @@ impl<'a> JobService<'a> {
             "execution.json",
             "home",
             "meta.json",
+            "last.md",
+            "prompt.md",
+            "result.schema.json",
             "status.json",
             "stderr.log",
             "stdout.log",
+            "tail.log",
             "tmp",
             "workspace",
         ]
@@ -873,10 +1197,58 @@ impl<'a> JobService<'a> {
             None
         };
         let payload_present = job.entry_exists("execution.json")?;
+        let mut turn_payload = false;
         if payload_present {
             let payload: ExecutionPayload = read_canonical_json(&job, "execution.json")
                 .map_err(|_| job_id_conflict("incomplete execution payload is invalid"))?;
             payload.validate_for_resolution(identity)?;
+            if let Some(section) = payload.turn() {
+                turn_payload = true;
+                if job.entry_exists("prompt.md")? {
+                    let prompt = job
+                        .read_private_regular("prompt.md", crate::task::MAX_PROMPT_BYTES as u64)
+                        .map_err(|_| job_id_conflict("incomplete turn prompt is unsafe"))?;
+                    if format!("{:x}", Sha256::digest(&prompt)) != section.turn().prompt_sha256() {
+                        return Err(job_id_conflict(
+                            "incomplete turn prompt does not match its digest",
+                        ));
+                    }
+                }
+                if job.entry_exists("result.schema.json")?
+                    && job
+                        .read_private_regular("result.schema.json", MAX_HOST_JSON_BYTES)
+                        .map_err(|_| job_id_conflict("incomplete turn schema is unsafe"))?
+                        != crate::agent::RESULT_SCHEMA_JSON.as_bytes()
+                {
+                    return Err(job_id_conflict("incomplete turn schema is not canonical"));
+                }
+                if job.entry_exists("tail.log")? {
+                    let tail = job
+                        .open_private_append("tail.log")
+                        .map_err(|_| job_id_conflict("incomplete turn tail is unsafe"))?;
+                    if job
+                        .validate_private_append_binding("tail.log", &tail)
+                        .map_err(|_| job_id_conflict("incomplete turn tail binding is unsafe"))?
+                        != 0
+                    {
+                        return Err(job_id_conflict(
+                            "nonempty unindexed turn tail is possible launch evidence",
+                        ));
+                    }
+                }
+            }
+        }
+        if !turn_payload
+            && names.iter().any(|name| {
+                matches!(
+                    name.as_str(),
+                    "last.md" | "prompt.md" | "result.schema.json" | "tail.log"
+                )
+            })
+        {
+            return Err(job_id_conflict(
+                "turn evidence belongs to a non-turn execution payload",
+            ));
         }
         let status_present = job.entry_exists("status.json")?;
         if status_present {
@@ -933,7 +1305,7 @@ impl<'a> JobService<'a> {
         .into_iter()
         .map(String::from)
         .collect::<std::collections::BTreeSet<_>>();
-        Ok(Some(if names == complete {
+        Ok(Some(if names == complete && !turn_payload {
             ResolutionFinal::Complete
         } else {
             ResolutionFinal::Incomplete(job)
@@ -1173,9 +1545,55 @@ impl<'a> JobService<'a> {
         }
         if !identityless_accepted {
             if current.state().is_terminal() {
+                let turn_section = if job.entry_exists("execution.json")? {
+                    let payload: ExecutionPayload = read_canonical_json(&job, "execution.json")?;
+                    payload.validate_for_durable_job(&lease, &meta)?;
+                    payload.turn().cloned()
+                } else {
+                    None
+                };
+                let publication = if let Some(section) = turn_section.as_ref() {
+                    let task_store = TaskStore::new(self.store, &SystemProcessRunner);
+                    let task_status =
+                        task_store.load_status(section.project_id(), section.turn().task_id())?;
+                    let pending = task_status.turns().last().is_some_and(|turn| {
+                        turn.turn_id() == lease.job_id() && turn.terminal().is_none()
+                    });
+                    if task_status.state() == crate::task::TaskState::Active && pending {
+                        let (terminal, path, exit_code) = terminal_turn_recovery(&current)?;
+                        TurnTerminalHook
+                            .invoke(
+                                self.store, &job, &meta, section, terminal, path, exit_code, false,
+                            )
+                            .map(|_| ())
+                    } else if task_status.state() == crate::task::TaskState::Active {
+                        return Err(protocol_code(
+                            "TASK_TURN_CONFLICT",
+                            "terminal job retains a turn payload but task has another active turn",
+                        ));
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                };
+                let payload_removal = if job.entry_exists("execution.json")? {
+                    self.store
+                        .remove_owned_regular_committed(&job, "execution.json")
+                } else {
+                    Ok(())
+                };
                 drop(admission);
                 drop(supervisor);
-                self.cleanup_and_release_reconciled(&lease, &job, &current)?;
+                let cleanup = match payload_removal {
+                    Ok(()) => self.cleanup_and_release_reconciled(&lease, &job, &current),
+                    Err(error) => Err(WorkerError::Io(error)),
+                };
+                if let Err(error) = publication {
+                    let _ = cleanup;
+                    return Err(error);
+                }
+                cleanup?;
                 return AuthoritativeJob::new(job, meta, current);
             }
             let supervisor_identity = current.supervisor_identity().ok_or_else(|| {
@@ -1205,8 +1623,17 @@ impl<'a> JobService<'a> {
                 supervisor_observation,
                 current.child_identity(),
             )?;
-            self.store
-                .remove_owned_regular_committed(&job, "execution.json")?;
+            let turn_section = if job.entry_exists("execution.json")? {
+                let payload: ExecutionPayload = read_canonical_json(&job, "execution.json")?;
+                payload.validate_for_durable_job(&lease, &meta)?;
+                payload.turn().cloned()
+            } else {
+                None
+            };
+            if job.entry_exists("execution.json")? {
+                self.store
+                    .remove_owned_regular_committed(&job, "execution.json")?;
+            }
             let stdout = job.open_private_append("stdout.log")?;
             let stderr = job.open_private_append("stderr.log")?;
             stdout.sync_all()?;
@@ -1228,8 +1655,27 @@ impl<'a> JobService<'a> {
                 &current,
                 &lost,
             )?;
+            let publication = turn_section.as_ref().map_or(Ok(()), |section| {
+                TurnTerminalHook
+                    .invoke(
+                        self.store,
+                        &job,
+                        &meta,
+                        section,
+                        crate::task::TurnTerminal::Lost,
+                        TerminalPath::LostReconciliation,
+                        None,
+                        false,
+                    )
+                    .map(|_| ())
+            });
             drop(supervisor);
-            self.cleanup_and_release_reconciled(&lease, &job, &lost)?;
+            let cleanup = self.cleanup_and_release_reconciled(&lease, &job, &lost);
+            if let Err(error) = publication {
+                let _ = cleanup;
+                return Err(error);
+            }
+            cleanup?;
             return AuthoritativeJob::new(job, meta, lost);
         }
 
@@ -1678,6 +2124,51 @@ impl<'a> JobService<'a> {
         Ok((meta, status))
     }
 
+    fn read_repairable_turn_final(
+        &self,
+        request: &SubmitRequest,
+        lease: &LeaseRecord,
+        section: &TurnSection,
+    ) -> Result<Option<(JobMeta, JobStatus)>, WorkerError> {
+        let material = request.material();
+        let job = match self.store.open_directory(
+            &format!(
+                "jobs/{}/{}/{}",
+                material.project_id(),
+                material.worktree_id(),
+                material.job_id()
+            ),
+            false,
+        ) {
+            Ok(job) => job,
+            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let validated = (|| {
+            let meta: JobMeta = read_canonical_json(&job, "meta.json")?;
+            require_exact_meta(&meta, request, lease)?;
+            let status: JobStatus = read_canonical_json(&job, "status.json")?;
+            status.validate()?;
+            if status != JobStatus::accepted(meta.created_at_millis())? {
+                return Err(protocol_code(
+                    "JOB_ID_CONFLICT",
+                    "unindexed final turn is not an exact prelaunch Accepted job",
+                ));
+            }
+            validate_indexed_turn_prelaunch_job(&job, request, section)?;
+            Ok((meta, status))
+        })()
+        .map_err(|_| {
+            protocol_code(
+                "JOB_ID_CONFLICT",
+                "unindexed final turn evidence is incomplete or conflicting",
+            )
+        })?;
+        Ok(Some(validated))
+    }
+
     fn read_repairable_final(
         &self,
         request: &SubmitRequest,
@@ -1840,6 +2331,62 @@ fn materialize_control_files(
     Ok(())
 }
 
+fn materialize_turn_control_files(
+    store: &HostStore,
+    root: &RootedDir,
+    request: &SubmitRequest,
+    prompt: &str,
+    meta: &JobMeta,
+    status: &JobStatus,
+    section: &TurnSection,
+) -> Result<(), WorkerError> {
+    let tmp = root.open_child_directory(&relative("tmp")?, true)?;
+    tmp.sync_root()?;
+    for name in ["stdout.log", "stderr.log", "tail.log"] {
+        let file = root.write_new_private_file(name, &[])?;
+        file.sync_all()?;
+    }
+    let prompt_file = root.write_new_private_file("prompt.md", prompt.as_bytes())?;
+    prompt_file.sync_all()?;
+    drop(prompt_file);
+    let schema = root.write_new_private_file(
+        crate::agent::SCHEMA_FILE_NAME,
+        crate::agent::RESULT_SCHEMA_JSON.as_bytes(),
+    )?;
+    schema.sync_all()?;
+    drop(schema);
+    write_new_canonical_json(
+        store,
+        root,
+        "meta.json",
+        meta,
+        crate::host_store::HostStoreWritePoint::AfterJobMetaWrite,
+        crate::host_store::HostStoreWritePoint::AfterJobMetaFileSync,
+    )?;
+    write_new_canonical_json(
+        store,
+        root,
+        "status.json",
+        status,
+        crate::host_store::HostStoreWritePoint::AfterJobStatusWrite,
+        crate::host_store::HostStoreWritePoint::AfterJobStatusFileSync,
+    )?;
+    write_new_canonical_json(
+        store,
+        root,
+        "execution.json",
+        &ExecutionPayload::new_with_turn(request, Some(section.clone()))?,
+        crate::host_store::HostStoreWritePoint::AfterJobExecutionWrite,
+        crate::host_store::HostStoreWritePoint::AfterJobExecutionFileSync,
+    )?;
+    root.sync_root()?;
+    consume_job_fault(
+        store,
+        crate::host_store::HostStoreWritePoint::AfterJobStagingDirectorySync,
+    )?;
+    Ok(())
+}
+
 fn validate_indexed_prelaunch_job(
     job: &RootedDir,
     request: &SubmitRequest,
@@ -1880,6 +2427,66 @@ fn validate_indexed_prelaunch_job(
         if job.validate_private_append_binding(log, &file)? != 0 {
             return Err(WorkerError::Protocol(
                 "indexed prelaunch job log is not empty".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_indexed_turn_prelaunch_job(
+    job: &RootedDir,
+    request: &SubmitRequest,
+    section: &TurnSection,
+) -> Result<(), WorkerError> {
+    let payload: ExecutionPayload = read_canonical_json(job, "execution.json")?;
+    payload.validate_for_turn(request, section)?;
+    let names = job
+        .list_names()?
+        .into_iter()
+        .map(|name| {
+            String::from_utf8(name)
+                .map_err(|_| WorkerError::Protocol("final turn has a non-UTF-8 entry".into()))
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    let expected = [
+        ".mac-worker-rooted-fs",
+        "execution.json",
+        "meta.json",
+        "prompt.md",
+        "result.schema.json",
+        "status.json",
+        "stderr.log",
+        "stdout.log",
+        "tail.log",
+        "tmp",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect::<std::collections::BTreeSet<_>>();
+    if names != expected {
+        return Err(WorkerError::Protocol(
+            "indexed prelaunch turn has an unsafe top-level layout".into(),
+        ));
+    }
+    job.open_child_directory(&relative("tmp")?, false)?;
+    let prompt = job.read_private_regular("prompt.md", crate::task::MAX_PROMPT_BYTES as u64)?;
+    if format!("{:x}", sha2::Sha256::digest(&prompt)) != section.turn().prompt_sha256() {
+        return Err(WorkerError::Protocol(
+            "indexed prelaunch turn prompt does not match its digest".into(),
+        ));
+    }
+    if job.read_private_regular("result.schema.json", MAX_HOST_JSON_BYTES)?
+        != crate::agent::RESULT_SCHEMA_JSON.as_bytes()
+    {
+        return Err(WorkerError::Protocol(
+            "indexed prelaunch turn result schema is not canonical".into(),
+        ));
+    }
+    for log in ["stdout.log", "stderr.log", "tail.log"] {
+        let file = job.open_private_append(log)?;
+        if job.validate_private_append_binding(log, &file)? != 0 {
+            return Err(WorkerError::Protocol(
+                "indexed prelaunch turn log is not empty".into(),
             ));
         }
     }
@@ -2156,7 +2763,7 @@ fn validate_terminal_log_lengths(job: &RootedDir, status: &JobStatus) -> Result<
     Ok(())
 }
 
-fn reconstruct_submit_request(
+pub(crate) fn reconstruct_submit_request(
     job: &RootedDir,
     meta: &JobMeta,
     lease: &LeaseRecord,
@@ -2312,6 +2919,55 @@ fn protocol_code(code: &'static str, message: &str) -> WorkerError {
     WorkerError::Protocol(format!("{code}: {message}"))
 }
 
+fn terminal_turn_recovery(
+    status: &JobStatus,
+) -> Result<(crate::task::TurnTerminal, TerminalPath, Option<i32>), WorkerError> {
+    match status.state() {
+        JobState::Succeeded => Ok((
+            crate::task::TurnTerminal::Succeeded,
+            TerminalPath::ChildExit(i32::from(status.exit_code().unwrap_or(0))),
+            status.exit_code().map(i32::from),
+        )),
+        JobState::Failed => {
+            if let Some(code) = status.exit_code() {
+                Ok((
+                    crate::task::TurnTerminal::Failed,
+                    TerminalPath::ChildExit(i32::from(code)),
+                    Some(i32::from(code)),
+                ))
+            } else if let Some(signal) = status.terminating_signal() {
+                Ok((
+                    crate::task::TurnTerminal::Cancelled,
+                    TerminalPath::ChildExit(-i32::try_from(signal).unwrap_or(1)),
+                    None,
+                ))
+            } else {
+                Err(job_state_invalid(
+                    "failed turn status has no command outcome",
+                ))
+            }
+        }
+        JobState::Cancelled => Ok((
+            crate::task::TurnTerminal::Cancelled,
+            TerminalPath::HostCancel,
+            None,
+        )),
+        JobState::TimedOut => Ok((
+            crate::task::TurnTerminal::TimedOut,
+            TerminalPath::Timeout,
+            None,
+        )),
+        JobState::Lost => Ok((
+            crate::task::TurnTerminal::Lost,
+            TerminalPath::LostReconciliation,
+            None,
+        )),
+        _ => Err(job_state_invalid(
+            "turn publication recovery requires a terminal job status",
+        )),
+    }
+}
+
 fn job_id_conflict(message: &str) -> WorkerError {
     protocol_code("JOB_ID_CONFLICT", message)
 }
@@ -2378,4 +3034,13 @@ fn reject_prelaunch_terminal(status: &JobStatus) -> Result<(), WorkerError> {
         ));
     }
     Ok(())
+}
+
+fn now_millis() -> Result<u64, WorkerError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| protocol_code("CLOCK_INVALID", "system clock precedes the Unix epoch"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| protocol_code("CLOCK_INVALID", "system clock is outside the range"))
 }

@@ -503,6 +503,10 @@ impl TaskMeta {
         self.agent
     }
 
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     pub fn source(&self) -> &TaskSource {
         &self.source
     }
@@ -521,6 +525,10 @@ impl TaskMeta {
 
     pub fn limits(&self) -> &TaskLimits {
         &self.limits
+    }
+
+    pub fn env_profile(&self) -> Option<&str> {
+        self.env_profile.as_deref()
     }
 
     pub fn close_policy(&self) -> ClosePolicy {
@@ -723,6 +731,38 @@ impl TurnSummary {
             started_at_millis,
             ended_at_millis,
         }
+    }
+
+    pub fn turn_number(&self) -> u32 {
+        self.turn_number
+    }
+
+    pub fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub fn terminal(&self) -> Option<TurnTerminal> {
+        self.terminal
+    }
+
+    pub fn outcome(&self) -> Option<&TaskOutcome> {
+        self.outcome.as_ref()
+    }
+
+    pub fn agent_committed(&self) -> Option<bool> {
+        self.agent_committed
+    }
+
+    pub fn log_truncated(&self) -> bool {
+        self.log_truncated
+    }
+
+    pub fn started_at_millis(&self) -> Option<u64> {
+        self.started_at_millis
+    }
+
+    pub fn ended_at_millis(&self) -> Option<u64> {
+        self.ended_at_millis
     }
 
     fn redact(self, boundary: &RedactionBoundary) -> Self {

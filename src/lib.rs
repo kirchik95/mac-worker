@@ -50,6 +50,7 @@ use transfer::{
     TransferIdentity,
 };
 use transport::{SshTransport, WorkersService};
+use turn::TaskTurnRequest;
 
 pub mod agent;
 pub mod agent_facts;
@@ -89,6 +90,7 @@ pub mod task_store;
 pub mod transfer;
 pub mod transfer_repo;
 pub mod transport;
+pub mod turn;
 
 #[doc(hidden)]
 #[derive(Debug, Clone)]
@@ -314,6 +316,11 @@ fn execute_with_context(
             command: HostCommand::TaskClose,
         } => Err(WorkerError::Protocol(
             "host task-close requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::TaskTurn,
+        } => Err(WorkerError::Protocol(
+            "host task-turn requires the stdio execution boundary".into(),
         )),
     }
 }
@@ -642,6 +649,14 @@ pub fn run_with_rsync_executor_in_context(
         }
     ) {
         return run_host_task_close(cli.config, runtime, runner, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::TaskTurn
+        }
+    ) {
+        return run_host_task_turn(cli.config, runtime, stdin, stdout);
     }
     if matches!(
         &cli.command,
@@ -982,6 +997,23 @@ fn run_host_task_close(
         stdin,
         stdout,
         |request: TaskCloseRequest, store, runner| TaskStore::new(store, runner).close(&request),
+    )
+}
+
+fn run_host_task_turn(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_control_endpoint(
+        config_override,
+        runtime,
+        stdin,
+        stdout,
+        |request: TaskTurnRequest, store, launcher| {
+            JobService::new(store, launcher).submit_turn(request)
+        },
     )
 }
 

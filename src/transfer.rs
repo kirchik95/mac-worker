@@ -29,6 +29,7 @@ use crate::{
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     rooted_fs::RootedDir,
     snapshot::Snapshot,
+    turn::{TaskTurnRequest, TaskTurnResponse},
 };
 
 pub use crate::host_store::TransferGuard;
@@ -58,6 +59,7 @@ pub enum HostOperation {
     TaskStatus,
     TaskDiff,
     TaskClose,
+    TaskTurn,
     Cancel,
     Reconcile,
 }
@@ -75,6 +77,7 @@ impl HostOperation {
             Self::TaskStatus => "~/.local/bin/worker host task-status",
             Self::TaskDiff => "~/.local/bin/worker host task-diff",
             Self::TaskClose => "~/.local/bin/worker host task-close",
+            Self::TaskTurn => "~/.local/bin/worker host task-turn",
             Self::Cancel => "~/.local/bin/worker host cancel",
             Self::Reconcile => "~/.local/bin/worker host reconcile",
         }
@@ -692,6 +695,19 @@ impl<'a> RemoteJobClient<'a> {
         job_id: JobId,
     ) -> Result<StatusResponse, WorkerError> {
         self.status_with_deadline(worker, job_id, MAX_CONTROL_DEADLINE)
+    }
+
+    pub fn submit_turn(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskTurnRequest,
+    ) -> Result<TaskTurnResponse, WorkerError> {
+        self.transport.request(
+            worker,
+            HostOperation::TaskTurn,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )
     }
 
     pub fn reconcile(

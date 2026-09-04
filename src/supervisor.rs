@@ -1,5 +1,7 @@
 use std::{
-    ffi::{CStr, CString, c_char, c_int, c_void},
+    collections::VecDeque,
+    ffi::{CStr, CString, OsString, c_char, c_int, c_void},
+    fmt,
     fs::File,
     io::{self, Read, Write},
     os::{
@@ -8,6 +10,11 @@ use std::{
     },
     path::{Path, PathBuf},
     ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -18,9 +25,13 @@ use crate::{
     host_store::{HostStore, JobDisposition, SupervisorGuard},
     inputs::RelativePath,
     job::{CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseRecord, ProcessIdentity},
-    job_service::{ExecutionPayload, LaunchCandidate, SupervisorLauncher},
+    job_service::{
+        ExecutionPayload, LaunchCandidate, SupervisorLauncher, reconstruct_submit_request,
+        validate_indexed_turn_prelaunch_job,
+    },
     lease::LeaseService,
     rooted_fs::RootedDir,
+    turn::{EnvProfile, TerminalPath, TurnSection, TurnTerminalHook},
 };
 
 const CONTROLLED_PATH: &str = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -116,6 +127,262 @@ pub enum ProcessGroupMembership {
     LeaderOnly,
     OtherMembers,
     Ambiguous,
+}
+
+/// The fully resolved process launch boundary. Batch launches retain the
+/// historical controlled environment; turn launches use the worker account's
+/// login environment and only add task-scoped values.
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct LaunchPlan {
+    program: String,
+    args: Vec<String>,
+    env: Vec<(OsString, OsString)>,
+    cwd: PathBuf,
+    stdin: StdinSource,
+    stdout: StdoutSink,
+}
+
+impl fmt::Debug for LaunchPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env_names = self
+            .env
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("LaunchPlan")
+            .field("program", &self.program)
+            .field("argument_count", &self.args.len())
+            .field("env_names", &env_names)
+            .field("cwd", &self.cwd)
+            .field("stdin", &self.stdin)
+            .field("stdout", &self.stdout)
+            .finish_non_exhaustive()
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdinSource {
+    Null,
+    File(String),
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdoutSink {
+    Direct,
+    Pipe,
+}
+
+impl LaunchPlan {
+    pub fn batch(
+        command: &CommandSpec,
+        lease: &LeaseRecord,
+        home: &Path,
+        tmp: &Path,
+    ) -> Result<Self, WorkerError> {
+        command.validate()?;
+        let (program, args) = match command {
+            CommandSpec::Argv { argv } => {
+                let executable = resolve_executable(&argv[0])?;
+                (executable.to_string_lossy().into_owned(), argv.clone())
+            }
+            CommandSpec::Shell { shell } => (
+                "/bin/zsh".into(),
+                vec!["/bin/zsh".into(), "-lc".into(), shell.clone()],
+            ),
+        };
+        Ok(Self {
+            program,
+            args,
+            env: batch_environment(lease, home, tmp)?,
+            cwd: PathBuf::new(),
+            stdin: StdinSource::Null,
+            stdout: StdoutSink::Direct,
+        })
+    }
+
+    pub fn turn(
+        command: &CommandSpec,
+        lease: &LeaseRecord,
+        section: &TurnSection,
+        account_home: &Path,
+        profile: &EnvProfile,
+        identity: &crate::task::GitIdentity,
+    ) -> Result<Self, WorkerError> {
+        let job_dir = PathBuf::from(format!(
+            "jobs/{}/{}/{}",
+            lease.project_id(),
+            lease.worktree_id(),
+            lease.job_id()
+        ));
+        let task_workspace = PathBuf::from(format!(
+            "tasks/{}/{}/workspace",
+            section.project_id(),
+            section.turn().task_id()
+        ));
+        Self::turn_at(
+            command,
+            lease,
+            section,
+            account_home,
+            profile,
+            identity,
+            &job_dir,
+            &task_workspace,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn turn_at(
+        command: &CommandSpec,
+        lease: &LeaseRecord,
+        section: &TurnSection,
+        account_home: &Path,
+        profile: &EnvProfile,
+        identity: &crate::task::GitIdentity,
+        turn_dir: &Path,
+        task_workspace: &Path,
+    ) -> Result<Self, WorkerError> {
+        command.validate()?;
+        let CommandSpec::Shell { shell } = command else {
+            return Err(protocol_code(
+                "TURN_COMMAND_INVALID",
+                "turn launches require a shell command",
+            ));
+        };
+        let mut env = vec![
+            ("HOME".into(), account_home.as_os_str().to_os_string()),
+            (
+                "USER".into(),
+                account_environment_value("USER", account_user(account_home)),
+            ),
+            (
+                "LOGNAME".into(),
+                account_environment_value("LOGNAME", account_user(account_home)),
+            ),
+            (
+                "SHELL".into(),
+                account_environment_value("SHELL", OsString::from("/bin/zsh")),
+            ),
+            ("TMPDIR".into(), turn_dir.join("tmp").into_os_string()),
+            (
+                "MAC_WORKER_TURN_DIR".into(),
+                turn_dir.as_os_str().to_os_string(),
+            ),
+            (
+                "MAC_WORKER_JOB_ID".into(),
+                lease.job_id().to_string().into(),
+            ),
+            (
+                "MAC_WORKER_CLIENT_ID".into(),
+                lease.client_id().to_string().into(),
+            ),
+            ("MAC_WORKER_PROJECT_ID".into(), lease.project_id().into()),
+            ("MAC_WORKER_WORKTREE_ID".into(), lease.worktree_id().into()),
+            (
+                "MAC_WORKER_TASK_ID".into(),
+                section.turn().task_id().to_string().into(),
+            ),
+            (
+                "MAC_WORKER_TURN".into(),
+                section.turn().turn_number().to_string().into(),
+            ),
+            ("GIT_AUTHOR_NAME".into(), identity.name().into()),
+            ("GIT_AUTHOR_EMAIL".into(), identity.email().into()),
+            ("GIT_COMMITTER_NAME".into(), identity.name().into()),
+            ("GIT_COMMITTER_EMAIL".into(), identity.email().into()),
+        ];
+        env.extend(profile.entries().iter().cloned());
+        for (name, value) in &env {
+            if name.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
+                return Err(protocol_code(
+                    "TURN_ENVIRONMENT_INVALID",
+                    "turn environment contains a NUL byte",
+                ));
+            }
+        }
+        Ok(Self {
+            program: "/bin/zsh".into(),
+            args: vec!["/bin/zsh".into(), "-lc".into(), shell.clone()],
+            env,
+            cwd: task_workspace.to_path_buf(),
+            stdin: StdinSource::File("prompt.md".into()),
+            stdout: StdoutSink::Pipe,
+        })
+    }
+
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn env(&self) -> &[(OsString, OsString)] {
+        &self.env
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn stdin(&self) -> &StdinSource {
+        &self.stdin
+    }
+
+    pub fn stdout(&self) -> StdoutSink {
+        self.stdout
+    }
+}
+
+fn batch_environment(
+    lease: &LeaseRecord,
+    home: &Path,
+    tmp: &Path,
+) -> Result<Vec<(OsString, OsString)>, WorkerError> {
+    let environment: Vec<(OsString, OsString)> = vec![
+        ("LC_ALL".into(), "C".into()),
+        ("LANG".into(), "C".into()),
+        ("PATH".into(), CONTROLLED_PATH.into()),
+        ("HOME".into(), home.as_os_str().to_os_string()),
+        ("TMPDIR".into(), tmp.as_os_str().to_os_string()),
+        (
+            "MAC_WORKER_JOB_ID".into(),
+            lease.job_id().to_string().into(),
+        ),
+        (
+            "MAC_WORKER_CLIENT_ID".into(),
+            lease.client_id().to_string().into(),
+        ),
+        ("MAC_WORKER_PROJECT_ID".into(), lease.project_id().into()),
+        ("MAC_WORKER_WORKTREE_ID".into(), lease.worktree_id().into()),
+    ];
+    if environment
+        .iter()
+        .any(|(name, value)| name.as_bytes().contains(&0) || value.as_bytes().contains(&0))
+    {
+        return Err(protocol_code(
+            "INVALID_ENVIRONMENT",
+            "batch environment contains a NUL byte",
+        ));
+    }
+    Ok(environment)
+}
+
+fn account_user(home: &Path) -> OsString {
+    home.file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("worker"))
+}
+
+fn account_environment_value(name: &str, fallback: OsString) -> OsString {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
 }
 
 pub trait ProcessInspector: Send + Sync {
@@ -513,6 +780,9 @@ impl SystemSupervisorLauncher {
         ];
         for key in [
             "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "XDG_CACHE_HOME",
@@ -799,6 +1069,7 @@ impl<'a> Supervisor<'a> {
             &status_bytes,
             &status,
             &supervised,
+            None,
         )?;
         status = supervised;
         status_bytes = canonical_json(&status)?;
@@ -835,6 +1106,19 @@ impl<'a> Supervisor<'a> {
                 guard,
                 "EXECUTION_PAYLOAD_INVALID",
                 error,
+            );
+        }
+        if let Some(section) = payload.turn().cloned() {
+            return self.run_turn_after_payload(
+                job_id,
+                guard,
+                &lease,
+                &job,
+                meta,
+                status_bytes,
+                status,
+                payload,
+                section,
             );
         }
         if self.fault == Some(SupervisorFaultPoint::AfterPayloadRead) {
@@ -1011,6 +1295,7 @@ impl<'a> Supervisor<'a> {
                         &status_bytes,
                         &status,
                         &child_status,
+                        None,
                     )?;
                     Ok(child_status)
                 })
@@ -1158,6 +1443,7 @@ impl<'a> Supervisor<'a> {
                         &status_bytes,
                         &status,
                         &running,
+                        None,
                     )?;
                     Ok(running)
                 })
@@ -1295,6 +1581,7 @@ impl<'a> Supervisor<'a> {
             &current_bytes,
             &status,
             &terminal,
+            None,
         )?;
         if self.fault == Some(SupervisorFaultPoint::AfterTerminalStatus) {
             return Err(injected_supervisor_fault("terminal status"));
@@ -1333,6 +1620,683 @@ impl<'a> Supervisor<'a> {
             ));
         }
         Ok((current_job, current_bytes, current, terminal_lease.clone()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_turn_after_payload(
+        &self,
+        _job_id: JobId,
+        mut guard: SupervisorGuard,
+        lease: &LeaseRecord,
+        job: &RootedDir,
+        meta: JobMeta,
+        status_bytes: Vec<u8>,
+        status: JobStatus,
+        payload: ExecutionPayload,
+        section: TurnSection,
+    ) -> Result<(), WorkerError> {
+        let request = match reconstruct_submit_request(job, &meta, lease) {
+            Ok(request) => request,
+            Err(error) => {
+                return self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    "EXECUTION_PAYLOAD_INVALID",
+                    error,
+                );
+            }
+        };
+        if self.fault == Some(SupervisorFaultPoint::AfterPayloadRead) {
+            return self.finish_turn_prelaunch_failure(
+                lease,
+                job,
+                guard,
+                &meta,
+                &section,
+                status_bytes,
+                status,
+                "CRASH_AFTER_PAYLOAD_READ",
+                injected_supervisor_fault("payload read"),
+            );
+        }
+        if let Err(error) = validate_indexed_turn_prelaunch_job(job, &request, &section) {
+            return self.finish_turn_prelaunch_failure(
+                lease,
+                job,
+                guard,
+                &meta,
+                &section,
+                status_bytes,
+                status,
+                "COMMAND_PREPARATION_FAILED",
+                error,
+            );
+        }
+
+        let account_home = match std::env::var_os("HOME") {
+            Some(home) if !home.is_empty() => PathBuf::from(home),
+            _ => {
+                return self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    "COMMAND_PREPARATION_FAILED",
+                    protocol_code("TURN_HOME_INVALID", "worker account HOME is absent"),
+                );
+            }
+        };
+        let profile = match section.turn().env_profile() {
+            Some(name) => match EnvProfile::load(
+                &account_home
+                    .join(".config")
+                    .join("mac-worker")
+                    .join("env")
+                    .join(format!("{name}.env")),
+            ) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    return self.finish_turn_prelaunch_failure(
+                        lease,
+                        job,
+                        guard,
+                        &meta,
+                        &section,
+                        status_bytes,
+                        status,
+                        "ENV_PROFILE_PERMISSIONS",
+                        error,
+                    );
+                }
+            },
+            None => EnvProfile::empty(),
+        };
+        let task_workspace = match self
+            .store
+            .open_task_workspace(section.project_id(), section.turn().task_id())
+        {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    "COMMAND_PREPARATION_FAILED",
+                    error,
+                );
+            }
+        };
+        let turn_path = job.path().to_path_buf();
+        let plan = match LaunchPlan::turn_at(
+            payload.command(),
+            lease,
+            &section,
+            &account_home,
+            &profile,
+            section.git_identity(),
+            &turn_path,
+            task_workspace.path(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    prelaunch_error_code(&error),
+                    error,
+                );
+            }
+        };
+        let command = match PreparedCommand::from_plan(&plan) {
+            Ok(command) => command,
+            Err(error) => {
+                return self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    prelaunch_error_code(&error),
+                    error,
+                );
+            }
+        };
+        let prompt = match job.open_private_regular_handle("prompt.md") {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    "LOG_BINDING_INVALID",
+                    WorkerError::Io(error),
+                );
+            }
+        };
+        let stderr = match job.open_private_append("stderr.log") {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                return self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    "LOG_BINDING_INVALID",
+                    WorkerError::Io(error),
+                );
+            }
+        };
+        let stdout = match job.open_private_append("stdout.log") {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                return self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    "LOG_BINDING_INVALID",
+                    WorkerError::Io(error),
+                );
+            }
+        };
+        let tail = match job.open_private_append("tail.log") {
+            Ok(tail) => tail,
+            Err(error) => {
+                return self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    "LOG_BINDING_INVALID",
+                    WorkerError::Io(error),
+                );
+            }
+        };
+        let (mut child, output) = match GatedChild::spawn_turn(
+            &command,
+            task_workspace.raw_directory_fd(),
+            prompt.as_raw_fd(),
+            stderr.as_raw_fd(),
+            self.inspector,
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                return self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    prelaunch_error_code(&error),
+                    error,
+                );
+            }
+        };
+        drop(prompt);
+        let mut pump = match TurnOutputPump::start(
+            output,
+            stdout,
+            tail,
+            self.store.clone(),
+            section.clone(),
+        ) {
+            Ok(pump) => pump,
+            Err(error) => {
+                let abort = child.abort_and_reap();
+                let result = self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    "LOG_BINDING_INVALID",
+                    error,
+                );
+                abort?;
+                return result;
+            }
+        };
+        if self.fault == Some(SupervisorFaultPoint::AfterChildReady) {
+            let abort = child.abort_and_reap();
+            let pump_result = stop_turn_pump(&mut pump);
+            let result = self.finish_turn_prelaunch_failure(
+                lease,
+                job,
+                guard,
+                &meta,
+                &section,
+                status_bytes,
+                status,
+                "CRASH_AFTER_CHILD_READY",
+                injected_supervisor_fault("child READY"),
+            );
+            abort?;
+            pump_result?;
+            return result;
+        }
+
+        let child_identity = child.identity();
+        let child_status = if self.fault == Some(SupervisorFaultPoint::BeforeChildStatusAbortProof)
+        {
+            Err(WorkerError::Io(io::Error::other(
+                "injected child status write failure",
+            )))
+        } else {
+            now_millis()
+                .and_then(|updated_at| status.with_child(child_identity, updated_at))
+                .and_then(|child_status| {
+                    replace_status(
+                        self.store,
+                        lease,
+                        &mut guard,
+                        job,
+                        &status_bytes,
+                        &status,
+                        &child_status,
+                        None,
+                    )?;
+                    Ok(child_status)
+                })
+        };
+        let mut status = match child_status {
+            Ok(child_status) => child_status,
+            Err(error) => {
+                let abort = child.abort_and_reap();
+                let pump_result = stop_turn_pump(&mut pump);
+                let result = self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    "CHILD_STATUS_WRITE_FAILED",
+                    error,
+                );
+                abort?;
+                pump_result?;
+                return result;
+            }
+        };
+        let mut status_bytes = canonical_json(&status)?;
+
+        match child.allow_exec(self.fault) {
+            Ok(()) => {}
+            Err(ExecStartError::ProvenPrelaunch { code, error }) => {
+                let abort = child.abort_and_reap();
+                let pump_result = stop_turn_pump(&mut pump);
+                let result = self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    code,
+                    error,
+                );
+                abort?;
+                pump_result?;
+                return result;
+            }
+            Err(ExecStartError::Ambiguous(error)) => {
+                let result = self.finish_turn_ambiguous(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    &mut pump,
+                    child_identity,
+                    "EXEC_ACK_AMBIGUOUS",
+                    error,
+                );
+                return result;
+            }
+        }
+        if self.fault == Some(SupervisorFaultPoint::AfterGo) {
+            let result = self.finish_turn_ambiguous(
+                lease,
+                job,
+                guard,
+                &meta,
+                &section,
+                status_bytes,
+                status,
+                &mut pump,
+                child_identity,
+                "EXEC_ACK_AMBIGUOUS",
+                injected_supervisor_fault("child GO"),
+            );
+            return result;
+        }
+        let running_result = if self.fault == Some(SupervisorFaultPoint::BeforeRunningStatus) {
+            Err(WorkerError::Io(io::Error::other(
+                "injected supervisor fault",
+            )))
+        } else {
+            now_millis()
+                .and_then(|updated_at| status.into_running(updated_at))
+                .and_then(|running| {
+                    replace_status(
+                        self.store,
+                        lease,
+                        &mut guard,
+                        job,
+                        &status_bytes,
+                        &status,
+                        &running,
+                        None,
+                    )?;
+                    Ok(running)
+                })
+        };
+        status = match running_result {
+            Ok(running) => running,
+            Err(error) => {
+                return self.finish_turn_ambiguous(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    &mut pump,
+                    child_identity,
+                    "RUNNING_STATUS_WRITE_FAILED",
+                    error,
+                );
+            }
+        };
+        status_bytes = canonical_json(&status)?;
+
+        if self.fault == Some(SupervisorFaultPoint::AfterRunningStatus) {
+            let result = self.finish_turn_ambiguous(
+                lease,
+                job,
+                guard,
+                &meta,
+                &section,
+                status_bytes,
+                status,
+                &mut pump,
+                child_identity,
+                "RUNNING_STATUS_WRITE_FAILED",
+                injected_supervisor_fault("running status"),
+            );
+            return result;
+        }
+
+        let outcome = wait_for_child(child_identity, lease.timeout_millis(), self.inspector)?;
+        std::thread::sleep(Duration::from_secs(1));
+        let pump_result = pump.stop_and_join()?;
+        stderr.sync_all()?;
+        let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
+        let stdout_file = job.open_private_append("stdout.log")?;
+        let stdout_length = job.validate_private_append_binding("stdout.log", &stdout_file)?;
+        if stdout_length != pump_result.stdout_bytes {
+            return Err(protocol_code(
+                "TURN_PUMP_FAILED",
+                "turn stdout length differs from pump accounting",
+            ));
+        }
+        if self.fault == Some(SupervisorFaultPoint::AfterLogSync) {
+            return Err(injected_supervisor_fault("log sync"));
+        }
+        let (terminal, terminal_kind, exit_code) = match outcome {
+            ChildOutcome::Exited(0) => (
+                status.into_succeeded(now_millis()?, stdout_length, stderr_length)?,
+                crate::task::TurnTerminal::Succeeded,
+                Some(0),
+            ),
+            ChildOutcome::Exited(code) => (
+                status.into_failed_exit(now_millis()?, code, stdout_length, stderr_length)?,
+                crate::task::TurnTerminal::Failed,
+                Some(i32::from(code)),
+            ),
+            ChildOutcome::Signalled(signal) => (
+                status.into_failed_signal(now_millis()?, signal, stdout_length, stderr_length)?,
+                crate::task::TurnTerminal::Cancelled,
+                None,
+            ),
+            ChildOutcome::TimedOut => (
+                status.into_infrastructure_terminal(
+                    JobState::TimedOut,
+                    now_millis()?,
+                    stdout_length,
+                    stderr_length,
+                    "COMMAND_TIMEOUT".into(),
+                )?,
+                crate::task::TurnTerminal::TimedOut,
+                None,
+            ),
+        };
+        let terminal_path = match outcome {
+            ChildOutcome::TimedOut => TerminalPath::Timeout,
+            other => TerminalPath::ChildExit(outcome_code(other)),
+        };
+        self.finish_turn_terminal(
+            lease,
+            job,
+            guard,
+            &meta,
+            &section,
+            status_bytes,
+            &status,
+            terminal,
+            terminal_kind,
+            terminal_path,
+            exit_code,
+            pump_result.log_truncated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_turn_prelaunch_failure(
+        &self,
+        lease: &LeaseRecord,
+        job: &RootedDir,
+        guard: SupervisorGuard,
+        meta: &JobMeta,
+        section: &TurnSection,
+        expected_bytes: Vec<u8>,
+        status: JobStatus,
+        code: &str,
+        original: WorkerError,
+    ) -> Result<(), WorkerError> {
+        let stdout = job.open_private_append("stdout.log")?;
+        let stderr = job.open_private_append("stderr.log")?;
+        stdout.sync_all()?;
+        stderr.sync_all()?;
+        let stdout_length = job.validate_private_append_binding("stdout.log", &stdout)?;
+        let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
+        let terminal = status.into_infrastructure_terminal(
+            JobState::Lost,
+            now_millis()?,
+            stdout_length,
+            stderr_length,
+            code.into(),
+        )?;
+        let finish = self.finish_turn_terminal(
+            lease,
+            job,
+            guard,
+            meta,
+            section,
+            expected_bytes,
+            &status,
+            terminal,
+            crate::task::TurnTerminal::Lost,
+            TerminalPath::PrelaunchFailure,
+            None,
+            false,
+        );
+        match finish {
+            Ok(()) => Err(original),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_turn_ambiguous(
+        &self,
+        lease: &LeaseRecord,
+        job: &RootedDir,
+        guard: SupervisorGuard,
+        meta: &JobMeta,
+        section: &TurnSection,
+        expected_bytes: Vec<u8>,
+        status: JobStatus,
+        pump: &mut TurnOutputPump,
+        child_identity: ProcessIdentity,
+        code: &str,
+        original: WorkerError,
+    ) -> Result<(), WorkerError> {
+        let wait = wait_for_child(child_identity, lease.timeout_millis(), self.inspector);
+        std::thread::sleep(Duration::from_secs(1));
+        let pump_result = pump.stop_and_join();
+        let stderr = job.open_private_append("stderr.log")?;
+        stderr.sync_all()?;
+        let stdout = job.open_private_append("stdout.log")?;
+        let stdout_length = job.validate_private_append_binding("stdout.log", &stdout)?;
+        let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
+        let terminal = status.into_infrastructure_terminal(
+            JobState::Lost,
+            now_millis()?,
+            stdout_length,
+            stderr_length,
+            code.into(),
+        )?;
+        let finish = self.finish_turn_terminal(
+            lease,
+            job,
+            guard,
+            meta,
+            section,
+            expected_bytes,
+            &status,
+            terminal,
+            crate::task::TurnTerminal::Lost,
+            TerminalPath::AmbiguousChild,
+            None,
+            pump_result
+                .as_ref()
+                .as_ref()
+                .is_ok_and(|result| result.log_truncated),
+        );
+        wait?;
+        pump_result?;
+        match finish {
+            Ok(()) => Err(original),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_turn_terminal(
+        &self,
+        lease: &LeaseRecord,
+        job: &RootedDir,
+        mut guard: SupervisorGuard,
+        meta: &JobMeta,
+        section: &TurnSection,
+        expected_bytes: Vec<u8>,
+        status: &JobStatus,
+        terminal: JobStatus,
+        terminal_kind: crate::task::TurnTerminal,
+        path: TerminalPath,
+        exit_code: Option<i32>,
+        log_truncated: bool,
+    ) -> Result<(), WorkerError> {
+        // Keep the execution payload until both the terminal job status and
+        // task publication have been made durable.  It is the recovery copy
+        // of the turn section if this supervisor exits between those writes.
+        self.store.replace_job_status_after(
+            &mut guard,
+            lease,
+            job,
+            &expected_bytes,
+            status,
+            &terminal,
+        )?;
+        if self.fault == Some(SupervisorFaultPoint::AfterTerminalStatus) {
+            return Err(injected_supervisor_fault("terminal status"));
+        }
+
+        let publication = TurnTerminalHook
+            .invoke(
+                self.store,
+                job,
+                meta,
+                section,
+                terminal_kind,
+                path,
+                exit_code,
+                log_truncated,
+            )
+            .map(|_| ());
+        let payload_removal = if job.entry_exists("execution.json")? {
+            self.store
+                .remove_owned_regular_committed(job, "execution.json")
+        } else {
+            Ok(())
+        };
+        // The guard must be retained while publication runs: releasing the
+        // job slot before the task branch is imported would expose a second
+        // turn to another worker.
+        drop(guard);
+        let cleanup = match payload_removal {
+            Ok(()) => self.cleanup_and_release(lease, job, terminal),
+            Err(error) => Err(WorkerError::Io(error)),
+        };
+        match publication {
+            Err(error) => {
+                let _ = cleanup;
+                Err(error)
+            }
+            Ok(()) => cleanup,
+        }
     }
 
     fn cleanup_and_release(
@@ -1411,47 +2375,34 @@ impl PreparedCommand {
         home: &Path,
         tmp: &Path,
     ) -> Result<Self, WorkerError> {
-        command.validate()?;
-        let (program, arguments) = match command {
-            CommandSpec::Argv { argv } => {
-                let executable = resolve_executable(&argv[0])?;
-                (executable, argv.clone())
-            }
-            CommandSpec::Shell { shell } => (
-                PathBuf::from("/bin/zsh"),
-                vec!["/bin/zsh".into(), "-lc".into(), shell.clone()],
-            ),
-        };
-        let program = CString::new(program.as_os_str().as_bytes())
+        let plan = LaunchPlan::batch(command, lease, home, tmp)?;
+        Self::from_plan(&plan)
+    }
+
+    fn from_plan(plan: &LaunchPlan) -> Result<Self, WorkerError> {
+        let program = CString::new(plan.program.as_bytes())
             .map_err(|_| protocol_code("INVALID_EXECUTABLE", "executable path contains NUL"))?;
-        let arguments = arguments
-            .into_iter()
+        let arguments = plan
+            .args
+            .iter()
+            .cloned()
             .map(|argument| {
                 CString::new(argument)
                     .map_err(|_| protocol_code("INVALID_COMMAND", "command argument contains NUL"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut environment = [
-            "LC_ALL=C".to_owned(),
-            "LANG=C".to_owned(),
-            format!("PATH={CONTROLLED_PATH}"),
-        ]
-        .into_iter()
-        .map(controlled_environment_entry)
-        .collect::<Result<Vec<_>, _>>()?;
-        environment.push(controlled_path_environment_entry(b"HOME=", home)?);
-        environment.push(controlled_path_environment_entry(b"TMPDIR=", tmp)?);
-        environment.extend(
-            [
-                format!("MAC_WORKER_JOB_ID={}", lease.job_id()),
-                format!("MAC_WORKER_CLIENT_ID={}", lease.client_id()),
-                format!("MAC_WORKER_PROJECT_ID={}", lease.project_id()),
-                format!("MAC_WORKER_WORKTREE_ID={}", lease.worktree_id()),
-            ]
-            .into_iter()
-            .map(controlled_environment_entry)
-            .collect::<Result<Vec<_>, _>>()?,
-        );
+        let environment = plan
+            .env
+            .iter()
+            .map(|(name, value)| {
+                let mut bytes = name.as_bytes().to_vec();
+                bytes.push(b'=');
+                bytes.extend_from_slice(value.as_bytes());
+                CString::new(bytes).map_err(|_| {
+                    protocol_code("INVALID_ENVIRONMENT", "launch environment contains NUL")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut argument_pointers = arguments
             .iter()
             .map(|argument| argument.as_ptr())
@@ -1470,20 +2421,6 @@ impl PreparedCommand {
             environment_pointers,
         })
     }
-}
-
-fn controlled_environment_entry(entry: String) -> Result<CString, WorkerError> {
-    CString::new(entry)
-        .map_err(|_| protocol_code("INVALID_ENVIRONMENT", "controlled environment is invalid"))
-}
-
-fn controlled_path_environment_entry(key: &[u8], path: &Path) -> Result<CString, WorkerError> {
-    let path = path.as_os_str().as_bytes();
-    let mut entry = Vec::with_capacity(key.len() + path.len());
-    entry.extend_from_slice(key);
-    entry.extend_from_slice(path);
-    CString::new(entry)
-        .map_err(|_| protocol_code("INVALID_ENVIRONMENT", "controlled environment is invalid"))
 }
 
 struct Pipe {
@@ -1537,10 +2474,50 @@ impl GatedChild {
         stderr: RawFd,
         inspector: &dyn ProcessInspector,
     ) -> Result<Self, WorkerError> {
+        let dev_null = open_dev_null()?;
+        let result = Self::spawn_with_fds(
+            command,
+            cwd,
+            dev_null.as_raw_fd(),
+            stdout,
+            stderr,
+            inspector,
+        );
+        drop(dev_null);
+        result
+    }
+
+    fn spawn_turn(
+        command: &PreparedCommand,
+        cwd: RawFd,
+        stdin: RawFd,
+        stderr: RawFd,
+        inspector: &dyn ProcessInspector,
+    ) -> Result<(Self, File), WorkerError> {
+        let output = Pipe::cloexec()?;
+        let result = Self::spawn_with_fds(
+            command,
+            cwd,
+            stdin,
+            output.write.as_raw_fd(),
+            stderr,
+            inspector,
+        );
+        drop(output.write);
+        result.map(|child| (child, File::from(output.read)))
+    }
+
+    fn spawn_with_fds(
+        command: &PreparedCommand,
+        cwd: RawFd,
+        stdin: RawFd,
+        stdout: RawFd,
+        stderr: RawFd,
+        inspector: &dyn ProcessInspector,
+    ) -> Result<Self, WorkerError> {
         let ready = Pipe::cloexec()?;
         let go = Pipe::cloexec()?;
         let exec_result = Pipe::cloexec()?;
-        let dev_null = open_dev_null()?;
         let descriptor_ceiling = descriptor_ceiling()?;
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -1551,9 +2528,9 @@ impl GatedChild {
                 gated_child_main(
                     command,
                     cwd,
+                    stdin,
                     stdout,
                     stderr,
-                    dev_null.as_raw_fd(),
                     ready.write.as_raw_fd(),
                     go.read.as_raw_fd(),
                     exec_result.write.as_raw_fd(),
@@ -1565,7 +2542,6 @@ impl GatedChild {
         drop(ready.write);
         drop(go.read);
         drop(exec_result.write);
-        drop(dev_null);
         let mut go_write = Some(go.write);
         let mut exec_result_read = Some(exec_result.read);
         let mut ready_file = File::from(ready.read);
@@ -1709,6 +2685,264 @@ impl Drop for GatedChild {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnPumpResult {
+    stdout_bytes: u64,
+    log_truncated: bool,
+}
+
+struct TurnOutputPump {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<Result<TurnPumpResult, WorkerError>>>,
+}
+
+impl TurnOutputPump {
+    fn start(
+        read: File,
+        mut stdout: File,
+        mut tail_file: File,
+        store: HostStore,
+        section: TurnSection,
+    ) -> Result<Self, WorkerError> {
+        set_nonblocking(read.as_raw_fd())?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let join = std::thread::Builder::new()
+            .name("mac-worker-turn-pump".into())
+            .spawn(move || {
+                pump_turn_output(
+                    read,
+                    &mut stdout,
+                    &mut tail_file,
+                    &store,
+                    &section,
+                    &thread_stop,
+                )
+            })
+            .map_err(WorkerError::Io)?;
+        Ok(Self {
+            stop,
+            join: Some(join),
+        })
+    }
+
+    fn stop_and_join(&mut self) -> Result<TurnPumpResult, WorkerError> {
+        self.stop.store(true, Ordering::Release);
+        let join = self.join.take().ok_or_else(|| {
+            protocol_code("TURN_PUMP_INVALID", "turn output pump was joined twice")
+        })?;
+        match join.join() {
+            Ok(result) => result,
+            Err(_) => Err(protocol_code(
+                "TURN_PUMP_FAILED",
+                "turn output pump thread panicked",
+            )),
+        }
+    }
+}
+
+impl Drop for TurnOutputPump {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            self.stop.store(true, Ordering::Release);
+            let _ = join.join();
+        }
+    }
+}
+
+fn pump_turn_output(
+    mut read: File,
+    stdout: &mut File,
+    tail_file: &mut File,
+    store: &HostStore,
+    section: &TurnSection,
+    stop: &AtomicBool,
+) -> Result<TurnPumpResult, WorkerError> {
+    let mut total = 0_u64;
+    let mut stored = 0_u64;
+    let mut tail = VecDeque::with_capacity(crate::turn::LOG_TAIL_BYTES);
+    let mut pending_line = Vec::new();
+    let adapter = crate::agent::adapter_for(section.turn().agent());
+    let mut session_bound = false;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        match read.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let bytes = &buffer[..count];
+                total = total.saturating_add(count as u64);
+                append_tail(&mut tail, bytes);
+                if stored < crate::turn::LOG_CAP_BYTES {
+                    let remaining = crate::turn::LOG_CAP_BYTES - stored;
+                    let write_count = (count as u64).min(remaining) as usize;
+                    if write_count > 0 {
+                        stdout
+                            .write_all(&bytes[..write_count])
+                            .map_err(WorkerError::Io)?;
+                        stored += write_count as u64;
+                    }
+                }
+                if !session_bound {
+                    pending_line.extend_from_slice(bytes);
+                    scan_turn_lines(
+                        &mut pending_line,
+                        adapter,
+                        store,
+                        section,
+                        &mut session_bound,
+                    )?;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+        if stop.load(Ordering::Acquire) {
+            // The supervisor supplies the one-second post-group-absence grace
+            // period. Drain every byte currently available, then terminate
+            // without waiting for a writer that escaped the process group.
+            match read.read(&mut buffer) {
+                Ok(count) if count > 0 => {
+                    let bytes = &buffer[..count];
+                    total = total.saturating_add(count as u64);
+                    append_tail(&mut tail, bytes);
+                    if stored < crate::turn::LOG_CAP_BYTES {
+                        let remaining = crate::turn::LOG_CAP_BYTES - stored;
+                        let write_count = (count as u64).min(remaining) as usize;
+                        if write_count > 0 {
+                            stdout
+                                .write_all(&bytes[..write_count])
+                                .map_err(WorkerError::Io)?;
+                            stored += write_count as u64;
+                        }
+                    }
+                    if !session_bound {
+                        pending_line.extend_from_slice(bytes);
+                        scan_turn_lines(
+                            &mut pending_line,
+                            adapter,
+                            store,
+                            section,
+                            &mut session_bound,
+                        )?;
+                    }
+                    continue;
+                }
+                Ok(_) | Err(_) => break,
+            }
+        }
+    }
+
+    stdout.sync_all().map_err(WorkerError::Io)?;
+    tail_file.set_len(0).map_err(WorkerError::Io)?;
+    let tail_bytes = tail.iter().copied().collect::<Vec<_>>();
+    tail_file.write_all(&tail_bytes).map_err(WorkerError::Io)?;
+    tail_file.sync_all().map_err(WorkerError::Io)?;
+    Ok(TurnPumpResult {
+        stdout_bytes: stored.min(crate::turn::LOG_CAP_BYTES),
+        log_truncated: total > crate::turn::LOG_CAP_BYTES,
+    })
+}
+
+fn append_tail(tail: &mut VecDeque<u8>, bytes: &[u8]) {
+    if bytes.len() >= crate::turn::LOG_TAIL_BYTES {
+        tail.clear();
+        tail.extend(
+            bytes[bytes.len() - crate::turn::LOG_TAIL_BYTES..]
+                .iter()
+                .copied(),
+        );
+        return;
+    }
+    let over = tail
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(crate::turn::LOG_TAIL_BYTES);
+    for _ in 0..over {
+        let _ = tail.pop_front();
+    }
+    tail.extend(bytes.iter().copied());
+}
+
+fn scan_turn_lines(
+    pending: &mut Vec<u8>,
+    adapter: &'static dyn crate::agent::AgentAdapter,
+    store: &HostStore,
+    section: &TurnSection,
+    session_bound: &mut bool,
+) -> Result<(), WorkerError> {
+    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+        let line = pending.drain(..=newline).collect::<Vec<_>>();
+        scan_one_turn_line(&line, adapter, store, section, session_bound)?;
+        if *session_bound {
+            pending.clear();
+            break;
+        }
+    }
+    if pending.len() > 1024 * 1024 {
+        pending.clear();
+    }
+    Ok(())
+}
+
+fn scan_one_turn_line(
+    line: &[u8],
+    adapter: &'static dyn crate::agent::AgentAdapter,
+    store: &HostStore,
+    section: &TurnSection,
+    session_bound: &mut bool,
+) -> Result<(), WorkerError> {
+    if *session_bound {
+        return Ok(());
+    }
+    let line = String::from_utf8_lossy(line);
+    let Some(event) = adapter.parse_event(line.trim_end_matches(['\r', '\n'])) else {
+        return Ok(());
+    };
+    let Some(session_ref) = adapter.session_ref(std::slice::from_ref(&event)) else {
+        return Ok(());
+    };
+    let binding =
+        crate::task_store::SessionBinding::new(adapter.kind(), session_ref, now_millis()?)?;
+    crate::task_store::TaskStore::new(store, &crate::process::SystemProcessRunner).bind_session(
+        section.project_id(),
+        section.turn().task_id(),
+        binding,
+    )?;
+    *session_bound = true;
+    Ok(())
+}
+
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn stop_turn_pump(pump: &mut TurnOutputPump) -> Result<TurnPumpResult, WorkerError> {
+    std::thread::sleep(Duration::from_secs(1));
+    pump.stop_and_join()
+}
+
+fn outcome_code(outcome: ChildOutcome) -> i32 {
+    match outcome {
+        ChildOutcome::Exited(code) => i32::from(code),
+        ChildOutcome::Signalled(signal) => -i32::try_from(signal).unwrap_or(1),
+        ChildOutcome::TimedOut => -1,
+    }
+}
+
 fn abort_pre_go(pid: libc::pid_t, go: &mut Option<OwnedFd>, exec_result: &mut Option<OwnedFd>) {
     drop(go.take());
     drop(exec_result.take());
@@ -1719,9 +2953,9 @@ fn abort_pre_go(pid: libc::pid_t, go: &mut Option<OwnedFd>, exec_result: &mut Op
 unsafe fn gated_child_main(
     command: &PreparedCommand,
     cwd: RawFd,
+    stdin: RawFd,
     stdout: RawFd,
     stderr: RawFd,
-    dev_null: RawFd,
     ready: RawFd,
     go: RawFd,
     exec_result: RawFd,
@@ -1729,7 +2963,7 @@ unsafe fn gated_child_main(
 ) -> ! {
     if unsafe { libc::setpgid(0, 0) } != 0
         || unsafe { libc::fchdir(cwd) } != 0
-        || unsafe { libc::dup2(dev_null, libc::STDIN_FILENO) } < 0
+        || unsafe { libc::dup2(stdin, libc::STDIN_FILENO) } < 0
         || unsafe { libc::dup2(stdout, libc::STDOUT_FILENO) } < 0
         || unsafe { libc::dup2(stderr, libc::STDERR_FILENO) } < 0
     {
@@ -2146,6 +3380,7 @@ fn prelaunch_terminal(
         expected_bytes,
         status,
         &terminal,
+        None,
     )?;
     Ok(terminal)
 }
@@ -2228,6 +3463,7 @@ fn finish_ambiguous_child(
         expected_bytes,
         status,
         &terminal,
+        None,
     )?;
     Ok(terminal)
 }
@@ -2292,7 +3528,17 @@ fn enrich_cleanup_error(
         &bytes,
         &current,
         &enriched,
+        None,
     )
+}
+
+struct TurnTerminalWrite<'a> {
+    meta: &'a JobMeta,
+    section: &'a TurnSection,
+    terminal: crate::task::TurnTerminal,
+    path: TerminalPath,
+    exit_code: Option<i32>,
+    log_truncated: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2304,6 +3550,7 @@ fn replace_status(
     expected_bytes: &[u8],
     expected: &JobStatus,
     replacement: &JobStatus,
+    turn: Option<&TurnTerminalWrite<'_>>,
 ) -> Result<(), WorkerError> {
     store.replace_job_status_after(
         status_guard,
@@ -2312,7 +3559,24 @@ fn replace_status(
         expected_bytes,
         expected,
         replacement,
-    )
+    )?;
+    if replacement.state().is_terminal()
+        && let Some(turn) = turn
+    {
+        TurnTerminalHook
+            .invoke(
+                store,
+                job,
+                turn.meta,
+                turn.section,
+                turn.terminal,
+                turn.path,
+                turn.exit_code,
+                turn.log_truncated,
+            )
+            .map(|_| ())?;
+    }
+    Ok(())
 }
 
 fn require_accepted_disposition(

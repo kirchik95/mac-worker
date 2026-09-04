@@ -103,6 +103,8 @@ pub enum HostCommand {
     TaskDiff,
     #[command(name = "task-close")]
     TaskClose,
+    #[command(name = "task-turn")]
+    TaskTurn,
     #[command(name = "receive-pack")]
     ReceivePack {
         job_id: HiddenComponent,
