@@ -479,6 +479,33 @@ fn result_schema_json_has_exactly_the_declared_keys() {
 }
 
 #[test]
+fn result_schema_json_is_strict_structured_output_compatible() {
+    // Catches a schema that strict backends reject at the API: Codex failed
+    // every live turn with `invalid_json_schema ... Missing 'questions'`
+    // because `required` did not list every property.
+    let value: serde_json::Value = serde_json::from_str(RESULT_SCHEMA_JSON).unwrap();
+    let mut keys: Vec<_> = value["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    let mut required: Vec<String> = value["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_str().unwrap().to_owned())
+        .collect();
+    required.sort();
+    assert_eq!(required, keys);
+    assert_eq!(
+        value["additionalProperties"],
+        serde_json::Value::Bool(false)
+    );
+}
+
+#[test]
 fn classify_maps_exit_and_status_without_guessing() {
     let adapter = adapter_for(AgentKind::Codex);
     assert_eq!(

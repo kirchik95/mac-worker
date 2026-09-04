@@ -11,7 +11,12 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub const MAX_SUMMARY_BYTES: usize = 512;
-pub const RESULT_SCHEMA_JSON: &str = r#"{"type":"object","properties":{"status":{"enum":["done","needs_input","blocked"]},"summary":{"type":"string"},"questions":{"type":"array","items":{"type":"string"}},"files_changed":{"type":"array","items":{"type":"string"}}},"required":["status","summary"],"additionalProperties":false}"#;
+/// Structured result schema handed to every agent. Strict structured-output
+/// backends (Codex over the OpenAI Responses API) reject a schema unless
+/// `required` lists every property and `additionalProperties` is false, so
+/// optional fields are required-but-possibly-empty arrays; the parser still
+/// defaults them when an agent omits them.
+pub const RESULT_SCHEMA_JSON: &str = r#"{"type":"object","properties":{"status":{"enum":["done","needs_input","blocked"]},"summary":{"type":"string"},"questions":{"type":"array","items":{"type":"string"}},"files_changed":{"type":"array","items":{"type":"string"}}},"required":["status","summary","questions","files_changed"],"additionalProperties":false}"#;
 pub const TURN_DIR_ENV: &str = "MAC_WORKER_TURN_DIR";
 pub const SCHEMA_FILE_NAME: &str = "result.schema.json";
 pub const LAST_MESSAGE_FILE_NAME: &str = "last.md";
