@@ -239,8 +239,9 @@ fn manifest_request_receipt_and_response_reject_unknown_duplicate_and_invalid_fi
     assert!(serde_json::from_slice::<SnapshotVerifyRequest>(&duplicate_request).is_err());
     let unknown_request = insert_before_final_brace(&verify_request_bytes(), b",\"path\":\"/tmp\"");
     assert!(serde_json::from_slice::<SnapshotVerifyRequest>(&unknown_request).is_err());
+    let current_version = format!("\"protocol_version\":{PROTOCOL_VERSION}");
     let invalid_version =
-        verify_request_bytes().replace_bytes(b"\"protocol_version\":3", b"\"protocol_version\":1");
+        verify_request_bytes().replace_bytes(current_version.as_bytes(), b"\"protocol_version\":1");
     assert!(serde_json::from_slice::<SnapshotVerifyRequest>(&invalid_version).is_err());
 
     let receipt: VerifiedReceipt = serde_json::from_slice(&receipt_bytes()).unwrap();
@@ -1485,8 +1486,9 @@ fn snapshot_verify_transport_uses_the_fixed_command_and_strict_response_dto() {
         }
     );
 
+    let current_version = format!("\"protocol_version\":{PROTOCOL_VERSION}");
     let invalid_response =
-        response_bytes().replace_bytes(b"\"protocol_version\":3", b"\"protocol_version\":9");
+        response_bytes().replace_bytes(current_version.as_bytes(), b"\"protocol_version\":9");
     let invalid_runner = RecordingControlRunner::returning(invalid_response);
     let error = SshJsonTransport::new(&invalid_runner)
         .request::<_, VerifiedSnapshotResponse>(
