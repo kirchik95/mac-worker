@@ -687,6 +687,20 @@ impl<'a> TurnPublisher<'a> {
             .ok_or_else(|| turn_error("PUBLISH_FAILED", "task has no turn history"))?;
         let stream = read_text(turn_dir, "stdout.log", LOG_CAP_BYTES)?;
         let tail = read_optional_text(turn_dir, "tail.log", LOG_TAIL_BYTES as u64)?;
+        // The agent writes its last message itself (Codex `-o`), with the
+        // account's umask rather than owner-only mode. The turn directory is
+        // owner-only, so restore the file's mode before the private reader
+        // sees it instead of failing publication of a successful turn.
+        if turn_dir.entry_exists("last.md")? {
+            turn_dir
+                .set_private_regular_mode("last.md", 0o600)
+                .map_err(|error| {
+                    turn_error(
+                        "PUBLISH_FAILED",
+                        format!("cannot restore last.md mode: {error}"),
+                    )
+                })?;
+        }
         let last_message =
             read_optional_text(turn_dir, "last.md", crate::task::MAX_PROMPT_BYTES as u64)?;
         let adapter = crate::agent::adapter_for(meta.agent());
