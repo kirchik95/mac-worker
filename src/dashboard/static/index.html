@@ -65,10 +65,121 @@
         </section>
       </div>
 
-      <section class="floor-section" aria-labelledby="history-heading">
+      <section class="floor-section task-section" aria-labelledby="tasks-heading">
         <div class="section-heading section-heading--compact">
           <div>
             <p class="section-index">Ledger 04</p>
+            <h2 id="tasks-heading">Tasks &amp; runs</h2>
+          </div>
+          <span class="section-key">Read only</span>
+        </div>
+
+        <div class="task-progress-shell">
+          <div class="task-subheading">
+            <div>
+              <p class="eyebrow">Run progress</p>
+              <h3>Durable task pool</h3>
+            </div>
+            <span class="read-only-label">Immutable observation</span>
+          </div>
+          <div id="run-progress" data-testid="run-progress" class="run-progress" aria-live="polite">
+            <p class="empty-state">Waiting for task runs…</p>
+          </div>
+        </div>
+
+        <div class="task-filters" aria-label="Task filters">
+          <div class="task-filter">
+            <label for="task-filter-run">Run</label>
+            <select id="task-filter-run" data-testid="task-filter-run">
+              <option value="">All runs</option>
+            </select>
+          </div>
+          <div class="task-filter">
+            <label for="task-filter-state">State</label>
+            <select id="task-filter-state" data-testid="task-filter-state">
+              <option value="">All states</option>
+            </select>
+          </div>
+          <div class="task-filter">
+            <label for="task-filter-worker">Worker</label>
+            <select id="task-filter-worker" data-testid="task-filter-worker">
+              <option value="">All workers</option>
+            </select>
+          </div>
+          <div class="task-filter">
+            <label for="task-filter-agent">Agent</label>
+            <select id="task-filter-agent" data-testid="task-filter-agent">
+              <option value="">All agents</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="task-table-shell">
+          <div class="task-table-heading">
+            <div>
+              <p class="eyebrow">Task table</p>
+              <p class="task-table-caption">State, authority, and scheduler position</p>
+            </div>
+            <span class="section-key">No controls</span>
+          </div>
+          <div id="task-list" data-testid="task-list" class="task-list" role="list" aria-label="Tasks">
+            <p class="empty-state">Waiting for durable tasks…</p>
+          </div>
+        </div>
+
+        <div class="task-inspector" aria-label="Selected task inspection">
+          <div class="task-panel">
+            <div class="task-panel__heading">
+              <div>
+                <p class="eyebrow">Immutable detail</p>
+                <h3>Task record</h3>
+              </div>
+              <span class="read-only-label">Read only</span>
+            </div>
+            <div id="task-detail" data-testid="task-detail" class="task-detail">
+              <p class="empty-state">Select a task to inspect its immutable record.</p>
+            </div>
+          </div>
+
+          <div class="task-panel">
+            <div class="task-panel__heading">
+              <div>
+                <p class="eyebrow">Normalized timeline</p>
+                <h3>Turn history</h3>
+              </div>
+              <span class="section-key">Text only</span>
+            </div>
+            <div id="task-timeline" data-testid="task-timeline" class="task-timeline">
+              <p class="empty-state">Turn history appears after a task is selected.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="task-panel task-log-panel">
+          <div class="task-panel__heading">
+            <div>
+              <p class="eyebrow">Raw turn logs</p>
+              <h3>Active output</h3>
+            </div>
+            <span class="section-key">Bounded · read only</span>
+          </div>
+          <div class="console-grid">
+            <figure class="console">
+              <figcaption><span>Task standard output</span><code>stdout</code></figcaption>
+              <pre id="task-stdout-log" data-testid="task-stdout-log" tabindex="0" aria-label="Task standard output log"></pre>
+            </figure>
+            <figure class="console">
+              <figcaption><span>Task standard error</span><code>stderr</code></figcaption>
+              <pre id="task-stderr-log" data-testid="task-stderr-log" tabindex="0" aria-label="Task standard error log"></pre>
+            </figure>
+          </div>
+        </div>
+      </section>
+
+      <section class="floor-section" aria-labelledby="history-heading">
+        <div class="section-heading section-heading--compact">
+          <div>
+            <p class="section-index">Ledger 05</p>
             <h2 id="history-heading">Recent tickets</h2>
           </div>
           <span class="section-key">Read only</span>
@@ -81,7 +192,7 @@
       <section class="floor-section detail-section" aria-labelledby="detail-heading">
         <div class="section-heading section-heading--compact">
           <div>
-            <p class="section-index">Scope 05</p>
+            <p class="section-index">Scope 06</p>
             <h2 id="detail-heading">Job detail</h2>
           </div>
           <span class="section-key">Immutable record</span>
