@@ -271,14 +271,47 @@ fn capability_projection_is_profile_keyed_and_stale_facts_never_satisfy_it() {
             .contains(&"agent:codex@unsafe".to_owned())
     );
 
-    let stale = SchedulerProbeAdapter::observations_at(
-        &config(),
-        &[health_with_facts(facts(0))],
-        FACTS_TTL + 1,
-    )
-    .unwrap();
+    let mut stale_health = health_with_facts(facts(0));
+    stale_health.probe.as_mut().unwrap().facts_age_millis = Some(FACTS_TTL + 1);
+    let stale =
+        SchedulerProbeAdapter::observations_at(&config(), &[stale_health], FACTS_TTL + 1).unwrap();
     assert!(
         !stale[0]
+            .capabilities()
+            .iter()
+            .any(|capability| capability.starts_with("agent:"))
+    );
+}
+
+#[test]
+fn capability_projection_uses_reported_fact_age_across_clock_skew() {
+    // Break caught: comparing a remote collected-at timestamp to the scheduler
+    // clock can make expired facts from a clock-ahead worker look fresh.
+    let mut stale_health = health_with_facts(facts(FACTS_TTL + 10_000));
+    stale_health.probe.as_mut().unwrap().facts_age_millis = Some(FACTS_TTL + 1);
+
+    let observations =
+        SchedulerProbeAdapter::observations_at(&config(), &[stale_health], 0).unwrap();
+
+    assert!(
+        !observations[0]
+            .capabilities()
+            .iter()
+            .any(|capability| capability.starts_with("agent:"))
+    );
+}
+
+#[test]
+fn capability_projection_requires_a_reported_fact_age() {
+    // Break caught: accepting fact payloads that omit their worker-measured age
+    // bypasses the TTL boundary for a malformed current-version probe.
+    let mut health = health_with_facts(facts(1));
+    health.probe.as_mut().unwrap().facts_age_millis = None;
+
+    let observations = SchedulerProbeAdapter::observations_at(&config(), &[health], 1).unwrap();
+
+    assert!(
+        !observations[0]
             .capabilities()
             .iter()
             .any(|capability| capability.starts_with("agent:"))

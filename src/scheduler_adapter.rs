@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    agent_facts::{AgentAuth, AgentFacts},
+    agent_facts::{AgentAuth, AgentFacts, FACTS_TTL},
     config::Config,
     error::WorkerError,
     lease::SlotState,
@@ -23,7 +23,7 @@ impl SchedulerProbeAdapter {
     pub fn observations_at(
         config: &Config,
         health: &[WorkerHealth],
-        now_millis: u64,
+        _now_millis: u64,
     ) -> Result<Vec<CandidateObservation>, WorkerError> {
         health
             .iter()
@@ -53,7 +53,7 @@ impl SchedulerProbeAdapter {
                         append_agent_capabilities(
                             &mut capabilities,
                             probe.agent_facts.as_ref(),
-                            now_millis,
+                            probe.facts_age_millis,
                         );
                         CandidateObservation::new(
                             worker_health.name.clone(),
@@ -82,11 +82,14 @@ impl SchedulerProbeAdapter {
 fn append_agent_capabilities(
     capabilities: &mut Vec<String>,
     facts: Option<&AgentFacts>,
-    now_millis: u64,
+    facts_age_millis: Option<u64>,
 ) {
-    let Some(facts) = facts.filter(|facts| !facts.is_stale(now_millis)) else {
+    let (Some(facts), Some(facts_age_millis)) = (facts, facts_age_millis) else {
         return;
     };
+    if facts_age_millis > FACTS_TTL {
+        return;
+    }
     let secure_profiles = facts
         .env_profiles
         .iter()
