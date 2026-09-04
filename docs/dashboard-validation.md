@@ -52,20 +52,20 @@ This section records the local documentation and dashboard-task gate for the pha
 
 ## Phase 5e live acceptance
 
-These rows record the v6 live dashboard observation against the matched release/client revision. They retain only shortened IDs, state names, counts, durations, outcome categories, revision/protocol matches, and privacy-safe pass/fail observations.
+These rows record the v7 live dashboard observation against the matched release/client revision. They retain only shortened IDs, state names, counts, durations, outcome categories, revision/protocol matches, and privacy-safe pass/fail observations.
 
 | Acceptance item | Evidence |
 | --- | --- |
 | 1. Loopback endpoint and no worker-side listener | Passed: one loopback dashboard endpoint was live; no worker-side listener was started. |
 | 2. Idle three-worker cards with current readiness | Passed: final refresh showed `3/3` ready/current/idle workers, protocol `4`, Codex `0.153.2`. |
 | 3. Three active task turns mapped to titles/agents and worker cards | Passed during item 1: three active rows occupied positions 1–3 on distinct workers and matched the CLI; snapshot progress was total 5, queued 2, active 3. The separate active-job projection was 0. |
-| 4. Queued task-turn and batch rows with FIFO position, pin/run-cap fields, and blocking reason | Partial: positions 4–5 matched the CLI. Live rows did not expose pin/run-cap or blocking-code fields, and the dashboard queue array was empty. |
-| 5. Browser run/state/worker/agent filters without a network mutation | Not exercised live: the root and snapshot were read-only; the automated suite covers the filter controls. |
+| 4. Queued task-turn and batch rows with FIFO position, pin/run-cap fields, and blocking reason | Passed for a live pinned row: position `1`, `pinned_worker=mini-1`, `run_max_parallel=null`, and `blocking_code=CAPABILITY_MISSING` were visible in the snapshot; the rendered card showed “Capability missing · agent:codex”. |
+| 5. Browser run/state/worker/agent filters without a network mutation | Passed for state (`active`/`queued`), worker (`mini-1`/`mini-2`), and agent (`codex`) filters; the run filter had only `All runs` because no named run existed. Filter changes caused no network mutation. |
 | 6. Task detail result card, questions, changed files, diff stat, and turn timeline | Passed for the active task: detail matched status, worker, turn, and session; timeline was present, while terminal result fields were correctly absent. |
-| 7. Active-turn stdout/stderr reconnect with exact 1-second cursors and no duplication | Partial: bounded active stdout returned data with offset `0` and a next offset. Exact 1-second reconnect/no-duplication behavior was not proven live. |
-| 8. Stale remote status and dead runner presentation without recovery | Not proven live: no stale/dead runner was presented in the dashboard. CLI runner replacement and reconnect were observed separately. |
+| 7. Active-turn stdout/stderr reconnect with exact 1-second cursors and no duplication | Passed for active stdout: the bounded route returned `0 → 1550`; two reconnect reads at `1550` returned `1550` with zero new bytes. No duplication was observed; stderr and exact one-second cadence were not separately exercised. |
+| 8. Stale remote status and dead runner presentation without recovery | Passed observation: after the validated runner kill, the queued row showed `Runner Dead` while remaining current and the active holder showed `Runner Unknown` with no outcome; after reconcile the queued row returned to `Runner Live`. |
 | 9. Dashboard shutdown preserving task/turn status and zero mutation | Passed operationally: dashboard stopped cleanly; final CLI state was terminal-only with five closed run rows and no active/queued rows. No mutation was observed; a direct before/after status comparison was not fully captured. |
-| 10. Non-loopback rejection, privacy scan, and CLI/snapshot JSON parity | Partial: item-1 task/progress counts matched CLI and snapshot. Non-loopback access was not exercised. Count-only scans found marker/secret `0/0`; path-like counts were local `62`, mini-1 `159`, mini-2 `72`, mini-3 `55`. |
+| 10. Non-loopback rejection, privacy scan, and CLI/snapshot JSON parity | Refusal/parity passed: the non-loopback request failed with connection refusal; CLI and snapshot each exposed 5 task rows with matching normalized fields. Marker/secret counts were `0/0`; `paths/paths_logs` were local `0/16`, mini-1 `162/66`, mini-2 `65/80`, mini-3 `3/52`, so the worker `paths` criterion was not fully passed. |
 
 ### Operator checklist
 
