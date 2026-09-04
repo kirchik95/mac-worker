@@ -154,4 +154,6 @@ The dashboard suites passed outside the restricted sandbox:
 
 - `cargo test --locked --test dashboard_model --test dashboard_cache --test dashboard_service --test dashboard_web --test dashboard_source --test dashboard_queue --test dashboard_command --test dashboard_cpu_adapter`
 
-The final all-target gate is recorded after this report is committed.
+The final all-target gate also passed outside the restricted sandbox:
+
+- `cargo test --locked --all-targets`
