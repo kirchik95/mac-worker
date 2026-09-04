@@ -182,9 +182,15 @@ fn execute_with_context(
                 cli_includes: includes,
             })?))
         }
-        Command::Workers => {
+        Command::Workers { refresh } => {
             let config = load_config(cli.config, runtime)?;
-            let service = WorkersService::new(SshTransport::new(runner));
+            let transport = SshTransport::new(runner);
+            if refresh {
+                for worker in &config.workers {
+                    transport.refresh_facts(worker)?;
+                }
+            }
+            let service = WorkersService::new(transport);
             Ok(CommandOutput::Workers(service.inspect(&config)))
         }
         Command::Dashboard { .. } => Err(WorkerError::Protocol(
@@ -286,6 +292,11 @@ fn execute_with_context(
             command: HostCommand::MigrateLayout,
         } => Err(WorkerError::Protocol(
             "host migrate-layout requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::RefreshFacts,
+        } => Err(WorkerError::Protocol(
+            "host refresh-facts requires the stdio execution boundary".into(),
         )),
         Command::Host {
             command: HostCommand::ReceivePack { .. },
@@ -705,6 +716,14 @@ pub fn run_with_rsync_executor_in_context(
         }
     ) {
         return run_host_migrate_layout(cli.config, runtime, stderr);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::RefreshFacts
+        }
+    ) {
+        return run_host_refresh_facts(cli.config, runtime, runner, stderr);
     }
     if let Command::Host {
         command:
@@ -1216,6 +1235,26 @@ fn run_host_migrate_layout(
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
         HostStore::migrate_layout(&paths.host_state_root())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            write_error(stderr, &error);
+            error.exit_code()
+        }
+    }
+}
+
+fn run_host_refresh_facts(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        ProbeCollector::refresh_facts_at(&paths.host_state_root(), &runtime.home, runner)?;
+        Ok(())
     })();
     match result {
         Ok(()) => 0,

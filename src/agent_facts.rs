@@ -281,8 +281,12 @@ impl AgentFacts {
         self.collected_at_millis
     }
 
+    pub fn age_millis(&self, now_millis: u64) -> u64 {
+        now_millis.saturating_sub(self.collected_at_millis)
+    }
+
     pub fn is_stale(&self, now_millis: u64) -> bool {
-        now_millis.saturating_sub(self.collected_at_millis) > FACTS_TTL
+        self.age_millis(now_millis) > FACTS_TTL
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {

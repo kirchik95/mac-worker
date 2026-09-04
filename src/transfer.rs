@@ -60,6 +60,7 @@ pub enum HostOperation {
     TaskDiff,
     TaskClose,
     TaskTurn,
+    RefreshFacts,
     Cancel,
     Reconcile,
 }
@@ -78,6 +79,7 @@ impl HostOperation {
             Self::TaskDiff => "~/.local/bin/worker host task-diff",
             Self::TaskClose => "~/.local/bin/worker host task-close",
             Self::TaskTurn => "~/.local/bin/worker host task-turn",
+            Self::RefreshFacts => "~/.local/bin/worker host refresh-facts",
             Self::Cancel => "~/.local/bin/worker host cancel",
             Self::Reconcile => "~/.local/bin/worker host reconcile",
         }

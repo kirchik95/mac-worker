@@ -795,6 +795,7 @@ read_canonical_hex "$transaction/candidate.sha256" 64 || exit 77
 digest_regular_file "$worker_path" || exit 77
 [ "$canonical_digest" = "$expected_digest" ] || exit 77
 "$worker_path" host migrate-layout || exit 77
+"$worker_path" host refresh-facts || exit 77
 exec "$worker_path" host probe"#;
 
 const CLEANUP_BODY: &str = r#"verify_cleanup_state() {

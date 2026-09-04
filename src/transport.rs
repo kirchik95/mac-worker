@@ -17,6 +17,7 @@ use crate::{
         HealthStatus, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION, SetupFailureKind,
         WorkerHealth, WorkersReport, missing_capabilities,
     },
+    transfer::HostOperation,
 };
 
 const SSH_PROGRAM: &str = "/usr/bin/ssh";
@@ -29,6 +30,11 @@ const MAX_CAPABILITY_BYTES: usize = 64;
 const MAX_CAPABILITY_COUNT: usize = 64;
 const MAX_CONCURRENT_PROBES: usize = 3;
 const MAX_PROBE_DEADLINE: Duration = Duration::from_secs(15);
+const REFRESH_FACTS_POLICY: ProcessPolicy = ProcessPolicy {
+    stdout_limit: 64 * 1024,
+    stderr_limit: 64 * 1024,
+    deadline: Duration::from_secs(30),
+};
 
 #[doc(hidden)]
 pub trait ProbeClock: Send + Sync {
@@ -195,6 +201,37 @@ impl<R: ProcessRunner> SshTransport<R> {
         Ok(format!(
             "{SSH_PROGRAM} -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
         ))
+    }
+
+    pub fn refresh_facts(&self, worker: &WorkerEntry) -> Result<(), WorkerError> {
+        if !valid_ssh_destination(&worker.ssh) || worker.remote_binary != "~/.local/bin/worker" {
+            return Err(WorkerError::Transport {
+                code: "INVALID_REQUEST",
+                message: "worker transport configuration is invalid".into(),
+            });
+        }
+        let request = ssh_request(
+            worker,
+            HostOperation::RefreshFacts.command().into(),
+            REFRESH_FACTS_POLICY,
+        );
+        let result = self
+            .runner
+            .run(&request)
+            .map_err(|_| WorkerError::Transport {
+                code: "REFRESH_FACTS_FAILED",
+                message: "worker fact refresh could not be started".into(),
+            })?;
+        if !result.status.success()
+            || result.stdout.len() > REFRESH_FACTS_POLICY.stdout_limit
+            || result.stderr.len() > REFRESH_FACTS_POLICY.stderr_limit
+        {
+            return Err(WorkerError::Transport {
+                code: "REFRESH_FACTS_FAILED",
+                message: "worker fact refresh failed".into(),
+            });
+        }
+        Ok(())
     }
 
     pub fn probe(&self, worker: &WorkerEntry) -> WorkerHealth {
@@ -509,6 +546,10 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
         slot_state: crate::lease::SlotState,
         active_lease: Option<crate::lease::LeaseSummary>,
         capabilities: Vec<String>,
+        #[serde(default)]
+        agent_facts: Option<crate::agent_facts::AgentFacts>,
+        #[serde(default)]
+        facts_age_millis: Option<u64>,
     }
 
     let version: VersionOnly = serde_json::from_str(response)?;
@@ -527,6 +568,8 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
         slot_state: legacy.slot_state,
         active_lease: legacy.active_lease,
         capabilities: legacy.capabilities,
+        agent_facts: legacy.agent_facts,
+        facts_age_millis: legacy.facts_age_millis,
     };
     if version.protocol_version == PROTOCOL_VERSION {
         match serde_json::from_str(response) {
@@ -559,6 +602,8 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
                     slot_state: crate::lease::SlotState::Idle,
                     active_lease: None,
                     capabilities: legacy.capabilities,
+                    agent_facts: None,
+                    facts_age_millis: None,
                 })
             }
         }

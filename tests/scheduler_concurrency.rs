@@ -217,6 +217,8 @@ impl ProcessRunner for ProductionLeaseRunner {
                 slot_state: SlotState::Idle,
                 active_lease: None,
                 capabilities: Vec::new(),
+                agent_facts: None,
+                facts_age_millis: None,
             }),
             value if value == HostOperation::LeaseAcquire.command() => {
                 let bytes = request.stdin.as_deref().ok_or_else(|| {

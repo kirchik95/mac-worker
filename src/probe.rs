@@ -2,18 +2,22 @@ use std::{
     fs, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_os = "macos")]
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::{
+    agent_facts::{AgentFacts, EnvProfile as AgentEnvProfile, collect_agent_facts},
     error::WorkerError,
+    host_store::HostStore,
     lease::{LeaseService, SlotState},
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
     protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
+    rooted_fs::RootedDir,
+    turn::EnvProfile as TurnEnvProfile,
 };
 
 const CONTROLLED_HOST_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -30,6 +34,9 @@ const HOST_COMMAND_POLICY: ProcessPolicy = ProcessPolicy {
     stderr_limit: 64 * 1024,
     deadline: Duration::from_secs(5),
 };
+const FACTS_FILE: &str = "facts.json";
+const MAX_FACTS_BYTES: u64 = 1024 * 1024;
+const FACTS_WRITE_RETRIES: usize = 3;
 
 struct ProcessOutput {
     code: Option<i32>,
@@ -181,7 +188,39 @@ impl ProbeCollector {
         let occupancy = LeaseService::load_if_present(host_state_root)?;
         response.slot_state = occupancy.slot_state;
         response.active_lease = occupancy.active_lease;
+        response.agent_facts = Self::cached_facts_at(host_state_root)?;
+        response.facts_age_millis = response
+            .agent_facts
+            .as_ref()
+            .map(|facts| facts.age_millis(current_time_millis()));
         Ok(response)
+    }
+
+    /// Refreshes the cached agent, profile, and Git-identity facts. This is
+    /// deliberately separate from [`Self::collect_at`] so the probe hot path
+    /// never starts an agent process.
+    pub fn refresh_facts_at(
+        host_state_root: &Path,
+        home: &Path,
+        runner: &dyn ProcessRunner,
+    ) -> Result<AgentFacts, WorkerError> {
+        HostStore::open(host_state_root)?;
+        let profiles = load_env_profiles(home)?;
+        let facts = collect_agent_facts(runner, &profiles);
+        write_cached_facts(host_state_root, &facts)?;
+        Ok(facts)
+    }
+
+    /// Reads the facts cache without launching any agent binary.
+    pub fn cached_facts_at(host_state_root: &Path) -> Result<Option<AgentFacts>, WorkerError> {
+        let Some(_store) = HostStore::open_if_present(host_state_root)? else {
+            return Ok(None);
+        };
+        let root = RootedDir::open(host_state_root).map_err(WorkerError::Io)?;
+        if !root.entry_exists(FACTS_FILE)? {
+            return Ok(None);
+        }
+        read_cached_facts(&root).map(Some)
     }
 
     fn collect_with(
@@ -227,8 +266,104 @@ impl ProbeCollector {
             slot_state: SlotState::Idle,
             active_lease: None,
             capabilities,
+            agent_facts: None,
+            facts_age_millis: None,
         })
     }
+}
+
+fn load_env_profiles(home: &Path) -> Result<Vec<AgentEnvProfile>, WorkerError> {
+    let directory = home.join(".config").join("mac-worker").join("env");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(WorkerError::Io(error)),
+    };
+    let mut profiles = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(WorkerError::Io)?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(name) = file_name.strip_suffix(".env") else {
+            continue;
+        };
+        if !valid_profile_name(name) {
+            continue;
+        }
+        let profile = match TurnEnvProfile::load(&entry.path()) {
+            Ok(profile) => AgentEnvProfile::new(name, true, profile.entries().to_vec()),
+            Err(_) => AgentEnvProfile::new(name, false, Vec::new()),
+        };
+        profiles.push(profile);
+    }
+    profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(profiles)
+}
+
+fn valid_profile_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.contains('/')
+        && !value.contains('\\')
+        && value != "."
+        && value != ".."
+        && !value.chars().any(char::is_control)
+}
+
+fn read_cached_facts(root: &RootedDir) -> Result<AgentFacts, WorkerError> {
+    let bytes = root
+        .read_private_regular(FACTS_FILE, MAX_FACTS_BYTES)
+        .map_err(WorkerError::Io)?;
+    let facts: AgentFacts = serde_json::from_slice(&bytes)
+        .map_err(|_| WorkerError::Protocol("cached agent facts are invalid".into()))?;
+    let canonical = facts
+        .canonical_bytes()
+        .map_err(|_| WorkerError::Protocol("cached agent facts are invalid".into()))?;
+    if canonical != bytes {
+        return Err(WorkerError::Protocol(
+            "cached agent facts are not canonical".into(),
+        ));
+    }
+    Ok(facts)
+}
+
+fn write_cached_facts(host_state_root: &Path, facts: &AgentFacts) -> Result<(), WorkerError> {
+    let bytes = facts
+        .canonical_bytes()
+        .map_err(|_| WorkerError::Protocol("failed to serialize cached agent facts".into()))?;
+    if bytes.len() as u64 > MAX_FACTS_BYTES {
+        return Err(WorkerError::Protocol(
+            "cached agent facts exceed 1 MiB".into(),
+        ));
+    }
+    let root = RootedDir::open(host_state_root).map_err(WorkerError::Io)?;
+    for _ in 0..FACTS_WRITE_RETRIES {
+        if root.entry_exists(FACTS_FILE)? {
+            let previous = root
+                .read_private_regular(FACTS_FILE, MAX_FACTS_BYTES)
+                .map_err(WorkerError::Io)?;
+            match root.replace_private_regular_exact(FACTS_FILE, &previous, &bytes) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::ESTALE) => continue,
+                Err(error) => return Err(WorkerError::Io(error)),
+            }
+        } else {
+            match root.write_private_atomic_no_replace(FACTS_FILE, &bytes) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(WorkerError::Io(error)),
+            }
+        }
+    }
+    Err(WorkerError::Io(io::Error::from_raw_os_error(libc::EAGAIN)))
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 pub fn collect_json() -> Result<Vec<u8>, WorkerError> {
@@ -844,6 +979,8 @@ mod tests {
                 slot_state: SlotState::Idle,
                 active_lease: None,
                 capabilities: vec!["darwin-arm64".into(), "git".into(), "python".into()],
+                agent_facts: None,
+                facts_age_millis: None,
             }
         );
     }

@@ -474,6 +474,8 @@ fn ready_report(active_job_id: JobId) -> WorkersReport {
                     created_at_millis: 1_500,
                 }),
                 capabilities: vec!["swift".into(), "xcode".into()],
+                agent_facts: None,
+                facts_age_millis: None,
             }),
             missing_capabilities: vec!["docker".into()],
             error_code: None,

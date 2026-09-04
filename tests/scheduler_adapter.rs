@@ -48,6 +48,8 @@ fn ready_health() -> WorkerHealth {
             slot_state: SlotState::Idle,
             active_lease: None,
             capabilities: vec!["node".into()],
+            agent_facts: None,
+            facts_age_millis: None,
         }),
         missing_capabilities: Vec::new(),
         error_code: None,

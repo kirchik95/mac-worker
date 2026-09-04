@@ -1,3 +1,5 @@
+use crate::agent_facts::AgentFacts;
+
 pub const PROTOCOL_VERSION: u32 = 4;
 pub const SUPERVISION_VERSION: u32 = 3;
 
@@ -29,6 +31,10 @@ pub struct ProbeResponse {
     pub slot_state: crate::lease::SlotState,
     pub active_lease: Option<crate::lease::LeaseSummary>,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub agent_facts: Option<AgentFacts>,
+    #[serde(default)]
+    pub facts_age_millis: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -189,6 +195,8 @@ mod tests {
                 slot_state: crate::lease::SlotState::Idle,
                 active_lease: None,
                 capabilities: vec!["darwin-arm64".into(), "git".into()],
+                agent_facts: None,
+                facts_age_millis: None,
             }
         }
 

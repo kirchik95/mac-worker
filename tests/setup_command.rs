@@ -162,6 +162,20 @@ fn canonical_setup_probe_fixture_carries_all_v3_scheduler_and_dashboard_facts() 
     );
 }
 
+#[test]
+fn setup_verification_refreshes_agent_facts_before_the_final_probe() {
+    // The helper must populate the cache after promotion so ordinary probes remain cheap.
+    let verification = generated_setup_commands().verification;
+    let refresh = verification
+        .find("\"$worker_path\" host refresh-facts")
+        .expect("setup verification must refresh cached agent facts");
+    let probe = verification
+        .find("exec \"$worker_path\" host probe")
+        .expect("setup verification must finish with a probe");
+
+    assert!(refresh < probe);
+}
+
 fn expected_setup_json(expected: &[u8]) -> Vec<u8> {
     String::from_utf8(expected.to_vec())
         .unwrap()
@@ -2192,7 +2206,7 @@ fn error_report_fallback_ignores_a_broken_stderr_writer() {
         Cli {
             config: Some("/definitely/missing/mac-worker.toml".into()),
             json: false,
-            command: Command::Workers,
+            command: Command::Workers { refresh: false },
         },
         &runner,
         &mut Vec::new(),

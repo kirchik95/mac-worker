@@ -139,6 +139,8 @@ impl ProcessRunner for FleetRunner {
                     slot_state: mac_worker::lease::SlotState::Idle,
                     active_lease: None,
                     capabilities: Vec::new(),
+                    agent_facts: None,
+                    facts_age_millis: None,
                 })
                 .unwrap(),
             );

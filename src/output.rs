@@ -308,6 +308,49 @@ fn render_worker_health_with_labels(
             probe.capabilities.join(", ")
         };
         lines.push(format!("  capabilities: {capabilities}"));
+        if let Some(facts) = &probe.agent_facts {
+            lines.push(format!(
+                "  agent facts age millis: {}",
+                probe.facts_age_millis.unwrap_or(0)
+            ));
+            lines.push(format!(
+                "  git identity: {}",
+                if facts.git_identity {
+                    "configured"
+                } else {
+                    "unconfigured"
+                }
+            ));
+            if facts.agents.is_empty() {
+                lines.push("  agents: none".into());
+            } else {
+                lines.push("  agents:".into());
+                for agent in &facts.agents {
+                    let version = agent.version.as_deref().unwrap_or("unknown");
+                    lines.push(format!(
+                        "    {} {}: {}",
+                        agent.name,
+                        version,
+                        agent.auth.as_str()
+                    ));
+                    for (profile, auth) in &agent.auth_by_profile {
+                        lines.push(format!("      {profile}: {}", auth.as_str()));
+                    }
+                }
+            }
+            if facts.env_profiles.is_empty() {
+                lines.push("  profiles: none".into());
+            } else {
+                lines.push("  profiles:".into());
+                for profile in &facts.env_profiles {
+                    lines.push(format!(
+                        "    {}: {}",
+                        profile.name,
+                        if profile.secure { "secure" } else { "insecure" }
+                    ));
+                }
+            }
+        }
         lines.push(format!("  free disk bytes: {}", probe.free_disk_bytes));
         lines.push(format!("  total disk bytes: {}", probe.total_disk_bytes));
         lines.push(format!(

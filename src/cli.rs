@@ -30,7 +30,10 @@ pub enum Command {
         #[arg(long = "include", value_parser = non_empty_pattern)]
         includes: Vec<String>,
     },
-    Workers,
+    Workers {
+        #[arg(long)]
+        refresh: bool,
+    },
     Dashboard {
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
         port: Option<u16>,
@@ -95,6 +98,8 @@ pub enum HostCommand {
     SnapshotVerify,
     #[command(name = "migrate-layout")]
     MigrateLayout,
+    #[command(name = "refresh-facts")]
+    RefreshFacts,
     #[command(name = "task-prepare")]
     TaskPrepare,
     #[command(name = "task-status")]

@@ -2604,6 +2604,8 @@ fn ready_probe() -> ProbeResponse {
         slot_state: mac_worker::lease::SlotState::Idle,
         active_lease: None,
         capabilities: vec!["declared-capability".into(), "project-capability".into()],
+        agent_facts: None,
+        facts_age_millis: None,
     }
 }
 
@@ -9280,7 +9282,11 @@ fn dispatcher_keeps_status_as_one_document_and_other_commands_unchanged() {
 
     stdout.clear();
     let workers_exit = dispatch(
-        public_cli(runtime.config.clone(), true, WorkerCommand::Workers),
+        public_cli(
+            runtime.config.clone(),
+            true,
+            WorkerCommand::Workers { refresh: false },
+        ),
         &RecordingRunner::returning(vec![canonical_process(&ready_probe())]),
         &runtime.context,
         &mut stdout,
