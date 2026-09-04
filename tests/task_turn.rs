@@ -393,6 +393,7 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
         close_policy: ClosePolicy::Never,
         env_profile: None,
         git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+        title: None,
         prompt: prompt.into(),
         created_at_millis: 100,
     })
@@ -566,6 +567,7 @@ fn successful_codex_turn_without_a_bound_session_fails_publication() {
         close_policy: ClosePolicy::Never,
         env_profile: None,
         git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+        title: None,
         prompt: prompt.into(),
         created_at_millis: 100,
     })

@@ -62,6 +62,7 @@ fn task_meta(base_oid: BaseOid) -> TaskMeta {
         close_policy: ClosePolicy::Never,
         env_profile: None,
         git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+        title: None,
         prompt: "make the requested change".into(),
         created_at_millis: 100,
     })
