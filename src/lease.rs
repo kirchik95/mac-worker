@@ -167,12 +167,21 @@ impl<'a> LeaseService<'a> {
         let capacity = self.store.capacity_lock_after(&guard)?;
         guard.validate()?;
         capacity.validate()?;
-        let live = self
-            .load_locked()?
-            .ok_or_else(|| WorkerError::Protocol("live lease is absent".into()))?;
-        if live != *expected {
-            return Err(WorkerError::Protocol("live lease identity mismatch".into()));
-        }
+        let live = match self.load_locked()? {
+            None => {
+                // The slot is already free. A concurrent cancel, supervisor
+                // finish, or status retry can reach release after the winner
+                // retired the exact lease. Prove this identity still owns the
+                // durable cleanup receipt instead of recording
+                // LEASE_RELEASE_FAILED against an idle worker.
+                receipt.validate_durable(self.store, expected)?;
+                return Ok(());
+            }
+            Some(live) if live != *expected => {
+                return Err(WorkerError::Protocol("live lease identity mismatch".into()));
+            }
+            Some(live) => live,
+        };
         let leases = self.store.open_directory("leases", false)?;
         let retired = format!(".released-{}", live.job_id());
         guard.validate()?;
@@ -524,6 +533,13 @@ mod lifecycle_tests {
         .unwrap();
         assert!(service.release_after_cleanup(&wrong, &receipt).is_err());
         assert_eq!(service.load().unwrap(), Some(lease.clone()));
+        service.release_after_cleanup(&lease, &receipt).unwrap();
+        assert_eq!(service.load().unwrap(), None);
+        // A later cancel, status, or supervisor finish can retry release after
+        // the winner already retired the slot. That must stay a no-op: the
+        // live lease is gone, but the exact cleanup receipt still proves this
+        // identity owned the cleanup. Treating absence as failure is what
+        // stamped LEASE_RELEASE_FAILED on already-idle workers.
         service.release_after_cleanup(&lease, &receipt).unwrap();
         assert_eq!(service.load().unwrap(), None);
     }

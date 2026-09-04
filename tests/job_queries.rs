@@ -589,6 +589,8 @@ fn cancel_terms_then_kills_only_the_exact_recorded_group_before_cleanup() {
             .unwrap();
 
     assert_eq!(response.status().status().state(), JobState::Cancelled);
+    assert_eq!(response.status().status().error_code(), Some("CANCELLED"));
+    assert_eq!(response.status().status().cleanup_error_code(), None);
     assert_eq!(
         runtime.signals(),
         vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
@@ -604,6 +606,91 @@ fn cancel_terms_then_kills_only_the_exact_recorded_group_before_cleanup() {
             .unwrap();
     assert_eq!(repeated.status().status().state(), JobState::Cancelled);
     assert!(retry.signals().is_empty(), "terminal retry must not signal");
+    assert_eq!(repeated.status().status().cleanup_error_code(), None);
+    assert_eq!(
+        read_job_status(&store, &lease).cleanup_error_code(),
+        None,
+        "a second cancel after a successful release must not stamp LEASE_RELEASE_FAILED"
+    );
+    let receipt = store.cleanup_job_owned(&lease).unwrap();
+    LeaseService::new(&store)
+        .release_after_cleanup(&lease, &receipt)
+        .unwrap();
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert_eq!(read_job_status(&store, &lease).cleanup_error_code(), None);
+}
+
+#[test]
+fn overlapping_cancels_do_not_record_lease_release_failed_after_the_slot_is_free() {
+    // Break caught: two cancels in quick succession both capture the live
+    // lease, the winner retires it, and the loser stamps LEASE_RELEASE_FAILED
+    // even though workers() would already show idle.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("overlap-cancel-release");
+    let (store, lease, request, status, _child) = indexed_running_job(&root, 90_401, 90_402);
+    let cancelled = status
+        .into_infrastructure_terminal(JobState::Cancelled, 14, 0, 0, "CANCELLED".into())
+        .unwrap();
+    install_job_status(&store, &lease, &cancelled, false);
+    let start = Arc::new(Barrier::new(2));
+    let (tx_a, rx_a) = mpsc::channel();
+    let (tx_b, rx_b) = mpsc::channel();
+    let root_a = root.clone();
+    let root_b = root.clone();
+    let request_a = request.clone();
+    let request_b = request;
+    let start_a = Arc::clone(&start);
+    let handle_a = thread::spawn(move || {
+        let store = HostStore::open(&root_a).unwrap();
+        start_a.wait();
+        let _ = tx_a.send(
+            JobService::new_with_reconciliation(
+                &store,
+                &RejectLauncher,
+                Arc::new(ScriptedReconciliation::new([], [])),
+            )
+            .cancel(request_a),
+        );
+    });
+    let handle_b = thread::spawn(move || {
+        let store = HostStore::open(&root_b).unwrap();
+        start.wait();
+        let _ = tx_b.send(
+            JobService::new_with_reconciliation(
+                &store,
+                &RejectLauncher,
+                Arc::new(ScriptedReconciliation::new([], [])),
+            )
+            .cancel(request_b),
+        );
+    });
+
+    let first = rx_a
+        .recv_timeout(Duration::from_secs(20))
+        .expect("cancel A hung")
+        .unwrap_or_else(|error| panic!("cancel A failed: {error}"));
+    let second = rx_b
+        .recv_timeout(Duration::from_secs(20))
+        .expect("cancel B hung")
+        .unwrap_or_else(|error| panic!("cancel B failed: {error}"));
+    handle_a.join().expect("cancel A thread panicked");
+    handle_b.join().expect("cancel B thread panicked");
+
+    for (label, response) in [("A", &first), ("B", &second)] {
+        assert_eq!(
+            response.status().status().state(),
+            JobState::Cancelled,
+            "{label}"
+        );
+        assert_eq!(
+            response.status().status().cleanup_error_code(),
+            None,
+            "{label} returned LEASE_RELEASE_FAILED after the slot was free"
+        );
+    }
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert_eq!(read_job_status(&store, &lease).cleanup_error_code(), None);
+    assert_eq!(read_job_status(&store, &lease).state(), JobState::Cancelled);
 }
 
 #[test]
