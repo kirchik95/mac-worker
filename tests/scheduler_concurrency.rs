@@ -1,25 +1,41 @@
+#[allow(dead_code)]
+mod support;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
+    os::unix::process::ExitStatusExt,
+    process::ExitStatus,
     sync::{
         Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
+    time::Duration,
 };
 
 use mac_worker::{
     client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore},
+    config::{Config, WorkerEntry},
+    error::WorkerError,
     host_store::HostStore,
     job::{
-        AdmissionObservation, CommandSpec, JobId, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseToken, ProcessIdentity, QueueEntry, QueueEntryKind, QueueRunReference, QueueState,
-        RequestFingerprintMaterial, RunId,
+        AdmissionObservation, CommandSpec, HostControlError, JobId, JobMeta, JobStatus,
+        LeaseAcquireRequest, LeaseAcquireResponse, LeaseToken, LocalJobRecord, ProcessIdentity,
+        QueueEntry, QueueEntryKind, QueueRunReference, QueueState, RequestFingerprintMaterial,
+        RunId, StatusResponse, SubmitRequest, SubmitResponse,
     },
-    lease::{AdmissionFacts, LeaseService},
-    protocol::MemoryPressure,
+    lease::{AdmissionFacts, LeaseService, SlotState},
+    paths::PathLayout,
+    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
+    remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
+    run::{JobFollower, RunObserver, RunRequest, RunService, RunStage},
     scheduler::{CandidateSlot, WorkerPreference},
+    transfer::HostOperation,
 };
+use support::GitRepo;
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -122,6 +138,248 @@ fn gated_store(
     });
     let store = Arc::new(ClientStateStore::open_with_concurrency_hook(&root, hook).unwrap());
     (directory, store, entered_rx, release_tx)
+}
+
+const PRODUCTION_RSYNC_STATS: &[u8] = b"Number of files: 2\nNumber of files transferred: 1\nTotal file size: 8 B\nTotal transferred file size: 8 B\nUnmatched data: 8 B\nMatched data: 0 B\nFile list size: 64 B\nTotal sent: 128 B\nTotal received: 32 B\n\nsent 128 bytes  received 32 bytes  1000 bytes/sec\ntotal size is 8  speedup is 0.05\n";
+
+fn canonical_process(value: &impl serde::Serialize) -> Result<ProcessResult, WorkerError> {
+    let mut stdout = serde_json::to_vec(value).map_err(|error| {
+        WorkerError::Protocol(format!("test response serialization failed: {error}"))
+    })?;
+    stdout.push(b'\n');
+    Ok(ProcessResult {
+        status: ExitStatus::from_raw(0),
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
+fn host_error_process(code: &'static str, message: String) -> Result<ProcessResult, WorkerError> {
+    let mut result = canonical_process(&HostControlError::new(code, message)?)?;
+    result.status = ExitStatus::from_raw(23 << 8);
+    Ok(result)
+}
+
+struct ProductionLeaseRunner {
+    host: HostStore,
+    lease_acquires: AtomicUsize,
+}
+
+impl ProductionLeaseRunner {
+    fn new(host: HostStore) -> Self {
+        Self {
+            host,
+            lease_acquires: AtomicUsize::new(0),
+        }
+    }
+
+    fn lease_acquires(&self) -> usize {
+        self.lease_acquires.load(Ordering::SeqCst)
+    }
+}
+
+impl ProcessRunner for ProductionLeaseRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == OsStr::new("/usr/bin/git") {
+            return SystemProcessRunner.run(request);
+        }
+        if request.program == OsStr::new("/usr/bin/rsync") {
+            return Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout: PRODUCTION_RSYNC_STATS.to_vec(),
+                stderr: Vec::new(),
+            });
+        }
+
+        let operation = request
+            .args
+            .last()
+            .and_then(|argument| argument.to_str())
+            .unwrap_or_default();
+        match operation {
+            "~/.local/bin/worker host probe" => canonical_process(&ProbeResponse {
+                protocol_version: PROTOCOL_VERSION,
+                supervision_version: SUPERVISION_VERSION,
+                hostname: "scheduler-test-host".into(),
+                arch: "arm64".into(),
+                os_version: "26.2".into(),
+                free_disk_bytes: 100 * 1024 * 1024 * 1024,
+                total_disk_bytes: 250 * 1024 * 1024 * 1024,
+                memory_pressure: MemoryPressure::Normal,
+                swap_used_bytes: Some(0),
+                available_memory_bytes: Some(12 * 1024 * 1024 * 1024),
+                cpu_counters: Some(CpuCounters {
+                    user_ticks: 10,
+                    system_ticks: 20,
+                    idle_ticks: 30,
+                    nice_ticks: 40,
+                }),
+                slot_state: SlotState::Idle,
+                active_lease: None,
+                capabilities: Vec::new(),
+            }),
+            value if value == HostOperation::LeaseAcquire.command() => {
+                let bytes = request.stdin.as_deref().ok_or_else(|| {
+                    WorkerError::Protocol(
+                        "lease acquire request was missing in test transport".into(),
+                    )
+                })?;
+                let acquire: LeaseAcquireRequest =
+                    serde_json::from_slice(bytes).map_err(|error| {
+                        WorkerError::Protocol(format!("invalid lease request: {error}"))
+                    })?;
+                self.lease_acquires.fetch_add(1, Ordering::SeqCst);
+                match LeaseService::new(&self.host).acquire(
+                    &acquire,
+                    &healthy_admission(),
+                    acquire.material().created_at_millis(),
+                ) {
+                    Ok(response) => canonical_process(&response),
+                    Err(WorkerError::Capacity { code, message }) => {
+                        host_error_process(code, message)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            value if value == HostOperation::SnapshotVerify.command() => {
+                let bytes = request.stdin.as_deref().ok_or_else(|| {
+                    WorkerError::Protocol(
+                        "snapshot verify request was missing in test transport".into(),
+                    )
+                })?;
+                let verify: SnapshotVerifyRequest =
+                    serde_json::from_slice(bytes).map_err(|error| {
+                        WorkerError::Protocol(format!("invalid snapshot verify request: {error}"))
+                    })?;
+                canonical_process(
+                    &VerifiedSnapshotResponse::new(
+                        verify.job_id(),
+                        verify.client_id(),
+                        verify.project_id().into(),
+                        verify.worktree_id().into(),
+                        verify.manifest_digest().into(),
+                        102,
+                        false,
+                    )
+                    .unwrap(),
+                )
+            }
+            value if value == HostOperation::Submit.command() => {
+                let bytes = request.stdin.as_deref().ok_or_else(|| {
+                    WorkerError::Protocol("submit request was missing in test transport".into())
+                })?;
+                let submit: SubmitRequest = serde_json::from_slice(bytes).map_err(|error| {
+                    WorkerError::Protocol(format!("invalid submit request: {error}"))
+                })?;
+                let meta = JobMeta::new(submit.material(), submit.request_fingerprint().clone())?;
+                canonical_process(&SubmitResponse::Accepted {
+                    meta: Box::new(meta),
+                    status: JobStatus::accepted(submit.material().created_at_millis() + 1)?,
+                })
+            }
+            _ => panic!("unexpected production-path test request: {request:?}"),
+        }
+    }
+}
+
+struct DispatchHandoffGate {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    hits: AtomicUsize,
+}
+
+impl DispatchHandoffGate {
+    fn new(entered: mpsc::Sender<()>, release: mpsc::Receiver<()>) -> Self {
+        Self {
+            entered,
+            release: Mutex::new(release),
+            hits: AtomicUsize::new(0),
+        }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+impl RunObserver for DispatchHandoffGate {
+    fn observe(&self, stage: RunStage) -> Result<(), WorkerError> {
+        if stage == RunStage::DispatchToLeaseHandoff {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            self.entered.send(()).map_err(|_| {
+                WorkerError::Protocol("production dispatch handoff receiver disappeared".into())
+            })?;
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| {
+                    WorkerError::Protocol("production dispatch handoff timed out".into())
+                })?;
+        }
+        Ok(())
+    }
+}
+
+struct SuccessfulRunFollower;
+
+impl JobFollower for SuccessfulRunFollower {
+    fn follow(
+        &self,
+        record: &LocalJobRecord,
+        _json: bool,
+        _stdout: &mut dyn std::io::Write,
+        _stderr: &mut dyn std::io::Write,
+    ) -> Result<StatusResponse, WorkerError> {
+        StatusResponse::new(
+            record.meta().clone(),
+            JobStatus::succeeded(record.meta().created_at_millis() + 2, 0, 0)?,
+        )
+    }
+}
+
+fn production_run_repo() -> GitRepo {
+    let repo = GitRepo::init();
+    repo.write(".worker.toml", b"version = 1\n");
+    repo.write("tracked.txt", b"tracked\n");
+    repo.commit_all("scheduler production path fixture");
+    repo
+}
+
+fn production_run_paths(temp: &tempfile::TempDir) -> PathLayout {
+    let root = temp.path().canonicalize().unwrap();
+    PathLayout {
+        config: root.join("config.toml"),
+        state: root.join("state"),
+        cache: root.join("cache"),
+        data: root.join("data"),
+    }
+}
+
+fn production_run_config() -> Config {
+    Config {
+        version: 1,
+        workers: vec![WorkerEntry {
+            name: "mini-a".into(),
+            ssh: "mini-a".into(),
+            slots: 1,
+            capabilities: Vec::new(),
+            remote_binary: "~/.local/bin/worker".into(),
+        }],
+    }
+}
+
+fn production_run_request(repo: &GitRepo) -> RunRequest {
+    RunRequest {
+        preference: WorkerPreference::Pinned {
+            worker: "mini-a".into(),
+        },
+        wait_for_capacity: false,
+        project: repo.root().to_path_buf(),
+        cli_includes: Vec::new(),
+        timeout: None,
+        command: CommandSpec::argv(vec!["scheduler-production-path".into()]).unwrap(),
+    }
 }
 
 #[test]
@@ -326,34 +584,116 @@ fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_w
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let lease_threads = reservations
+    let lease_attempts = reservations
         .into_iter()
         .enumerate()
-        .map(|(index, (entry, worker))| {
+        .flat_map(|(index, (entry, worker))| {
+            let competing = queued(
+                &store,
+                50_000 + index as u128,
+                owner(50_000 + index as u32),
+                WorkerPreference::Pinned {
+                    worker: worker.clone(),
+                },
+                None,
+            );
+            vec![
+                (
+                    format!("{worker}-queue-head"),
+                    worker.clone(),
+                    true,
+                    entry.job_id(),
+                    lease_request(&entry, &worker, index as u128),
+                ),
+                (
+                    format!("{worker}-competing-claimant"),
+                    worker.clone(),
+                    false,
+                    competing.job_id(),
+                    lease_request(&competing, &worker, 10_000 + index as u128),
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lease_attempts.len(), 6);
+    let lease_barrier = Arc::new(Barrier::new(lease_attempts.len() + 1));
+    let lease_threads = lease_attempts
+        .into_iter()
+        .map(|(label, worker, from_queue, job_id, request)| {
             let host = host_roots.get(worker.as_str()).unwrap().clone();
-            let request = lease_request(&entry, &worker, index as u128);
+            let barrier = Arc::clone(&lease_barrier);
             thread::spawn(move || {
+                barrier.wait();
                 let response =
                     LeaseService::new(&host).acquire(&request, &healthy_admission(), 101);
-                (worker, entry.job_id(), response)
+                (label, worker, from_queue, job_id, response)
             })
         })
         .collect::<Vec<_>>();
-    let leases = lease_threads
+    lease_barrier.wait();
+    let lease_results = lease_threads
         .into_iter()
         .map(|thread| thread.join().unwrap())
         .collect::<Vec<_>>();
-    for (worker, job_id, response) in leases {
-        let LeaseAcquireResponse::Acquired { lease } = response.unwrap() else {
-            panic!("a selected worker must durably acquire one lease");
-        };
-        assert_eq!(lease.job_id(), job_id);
+    assert_eq!(lease_results.len(), 6);
+    let attempts_per_worker = lease_results.iter().fold(
+        BTreeMap::<&str, usize>::new(),
+        |mut counts, (_, worker, _, _, _)| {
+            *counts.entry(worker.as_str()).or_insert(0) += 1;
+            counts
+        },
+    );
+    assert_eq!(
+        attempts_per_worker,
+        BTreeMap::from([("mini-a", 2), ("mini-b", 2), ("mini-c", 2)]),
+        "every selected worker must have two concurrent authoritative claimants"
+    );
+
+    for worker in ["mini-a", "mini-b", "mini-c"] {
+        let attempts = lease_results
+            .iter()
+            .filter(|(_, attempt_worker, _, _, _)| attempt_worker == worker)
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 2);
+        let acquired = attempts
+            .iter()
+            .filter_map(|(_, _, _, _, result)| match result {
+                Ok(LeaseAcquireResponse::Acquired { lease }) => Some(lease),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            acquired.len(),
+            1,
+            "worker {worker} must durably grant exactly one lease"
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|(_, _, _, _, result)| matches!(
+                    result,
+                    Err(WorkerError::Capacity {
+                        code: "CAPACITY_BUSY",
+                        ..
+                    })
+                ))
+                .count(),
+            1,
+            "worker {worker} must return typed CAPACITY_BUSY to its losing claimant"
+        );
+        let lease = acquired[0];
         assert_eq!(lease.worker_name(), worker);
-        let durable = LeaseService::new(host_roots.get(worker.as_str()).unwrap())
+        let durable = LeaseService::new(host_roots.get(worker).unwrap())
             .load()
             .unwrap()
-            .expect("selected worker must retain its one lease");
-        assert_eq!(durable, lease);
+            .expect("selected worker must retain its one authoritative lease");
+        assert_eq!(&durable, lease);
+        assert!(
+            attempts
+                .iter()
+                .any(|(_, _, _, job_id, _)| *job_id == lease.job_id()),
+            "the durable lease must belong to one retained claimant"
+        );
     }
 }
 
@@ -488,80 +828,132 @@ fn enqueue_claim_handoff_matrix_preserves_the_published_fifo_head() {
 }
 
 #[test]
-fn claim_lease_handoff_matrix_persists_exactly_one_authoritative_lease() {
-    // Break caught: a claim can be handed to a lease boundary using a stale
-    // cap decision, or the lease identity can diverge from the queue winner.
+fn claim_lease_handoff_matrix_uses_production_run_dispatch() {
+    // Break caught: a QueueState::Dispatching claim can be decoupled from the
+    // RunService lease transfer, allowing a direct test-only lease acquire to
+    // pass while production dispatch never reaches the authoritative host.
+    let repo = production_run_repo();
     let mut schedule_counts = [0usize; 4];
     for case in 0..100_u128 {
         let schedule = (case % 4) as usize;
         schedule_counts[schedule] += 1;
-        let (directory, store, entered, release) =
-            gated_store(ClientStateConcurrencyPoint::ClaimRunCapEvaluation);
-        let row_owner = owner(31_000 + case as u32);
-        let entry = queued(
-            &store,
-            31_000 + case,
-            row_owner,
-            WorkerPreference::Pinned {
-                worker: "mini-a".into(),
-            },
-            None,
-        );
-        let published = store.enqueue(entry).unwrap();
-        let host = Arc::new(HostStore::open(&directory.path().join("host")).unwrap());
-        let request = lease_request(&published, "mini-a", case + 1_000);
-        let claimant_store = Arc::clone(&store);
-        let claimant =
-            thread::spawn(move || claimant_store.claim_next(row_owner, &["mini-a".into()], 101));
-        entered.recv().unwrap();
-
-        let (start_lease, wait_for_lease) = mpsc::channel();
-        let lease_host = Arc::clone(&host);
-        let lease = thread::spawn(move || {
-            wait_for_lease.recv().unwrap();
-            LeaseService::new(&lease_host).acquire(&request, &healthy_admission(), 101)
+        let temp = tempfile::tempdir().unwrap();
+        let paths = production_run_paths(&temp);
+        let store = Arc::new(ClientStateStore::open(&paths.state).unwrap());
+        let host = Arc::new(HostStore::open(&paths.data.join("host")).unwrap());
+        let runner = Arc::new(ProductionLeaseRunner::new((*host).clone()));
+        let config = production_run_config();
+        let follower = SuccessfulRunFollower;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let observer = Arc::new(DispatchHandoffGate::new(entered_tx, release_rx));
+        let run_store = Arc::clone(&store);
+        let run_runner = Arc::clone(&runner);
+        let run_observer = Arc::clone(&observer);
+        let run_paths = paths.clone();
+        let run_config = config.clone();
+        let run_request = production_run_request(&repo);
+        let run = thread::spawn(move || {
+            let service = RunService::with_follower(
+                &*run_runner,
+                &run_config,
+                &run_paths,
+                &run_store,
+                &follower,
+            )
+            .with_observer(&*run_observer);
+            service.submit_and_follow(run_request, false, &mut Vec::new(), &mut Vec::new())
         });
-        let mut lease = Some(lease);
-        let mut claimant = Some(claimant);
-        let mut claim_result = None;
-        let lease_result = match schedule {
-            0 => {
-                start_lease.send(()).unwrap();
-                release.send(()).unwrap();
-                None
-            }
-            1 => {
-                release.send(()).unwrap();
-                start_lease.send(()).unwrap();
-                None
-            }
-            2 => {
-                release.send(()).unwrap();
-                claim_result = Some(claimant.take().unwrap().join().unwrap());
-                start_lease.send(()).unwrap();
-                None
-            }
-            3 => {
-                start_lease.send(()).unwrap();
-                release.send(()).unwrap();
-                Some(lease.take().unwrap().join().unwrap())
-            }
-            _ => unreachable!(),
-        };
-        let claim = claim_result
-            .unwrap_or_else(|| claimant.take().unwrap().join().unwrap())
-            .unwrap()
-            .expect("the pinned row must be claimed");
-        let lease_response = lease_result.unwrap_or_else(|| lease.take().unwrap().join().unwrap());
-        let LeaseAcquireResponse::Acquired { lease } = lease_response.unwrap() else {
-            panic!("the selected worker must accept the exact lease request");
-        };
-        assert_eq!(claim.entry().job_id(), lease.job_id(), "case {case}");
-        assert_eq!(lease.worker_name(), "mini-a", "case {case}");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("case {case} never reached dispatch-to-lease handoff"));
+        let before = store.queue_snapshot().unwrap();
+        assert_eq!(before.entries().len(), 1, "case {case}");
+        let entry = &before.entries()[0];
+        let job_id = entry.job_id();
+        assert!(matches!(
+            entry.state(),
+            QueueState::Dispatching { selected_worker, .. } if selected_worker == "mini-a"
+        ));
+        assert!(
+            store.load_job(job_id).is_ok(),
+            "case {case} local record exists"
+        );
         assert_eq!(
             LeaseService::new(&host).load().unwrap(),
-            Some(lease),
-            "case {case} persisted the authoritative lease"
+            None,
+            "case {case}"
+        );
+
+        match schedule {
+            0 => {
+                assert!(matches!(
+                    store.queue_snapshot().unwrap().entries()[0].state(),
+                    QueueState::Dispatching { .. }
+                ));
+                release_tx.send(()).unwrap();
+            }
+            1 => {
+                release_tx.send(()).unwrap();
+                let _ = store.queue_snapshot().unwrap();
+            }
+            2 => {
+                let reader_store = Arc::clone(&store);
+                let reader_host = Arc::clone(&host);
+                let (reader_started_tx, reader_started_rx) = mpsc::channel();
+                let (reader_done_tx, reader_done_rx) = mpsc::channel();
+                let reader = thread::spawn(move || {
+                    reader_started_tx.send(()).unwrap();
+                    let snapshot = reader_store.queue_snapshot().unwrap();
+                    let lease = LeaseService::new(&reader_host).load().unwrap();
+                    reader_done_tx.send((snapshot, lease)).unwrap();
+                });
+                reader_started_rx.recv().unwrap();
+                let (snapshot, lease) = reader_done_rx.recv().unwrap();
+                assert!(matches!(
+                    snapshot.entries()[0].state(),
+                    QueueState::Dispatching { .. }
+                ));
+                assert_eq!(lease, None, "case {case} reader precedes lease transfer");
+                release_tx.send(()).unwrap();
+                reader.join().unwrap();
+            }
+            3 => {
+                release_tx.send(()).unwrap();
+                let reader_store = Arc::clone(&store);
+                let reader = thread::spawn(move || reader_store.queue_snapshot().unwrap());
+                let _ = reader.join().unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let completion = run
+            .join()
+            .unwrap()
+            .unwrap_or_else(|error| panic!("case {case} production dispatch failed: {error}"));
+        assert_eq!(
+            observer.hits(),
+            1,
+            "case {case} named handoff is reached once"
+        );
+        assert_eq!(runner.lease_acquires(), 1, "case {case}");
+        assert_eq!(completion.report.job_id, job_id, "case {case}");
+        assert_eq!(completion.report.worker, "mini-a", "case {case}");
+        assert_eq!(
+            completion.report.status.state(),
+            mac_worker::job::JobState::Succeeded,
+            "case {case} terminal outcome follows authoritative lease"
+        );
+        let live = LeaseService::new(&host)
+            .load()
+            .unwrap()
+            .expect("case must retain the one authoritative host lease");
+        assert_eq!(live.job_id(), job_id, "case {case}");
+        assert_eq!(live.worker_name(), "mini-a", "case {case}");
+        assert!(
+            store.queue_snapshot().unwrap().entries().is_empty(),
+            "case {case}"
         );
     }
     assert_eq!(schedule_counts, [25, 25, 25, 25]);
