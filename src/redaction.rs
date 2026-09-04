@@ -14,6 +14,14 @@ const TOKEN_PLACEHOLDER: &str = "[token]";
 const MIN_HEX_TOKEN: usize = 32;
 const MIN_BASE64_TOKEN: usize = 32;
 const MIN_SK_TOKEN: usize = 8;
+const COMMON_PATH_PREFIXES: &[&str] = &[
+    "/Users/",
+    "/home/",
+    "/private/var/folders/",
+    "/var/folders/",
+    "/private/tmp/",
+    "/tmp/",
+];
 
 #[derive(Debug, Clone)]
 pub struct RedactionBoundary {
@@ -30,7 +38,10 @@ impl RedactionBoundary {
     }
 
     fn for_home(home: Option<PathBuf>) -> Self {
-        let mut homes = Vec::new();
+        let mut homes = COMMON_PATH_PREFIXES
+            .iter()
+            .map(|prefix| (*prefix).to_owned())
+            .collect::<Vec<_>>();
         if let Some(home) = home {
             if let Some(raw) = home.to_str() {
                 push_unique(&mut homes, raw.to_owned());

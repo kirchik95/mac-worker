@@ -22,6 +22,7 @@ use crate::{
         SubmitResponse,
     },
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
+    redaction::RedactionBoundary,
     rooted_fs::RootedDir,
     task::{
         BaseOid, ClosePolicy, GitIdentity, TaskId, TaskMeta, TaskOutcome, TaskStatus, TurnTerminal,
@@ -728,6 +729,10 @@ impl<'a> TurnPublisher<'a> {
         let agent_outcome = adapter.classify(exit_code, structured.status());
         let outcome = TaskOutcome::from_turn(terminal, Some(agent_outcome));
         let close = meta.close_policy() == ClosePolicy::Done && outcome == TaskOutcome::Done;
+        let boundary = RedactionBoundary::from_env();
+        let summary = nonempty(&boundary.summary(structured.summary()));
+        let questions = boundary.questions(structured.questions());
+        let agent_files_changed = boundary.changed_files(structured.files_changed());
         TaskStore::new(self.store, self.runner).finish_turn(
             meta.project_id(),
             meta.task_id(),
@@ -737,10 +742,10 @@ impl<'a> TurnPublisher<'a> {
             agent_committed,
             log_truncated,
             head_oid.clone(),
-            nonempty(structured.summary()),
-            structured.questions().to_vec(),
+            summary.clone(),
+            questions.clone(),
             if files_changed.is_empty() {
-                structured.files_changed().to_vec()
+                agent_files_changed.clone()
             } else {
                 files_changed.clone()
             },
@@ -760,8 +765,8 @@ impl<'a> TurnPublisher<'a> {
             agent_committed,
             log_truncated,
             head_oid,
-            summary: nonempty(structured.summary()),
-            questions: structured.questions().to_vec(),
+            summary,
+            questions,
             files_changed,
             diff_stat,
         })

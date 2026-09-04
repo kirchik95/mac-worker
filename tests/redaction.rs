@@ -33,6 +33,25 @@ fn summary_redacts_home_paths_tilde_paths_and_tokens() {
 }
 
 #[test]
+fn summary_redacts_other_users_home_and_temp_paths() {
+    let paths = [
+        "/Users/bob/project/.git/index.lock",
+        "/home/bob/project/.git/index.lock",
+        "/private/var/folders/ab/cd1234/T/mac-worker.log",
+        "/var/folders/ab/cd1234/T/mac-worker.log",
+        "/tmp/mac-worker/turn.log",
+        "/private/tmp/mac-worker/turn.log",
+    ];
+    let input = paths.join(" ");
+    let text = boundary().summary(&input);
+
+    for path in paths {
+        assert!(!text.contains(path), "path was retained: {path}");
+    }
+    assert_eq!(text.matches("[path]").count(), paths.len());
+}
+
+#[test]
 fn questions_redact_and_bound_each_item_and_the_list() {
     let questions = boundary().questions([
         "open /Users/alice/.env please".to_owned(),

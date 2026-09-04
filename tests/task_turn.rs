@@ -340,7 +340,7 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
         "/bin/sh",
         vec![
             "-c".into(),
-            "printf changed > agent.txt; printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"session-1\"}' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"done\\\",\\\"summary\\\":\\\"ok\\\",\\\"questions\\\":[],\\\"files_changed\\\":[]}\"}}'".into(),
+            "printf changed > agent.txt; printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"session-1\"}' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"done\\\",\\\"summary\\\":\\\"finished at /Users/worker/.git/index.lock\\\",\\\"questions\\\":[\\\"why is /Users/worker/.git/index.lock locked?\\\"],\\\"files_changed\\\":[]}\"}}'".into(),
         ],
         PromptDelivery::Stdin,
         Vec::new(),
@@ -454,6 +454,11 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
         });
     assert_eq!(response.task().state(), TaskState::Open);
     assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(response.task().summary(), Some("finished at [path]"));
+    assert_eq!(
+        response.task().questions(),
+        &["why is [path] locked?".to_owned()]
+    );
     assert!(response.task().session_present());
     assert_eq!(response.task().turns()[0].agent_committed(), Some(false));
     assert_eq!(response.task().files_changed(), &["agent.txt"]);
@@ -464,6 +469,17 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
             .unwrap()
             .is_some()
     );
+    let status_json = fs::read(
+        store
+            .task_dir(PROJECT_ID, task_id())
+            .unwrap()
+            .join("status.json"),
+    )
+    .unwrap();
+    let status_json = String::from_utf8(status_json).unwrap();
+    assert!(!status_json.contains("/Users/worker/.git/index.lock"));
+    assert!(status_json.contains("finished at [path]"));
+    assert!(status_json.contains("why is [path] locked?"));
 
     let retry = JobService::new(&store, &launcher)
         .submit_turn(request)
