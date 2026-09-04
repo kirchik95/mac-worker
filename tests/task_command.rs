@@ -1,7 +1,10 @@
 use clap::Parser;
 use mac_worker::{
     cli::{Cli, Command, TaskCommand},
+    protocol::PROTOCOL_VERSION,
+    task::RunProgress,
     task_client::BatchFile,
+    task_view::{TaskListJson, TaskListProjection},
 };
 
 #[test]
@@ -201,4 +204,20 @@ prompt = "x"
         conflicting.is_err(),
         "mixed top-level and [defaults] keys must be rejected"
     );
+}
+
+#[test]
+fn task_list_json_envelope_flattens_the_shared_projection() {
+    let projection = TaskListProjection {
+        tasks: Vec::new(),
+        runs: Vec::new(),
+        progress: RunProgress::from_states(std::iter::empty()),
+    };
+    let value = serde_json::to_value(TaskListJson::new(PROTOCOL_VERSION, projection)).unwrap();
+
+    assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
+    assert!(value.get("tasks").is_some());
+    assert!(value.get("runs").is_some());
+    assert!(value.get("progress").is_some());
+    assert!(value.get("projection").is_none());
 }

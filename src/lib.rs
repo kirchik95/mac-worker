@@ -91,6 +91,7 @@ pub mod supervisor;
 pub mod task;
 pub mod task_client;
 pub mod task_store;
+pub mod task_view;
 pub mod transfer;
 pub mod transfer_repo;
 pub mod transport;
@@ -1048,20 +1049,16 @@ fn write_task_list_report(
     if json {
         write_json_line(
             stdout,
-            &serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
-                "tasks": report.tasks(),
-                "progress": report.progress(),
-            }),
+            &crate::task_view::TaskListJson::new(PROTOCOL_VERSION, report.projection().clone()),
         )
     } else {
         for task in report.tasks() {
             writeln!(
                 stdout,
                 "{}: {} ({})",
-                task.task_id(),
-                task_state_name(task.state()),
-                task.worker().unwrap_or("unassigned")
+                task.task_id,
+                task_state_name(task.state),
+                task.worker.as_deref().unwrap_or("unassigned")
             )?;
         }
         stdout.flush()?;
@@ -1189,7 +1186,7 @@ fn write_run_report(
     }
 }
 
-fn write_json_line(stdout: &mut dyn Write, value: &serde_json::Value) -> Result<(), WorkerError> {
+fn write_json_line<T: Serialize>(stdout: &mut dyn Write, value: &T) -> Result<(), WorkerError> {
     serde_json::to_writer(&mut *stdout, value)
         .map_err(|error| WorkerError::Io(io::Error::other(error)))?;
     stdout.write_all(b"\n")?;

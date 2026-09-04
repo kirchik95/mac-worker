@@ -24,9 +24,13 @@ use crate::{
     scheduler_adapter::SchedulerProbeAdapter,
     supervisor::{ProcessObservation, SystemProcessInspector},
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, RunId, RunProgress, RunRecord,
-        RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
-        TaskState, TaskStatus, TaskSummary, TurnId, TurnSummary,
+        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, RunId, RunRecord, RunnerIdentity,
+        RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskState,
+        TaskStatus, TurnId, TurnSummary,
+    },
+    task_view::{
+        TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
+        project_task_list,
     },
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
@@ -104,16 +108,24 @@ impl TaskReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskListReport {
-    tasks: Vec<TaskSummary>,
+    projection: TaskListProjection,
 }
 
 impl TaskListReport {
-    pub fn tasks(&self) -> &[TaskSummary] {
-        &self.tasks
+    pub fn projection(&self) -> &TaskListProjection {
+        &self.projection
     }
 
-    pub fn progress(&self) -> RunProgress {
-        RunProgress::from_states(self.tasks.iter().map(TaskSummary::state))
+    pub fn tasks(&self) -> &[TaskListRow] {
+        &self.projection.tasks
+    }
+
+    pub fn runs(&self) -> &[TaskRunProjection] {
+        &self.projection.runs
+    }
+
+    pub fn progress(&self) -> crate::task::RunProgress {
+        self.projection.progress
     }
 }
 
@@ -712,7 +724,7 @@ impl<'a> TaskClient<'a> {
     }
 
     pub fn list(&self, filter: TaskListFilter) -> Result<TaskListReport, WorkerError> {
-        let mut tasks = self
+        let records = self
             .client_state
             .list_tasks()?
             .into_iter()
@@ -726,13 +738,30 @@ impl<'a> TaskClient<'a> {
                     .state
                     .is_none_or(|state| task.status().state() == state)
             })
+            .collect::<Vec<_>>();
+
+        let runner_states = records
+            .iter()
             .map(|task| {
-                let runner = self.client_state.runner_liveness(task.meta().task_id())?;
-                Ok(task.summary().with_runner_state(runner))
+                Ok((
+                    task.meta().task_id(),
+                    self.client_state.runner_liveness(task.meta().task_id())?,
+                ))
             })
-            .collect::<Result<Vec<_>, WorkerError>>()?;
-        tasks.sort_by_key(TaskSummary::updated_at_millis);
-        Ok(TaskListReport { tasks })
+            .collect::<Result<std::collections::HashMap<_, _>, WorkerError>>()?;
+        let freshness = records
+            .iter()
+            .map(|task| (task.meta().task_id(), TaskFreshness::Current))
+            .collect();
+        let runs = self
+            .client_state
+            .list_runs()?
+            .into_iter()
+            .filter(|run| filter.run_id.is_none_or(|run_id| run.run_id() == run_id))
+            .collect::<Vec<_>>();
+        let projection = project_task_list(&records, &runs, &runner_states, &freshness)
+            .map_err(task_view_error)?;
+        Ok(TaskListReport { projection })
     }
 
     pub fn logs(
@@ -2194,6 +2223,13 @@ fn task_error(code: &'static str, message: impl Into<String>) -> WorkerError {
     WorkerError::Task {
         code,
         message: message.into(),
+    }
+}
+
+fn task_view_error(error: TaskViewError) -> WorkerError {
+    WorkerError::Task {
+        code: error.code(),
+        message: error.message().to_owned(),
     }
 }
 
