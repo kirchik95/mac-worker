@@ -464,6 +464,8 @@ fn ready_report(active_job_id: JobId) -> WorkersReport {
                 total_disk_bytes: 1_000,
                 memory_pressure: MemoryPressure::Warn,
                 swap_used_bytes: Some(42),
+                available_memory_bytes: None,
+                cpu_counters: None,
                 slot_state: SlotState::Busy,
                 active_lease: Some(LeaseSummary {
                     job_id: active_job_id,
