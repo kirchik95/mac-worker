@@ -915,6 +915,28 @@ fn protocol_two_without_supervision_capability_is_an_explicit_version_mismatch()
 }
 
 #[test]
+fn phase_four_protocol_three_probe_with_supervision_remains_a_protocol_mismatch() {
+    let mut response: serde_json::Value = serde_json::from_slice(&valid_probe_json()).unwrap();
+    response["protocol_version"] = serde_json::json!(3);
+    response["supervision_version"] = serde_json::json!(2);
+    let health = SshTransport::new(RecordingRunner::returning_json(
+        serde_json::to_vec(&response).unwrap(),
+    ))
+    .probe(&worker("mini-1", "mac1", &[]));
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
+    assert_eq!(
+        health.probe.as_ref().map(|probe| probe.protocol_version),
+        Some(3)
+    );
+    assert_eq!(
+        health.probe.as_ref().map(|probe| probe.supervision_version),
+        Some(2)
+    );
+}
+
+#[test]
 fn task7_only_supervision_helper_is_rejected_after_query_capability_bump() {
     // Catches treating a Task 7 helper (supervision v1) as if it implemented
     // the Task 8 status/log/resolve control surface.

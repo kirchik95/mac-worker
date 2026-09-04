@@ -513,10 +513,6 @@ fn is_lower_hex(byte: u8) -> bool {
 
 fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Error> {
     #[derive(serde::Deserialize)]
-    struct VersionOnly {
-        protocol_version: u32,
-    }
-    #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct LegacyProbe {
         protocol_version: u32,
@@ -552,7 +548,6 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
         facts_age_millis: Option<u64>,
     }
 
-    let version: VersionOnly = serde_json::from_str(response)?;
     let without_supervision = |legacy: ProbeWithoutSupervision| ProbeResponse {
         protocol_version: legacy.protocol_version,
         supervision_version: 0,
@@ -571,23 +566,12 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
         agent_facts: legacy.agent_facts,
         facts_age_millis: legacy.facts_age_millis,
     };
-    if version.protocol_version == PROTOCOL_VERSION {
-        match serde_json::from_str(response) {
-            Ok(probe) => Ok(probe),
-            Err(full_error) => {
-                let legacy: ProbeWithoutSupervision = match serde_json::from_str(response) {
-                    Ok(legacy) => legacy,
-                    Err(_) => return Err(full_error),
-                };
-                Ok(without_supervision(legacy))
-            }
-        }
-    } else {
-        match serde_json::from_str(response) {
+    match serde_json::from_str::<ProbeResponse>(response) {
+        Ok(probe) => Ok(probe),
+        Err(full_error) => match serde_json::from_str::<ProbeWithoutSupervision>(response) {
             Ok(legacy) => Ok(without_supervision(legacy)),
-            Err(_) => {
-                let legacy: LegacyProbe = serde_json::from_str(response)?;
-                Ok(ProbeResponse {
+            Err(_) => match serde_json::from_str::<LegacyProbe>(response) {
+                Ok(legacy) => Ok(ProbeResponse {
                     protocol_version: legacy.protocol_version,
                     supervision_version: 0,
                     hostname: legacy.hostname,
@@ -604,9 +588,10 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
                     capabilities: legacy.capabilities,
                     agent_facts: None,
                     facts_age_millis: None,
-                })
-            }
-        }
+                }),
+                Err(_) => Err(full_error),
+            },
+        },
     }
 }
 
