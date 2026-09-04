@@ -32,7 +32,10 @@ use crate::{
     scheduler::{CandidateObservation, SchedulerPolicy, WorkerPreference},
     scheduler_adapter::SchedulerProbeAdapter,
     supervisor::SystemProcessInspector,
-    task::{LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId},
+    task::{
+        LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId,
+        TurnSummary,
+    },
     task_store::{TaskCancelRequest, TaskPrepareRequest, TaskSessionRequest, TaskStatusRequest},
     transfer::{RemoteJobClient, TransferIdentity},
     transfer_repo::TransferRepo,
@@ -206,7 +209,7 @@ impl<'a> TurnRunner<'a> {
                 // Before the host accepted a job, the dispatch is safe to
                 // retry.  Once accepted, the queue row remains durable and
                 // reconciliation will hand it to a replacement runner.
-                if self.can_revert_preacceptance(task_id, turn_id)? {
+                if matches!(self.can_revert_preacceptance(task_id, turn_id), Ok(true)) {
                     let _ = self.client_state.revert_dispatch(turn_id, owner);
                 }
                 let _ = self.client_state.record_runner(task_id, None);
@@ -748,24 +751,44 @@ impl<'a> TurnRunner<'a> {
     ) -> Result<TurnOutcomeReport, WorkerError> {
         self.persist_status(task_id, terminal.clone())?;
         let fetched = if matches!(terminal.state(), TaskState::Open | TaskState::Closed) {
-            GitTransport::new(self.runner).fetch_result(
+            if let Err(_error) = GitTransport::new(self.runner).fetch_result(
                 worker,
                 self.client_state.client_id(),
                 initial_record.meta().project_id(),
                 task_id,
                 transfer.path(),
-            )?;
-            Some(
-                transfer
-                    .import_result(
-                        self.runner,
-                        &project.context.common_dir,
-                        worker.name.as_str(),
+            ) {
+                return self.finish_publication_failure(
+                    task_id,
+                    turn_id,
+                    owner,
+                    terminal,
+                    transfer,
+                    "RESULT_FETCH_FAILED",
+                    log,
+                    follow,
+                );
+            }
+            match transfer.import_result(
+                self.runner,
+                &project.context.common_dir,
+                worker.name.as_str(),
+                task_id,
+            ) {
+                Ok(receipt) => Some(receipt.head().clone()),
+                Err(_error) => {
+                    return self.finish_publication_failure(
                         task_id,
-                    )?
-                    .head()
-                    .clone(),
-            )
+                        turn_id,
+                        owner,
+                        terminal,
+                        transfer,
+                        "PUBLISH_FAILED",
+                        log,
+                        follow,
+                    );
+                }
+            }
         } else {
             None
         };
@@ -796,6 +819,41 @@ impl<'a> TurnRunner<'a> {
             status: terminal,
             events: vec![event],
             exit_code,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_publication_failure(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        owner: ProcessIdentity,
+        terminal: TaskStatus,
+        transfer: TransferRepo,
+        failure_code: &'static str,
+        log: &mut LogWriter,
+        follow: &mut Option<&mut dyn Write>,
+    ) -> Result<TurnOutcomeReport, WorkerError> {
+        let outcome = TaskOutcome::failed(failure_code);
+        let status = publication_failure_status(&terminal, outcome.clone(), now_millis()?)?;
+        let record = self.client_state.load_task(task_id)?;
+        self.client_state
+            .update_task(record.with_status(status.clone())?.with_runner(None)?)?;
+        transfer.release_base(self.runner, task_id)?;
+        self.client_state
+            .remove_task_turn_after_terminal(turn_id, owner)?;
+        let event = serde_json::json!({
+            "type": "turn_terminal",
+            "protocol_version": crate::protocol::PROTOCOL_VERSION,
+            "task_id": task_id.to_string(),
+            "turn_id": turn_id.to_string(),
+            "outcome": outcome,
+        });
+        append_event(log, follow, event.clone())?;
+        Ok(TurnOutcomeReport {
+            status,
+            events: vec![event],
+            exit_code: turn_exit_code(&TaskOutcome::failed(failure_code)),
         })
     }
 
@@ -1171,15 +1229,54 @@ fn queue_error(code: &'static str, message: impl Into<String>) -> WorkerError {
 fn turn_exit_code(outcome: &TaskOutcome) -> u8 {
     match outcome {
         TaskOutcome::Done | TaskOutcome::NeedsInput | TaskOutcome::Unknown => 0,
-        TaskOutcome::Failed { reason } => reason
-            .strip_prefix("agent exited ")
-            .and_then(|code| code.parse::<u8>().ok())
-            .unwrap_or(1),
+        TaskOutcome::Failed { reason } => match reason.as_str() {
+            "PUBLISH_FAILED" | "RESULT_FETCH_FAILED" | "RESULT_UNPARSEABLE" => 70,
+            _ => reason
+                .strip_prefix("agent exited ")
+                .and_then(|code| code.parse::<u8>().ok())
+                .unwrap_or(1),
+        },
         TaskOutcome::Blocked
         | TaskOutcome::Cancelled
         | TaskOutcome::TimedOut
         | TaskOutcome::Lost => 1,
     }
+}
+
+fn publication_failure_status(
+    terminal: &TaskStatus,
+    outcome: TaskOutcome,
+    ended_at_millis: u64,
+) -> Result<TaskStatus, WorkerError> {
+    let mut turns = terminal.turns().to_vec();
+    if let Some(last) = turns.last().cloned() {
+        let replacement = TurnSummary::new(
+            last.turn_number(),
+            last.turn_id(),
+            last.terminal(),
+            Some(outcome.clone()),
+            last.agent_committed(),
+            last.log_truncated(),
+            last.started_at_millis(),
+            Some(ended_at_millis),
+        );
+        *turns
+            .last_mut()
+            .expect("cloned last turn must remain present") = replacement;
+    }
+    TaskStatus::new(
+        TaskState::Open,
+        Some(outcome),
+        terminal.worker().map(str::to_owned),
+        terminal.session_present(),
+        terminal.head_oid().cloned(),
+        terminal.summary().map(str::to_owned),
+        terminal.questions().to_vec(),
+        terminal.files_changed().to_vec(),
+        terminal.diff_stat().map(str::to_owned),
+        turns,
+        ended_at_millis,
+    )
 }
 
 fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerError> {
@@ -1265,7 +1362,7 @@ mod tests {
             turn_exit_code(&TaskOutcome::Failed {
                 reason: "PUBLISH_FAILED".into(),
             }),
-            1
+            70
         );
         assert_eq!(turn_exit_code(&TaskOutcome::Blocked), 1);
         assert_eq!(turn_exit_code(&TaskOutcome::Done), 0);
