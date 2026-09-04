@@ -1,10 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    fs::{self, File},
+    fs::File,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, fs::PermissionsExt},
+        unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
     process::Command,
@@ -3210,41 +3210,24 @@ fn initialize_mirror(mirror: &RootedDir) -> Result<(), WorkerError> {
 
 fn ensure_mirror_directory(mirror: &RootedDir) -> Result<(), WorkerError> {
     mirror.verify_descriptors_cloexec()?;
-    let metadata = fs::symlink_metadata(mirror.path())?;
-    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(WorkerError::Git {
-            code: "BASE_UNAVAILABLE",
-            message: "host mirror is not a private directory".into(),
-        });
-    }
-    fs::set_permissions(mirror.path(), fs::Permissions::from_mode(0o700))?;
-    let hooks = mirror.path().join("hooks");
-    match fs::symlink_metadata(&hooks) {
-        Ok(metadata) if !metadata.is_dir() => {
-            return Err(WorkerError::Git {
-                code: "BASE_UNAVAILABLE",
-                message: "host mirror hooks directory is unsafe".into(),
-            });
+    require_private_directory_metadata(&mirror.root_metadata()?)?;
+    let hooks = match mirror.repair_owned_child_directory_mode("hooks", 0o700) {
+        Ok(()) => mirror.open_child_directory(&relative("hooks")?, false)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            mirror.create_new_child_directory("hooks")?
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&hooks)?,
+        Err(error) => return Err(error.into()),
+    };
+    let expected = crate::git_transport::PRE_RECEIVE_HOOK.as_bytes();
+    match hooks.read_private_regular("pre-receive", MAX_HOST_FILE_BYTES) {
+        Ok(bytes) if bytes == expected => {}
+        Ok(bytes) => hooks.rewrite_private_regular_exact("pre-receive", &bytes, expected)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hooks.write_private_atomic_no_replace("pre-receive", expected)?;
+        }
         Err(error) => return Err(error.into()),
     }
-    fs::set_permissions(&hooks, fs::Permissions::from_mode(0o700))?;
-    let hook = hooks.join("pre-receive");
-    if fs::symlink_metadata(&hook)
-        .map(|metadata| !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0)
-        .unwrap_or(false)
-    {
-        return Err(WorkerError::Git {
-            code: "BASE_UNAVAILABLE",
-            message: "host mirror pre-receive hook is unsafe".into(),
-        });
-    }
-    if fs::read(&hook).ok().as_deref() != Some(crate::git_transport::PRE_RECEIVE_HOOK.as_bytes()) {
-        fs::write(&hook, crate::git_transport::PRE_RECEIVE_HOOK)?;
-    }
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
+    hooks.set_private_regular_mode("pre-receive", 0o700)?;
     configure_mirror(mirror.path())
 }
 

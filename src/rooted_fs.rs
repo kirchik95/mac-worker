@@ -1143,6 +1143,61 @@ impl RootedDir {
         })
     }
 
+    /// Restores the private mode of a direct child directory using only
+    /// descriptor-relative operations. This deliberately accepts an
+    /// owner-owned directory whose mode is currently too broad, so callers can
+    /// repair directories created by trusted external tools without following a
+    /// path that could be substituted between validation and chmod.
+    pub(crate) fn repair_owned_child_directory_mode(
+        &self,
+        name: &str,
+        mode: u32,
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        if mode & !0o7777 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory mode contains unsupported bits",
+            ));
+        }
+        let parent = stat_fd(self.root.as_raw_fd())?;
+        if let Some(device) = self.security_device {
+            require_private_directory_on_device(&parent, device)?;
+        } else {
+            require_private_directory(&parent)?;
+        }
+        let name = private_leaf_name(name)?;
+        let before = stat_at(self.root.as_raw_fd(), &name)?;
+        require_owned_directory_for_repair(&before, self.security_device)?;
+        let directory = open_directory_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(directory.as_raw_fd())?;
+        require_owned_directory_for_repair(&opened, self.security_device)?;
+        if !same_file(&before, &opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        cvt(unsafe { libc::fchmod(directory.as_raw_fd(), mode as libc::mode_t) })?;
+        cvt(unsafe { libc::fsync(directory.as_raw_fd()) })?;
+
+        let after = stat_fd(directory.as_raw_fd())?;
+        let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+        if !same_file(&before, &after)
+            || !same_file(&before, &rebound)
+            || after.st_uid != unsafe { libc::geteuid() }
+            || rebound.st_uid != unsafe { libc::geteuid() }
+            || after.st_mode as u32 & 0o7777 != mode
+            || rebound.st_mode as u32 & 0o7777 != mode
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        if let Some(device) = self.security_device
+            && (after.st_dev as u64 != device || rebound.st_dev as u64 != device)
+        {
+            return Err(os_error(libc::EXDEV));
+        }
+        self.verify_root_name()?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
     pub(crate) fn open_private_direct_child_on_device(
         &self,
         name: &str,
@@ -4326,6 +4381,23 @@ fn require_private_directory_on_device(
 ) -> io::Result<()> {
     require_private_directory(metadata)?;
     if metadata.st_dev as u64 != expected_device {
+        return Err(os_error(libc::EXDEV));
+    }
+    Ok(())
+}
+
+fn require_owned_directory_for_repair(
+    metadata: &libc::stat,
+    expected_device: Option<u64>,
+) -> io::Result<()> {
+    if file_type(metadata.st_mode) != libc::S_IFDIR || metadata.st_uid != unsafe { libc::geteuid() }
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "repair target is not an owner directory",
+        ));
+    }
+    if expected_device.is_some_and(|device| metadata.st_dev as u64 != device) {
         return Err(os_error(libc::EXDEV));
     }
     Ok(())

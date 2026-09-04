@@ -420,6 +420,26 @@ fn mirror_hook_wins_over_global_hooks_path_and_denies_heads_and_deletions() {
 }
 
 #[test]
+fn mirror_repair_rejects_hardlinked_pre_receive_before_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    let hook = mirror.path().join("hooks/pre-receive");
+    let sentinel = temp.path().join("sentinel");
+    fs::write(&sentinel, b"do not overwrite").unwrap();
+    fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o600)).unwrap();
+
+    fs::remove_file(&hook).unwrap();
+    fs::hard_link(&sentinel, &hook).unwrap();
+
+    assert!(
+        store.mirror(PROJECT_ID).is_err(),
+        "a hardlinked hook must be rejected before repair"
+    );
+    assert_eq!(fs::read(&sentinel).unwrap(), b"do not overwrite");
+}
+
+#[test]
 fn git_ssh_command_matches_json_transport_options_without_separator() {
     let command = SshTransport::new(RecordingRunner::default())
         .git_ssh_command(&worker())
