@@ -1,28 +1,36 @@
 #[allow(dead_code)]
 mod support;
 
-use std::{fs, os::unix::fs::PermissionsExt, process};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    process,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy, PromptDelivery, TurnLaunch, TurnLimits},
     error::WorkerError,
     host_store::HostStore,
     job::{
-        ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseRecord, LeaseToken,
-        RequestFingerprintMaterial,
+        ClientId, CommandSpec, JobId, JobState, JobStatus, LeaseAcquireRequest, LeaseRecord,
+        LeaseToken, RequestFingerprintMaterial,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
     protocol::{MemoryPressure, PROTOCOL_VERSION, SUPERVISION_VERSION},
     supervisor::{
-        LaunchPlan, StdinSource, StdoutSink, Supervisor, SupervisorFaultPoint,
-        SystemProcessInspector,
+        LaunchPlan, ProcessGroupMembership, ProcessGroupObservation, ProcessInspector,
+        ProcessObservation, ReconciliationRuntime, StdinSource, StdoutSink, Supervisor,
+        SupervisorFaultPoint, SystemProcessInspector,
     },
     task::{
         BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
         TaskMetaInput, TaskOutcome, TaskSource, TaskState,
     },
-    task_store::{TaskPrepareRequest, TaskStore},
+    task_store::{TaskCancelRequest, TaskPrepareRequest, TaskStore},
     turn::{EnvProfile, TaskTurnRequest, TurnMaterial, TurnSection},
 };
 use support::GitRepo;
@@ -98,6 +106,180 @@ impl SupervisorLauncher for InlineTurnLauncher {
         }
         Ok(LaunchCandidate::new(identity))
     }
+}
+
+struct FastReconciliationRuntime {
+    clock: Mutex<Duration>,
+}
+
+impl ProcessInspector for FastReconciliationRuntime {
+    fn identity_for_pid(&self, pid: u32) -> Result<mac_worker::job::ProcessIdentity, WorkerError> {
+        SystemProcessInspector.identity_for_pid(pid)
+    }
+
+    fn observe(&self, expected: mac_worker::job::ProcessIdentity) -> ProcessObservation {
+        SystemProcessInspector.observe(expected)
+    }
+
+    fn observe_group(&self, process_group: u32) -> ProcessGroupObservation {
+        SystemProcessInspector.observe_group(process_group)
+    }
+
+    fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership {
+        SystemProcessInspector.observe_group_members(leader)
+    }
+}
+
+impl ReconciliationRuntime for FastReconciliationRuntime {
+    fn signal_process_group(&self, process_group: u32, signal: i32) -> Result<(), WorkerError> {
+        if !matches!(signal, libc::SIGTERM | libc::SIGKILL) {
+            return Err(WorkerError::Protocol(
+                "test reconciliation signal is not permitted".into(),
+            ));
+        }
+        let process_group = i32::try_from(process_group)
+            .map_err(|_| WorkerError::Protocol("test process group is invalid".into()))?;
+        if unsafe { libc::kill(-process_group, signal) } != 0 {
+            return Err(WorkerError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    fn monotonic_now(&self) -> Duration {
+        *self.clock.lock().unwrap()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration.min(Duration::from_millis(20)));
+        let mut clock = self.clock.lock().unwrap();
+        *clock = clock.saturating_add(duration);
+    }
+}
+
+fn prepared_task_turn(
+    script: &str,
+) -> (
+    tempfile::TempDir,
+    HostStore,
+    mac_worker::turn::TaskTurnRequest,
+    TaskCancelRequest,
+) {
+    let temp = tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"base\n");
+    source.commit_all("base");
+    let base_oid: BaseOid = String::from_utf8(source.git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    let mirror_path = mirror.path().to_string_lossy().into_owned();
+    let base_ref = format!("HEAD:refs/mac-worker/bases/{}", task_id());
+    assert!(
+        source
+            .git(&["push", &mirror_path, &base_ref])
+            .status
+            .success()
+    );
+
+    let prompt = "turn prompt";
+    let turn_limits = TurnLimits::new(30_000, None, None).unwrap();
+    let turn = TurnMaterial::from_prompt(
+        task_id(),
+        1,
+        AgentKind::Codex,
+        None,
+        PermissionPolicy::Workspace,
+        turn_limits.clone(),
+        base_oid.clone(),
+        prompt,
+        None,
+        Uuid::from_u128(2),
+        false,
+    )
+    .unwrap();
+    let launch = TurnLaunch::new(
+        "/bin/sh",
+        vec!["-c".into(), script.into()],
+        PromptDelivery::Stdin,
+        Vec::new(),
+        false,
+    );
+    let job_id = JobId::new(Uuid::from_u128(3));
+    let client_id = ClientId::new(Uuid::from_u128(4));
+    let lease_token = LeaseToken::new(Uuid::from_u128(5));
+    let seed_material = RequestFingerprintMaterial::new(
+        job_id,
+        client_id,
+        lease_token,
+        100,
+        "test-worker".into(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        turn.digest(),
+        String::new(),
+        30_000,
+        "heavy".into(),
+        CommandSpec::shell("true".into()).unwrap(),
+    )
+    .unwrap();
+    let seed_lease =
+        LeaseRecord::new(&seed_material, seed_material.fingerprint(), 100, 30_100).unwrap();
+    let projected = turn.v1_material(&seed_lease, &launch).unwrap();
+    LeaseService::new(&store)
+        .acquire(
+            &LeaseAcquireRequest::new(projected.clone()),
+            &AdmissionFacts {
+                free_disk_bytes: 100 * 1024 * 1024 * 1024,
+                total_disk_bytes: 200 * 1024 * 1024 * 1024,
+                memory_pressure: MemoryPressure::Normal,
+                swap_used_bytes: Some(0),
+            },
+            100,
+        )
+        .unwrap();
+
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id: task_id(),
+        run_id: None,
+        project_id: PROJECT_ID.into(),
+        worktree_id: WORKTREE_ID.into(),
+        agent: AgentKind::Codex,
+        model: None,
+        policy: PermissionPolicy::Workspace,
+        source: TaskSource::Local { wip: false },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid,
+        limits: TaskLimits::new(turn_limits, 3).unwrap(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+        title: None,
+        prompt: prompt.into(),
+        created_at_millis: 100,
+    })
+    .unwrap();
+    let admission = store.admission_lock(job_id).unwrap();
+    let transfer = store.transfer_lock_after(&admission, job_id).unwrap();
+    TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
+        .prepare(
+            &TaskPrepareRequest::new(meta, job_id, "test-worker"),
+            &transfer,
+        )
+        .unwrap();
+    drop(transfer);
+    drop(admission);
+
+    let request = mac_worker::turn::TaskTurnRequest::new(
+        mac_worker::job::SubmitRequest::new(projected),
+        turn,
+        prompt,
+    );
+    let cancel = TaskCancelRequest::new(PROJECT_ID, task_id(), job_id);
+    (temp, store, request, cancel)
 }
 
 #[test]
@@ -799,4 +981,87 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
         .unwrap();
     assert_eq!(retry.task().state(), TaskState::Open);
     assert_eq!(retry.task().last_outcome(), Some(&TaskOutcome::Done));
+}
+
+#[test]
+fn cancelling_a_running_turn_hands_off_before_deadline_and_publishes_cancelled() {
+    // Break caught: the turn supervisor retained its guard while waiting for
+    // the agent, so a concurrent host cancellation expired with
+    // SUPERVISOR_LOCK_PENDING instead of publishing a cancelled turn.
+    let script = "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"session-cancel\"}'; sleep 8; printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"done\\\",\\\"summary\\\":\\\"natural\\\",\\\"questions\\\":[],\\\"files_changed\\\":[]}\"}}'";
+    let (_temp, store, request, cancel_request) = prepared_task_turn(script);
+    let submit_store = store.clone();
+    let submit_request = request.clone();
+    let submit = thread::spawn(move || {
+        let launcher = InlineTurnLauncher {
+            store: submit_store.clone(),
+            fault: None,
+        };
+        JobService::new(&submit_store, &launcher).submit_turn(submit_request)
+    });
+
+    let running_deadline = Instant::now() + Duration::from_secs(5);
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, cancel_request.turn_id())
+        .unwrap();
+    loop {
+        let running = fs::read(job_path.join("status.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<JobStatus>(&bytes).ok())
+            .is_some_and(|status| {
+                status.state() == JobState::Running && status.child_identity().is_some()
+            });
+        if running {
+            break;
+        }
+        if Instant::now() >= running_deadline {
+            let _ = submit.join();
+            panic!("inline supervisor did not publish Running before the deadline");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let cancel_started = Instant::now();
+    let cancel_store = store.clone();
+    let cancel = thread::spawn(move || {
+        let launcher = InlineTurnLauncher {
+            store: cancel_store.clone(),
+            fault: None,
+        };
+        JobService::new_with_reconciliation(
+            &cancel_store,
+            &launcher,
+            Arc::new(FastReconciliationRuntime {
+                clock: Mutex::new(Duration::ZERO),
+            }),
+        )
+        .cancel_task(cancel_request)
+    });
+    let cancel_result = cancel.join().expect("cancellation thread panicked");
+    let cancel_elapsed = cancel_started.elapsed();
+    let submit_result = submit.join().expect("submit thread panicked");
+    let cancelled =
+        cancel_result.unwrap_or_else(|error| panic!("turn cancellation failed: {error}"));
+    let submitted = submit_result.unwrap_or_else(|error| panic!("turn runner failed: {error}"));
+
+    assert!(
+        cancel_elapsed < Duration::from_secs(5),
+        "cancellation exceeded the supervisor handoff deadline: {cancel_elapsed:?}"
+    );
+    assert_eq!(cancelled.status().state(), TaskState::Open);
+    assert_eq!(
+        cancelled.status().last_outcome(),
+        Some(&TaskOutcome::Cancelled)
+    );
+    assert_eq!(submitted.task().state(), TaskState::Open);
+    assert_eq!(
+        submitted.task().last_outcome(),
+        Some(&TaskOutcome::Cancelled)
+    );
+
+    let job_status: JobStatus = serde_json::from_slice(
+        &fs::read(job_path.join("status.json")).expect("cancelled job status is retained"),
+    )
+    .unwrap();
+    assert_eq!(job_status.state(), JobState::Cancelled);
 }

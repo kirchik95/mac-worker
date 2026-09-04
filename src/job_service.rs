@@ -806,9 +806,18 @@ impl<'a> JobService<'a> {
                 &cancelled,
             )?;
             let publication = self.publish_cancelled_task_turn(lease, &job, &meta);
+            let payload_removal = if job.entry_exists("execution.json")? {
+                self.store
+                    .remove_owned_regular_committed(&job, "execution.json")
+            } else {
+                Ok(())
+            };
             drop(supervisor);
             drop(admission);
-            let cleanup = self.cleanup_and_release_reconciled(lease, &job, &cancelled);
+            let cleanup = match payload_removal {
+                Ok(()) => self.cleanup_and_release_reconciled(lease, &job, &cancelled),
+                Err(error) => Err(WorkerError::Io(error)),
+            };
             if let Err(error) = publication {
                 let _ = cleanup;
                 return Err(error);
@@ -838,8 +847,17 @@ impl<'a> JobService<'a> {
                 &cancelled,
             )?;
             let publication = self.publish_cancelled_task_turn(lease, &job, &meta);
+            let payload_removal = if job.entry_exists("execution.json")? {
+                self.store
+                    .remove_owned_regular_committed(&job, "execution.json")
+            } else {
+                Ok(())
+            };
             drop(supervisor);
-            let cleanup = self.cleanup_and_release_reconciled(lease, &job, &cancelled);
+            let cleanup = match payload_removal {
+                Ok(()) => self.cleanup_and_release_reconciled(lease, &job, &cancelled),
+                Err(error) => Err(WorkerError::Io(error)),
+            };
             if let Err(error) = publication {
                 let _ = cleanup;
                 return Err(error);

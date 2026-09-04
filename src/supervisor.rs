@@ -1625,7 +1625,7 @@ impl<'a> Supervisor<'a> {
     #[allow(clippy::too_many_arguments)]
     fn run_turn_after_payload(
         &self,
-        _job_id: JobId,
+        job_id: JobId,
         mut guard: SupervisorGuard,
         lease: &LeaseRecord,
         job: &RootedDir,
@@ -1955,7 +1955,7 @@ impl<'a> Supervisor<'a> {
                 return result;
             }
         };
-        let mut status_bytes = canonical_json(&status)?;
+        let status_bytes = canonical_json(&status)?;
 
         match child.allow_exec(self.fault) {
             Ok(()) => {}
@@ -2049,32 +2049,94 @@ impl<'a> Supervisor<'a> {
                 );
             }
         };
-        status_bytes = canonical_json(&status)?;
+        // Running is the sole durable handoff boundary. Before this fsynced
+        // status, the elected guard stays held and prelaunch ownership is
+        // unchanged; afterwards an explicit cancellation may acquire the
+        // guard and fence this supervisor while it waits for the child.
+        drop(guard);
 
         if self.fault == Some(SupervisorFaultPoint::AfterRunningStatus) {
-            let result = self.finish_turn_ambiguous(
-                lease,
-                job,
-                guard,
-                &meta,
-                &section,
-                status_bytes,
-                status,
-                &mut pump,
-                child_identity,
-                "RUNNING_STATUS_WRITE_FAILED",
-                injected_supervisor_fault("running status"),
-            );
-            return result;
+            let _ = wait_for_child(child_identity, lease.timeout_millis(), self.inspector)?;
+            return Err(injected_supervisor_fault("running status"));
         }
 
         let outcome = wait_for_child(child_identity, lease.timeout_millis(), self.inspector)?;
         std::thread::sleep(Duration::from_secs(1));
+
+        // Reacquire through the documented admission -> supervisor order.
+        // Cancellation may have won while we were intentionally unlocked,
+        // published Cancelled, cleaned mutable scopes, and released the
+        // lease; in that case stop the pump and leave the terminal state
+        // untouched.
+        let admission = self.store.admission_lock(job_id)?;
+        let Some(guard) = self.store.supervisor_lock_after(&admission, job_id, true)? else {
+            drop(admission);
+            let _ = pump.stop_and_join();
+            return Err(protocol_code(
+                "SUPERVISOR_LOCK_UNAVAILABLE",
+                "supervisor lock was unavailable after running handoff",
+            ));
+        };
+        let live = LeaseService::new(self.store).load_after(&admission, job_id);
+        let (current_job, current_bytes, current_status, terminal_lease) = match live {
+            // A readable live lease remains the authoritative handoff proof.
+            // Do not allow a valid replacement lease to inherit this
+            // supervisor's terminal-write capability.
+            Ok(Some(live)) if live == *lease => {
+                let values = self.revalidate_running_handoff(lease, &status, &live)?;
+                if values.2.state().is_terminal() {
+                    drop(guard);
+                    drop(admission);
+                    let _ = pump.stop_and_join();
+                    return Ok(());
+                }
+                values
+            }
+            Ok(Some(_)) => {
+                drop(guard);
+                drop(admission);
+                let _ = pump.stop_and_join();
+                return Err(protocol_code(
+                    "STATUS_CHANGED",
+                    "live lease changed during supervisor handoff",
+                ));
+            }
+            // A completed cancellation removes the exact lease before this
+            // supervisor returns from its intentional unlocked wait. It owns
+            // the terminal state now, so leave it untouched.
+            Ok(None) => {
+                drop(guard);
+                drop(admission);
+                let _ = pump.stop_and_join();
+                return Ok(());
+            }
+            Err(_) => {
+                // Preserve the recovery property when the child has made the
+                // known lease unreadable: the same Accepted disposition,
+                // metadata, and active Running status prove that neither
+                // cancellation nor another lifecycle owner won the handoff.
+                let values = self.revalidate_running_handoff(lease, &status, lease)?;
+                if values.2.state().is_terminal() {
+                    drop(guard);
+                    drop(admission);
+                    let _ = pump.stop_and_join();
+                    return Ok(());
+                }
+                values
+            }
+        };
+        drop(admission);
+
+        // The handoff guard fences cancellation while the pump is stopped and
+        // the final log lengths are measured for terminal publication.
+        drop(stderr);
         let pump_result = pump.stop_and_join()?;
+        let stderr = current_job.open_private_append("stderr.log")?;
         stderr.sync_all()?;
-        let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
-        let stdout_file = job.open_private_append("stdout.log")?;
-        let stdout_length = job.validate_private_append_binding("stdout.log", &stdout_file)?;
+        let stderr_length = current_job.validate_private_append_binding("stderr.log", &stderr)?;
+        let stdout_file = current_job.open_private_append("stdout.log")?;
+        let stdout_length =
+            current_job.validate_private_append_binding("stdout.log", &stdout_file)?;
         if stdout_length != pump_result.stdout_bytes {
             return Err(protocol_code(
                 "TURN_PUMP_FAILED",
@@ -2086,22 +2148,32 @@ impl<'a> Supervisor<'a> {
         }
         let (terminal, terminal_kind, exit_code) = match outcome {
             ChildOutcome::Exited(0) => (
-                status.into_succeeded(now_millis()?, stdout_length, stderr_length)?,
+                current_status.into_succeeded(now_millis()?, stdout_length, stderr_length)?,
                 crate::task::TurnTerminal::Succeeded,
                 Some(0),
             ),
             ChildOutcome::Exited(code) => (
-                status.into_failed_exit(now_millis()?, code, stdout_length, stderr_length)?,
+                current_status.into_failed_exit(
+                    now_millis()?,
+                    code,
+                    stdout_length,
+                    stderr_length,
+                )?,
                 crate::task::TurnTerminal::Failed,
                 Some(i32::from(code)),
             ),
             ChildOutcome::Signalled(signal) => (
-                status.into_failed_signal(now_millis()?, signal, stdout_length, stderr_length)?,
+                current_status.into_failed_signal(
+                    now_millis()?,
+                    signal,
+                    stdout_length,
+                    stderr_length,
+                )?,
                 crate::task::TurnTerminal::Cancelled,
                 None,
             ),
             ChildOutcome::TimedOut => (
-                status.into_infrastructure_terminal(
+                current_status.into_infrastructure_terminal(
                     JobState::TimedOut,
                     now_millis()?,
                     stdout_length,
@@ -2117,13 +2189,13 @@ impl<'a> Supervisor<'a> {
             other => TerminalPath::ChildExit(outcome_code(other)),
         };
         self.finish_turn_terminal(
-            lease,
-            job,
+            &terminal_lease,
+            &current_job,
             guard,
             &meta,
             &section,
-            status_bytes,
-            &status,
+            current_bytes,
+            &current_status,
             terminal,
             terminal_kind,
             terminal_path,
