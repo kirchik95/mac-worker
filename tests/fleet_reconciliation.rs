@@ -3,7 +3,12 @@ use std::{
     fs,
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     process::ExitStatus,
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
     time::Duration,
 };
 
@@ -257,10 +262,41 @@ fn one_unavailable_worker_does_not_block_other_reconciliation_or_queue_progress(
 #[derive(Default)]
 struct CountingFleetObserver(Mutex<usize>);
 
+struct BlockingFleetObserver {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    blocked: AtomicBool,
+    calls: AtomicUsize,
+}
+
 impl FleetReconcileObserver for CountingFleetObserver {
     fn observe(&self, stage: FleetReconcileStage) -> Result<(), mac_worker::error::WorkerError> {
         assert_eq!(stage, FleetReconcileStage::ResponseHandling);
         *self.0.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
+impl FleetReconcileObserver for BlockingFleetObserver {
+    fn observe(&self, stage: FleetReconcileStage) -> Result<(), mac_worker::error::WorkerError> {
+        assert_eq!(stage, FleetReconcileStage::ResponseHandling);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if !self.blocked.swap(true, Ordering::SeqCst) {
+            self.entered.send(()).map_err(|_| {
+                mac_worker::error::WorkerError::Protocol(
+                    "reconciliation handoff gate receiver disappeared".into(),
+                )
+            })?;
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| {
+                    mac_worker::error::WorkerError::Protocol(
+                        "reconciliation handoff gate timed out".into(),
+                    )
+                })?;
+        }
         Ok(())
     }
 }
@@ -307,6 +343,182 @@ fn reconciliation_response_handoff_matrix_preserves_one_authoritative_update_per
             "case {case}"
         );
     }
+}
+
+#[test]
+fn reboot_reconcile_handoff_matrix_retains_ambiguity_and_applies_only_authoritative_status() {
+    // Break caught: a reboot races response handling and loses an ambiguous
+    // owner record, applies a response for the wrong job, or duplicates a
+    // durable status update.
+    let mut schedule_counts = [0usize; 4];
+    for case in 0..100 {
+        let schedule = case % 4;
+        schedule_counts[schedule] += 1;
+        let (directory, store, config, runner, ids) = fleet_fixture();
+        let first_job_id = ids[0];
+        let unavailable = match case % 4 {
+            0 => Some("mini-1"),
+            1 => Some("mini-2"),
+            2 => Some("mini-3"),
+            _ => None,
+        };
+        let mut runner = runner;
+        runner.unavailable_hosts = unavailable
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let state_root = directory.path().canonicalize().unwrap().join("state");
+        let store = Arc::new(store);
+        let config = Arc::new(config);
+        let runner = Arc::new(runner);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let observer = Arc::new(BlockingFleetObserver {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            blocked: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        });
+        let reconcile_store = Arc::clone(&store);
+        let reconcile_config = Arc::clone(&config);
+        let reconcile_runner = Arc::clone(&runner);
+        let reconcile_observer = Arc::clone(&observer);
+        let reconcile = thread::spawn(move || {
+            FleetReconciler {
+                config: &reconcile_config,
+                client_state: &reconcile_store,
+                remote: RemoteJobClient::new(&*reconcile_runner),
+                reconcile_observer: None,
+            }
+            .with_reconcile_observer(&*reconcile_observer)
+            .reconcile()
+        });
+        let mut reconcile = Some(reconcile);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("case {case} did not reach response handling"));
+
+        let (start_reboot, wait_for_reboot) = mpsc::channel();
+        let (reboot_ready, reboot_ready_rx) = mpsc::channel();
+        let (allow_reboot_read, wait_for_release) = mpsc::channel();
+        let reboot = thread::spawn(move || {
+            wait_for_reboot.recv().unwrap();
+            let reopened = ClientStateStore::open(&state_root).unwrap();
+            let before = reopened.load_job(first_job_id).unwrap();
+            reboot_ready.send(()).unwrap();
+            wait_for_release.recv().unwrap();
+            let after = reopened.load_job(first_job_id).unwrap();
+            (before, after)
+        });
+        let mut reboot = Some(reboot);
+        let (report, (before, after)) = match schedule {
+            0 => {
+                start_reboot.send(()).unwrap();
+                reboot_ready_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("case {case} reboot did not reopen state"));
+                allow_reboot_read.send(()).unwrap();
+                let reboot_result = reboot.take().unwrap().join().unwrap();
+                release_tx.send(()).unwrap();
+                let report = reconcile.take().unwrap().join().unwrap().unwrap();
+                (report, reboot_result)
+            }
+            1 => {
+                start_reboot.send(()).unwrap();
+                reboot_ready_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("case {case} reboot did not reopen state"));
+                release_tx.send(()).unwrap();
+                let report = reconcile.take().unwrap().join().unwrap().unwrap();
+                allow_reboot_read.send(()).unwrap();
+                let reboot_result = reboot.take().unwrap().join().unwrap();
+                (report, reboot_result)
+            }
+            2 => {
+                release_tx.send(()).unwrap();
+                let report = reconcile.take().unwrap().join().unwrap().unwrap();
+                start_reboot.send(()).unwrap();
+                reboot_ready_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("case {case} reboot did not reopen state"));
+                allow_reboot_read.send(()).unwrap();
+                let reboot_result = reboot.take().unwrap().join().unwrap();
+                (report, reboot_result)
+            }
+            3 => {
+                start_reboot.send(()).unwrap();
+                reboot_ready_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("case {case} reboot did not reopen state"));
+                release_tx.send(()).unwrap();
+                allow_reboot_read.send(()).unwrap();
+                let reboot_result = reboot.take().unwrap().join().unwrap();
+                let report = reconcile.take().unwrap().join().unwrap().unwrap();
+                (report, reboot_result)
+            }
+            _ => unreachable!(),
+        };
+        let final_status = store.load_job(first_job_id).unwrap().last_status().cloned();
+        if schedule == 2 {
+            assert_eq!(before.last_status(), final_status.as_ref(), "case {case}");
+        } else {
+            assert!(before.last_status().is_none(), "case {case}");
+        }
+        assert_eq!(
+            observer.calls.load(Ordering::SeqCst),
+            3 - usize::from(unavailable.is_some()),
+            "case {case} response handoff count"
+        );
+        assert_eq!(
+            report.workers().len(),
+            3,
+            "case {case} fleet report retained all configured workers"
+        );
+        for (index, (job_id, worker)) in ids
+            .into_iter()
+            .zip(["mini-1", "mini-2", "mini-3"])
+            .enumerate()
+        {
+            let record = store.load_job(job_id).unwrap();
+            if unavailable == Some(worker) {
+                assert!(
+                    record.last_status().is_none(),
+                    "case {case} worker {worker}"
+                );
+                assert!(
+                    matches!(
+                        record.remote_uncertainty(),
+                        RemoteUncertainty::UnknownRemote { .. }
+                    ),
+                    "case {case} worker {worker} retained uncertainty"
+                );
+            } else {
+                assert_eq!(
+                    record.last_status().unwrap().state(),
+                    mac_worker::job::JobState::Accepted
+                );
+                assert_eq!(record.remote_uncertainty(), &RemoteUncertainty::None);
+                assert_eq!(
+                    report.workers()[index].jobs.len(),
+                    1,
+                    "case {case} worker {worker}"
+                );
+            }
+        }
+        if schedule == 3 {
+            assert!(
+                after.last_status().is_none() || after.last_status() == final_status.as_ref(),
+                "case {case} reboot observed a non-authoritative status"
+            );
+        } else {
+            assert_eq!(
+                after.last_status(),
+                final_status.as_ref(),
+                "case {case} reboot observed the same durable status"
+            );
+        }
+    }
+    assert_eq!(schedule_counts, [25, 25, 25, 25]);
 }
 
 #[test]

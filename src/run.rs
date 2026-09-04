@@ -387,7 +387,6 @@ pub struct StatusRow {
     pub worktree_id: String,
     pub manifest_digest: String,
     pub command_summary: CommandSummary,
-    #[serde(skip_serializing)]
     pub relative_working_dir: String,
     pub created_at_millis: u64,
     pub status: Option<JobStatus>,
@@ -1300,6 +1299,9 @@ impl<'a> RunService<'a> {
             return self.cancellation_handoff(&record, identity.dispatch_owner);
         }
         self.observer.observe(RunStage::DispatchToLeaseHandoff)?;
+        if self.cancel_after_local_record(&remote, &worker, &record, identity.dispatch_owner)? {
+            return self.cancellation_handoff(&record, identity.dispatch_owner);
+        }
         let acquire_result: Result<LeaseAcquireResponse, WorkerError> = transport.request(
             &worker,
             HostOperation::LeaseAcquire,

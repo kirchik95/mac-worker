@@ -805,6 +805,7 @@ fn status_row_serialization_omits_private_identity_and_payload() {
             "job_id",
             "manifest_digest",
             "project_id",
+            "relative_working_dir",
             "remote_uncertainty",
             "status",
             "worker",
@@ -2352,6 +2353,8 @@ enum RunScriptStep {
     SubmitAcceptedMismatch,
     SubmitExisting,
     CancelPrelaunch,
+    StatusStoredRecord,
+    CancelStoredRecord,
     TransportFailure(HostOperation),
     AuthoritativeFailure(HostOperation, &'static str),
     UploadFailure,
@@ -2908,6 +2911,50 @@ impl ProcessRunner for RunScriptRunner {
                     &CancelResponse::new(material_status(material, cancelled)).unwrap(),
                 )
             }
+            RunScriptStep::StatusStoredRecord => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    HostOperation::Status.command()
+                );
+                let status: StatusRequest =
+                    serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                let record = ClientStateStore::open(&self.state_root)
+                    .unwrap()
+                    .load_job(status.job_id())
+                    .unwrap();
+                let current = record
+                    .last_status()
+                    .cloned()
+                    .unwrap_or(JobStatus::accepted(record.meta().created_at_millis()).unwrap());
+                canonical_process(&StatusResponse::new(record.meta().clone(), current).unwrap())
+            }
+            RunScriptStep::CancelStoredRecord => {
+                assert_eq!(
+                    request.args.last().unwrap(),
+                    HostOperation::Cancel.command()
+                );
+                let cancel: CancelRequest =
+                    serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                let record = ClientStateStore::open(&self.state_root)
+                    .unwrap()
+                    .load_job(cancel.job_id())
+                    .unwrap();
+                assert_eq!(cancel.client_id(), record.meta().client_id());
+                assert_eq!(
+                    cancel.request_fingerprint(),
+                    record.meta().request_fingerprint()
+                );
+                let cancelled = JobStatus::accepted(record.meta().created_at_millis())
+                    .unwrap()
+                    .into_prelaunch_cancelled(record.meta().created_at_millis() + 1, 0, 0)
+                    .unwrap();
+                canonical_process(
+                    &CancelResponse::new(
+                        StatusResponse::new(record.meta().clone(), cancelled).unwrap(),
+                    )
+                    .unwrap(),
+                )
+            }
             RunScriptStep::TransportFailure(operation) => {
                 assert_eq!(request.args.last().unwrap(), operation.command());
                 if operation == HostOperation::LeaseAcquire {
@@ -3328,10 +3375,53 @@ struct CancelAtAcceptedOutputObserver<'a> {
 #[derive(Default)]
 struct CountingCancelObserver(AtomicUsize);
 
+struct BlockingDispatchObserver {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+struct BlockingCancelObserver {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    calls: AtomicUsize,
+}
+
 impl CancelObserver for CountingCancelObserver {
     fn observe(&self, stage: CancelStage) -> Result<(), WorkerError> {
         assert_eq!(stage, CancelStage::RemoteCancelHandoff);
         self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl CancelObserver for BlockingCancelObserver {
+    fn observe(&self, stage: CancelStage) -> Result<(), WorkerError> {
+        assert_eq!(stage, CancelStage::RemoteCancelHandoff);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.send(()).map_err(|_| {
+            WorkerError::Protocol("cancel handoff gate receiver disappeared".into())
+        })?;
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| WorkerError::Protocol("cancel handoff gate timed out".into()))?;
+        Ok(())
+    }
+}
+
+impl RunObserver for BlockingDispatchObserver {
+    fn observe(&self, stage: RunStage) -> Result<(), WorkerError> {
+        if stage == RunStage::DispatchToLeaseHandoff {
+            self.entered.send(()).map_err(|_| {
+                WorkerError::Protocol("dispatch handoff gate receiver disappeared".into())
+            })?;
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| WorkerError::Protocol("dispatch handoff gate timed out".into()))?;
+        }
         Ok(())
     }
 }
@@ -3933,6 +4023,132 @@ fn remote_cancel_handoff_matrix_uses_one_typed_request_per_id_across_100_cases()
 }
 
 #[test]
+fn remote_cancel_handoff_gate_matrix_preserves_exact_identity_across_100_cases() {
+    // Break caught: a reader or retry racing the remote-cancel handoff can
+    // cause duplicate cancellation, mutate a different job, or lose the
+    // authoritative terminal response.
+    for case in 0..100_u128 {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(state_store(&temp));
+        let created_at = 2_000 + case as u64;
+        let record = test_record(
+            &store,
+            92_000 + case,
+            created_at,
+            Some(JobStatus::accepted(created_at).unwrap()),
+            RemoteUncertainty::None,
+        );
+        store.create_job(record.clone()).unwrap();
+        let cancelled = JobStatus::accepted(created_at)
+            .unwrap()
+            .into_prelaunch_cancelled(created_at + 1, 0, 0)
+            .unwrap();
+        let accepted = StatusResponse::new(
+            record.meta().clone(),
+            JobStatus::accepted(created_at).unwrap(),
+        )
+        .unwrap();
+        let response = CancelResponse::new(
+            StatusResponse::new(record.meta().clone(), cancelled.clone()).unwrap(),
+        )
+        .unwrap();
+        let runner = Arc::new(RecordingRunner::returning(vec![
+            status_result(&accepted),
+            status_result(&response),
+        ]));
+        let config = Arc::new(config());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let observer = Arc::new(BlockingCancelObserver {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        });
+        let cancel_store = Arc::clone(&store);
+        let cancel_runner = Arc::clone(&runner);
+        let cancel_config = Arc::clone(&config);
+        let cancel_observer = Arc::clone(&observer);
+        let job_id = record.meta().job_id();
+        let canceller = thread::spawn(move || {
+            CancelService::new(&*cancel_runner, &cancel_config, &cancel_store)
+                .with_cancel_observer(&*cancel_observer)
+                .cancel(job_id)
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("case {case} did not reach remote-cancel handoff"));
+
+        let (reader_ready_tx, reader_ready_rx) = mpsc::channel();
+        let reader_store = Arc::clone(&store);
+        let reader = thread::spawn(move || {
+            let snapshot = reader_store.load_job(job_id).unwrap();
+            reader_ready_tx.send(()).unwrap();
+            snapshot
+        });
+        if case % 2 == 0 {
+            reader_ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("case {case} reader did not overlap handoff"));
+            release_tx.send(()).unwrap();
+        } else {
+            release_tx.send(()).unwrap();
+            reader_ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("case {case} reader did not observe durable state"));
+        }
+
+        let report = canceller.join().unwrap().unwrap();
+        let observed = reader.join().unwrap();
+        assert!(
+            matches!(report, CancelReport::RemoteCancelled { .. }),
+            "case {case}"
+        );
+        assert_eq!(observer.calls.load(Ordering::SeqCst), 1, "case {case}");
+        assert_eq!(
+            observed.meta(),
+            record.meta(),
+            "case {case} reader identity"
+        );
+        assert!(matches!(
+            observed.last_status().map(JobStatus::state),
+            Some(JobState::Accepted | JobState::Cancelled)
+        ));
+
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 2, "case {case}");
+        assert_resolution_status_call(&requests[0], job_id);
+        assert_control_call(&requests[1], HostOperation::Cancel, Duration::from_secs(30));
+        let cancel_request: CancelRequest =
+            serde_json::from_slice(requests[1].stdin.as_deref().unwrap()).unwrap();
+        assert_eq!(cancel_request.job_id(), job_id, "case {case}");
+        assert_eq!(
+            cancel_request.client_id(),
+            record.meta().client_id(),
+            "case {case}"
+        );
+        assert_eq!(
+            cancel_request.lease_token(),
+            record.lease_token(),
+            "case {case}"
+        );
+        assert_eq!(
+            cancel_request.request_fingerprint(),
+            record.meta().request_fingerprint(),
+            "case {case}"
+        );
+        assert_eq!(
+            store
+                .load_job(job_id)
+                .unwrap()
+                .last_status()
+                .map(JobStatus::state),
+            Some(JobState::Cancelled),
+            "case {case} authoritative cancellation"
+        );
+    }
+}
+
+#[test]
 fn cancel_transport_loss_is_resolved_only_by_original_id_status() {
     let temp = tempfile::tempdir().unwrap();
     let store = state_store(&temp);
@@ -4260,6 +4476,186 @@ fn claim_race_cancellation_retires_only_the_exact_prelocal_dispatch_without_remo
     );
     assert_no_run_capture(&paths.cache);
     runner.assert_consumed();
+}
+
+#[test]
+fn cancel_launch_handoff_matrix_has_one_terminal_outcome_and_no_lease_launch() {
+    // Break caught: a cancel that completes during the dispatch-to-lease
+    // handoff is ignored, causing an extra lease/launch or a second terminal
+    // outcome for the exact same job ID.
+    let repo = run_repo(b"version = 1\n");
+    let mut schedule_counts = [0usize; 4];
+    for case in 0..100 {
+        let schedule = case % 4;
+        schedule_counts[schedule] += 1;
+        let run_request = orchestration_request(&repo);
+        let temp = tempfile::tempdir().unwrap();
+        let paths = run_paths(&temp);
+        let store = Arc::new(ClientStateStore::open(&paths.state).unwrap());
+        let runner = Arc::new(RunScriptRunner::new(
+            paths.state.clone(),
+            [
+                RunScriptStep::ProbeReady,
+                RunScriptStep::StatusStoredRecord,
+                RunScriptStep::CancelStoredRecord,
+            ],
+        ));
+        let config = Arc::new(run_config());
+        let follower = Arc::new(RecordingFollower::succeeding(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let dispatch_observer = Arc::new(BlockingDispatchObserver {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let run_store = Arc::clone(&store);
+        let run_runner = Arc::clone(&runner);
+        let run_config = Arc::clone(&config);
+        let run_follower = Arc::clone(&follower);
+        let run_observer = Arc::clone(&dispatch_observer);
+        let run_paths = paths.clone();
+        let run_thread = thread::spawn(move || {
+            let service = RunService::with_follower(
+                &*run_runner,
+                &run_config,
+                &run_paths,
+                &run_store,
+                &*run_follower,
+            )
+            .with_observer(&*run_observer);
+            service.submit_and_follow(run_request, false, &mut Vec::new(), &mut Vec::new())
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("case {case} did not reach dispatch handoff"));
+        let job_id = store
+            .queue_snapshot()
+            .unwrap()
+            .entries()
+            .first()
+            .expect("dispatch handoff must retain its queue row")
+            .job_id();
+        let cancel_runner = Arc::clone(&runner);
+        let cancel_store = Arc::clone(&store);
+        let cancel_config = Arc::clone(&config);
+        let cancel_observer = Arc::new(CountingCancelObserver::default());
+        let cancel_observer_ref = Arc::clone(&cancel_observer);
+        let (start_cancel, wait_for_cancel_start) = mpsc::channel();
+        let canceller = thread::spawn(move || {
+            wait_for_cancel_start.recv().unwrap();
+            CancelService::new(&*cancel_runner, &cancel_config, &cancel_store)
+                .with_cancel_observer(&*cancel_observer_ref)
+                .cancel(job_id)
+        });
+
+        let spawn_reader = || {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let reader_store = Arc::clone(&store);
+            let reader = thread::spawn(move || {
+                let snapshot = reader_store.load_job(job_id).unwrap();
+                ready_tx.send(()).unwrap();
+                snapshot
+            });
+            (reader, ready_rx)
+        };
+        let mut reader = None;
+        match schedule {
+            0 => {
+                start_cancel.send(()).unwrap();
+            }
+            1 => {
+                let (handle, ready) = spawn_reader();
+                ready
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("case {case} reader did not start"));
+                reader = Some(handle);
+                start_cancel.send(()).unwrap();
+            }
+            2 => {
+                let enqueued_at = store
+                    .queue_snapshot()
+                    .unwrap()
+                    .entries()
+                    .first()
+                    .unwrap()
+                    .enqueued_at_millis();
+                let pre_cancel = store.request_queue_cancel(job_id, enqueued_at).unwrap();
+                assert!(matches!(
+                    pre_cancel,
+                    Some(mac_worker::job::QueueCancel::RequestedDispatch { job_id: id, .. })
+                        if id == job_id
+                ));
+                start_cancel.send(()).unwrap();
+            }
+            3 => {
+                start_cancel.send(()).unwrap();
+                let (handle, ready) = spawn_reader();
+                ready
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("case {case} reader did not start"));
+                reader = Some(handle);
+            }
+            _ => unreachable!(),
+        }
+        let cancel_report = canceller.join().unwrap().unwrap();
+        assert!(
+            matches!(cancel_report, CancelReport::RemoteCancelled { .. }),
+            "case {case}: {cancel_report:?}"
+        );
+        if let Some(reader) = reader {
+            let observed = reader.join().unwrap();
+            assert_eq!(observed.meta(), store.load_job(job_id).unwrap().meta());
+            assert!(matches!(
+                observed.last_status().map(JobStatus::state),
+                None | Some(JobState::Accepted | JobState::Cancelled)
+            ));
+        }
+        release_tx.send(()).unwrap();
+
+        let run_result = run_thread.join().unwrap();
+        assert!(
+            matches!(
+                run_result,
+                Err(WorkerError::Queue {
+                    code: "CANCELLED",
+                    ..
+                })
+            ),
+            "case {case}: {run_result:?}"
+        );
+        assert_eq!(cancel_observer.0.load(Ordering::SeqCst), 1, "case {case}");
+        assert_eq!(follower.calls.load(Ordering::SeqCst), 0, "case {case}");
+        let requests = runner.requests();
+        assert!(
+            requests.iter().all(|request| request.args.last()
+                != Some(&HostOperation::LeaseAcquire.command().into())),
+            "case {case} crossed lease acquire after cancellation"
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(
+                    |request| request.args.last() == Some(&HostOperation::Cancel.command().into())
+                )
+                .count()
+                == 1,
+            "case {case} did not issue exactly one remote cancel"
+        );
+        assert!(
+            store.queue_snapshot().unwrap().entries().is_empty(),
+            "case {case}"
+        );
+        assert_eq!(
+            store
+                .load_job(job_id)
+                .unwrap()
+                .last_status()
+                .map(JobStatus::state),
+            Some(JobState::Cancelled),
+            "case {case}"
+        );
+    }
+    assert_eq!(schedule_counts, [25, 25, 25, 25]);
 }
 
 #[test]
@@ -8756,7 +9152,7 @@ fn human_status_and_json_status_share_the_same_sanitized_report() {
     // Break caught: human status invents fields, omits the shared DTO, or
     // renders planted command/path/token/SSH values.
     let command_secret = "printf TASK9_COMMAND_SECRET PLANTED_ENV_LIKE_VALUE";
-    let planted_path = "workspace/PLANTED_PROJECT_PATH";
+    let safe_relative_path = "packages/app";
     let planted_env = "PLANTED_ENV_LIKE_VALUE";
     let temp = tempfile::tempdir().unwrap();
     let runtime = public_runtime(temp.path(), temp.path());
@@ -8768,7 +9164,7 @@ fn human_status_and_json_status_share_the_same_sanitized_report() {
         PROJECT_ID,
         WORKTREE_ID,
         MANIFEST_DIGEST,
-        planted_path,
+        safe_relative_path,
         30_000,
         "heavy",
         CommandSpec::shell(command_secret.into()).unwrap(),
@@ -8821,14 +9217,7 @@ fn human_status_and_json_status_share_the_same_sanitized_report() {
     );
     let human = String::from_utf8(stdout.clone()).unwrap();
     assert!(human.contains("1 older jobs omitted"));
-    for secret in [
-        command_secret,
-        planted_path,
-        planted_env,
-        CLIENT_ID,
-        LEASE_TOKEN,
-        "mac1",
-    ] {
+    for secret in [command_secret, planted_env, CLIENT_ID, LEASE_TOKEN, "mac1"] {
         assert!(!human.contains(secret), "human status leaked {secret}");
     }
 
@@ -8860,15 +9249,9 @@ fn human_status_and_json_status_share_the_same_sanitized_report() {
         value["jobs"][0]["manifest_digest"],
         report.jobs[0].manifest_digest
     );
+    assert_eq!(value["jobs"][0]["relative_working_dir"], safe_relative_path);
     let encoded = String::from_utf8(stdout).unwrap();
-    for secret in [
-        command_secret,
-        planted_path,
-        planted_env,
-        CLIENT_ID,
-        LEASE_TOKEN,
-        "mac1",
-    ] {
+    for secret in [command_secret, planted_env, CLIENT_ID, LEASE_TOKEN, "mac1"] {
         assert!(!encoded.contains(secret), "JSON status leaked {secret}");
     }
 }
