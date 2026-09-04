@@ -197,6 +197,8 @@ fn probe_with_counters(total_ticks: u64, idle_ticks: u64) -> ProbeResponse {
         slot_state: SlotState::Idle,
         active_lease: None,
         capabilities: vec!["swift".into()],
+        agent_facts: None,
+        facts_age_millis: None,
     }
 }
 
