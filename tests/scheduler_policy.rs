@@ -254,4 +254,13 @@ proptest! {
         let unique = names.iter().collect::<std::collections::BTreeSet<_>>();
         prop_assert_eq!(names.len(), unique.len());
     }
+
+    #[test]
+    fn ranking_is_invariant_under_input_permutation(input in arbitrary_health_sets()) {
+        let forward = SchedulerPolicy::rank(&input, &[], &AffinityHints::none());
+        let mut reversed_input = input;
+        reversed_input.reverse();
+        let reversed = SchedulerPolicy::rank(&reversed_input, &[], &AffinityHints::none());
+        prop_assert_eq!(forward, reversed);
+    }
 }

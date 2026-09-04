@@ -476,10 +476,12 @@ fn queue_rows_expose_advisory_blocking_reasons_from_cached_observations_only() {
         ))
         .unwrap();
 
+    let before_read = fixture.store.queue_snapshot().unwrap();
     let rows = fixture
         .store
         .queue_rows_with_blocking_reasons(&config)
         .unwrap();
+    assert_eq!(fixture.store.queue_snapshot().unwrap(), before_read);
     let reason_for = |job_id| {
         rows.iter()
             .find(|row| row.entry().job_id() == job_id)
@@ -2786,6 +2788,79 @@ fn two_dispatchers_racing_last_local_run_slot_admit_at_most_cap() {
     .filter(Option::is_some)
     .count();
     assert_eq!(admitted, 1);
+}
+
+#[test]
+fn run_capped_head_does_not_block_a_younger_row_eligible_for_another_worker() {
+    // Break caught: an older row that cannot consume its run's final slot is
+    // treated as FIFO-eligible and blocks younger work on another worker.
+    let fixture = open_queue();
+    let run = run_reference("head-cap-does-not-block", 1);
+    let active_owner = owner(572);
+    fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "0000000000000000000000000000008c",
+            572,
+            active_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run.clone()),
+        ))
+        .unwrap();
+    fixture
+        .store
+        .claim_next(active_owner, &["mini-1".into()], 573)
+        .unwrap()
+        .expect("the first row consumes the run slot");
+
+    let capped_head_owner = owner(573);
+    fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "0000000000000000000000000000008d",
+            574,
+            capped_head_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-2".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            Some(run),
+        ))
+        .unwrap();
+    let younger_owner = owner(574);
+    let younger = fixture
+        .store
+        .enqueue(queued_with(
+            &fixture.store,
+            "0000000000000000000000000000008e",
+            575,
+            younger_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-3".into(),
+            },
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            None,
+        ))
+        .unwrap();
+
+    let claim = fixture
+        .store
+        .claim_next(younger_owner, &["mini-3".into()], 576)
+        .unwrap()
+        .expect("the capped head must not block another worker");
+    assert_eq!(claim.entry().job_id(), younger.job_id());
+    assert!(matches!(
+        fixture.store.queue_snapshot().unwrap().entries()[1].state(),
+        QueueState::Waiting { owner } if *owner == capped_head_owner
+    ));
 }
 
 #[test]

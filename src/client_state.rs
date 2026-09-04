@@ -85,6 +85,23 @@ pub enum ClientStateCreationRacePoint {
     LockFile = 3,
 }
 
+/// Test-only synchronization points around the durable scheduler boundaries.
+/// Normal stores have no hook, so production execution remains inert.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientStateConcurrencyPoint {
+    QueuePublication,
+    ClaimRunCapEvaluation,
+    ObservationRefreshPublication,
+}
+
+/// A deterministic test hook for scheduler persistence races. Implementors
+/// must not grant capacity or alter durable state.
+#[doc(hidden)]
+pub trait ClientStateConcurrencyHook: Send + Sync {
+    fn reach(&self, point: ClientStateConcurrencyPoint);
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientStateSyncCounts {
@@ -151,6 +168,7 @@ struct ClientStateInner {
     observations: OwnedFd,
     client_id: ClientId,
     owner_inspector: Arc<dyn ProcessInspector>,
+    concurrency_hook: Option<Arc<dyn ClientStateConcurrencyHook>>,
     write_fault: Arc<AtomicU8>,
     sync_counts: Arc<SyncCounters>,
     cleanup_pause: Mutex<Option<Arc<CleanupPauseState>>>,
@@ -278,7 +296,13 @@ struct SyncCounters {
 
 impl ClientStateStore {
     pub fn open(state_root: &Path) -> Result<Self, WorkerError> {
-        Self::open_inner(state_root, None, None, Arc::new(SystemProcessInspector))
+        Self::open_inner(
+            state_root,
+            None,
+            None,
+            Arc::new(SystemProcessInspector),
+            None,
+        )
     }
 
     #[doc(hidden)]
@@ -291,6 +315,7 @@ impl ClientStateStore {
             Some(point),
             None,
             Arc::new(SystemProcessInspector),
+            None,
         )
     }
 
@@ -304,6 +329,7 @@ impl ClientStateStore {
             None,
             Some(point),
             Arc::new(SystemProcessInspector),
+            None,
         )
     }
 
@@ -315,7 +341,21 @@ impl ClientStateStore {
     where
         I: ProcessInspector + 'static,
     {
-        Self::open_inner(state_root, None, None, Arc::new(inspector))
+        Self::open_inner(state_root, None, None, Arc::new(inspector), None)
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_concurrency_hook(
+        state_root: &Path,
+        hook: Arc<dyn ClientStateConcurrencyHook>,
+    ) -> Result<Self, WorkerError> {
+        Self::open_inner(
+            state_root,
+            None,
+            None,
+            Arc::new(SystemProcessInspector),
+            Some(hook),
+        )
     }
 
     fn open_inner(
@@ -323,6 +363,7 @@ impl ClientStateStore {
         initial_fault: Option<ClientStateWritePoint>,
         initial_creation_race: Option<ClientStateCreationRacePoint>,
         owner_inspector: Arc<dyn ProcessInspector>,
+        concurrency_hook: Option<Arc<dyn ClientStateConcurrencyHook>>,
     ) -> Result<Self, WorkerError> {
         let write_fault = Arc::new(AtomicU8::new(initial_fault.map_or(0, |point| point as u8)));
         let sync_counts = Arc::new(SyncCounters::default());
@@ -426,6 +467,7 @@ impl ClientStateStore {
                 observations,
                 client_id,
                 owner_inspector,
+                concurrency_hook,
                 write_fault,
                 sync_counts,
                 cleanup_pause: Mutex::new(None),
@@ -587,6 +629,7 @@ impl ClientStateStore {
         }
 
         self.update_queue(|snapshot| {
+            self.reach_concurrency_point(ClientStateConcurrencyPoint::ClaimRunCapEvaluation);
             let mut selected = None;
             for worker in ranked_workers {
                 if snapshot.entries.iter().any(|entry| {
@@ -1123,6 +1166,9 @@ impl ClientStateStore {
         let bytes = canonical_json_bytes(&observation, "admission observation")?;
         {
             let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+            self.reach_concurrency_point(
+                ClientStateConcurrencyPoint::ObservationRefreshPublication,
+            );
             publish_observation(self.inner.observations.as_raw_fd(), worker, &bytes, self)?;
         }
         drop(refresh_lock);
@@ -1144,9 +1190,16 @@ impl ClientStateStore {
         snapshot.validate()?;
         require_queue_client(&snapshot, self.inner.client_id)?;
         if changed {
+            self.reach_concurrency_point(ClientStateConcurrencyPoint::QueuePublication);
             publish_queue_snapshot(self, &snapshot, identity)?;
         }
         Ok(result)
+    }
+
+    fn reach_concurrency_point(&self, point: ClientStateConcurrencyPoint) {
+        if let Some(hook) = &self.inner.concurrency_hook {
+            hook.reach(point);
+        }
     }
 
     fn owner_is_live_or_ambiguous(
