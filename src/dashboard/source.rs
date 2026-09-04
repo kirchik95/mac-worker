@@ -195,9 +195,9 @@ impl DashboardDataSource for MacWorkerDashboardSource {
     }
 
     fn collect_workers(&self, deadline: Duration) -> Vec<WorkerObservationResult> {
+        let report = self.workers.inspect(&self.config, deadline);
         let observed_at_millis = current_time_millis();
-        self.workers
-            .inspect(&self.config, deadline)
+        report
             .workers
             .into_iter()
             .map(|worker| {

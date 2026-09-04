@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::{
@@ -65,6 +65,22 @@ fn source_uses_typed_probe_data_without_exposing_ssh() {
     assert!(fixture.remote.status_calls().is_empty());
     assert!(fixture.remote.log_calls().is_empty());
     assert!(fixture.remote.mutating_calls().is_empty());
+}
+
+#[test]
+fn source_stamps_current_worker_observations_after_collection_finishes() {
+    let fixture = Fixture::new(ready_report(job_id(99)));
+    fixture.workers.set_inspect_delay(Duration::from_millis(25));
+
+    let rows = fixture.source().collect_workers(Duration::from_secs(1));
+
+    let WorkerObservationResult::Current(observation) = rows.into_iter().next().unwrap() else {
+        panic!("ready probe must project to a current observation");
+    };
+    assert!(
+        observation.observed_at_millis >= fixture.workers.finished_at_millis(),
+        "a current observation must not predate the completed collection"
+    );
 }
 
 #[test]
@@ -392,6 +408,8 @@ impl Fixture {
 struct RecordingWorkers {
     report: WorkersReport,
     deadlines: Mutex<Vec<Duration>>,
+    inspect_delay: Mutex<Duration>,
+    finished_at_millis: Mutex<Option<u64>>,
 }
 
 impl RecordingWorkers {
@@ -399,17 +417,39 @@ impl RecordingWorkers {
         Self {
             report,
             deadlines: Mutex::new(Vec::new()),
+            inspect_delay: Mutex::new(Duration::ZERO),
+            finished_at_millis: Mutex::new(None),
         }
     }
 
     fn deadlines(&self) -> Vec<Duration> {
         self.deadlines.lock().unwrap().clone()
     }
+
+    fn set_inspect_delay(&self, delay: Duration) {
+        *self.inspect_delay.lock().unwrap() = delay;
+    }
+
+    fn finished_at_millis(&self) -> u64 {
+        self.finished_at_millis
+            .lock()
+            .unwrap()
+            .expect("inspection must have completed")
+    }
 }
 
 impl DashboardWorkerReader for RecordingWorkers {
     fn inspect(&self, _config: &Config, deadline: Duration) -> WorkersReport {
         self.deadlines.lock().unwrap().push(deadline);
+        std::thread::sleep(*self.inspect_delay.lock().unwrap());
+        *self.finished_at_millis.lock().unwrap() = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .try_into()
+                .unwrap(),
+        );
         self.report.clone()
     }
 }
