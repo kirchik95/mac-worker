@@ -21,8 +21,9 @@ use crate::{
         FleetReconcileJobResult, FleetReconcileRequest, JobId, JobMeta, JobState, JobStatus,
         JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
         LocalJobRecord, LogChunk, LogCursor, LogStream, PreacceptanceDisposition, ProcessIdentity,
-        QueueCancel, QueueEntry, QueueEntryKind, RemoteUncertainty, RequestFingerprintMaterial,
-        ResolveOrAbandonRequest, StatusResponse, SubmitRequest, SubmitResponse, TerminalLogDrain,
+        QueueCancel, QueueEntry, QueueEntryKind, QueueState, RemoteUncertainty,
+        RequestFingerprintMaterial, ResolveOrAbandonRequest, StatusResponse, SubmitRequest,
+        SubmitResponse, TerminalLogDrain,
     },
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRunner},
@@ -34,7 +35,8 @@ use crate::{
     protocol::{HealthStatus, PROTOCOL_VERSION, SUPERVISION_VERSION, WorkerHealth},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     scheduler::{
-        AffinityHints, CandidateObservation, SchedulerPolicy, Selection, WorkerPreference,
+        AffinityHints, CandidateObservation, QueueBlockingReason, SchedulerPolicy, Selection,
+        WorkerPreference,
     },
     scheduler_adapter::SchedulerProbeAdapter,
     supervisor::SystemProcessInspector,
@@ -425,8 +427,55 @@ impl StatusRow {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum StatusQueueBlockingReason {
+    PinnedWorkerBusy { worker: String },
+    CapabilityMissing { missing: Vec<String> },
+    RunCap,
+    NoEligibleWorker,
+}
+
+impl StatusQueueBlockingReason {
+    fn from_queue(reason: &QueueBlockingReason) -> Self {
+        match reason {
+            QueueBlockingReason::PinnedWorkerBusy { worker } => Self::PinnedWorkerBusy {
+                worker: worker.clone(),
+            },
+            QueueBlockingReason::CapabilityMissing { missing } => Self::CapabilityMissing {
+                missing: missing.clone(),
+            },
+            QueueBlockingReason::RunCap => Self::RunCap,
+            QueueBlockingReason::NoEligibleWorker => Self::NoEligibleWorker,
+        }
+    }
+
+    pub(crate) fn render_human(&self) -> String {
+        match self {
+            Self::PinnedWorkerBusy { worker } => format!("pinned_busy {worker}"),
+            Self::CapabilityMissing { missing } => {
+                format!("capability_missing {}", missing.join(","))
+            }
+            Self::RunCap => "run_cap".into(),
+            Self::NoEligibleWorker => "no_eligible_worker".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct QueuedStatusRow {
+    pub position: usize,
+    pub job_id: JobId,
+    pub project_id: String,
+    pub command_summary: CommandSummary,
+    pub requirements: Vec<String>,
+    pub blocking_reason: Option<StatusQueueBlockingReason>,
+    pub age_millis: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StatusReport {
     pub protocol_version: u32,
+    pub queued: Vec<QueuedStatusRow>,
     pub jobs: Vec<StatusRow>,
     pub omitted: usize,
 }
@@ -435,6 +484,7 @@ impl StatusReport {
     pub fn new(jobs: Vec<StatusRow>, omitted: usize) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
+            queued: Vec::new(),
             jobs,
             omitted,
         }
@@ -2237,7 +2287,14 @@ impl StatusService<'_> {
             .iter()
             .map(StatusRow::try_from_record)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(StatusReport::new(jobs, omitted))
+        let now_millis = current_time_millis()?;
+        let queued = waiting_status_rows(self.config, self.client_state, now_millis)?;
+        Ok(StatusReport {
+            protocol_version: PROTOCOL_VERSION,
+            queued,
+            jobs,
+            omitted,
+        })
     }
 
     fn inspect_exact(&self, job_id: JobId) -> Result<StatusReport, WorkerError> {
@@ -2409,6 +2466,31 @@ fn local_status_conflict() -> WorkerError {
     WorkerError::Protocol(
         "LOCAL_STATUS_CONFLICT: local job observation conflicts with remote authority".into(),
     )
+}
+
+fn waiting_status_rows(
+    config: &Config,
+    client_state: &ClientStateStore,
+    now_millis: u64,
+) -> Result<Vec<QueuedStatusRow>, WorkerError> {
+    let mut queued = Vec::new();
+    for row in client_state.queue_rows_with_blocking_reasons(config)? {
+        if !matches!(row.entry().state(), QueueState::Waiting { .. }) {
+            continue;
+        }
+        queued.push(QueuedStatusRow {
+            position: queued.len() + 1,
+            job_id: row.entry().job_id(),
+            project_id: row.entry().project_id().to_owned(),
+            command_summary: row.entry().command_summary().clone(),
+            requirements: row.entry().requirements().to_vec(),
+            blocking_reason: row
+                .blocking_reason()
+                .map(StatusQueueBlockingReason::from_queue),
+            age_millis: now_millis.saturating_sub(row.entry().enqueued_at_millis()),
+        });
+    }
+    Ok(queued)
 }
 
 fn eligible_for_list_refresh(record: &LocalJobRecord) -> bool {

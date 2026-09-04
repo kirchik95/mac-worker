@@ -350,14 +350,35 @@ fn setup_warning_code(code: &crate::protocol::SetupWarningCode) -> &'static str 
 
 fn render_status_report(report: &crate::run::StatusReport) -> String {
     let mut lines = report
-        .jobs
+        .queued
         .iter()
-        .map(render_status_row)
+        .map(render_queued_status_row)
+        .chain(report.jobs.iter().map(render_status_row))
         .collect::<Vec<_>>();
     if report.omitted > 0 {
         lines.push(format!("{} older jobs omitted", report.omitted));
     }
     lines.join("\n")
+}
+
+fn render_queued_status_row(row: &crate::run::QueuedStatusRow) -> String {
+    let command = match row.command_summary.arg_count() {
+        Some(count) => format!("argv {count}"),
+        None => "shell".into(),
+    };
+    let requirements = if row.requirements.is_empty() {
+        "-".to_owned()
+    } else {
+        row.requirements.join(",")
+    };
+    let blocking = row
+        .blocking_reason
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), |reason| reason.render_human());
+    format!(
+        "queued {} {} {} {command} {requirements} {blocking} age {}",
+        row.position, row.job_id, row.project_id, row.age_millis
+    )
 }
 
 fn render_status_row(row: &crate::run::StatusRow) -> String {

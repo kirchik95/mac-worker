@@ -43,9 +43,10 @@ use mac_worker::{
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     run::{
         CancelObserver, CancelReport, CancelService, CancelStage, FollowRuntime, JobFollower,
-        LogsService, RunCompletion, RunObserver, RunReport, RunRequest, RunService, RunStage,
-        STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT, SchedulerRuntime,
-        StatusReport, StatusRow, StatusService, SystemFollowRuntime,
+        LogsService, QueuedStatusRow, RunCompletion, RunObserver, RunReport, RunRequest,
+        RunService, RunStage, STATUS_LIST_LIMIT, STATUS_REFRESH_DEADLINE, STATUS_REFRESH_LIMIT,
+        SchedulerRuntime, StatusQueueBlockingReason, StatusReport, StatusRow, StatusService,
+        SystemFollowRuntime,
     },
     run_with_io_in_context,
     scheduler::{CandidateSlot, WorkerPreference},
@@ -941,6 +942,105 @@ fn status_list_never_implicitly_selects_latest_job() {
     assert_eq!(report.jobs[0].job_id, JobId::new(uuid::Uuid::from_u128(2)));
     assert_eq!(report.jobs[1].job_id, JobId::new(uuid::Uuid::from_u128(1)));
     assert_eq!(report.omitted, 0);
+}
+
+#[test]
+fn status_without_id_lists_waiting_queue_rows_with_jobs() {
+    // Break caught: bare `worker status` omits FIFO waiting rows or leaks
+    // argv, environment, or local paths through the public report.
+    let planted_command = "printf PLANTED_STATUS_ARGV $PLANTED_STATUS_ENV";
+    let planted_path = "/Users/alice/PLANTED_STATUS_PATH";
+    let temp = tempfile::tempdir().unwrap();
+    let store = state_store(&temp);
+    let queued_id = JobId::new(uuid::Uuid::from_u128(77_001));
+    store
+        .enqueue(
+            QueueEntry::new(
+                queued_id,
+                store.client_id(),
+                PROJECT_ID.into(),
+                WORKTREE_ID.into(),
+                CommandSpec::argv(vec![planted_command.into(), planted_path.into()])
+                    .unwrap()
+                    .summary()
+                    .unwrap(),
+                vec!["rust".into()],
+                WorkerPreference::Automatic,
+                QueueEntryKind::Batch,
+                None,
+                ProcessIdentity::new(77_001, 770_010_007).unwrap(),
+                1_000,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    store
+        .create_job(test_record(
+            &store,
+            2,
+            200,
+            Some(JobStatus::succeeded(200, 0, 0).unwrap()),
+            RemoteUncertainty::None,
+        ))
+        .unwrap();
+    let runner = RecordingRunner::returning(Vec::new());
+    let remote = RemoteJobClient::new(&runner);
+    let config = config();
+
+    let report = service(&config, &store, &remote).inspect(None).unwrap();
+
+    assert_eq!(report.queued.len(), 1);
+    assert_eq!(report.queued[0].position, 1);
+    assert_eq!(report.queued[0].job_id, queued_id);
+    assert_eq!(report.queued[0].project_id, PROJECT_ID);
+    assert_eq!(report.queued[0].requirements, vec!["rust".to_owned()]);
+    assert_eq!(
+        report.queued[0].blocking_reason,
+        Some(StatusQueueBlockingReason::NoEligibleWorker)
+    );
+    assert!(report.queued[0].age_millis > 0);
+    assert_eq!(report.jobs.len(), 1);
+    let queued_json = serde_json::to_value(&report.queued[0]).unwrap();
+    let queued_keys = queued_json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        queued_keys,
+        BTreeSet::from([
+            "age_millis",
+            "blocking_reason",
+            "command_summary",
+            "job_id",
+            "position",
+            "project_id",
+            "requirements",
+        ])
+    );
+
+    let expected_human = expected_human_status(&report);
+    let output = mac_worker::output::CommandOutput::Status(report.clone());
+    assert_eq!(output.render_human(), expected_human);
+    let json = output.render_json().unwrap();
+    let value: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["kind"], "status");
+    assert_eq!(value["queued"].as_array().unwrap().len(), 1);
+    assert_eq!(value["queued"][0]["position"], 1);
+    assert_eq!(value["queued"][0]["job_id"], queued_id.to_string());
+    assert_eq!(
+        value["queued"][0]["blocking_reason"]["code"],
+        "no_eligible_worker"
+    );
+    assert_eq!(value["jobs"].as_array().unwrap().len(), 1);
+    for secret in [planted_command, planted_path, "PLANTED_STATUS_ENV"] {
+        assert!(
+            !expected_human.contains(secret),
+            "human status leaked {secret}"
+        );
+        assert!(!json.contains(secret), "JSON status leaked {secret}");
+    }
 }
 
 #[test]
@@ -8916,11 +9016,41 @@ fn expected_status_line(row: &StatusRow) -> String {
     )
 }
 
+fn expected_queued_line(row: &QueuedStatusRow) -> String {
+    let command = match row.command_summary.arg_count() {
+        Some(count) => format!("argv {count}"),
+        None => "shell".into(),
+    };
+    let requirements = if row.requirements.is_empty() {
+        "-".to_owned()
+    } else {
+        row.requirements.join(",")
+    };
+    let blocking = row.blocking_reason.as_ref().map_or_else(
+        || "none".to_owned(),
+        |reason| match reason {
+            StatusQueueBlockingReason::PinnedWorkerBusy { worker } => {
+                format!("pinned_busy {worker}")
+            }
+            StatusQueueBlockingReason::CapabilityMissing { missing } => {
+                format!("capability_missing {}", missing.join(","))
+            }
+            StatusQueueBlockingReason::RunCap => "run_cap".into(),
+            StatusQueueBlockingReason::NoEligibleWorker => "no_eligible_worker".into(),
+        },
+    );
+    format!(
+        "queued {} {} {} {command} {requirements} {blocking} age {}",
+        row.position, row.job_id, row.project_id, row.age_millis
+    )
+}
+
 fn expected_human_status(report: &StatusReport) -> String {
     let mut lines = report
-        .jobs
+        .queued
         .iter()
-        .map(expected_status_line)
+        .map(expected_queued_line)
+        .chain(report.jobs.iter().map(expected_status_line))
         .collect::<Vec<_>>();
     if report.omitted > 0 {
         lines.push(format!("{} older jobs omitted", report.omitted));
