@@ -224,7 +224,7 @@ fn fetch_result_uses_hidden_upload_pack_and_aliases_import_receipt() {
             .windows(2)
             .any(|window| window[0] == "-C" && window[1] == transfer.path().as_os_str())
     );
-    assert_request_has_arg(&request, "--no-write-fetch-head");
+    assert_request_has_arg(request, "--no-write-fetch-head");
     let upload = request
         .args
         .iter()
@@ -248,7 +248,7 @@ fn fetch_result_uses_hidden_upload_pack_and_aliases_import_receipt() {
         ))
     }));
     assert_eq!(
-        env(&request, "GIT_SSH_COMMAND"),
+        env(request, "GIT_SSH_COMMAND"),
         "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
     );
     assert_eq!(

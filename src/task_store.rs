@@ -1377,6 +1377,16 @@ fn agent_name(agent: AgentKind) -> &'static str {
     }
 }
 
+fn parse_agent(value: &str) -> Result<AgentKind, WorkerError> {
+    match value {
+        "codex" => Ok(AgentKind::Codex),
+        "claude" => Ok(AgentKind::Claude),
+        "cursor" => Ok(AgentKind::Cursor),
+        "opencode" => Ok(AgentKind::Opencode),
+        _ => Err(task_error("TASK_SESSION_INVALID", "unknown agent kind")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1430,15 +1440,5 @@ mod tests {
         assert_eq!(status.state(), TaskState::Open);
         assert_eq!(status.last_outcome(), Some(&TaskOutcome::Lost));
         assert_eq!(status.turns()[0].terminal(), Some(TurnTerminal::Lost));
-    }
-}
-
-fn parse_agent(value: &str) -> Result<AgentKind, WorkerError> {
-    match value {
-        "codex" => Ok(AgentKind::Codex),
-        "claude" => Ok(AgentKind::Claude),
-        "cursor" => Ok(AgentKind::Cursor),
-        "opencode" => Ok(AgentKind::Opencode),
-        _ => Err(task_error("TASK_SESSION_INVALID", "unknown agent kind")),
     }
 }
