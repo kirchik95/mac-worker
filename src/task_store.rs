@@ -710,6 +710,77 @@ impl<'a> TaskStore<'a> {
         replace_status_bytes(&task, current, next)
     }
 
+    /// Completes a pending turn when its execution payload is too corrupt to
+    /// recover its `TurnSection`. The durable task status is the independent
+    /// locator: it is written before the turn job is accepted and binds the
+    /// active turn to the globally unique job ID.
+    pub(crate) fn finish_unrecoverable_active_turn(
+        &self,
+        project_id: &str,
+        turn_id: JobId,
+    ) -> Result<bool, WorkerError> {
+        validate_project_id(project_id)?;
+        let tasks = match self
+            .store
+            .open_directory(&format!("tasks/{project_id}"), false)
+        {
+            Ok(tasks) => tasks,
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut matching_task = None;
+        for raw_name in tasks.list_names()? {
+            // RootedDir owns this private operation namespace beside task
+            // directories; it is not a task record.
+            if raw_name.as_slice() == b".mac-worker-rooted-fs" {
+                continue;
+            }
+            let name = std::str::from_utf8(&raw_name).map_err(|_| {
+                task_error(
+                    "TASK_INCONSISTENT",
+                    "task directory name is not valid UTF-8",
+                )
+            })?;
+            let task_id = name.parse::<TaskId>().map_err(|_| {
+                task_error("TASK_INCONSISTENT", "task directory name is not a task ID")
+            })?;
+            let task = self.open_existing_task(project_id, task_id)?;
+            let status = self.read_status(&task)?;
+            let pending = status.state() == TaskState::Active
+                && status
+                    .turns()
+                    .last()
+                    .is_some_and(|turn| turn.turn_id() == turn_id && turn.terminal().is_none());
+            if pending && matching_task.replace(task_id).is_some() {
+                return Err(task_error(
+                    "TASK_INCONSISTENT",
+                    "multiple active tasks reference the same turn job",
+                ));
+            }
+        }
+        let Some(task_id) = matching_task else {
+            return Ok(false);
+        };
+        self.finish_turn(
+            project_id,
+            task_id,
+            turn_id,
+            TurnTerminal::Lost,
+            TaskOutcome::Lost,
+            false,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            false,
+        )?;
+        Ok(true)
+    }
+
     pub fn bind_session(
         &self,
         project_id: &str,
@@ -1303,6 +1374,62 @@ fn agent_name(agent: AgentKind) -> &'static str {
         AgentKind::Claude => "claude",
         AgentKind::Cursor => "cursor",
         AgentKind::Opencode => "opencode",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        host_store::HostStore,
+        job::JobId,
+        process::SystemProcessRunner,
+        task::{TaskId, TaskOutcome, TaskState, TurnSummary, TurnTerminal},
+    };
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn unrecoverable_payload_finishes_matching_active_turn_by_job_id() {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let task_id = TaskId::new(Uuid::from_u128(1));
+        let turn_id = JobId::new(Uuid::from_u128(2));
+        let task = store
+            .open_task_directory(PROJECT_ID, task_id, true)
+            .unwrap();
+        let initial = TaskStatus::new(
+            TaskState::Active,
+            None,
+            Some("worker".into()),
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec![TurnSummary::new(
+                1, turn_id, None, None, None, false, None, None,
+            )],
+            1,
+        )
+        .unwrap();
+        write_record_once(&task, "status.json", &initial).unwrap();
+
+        assert!(
+            TaskStore::new(&store, &SystemProcessRunner)
+                .finish_unrecoverable_active_turn(PROJECT_ID, turn_id)
+                .unwrap()
+        );
+
+        let status = TaskStore::new(&store, &SystemProcessRunner)
+            .load_status(PROJECT_ID, task_id)
+            .unwrap();
+        assert_eq!(status.state(), TaskState::Open);
+        assert_eq!(status.last_outcome(), Some(&TaskOutcome::Lost));
+        assert_eq!(status.turns()[0].terminal(), Some(TurnTerminal::Lost));
     }
 }
 

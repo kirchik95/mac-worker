@@ -2354,8 +2354,20 @@ impl<'a> Supervisor<'a> {
                 return Err(error);
             }
         };
+        // A malformed payload has no trustworthy TurnSection for the normal
+        // terminal hook. The prepared task status is the independent durable
+        // binding from this job ID to its pending turn, so recover that turn
+        // before releasing the lease rather than leaving it Active forever.
+        let publication =
+            crate::task_store::TaskStore::new(self.store, &crate::process::SystemProcessRunner)
+                .finish_unrecoverable_active_turn(lease.project_id(), lease.job_id());
         drop(guard);
-        self.cleanup_and_release(lease, job, terminal)?;
+        let cleanup = self.cleanup_and_release(lease, job, terminal);
+        if let Err(error) = publication {
+            let _ = cleanup;
+            return Err(error);
+        }
+        cleanup?;
         Err(original)
     }
 }
