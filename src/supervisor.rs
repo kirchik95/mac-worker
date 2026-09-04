@@ -2804,38 +2804,11 @@ fn pump_turn_output(
             Err(error) => return Err(WorkerError::Io(error)),
         }
         if stop.load(Ordering::Acquire) {
-            // The supervisor supplies the one-second post-group-absence grace
-            // period. Drain every byte currently available, then terminate
-            // without waiting for a writer that escaped the process group.
-            match read.read(&mut buffer) {
-                Ok(count) if count > 0 => {
-                    let bytes = &buffer[..count];
-                    total = total.saturating_add(count as u64);
-                    append_tail(&mut tail, bytes);
-                    if stored < crate::turn::LOG_CAP_BYTES {
-                        let remaining = crate::turn::LOG_CAP_BYTES - stored;
-                        let write_count = (count as u64).min(remaining) as usize;
-                        if write_count > 0 {
-                            stdout
-                                .write_all(&bytes[..write_count])
-                                .map_err(WorkerError::Io)?;
-                            stored += write_count as u64;
-                        }
-                    }
-                    if !session_bound {
-                        pending_line.extend_from_slice(bytes);
-                        scan_turn_lines(
-                            &mut pending_line,
-                            adapter,
-                            store,
-                            section,
-                            &mut session_bound,
-                        )?;
-                    }
-                    continue;
-                }
-                Ok(_) | Err(_) => break,
-            }
+            // The supervisor already supplied the one-second post-group-
+            // absence grace. Do not wait for pipe EOF: an escaped descendant
+            // can keep writing forever. The current read has been retained,
+            // and dropping `read` below closes this end of the pipe.
+            break;
         }
     }
 
@@ -3801,7 +3774,88 @@ mod tests {
         },
     };
 
-    use crate::job::RequestFingerprintMaterial;
+    use crate::{
+        agent::{AgentKind, PermissionPolicy, TurnLimits},
+        job::RequestFingerprintMaterial,
+        task::{BaseOid, GitIdentity, TaskId},
+        turn::TurnMaterial,
+    };
+    use uuid::Uuid;
+
+    fn pump_turn_section() -> TurnSection {
+        let task_id = TaskId::new(Uuid::from_u128(1));
+        let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
+        let material = TurnMaterial::from_prompt(
+            task_id,
+            1,
+            AgentKind::Codex,
+            None,
+            PermissionPolicy::Workspace,
+            TurnLimits::new(30_000, None, None).unwrap(),
+            base_oid,
+            "prompt",
+            None,
+            Uuid::from_u128(2),
+            false,
+        )
+        .unwrap();
+        TurnSection::new(
+            material,
+            "b".repeat(64),
+            GitIdentity::new("Test Worker", "worker@example.test").unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn turn_pump_stops_after_grace_when_an_escaped_writer_keeps_stdout_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let mut descriptors = [0; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let read = unsafe { File::from_raw_fd(descriptors[0]) };
+        let mut writer = unsafe { File::from_raw_fd(descriptors[1]) };
+        let stdout = File::create(temp.path().join("stdout.log")).unwrap();
+        let tail = File::create(temp.path().join("tail.log")).unwrap();
+        let mut pump =
+            TurnOutputPump::start(read, stdout, tail, store, pump_turn_section()).unwrap();
+
+        let writing = Arc::new(AtomicBool::new(true));
+        let writer_flag = Arc::clone(&writing);
+        let (started_tx, started_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let bytes = [b'x'; 4096];
+            writer.write_all(&bytes).unwrap();
+            started_tx.send(()).unwrap();
+            while writer_flag.load(Ordering::Acquire) {
+                match writer.write_all(&bytes) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
+                    Err(error) => panic!("escaped writer failed: {error}"),
+                }
+            }
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let writer_stop = Arc::clone(&writing);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            writer_stop.store(false, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = pump.stop_and_join();
+        let elapsed = started.elapsed();
+        writing.store(false, Ordering::Release);
+        stopper.join().unwrap();
+        writer.join().unwrap();
+
+        result.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "pump waited {elapsed:?} for an escaped stdout writer"
+        );
+    }
 
     struct RejectingInspector {
         observed_pid: AtomicU32,
