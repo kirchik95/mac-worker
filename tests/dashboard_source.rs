@@ -18,14 +18,16 @@ use mac_worker::{
     },
     error::WorkerError,
     job::{
-        CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseToken, LocalJobRecord, LogChunk,
-        LogStream, RemoteUncertainty, RequestFingerprintMaterial, StatusResponse,
+        AdmissionObservation, CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus,
+        LeaseToken, LocalJobRecord, LogChunk, LogStream, ProcessIdentity, QueueEntry,
+        QueueEntryKind, RemoteUncertainty, RequestFingerprintMaterial, StatusResponse,
     },
     lease::{LeaseSummary, SlotState},
     protocol::{
         HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
         WorkerHealth as ProbeWorkerHealth, WorkersReport,
     },
+    scheduler::{CandidateSlot, WorkerPreference},
 };
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -182,6 +184,61 @@ fn local_job_projection_contains_only_safe_summary_metadata() {
     assert!(!wire.contains("packages/dashboard"));
     assert!(!wire.contains(REMOTE_SSH));
     assert!(fixture.remote.status_calls().is_empty());
+    assert!(fixture.remote.mutating_calls().is_empty());
+}
+
+#[test]
+fn source_projects_client_state_fifo_rows_and_advisory_blocking_codes_without_refreshing() {
+    // Break caught: the production constructor keeps the empty queue reader,
+    // reorders waiting rows, or causes a dashboard read to refresh/mutate
+    // scheduler state rather than project the persisted advisory view.
+    let fixture = Fixture::new(ready_report(job_id(99)));
+    let source = fixture.source();
+    assert!(source.queue_entries().unwrap().is_empty());
+
+    let first = fixture
+        .state
+        .enqueue(queue_entry(
+            &fixture,
+            11,
+            1_000,
+            WorkerPreference::Automatic,
+        ))
+        .unwrap();
+    let second = fixture
+        .state
+        .enqueue(queue_entry(
+            &fixture,
+            12,
+            1_001,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+        ))
+        .unwrap();
+    cache_busy_observation(&fixture, 1_002);
+    let before = fixture.state.queue_snapshot().unwrap();
+
+    let queue = source.queue_entries().unwrap();
+
+    assert_eq!(
+        queue.iter().map(|entry| entry.position).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        queue.iter().map(|entry| entry.job_id).collect::<Vec<_>>(),
+        vec![first.job_id(), second.job_id()]
+    );
+    assert_eq!(queue[0].blocking_code, "NO_COMPATIBLE_IDLE_WORKER");
+    assert_eq!(queue[1].blocking_code, "PINNED_WORKER_BUSY");
+    assert_eq!(queue[0].project_id, PROJECT_ID);
+    assert_eq!(queue[0].worktree_id, WORKTREE_ID);
+    assert_eq!(queue[0].project_label, None);
+    assert_eq!(queue[0].command_summary.arg_count, Some(2));
+    assert_eq!(fixture.state.queue_snapshot().unwrap(), before);
+    assert!(fixture.workers.deadlines().is_empty());
+    assert!(fixture.remote.status_calls().is_empty());
+    assert!(fixture.remote.log_calls().is_empty());
     assert!(fixture.remote.mutating_calls().is_empty());
 }
 
@@ -513,6 +570,45 @@ fn status_for(state: JobState, updated_at_millis: u64) -> JobStatus {
         )
         .unwrap(),
     }
+}
+
+fn queue_entry(
+    fixture: &Fixture,
+    id: u128,
+    enqueued_at_millis: u64,
+    preference: WorkerPreference,
+) -> QueueEntry {
+    QueueEntry::new(
+        job_id(id),
+        fixture.state.client_id(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        CommandSummary::argv(2).unwrap(),
+        Vec::new(),
+        preference,
+        QueueEntryKind::Batch,
+        None,
+        ProcessIdentity::new(10_000 + id as u32, 100_000 + id as u64).unwrap(),
+        enqueued_at_millis,
+    )
+    .unwrap()
+}
+
+fn cache_busy_observation(fixture: &Fixture, observed_at_millis: u64) {
+    let observation = AdmissionObservation::new(
+        "mini-1".into(),
+        true,
+        CandidateSlot::Busy,
+        vec!["swift".into()],
+        Some(8 * 1024 * 1024 * 1024),
+        64 * 1024 * 1024 * 1024,
+        observed_at_millis,
+    )
+    .unwrap();
+    fixture
+        .state
+        .admission_observation("mini-1", observed_at_millis, || Ok(observation))
+        .unwrap();
 }
 
 fn job_id(value: u128) -> JobId {

@@ -13,10 +13,8 @@ use crate::{
             DashboardJobState, DashboardLogChunk, DashboardMemoryPressure, DashboardSlotState,
             DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
         },
-        service::{
-            DashboardDataSource, DashboardQueueReader, EmptyDashboardQueueReader,
-            WorkerObservationResult,
-        },
+        queue::ClientStateDashboardQueueReader,
+        service::{DashboardDataSource, DashboardQueueReader, WorkerObservationResult},
         web::DashboardLogSource,
     },
     error::WorkerError,
@@ -138,13 +136,11 @@ impl MacWorkerDashboardSource {
         local_jobs: Arc<ClientStateStore>,
         remote: Arc<dyn DashboardRemoteReader>,
     ) -> Self {
-        Self::with_queue(
-            config,
-            workers,
-            local_jobs,
-            remote,
-            Arc::new(EmptyDashboardQueueReader),
-        )
+        let queue = Arc::new(ClientStateDashboardQueueReader::new(
+            Arc::clone(&config),
+            Arc::clone(&local_jobs),
+        ));
+        Self::with_queue(config, workers, local_jobs, remote, queue)
     }
 
     pub fn with_queue(
