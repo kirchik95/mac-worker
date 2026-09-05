@@ -28,7 +28,7 @@ use crate::{
         QueueEntry, QueueEntryKind, QueueSnapshot, QueueState, RemoteUncertainty,
         ResolveOrAbandonRequest,
     },
-    rooted_fs::RootedDir,
+    rooted_fs::{RootedDir, is_private_replacement_name},
     scheduler::{
         AffinityHints, CandidateObservation, CandidateRejection, QueueBlockingReason,
         SchedulerPolicy, Selection, WorkerPreference,
@@ -96,6 +96,7 @@ pub enum ClientStateWritePoint {
     AfterParkedTaskTurnPublication = 28,
     AfterTaskSubmissionTurnsRetirement = 29,
     AfterSubmissionIntentClearPublicationBeforeFinalSync = 30,
+    AfterTaskReplacementExchangeBeforeFirstDirectorySync = 31,
 }
 
 #[doc(hidden)]
@@ -199,6 +200,7 @@ struct ClientStateInner {
     write_fault: Arc<AtomicU8>,
     task_rollback_update_failures: AtomicU8,
     submission_rollback_cleanup_fault: AtomicU8,
+    task_replacement_after_exchange_failure: AtomicU8,
     sync_counts: Arc<SyncCounters>,
     cleanup_pause: Mutex<Option<Arc<CleanupPauseState>>>,
 }
@@ -533,6 +535,7 @@ impl ClientStateStore {
                 write_fault,
                 task_rollback_update_failures: AtomicU8::new(0),
                 submission_rollback_cleanup_fault: AtomicU8::new(0),
+                task_replacement_after_exchange_failure: AtomicU8::new(0),
                 sync_counts,
                 cleanup_pause: Mutex::new(None),
             }),
@@ -1860,12 +1863,30 @@ impl ClientStateStore {
             return Err(invalid_state("task filename and record identity differ"));
         }
         tasks
-            .replace_private_regular_exact_before_final_sync(&name, &old, &bytes, before_final_sync)
+            .replace_private_regular_exact_with_sync_hooks(
+                &name,
+                &old,
+                &bytes,
+                || {
+                    if self.take_task_replacement_after_exchange_failure() {
+                        return Err(io::Error::other(
+                            injected_failure(
+                                ClientStateWritePoint::AfterTaskReplacementExchangeBeforeFirstDirectorySync,
+                            )
+                            .to_string(),
+                        ));
+                    }
+                    Ok(())
+                },
+                before_final_sync,
+            )
             .map_err(WorkerError::Io)
     }
 
     pub fn list_tasks(&self) -> Result<Vec<LocalTaskRecord>, WorkerError> {
         let tasks = self.tasks_dir()?;
+        let names = tasks.list_names().map_err(WorkerError::Io)?;
+        self.recover_task_replacement_residue(&tasks, &names)?;
         let mut names = tasks.list_names().map_err(WorkerError::Io)?;
         names.retain(|name| name.as_slice() != ROOTED_FS_NAMESPACE);
         names.sort();
@@ -1885,6 +1906,44 @@ impl ClientStateStore {
             .collect()
     }
 
+    fn recover_task_replacement_residue(
+        &self,
+        tasks: &RootedDir,
+        names: &[Vec<u8>],
+    ) -> Result<(), WorkerError> {
+        let has_replacement = names.iter().any(|name| is_private_replacement_name(name));
+        if has_replacement
+            || tasks
+                .has_private_cleanup_residue()
+                .map_err(WorkerError::Io)?
+        {
+            tasks
+                .retry_pending_owned_regulars_matching(|name, _| is_private_replacement_name(name))
+                .map_err(WorkerError::Io)?;
+        }
+
+        for name in tasks.list_names().map_err(WorkerError::Io)? {
+            if !is_private_replacement_name(&name) {
+                continue;
+            }
+            let name = std::str::from_utf8(&name)
+                .map_err(|_| invalid_state("task replacement residue is not UTF-8"))?;
+            let bytes = tasks
+                .read_private_regular(name, MAX_STATE_FILE_BYTES as u64)
+                .map_err(WorkerError::Io)?;
+            let residue = parse_task_record(&bytes)?;
+            let task_id = residue.meta().task_id();
+            let current = read_task_from_dir(tasks, &task_file_name(task_id)?, task_id)?;
+            if current.meta() != residue.meta() {
+                return Err(invalid_state(
+                    "task replacement residue is not bound to the live task record",
+                ));
+            }
+            tasks.remove_owned_regular(name).map_err(WorkerError::Io)?;
+        }
+        Ok(())
+    }
+
     /// Removes every client-owned task artifact created during initial
     /// submission. This is used only before a turn is handed to a runner.
     pub fn remove_task_submission(&self, task_id: TaskId) -> Result<(), WorkerError> {
@@ -1897,8 +1956,8 @@ impl ClientStateStore {
         Ok(())
     }
 
-    /// Removes the durable record before its prompt tree so a record-removal
-    /// failure cannot leave a terminal task without the prompt it describes.
+    /// Removes the durable record after the caller has retired its prompt
+    /// tree and queue row, leaving no orphaned submission artifacts.
     pub fn remove_task_submission_record(&self, task_id: TaskId) -> Result<(), WorkerError> {
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let tasks = self.tasks_dir()?;
@@ -1922,8 +1981,9 @@ impl ClientStateStore {
         }
     }
 
-    /// Removes the initial task prompt tree after its record and queue row
-    /// have been retired. Callers restore the record and row if this fails.
+    /// Removes the initial task prompt tree while its durable task record
+    /// remains available for recovery. Callers restore the queue row if this
+    /// fails.
     pub fn remove_task_submission_turns(&self, task_id: TaskId) -> Result<(), WorkerError> {
         if self.take_fault(ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval) {
             return Err(injected_failure(
@@ -2408,6 +2468,13 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    pub fn inject_task_replacement_after_exchange_failure_once(&self) {
+        self.inner
+            .task_replacement_after_exchange_failure
+            .store(1, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
     pub fn inject_submission_rollback_cleanup_failure_once(&self, point: ClientStateWritePoint) {
         assert!(matches!(
             point,
@@ -2529,6 +2596,13 @@ impl ClientStateStore {
                     Some(remaining - 1)
                 }
             })
+            .is_ok()
+    }
+
+    fn take_task_replacement_after_exchange_failure(&self) -> bool {
+        self.inner
+            .task_replacement_after_exchange_failure
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
 
@@ -5007,6 +5081,9 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         }
         ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync => {
             "after submission intent-clear publication before final sync"
+        }
+        ClientStateWritePoint::AfterTaskReplacementExchangeBeforeFirstDirectorySync => {
+            "after task replacement exchange before first directory sync"
         }
     };
     WorkerError::Io(io::Error::other(format!(

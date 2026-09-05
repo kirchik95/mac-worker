@@ -1752,6 +1752,27 @@ impl RootedDir {
     where
         F: FnOnce() -> io::Result<()>,
     {
+        self.replace_private_regular_exact_with_sync_hooks(
+            name,
+            expected,
+            replacement,
+            || Ok(()),
+            before_final_sync,
+        )
+    }
+
+    pub(crate) fn replace_private_regular_exact_with_sync_hooks<F, G>(
+        &self,
+        name: &str,
+        expected: &[u8],
+        replacement: &[u8],
+        after_exchange_before_first_sync: G,
+        before_final_sync: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<()>,
+        G: FnOnce() -> io::Result<()>,
+    {
         self.verify_root_name()?;
         let target = CString::new(name).map_err(interior_nul_error)?;
         let before = stat_at(self.root.as_raw_fd(), &target)?;
@@ -1815,6 +1836,7 @@ impl RootedDir {
             return Err(os_error(libc::ESTALE));
         }
         self.verify_root_name()?;
+        after_exchange_before_first_sync()?;
         cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
         self.remove_owned_regular(temporary.to_str().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "replacement name is not UTF-8")
@@ -10277,6 +10299,15 @@ fn identity_is_in_ancestry(identity: FileIdentity, directory: RawFd) -> io::Resu
 
 fn random_private_name(kind: &str) -> CString {
     CString::new(format!("{kind}-{}", uuid::Uuid::new_v4())).expect("UUID private name has no NUL")
+}
+
+pub(crate) fn is_private_replacement_name(name: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(name) else {
+        return false;
+    };
+    name.strip_prefix("replace-").is_some_and(|value| {
+        uuid::Uuid::parse_str(value).is_ok_and(|uuid| uuid.hyphenated().to_string() == value)
+    })
 }
 
 fn is_random_private_name(name: &CStr, kind: &str) -> bool {
