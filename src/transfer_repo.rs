@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     error::WorkerError,
+    gc::{GcCandidate, GcReport, git_ref_names},
     inputs::{InputSelector, RelativePath, SelectedInputKind, SelectionFailure},
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     project::ProjectContext,
@@ -129,6 +130,140 @@ pub struct TransferRepo {
     path: PathBuf,
     repo_id: String,
     alternates_target: PathBuf,
+}
+
+/// Garbage collection for the MacBook-side transfer namespace.  A transfer
+/// repository is eligible only when it has no base refs, contains only stale
+/// result refs, and no currently protected local task refers to it.  The
+/// optional protected set is supplied by the client-state owner so in-flight
+/// import/publication operations remain live even before a base ref is
+/// installed.
+pub struct TransferGc<'a> {
+    cache_root: &'a Path,
+    runner: &'a dyn ProcessRunner,
+    protected_repo_ids: BTreeSet<String>,
+}
+
+impl<'a> TransferGc<'a> {
+    pub fn new(cache_root: &'a Path, runner: &'a dyn ProcessRunner) -> Self {
+        Self {
+            cache_root,
+            runner,
+            protected_repo_ids: BTreeSet::new(),
+        }
+    }
+
+    pub fn with_protected_repo_ids(
+        mut self,
+        protected_repo_ids: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.protected_repo_ids = protected_repo_ids.into_iter().collect();
+        self
+    }
+
+    pub fn preview_at(&self, now_millis: u64) -> Result<GcReport, WorkerError> {
+        self.run(now_millis, false)
+    }
+
+    pub fn apply_at(&self, now_millis: u64) -> Result<GcReport, WorkerError> {
+        self.run(now_millis, true)
+    }
+
+    fn run(&self, now_millis: u64, apply: bool) -> Result<GcReport, WorkerError> {
+        let parent_path = self.cache_root.join("transfer");
+        let parent = match RootedDir::open(&parent_path) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(GcReport::new(apply, Vec::new(), Vec::new(), Vec::new()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut candidates = Vec::new();
+        for raw_name in parent.list_names()? {
+            if raw_name.as_slice() == b".mac-worker-rooted-fs" {
+                continue;
+            }
+            let name = std::str::from_utf8(&raw_name).map_err(|_| {
+                WorkerError::Protocol("GC_METADATA_INVALID: transfer repo name is not UTF-8".into())
+            })?;
+            let Some(repo_id) = name.strip_suffix(".git") else {
+                return Err(WorkerError::Protocol(
+                    "GC_METADATA_INVALID: transfer repo name does not end in .git".into(),
+                ));
+            };
+            if !is_lower_hex(repo_id, 64) {
+                return Err(WorkerError::Protocol(
+                    "GC_METADATA_INVALID: transfer repo ID is invalid".into(),
+                ));
+            }
+            if self.protected_repo_ids.contains(repo_id) {
+                continue;
+            }
+            let repo = parent
+                .open_child_directory(&relative_transfer(name)?, false)
+                .map_err(WorkerError::Io)?;
+            let refs = git_ref_names(self.runner, repo.path())?;
+            if !transfer_refs_are_collectable(&refs) {
+                continue;
+            }
+            let modified = crate::gc::rooted_modified_millis(&repo)?;
+            if now_millis.saturating_sub(modified) < crate::gc::BRANCH_RETENTION_MILLIS {
+                continue;
+            }
+            candidates.push(GcCandidate::new(
+                "transfer_repo",
+                repo_id,
+                0,
+                "transfer repository retention",
+            )?);
+        }
+        candidates.sort_by(|left, right| left.identifier().cmp(right.identifier()));
+        let mut applied = Vec::new();
+        if apply {
+            for candidate in &candidates {
+                if self.apply_candidate(&parent, candidate, now_millis)? {
+                    applied.push(candidate.clone());
+                }
+            }
+        }
+        Ok(GcReport::new(apply, candidates, applied, Vec::new()))
+    }
+
+    fn apply_candidate(
+        &self,
+        parent: &RootedDir,
+        candidate: &GcCandidate,
+        now_millis: u64,
+    ) -> Result<bool, WorkerError> {
+        let repo_id = candidate.identifier();
+        if !is_lower_hex(repo_id, 64) || self.protected_repo_ids.contains(repo_id) {
+            return Ok(false);
+        }
+        let name = format!("{repo_id}.git");
+        if !parent.entry_exists(&name)? {
+            return Ok(false);
+        }
+        let repo = parent
+            .open_child_directory(&relative_transfer(&name)?, false)
+            .map_err(WorkerError::Io)?;
+        let modified = crate::gc::rooted_modified_millis(&repo)?;
+        if !transfer_refs_are_collectable(&git_ref_names(self.runner, repo.path())?)
+            || now_millis.saturating_sub(modified) < crate::gc::BRANCH_RETENTION_MILLIS
+        {
+            return Ok(false);
+        }
+        parent.remove_owned_child(&name)?;
+        Ok(true)
+    }
+}
+
+fn relative_transfer(path: &str) -> Result<RelativePath, WorkerError> {
+    RelativePath::parse(path.as_bytes()).map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
+fn transfer_refs_are_collectable(refs: &[String]) -> bool {
+    refs.iter()
+        .all(|reference| reference.starts_with("refs/mac-worker/results/"))
 }
 
 impl TransferRepo {

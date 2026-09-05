@@ -21,6 +21,7 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("logs"))
         .stdout(predicate::str::contains("cancel"))
+        .stdout(predicate::str::contains("gc"))
         .stdout(predicate::str::contains("host").not());
 
     for public_command in ["dashboard", "run", "status", "logs", "cancel", "task"] {
@@ -32,6 +33,26 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
             .stdout(predicate::str::contains(public_command))
             .stdout(predicate::str::contains("Usage:"));
     }
+}
+
+#[test]
+fn gc_supports_preview_by_default_and_explicit_apply() {
+    let preview = Cli::try_parse_from(["worker", "gc"]).unwrap();
+    assert!(matches!(
+        preview.command,
+        WorkerCommand::Gc { apply: false }
+    ));
+
+    let apply = Cli::try_parse_from(["worker", "gc", "--apply"]).unwrap();
+    assert!(matches!(apply.command, WorkerCommand::Gc { apply: true }));
+
+    let host = Cli::try_parse_from(["worker", "host", "gc"]).unwrap();
+    assert!(matches!(
+        host.command,
+        WorkerCommand::Host {
+            command: HostCommand::Gc
+        }
+    ));
 }
 
 #[test]
@@ -140,7 +161,7 @@ fn run_help_exposes_optional_pin_and_no_wait_scheduler_controls() {
 }
 
 #[test]
-fn public_help_excludes_unimplemented_later_phase_commands() {
+fn public_help_exposes_gc_but_excludes_unimplemented_later_phase_commands() {
     // Break caught: a future-phase control plane becomes discoverable before
     // its contract, lifecycle, and privacy boundaries are implemented.
     let mut command = Command::cargo_bin("worker").unwrap();
@@ -149,8 +170,7 @@ fn public_help_excludes_unimplemented_later_phase_commands() {
     let forbidden = predicate::str::contains("fetch")
         .or(predicate::str::contains("artifacts"))
         .or(predicate::str::contains("cache"))
-        .or(predicate::str::contains("Docker"))
-        .or(predicate::str::contains("garbage collection"));
+        .or(predicate::str::contains("Docker"));
 
     command.assert().success().stdout(forbidden.not());
 }

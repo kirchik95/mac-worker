@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     config::WorkerEntry,
     error::{ProcessError, ProcessStream, WorkerError},
+    gc::{GcReport, GcRequest},
     host_store::{HostStore, JobDisposition},
     job::{
         CancelRequest, CancelResponse, ClientId, CommandSummary, FleetReconcileRequest,
@@ -58,6 +59,7 @@ pub enum HostOperation {
     LeaseAcquire,
     SnapshotVerify,
     Submit,
+    Gc,
     Status,
     LogChunk,
     ResolveOrAbandon,
@@ -80,6 +82,7 @@ impl HostOperation {
             Self::LeaseAcquire => "~/.local/bin/worker host lease-acquire",
             Self::SnapshotVerify => "~/.local/bin/worker host snapshot-verify",
             Self::Submit => "~/.local/bin/worker host submit",
+            Self::Gc => "~/.local/bin/worker host gc",
             Self::Status => "~/.local/bin/worker host status",
             Self::LogChunk => "~/.local/bin/worker host log-chunk",
             Self::ResolveOrAbandon => "~/.local/bin/worker host resolve-or-abandon",
@@ -712,6 +715,18 @@ impl<'a> RemoteJobClient<'a> {
         let response: crate::job::LeaseAcquireResponse = self.transport.request(
             worker,
             HostOperation::LeaseAcquire,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        response.validate().map_err(|_| invalid_remote_response())?;
+        Ok(response)
+    }
+
+    pub fn gc(&self, worker: &WorkerEntry, request: &GcRequest) -> Result<GcReport, WorkerError> {
+        request.validate()?;
+        let response: GcReport = self.transport.request(
+            worker,
+            HostOperation::Gc,
             request,
             control_policy(MAX_CONTROL_DEADLINE),
         )?;

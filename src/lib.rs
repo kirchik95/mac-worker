@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     io::{self, Cursor, Read, Write},
     path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use cli::{Cli, Command, HiddenComponent, HostCommand, TaskCommand};
@@ -13,6 +14,7 @@ use dashboard::command::{
 };
 use doctor::{DoctorRequest, DoctorService};
 use error::WorkerError;
+use gc::{GcReport, GcRequest, HostGc};
 use git_transport::{
     GitServerExecutor, HostGitService, ReceivePackComponents, SystemGitServerExecutor,
     UploadPackComponents,
@@ -51,6 +53,7 @@ use transfer::{
     HostTransferService, RemoteJobClient, RsyncServerExecutor, SystemRsyncServerExecutor,
     TransferIdentity,
 };
+use transfer_repo::TransferGc;
 use transport::{SshTransport, WorkersService};
 use turn::TaskTurnRequest;
 use turn_runner::{DetachedRunnerExecutor, InlineRunnerExecutor, TurnRunner};
@@ -63,6 +66,7 @@ pub mod config;
 pub mod dashboard;
 pub mod doctor;
 pub mod error;
+pub mod gc;
 pub mod git_transport;
 pub mod host_store;
 pub mod inputs;
@@ -199,6 +203,9 @@ fn execute_with_context(
             let service = WorkersService::new(transport);
             Ok(CommandOutput::Workers(service.inspect(&config)))
         }
+        Command::Gc { .. } => Err(WorkerError::Protocol(
+            "public gc requires the stdio execution boundary".into(),
+        )),
         Command::Dashboard { .. } => Err(WorkerError::Protocol(
             "public dashboard requires the stdio execution boundary".into(),
         )),
@@ -250,6 +257,11 @@ fn execute_with_context(
                 &paths,
             )?))
         }
+        Command::Host {
+            command: HostCommand::Gc,
+        } => Err(WorkerError::Protocol(
+            "host gc requires the stdio execution boundary".into(),
+        )),
         Command::Host {
             command: HostCommand::LeaseAcquire,
         } => Err(WorkerError::Protocol(
@@ -1244,6 +1256,19 @@ pub fn run_with_rsync_executor_in_context(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    if let Command::Gc { apply } = &cli.command {
+        return run_gc_command(
+            cli.config, runtime, runner, *apply, cli.json, stdout, stderr,
+        );
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::Gc
+        }
+    ) {
+        return run_host_gc(cli.config, runtime, runner, stdin, stdout);
+    }
     if matches!(
         &cli.command,
         Command::Host {
@@ -1494,6 +1519,138 @@ fn write_command_diagnostic(public_status: bool, stderr: &mut dyn Write, error: 
     }
 }
 
+#[derive(Debug, Serialize)]
+struct GcWorkerReport {
+    worker: String,
+    report: GcReport,
+}
+
+#[derive(Debug, Serialize)]
+struct GcFleetReport {
+    protocol_version: u32,
+    apply: bool,
+    workers: Vec<GcWorkerReport>,
+    transfer: GcReport,
+}
+
+fn run_gc_command(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    apply: bool,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<GcFleetReport, WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        let config = Config::load(&paths.config)?;
+        let client_state = ClientStateStore::open(&paths.state)?;
+        let now = current_time_millis()?;
+        let protected_repo_ids = client_state
+            .list_tasks()?
+            .into_iter()
+            .filter(|task| !task.status().state().is_terminal() || task.runner().is_some())
+            .map(|task| task.repo_id().to_owned())
+            .collect::<Vec<_>>();
+        let transfer =
+            TransferGc::new(&paths.cache, runner).with_protected_repo_ids(protected_repo_ids);
+        let transfer = if apply {
+            transfer.apply_at(now)?
+        } else {
+            transfer.preview_at(now)?
+        };
+        let remote = RemoteJobClient::new(runner);
+        let request = GcRequest::new(apply, now);
+        let workers = config
+            .workers
+            .iter()
+            .map(|worker| {
+                Ok(GcWorkerReport {
+                    worker: worker.name.clone(),
+                    report: remote.gc(worker, &request)?,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkerError>>()?;
+        Ok(GcFleetReport {
+            protocol_version: PROTOCOL_VERSION,
+            apply,
+            workers,
+            transfer,
+        })
+    })();
+
+    match result {
+        Ok(report) if json => match write_json_line(stdout, &report) {
+            Ok(()) => 0,
+            Err(error) => error.exit_code(),
+        },
+        Ok(report) => match write_gc_human(&report, stdout) {
+            Ok(()) => 0,
+            Err(error) => error.exit_code(),
+        },
+        Err(error) if json => match write_json_error_event(stdout, &error) {
+            Ok(()) => error.exit_code(),
+            Err(_) => crate::error::ExitKind::Io as u8,
+        },
+        Err(error) => {
+            write_public_diagnostic(stderr, &error);
+            error.exit_code()
+        }
+    }
+}
+
+fn write_gc_human(report: &GcFleetReport, stdout: &mut dyn Write) -> Result<(), WorkerError> {
+    writeln!(
+        stdout,
+        "gc: {}",
+        if report.apply { "apply" } else { "preview" }
+    )?;
+    for worker in &report.workers {
+        write_gc_report_human(&worker.report, &format!("worker {}", worker.worker), stdout)?;
+    }
+    write_gc_report_human(&report.transfer, "transfer", stdout)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn write_gc_report_human(
+    report: &GcReport,
+    label: &str,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    writeln!(
+        stdout,
+        "  {label}: {} candidate(s), {} applied",
+        report.candidates().len(),
+        report.applied().len()
+    )?;
+    for candidate in report.candidates() {
+        writeln!(
+            stdout,
+            "    {} {} bytes ({}) {}",
+            candidate.kind(),
+            candidate.size_bytes(),
+            candidate.reason(),
+            candidate.identifier()
+        )?;
+    }
+    for warning in report.warnings() {
+        writeln!(stdout, "    warning: {warning}")?;
+    }
+    Ok(())
+}
+
+fn current_time_millis() -> Result<u64, WorkerError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| WorkerError::Protocol("system clock is before the Unix epoch".into()))
+        .and_then(|duration| {
+            u64::try_from(duration.as_millis())
+                .map_err(|_| WorkerError::Protocol("system clock exceeds supported range".into()))
+        })
+}
+
 fn run_host_submit(
     config_override: Option<PathBuf>,
     runtime: &RuntimeContext,
@@ -1541,6 +1698,23 @@ fn run_host_submit(
         return crate::error::ExitKind::Io as u8;
     }
     exit
+}
+
+fn run_host_gc(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_task_control_endpoint(
+        config_override,
+        runtime,
+        runner,
+        stdin,
+        stdout,
+        |request: GcRequest, store, runner| HostGc::new(store, runner).run(&request),
+    )
 }
 
 fn run_host_status(

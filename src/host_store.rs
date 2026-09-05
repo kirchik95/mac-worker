@@ -29,6 +29,11 @@ use crate::{
     task::{TaskId, TaskStatus},
 };
 
+pub use crate::gc::{
+    BRANCH_RETENTION_MILLIS, GcCandidate, GcReport, GcRequest, HostGc, JOB_RETENTION_MILLIS,
+    TASK_RETENTION_MILLIS,
+};
+
 const MAX_HOST_FILE_BYTES: u64 = 1024 * 1024;
 pub const HOST_LAYOUT_VERSION: u32 = 2;
 pub type StagingNonce = [u8; 16];
@@ -1964,6 +1969,18 @@ impl HostStore {
     ) -> Result<TaskStatus, WorkerError> {
         let task = self.open_task_directory(project_id, task_id, false)?;
         read_json_strict_at(&task, "status.json")
+    }
+
+    /// Runs a host-owned operation while holding the installation lock.
+    /// Garbage collection uses the same lock domain as publication and task
+    /// cleanup so its candidate preview and apply pass cannot split around a
+    /// concurrent mutation.
+    pub(crate) fn with_gc_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, WorkerError>,
+    ) -> Result<T, WorkerError> {
+        let _guard = InstallationGuard::acquire(&self.inner)?;
+        operation()
     }
 
     pub fn begin_job(

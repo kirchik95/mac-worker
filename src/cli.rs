@@ -38,6 +38,11 @@ pub enum Command {
         #[arg(long)]
         refresh: bool,
     },
+    #[command(about = "Preview or apply retention garbage collection on workers")]
+    Gc {
+        #[arg(long)]
+        apply: bool,
+    },
     Dashboard {
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
         port: Option<u16>,
@@ -227,6 +232,8 @@ pub enum TaskCommand {
 #[derive(Debug, Subcommand)]
 pub enum HostCommand {
     Probe,
+    #[command(name = "gc")]
+    Gc,
     Status,
     #[command(name = "log-chunk")]
     LogChunk,

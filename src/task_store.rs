@@ -780,6 +780,46 @@ impl<'a> TaskStore<'a> {
         Ok(TaskCloseResponse::new(status))
     }
 
+    /// Closes an idle open task as part of retention GC.  Retention closure
+    /// intentionally keeps the task record, session binding, turn history,
+    /// and result refs; it only removes the workspace and advances the
+    /// activity timestamp so the v1 metadata retention window starts at the
+    /// automatic close.
+    pub(crate) fn close_for_retention(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        now_millis: u64,
+    ) -> Result<Option<TaskStatus>, WorkerError> {
+        validate_project_id(project_id)?;
+        let task = self.open_existing_task(project_id, task_id)?;
+        let status = self.read_status(&task)?;
+        if status.state() != TaskState::Open {
+            return Ok(None);
+        }
+        if task.entry_exists("workspace")? {
+            task.validate_private_entry("workspace")?;
+            self.store
+                .remove_owned_child_committed(&task, "workspace")?;
+        }
+        let next = TaskStatus::new(
+            TaskState::Closed,
+            status.last_outcome().cloned(),
+            status.worker().map(str::to_owned),
+            status.session_present(),
+            status.head_oid().cloned(),
+            status.summary().map(str::to_owned),
+            status.questions().to_vec(),
+            status.files_changed().to_vec(),
+            status.diff_stat().map(str::to_owned),
+            status.turns().to_vec(),
+            now_millis,
+        )?;
+        let next = replace_status_bytes(&task, status, next)?;
+        task.sync_root()?;
+        Ok(Some(next))
+    }
+
     pub fn publish_branch_into_mirror(
         &self,
         project_id: &str,
