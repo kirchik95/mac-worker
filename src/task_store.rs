@@ -788,6 +788,26 @@ impl<'a> TaskStore<'a> {
         if status.state() == TaskState::Active {
             return Err(task_error("TASK_BUSY", "task has an active turn"));
         }
+
+        // Prove the discard target before changing the task. Once the
+        // terminal state is durable, any later cleanup failure is safe to
+        // retry without making an open task look partially deleted.
+        let mirror = if request.discard() {
+            Some(
+                self.store
+                    .mirror_if_present(request.project_id())?
+                    .ok_or_else(|| git_error("BASE_UNAVAILABLE", "project mirror is absent"))?,
+            )
+        } else {
+            None
+        };
+        let next_state = if request.discard() {
+            TaskState::Abandoned
+        } else {
+            TaskState::Closed
+        };
+        let status = replace_status_record(&task, status, next_state, None)?;
+
         if task.entry_exists("workspace")? {
             task.validate_private_entry("workspace")?;
             self.store
@@ -795,11 +815,7 @@ impl<'a> TaskStore<'a> {
         }
 
         let mut warnings = Vec::new();
-        let next_state = if request.discard() {
-            let mirror = self
-                .store
-                .mirror_if_present(request.project_id())?
-                .ok_or_else(|| git_error("BASE_UNAVAILABLE", "project mirror is absent"))?;
+        if let Some(mirror) = mirror {
             self.delete_ref(&mirror, &format!("refs/heads/task/{}", request.task_id()))?;
             self.delete_ref(
                 &mirror,
@@ -811,11 +827,7 @@ impl<'a> TaskStore<'a> {
             {
                 push_close_warning(&mut warnings, NATIVE_SESSION_DELETE_WARNING);
             }
-            TaskState::Abandoned
-        } else {
-            TaskState::Closed
-        };
-        let status = replace_status_record(&task, status, next_state, None)?;
+        }
         task.sync_root()?;
         Ok(TaskCloseResponse::with_warnings(status, warnings))
     }

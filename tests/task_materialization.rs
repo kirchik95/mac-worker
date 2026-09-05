@@ -576,6 +576,30 @@ fn close_removes_only_workspace_and_discard_prunes_published_refs() {
 }
 
 #[test]
+fn discard_keeps_task_intact_when_the_mirror_is_missing() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    acquire_lease(&store);
+    prepare_task(&store, base_oid);
+    TaskStore::new(&store, &SystemProcessRunner)
+        .publish_branch_into_mirror(PROJECT_ID, task_id())
+        .unwrap();
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    let mirror_path = store.mirror(PROJECT_ID).unwrap().path().to_path_buf();
+    fs::remove_dir_all(mirror_path).unwrap();
+
+    let error = TaskStore::new(&store, &SystemProcessRunner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), true))
+        .unwrap_err();
+
+    assert_eq!(error.public_code(), "BASE_UNAVAILABLE");
+    assert!(workspace.exists());
+    assert_eq!(
+        store.task_status(PROJECT_ID, task_id()).unwrap().state(),
+        TaskState::Open
+    );
+}
+
+#[test]
 fn discard_deletes_codex_session_after_workspace_removal_with_bounded_argv() {
     let (_temp, store, base_oid) = store_with_mirror();
     acquire_lease(&store);
