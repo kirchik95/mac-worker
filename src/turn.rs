@@ -1033,14 +1033,22 @@ pub fn prebind_session(
     account_home: &Path,
 ) -> Result<TaskSessionResponse, WorkerError> {
     request.validate()?;
+    let agent = request.agent()?;
     let task_store = TaskStore::new(store, runner);
     match task_store.session(request.project_id(), request.task_id()) {
-        Ok(Some(binding)) => return Ok(TaskSessionResponse::new(binding)),
+        Ok(Some(binding)) if binding.agent() == agent => {
+            return Ok(TaskSessionResponse::new(binding));
+        }
+        Ok(Some(_)) => {
+            return Err(turn_error(
+                "TASK_SESSION_CONFLICT",
+                "task session binding belongs to a different agent",
+            ));
+        }
         Ok(None) => {}
         Err(error) if error.public_code() == "TASK_NOT_FOUND" => {}
         Err(error) => return Err(error),
     }
-    let agent = request.agent()?;
     if let Some(session_ref) = request.session_ref() {
         let binding = SessionBinding::new(agent, session_ref, now_millis()?)?;
         task_store.bind_session(request.project_id(), request.task_id(), binding.clone())?;
@@ -1433,4 +1441,39 @@ fn turn_error(code: &str, message: impl Into<String>) -> WorkerError {
 fn os_str_bytes(value: &OsStr) -> &[u8] {
     use std::os::unix::ffi::OsStrExt;
     value.as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        agent::AgentKind,
+        host_store::HostStore,
+        process::SystemProcessRunner,
+        rooted_fs::RootedDir,
+        task::TaskId,
+        task_store::{SessionBinding, TaskPrebindRequest},
+    };
+    use tempfile::tempdir;
+
+    const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn prebind_rejects_an_existing_binding_for_a_different_agent() {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let task_id = TaskId::generate();
+        let task = store
+            .open_task_directory(PROJECT_ID, task_id, true)
+            .unwrap();
+        let binding = SessionBinding::new(AgentKind::Cursor, "chat0001", 1).unwrap();
+        let bytes = serde_json::to_vec(&binding).unwrap();
+        RootedDir::write_private_atomic_no_replace(&task, "session.json", &bytes).unwrap();
+
+        let request = TaskPrebindRequest::discover(PROJECT_ID, task_id, AgentKind::Opencode, None);
+        let error =
+            prebind_session(&store, &SystemProcessRunner, &request, temp.path()).unwrap_err();
+
+        assert_eq!(error.public_code(), "TASK_SESSION_CONFLICT");
+    }
 }
