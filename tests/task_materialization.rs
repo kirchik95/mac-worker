@@ -777,6 +777,14 @@ fn session_binding_is_owner_only_idempotent_and_strict() {
         fs::metadata(session).unwrap().permissions().mode() & 0o777,
         0o600
     );
+
+    let error = SessionBinding::new(AgentKind::Codex, "--help", 202).unwrap_err();
+    assert_eq!(error.public_code(), "TASK_SESSION_INVALID");
+    assert!(
+        mac_worker::agent::adapter_for(AgentKind::Codex)
+            .delete_session("--help")
+            .is_none()
+    );
 }
 
 #[test]

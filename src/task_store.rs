@@ -87,11 +87,12 @@ impl SessionBinding {
     fn validate(&self) -> Result<(), WorkerError> {
         if self.session_ref.is_empty()
             || self.session_ref.len() > 256
+            || self.session_ref.starts_with('-')
             || self.session_ref.chars().any(char::is_control)
         {
             return Err(task_error(
                 "TASK_SESSION_INVALID",
-                "session reference is empty, too long, or contains a control character",
+                "session reference is empty, too long, option-like, or contains a control character",
             ));
         }
         Ok(())

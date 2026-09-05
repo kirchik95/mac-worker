@@ -601,9 +601,12 @@ fn require_session_ref(session_ref: &str) -> Result<&str, AdapterError> {
     if session_ref.is_empty() {
         return Err(AdapterError::new("session reference is unbound"));
     }
-    if session_ref.len() > 256 || session_ref.chars().any(char::is_control) {
+    if session_ref.len() > 256
+        || session_ref.starts_with('-')
+        || session_ref.chars().any(char::is_control)
+    {
         return Err(AdapterError::new(
-            "session reference is too long or contains a control character",
+            "session reference is too long, option-like, or contains a control character",
         ));
     }
     Ok(session_ref)
