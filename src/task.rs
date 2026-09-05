@@ -188,8 +188,70 @@ impl TaskTitle {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskSource {
-    Local { wip: bool },
-    Origin { url: String },
+    Local {
+        wip: bool,
+        #[serde(default)]
+        push_target: Option<PushTarget>,
+    },
+    Origin {
+        url: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushTarget {
+    url: String,
+    requirement: String,
+}
+
+impl TaskSource {
+    pub(crate) fn origin_requirement(&self) -> Result<Option<String>, WorkerError> {
+        match self {
+            Self::Origin { url } => {
+                crate::project::origin_host(url).map(|host| Some(format!("origin:{host}")))
+            }
+            Self::Local { push_target, .. } => Ok(push_target
+                .as_ref()
+                .map(|target| target.requirement.clone())),
+        }
+    }
+}
+
+impl PushTarget {
+    pub fn new(url: String) -> Result<Self, WorkerError> {
+        let normalized = crate::project::normalize_origin(&url)
+            .map_err(|_| task_config("push origin URL is invalid or not in normalized form"))?;
+        if normalized != url {
+            return Err(task_config(
+                "push origin URL is invalid or not in normalized form",
+            ));
+        }
+        let host = crate::project::origin_host(&url)
+            .map_err(|_| task_config("push origin URL is invalid or not in normalized form"))?;
+        Ok(Self {
+            url,
+            requirement: format!("origin:{host}"),
+        })
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn requirement(&self) -> &str {
+        &self.requirement
+    }
+
+    fn validate(&self) -> Result<(), WorkerError> {
+        let expected = Self::new(self.url.clone())?;
+        if self.requirement != expected.requirement {
+            return Err(task_config(
+                "push origin requirement does not match the normalized origin URL",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,6 +578,23 @@ impl TaskMeta {
         &self.source
     }
 
+    pub fn push_origin_url(&self) -> Option<&str> {
+        if !self.publish.contains(&PublishMode::Push) {
+            return None;
+        }
+        match &self.source {
+            TaskSource::Origin { url } => Some(url),
+            TaskSource::Local { push_target, .. } => push_target.as_ref().map(PushTarget::url),
+        }
+    }
+
+    pub fn origin_requirement(&self) -> Option<String> {
+        if !self.publish.contains(&PublishMode::Push) {
+            return None;
+        }
+        self.source.origin_requirement().ok().flatten()
+    }
+
     pub fn publish(&self) -> &[PublishMode] {
         &self.publish
     }
@@ -584,19 +663,34 @@ impl TaskMeta {
     }
 
     fn validate_core_scope(&self) -> Result<(), WorkerError> {
-        if let TaskSource::Origin { url } = &self.source {
-            let normalized = crate::project::normalize_origin(url)
-                .map_err(|_| task_config("origin URL is invalid or not in normalized form"))?;
-            if normalized != *url {
-                return Err(task_config(
-                    "origin URL is invalid or not in normalized form",
-                ));
+        match &self.source {
+            TaskSource::Origin { url } => {
+                let normalized = crate::project::normalize_origin(url)
+                    .map_err(|_| task_config("origin URL is invalid or not in normalized form"))?;
+                if normalized != *url {
+                    return Err(task_config(
+                        "origin URL is invalid or not in normalized form",
+                    ));
+                }
+            }
+            TaskSource::Local { push_target, .. } => {
+                if let Some(target) = push_target {
+                    target.validate()?;
+                }
+                if self.publish.contains(&PublishMode::Push) && push_target.is_none() {
+                    return Err(task_config(
+                        "local push publication requires a pinned origin target",
+                    ));
+                }
+                if !self.publish.contains(&PublishMode::Push) && push_target.is_some() {
+                    return Err(task_config("local push target requires push publication"));
+                }
             }
         }
         if !self.publish.contains(&PublishMode::Fetch) {
             return Err(task_config("publish fetch is required for every task"));
         }
-        if matches!(self.source, TaskSource::Local { wip: true })
+        if matches!(self.source, TaskSource::Local { wip: true, .. })
             && self.publish.contains(&PublishMode::Push)
         {
             return Err(WorkerError::Task {

@@ -23,6 +23,9 @@ const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn task_meta(source: TaskSource, publish: Vec<PublishMode>) -> TaskMeta {
+    let publish_branch = publish
+        .contains(&PublishMode::Push)
+        .then(|| "release-candidate".parse().unwrap());
     TaskMeta::new(TaskMetaInput {
         task_id: TaskId::new(Uuid::from_u128(1)),
         run_id: None,
@@ -33,7 +36,7 @@ fn task_meta(source: TaskSource, publish: Vec<PublishMode>) -> TaskMeta {
         policy: PermissionPolicy::Workspace,
         source,
         publish,
-        publish_branch: Some("release-candidate".parse().unwrap()),
+        publish_branch,
         base_oid: "0123456789012345678901234567890123456789".parse().unwrap(),
         limits: TaskLimits::default(),
         close_policy: ClosePolicy::Never,
@@ -58,6 +61,62 @@ fn origin_source_and_push_are_recorded_as_one_canonical_scope() {
     assert_eq!(value["source"]["url"], "https://example.test/repo.git");
     assert_eq!(value["publish"], serde_json::json!(["fetch", "push"]));
     assert_eq!(value["publish_branch"], "release-candidate");
+}
+
+#[test]
+fn local_push_metadata_carries_a_canonical_pinned_origin_target() {
+    let mut wire = serde_json::to_value(task_meta(
+        TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        vec![PublishMode::Fetch],
+    ))
+    .unwrap();
+    wire["publish"] = serde_json::json!(["fetch", "push"]);
+    wire["publish_branch"] = serde_json::Value::Null;
+    wire["source"]["push_target"] = serde_json::json!({
+        "url": "https://example.test/repo.git",
+        "requirement": "origin:example.test"
+    });
+
+    let meta: TaskMeta = serde_json::from_value(wire).unwrap();
+    let stored = serde_json::to_value(meta).unwrap();
+    assert_eq!(
+        stored["source"]["push_target"],
+        serde_json::json!({
+            "url": "https://example.test/repo.git",
+            "requirement": "origin:example.test"
+        }),
+        "a local push task must persist its normalized target and admission identity"
+    );
+}
+
+#[test]
+fn local_push_metadata_rejects_missing_or_noncanonical_pinned_targets() {
+    let mut wire = serde_json::to_value(task_meta(
+        TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        vec![PublishMode::Fetch],
+    ))
+    .unwrap();
+    wire["publish"] = serde_json::json!(["fetch", "push"]);
+
+    assert!(serde_json::from_value::<TaskMeta>(wire.clone()).is_err());
+
+    wire["source"]["push_target"] = serde_json::json!({
+        "url": "https://user:secret@EXAMPLE.test/repo.git?token=secret",
+        "requirement": "origin:example.test"
+    });
+    assert!(serde_json::from_value::<TaskMeta>(wire.clone()).is_err());
+
+    wire["source"]["push_target"] = serde_json::json!({
+        "url": "https://example.test/repo.git",
+        "requirement": "origin:other.example.test"
+    });
+    assert!(serde_json::from_value::<TaskMeta>(wire).is_err());
 }
 
 #[test]

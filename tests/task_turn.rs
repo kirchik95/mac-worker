@@ -30,8 +30,8 @@ use mac_worker::{
         SupervisorFaultPoint, SystemProcessInspector,
     },
     task::{
-        BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+        BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, PushTarget, TaskId, TaskLimits,
+        TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
     },
     task_store::{TaskCancelRequest, TaskPrepareRequest, TaskStore},
     turn::{EnvProfile, TaskTurnRequest, TurnMaterial, TurnSection},
@@ -169,7 +169,10 @@ fn prepared_task_turn(
 ) {
     prepared_task_turn_with_options(
         script,
-        TaskSource::Local { wip: false },
+        TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
         vec![PublishMode::Fetch],
         None,
         None,
@@ -187,7 +190,10 @@ fn prepared_push_task_turn(
 ) {
     prepared_task_turn_with_options(
         script,
-        TaskSource::Local { wip: false },
+        TaskSource::Local {
+            wip: false,
+            push_target: Some(PushTarget::new(origin.to_owned()).unwrap()),
+        },
         vec![PublishMode::Fetch, PublishMode::Push],
         Some("release-candidate".parse().unwrap()),
         Some(origin.to_owned()),
@@ -411,6 +417,30 @@ fn task_turn_publication_origin_survives_the_canonical_turn_payload() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn local_push_turn_rejects_a_target_other_than_the_pinned_origin() {
+    let (_temp, store, request, _cancel) =
+        prepared_push_task_turn("exit 0", "https://example.test/repo.git");
+    let mismatched = TaskTurnRequest::new_with_origin(
+        request.submit().clone(),
+        request.turn().clone(),
+        request.prompt(),
+        Some("https://other.example.test/repo.git".into()),
+    )
+    .unwrap();
+
+    let error = JobService::new(
+        &store,
+        &InlineTurnLauncher {
+            store: store.clone(),
+            fault: None,
+        },
+    )
+    .submit_turn(mismatched)
+    .unwrap_err();
+    assert_eq!(error.public_code(), "REQUEST_CONFLICT");
 }
 
 #[test]
@@ -685,7 +715,10 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
         agent: AgentKind::Codex,
         model: None,
         policy: PermissionPolicy::Workspace,
-        source: TaskSource::Local { wip: false },
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
         publish: vec![PublishMode::Fetch],
         publish_branch: None,
         base_oid,
@@ -1001,7 +1034,10 @@ fn successful_codex_turn_without_a_bound_session_fails_publication() {
         agent: AgentKind::Codex,
         model: None,
         policy: PermissionPolicy::Workspace,
-        source: TaskSource::Local { wip: false },
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
         publish: vec![PublishMode::Fetch],
         publish_branch: None,
         base_oid,
@@ -1140,7 +1176,10 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
         agent: AgentKind::Codex,
         model: None,
         policy: PermissionPolicy::Workspace,
-        source: TaskSource::Local { wip: false },
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
         publish: vec![PublishMode::Fetch],
         publish_branch: None,
         base_oid,

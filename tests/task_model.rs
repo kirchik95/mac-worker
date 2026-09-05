@@ -4,9 +4,9 @@ use mac_worker::{
     job::{JobId, ProcessIdentity},
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, MAX_FOLLOWUPS,
-        MAX_PROMPT_BYTES, PublishMode, RunId, RunProgress, RunRecord, RunnerIdentity, RunnerState,
-        TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
-        TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        MAX_PROMPT_BYTES, PublishMode, PushTarget, RunId, RunProgress, RunRecord, RunnerIdentity,
+        RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
+        TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
     },
 };
 use proptest::prelude::*;
@@ -52,7 +52,10 @@ fn fields_with_prompt(prompt: String) -> TaskMetaInput {
         agent: AgentKind::Codex,
         model: Some("gpt-5".into()),
         policy: PermissionPolicy::Workspace,
-        source: TaskSource::Local { wip: false },
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
         publish: vec![PublishMode::Fetch],
         publish_branch: None,
         base_oid: BASE_OID.parse().expect("fixture base oid"),
@@ -419,6 +422,10 @@ fn origin_source_and_push_publication_are_valid_task_scopes() {
 
     let mut push_fields = fields_with_prompt("Ship it".into());
     push_fields.publish = vec![PublishMode::Fetch, push];
+    push_fields.source = TaskSource::Local {
+        wip: false,
+        push_target: Some(PushTarget::new("https://example.test/repo.git".into()).unwrap()),
+    };
     let push_meta = TaskMeta::new(push_fields).unwrap();
     assert_eq!(
         push_meta.publish(),
@@ -426,7 +433,10 @@ fn origin_source_and_push_publication_are_valid_task_scopes() {
     );
 
     let mut wip_push_fields = fields_with_prompt("Ship it".into());
-    wip_push_fields.source = TaskSource::Local { wip: true };
+    wip_push_fields.source = TaskSource::Local {
+        wip: true,
+        push_target: Some(PushTarget::new("https://example.test/repo.git".into()).unwrap()),
+    };
     wip_push_fields.publish = vec![PublishMode::Fetch, PublishMode::Push];
     let error = TaskMeta::new(wip_push_fields).unwrap_err();
     assert_eq!(error.public_code(), "PUBLISH_REQUIRES_COMMITTED_BASE");
@@ -704,7 +714,10 @@ fn arbitrary_local_task_record() -> impl Strategy<Value = LocalTaskRecord> {
                 let mut input = fields_with_prompt(prompt);
                 input.task_id = TaskId::new(Uuid::from_u128(task + 1));
                 input.run_id = run.map(|value| RunId::new(Uuid::from_u128(value)));
-                input.source = TaskSource::Local { wip };
+                input.source = TaskSource::Local {
+                    wip,
+                    push_target: None,
+                };
                 input.created_at_millis = created_at_millis;
                 let meta = TaskMeta::new(input).expect("generated meta");
                 let runner = runner_pid.map(|pid| {

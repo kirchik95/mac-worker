@@ -16,6 +16,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectState {
     pub context: ProjectContext,
+    pub origin: Option<String>,
     pub settings: ProjectSettings,
     pub requirements: Vec<String>,
 }
@@ -66,12 +67,13 @@ impl ProjectState {
         project: &Path,
         cli_includes: &[String],
     ) -> Result<Self, WorkerError> {
-        let context = ProjectInspector::new(runner).inspect(project)?;
+        let (context, origin) = ProjectInspector::new(runner).inspect_with_origin(project)?;
         let settings = ProjectSettings::load(&context.root, cli_includes)?;
         let detected = RequirementDetector::detect(&context.root)?;
         let requirements = merge_project_requirements(&settings.requires, detected);
         Ok(Self {
             context,
+            origin,
             settings,
             requirements,
         })

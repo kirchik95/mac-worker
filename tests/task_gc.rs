@@ -125,7 +125,10 @@ fn task_meta(task_id: TaskId, base_oid: BaseOid, created_at_millis: u64) -> Task
         agent: AgentKind::Codex,
         model: None,
         policy: PermissionPolicy::Workspace,
-        source: TaskSource::Local { wip: false },
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
         publish: vec![PublishMode::Fetch],
         publish_branch: None,
         base_oid,

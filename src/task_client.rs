@@ -18,15 +18,14 @@ use crate::{
     },
     paths::PathLayout,
     process::ProcessRunner,
-    project::ProjectInspector,
     project_config::TaskSettings,
     project_state::ProjectState,
     scheduler::{CandidateObservation, SchedulerPolicy, Selection, WorkerPreference},
     scheduler_adapter::SchedulerProbeAdapter,
     supervisor::{ProcessObservation, SystemProcessInspector},
     task::{
-        BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId,
-        RunRecord, RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
+        BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, PushTarget,
+        RunId, RunRecord, RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
         TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
     },
     task_view::{
@@ -550,19 +549,24 @@ impl<'a> TaskClient<'a> {
             .env_profile
             .clone()
             .or_else(|| settings.env_profile.clone());
-        let source_name = request.source.as_deref().unwrap_or(&settings.source);
         let publish_names = request.publish.as_deref().unwrap_or(&settings.publish);
-        let needs_origin =
-            source_name == "origin" || publish_names.iter().any(|mode| mode == "push");
+        let publish = parse_publish_modes(publish_names)?;
+        let source_name = request.source.as_deref().unwrap_or(&settings.source);
+        let needs_origin = source_name == "origin" || publish.contains(&PublishMode::Push);
         let origin_url = if needs_origin {
-            ProjectInspector::new(self.runner)
-                .normalized_origin(&initial.context.root)?
+            initial
+                .origin
+                .clone()
                 .ok_or_else(|| task_error("INVALID_ORIGIN", "project origin is not configured"))?
         } else {
             String::new()
         };
-        let source = parse_task_source(source_name, request.wip, &origin_url)?;
-        let publish = parse_publish_modes(publish_names)?;
+        let source = parse_task_source(
+            source_name,
+            request.wip,
+            &origin_url,
+            publish.contains(&PublishMode::Push),
+        )?;
         let publish_branch = parse_publish_branch(request.publish_branch.as_deref(), &publish)?;
         if request.wip && publish.contains(&PublishMode::Push) {
             return Err(task_error(
@@ -570,16 +574,11 @@ impl<'a> TaskClient<'a> {
                 "publish push requires a committed base",
             ));
         }
-        let origin_host = if needs_origin {
-            Some(crate::project::origin_host(&origin_url)?)
-        } else {
-            None
-        };
         let requirements = task_requirements(
             &initial.requirements,
             request.agent,
             env_profile.as_deref(),
-            origin_host.as_deref(),
+            source.origin_requirement()?.as_deref(),
         );
         let observations = self.observe_admission(&request.preference)?;
         let affinity = self
@@ -1655,7 +1654,7 @@ impl<'a> TaskClient<'a> {
                 &project.requirements,
                 record.meta().agent(),
                 record.meta().env_profile(),
-                task_origin_host(self.runner, &project, record.meta())?.as_deref(),
+                task_origin_requirement(record.meta()).as_deref(),
             ),
             preference,
             QueueEntryKind::TaskTurn,
@@ -1875,7 +1874,7 @@ impl<'a> TaskClient<'a> {
                 &project.requirements,
                 record.meta().agent(),
                 record.meta().env_profile(),
-                task_origin_host(self.runner, &project, record.meta())?.as_deref(),
+                task_origin_requirement(record.meta()).as_deref(),
             ),
             preference,
             QueueEntryKind::TaskTurn,
@@ -2261,9 +2260,19 @@ fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerEr
     )
 }
 
-fn parse_task_source(source: &str, wip: bool, origin_url: &str) -> Result<TaskSource, WorkerError> {
+fn parse_task_source(
+    source: &str,
+    wip: bool,
+    origin_url: &str,
+    pushing: bool,
+) -> Result<TaskSource, WorkerError> {
     match source {
-        "local" => Ok(TaskSource::Local { wip }),
+        "local" => Ok(TaskSource::Local {
+            wip,
+            push_target: pushing
+                .then(|| PushTarget::new(origin_url.to_owned()))
+                .transpose()?,
+        }),
         "origin" if !wip && !origin_url.is_empty() => Ok(TaskSource::Origin {
             url: origin_url.to_owned(),
         }),
@@ -2335,28 +2344,15 @@ fn parse_publish_branch(
     })
 }
 
-fn task_origin_host(
-    runner: &dyn ProcessRunner,
-    project: &ProjectState,
-    meta: &TaskMeta,
-) -> Result<Option<String>, WorkerError> {
-    let origin = match meta.source() {
-        TaskSource::Origin { url } => Some(url.clone()),
-        TaskSource::Local { .. } if meta.publish().contains(&PublishMode::Push) => {
-            ProjectInspector::new(runner).normalized_origin(&project.context.root)?
-        }
-        TaskSource::Local { .. } => None,
-    };
-    origin
-        .map(|origin| crate::project::origin_host(&origin))
-        .transpose()
+fn task_origin_requirement(meta: &TaskMeta) -> Option<String> {
+    meta.origin_requirement()
 }
 
 fn task_requirements(
     project: &[String],
     agent: AgentKind,
     profile: Option<&str>,
-    origin_host: Option<&str>,
+    origin_requirement: Option<&str>,
 ) -> Vec<String> {
     let mut requirements = project.to_vec();
     let name = agent_name(agent);
@@ -2367,11 +2363,10 @@ fn task_requirements(
     if !requirements.iter().any(|item| item == &requirement) {
         requirements.push(requirement);
     }
-    if let Some(host) = origin_host {
-        let requirement = format!("origin:{host}");
-        if !requirements.iter().any(|item| item == &requirement) {
-            requirements.push(requirement);
-        }
+    if let Some(requirement) = origin_requirement
+        && !requirements.iter().any(|item| item == requirement)
+    {
+        requirements.push(requirement.to_owned());
     }
     requirements
 }

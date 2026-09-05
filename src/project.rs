@@ -53,6 +53,13 @@ impl<'a> ProjectInspector<'a> {
     }
 
     pub fn inspect(&self, cwd: &Path) -> Result<ProjectContext, WorkerError> {
+        self.inspect_with_origin(cwd).map(|(context, _)| context)
+    }
+
+    pub(crate) fn inspect_with_origin(
+        &self,
+        cwd: &Path,
+    ) -> Result<(ProjectContext, Option<String>), WorkerError> {
         let root = self.required_path(
             cwd,
             &["rev-parse", "--path-format=absolute", "--show-toplevel"],
@@ -96,23 +103,26 @@ impl<'a> ProjectInspector<'a> {
             self.optional_utf8_scalar(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
         let origin = self.normalized_origin(cwd)?;
 
-        let project_id = match origin {
-            Some(origin) => hash_identity(b"origin\0", normalize_origin(&origin)?.as_bytes()),
+        let project_id = match &origin {
+            Some(origin) => hash_identity(b"origin\0", normalize_origin(origin)?.as_bytes()),
             None => hash_identity(b"common-dir\0", common_dir.as_os_str().as_bytes()),
         };
         let worktree_id = hash_identity(b"worktree\0", root.as_os_str().as_bytes());
 
-        Ok(ProjectContext {
-            root,
-            relative_cwd,
-            git_dir,
-            common_dir,
-            head,
-            branch,
-            project_id,
-            worktree_id,
-            dirty,
-        })
+        Ok((
+            ProjectContext {
+                root,
+                relative_cwd,
+                git_dir,
+                common_dir,
+                head,
+                branch,
+                project_id,
+                worktree_id,
+                dirty,
+            },
+            origin,
+        ))
     }
 
     /// Returns the project's origin in the canonical form used by task

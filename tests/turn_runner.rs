@@ -150,6 +150,8 @@ struct AcceptedThenTerminalRunner {
     probe_count: Mutex<u32>,
     facts_fresh: Mutex<bool>,
     base_release_failures: Mutex<u8>,
+    origin_read_count: Mutex<u32>,
+    change_origin_after_submit: Mutex<bool>,
 }
 
 #[derive(Clone)]
@@ -182,6 +184,8 @@ impl AcceptedThenTerminalRunner {
             probe_count: Mutex::new(0),
             facts_fresh: Mutex::new(false),
             base_release_failures: Mutex::new(0),
+            origin_read_count: Mutex::new(0),
+            change_origin_after_submit: Mutex::new(false),
         }
     }
 
@@ -246,6 +250,23 @@ impl AcceptedThenTerminalRunner {
         *count += 1;
         self.facts_fresh() || *count == 1
     }
+
+    fn submitted_turn_origin(&self) -> Option<String> {
+        self.requests()
+            .into_iter()
+            .find(|request| {
+                request
+                    .args
+                    .iter()
+                    .any(|arg| arg == HostOperation::TaskTurn.command())
+            })
+            .map(|request| decode_request::<TaskTurnRequest>(&request).unwrap())
+            .and_then(|request| request.origin_url().map(str::to_owned))
+    }
+
+    fn change_origin_after_submit(&self) {
+        *self.change_origin_after_submit.lock().unwrap() = true;
+    }
 }
 
 impl ProcessRunner for AcceptedThenTerminalRunner {
@@ -256,6 +277,20 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
         self.requests.lock().unwrap().push(request.clone());
 
         if request.program == OsStr::new("/usr/bin/git") {
+            if request.args.iter().any(|arg| arg == "config")
+                && request.args.iter().any(|arg| arg == "--get")
+                && request.args.iter().any(|arg| arg == "remote.origin.url")
+            {
+                let mut reads = self.origin_read_count.lock().unwrap();
+                *reads += 1;
+                if *self.change_origin_after_submit.lock().unwrap() && *reads > 3 {
+                    return Ok(ProcessResult {
+                        status: ExitStatus::from_raw(0),
+                        stdout: b"https://other.example.test/repo.git\n".to_vec(),
+                        stderr: Vec::new(),
+                    });
+                }
+            }
             if request.args.iter().any(|arg| arg == "update-ref")
                 && request.args.iter().any(|arg| arg == "-d")
                 && request
@@ -497,15 +532,22 @@ struct AcceptedThenTerminalFixture {
 
 impl AcceptedThenTerminalFixture {
     fn new() -> Self {
+        Self::new_with_push_origin(None)
+    }
+
+    fn new_with_push_origin(origin: Option<&str>) -> Self {
         let repo = support::GitRepo::init();
         repo.write("base.txt", b"base\n");
         repo.commit_all("base");
+        if let Some(origin) = origin {
+            repo.git(&["remote", "add", "origin", origin]);
+        }
         let state_root = tempfile::tempdir().unwrap();
         let state_root_path = state_root.path().canonicalize().unwrap();
         let paths = support::task_harness::paths(&state_root_path);
         let state = ClientStateStore::open(&paths.state).unwrap();
         let config = Config::parse(
-            "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+            "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\", \"origin:example.test\"]\n",
         )
         .unwrap();
         let runner = AcceptedThenTerminalRunner::new();
@@ -519,9 +561,9 @@ impl AcceptedThenTerminalFixture {
                     prompt: "make the change".into(),
                     project: repo.root().to_path_buf(),
                     base: "main".into(),
-                    wip: true,
+                    wip: origin.is_none(),
                     source: None,
-                    publish: None,
+                    publish: origin.map(|_| vec!["fetch".into(), "push".into()]),
                     publish_branch: None,
                     cli_includes: Vec::new(),
                     limits: TaskLimits::default(),
@@ -674,6 +716,34 @@ fn runner_refreshes_stale_agent_facts_before_claiming() {
             .capabilities()
             .iter()
             .any(|capability| capability == "agent:codex@secure")
+    );
+}
+
+#[test]
+fn runner_uses_the_submit_time_local_push_target_after_origin_changes() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture =
+        AcceptedThenTerminalFixture::new_with_push_origin(Some("https://example.test/repo.git"));
+    let queued = fixture
+        .state
+        .queue_entry_for_task_turn(fixture.task_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        queued
+            .requirements()
+            .iter()
+            .any(|requirement| requirement == "origin:example.test"),
+        "scheduler admission must retain the requirement derived at submission"
+    );
+    fixture.runner.change_origin_after_submit();
+
+    fixture.run(&mut Vec::new()).unwrap();
+
+    assert_eq!(
+        fixture.runner.submitted_turn_origin().as_deref(),
+        Some("https://example.test/repo.git"),
+        "each turn must use the target pinned when the task was submitted"
     );
 }
 

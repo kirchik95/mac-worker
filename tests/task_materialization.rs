@@ -75,7 +75,10 @@ fn task_meta_for(task_id: TaskId, base_oid: BaseOid) -> TaskMeta {
         agent: AgentKind::Codex,
         model: None,
         policy: PermissionPolicy::Workspace,
-        source: mac_worker::task::TaskSource::Local { wip: false },
+        source: mac_worker::task::TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
         publish: vec![PublishMode::Fetch],
         publish_branch: None,
         base_oid,

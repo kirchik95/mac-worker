@@ -224,7 +224,10 @@ fn task_record(
         agent: AgentKind::Codex,
         model: None,
         policy: mac_worker::agent::PermissionPolicy::Workspace,
-        source: TaskSource::Local { wip: false },
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
         publish: vec![PublishMode::Fetch],
         publish_branch: None,
         base_oid: base_oid.clone(),
@@ -361,7 +364,10 @@ fn active_task(store: &ClientStateStore, task_number: u128, turn_id: JobId) {
         agent: mac_worker::agent::AgentKind::Codex,
         model: None,
         policy: mac_worker::agent::PermissionPolicy::Workspace,
-        source: TaskSource::Local { wip: false },
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
         publish: vec![PublishMode::Fetch],
         publish_branch: None,
         base_oid: base_oid.clone(),

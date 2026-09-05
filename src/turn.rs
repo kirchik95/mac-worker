@@ -30,7 +30,7 @@ use crate::{
     rooted_fs::RootedDir,
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskMeta, TaskOutcome,
-        TaskSource, TaskStatus, TurnTerminal,
+        TaskStatus, TurnTerminal,
     },
     task_store::{
         SessionBinding, TaskCloseRequest, TaskPrebindRequest, TaskSessionResponse, TaskStore,
@@ -728,10 +728,7 @@ impl<'a> TurnPublisher<'a> {
             Some(_) => TurnTerminal::Failed,
             None => TurnTerminal::Lost,
         };
-        let origin_url = match task.meta().source() {
-            TaskSource::Origin { url } => Some(url.as_str()),
-            TaskSource::Local { .. } => None,
-        };
+        let origin_url = task.meta().push_origin_url();
         self.publish_with_terminal(task, turn_dir, terminal, exit_code, false, origin_url)
     }
 
@@ -795,9 +792,15 @@ impl<'a> TurnPublisher<'a> {
         let outcome = TaskOutcome::from_turn(terminal, Some(agent_outcome));
         let close = meta.close_policy() == ClosePolicy::Done && outcome == TaskOutcome::Done;
         if meta.publish().contains(&PublishMode::Push) {
-            let origin_url = origin_url.ok_or_else(|| {
+            let expected_origin = meta.push_origin_url().ok_or_else(|| {
                 turn_error("PUBLISH_FAILED", "push publication has no origin target")
             })?;
+            if origin_url != Some(expected_origin) {
+                return Err(turn_error(
+                    "REQUEST_CONFLICT",
+                    "turn origin target does not match the task",
+                ));
+            }
             let mirror = self
                 .store
                 .mirror_if_present(meta.project_id())?
@@ -807,7 +810,7 @@ impl<'a> TurnPublisher<'a> {
                 .cloned()
                 .unwrap_or_else(|| BranchName::for_task(meta.task_id()));
             GitTransport::new(self.runner).push_origin(
-                origin_url,
+                expected_origin,
                 meta.task_id(),
                 &branch,
                 &mirror,

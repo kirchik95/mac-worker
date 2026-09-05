@@ -28,7 +28,7 @@ use crate::{
         ProcessObservation, ReconciliationRuntime, SystemReconciliationRuntime,
         reconcile_orphan_processes, terminate_exact_recorded_group,
     },
-    task::{PublishMode, TaskSource},
+    task::PublishMode,
     task_store::{TaskCancelRequest, TaskStore},
     turn::{
         TaskTurnRequest, TaskTurnResponse, TerminalPath, TurnReceipt, TurnSection, TurnTerminalHook,
@@ -3127,9 +3127,8 @@ fn validate_turn_origin(
     origin_url: Option<&str>,
 ) -> Result<(), WorkerError> {
     let pushing = meta.publish().contains(&PublishMode::Push);
-    match (meta.source(), pushing, origin_url) {
-        (TaskSource::Origin { url }, true, Some(actual)) if actual == url => Ok(()),
-        (TaskSource::Local { .. }, true, Some(_)) => Ok(()),
+    match (meta.push_origin_url(), pushing, origin_url) {
+        (Some(expected), true, Some(actual)) if actual == expected => Ok(()),
         (_, false, None) => Ok(()),
         (_, true, None) => Err(protocol_code(
             "REQUEST_CONFLICT",
@@ -3139,9 +3138,13 @@ fn validate_turn_origin(
             "REQUEST_CONFLICT",
             "turn has an unexpected origin target",
         )),
-        (TaskSource::Origin { .. }, true, Some(_)) => Err(protocol_code(
+        (Some(_), true, Some(_)) => Err(protocol_code(
             "REQUEST_CONFLICT",
             "turn origin target does not match the task",
+        )),
+        (None, true, Some(_)) => Err(protocol_code(
+            "REQUEST_CONFLICT",
+            "push publication has no pinned origin target",
         )),
     }
 }

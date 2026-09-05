@@ -28,14 +28,13 @@ use crate::{
     },
     paths::PathLayout,
     process::ProcessRunner,
-    project::ProjectInspector,
     project_state::ProjectState,
     scheduler::{CandidateObservation, SchedulerPolicy, WorkerPreference},
     scheduler_adapter::SchedulerProbeAdapter,
     supervisor::SystemProcessInspector,
     task::{
-        LocalTaskRecord, PublishMode, RunnerIdentity, TaskId, TaskOutcome, TaskSource, TaskState,
-        TaskStatus, TurnId, TurnSummary,
+        LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId,
+        TurnSummary,
     },
     task_store::{
         TaskCancelRequest, TaskPrebindRequest, TaskPrepareRequest, TaskSessionRequest,
@@ -641,7 +640,7 @@ impl<'a> TurnRunner<'a> {
                         SubmitRequest::new(material.clone()),
                         turn.clone(),
                         prompt.clone(),
-                        turn_origin_url(self.runner, &project, initial_record.meta())?,
+                        turn_origin_url(initial_record.meta()),
                     )?;
                     let response = match remote.submit_turn(worker, &request) {
                         Ok(response) => response,
@@ -1281,21 +1280,8 @@ fn require_project_match(
     Ok(())
 }
 
-fn turn_origin_url(
-    runner: &dyn ProcessRunner,
-    project: &ProjectState,
-    meta: &crate::task::TaskMeta,
-) -> Result<Option<String>, WorkerError> {
-    if !meta.publish().contains(&PublishMode::Push) {
-        return Ok(None);
-    }
-    match meta.source() {
-        TaskSource::Origin { url } => Ok(Some(url.clone())),
-        TaskSource::Local { .. } => ProjectInspector::new(runner)
-            .normalized_origin(&project.context.root)?
-            .ok_or_else(|| task_error("INVALID_ORIGIN", "project origin is not configured"))
-            .map(Some),
-    }
+fn turn_origin_url(meta: &crate::task::TaskMeta) -> Option<String> {
+    meta.push_origin_url().map(str::to_owned)
 }
 
 fn capacity_busy() -> WorkerError {

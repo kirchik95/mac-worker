@@ -633,7 +633,10 @@ fn task_record(
             agent: AgentKind::Codex,
             model: Some("gpt-5".into()),
             policy: PermissionPolicy::Workspace,
-            source: TaskSource::Local { wip: false },
+            source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
             publish: vec![mac_worker::task::PublishMode::Fetch],
             publish_branch: None,
             base_oid: BASE_OID.parse().unwrap(),
