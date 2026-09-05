@@ -1046,6 +1046,7 @@ impl<'a> TaskClient<'a> {
     pub fn reconcile_runners(&self) -> Result<ReconcileReport, WorkerError> {
         let mut report = ReconcileReport::default();
         let owner = current_process_identity()?;
+        self.client_state.recover_replacement_residue()?;
 
         // A submit can fail while compensating its locally-created state. The
         // pre-handoff intent is durable from initial task creation; the

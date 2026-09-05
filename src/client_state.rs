@@ -1856,6 +1856,8 @@ impl ClientStateStore {
         let bytes = task_record_bytes(&replacement)?;
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let tasks = self.tasks_dir()?;
+        let names = tasks.list_names().map_err(WorkerError::Io)?;
+        self.recover_task_replacement_residue(&tasks, &names)?;
         let name = task_file_name(task_id)?;
         let old = tasks
             .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
@@ -1901,10 +1903,13 @@ impl ClientStateStore {
     /// rather than attempting to acquire StateLock recursively.
     fn list_tasks_locked(&self) -> Result<Vec<LocalTaskRecord>, WorkerError> {
         let tasks = self.tasks_dir()?;
-        let names = tasks.list_names().map_err(WorkerError::Io)?;
-        self.recover_task_replacement_residue(&tasks, &names)?;
         let mut names = tasks.list_names().map_err(WorkerError::Io)?;
-        names.retain(|name| name.as_slice() != ROOTED_FS_NAMESPACE);
+        // Replacement residue is a crash artifact. Enumeration is a
+        // read-only projection, so leave it for a mutating recovery path and
+        // ignore the private displaced record here.
+        names.retain(|name| {
+            name.as_slice() != ROOTED_FS_NAMESPACE && !is_private_replacement_name(name)
+        });
         names.sort();
         names
             .into_iter()
@@ -2087,8 +2092,6 @@ impl ClientStateStore {
         }
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;
-        let names = runs.list_names().map_err(WorkerError::Io)?;
-        self.recover_run_replacement_residue(&runs, &names)?;
         let name = run_file_name(run_id)?;
         read_run_from_dir(&runs, &name, run_id)
     }
@@ -2096,10 +2099,13 @@ impl ClientStateStore {
     pub fn list_runs(&self) -> Result<Vec<RunRecord>, WorkerError> {
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;
-        let names = runs.list_names().map_err(WorkerError::Io)?;
-        self.recover_run_replacement_residue(&runs, &names)?;
         let mut names = runs.list_names().map_err(WorkerError::Io)?;
-        names.retain(|name| name.as_slice() != ROOTED_FS_NAMESPACE);
+        // Replacement residue is a crash artifact. Enumeration is a
+        // read-only projection, so leave it for a mutating recovery path and
+        // ignore the private displaced record here.
+        names.retain(|name| {
+            name.as_slice() != ROOTED_FS_NAMESPACE && !is_private_replacement_name(name)
+        });
         names.sort();
         names
             .into_iter()
@@ -2115,6 +2121,20 @@ impl ClientStateStore {
                 read_run_from_dir(&runs, text, run_id)
             })
             .collect()
+    }
+
+    /// Completes filesystem replacement recovery for mutating command paths.
+    /// Read-only enumeration deliberately does not call this method.
+    pub(crate) fn recover_replacement_residue(&self) -> Result<(), WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+
+        let tasks = self.tasks_dir()?;
+        let task_names = tasks.list_names().map_err(WorkerError::Io)?;
+        self.recover_task_replacement_residue(&tasks, &task_names)?;
+
+        let runs = self.runs_dir()?;
+        let run_names = runs.list_names().map_err(WorkerError::Io)?;
+        self.recover_run_replacement_residue(&runs, &run_names)
     }
 
     fn recover_run_replacement_residue(

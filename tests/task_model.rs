@@ -2,6 +2,7 @@
 mod support;
 
 use std::{
+    fs,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -578,6 +579,49 @@ fn task_enumeration_waits_for_a_pre_exchange_replacement_writer() {
 }
 
 #[test]
+fn task_enumeration_does_not_recover_replacement_residue() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let original = sample_record();
+    let replacement = original.clone().with_runner(None).unwrap();
+    state.create_task(original).unwrap();
+
+    state.inject_task_replacement_after_exchange_failure_once();
+    assert!(state.update_task(replacement.clone()).is_err());
+
+    let residue_before = fs::read_dir(paths.state.join("tasks"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("replace-"))
+        .count();
+    assert_eq!(residue_before, 1);
+
+    assert_eq!(state.list_tasks().unwrap(), vec![replacement.clone()]);
+
+    let residue_after = fs::read_dir(paths.state.join("tasks"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("replace-"))
+        .count();
+    assert_eq!(residue_after, residue_before);
+
+    state
+        .update_task(
+            replacement
+                .with_status_observed_at(Some(1_700_000_000_001))
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(
+        fs::read_dir(paths.state.join("tasks"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with("replace-"))
+    );
+}
+
+#[test]
 fn reopen_recovers_run_reservation_replacement_residue_after_exchange_fsync_failure() {
     // Break caught: releasing a task-owned publish reservation can exchange
     // the updated run before its directory fsync fails. Reopening must remove
@@ -608,6 +652,9 @@ fn reopen_recovers_run_reservation_replacement_residue_after_exchange_fsync_fail
     );
 
     let reopened = ClientStateStore::open(&paths.state).unwrap();
+    reopened
+        .release_run_publish_branch_for_task(run_id, task_id, &branch)
+        .unwrap();
     let runs = reopened.list_runs().unwrap();
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].run_id(), run_id);
@@ -621,6 +668,49 @@ fn reopen_recovers_run_reservation_replacement_residue_after_exchange_fsync_fail
                 .to_string_lossy()
                 .starts_with("replace-"))
     );
+}
+
+#[test]
+fn run_enumeration_does_not_recover_replacement_residue() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let run_id = run_id();
+    let task_id = task_id();
+    let branch: BranchName = "release-candidate".parse().unwrap();
+    state
+        .create_run(RunRecord::new(run_id, None, vec![task_id], 1, 99).unwrap())
+        .unwrap();
+    state
+        .reserve_run_publish_branch_for_task(run_id, task_id, branch.clone())
+        .unwrap();
+
+    state.inject_write_failure_once(
+        ClientStateWritePoint::AfterRunReplacementExchangeBeforeFirstDirectorySync,
+    );
+    assert!(
+        state
+            .release_run_publish_branch_for_task(run_id, task_id, &branch)
+            .is_err()
+    );
+
+    let residue_before = fs::read_dir(paths.state.join("runs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("replace-"))
+        .count();
+    assert_eq!(residue_before, 1);
+
+    let listed = state.list_runs().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].publish_branches().is_empty());
+
+    let residue_after = fs::read_dir(paths.state.join("runs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("replace-"))
+        .count();
+    assert_eq!(residue_after, residue_before);
 }
 
 #[test]
