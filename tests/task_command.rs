@@ -94,6 +94,28 @@ fn task_submit_requires_exactly_one_prompt_source() {
 }
 
 #[test]
+fn task_submit_accepts_repeatable_publication_modes() {
+    let parsed = Cli::try_parse_from([
+        "worker",
+        "task",
+        "submit",
+        "--agent",
+        "codex",
+        "--prompt",
+        "publish",
+        "--source",
+        "origin",
+        "--publish",
+        "fetch",
+        "--publish",
+        "push",
+        "--publish-branch",
+        "release-candidate",
+    ]);
+    assert!(parsed.is_ok(), "origin push form must parse: {parsed:?}");
+}
+
+#[test]
 fn task_submit_allows_attached_no_wait_to_fail_after_the_probe() {
     let parsed = Cli::try_parse_from([
         "worker",

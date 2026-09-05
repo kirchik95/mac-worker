@@ -34,7 +34,9 @@ use crate::{
         SchedulerPolicy, Selection, WorkerPreference,
     },
     supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
-    task::{LocalTaskRecord, RunId, RunRecord, RunnerIdentity, RunnerState, TaskId, TurnId},
+    task::{
+        BranchName, LocalTaskRecord, RunId, RunRecord, RunnerIdentity, RunnerState, TaskId, TurnId,
+    },
     transfer::PreacceptanceAbandonmentReceipt,
 };
 
@@ -1226,6 +1228,28 @@ impl ClientStateStore {
         Ok(cached)
     }
 
+    /// Replaces the advisory admission projection after a runner has
+    /// refreshed worker facts. The worker probe is authoritative for this
+    /// write; an observation that is older than the current record cannot
+    /// overwrite a newer concurrent refresh.
+    pub fn publish_admission_observation(
+        &self,
+        observation: AdmissionObservation,
+    ) -> Result<(), WorkerError> {
+        observation.validate()?;
+        let worker = observation.worker_name();
+        validate_state_worker_name(worker)?;
+        let bytes = canonical_json_bytes(&observation, "admission observation")?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        if let Some(existing) =
+            read_observation_optional(self.inner.observations.as_raw_fd(), worker)?
+            && existing.observed_at_millis() > observation.observed_at_millis()
+        {
+            return Ok(());
+        }
+        publish_observation(self.inner.observations.as_raw_fd(), worker, &bytes, self)
+    }
+
     fn update_queue<R, F>(&self, update: F) -> Result<R, WorkerError>
     where
         F: FnOnce(&mut QueueSnapshot) -> Result<(R, bool), WorkerError>,
@@ -1778,6 +1802,53 @@ impl ClientStateStore {
                 read_run_from_dir(&runs, text, run_id)
             })
             .collect()
+    }
+
+    pub fn reserve_run_publish_branch(
+        &self,
+        run_id: RunId,
+        branch: BranchName,
+    ) -> Result<RunRecord, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let runs = self.runs_dir()?;
+        let name = run_file_name(run_id)?;
+        let old = runs
+            .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
+            .map_err(WorkerError::Io)?;
+        let existing = parse_run_record(&old)?;
+        if existing.run_id() != run_id {
+            return Err(invalid_state("run filename and record identity differ"));
+        }
+        let replacement = existing.reserve_publish_branch(branch)?;
+        let bytes = run_record_bytes(&replacement)?;
+        runs.replace_private_regular_exact(&name, &old, &bytes)
+            .map_err(WorkerError::Io)?;
+        Ok(replacement)
+    }
+
+    pub fn release_run_publish_branch(
+        &self,
+        run_id: RunId,
+        branch: &BranchName,
+    ) -> Result<RunRecord, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let runs = self.runs_dir()?;
+        let name = run_file_name(run_id)?;
+        let old = runs
+            .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
+            .map_err(WorkerError::Io)?;
+        let existing = parse_run_record(&old)?;
+        if existing.run_id() != run_id {
+            return Err(invalid_state("run filename and record identity differ"));
+        }
+        let replacement = existing.release_publish_branch(branch);
+        if replacement == existing {
+            return Ok(existing);
+        }
+        let bytes = run_record_bytes(&replacement)?;
+        runs.replace_private_regular_exact(&name, &old, &bytes)
+            .map_err(WorkerError::Io)?;
+        Ok(replacement)
     }
 
     pub fn queue_entry(&self, job_id: JobId) -> Result<Option<QueueEntry>, WorkerError> {

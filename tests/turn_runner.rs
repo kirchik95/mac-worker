@@ -9,11 +9,12 @@ use std::{
     path::{Path, PathBuf},
     process::{self, ExitStatus},
     sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::{
     agent::AgentKind,
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe},
+    agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
     client_state::ClientStateStore,
     config::Config,
     job::{
@@ -117,6 +118,8 @@ struct AcceptedThenTerminalRunner {
     task: Mutex<Option<(TaskMeta, TurnId)>>,
     turn_submitted: Mutex<bool>,
     stdout_log_sent: Mutex<bool>,
+    probe_count: Mutex<u32>,
+    facts_fresh: Mutex<bool>,
 }
 
 impl AcceptedThenTerminalRunner {
@@ -126,6 +129,8 @@ impl AcceptedThenTerminalRunner {
             task: Mutex::new(None),
             turn_submitted: Mutex::new(false),
             stdout_log_sent: Mutex::new(false),
+            probe_count: Mutex::new(0),
+            facts_fresh: Mutex::new(false),
         }
     }
 
@@ -173,6 +178,16 @@ impl AcceptedThenTerminalRunner {
 
     fn requests(&self) -> Vec<ProcessRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn facts_fresh(&self) -> bool {
+        *self.facts_fresh.lock().unwrap()
+    }
+
+    fn facts_are_fresh_for_probe(&self) -> bool {
+        let mut count = self.probe_count.lock().unwrap();
+        *count += 1;
+        self.facts_fresh() || *count == 1
     }
 }
 
@@ -238,39 +253,63 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
             .and_then(|argument| argument.to_str())
             .unwrap_or_default();
         match operation {
-            "~/.local/bin/worker host probe" => canonical_process(&ProbeResponse {
-                protocol_version: PROTOCOL_VERSION,
-                supervision_version: SUPERVISION_VERSION,
-                hostname: "mini-1.local".into(),
-                arch: "arm64".into(),
-                os_version: "26.2".into(),
-                free_disk_bytes: 100 * 1024 * 1024 * 1024,
-                total_disk_bytes: 250 * 1024 * 1024 * 1024,
-                memory_pressure: MemoryPressure::Normal,
-                swap_used_bytes: Some(0),
-                available_memory_bytes: Some(12 * 1024 * 1024 * 1024),
-                cpu_counters: Some(CpuCounters {
-                    user_ticks: 10,
-                    system_ticks: 20,
-                    idle_ticks: 30,
-                    nice_ticks: 40,
-                }),
-                slot_state: SlotState::Idle,
-                active_lease: None,
-                capabilities: vec!["darwin-arm64".into()],
-                agent_facts: Some(AgentFacts {
-                    agents: vec![AgentProbe {
-                        name: "codex".into(),
-                        version: Some("0.1.0".into()),
-                        auth: AgentAuth::Authenticated,
-                        auth_by_profile: Vec::new(),
-                    }],
-                    env_profiles: Vec::new(),
-                    git_identity: true,
-                    collected_at_millis: 1,
-                }),
-                facts_age_millis: Some(0),
-            }),
+            value if value == HostOperation::RefreshFacts.command() => {
+                *self.facts_fresh.lock().unwrap() = true;
+                Ok(ProcessResult {
+                    status: ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+            "~/.local/bin/worker host probe" => {
+                // The submit path gets one fresh observation to pass initial
+                // admission. The runner then observes a stale cache and must
+                // refresh facts before claiming the turn.
+                let fresh = self.facts_are_fresh_for_probe();
+                canonical_process(&ProbeResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    supervision_version: SUPERVISION_VERSION,
+                    hostname: "mini-1.local".into(),
+                    arch: "arm64".into(),
+                    os_version: "26.2".into(),
+                    free_disk_bytes: 100 * 1024 * 1024 * 1024,
+                    total_disk_bytes: 250 * 1024 * 1024 * 1024,
+                    memory_pressure: MemoryPressure::Normal,
+                    swap_used_bytes: Some(0),
+                    available_memory_bytes: Some(12 * 1024 * 1024 * 1024),
+                    cpu_counters: Some(CpuCounters {
+                        user_ticks: 10,
+                        system_ticks: 20,
+                        idle_ticks: 30,
+                        nice_ticks: 40,
+                    }),
+                    slot_state: SlotState::Idle,
+                    active_lease: None,
+                    capabilities: vec!["darwin-arm64".into()],
+                    agent_facts: Some(AgentFacts {
+                        agents: vec![AgentProbe {
+                            name: "codex".into(),
+                            version: Some("0.1.0".into()),
+                            auth: AgentAuth::Authenticated,
+                            auth_by_profile: vec![(
+                                "secure".into(),
+                                if self.facts_fresh() {
+                                    AgentAuth::Authenticated
+                                } else {
+                                    AgentAuth::Unauthenticated
+                                },
+                            )],
+                        }],
+                        env_profiles: vec![ProfileProbe {
+                            name: "secure".into(),
+                            secure: true,
+                        }],
+                        git_identity: true,
+                        collected_at_millis: if fresh { u64::MAX / 2 } else { 1 },
+                    }),
+                    facts_age_millis: Some(if fresh { 0 } else { FACTS_TTL + 1 }),
+                })
+            }
             value if value == HostOperation::LeaseAcquire.command() => {
                 let acquire: LeaseAcquireRequest = decode_request(request)?;
                 let material = acquire.material();
@@ -407,6 +446,9 @@ impl AcceptedThenTerminalFixture {
                     project: repo.root().to_path_buf(),
                     base: "main".into(),
                     wip: true,
+                    source: None,
+                    publish: None,
+                    publish_branch: None,
                     cli_includes: Vec::new(),
                     limits: TaskLimits::default(),
                     close_policy: ClosePolicy::Never,
@@ -524,6 +566,41 @@ fn follower_write_error_detaches_runner_and_completes_remote_turn() {
 
     assert_eq!(follower.events, 1);
     assert_remote_turn_completed(&fixture, &outcome);
+}
+
+#[test]
+fn runner_refreshes_stale_agent_facts_before_claiming() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let outcome = fixture.run(&mut Vec::new()).unwrap();
+
+    assert_eq!(outcome.status().state(), TaskState::Closed);
+    assert!(fixture.runner.facts_fresh());
+    assert!(fixture.runner.requests().iter().any(|request| {
+        request
+            .args
+            .iter()
+            .any(|arg| arg == HostOperation::RefreshFacts.command())
+    }));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let cached = fixture
+        .state
+        .admission_observation("mini-1", now, || {
+            Err(mac_worker::error::WorkerError::Protocol(
+                "refreshed facts were not cached".into(),
+            ))
+        })
+        .unwrap();
+    assert!(
+        cached
+            .observation()
+            .capabilities()
+            .iter()
+            .any(|capability| capability == "agent:codex@secure")
+    );
 }
 
 #[test]
@@ -654,7 +731,7 @@ impl ProcessRunner for FetchFailingRunner {
                     }],
                     env_profiles: Vec::new(),
                     git_identity: true,
-                    collected_at_millis: 1,
+                    collected_at_millis: u64::MAX / 2,
                 }),
                 facts_age_millis: Some(0),
             }),
@@ -774,6 +851,9 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
                 project: repo.root().to_path_buf(),
                 base: "main".into(),
                 wip: true,
+                source: None,
+                publish: None,
+                publish_branch: None,
                 cli_includes: Vec::new(),
                 limits: TaskLimits::default(),
                 close_policy: ClosePolicy::Never,

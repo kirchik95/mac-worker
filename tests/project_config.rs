@@ -51,7 +51,7 @@ fn absent_project_settings_file_uses_v1_defaults() {
 }
 
 #[test]
-fn project_task_settings_parse_defaults_and_reject_deferred_capabilities() {
+fn project_task_settings_parse_defaults_and_accept_origin_push_capabilities() {
     let repo = GitRepo::init();
     repo.write(
         ".worker.toml",
@@ -67,16 +67,19 @@ max_followups = 7
     let settings = ProjectSettings::load(repo.root(), &[]).unwrap();
     assert_eq!(settings.task.max_followups, 7);
 
-    for task in [
-        "[task]\nsource = \"origin\"\n",
-        "[task]\npublish = [\"push\"]\n",
-        "[task]\nunknown = true\n",
-    ] {
-        let repo = GitRepo::init();
-        repo.write(".worker.toml", task.as_bytes());
-        let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
-        assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
-    }
+    let repo = GitRepo::init();
+    repo.write(".worker.toml", b"[task]\nunknown = true\n");
+    let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
+    assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
+
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        b"version = 1\n[task]\nsource = \"origin\"\npublish = [\"fetch\", \"push\"]\n",
+    );
+    let settings = ProjectSettings::load(repo.root(), &[]).unwrap();
+    assert_eq!(settings.task.source, "origin");
+    assert_eq!(settings.task.publish, vec!["fetch", "push"]);
 }
 
 #[test]

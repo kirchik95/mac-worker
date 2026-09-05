@@ -18,15 +18,16 @@ use crate::{
     },
     paths::PathLayout,
     process::ProcessRunner,
+    project::ProjectInspector,
     project_config::TaskSettings,
     project_state::ProjectState,
     scheduler::{CandidateObservation, SchedulerPolicy, Selection, WorkerPreference},
     scheduler_adapter::SchedulerProbeAdapter,
     supervisor::{ProcessObservation, SystemProcessInspector},
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, RunId, RunRecord, RunnerIdentity,
-        RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskState,
-        TaskStatus, TurnId, TurnSummary,
+        BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId,
+        RunRecord, RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
+        TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
     },
     task_view::{
         TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
@@ -53,6 +54,9 @@ pub struct TaskSubmitRequest {
     pub project: PathBuf,
     pub base: String,
     pub wip: bool,
+    pub source: Option<String>,
+    pub publish: Option<Vec<String>>,
+    pub publish_branch: Option<String>,
     pub cli_includes: Vec<String>,
     pub limits: TaskLimits,
     pub close_policy: ClosePolicy,
@@ -540,8 +544,37 @@ impl<'a> TaskClient<'a> {
             .env_profile
             .clone()
             .or_else(|| settings.env_profile.clone());
-        let requirements =
-            task_requirements(&initial.requirements, request.agent, env_profile.as_deref());
+        let source_name = request.source.as_deref().unwrap_or(&settings.source);
+        let publish_names = request.publish.as_deref().unwrap_or(&settings.publish);
+        let needs_origin =
+            source_name == "origin" || publish_names.iter().any(|mode| mode == "push");
+        let origin_url = if needs_origin {
+            ProjectInspector::new(self.runner)
+                .normalized_origin(&initial.context.root)?
+                .ok_or_else(|| task_error("INVALID_ORIGIN", "project origin is not configured"))?
+        } else {
+            String::new()
+        };
+        let source = parse_task_source(source_name, request.wip, &origin_url)?;
+        let publish = parse_publish_modes(publish_names)?;
+        let publish_branch = parse_publish_branch(request.publish_branch.as_deref(), &publish)?;
+        if request.wip && publish.contains(&PublishMode::Push) {
+            return Err(task_error(
+                "PUBLISH_REQUIRES_COMMITTED_BASE",
+                "publish push requires a committed base",
+            ));
+        }
+        let origin_host = if needs_origin {
+            Some(crate::project::origin_host(&origin_url)?)
+        } else {
+            None
+        };
+        let requirements = task_requirements(
+            &initial.requirements,
+            request.agent,
+            env_profile.as_deref(),
+            origin_host.as_deref(),
+        );
         let observations = self.observe_admission(&request.preference)?;
         let affinity = self
             .client_state
@@ -570,9 +603,23 @@ impl<'a> TaskClient<'a> {
         let turn_id = _turn_id_override.unwrap_or_else(TurnId::generate);
         let now = current_time_millis()?;
         let identity = GitIdentity::new(DEFAULT_GIT_NAME, DEFAULT_GIT_EMAIL)?;
+        let reserved_branch = publish.contains(&PublishMode::Push).then(|| {
+            publish_branch
+                .clone()
+                .unwrap_or_else(|| BranchName::for_task(task_id))
+        });
+        let origin_base = if let TaskSource::Origin { url } = &source {
+            let oid = TransferRepo::resolve_base_oid(self.runner, &initial.context, &request.base)?;
+            GitTransport::new(self.runner).preflight_origin(url, &oid)?;
+            Some(crate::transfer_repo::BaseCommit::from_origin(oid))
+        } else {
+            None
+        };
         let transfer =
             TransferRepo::open_or_create(&self.paths.cache, &initial.context.common_dir)?;
-        let base = if request.wip {
+        let base = if let Some(base) = origin_base {
+            base
+        } else if request.wip {
             transfer.build_wip_base(
                 self.runner,
                 &initial.context,
@@ -583,8 +630,9 @@ impl<'a> TaskClient<'a> {
         } else {
             transfer.resolve_base(self.runner, &initial.context, &request.base)?
         };
-        if let Err(error) =
-            transfer.check_sensitive_tree(self.runner, base.oid(), &initial.settings)
+        if !matches!(source, TaskSource::Origin { .. })
+            && let Err(error) =
+                transfer.check_sensitive_tree(self.runner, base.oid(), &initial.settings)
         {
             let _ = transfer.release_base(self.runner, task_id);
             return Err(error);
@@ -603,7 +651,6 @@ impl<'a> TaskClient<'a> {
         }
 
         let policy = permission_policy(settings, request.agent);
-        let source = crate::task::TaskSource::Local { wip: request.wip };
         let meta = TaskMeta::new(TaskMetaInput {
             task_id,
             run_id: request.run_id,
@@ -613,8 +660,8 @@ impl<'a> TaskClient<'a> {
             model: request.model.clone(),
             policy,
             source,
-            publish: vec![crate::task::PublishMode::Fetch],
-            publish_branch: None,
+            publish,
+            publish_branch: publish_branch.clone(),
             base_oid: base.oid().clone(),
             limits,
             close_policy: request.close_policy,
@@ -652,7 +699,28 @@ impl<'a> TaskClient<'a> {
             request.wait_for_capacity,
             None,
         )?;
-        self.client_state.create_task(record)?;
+        let reservation = match (request.run_id, reserved_branch.as_ref()) {
+            (Some(run_id), Some(branch)) => match self
+                .client_state
+                .reserve_run_publish_branch(run_id, branch.clone())
+            {
+                Ok(run) => Some(run),
+                Err(error) => {
+                    let _ = transfer.release_base(self.runner, task_id);
+                    return Err(error);
+                }
+            },
+            _ => None,
+        };
+        if let Err(error) = self.client_state.create_task(record) {
+            if reservation.is_some()
+                && let (Some(run_id), Some(branch)) = (request.run_id, reserved_branch.as_ref())
+            {
+                let _ = self.client_state.release_run_publish_branch(run_id, branch);
+            }
+            let _ = transfer.release_base(self.runner, task_id);
+            return Err(error);
+        }
         if let Err(error) = self
             .client_state
             .write_turn_prompt(task_id, turn_id, &composed_prompt)
@@ -1479,6 +1547,19 @@ impl<'a> TaskClient<'a> {
             project: project.to_path_buf(),
             base: task.base.clone().unwrap_or_else(|| defaults.base.clone()),
             wip: task.wip.unwrap_or(defaults.wip),
+            source: task
+                .source
+                .clone()
+                .or_else(|| Some(defaults.source.clone())),
+            publish: Some(
+                task.publish
+                    .clone()
+                    .unwrap_or_else(|| defaults.publish.clone()),
+            ),
+            publish_branch: task
+                .publish_branch
+                .clone()
+                .or_else(|| defaults.publish_branch.clone()),
             cli_includes: Vec::new(),
             limits,
             close_policy: parse_close_policy(
@@ -1529,6 +1610,7 @@ impl<'a> TaskClient<'a> {
                 &project.requirements,
                 record.meta().agent(),
                 record.meta().env_profile(),
+                task_origin_host(self.runner, &project, record.meta())?.as_deref(),
             ),
             preference,
             QueueEntryKind::TaskTurn,
@@ -1672,6 +1754,7 @@ impl<'a> TaskClient<'a> {
                 &project.requirements,
                 record.meta().agent(),
                 record.meta().env_profile(),
+                task_origin_host(self.runner, &project, record.meta())?.as_deref(),
             ),
             preference,
             QueueEntryKind::TaskTurn,
@@ -2055,7 +2138,103 @@ fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerEr
     )
 }
 
-fn task_requirements(project: &[String], agent: AgentKind, profile: Option<&str>) -> Vec<String> {
+fn parse_task_source(source: &str, wip: bool, origin_url: &str) -> Result<TaskSource, WorkerError> {
+    match source {
+        "local" => Ok(TaskSource::Local { wip }),
+        "origin" if !wip && !origin_url.is_empty() => Ok(TaskSource::Origin {
+            url: origin_url.to_owned(),
+        }),
+        "origin" => Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "source origin requires a configured origin and a committed base",
+        )),
+        _ => Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "source must be local or origin",
+        )),
+    }
+}
+
+fn parse_publish_modes(values: &[String]) -> Result<Vec<PublishMode>, WorkerError> {
+    if values.is_empty() {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "publish fetch is required for every task",
+        ));
+    }
+    let mut modes = Vec::with_capacity(values.len());
+    for value in values {
+        let mode = match value.as_str() {
+            "fetch" => PublishMode::Fetch,
+            "push" => PublishMode::Push,
+            _ => {
+                return Err(task_error(
+                    "TASK_CONFIG_INVALID",
+                    "publish must be fetch or push",
+                ));
+            }
+        };
+        if modes.contains(&mode) {
+            return Err(task_error(
+                "TASK_CONFIG_INVALID",
+                "publish modes must be unique",
+            ));
+        }
+        modes.push(mode);
+    }
+    if !modes.contains(&PublishMode::Fetch) {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "publish fetch is required for every task",
+        ));
+    }
+    Ok(modes)
+}
+
+fn parse_publish_branch(
+    value: Option<&str>,
+    publish: &[PublishMode],
+) -> Result<Option<BranchName>, WorkerError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !publish.contains(&PublishMode::Push) {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "publish_branch requires publish push",
+        ));
+    }
+    value.parse().map(Some).map_err(|_| {
+        task_error(
+            "TASK_CONFIG_INVALID",
+            "publish branch is not a valid Git branch name",
+        )
+    })
+}
+
+fn task_origin_host(
+    runner: &dyn ProcessRunner,
+    project: &ProjectState,
+    meta: &TaskMeta,
+) -> Result<Option<String>, WorkerError> {
+    let origin = match meta.source() {
+        TaskSource::Origin { url } => Some(url.clone()),
+        TaskSource::Local { .. } if meta.publish().contains(&PublishMode::Push) => {
+            ProjectInspector::new(runner).normalized_origin(&project.context.root)?
+        }
+        TaskSource::Local { .. } => None,
+    };
+    origin
+        .map(|origin| crate::project::origin_host(&origin))
+        .transpose()
+}
+
+fn task_requirements(
+    project: &[String],
+    agent: AgentKind,
+    profile: Option<&str>,
+    origin_host: Option<&str>,
+) -> Vec<String> {
     let mut requirements = project.to_vec();
     let name = agent_name(agent);
     let requirement = profile.map_or_else(
@@ -2064,6 +2243,12 @@ fn task_requirements(project: &[String], agent: AgentKind, profile: Option<&str>
     );
     if !requirements.iter().any(|item| item == &requirement) {
         requirements.push(requirement);
+    }
+    if let Some(host) = origin_host {
+        let requirement = format!("origin:{host}");
+        if !requirements.iter().any(|item| item == &requirement) {
+            requirements.push(requirement);
+        }
     }
     requirements
 }
@@ -2152,24 +2337,55 @@ fn read_batch_prompt(task: &BatchTask, batch_dir: &Path) -> Result<String, Worke
 
 fn validate_batch_scope(defaults: &BatchDefaults, task: &BatchTask) -> Result<(), WorkerError> {
     let source = task.source.as_deref().unwrap_or(&defaults.source);
-    if source != "local" {
+    if !matches!(source, "local" | "origin") {
         return Err(task_error(
             "TASK_CONFIG_INVALID",
-            "source origin is deferred to a later plan (TASK_CONFIG_INVALID)",
+            "source must be local or origin (TASK_CONFIG_INVALID)",
         ));
     }
 
     let publish = task.publish.as_ref().unwrap_or(&defaults.publish);
-    if publish.iter().any(|mode| mode == "push") || task.publish_branch.is_some() {
+    if publish
+        .iter()
+        .any(|mode| !matches!(mode.as_str(), "fetch" | "push"))
+    {
         return Err(task_error(
             "TASK_CONFIG_INVALID",
-            "publish push and publish_branch are deferred to a later plan (TASK_CONFIG_INVALID)",
+            "publish must be fetch or push (TASK_CONFIG_INVALID)",
         ));
     }
-    if publish != &["fetch".to_owned()] {
+    if publish
+        .iter()
+        .filter(|mode| mode.as_str() == "fetch")
+        .count()
+        > 1
+        || publish
+            .iter()
+            .filter(|mode| mode.as_str() == "push")
+            .count()
+            > 1
+    {
         return Err(task_error(
             "TASK_CONFIG_INVALID",
-            "publish must contain only fetch in this phase (TASK_CONFIG_INVALID)",
+            "publish modes must be unique (TASK_CONFIG_INVALID)",
+        ));
+    }
+    if !publish.iter().any(|mode| mode == "fetch") {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "publish fetch is required for every task (TASK_CONFIG_INVALID)",
+        ));
+    }
+    if task.publish_branch.is_some() && !publish.iter().any(|mode| mode == "push") {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "publish_branch requires publish push (TASK_CONFIG_INVALID)",
+        ));
+    }
+    if task.wip.unwrap_or(defaults.wip) && publish.iter().any(|mode| mode == "push") {
+        return Err(task_error(
+            "PUBLISH_REQUIRES_COMMITTED_BASE",
+            "publish push requires a committed base",
         ));
     }
     Ok(())

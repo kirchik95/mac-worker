@@ -732,11 +732,7 @@ fn run_task_subcommand(
             no_wait,
             wait,
         } => {
-            validate_task_scope_options(
-                source.as_deref(),
-                publish.as_deref(),
-                publish_branch.as_deref(),
-            )?;
+            validate_task_scope_options(source.as_deref(), &publish, publish_branch.as_deref())?;
             let prompt = read_prompt(prompt, prompt_file)?;
             let limits = make_task_limits(timeout, max_turns, max_budget, max_followups)?;
             let project = project.unwrap_or(runtime.current_dir()?);
@@ -752,6 +748,9 @@ fn run_task_subcommand(
                     project,
                     base,
                     wip,
+                    source,
+                    publish: (!publish.is_empty()).then_some(publish),
+                    publish_branch,
                     cli_includes: includes,
                     limits,
                     close_policy: parse_task_close_policy(close_on.as_deref())?,
@@ -925,21 +924,44 @@ fn read_prompt(
 
 fn validate_task_scope_options(
     source: Option<&str>,
-    publish: Option<&str>,
+    publish: &[String],
     publish_branch: Option<&str>,
 ) -> Result<(), WorkerError> {
-    if source.is_some_and(|source| source != "local") {
+    if source.is_some_and(|source| !matches!(source, "local" | "origin")) {
         return Err(WorkerError::Task {
             code: "TASK_CONFIG_INVALID",
-            message: "source origin is deferred to a later plan (TASK_CONFIG_INVALID)".into(),
+            message: "source must be local or origin (TASK_CONFIG_INVALID)".into(),
         });
     }
-    if publish.is_some_and(|publish| publish != "fetch") || publish_branch.is_some() {
+    if publish
+        .iter()
+        .any(|publish| !matches!(publish.as_str(), "fetch" | "push"))
+    {
         return Err(WorkerError::Task {
             code: "TASK_CONFIG_INVALID",
-            message:
-                "publish push and publish_branch are deferred to a later plan (TASK_CONFIG_INVALID)"
-                    .into(),
+            message: "publish must be fetch or push (TASK_CONFIG_INVALID)".into(),
+        });
+    }
+    if publish
+        .iter()
+        .filter(|publish| publish.as_str() == "fetch")
+        .count()
+        > 1
+        || publish
+            .iter()
+            .filter(|publish| publish.as_str() == "push")
+            .count()
+            > 1
+    {
+        return Err(WorkerError::Task {
+            code: "TASK_CONFIG_INVALID",
+            message: "publish modes must be unique (TASK_CONFIG_INVALID)".into(),
+        });
+    }
+    if publish_branch.is_some() && !publish.iter().any(|mode| mode == "push") {
+        return Err(WorkerError::Task {
+            code: "TASK_CONFIG_INVALID",
+            message: "publish_branch requires publish push (TASK_CONFIG_INVALID)".into(),
         });
     }
     Ok(())

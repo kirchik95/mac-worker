@@ -28,13 +28,14 @@ use crate::{
     },
     paths::PathLayout,
     process::ProcessRunner,
+    project::ProjectInspector,
     project_state::ProjectState,
     scheduler::{CandidateObservation, SchedulerPolicy, WorkerPreference},
     scheduler_adapter::SchedulerProbeAdapter,
     supervisor::SystemProcessInspector,
     task::{
-        LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId,
-        TurnSummary,
+        LocalTaskRecord, PublishMode, RunnerIdentity, TaskId, TaskOutcome, TaskSource, TaskState,
+        TaskStatus, TurnId, TurnSummary,
     },
     task_store::{TaskCancelRequest, TaskPrepareRequest, TaskSessionRequest, TaskStatusRequest},
     transfer::{RemoteJobClient, TransferIdentity},
@@ -607,11 +608,12 @@ impl<'a> TurnRunner<'a> {
                 {
                     prepared.status().clone()
                 } else {
-                    let request = TaskTurnRequest::new(
+                    let request = TaskTurnRequest::new_with_origin(
                         SubmitRequest::new(material.clone()),
                         turn.clone(),
                         prompt.clone(),
-                    );
+                        turn_origin_url(self.runner, &project, initial_record.meta())?,
+                    )?;
                     let response = match remote.submit_turn(worker, &request) {
                         Ok(response) => response,
                         Err(error) => {
@@ -1076,35 +1078,41 @@ impl<'a> TurnRunner<'a> {
                     version: self.config.version,
                     workers: vec![worker.clone()],
                 };
+                let observed_at = now_millis()?;
+                let mut health = WorkersService::new(SshTransport::new(self.runner))
+                    .inspect(&one)
+                    .workers
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| WorkerError::Protocol("worker probe was empty".into()))?;
+                let facts_stale = health.probe.as_ref().is_none_or(|probe| {
+                    probe
+                        .agent_facts
+                        .as_ref()
+                        .is_none_or(|facts| facts.is_stale(observed_at))
+                });
+                if facts_stale {
+                    SshTransport::new(self.runner).refresh_facts(worker)?;
+                    health = WorkersService::new(SshTransport::new(self.runner))
+                        .inspect(&one)
+                        .workers
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| WorkerError::Protocol("worker probe was empty".into()))?;
+                    let candidate = candidate_from_health(&one, &health)?;
+                    self.client_state
+                        .publish_admission_observation(admission_from_health(
+                            &one,
+                            &health,
+                            observed_at,
+                        )?)?;
+                    return Ok(candidate);
+                }
+
                 let cached =
                     self.client_state
-                        .admission_observation(&worker.name, now_millis()?, || {
-                            let health = WorkersService::new(SshTransport::new(self.runner))
-                                .inspect(&one)
-                                .workers
-                                .into_iter()
-                                .next()
-                                .ok_or_else(|| {
-                                    WorkerError::Protocol("worker probe was empty".into())
-                                })?;
-                            let candidate = SchedulerProbeAdapter::observations(
-                                &one,
-                                std::slice::from_ref(&health),
-                            )?
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| {
-                                WorkerError::Protocol("worker probe was empty".into())
-                            })?;
-                            AdmissionObservation::new(
-                                candidate.worker_name().to_owned(),
-                                candidate.ready(),
-                                candidate.slot(),
-                                candidate.capabilities().to_vec(),
-                                candidate.available_memory_bytes(),
-                                candidate.free_disk_bytes(),
-                                now_millis()?,
-                            )
+                        .admission_observation(&worker.name, observed_at, || {
+                            admission_from_health(&one, &health, observed_at)
                         })?;
                 CandidateObservation::new(
                     cached.observation().worker_name().to_owned(),
@@ -1120,6 +1128,33 @@ impl<'a> TurnRunner<'a> {
             })
             .collect()
     }
+}
+
+fn candidate_from_health(
+    config: &Config,
+    health: &crate::protocol::WorkerHealth,
+) -> Result<CandidateObservation, WorkerError> {
+    SchedulerProbeAdapter::observations(config, std::slice::from_ref(health))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| WorkerError::Protocol("worker probe was empty".into()))
+}
+
+fn admission_from_health(
+    config: &Config,
+    health: &crate::protocol::WorkerHealth,
+    observed_at: u64,
+) -> Result<AdmissionObservation, WorkerError> {
+    let candidate = candidate_from_health(config, health)?;
+    AdmissionObservation::new(
+        candidate.worker_name().to_owned(),
+        candidate.ready(),
+        candidate.slot(),
+        candidate.capabilities().to_vec(),
+        candidate.available_memory_bytes(),
+        candidate.free_disk_bytes(),
+        observed_at,
+    )
 }
 
 /// Transfer a waiting or dispatching task row to the process that will
@@ -1215,6 +1250,23 @@ fn require_project_match(
         ));
     }
     Ok(())
+}
+
+fn turn_origin_url(
+    runner: &dyn ProcessRunner,
+    project: &ProjectState,
+    meta: &crate::task::TaskMeta,
+) -> Result<Option<String>, WorkerError> {
+    if !meta.publish().contains(&PublishMode::Push) {
+        return Ok(None);
+    }
+    match meta.source() {
+        TaskSource::Origin { url } => Ok(Some(url.clone())),
+        TaskSource::Local { .. } => ProjectInspector::new(runner)
+            .normalized_origin(&project.context.root)?
+            .ok_or_else(|| task_error("INVALID_ORIGIN", "project origin is not configured"))
+            .map(Some),
+    }
 }
 
 fn capacity_busy() -> WorkerError {

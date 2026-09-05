@@ -397,7 +397,7 @@ fn runner_identity_wraps_process_identity() {
 }
 
 #[test]
-fn later_plan_source_and_publish_options_parse_but_core_scope_rejects_them() {
+fn origin_source_and_push_publication_are_valid_task_scopes() {
     let origin: TaskSource = serde_json::from_value(serde_json::json!({
         "kind": "origin",
         "url": "https://example.test/repo.git"
@@ -409,21 +409,33 @@ fn later_plan_source_and_publish_options_parse_but_core_scope_rejects_them() {
 
     let mut origin_fields = fields_with_prompt("Ship it".into());
     origin_fields.source = origin;
-    let error = TaskMeta::new(origin_fields).unwrap_err();
-    assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
-    assert!(error.to_string().contains("later plan"), "{error}");
+    let origin_meta = TaskMeta::new(origin_fields).unwrap();
+    assert_eq!(
+        origin_meta.source(),
+        &TaskSource::Origin {
+            url: "https://example.test/repo.git".into(),
+        }
+    );
 
     let mut push_fields = fields_with_prompt("Ship it".into());
     push_fields.publish = vec![PublishMode::Fetch, push];
-    let error = TaskMeta::new(push_fields).unwrap_err();
-    assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
-    assert!(error.to_string().contains("later plan"), "{error}");
+    let push_meta = TaskMeta::new(push_fields).unwrap();
+    assert_eq!(
+        push_meta.publish(),
+        &[PublishMode::Fetch, PublishMode::Push]
+    );
+
+    let mut wip_push_fields = fields_with_prompt("Ship it".into());
+    wip_push_fields.source = TaskSource::Local { wip: true };
+    wip_push_fields.publish = vec![PublishMode::Fetch, PublishMode::Push];
+    let error = TaskMeta::new(wip_push_fields).unwrap_err();
+    assert_eq!(error.public_code(), "PUBLISH_REQUIRES_COMMITTED_BASE");
 
     let mut branch_fields = fields_with_prompt("Ship it".into());
     branch_fields.publish_branch = Some("feature/ship-it".parse().unwrap());
     let error = TaskMeta::new(branch_fields).unwrap_err();
     assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
-    assert!(error.to_string().contains("later plan"), "{error}");
+    assert!(error.to_string().contains("publish push"), "{error}");
 }
 
 #[test]
@@ -624,6 +636,16 @@ fn run_record_round_trips_and_rejects_unknown_fields() {
     let mut unknown = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
     unknown["path"] = serde_json::json!("/secret");
     assert!(serde_json::from_value::<RunRecord>(unknown).is_err());
+}
+
+#[test]
+fn run_record_reserves_each_publish_branch_only_once() {
+    let record = RunRecord::new(run_id(), Some("batch-1".into()), vec![task_id()], 2, 99).unwrap();
+    let branch: BranchName = "release-candidate".parse().unwrap();
+    let reserved = record.reserve_publish_branch(branch.clone()).unwrap();
+    assert_eq!(reserved.publish_branches(), std::slice::from_ref(&branch));
+    let duplicate = reserved.reserve_publish_branch(branch).unwrap_err();
+    assert_eq!(duplicate.public_code(), "TASK_CONFIG_INVALID");
 }
 
 #[test]

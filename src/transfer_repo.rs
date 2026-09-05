@@ -87,6 +87,20 @@ impl BaseCommit {
     pub fn dirty(&self) -> &DirtyReport {
         &self.dirty
     }
+
+    pub fn from_origin(oid: BaseOid) -> Self {
+        Self {
+            head_oid: oid.clone(),
+            oid,
+            kind: BaseKind::Committed,
+            branch: None,
+            dirty: DirtyReport {
+                modified: 0,
+                added: 0,
+                deleted: 0,
+            },
+        }
+    }
 }
 
 /// Task 3 will reuse or alias this receipt as `FetchReceipt`.
@@ -118,6 +132,14 @@ pub struct TransferRepo {
 }
 
 impl TransferRepo {
+    pub fn resolve_base_oid(
+        runner: &dyn ProcessRunner,
+        context: &ProjectContext,
+        reference: &str,
+    ) -> Result<BaseOid, WorkerError> {
+        resolve_commit(runner, context, reference)
+    }
+
     pub fn open_or_create(cache_root: &Path, user_common_dir: &Path) -> Result<Self, WorkerError> {
         let repo_id = repo_id_for(user_common_dir)?;
         let alternates_target =

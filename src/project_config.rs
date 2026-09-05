@@ -301,23 +301,23 @@ fn default_task_permissions() -> BTreeMap<String, String> {
 }
 
 fn validate_task_settings(raw: RawTaskSettings) -> Result<TaskSettings, WorkerError> {
-    if raw.source != "local" {
+    if !matches!(raw.source.as_str(), "local" | "origin") {
         return Err(task_config(
-            "source origin is deferred to a later plan (TASK_CONFIG_INVALID)",
+            "task source must be local or origin (TASK_CONFIG_INVALID)",
         ));
     }
     let mut publish = Vec::new();
     for mode in raw.publish {
-        if mode != "fetch" {
+        if !matches!(mode.as_str(), "fetch" | "push") {
             return Err(task_config(
-                "publish push is deferred to a later plan (TASK_CONFIG_INVALID)",
+                "task publish mode must be fetch or push (TASK_CONFIG_INVALID)",
             ));
         }
         if !publish.iter().any(|existing| existing == &mode) {
             publish.push(mode);
         }
     }
-    if publish != ["fetch"] {
+    if !publish.iter().any(|mode| mode == "fetch") {
         return Err(task_config(
             "publish fetch is required for every task (TASK_CONFIG_INVALID)",
         ));

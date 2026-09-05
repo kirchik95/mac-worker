@@ -4,7 +4,7 @@ mod support;
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
-    process,
+    process::{self, Command},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -30,7 +30,7 @@ use mac_worker::{
         SupervisorFaultPoint, SystemProcessInspector,
     },
     task::{
-        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
+        BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
         TaskMetaInput, TaskOutcome, TaskSource, TaskState,
     },
     task_store::{TaskCancelRequest, TaskPrepareRequest, TaskStore},
@@ -167,6 +167,45 @@ fn prepared_task_turn(
     mac_worker::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
+    prepared_task_turn_with_options(
+        script,
+        TaskSource::Local { wip: false },
+        vec![PublishMode::Fetch],
+        None,
+        None,
+    )
+}
+
+fn prepared_push_task_turn(
+    script: &str,
+    origin: &str,
+) -> (
+    tempfile::TempDir,
+    HostStore,
+    mac_worker::turn::TaskTurnRequest,
+    TaskCancelRequest,
+) {
+    prepared_task_turn_with_options(
+        script,
+        TaskSource::Local { wip: false },
+        vec![PublishMode::Fetch, PublishMode::Push],
+        Some("release-candidate".parse().unwrap()),
+        Some(origin.to_owned()),
+    )
+}
+
+fn prepared_task_turn_with_options(
+    script: &str,
+    task_source: TaskSource,
+    publish: Vec<PublishMode>,
+    publish_branch: Option<BranchName>,
+    origin_url: Option<String>,
+) -> (
+    tempfile::TempDir,
+    HostStore,
+    mac_worker::turn::TaskTurnRequest,
+    TaskCancelRequest,
+) {
     let temp = tempdir().unwrap();
     let store = HostStore::open(&temp.path().join("host")).unwrap();
     let source = GitRepo::init();
@@ -252,9 +291,9 @@ fn prepared_task_turn(
         agent: AgentKind::Codex,
         model: None,
         policy: PermissionPolicy::Workspace,
-        source: TaskSource::Local { wip: false },
-        publish: vec![PublishMode::Fetch],
-        publish_branch: None,
+        source: task_source,
+        publish,
+        publish_branch,
         base_oid,
         limits: TaskLimits::new(turn_limits, 3).unwrap(),
         close_policy: ClosePolicy::Never,
@@ -276,11 +315,13 @@ fn prepared_task_turn(
     drop(transfer);
     drop(admission);
 
-    let request = mac_worker::turn::TaskTurnRequest::new(
+    let request = mac_worker::turn::TaskTurnRequest::new_with_origin(
         mac_worker::job::SubmitRequest::new(projected),
         turn,
         prompt,
-    );
+        origin_url,
+    )
+    .unwrap();
     let cancel = TaskCancelRequest::new(PROJECT_ID, task_id(), job_id);
     (temp, store, request, cancel)
 }
@@ -342,6 +383,80 @@ fn turn_material_round_trips_canonically() {
     let decoded: TurnMaterial = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(decoded, original);
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+}
+
+#[test]
+fn task_turn_publication_origin_survives_the_canonical_turn_payload() {
+    let (_temp, _store, request, _cancel) = prepared_task_turn("exit 0");
+    let request = TaskTurnRequest::new_with_origin(
+        request.submit().clone(),
+        request.turn().clone(),
+        request.prompt(),
+        Some("https://example.test/repo.git".into()),
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&request).unwrap();
+    let parsed: TaskTurnRequest = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        parsed.origin_url(),
+        Some("https://example.test/repo.git"),
+        "the worker push target must survive the durable request boundary"
+    );
+    assert!(
+        TaskTurnRequest::new_with_origin(
+            request.submit().clone(),
+            request.turn().clone(),
+            request.prompt(),
+            Some("https://USER:secret@EXAMPLE.test/repo.git?token=secret".into()),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn failed_origin_push_keeps_task_open_and_retains_the_mirror_branch() {
+    let origin = "ssh://127.0.0.1:1/repo.git";
+    let script = r#"printf changed > agent.txt; printf '%s\n' '{"type":"thread.started","thread_id":"session-push"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"push attempt\",\"questions\":[],\"files_changed\":[]}"}}'"#;
+    let (_temp, store, request, _cancel) = prepared_push_task_turn(script, origin);
+    let launcher = InlineTurnLauncher {
+        store: store.clone(),
+        fault: None,
+    };
+
+    let error = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "PUBLISH_FAILED");
+    let status = store.task_status(PROJECT_ID, task_id()).unwrap();
+    assert_eq!(status.state(), TaskState::Open);
+    assert!(matches!(
+        status.last_outcome(),
+        Some(TaskOutcome::Failed { reason }) if reason == "PUBLISH_FAILED"
+    ));
+    assert!(
+        store
+            .task_workspace_if_present(PROJECT_ID, task_id())
+            .unwrap()
+            .is_some()
+    );
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    let branch = format!("refs/heads/task/{}", task_id());
+    let branch_exists = Command::new("/usr/bin/git")
+        .args([
+            "--git-dir",
+            &mirror.path().to_string_lossy(),
+            "show-ref",
+            "--verify",
+            &branch,
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(
+        branch_exists,
+        "publisher must retain the mirror result branch"
+    );
 }
 
 #[test]

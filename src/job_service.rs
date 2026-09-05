@@ -28,6 +28,7 @@ use crate::{
         ProcessObservation, ReconciliationRuntime, SystemReconciliationRuntime,
         reconcile_orphan_processes, terminate_exact_recorded_group,
     },
+    task::{PublishMode, TaskSource},
     task_store::{TaskCancelRequest, TaskStore},
     turn::{
         TaskTurnRequest, TaskTurnResponse, TerminalPath, TurnReceipt, TurnSection, TurnTerminalHook,
@@ -543,8 +544,13 @@ impl<'a> JobService<'a> {
                 "resumed turn requires a bound agent session",
             ));
         }
-        let section =
-            TurnSection::new(turn.clone(), meta.project_id(), meta.git_identity().clone())?;
+        validate_turn_origin(&meta, request.origin_url())?;
+        let section = TurnSection::new_with_origin(
+            turn.clone(),
+            meta.project_id(),
+            meta.git_identity().clone(),
+            request.origin_url().map(str::to_owned),
+        )?;
         if let Some((job_meta, initial_status)) =
             self.read_repairable_turn_final(&submit, &lease, &section)?
         {
@@ -3114,6 +3120,30 @@ fn require_exact_meta(
         ));
     }
     Ok(())
+}
+
+fn validate_turn_origin(
+    meta: &crate::task::TaskMeta,
+    origin_url: Option<&str>,
+) -> Result<(), WorkerError> {
+    let pushing = meta.publish().contains(&PublishMode::Push);
+    match (meta.source(), pushing, origin_url) {
+        (TaskSource::Origin { url }, true, Some(actual)) if actual == url => Ok(()),
+        (TaskSource::Local { .. }, true, Some(_)) => Ok(()),
+        (_, false, None) => Ok(()),
+        (_, true, None) => Err(protocol_code(
+            "REQUEST_CONFLICT",
+            "push publication has no origin target",
+        )),
+        (_, false, Some(_)) => Err(protocol_code(
+            "REQUEST_CONFLICT",
+            "turn has an unexpected origin target",
+        )),
+        (TaskSource::Origin { .. }, true, Some(_)) => Err(protocol_code(
+            "REQUEST_CONFLICT",
+            "turn origin target does not match the task",
+        )),
+    }
 }
 
 fn relative(path: &str) -> Result<RelativePath, WorkerError> {

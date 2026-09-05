@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 mod support;
 
+use std::os::unix::process::ExitStatusExt;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 use mac_worker::{
@@ -142,6 +143,70 @@ fn prepare_task(store: &HostStore, base_oid: BaseOid) {
     TaskStore::new(store, &SystemProcessRunner)
         .prepare(&prepare_request(base_oid), &transfer)
         .unwrap();
+}
+
+#[test]
+fn origin_prepare_fetches_the_exact_base_before_workspace_creation() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    store.mirror(PROJECT_ID).unwrap();
+    acquire_lease(&store);
+    let base_oid: BaseOid = "0123456789012345678901234567890123456789".parse().unwrap();
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id: task_id(),
+        run_id: None,
+        project_id: PROJECT_ID.into(),
+        worktree_id: WORKTREE_ID.into(),
+        agent: AgentKind::Codex,
+        model: None,
+        policy: PermissionPolicy::Workspace,
+        source: mac_worker::task::TaskSource::Origin {
+            url: "https://example.test/repo.git".into(),
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid: base_oid.clone(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+        title: None,
+        prompt: "prepare from origin".into(),
+        created_at_millis: 100,
+    })
+    .unwrap();
+    let runner =
+        support::recording_runner::RecordingRunner::returning(mac_worker::process::ProcessResult {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: b"origin unavailable".to_vec(),
+        });
+    let request = TaskPrepareRequest::new(meta, job_id(), "mini-1");
+    let error = {
+        let (_admission, transfer) = transfer_guard(&store);
+        TaskStore::new(&store, &runner)
+            .prepare(&request, &transfer)
+            .unwrap_err()
+    };
+    assert_eq!(error.public_code(), "BASE_UNAVAILABLE");
+    assert!(
+        store
+            .task_workspace_if_present(PROJECT_ID, task_id())
+            .unwrap()
+            .is_none()
+    );
+    let request = runner.single_request();
+    let args = request
+        .args
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(args.iter().any(|arg| arg == "fetch"));
+    assert!(
+        args.iter()
+            .any(|arg| arg == "https://example.test/repo.git")
+    );
+    assert!(args.iter().any(|arg| arg == base_oid.as_str()));
 }
 
 fn acquire_lease(store: &HostStore) {

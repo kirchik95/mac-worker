@@ -141,7 +141,7 @@ pub enum TaskCommand {
         #[arg(long, value_parser = non_empty_text)]
         source: Option<String>,
         #[arg(long, value_parser = non_empty_text)]
-        publish: Option<String>,
+        publish: Vec<String>,
         #[arg(long, value_parser = non_empty_text)]
         publish_branch: Option<String>,
         #[arg(long)]

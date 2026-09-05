@@ -11,13 +11,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwn
 use crate::{
     agent::AgentKind,
     error::WorkerError,
+    git_transport::GitTransport,
     host_store::{HostStore, TransferGuard},
     job::JobId,
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::PROTOCOL_VERSION,
     rooted_fs::RootedDir,
     task::{
-        BaseOid, TaskId, TaskMeta, TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal,
+        BaseOid, TaskId, TaskMeta, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary,
+        TurnTerminal,
     },
 };
 
@@ -539,10 +541,17 @@ impl<'a> TaskStore<'a> {
         let task_id = meta.task_id();
         // This is intentionally the first filesystem lookup under `tasks/`:
         // a missing or invalid base must not leave a task directory behind.
-        let mirror = self
-            .store
-            .mirror_if_present(meta.project_id())?
-            .ok_or_else(|| git_error("BASE_UNAVAILABLE", "project mirror is absent"))?;
+        let mirror = match meta.source() {
+            TaskSource::Origin { url } => {
+                let mirror = self.store.mirror(meta.project_id())?;
+                GitTransport::new(self.runner).fetch_origin(url, meta.base_oid(), &mirror)?;
+                mirror
+            }
+            TaskSource::Local { .. } => self
+                .store
+                .mirror_if_present(meta.project_id())?
+                .ok_or_else(|| git_error("BASE_UNAVAILABLE", "project mirror is absent"))?,
+        };
         self.verify_base(&mirror, meta.base_oid())?;
 
         let task = self

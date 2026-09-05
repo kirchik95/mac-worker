@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLaunch, TurnLimits, render_shell},
     error::WorkerError,
+    git_transport::GitTransport,
     host_store::{HostStore, PublicationReceipt, StagedJob, StagingNonce},
     job::JobId,
     job::{
@@ -25,7 +26,8 @@ use crate::{
     redaction::RedactionBoundary,
     rooted_fs::RootedDir,
     task::{
-        BaseOid, ClosePolicy, GitIdentity, TaskId, TaskMeta, TaskOutcome, TaskStatus, TurnTerminal,
+        BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskMeta, TaskOutcome,
+        TaskSource, TaskStatus, TurnTerminal,
     },
     task_store::{SessionBinding, TaskCloseRequest, TaskStore},
 };
@@ -287,6 +289,7 @@ pub struct TurnSection {
     turn: TurnMaterial,
     project_id: String,
     git_identity: GitIdentity,
+    origin_url: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -354,12 +357,23 @@ impl TurnSection {
         project_id: impl Into<String>,
         git_identity: GitIdentity,
     ) -> Result<Self, WorkerError> {
+        Self::new_with_origin(turn, project_id, git_identity, None)
+    }
+
+    pub fn new_with_origin(
+        turn: TurnMaterial,
+        project_id: impl Into<String>,
+        git_identity: GitIdentity,
+        origin_url: Option<String>,
+    ) -> Result<Self, WorkerError> {
         let section = Self {
             turn,
             project_id: project_id.into(),
             git_identity,
+            origin_url,
         };
         section.turn.validate()?;
+        validate_origin_url(section.origin_url.as_deref())?;
         if section.project_id.is_empty()
             || section.project_id.len() != 64
             || !section
@@ -383,14 +397,19 @@ impl TurnSection {
     pub fn git_identity(&self) -> &GitIdentity {
         &self.git_identity
     }
+
+    pub fn origin_url(&self) -> Option<&str> {
+        self.origin_url.as_deref()
+    }
 }
 
 impl serde::Serialize for TurnSection {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut record = serializer.serialize_struct("TurnSection", 3)?;
+        let mut record = serializer.serialize_struct("TurnSection", 4)?;
         record.serialize_field("turn", &self.turn)?;
         record.serialize_field("project_id", &self.project_id)?;
         record.serialize_field("git_identity", &self.git_identity)?;
+        record.serialize_field("origin_url", &self.origin_url)?;
         record.end()
     }
 }
@@ -403,9 +422,16 @@ impl<'de> serde::Deserialize<'de> for TurnSection {
             turn: TurnMaterial,
             project_id: String,
             git_identity: GitIdentity,
+            origin_url: Option<String>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        Self::new(wire.turn, wire.project_id, wire.git_identity).map_err(D::Error::custom)
+        Self::new_with_origin(
+            wire.turn,
+            wire.project_id,
+            wire.git_identity,
+            wire.origin_url,
+        )
+        .map_err(D::Error::custom)
     }
 }
 
@@ -414,6 +440,7 @@ pub struct TaskTurnRequest {
     submit: SubmitRequest,
     turn: TurnMaterial,
     prompt: String,
+    origin_url: Option<String>,
 }
 
 impl fmt::Debug for TaskTurnRequest {
@@ -433,12 +460,30 @@ impl TaskTurnRequest {
             submit,
             turn,
             prompt: prompt.into(),
+            origin_url: None,
         }
+    }
+
+    pub fn new_with_origin(
+        submit: SubmitRequest,
+        turn: TurnMaterial,
+        prompt: impl Into<String>,
+        origin_url: Option<String>,
+    ) -> Result<Self, WorkerError> {
+        let request = Self {
+            submit,
+            turn,
+            prompt: prompt.into(),
+            origin_url,
+        };
+        validate_origin_url(request.origin_url.as_deref())?;
+        Ok(request)
     }
 
     pub fn validate(&self) -> Result<(), WorkerError> {
         self.submit.validate()?;
         self.turn.validate()?;
+        validate_origin_url(self.origin_url.as_deref())?;
         let prompt = self.prompt.as_bytes();
         if prompt.len() > crate::task::MAX_PROMPT_BYTES {
             return Err(turn_error(
@@ -474,12 +519,17 @@ impl TaskTurnRequest {
         &self.prompt
     }
 
+    pub fn origin_url(&self) -> Option<&str> {
+        self.origin_url.as_deref()
+    }
+
     #[doc(hidden)]
     pub fn with_turn(&self, turn: TurnMaterial) -> Self {
         Self {
             submit: self.submit.clone(),
             turn,
             prompt: self.prompt.clone(),
+            origin_url: self.origin_url.clone(),
         }
     }
 
@@ -489,6 +539,7 @@ impl TaskTurnRequest {
             submit: self.submit.clone(),
             turn: self.turn.clone(),
             prompt: prompt.into(),
+            origin_url: self.origin_url.clone(),
         }
     }
 }
@@ -496,10 +547,11 @@ impl TaskTurnRequest {
 impl serde::Serialize for TaskTurnRequest {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("TaskTurnRequest", 3)?;
+        let mut record = serializer.serialize_struct("TaskTurnRequest", 4)?;
         record.serialize_field("submit", &self.submit)?;
         record.serialize_field("turn", &self.turn)?;
         record.serialize_field("prompt", &self.prompt)?;
+        record.serialize_field("origin_url", &self.origin_url)?;
         record.end()
     }
 }
@@ -512,9 +564,11 @@ impl<'de> serde::Deserialize<'de> for TaskTurnRequest {
             submit: SubmitRequest,
             turn: TurnMaterial,
             prompt: String,
+            origin_url: Option<String>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        let request = Self::new(wire.submit, wire.turn, wire.prompt);
+        let request = Self::new_with_origin(wire.submit, wire.turn, wire.prompt, wire.origin_url)
+            .map_err(D::Error::custom)?;
         request.validate().map_err(D::Error::custom)?;
         Ok(request)
     }
@@ -580,6 +634,7 @@ impl TurnTerminalHook {
             terminal,
             exit_code,
             log_truncated,
+            section.origin_url(),
         ) {
             Ok(result) => Ok(result),
             Err(error) => {
@@ -668,7 +723,11 @@ impl<'a> TurnPublisher<'a> {
             Some(_) => TurnTerminal::Failed,
             None => TurnTerminal::Lost,
         };
-        self.publish_with_terminal(task, turn_dir, terminal, exit_code, false)
+        let origin_url = match task.meta().source() {
+            TaskSource::Origin { url } => Some(url.as_str()),
+            TaskSource::Local { .. } => None,
+        };
+        self.publish_with_terminal(task, turn_dir, terminal, exit_code, false, origin_url)
     }
 
     pub(crate) fn publish_with_terminal(
@@ -678,6 +737,7 @@ impl<'a> TurnPublisher<'a> {
         terminal: TurnTerminal,
         exit_code: Option<i32>,
         log_truncated: bool,
+        origin_url: Option<&str>,
     ) -> Result<TurnResult, WorkerError> {
         let meta = task.meta();
         let turn_id = task
@@ -729,6 +789,25 @@ impl<'a> TurnPublisher<'a> {
         let agent_outcome = adapter.classify(exit_code, structured.status());
         let outcome = TaskOutcome::from_turn(terminal, Some(agent_outcome));
         let close = meta.close_policy() == ClosePolicy::Done && outcome == TaskOutcome::Done;
+        if meta.publish().contains(&PublishMode::Push) {
+            let origin_url = origin_url.ok_or_else(|| {
+                turn_error("PUBLISH_FAILED", "push publication has no origin target")
+            })?;
+            let mirror = self
+                .store
+                .mirror_if_present(meta.project_id())?
+                .ok_or_else(|| turn_error("PUBLISH_FAILED", "project mirror is absent"))?;
+            let branch = meta
+                .publish_branch()
+                .cloned()
+                .unwrap_or_else(|| BranchName::for_task(meta.task_id()));
+            GitTransport::new(self.runner).push_origin(
+                origin_url,
+                meta.task_id(),
+                &branch,
+                &mirror,
+            )?;
+        }
         let boundary = RedactionBoundary::from_env();
         let summary = nonempty(&boundary.summary(structured.summary()));
         let questions = boundary.questions(structured.questions());
@@ -1227,6 +1306,21 @@ fn validate_hex(value: &str, label: &str) -> Result<(), WorkerError> {
 fn validate_text(value: &str, max: usize, label: &str) -> Result<(), WorkerError> {
     if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
         return Err(turn_error("TURN_INVALID", format!("{label} is invalid")));
+    }
+    Ok(())
+}
+
+fn validate_origin_url(origin: Option<&str>) -> Result<(), WorkerError> {
+    let Some(origin) = origin else {
+        return Ok(());
+    };
+    let normalized = crate::project::normalize_origin(origin)
+        .map_err(|_| turn_error("TURN_INVALID", "turn origin URL is invalid"))?;
+    if normalized != origin {
+        return Err(turn_error(
+            "TURN_INVALID",
+            "turn origin URL is not normalized",
+        ));
     }
     Ok(())
 }

@@ -520,6 +520,10 @@ impl TaskMeta {
         &self.publish
     }
 
+    pub fn publish_branch(&self) -> Option<&BranchName> {
+        self.publish_branch.as_ref()
+    }
+
     pub fn base_oid(&self) -> &BaseOid {
         &self.base_oid
     }
@@ -580,17 +584,36 @@ impl TaskMeta {
     }
 
     fn validate_core_scope(&self) -> Result<(), WorkerError> {
-        if matches!(self.source, TaskSource::Origin { .. }) {
-            return Err(task_config("source origin is deferred to a later plan"));
+        if let TaskSource::Origin { url } = &self.source {
+            let normalized = crate::project::normalize_origin(url)
+                .map_err(|_| task_config("origin URL is invalid or not in normalized form"))?;
+            if normalized != *url {
+                return Err(task_config(
+                    "origin URL is invalid or not in normalized form",
+                ));
+            }
         }
         if !self.publish.contains(&PublishMode::Fetch) {
             return Err(task_config("publish fetch is required for every task"));
         }
-        if self.publish.contains(&PublishMode::Push) {
-            return Err(task_config("publish push is deferred to a later plan"));
+        if matches!(self.source, TaskSource::Local { wip: true })
+            && self.publish.contains(&PublishMode::Push)
+        {
+            return Err(WorkerError::Task {
+                code: "PUBLISH_REQUIRES_COMMITTED_BASE",
+                message: "publish push requires a committed base".into(),
+            });
         }
-        if self.publish_branch.is_some() {
-            return Err(task_config("publish branch is deferred to a later plan"));
+        if self
+            .publish
+            .iter()
+            .enumerate()
+            .any(|(index, mode)| self.publish[..index].contains(mode))
+        {
+            return Err(task_config("publish modes must be unique"));
+        }
+        if self.publish_branch.is_some() && !self.publish.contains(&PublishMode::Push) {
+            return Err(task_config("publish branch requires publish push"));
         }
         Ok(())
     }
@@ -1263,6 +1286,7 @@ pub struct RunRecord {
     task_ids: Vec<TaskId>,
     max_parallel: u32,
     created_at_millis: u64,
+    reserved_publish_branches: Vec<BranchName>,
 }
 
 impl RunRecord {
@@ -1279,6 +1303,7 @@ impl RunRecord {
             task_ids,
             max_parallel,
             created_at_millis,
+            reserved_publish_branches: Vec::new(),
         };
         record.validate()?;
         Ok(record)
@@ -1308,12 +1333,44 @@ impl RunRecord {
         self.created_at_millis
     }
 
+    pub fn publish_branches(&self) -> &[BranchName] {
+        &self.reserved_publish_branches
+    }
+
+    pub fn reserve_publish_branch(&self, branch: BranchName) -> Result<Self, WorkerError> {
+        if self.reserved_publish_branches.contains(&branch) {
+            return Err(task_config(
+                "publish branch is already reserved in this run",
+            ));
+        }
+        let mut replacement = self.clone();
+        replacement.reserved_publish_branches.push(branch);
+        replacement.validate()?;
+        Ok(replacement)
+    }
+
+    pub fn release_publish_branch(&self, branch: &BranchName) -> Self {
+        let mut replacement = self.clone();
+        replacement
+            .reserved_publish_branches
+            .retain(|reserved| reserved != branch);
+        replacement
+    }
+
     fn validate(&self) -> Result<(), WorkerError> {
         if let Some(name) = &self.name {
             validate_optional_text(name, MAX_TITLE_BYTES, "run name")?;
         }
         if self.max_parallel == 0 {
             return Err(task_config("max_parallel must be greater than zero"));
+        }
+        if self
+            .reserved_publish_branches
+            .iter()
+            .enumerate()
+            .any(|(index, branch)| self.reserved_publish_branches[..index].contains(branch))
+        {
+            return Err(task_config("publish branches must be unique in a run"));
         }
         Ok(())
     }
@@ -1322,12 +1379,13 @@ impl RunRecord {
 impl Serialize for RunRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("RunRecord", 5)?;
+        let mut record = serializer.serialize_struct("RunRecord", 6)?;
         record.serialize_field("run_id", &self.run_id)?;
         record.serialize_field("name", &self.name)?;
         record.serialize_field("task_ids", &self.task_ids)?;
         record.serialize_field("max_parallel", &self.max_parallel)?;
         record.serialize_field("created_at_millis", &self.created_at_millis)?;
+        record.serialize_field("reserved_publish_branches", &self.reserved_publish_branches)?;
         record.end()
     }
 }
@@ -1342,16 +1400,23 @@ impl<'de> Deserialize<'de> for RunRecord {
             task_ids: Vec<TaskId>,
             max_parallel: u32,
             created_at_millis: u64,
+            reserved_publish_branches: Vec<BranchName>,
         }
         let wire: Wire = deserialize_unique_object(deserializer)?;
-        Self::new(
+        let mut record = Self::new(
             wire.run_id,
             wire.name,
             wire.task_ids,
             wire.max_parallel,
             wire.created_at_millis,
         )
-        .map_err(de::Error::custom)
+        .map_err(de::Error::custom)?;
+        for branch in wire.reserved_publish_branches {
+            record = record
+                .reserve_publish_branch(branch)
+                .map_err(de::Error::custom)?;
+        }
+        Ok(record)
     }
 }
 

@@ -94,7 +94,7 @@ impl<'a> ProjectInspector<'a> {
         let head = self.optional_utf8_scalar(cwd, &["rev-parse", "--verify", "HEAD"])?;
         let branch =
             self.optional_utf8_scalar(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-        let origin = self.optional_utf8_scalar(cwd, &["config", "--get", "remote.origin.url"])?;
+        let origin = self.normalized_origin(cwd)?;
 
         let project_id = match origin {
             Some(origin) => hash_identity(b"origin\0", normalize_origin(&origin)?.as_bytes()),
@@ -113,6 +113,15 @@ impl<'a> ProjectInspector<'a> {
             worktree_id,
             dirty,
         })
+    }
+
+    /// Returns the project's origin in the canonical form used by task
+    /// records and worker capability requirements.  The raw Git config value
+    /// is deliberately never returned to callers.
+    pub fn normalized_origin(&self, cwd: &Path) -> Result<Option<String>, WorkerError> {
+        self.optional_utf8_scalar(cwd, &["config", "--get", "remote.origin.url"])?
+            .map(|origin| normalize_origin(&origin))
+            .transpose()
     }
 
     fn required_path(
@@ -224,7 +233,7 @@ fn parse_scalar(output: &[u8]) -> Result<Vec<u8>, WorkerError> {
     Ok(scalar.to_vec())
 }
 
-fn normalize_origin(origin: &str) -> Result<String, WorkerError> {
+pub fn normalize_origin(origin: &str) -> Result<String, WorkerError> {
     if let Ok(mut url) = Url::parse(origin)
         && matches!(url.scheme(), "http" | "https" | "ssh")
     {
@@ -253,6 +262,22 @@ fn normalize_origin(origin: &str) -> Result<String, WorkerError> {
     }
 
     Err(invalid_origin())
+}
+
+pub fn origin_host(origin: &str) -> Result<String, WorkerError> {
+    let normalized = normalize_origin(origin)?;
+    if let Ok(url) = Url::parse(&normalized) {
+        return url
+            .host_str()
+            .map(str::to_owned)
+            .filter(|host| !host.is_empty())
+            .ok_or_else(invalid_origin);
+    }
+    normalized
+        .split_once(':')
+        .map(|(host, _)| host.to_owned())
+        .filter(|host| !host.is_empty())
+        .ok_or_else(invalid_origin)
 }
 
 fn hash_identity(prefix: &[u8], value: &[u8]) -> String {

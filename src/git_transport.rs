@@ -14,7 +14,7 @@ use crate::{
     job::{ClientId, JobId, LeaseToken, RequestFingerprint},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     rooted_fs::RootedDir,
-    task::{BaseOid, TaskId},
+    task::{BaseOid, BranchName, TaskId},
     transfer::TransferIdentity,
     transfer_repo::ImportReceipt,
     transport::SshTransport,
@@ -28,6 +28,8 @@ const GIT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const GIT_CONFIG_GLOBAL: &str = "GIT_CONFIG_GLOBAL";
 const GIT_CONFIG_NOSYSTEM: &str = "GIT_CONFIG_NOSYSTEM";
 const GIT_TERMINAL_PROMPT: &str = "GIT_TERMINAL_PROMPT";
+const ORIGIN_PREFLIGHT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+const ORIGIN_PREFLIGHT_DEADLINE: Duration = Duration::from_secs(30);
 
 pub const PRE_RECEIVE_HOOK: &str = "#!/bin/sh\nstatus=0\nwhile read old new ref; do\n  case \"$ref\" in refs/mac-worker/bases/*) ;; *) echo \"mac-worker: ref not allowed: $ref\" >&2; status=1;; esac\n  case \"$new\" in 0000000000000000000000000000000000000000) echo \"mac-worker: deletion not allowed\" >&2; status=1;; esac\ndone\nexit $status\n";
 
@@ -93,6 +95,103 @@ impl<'a> GitTransport<'a> {
                 .or_else(|| parse_objects_written(&result.stderr))
                 .unwrap_or(0),
         })
+    }
+
+    /// Checks the advertised refs of a normalized origin for one exact
+    /// object ID.  The remote output is treated as untrusted transport data:
+    /// only the equality result is returned to the task layer.
+    pub fn preflight_origin(&self, origin: &str, base: &BaseOid) -> Result<(), WorkerError> {
+        let normalized = crate::project::normalize_origin(origin)
+            .map_err(|_| git_error("BASE_NOT_ON_ORIGIN", "origin URL is invalid"))?;
+        let result = self
+            .runner
+            .run(&origin_request(normalized))
+            .map_err(|_| git_error("BASE_NOT_ON_ORIGIN", "origin did not advertise the base"))?;
+        if !result.status.success() {
+            return Err(git_error(
+                "BASE_NOT_ON_ORIGIN",
+                "origin did not advertise the base",
+            ));
+        }
+        let advertised = result.stdout.split(|byte| *byte == b'\n').any(|line| {
+            std::str::from_utf8(line)
+                .ok()
+                .and_then(|line| line.split_ascii_whitespace().next())
+                == Some(base.as_str())
+        });
+        if advertised {
+            Ok(())
+        } else {
+            Err(git_error(
+                "BASE_NOT_ON_ORIGIN",
+                "origin did not advertise the base",
+            ))
+        }
+    }
+
+    /// Fetches one exact origin object into a worker-owned bare mirror.  The
+    /// caller supplies the mirror selected by the rooted host store; this
+    /// operation never accepts a remote repository path or refspec.
+    pub fn fetch_origin(
+        &self,
+        origin: &str,
+        base: &BaseOid,
+        mirror: &RootedDir,
+    ) -> Result<(), WorkerError> {
+        let normalized = crate::project::normalize_origin(origin)
+            .map_err(|_| git_error("BASE_UNAVAILABLE", "origin URL is invalid"))?;
+        let result = self
+            .runner
+            .run(&git_request(
+                mirror.path(),
+                None,
+                vec![
+                    OsString::from("fetch"),
+                    OsString::from("--no-write-fetch-head"),
+                    normalized.into(),
+                    base.to_string().into(),
+                ],
+            ))
+            .map_err(|_| git_error("BASE_UNAVAILABLE", "origin base fetch failed"))?;
+        if result.status.success() {
+            Ok(())
+        } else {
+            Err(git_error("BASE_UNAVAILABLE", "origin base fetch failed"))
+        }
+    }
+
+    /// Publishes the durable mirror result branch to one normalized origin
+    /// branch.  The source ref is derived from the task ID and cannot be
+    /// supplied by the caller.
+    pub fn push_origin(
+        &self,
+        origin: &str,
+        task_id: TaskId,
+        branch: &BranchName,
+        mirror: &RootedDir,
+    ) -> Result<(), WorkerError> {
+        let normalized = crate::project::normalize_origin(origin)
+            .map_err(|_| git_error("PUBLISH_FAILED", "origin URL is invalid"))?;
+        let source = format!("refs/heads/task/{task_id}");
+        let destination = format!("{source}:refs/heads/{branch}");
+        let result = self
+            .runner
+            .run(&git_request(
+                mirror.path(),
+                None,
+                vec![
+                    OsString::from("push"),
+                    OsString::from("--no-verify"),
+                    normalized.into(),
+                    destination.into(),
+                ],
+            ))
+            .map_err(|_| git_error("PUBLISH_FAILED", "origin publication failed"))?;
+        if result.status.success() {
+            Ok(())
+        } else {
+            Err(git_error("PUBLISH_FAILED", "origin publication failed"))
+        }
     }
 
     pub fn fetch_result(
@@ -365,6 +464,35 @@ fn git_request(
             stdout_limit: GIT_OUTPUT_LIMIT,
             stderr_limit: GIT_OUTPUT_LIMIT,
             deadline: GIT_DEADLINE,
+        },
+    }
+}
+
+fn origin_request(origin: String) -> ProcessRequest {
+    ProcessRequest {
+        program: GIT_PROGRAM.into(),
+        args: vec![OsString::from("ls-remote"), origin.into()],
+        environment: vec![
+            (GIT_CONFIG_GLOBAL.into(), "/dev/null".into()),
+            (GIT_CONFIG_NOSYSTEM.into(), "1".into()),
+            (GIT_TERMINAL_PROMPT.into(), "0".into()),
+        ],
+        environment_remove: vec![
+            "GIT_DIR".into(),
+            "GIT_WORK_TREE".into(),
+            "GIT_INDEX_FILE".into(),
+            "GIT_COMMON_DIR".into(),
+            "GIT_OBJECT_DIRECTORY".into(),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES".into(),
+            "GIT_CEILING_DIRECTORIES".into(),
+            "GIT_CONFIG_COUNT".into(),
+            "GIT_CONFIG_PARAMETERS".into(),
+        ],
+        stdin: None,
+        policy: ProcessPolicy {
+            stdout_limit: ORIGIN_PREFLIGHT_OUTPUT_LIMIT,
+            stderr_limit: GIT_OUTPUT_LIMIT,
+            deadline: ORIGIN_PREFLIGHT_DEADLINE,
         },
     }
 }
