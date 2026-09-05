@@ -5,7 +5,10 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     process::{self, Command},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -111,6 +114,21 @@ impl SupervisorLauncher for InlineTurnLauncher {
     }
 }
 
+struct CountingFailingLauncher {
+    launches: Arc<AtomicUsize>,
+}
+
+impl SupervisorLauncher for CountingFailingLauncher {
+    fn launch(
+        &self,
+        _job_id: JobId,
+        _guard: mac_worker::host_store::SupervisorGuard,
+    ) -> Result<LaunchCandidate, WorkerError> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        Err(WorkerError::Protocol("test launcher was invoked".into()))
+    }
+}
+
 struct FastReconciliationRuntime {
     clock: Mutex<Duration>,
 }
@@ -198,6 +216,18 @@ fn prepared_push_task_turn(
         Some("release-candidate".parse().unwrap()),
         Some(origin.to_owned()),
     )
+}
+
+fn request_with_mismatched_origin(
+    request: &mac_worker::turn::TaskTurnRequest,
+) -> mac_worker::turn::TaskTurnRequest {
+    mac_worker::turn::TaskTurnRequest::new_with_origin(
+        request.submit().clone(),
+        request.turn().clone(),
+        request.prompt(),
+        Some("https://other.example.test/repo.git".into()),
+    )
+    .unwrap()
 }
 
 fn prepared_task_turn_with_options(
@@ -441,6 +471,157 @@ fn local_push_turn_rejects_a_target_other_than_the_pinned_origin() {
     .submit_turn(mismatched)
     .unwrap_err();
     assert_eq!(error.public_code(), "REQUEST_CONFLICT");
+}
+
+#[test]
+fn accepted_origin_mismatch_replay_returns_conflict_before_launch() {
+    let (_temp, store, request, _cancel) =
+        prepared_push_task_turn("exit 0", "ssh://127.0.0.1:1/repo.git");
+    let setup_launches = Arc::new(AtomicUsize::new(0));
+    assert!(
+        JobService::new(
+            &store,
+            &CountingFailingLauncher {
+                launches: setup_launches.clone(),
+            },
+        )
+        .submit_turn(request.clone())
+        .is_err()
+    );
+    assert_eq!(setup_launches.load(Ordering::SeqCst), 1);
+
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    let status_before = fs::read(job_path.join("status.json")).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<JobStatus>(&status_before)
+            .unwrap()
+            .state(),
+        JobState::Accepted
+    );
+    let mismatched = request_with_mismatched_origin(&request);
+    assert_eq!(
+        mismatched.submit().request_fingerprint(),
+        request.submit().request_fingerprint()
+    );
+    let replay_launches = Arc::new(AtomicUsize::new(0));
+    let error = JobService::new(
+        &store,
+        &CountingFailingLauncher {
+            launches: replay_launches.clone(),
+        },
+    )
+    .submit_turn(mismatched)
+    .unwrap_err();
+
+    assert_eq!(error.public_code(), "REQUEST_CONFLICT");
+    assert_eq!(replay_launches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fs::read(job_path.join("status.json")).unwrap(),
+        status_before
+    );
+}
+
+#[test]
+fn running_origin_mismatch_replay_returns_conflict_before_launch() {
+    let script = "sleep 3; printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"session-origin-running\"}' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"done\\\",\\\"summary\\\":\\\"finished\\\",\\\"questions\\\":[],\\\"files_changed\\\":[]}\"}}'";
+    let (_temp, store, request, _cancel) =
+        prepared_push_task_turn(script, "ssh://127.0.0.1:1/repo.git");
+    let submit_store = store.clone();
+    let submit_request = request.clone();
+    let submit = thread::spawn(move || {
+        JobService::new(
+            &submit_store,
+            &InlineTurnLauncher {
+                store: submit_store.clone(),
+                fault: None,
+            },
+        )
+        .submit_turn(submit_request)
+    });
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let running = fs::read(job_path.join("status.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<JobStatus>(&bytes).ok())
+            .is_some_and(|status| status.state() == JobState::Running);
+        if running {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = submit.join();
+            panic!("inline supervisor did not publish Running before the deadline");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let status_before = fs::read(job_path.join("status.json")).unwrap();
+    let replay_launches = Arc::new(AtomicUsize::new(0));
+    let error = JobService::new(
+        &store,
+        &CountingFailingLauncher {
+            launches: replay_launches.clone(),
+        },
+    )
+    .submit_turn(request_with_mismatched_origin(&request))
+    .unwrap_err();
+
+    assert_eq!(error.public_code(), "REQUEST_CONFLICT");
+    assert_eq!(replay_launches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fs::read(job_path.join("status.json")).unwrap(),
+        status_before
+    );
+    let _ = submit.join().expect("running submit thread panicked");
+}
+
+#[test]
+fn terminal_origin_mismatch_replay_returns_conflict_before_recovery() {
+    let script = r#"printf '%s\n' '{"type":"thread.started","thread_id":"session-origin-terminal"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"finished\",\"questions\":[],\"files_changed\":[]}"}}'"#;
+    let (_temp, store, request, _cancel) =
+        prepared_push_task_turn(script, "ssh://127.0.0.1:1/repo.git");
+    assert!(
+        JobService::new(
+            &store,
+            &InlineTurnLauncher {
+                store: store.clone(),
+                fault: None,
+            },
+        )
+        .submit_turn(request.clone())
+        .is_err()
+    );
+
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    let status_before = fs::read(job_path.join("status.json")).unwrap();
+    assert!(
+        serde_json::from_slice::<JobStatus>(&status_before)
+            .unwrap()
+            .state()
+            .is_terminal()
+    );
+    let replay_launches = Arc::new(AtomicUsize::new(0));
+    let error = JobService::new(
+        &store,
+        &CountingFailingLauncher {
+            launches: replay_launches.clone(),
+        },
+    )
+    .submit_turn(request_with_mismatched_origin(&request))
+    .unwrap_err();
+
+    assert_eq!(error.public_code(), "REQUEST_CONFLICT");
+    assert_eq!(replay_launches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fs::read(job_path.join("status.json")).unwrap(),
+        status_before
+    );
 }
 
 #[test]

@@ -16,7 +16,10 @@ use mac_worker::{
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project_state::ProjectState,
-    scheduler::{CandidateSlot, WorkerPreference},
+    scheduler::{
+        AffinityHints, CandidateObservation, CandidateRejection, CandidateSlot, SchedulerPolicy,
+        Selection, WorkerPreference,
+    },
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
     },
@@ -280,6 +283,66 @@ fn task_record(
     .unwrap()
 }
 
+fn origin_queued_task_record(
+    task_id: TaskId,
+    turn_id: JobId,
+    project_id: String,
+    worktree_id: String,
+    runner: ProcessIdentity,
+) -> LocalTaskRecord {
+    let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id,
+        run_id: None,
+        project_id,
+        worktree_id,
+        agent: AgentKind::Codex,
+        model: None,
+        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        source: TaskSource::Origin {
+            url: "https://origin.example.test/repo.git".into(),
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid: base_oid.clone(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("mac-worker", "mac-worker@example.test").unwrap(),
+        title: None,
+        prompt: "fixture origin task".into(),
+        created_at_millis: 1,
+    })
+    .unwrap();
+    let pending = TurnSummary::new(1, turn_id, None, None, None, false, Some(1), None);
+    let status = TaskStatus::new(
+        TaskState::Queued,
+        None,
+        Some("mini-1".into()),
+        false,
+        Some(base_oid),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        vec![pending],
+        1,
+    )
+    .unwrap();
+    LocalTaskRecord::new(
+        meta,
+        status,
+        None,
+        Some(RunnerIdentity::new(runner)),
+        None,
+        PROJECT_ID.into(),
+        None,
+        true,
+        None,
+    )
+    .unwrap()
+}
+
 impl Fixture {
     fn open() -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -411,6 +474,75 @@ fn active_task(store: &ClientStateStore, task_number: u128, turn_id: JobId) {
             .unwrap(),
         )
         .unwrap();
+}
+
+#[test]
+fn reconcile_requeues_fetch_only_origin_task_with_pinned_origin_requirement() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let task_id = TaskId::new(Uuid::from_u128(900));
+    let turn_id = job(901);
+    let record = origin_queued_task_record(
+        task_id,
+        turn_id,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        owner(900),
+    );
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+    store.create_task(record).unwrap();
+    store
+        .write_turn_prompt(task_id, turn_id, "fixture prompt")
+        .unwrap();
+
+    let config = task_config();
+    let executor = InlineRunnerExecutor;
+    TaskClient::new(&remote, &config, &paths, &store, &executor)
+        .reconcile_runners()
+        .unwrap();
+
+    let entry = store
+        .queue_entry_for_task_turn(task_id)
+        .unwrap()
+        .expect("missing queued turn must be reconstructed");
+    assert!(
+        entry
+            .requirements()
+            .contains(&"origin:origin.example.test".to_owned())
+    );
+
+    let worker_without_origin = CandidateObservation::new(
+        "mini-1".into(),
+        true,
+        CandidateSlot::Idle,
+        entry
+            .requirements()
+            .iter()
+            .filter(|requirement| requirement.as_str() != "origin:origin.example.test")
+            .cloned()
+            .collect(),
+        Some(8 * 1024 * 1024 * 1024),
+        64 * 1024 * 1024 * 1024,
+    )
+    .unwrap();
+    assert!(matches!(
+        SchedulerPolicy::select(
+            &[worker_without_origin],
+            entry.requirements(),
+            entry.preference(),
+            &AffinityHints::none(),
+        ),
+        Selection::NoEligible { rejections }
+            if rejections == vec![CandidateRejection::MissingCapabilities {
+                name: "mini-1".into(),
+                missing: vec!["origin:origin.example.test".into()],
+            }]
+    ));
 }
 
 #[test]
