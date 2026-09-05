@@ -1757,21 +1757,24 @@ impl RootedDir {
             expected,
             replacement,
             || Ok(()),
+            || Ok(()),
             before_final_sync,
         )
     }
 
-    pub(crate) fn replace_private_regular_exact_with_sync_hooks<F, G>(
+    pub(crate) fn replace_private_regular_exact_with_sync_hooks<F, G, H>(
         &self,
         name: &str,
         expected: &[u8],
         replacement: &[u8],
+        before_exchange: H,
         after_exchange_before_first_sync: G,
         before_final_sync: F,
     ) -> io::Result<()>
     where
         F: FnOnce() -> io::Result<()>,
         G: FnOnce() -> io::Result<()>,
+        H: FnOnce() -> io::Result<()>,
     {
         self.verify_root_name()?;
         let target = CString::new(name).map_err(interior_nul_error)?;
@@ -1816,6 +1819,7 @@ impl RootedDir {
             let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
             return Err(os_error(libc::ESTALE));
         }
+        before_exchange()?;
         if let Err(error) = exchange_entries(
             self.root.as_raw_fd(),
             &temporary,

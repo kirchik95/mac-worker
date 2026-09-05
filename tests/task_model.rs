@@ -1,9 +1,19 @@
 #[allow(dead_code)]
 mod support;
 
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
+
 use mac_worker::{
     agent::{AdapterError, AgentKind, AgentOutcome, PermissionPolicy, TurnLimits},
-    client_state::ClientStateStore,
+    client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore},
     error::{ExitKind, WorkerError},
     job::{JobId, ProcessIdentity},
     task::{
@@ -123,6 +133,23 @@ fn sample_record() -> LocalTaskRecord {
         None,
     )
     .expect("fixture record")
+}
+
+struct PreExchangeReplacementGate {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    used: AtomicBool,
+}
+
+impl ClientStateConcurrencyHook for PreExchangeReplacementGate {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == ClientStateConcurrencyPoint::TaskReplacementPreExchange
+            && !self.used.swap(true, Ordering::SeqCst)
+        {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+    }
 }
 
 #[test]
@@ -490,6 +517,61 @@ fn task_records_require_the_always_on_fetch_publish_mode() {
     let error = TaskMeta::new(fields).unwrap_err();
     assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
     assert!(error.to_string().contains("fetch"), "{error}");
+}
+
+#[test]
+fn task_enumeration_waits_for_a_pre_exchange_replacement_writer() {
+    // Break caught: list_tasks recovered a staged replace-<uuid> entry while
+    // the writer still owned it, so the writer later failed its exact exchange.
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let (writer_entered_tx, writer_entered_rx) = mpsc::channel();
+    let (writer_release_tx, writer_release_rx) = mpsc::channel();
+    let state = Arc::new(
+        ClientStateStore::open_with_concurrency_hook(
+            &paths.state,
+            Arc::new(PreExchangeReplacementGate {
+                entered: writer_entered_tx,
+                release: Mutex::new(writer_release_rx),
+                used: AtomicBool::new(false),
+            }),
+        )
+        .unwrap(),
+    );
+    let original = sample_record();
+    let replacement = original.clone().with_runner(None).unwrap();
+    let expected = replacement.clone();
+    state.create_task(original).unwrap();
+
+    thread::scope(|scope| {
+        let writer_state = Arc::clone(&state);
+        let writer = scope.spawn(move || writer_state.update_task(replacement.clone()));
+        writer_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let reader_state = Arc::clone(&state);
+        let contention = state.observe_next_lock_contention();
+        let (listed_tx, listed_rx) = mpsc::channel();
+        scope.spawn(move || {
+            listed_tx.send(reader_state.list_tasks()).unwrap();
+        });
+
+        let reader_contended = contention.confirmed_within(Duration::from_secs(2));
+        writer_release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(
+            reader_contended,
+            "enumeration must wait for the pre-exchange writer"
+        );
+        assert_eq!(
+            listed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            vec![expected]
+        );
+    });
 }
 
 #[test]

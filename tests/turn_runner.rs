@@ -1242,7 +1242,6 @@ fn assert_submit_rolls_back_post_create_state(
         state.inject_submission_rollback_cleanup_failure_once(fault);
     } else if fault == ClientStateWritePoint::AfterTaskReplacementExchangeBeforeFirstDirectorySync {
         state.inject_write_failure_once(ClientStateWritePoint::BeforeSubmissionReport);
-        state.inject_task_rollback_update_failures(1);
         state.inject_task_replacement_after_exchange_failure_once();
     } else {
         state.inject_write_failure_once(fault);
@@ -1287,13 +1286,7 @@ fn assert_submit_rolls_back_post_create_state(
     );
     if fault == ClientStateWritePoint::AfterTaskReplacementExchangeBeforeFirstDirectorySync {
         let reopened = ClientStateStore::open(&paths.state).unwrap();
-        let pending = reopened.list_tasks().unwrap();
-        assert_eq!(pending.len(), 1);
-        let task_id = pending[0].meta().task_id();
-        assert_eq!(
-            pending[0].abandon_code(),
-            Some("SUBMISSION_ROLLBACK_INCOMPLETE")
-        );
+        assert!(reopened.list_tasks().unwrap().is_empty());
 
         TaskClient::new(&runner, &config, &paths, &reopened, &executor)
             .reconcile_runners()
@@ -1312,11 +1305,6 @@ fn assert_submit_rolls_back_post_create_state(
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(turn_entries, vec![".mac-worker-rooted-fs"]);
-        let project =
-            mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
-        let transfer =
-            TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
-        assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
         return;
     }
     if expect_rollback {
@@ -1550,10 +1538,11 @@ fn restart_recovers_after_turn_tree_retirement_fault_with_a_durable_rollback_mar
 }
 
 #[test]
-fn restart_reconciles_submission_after_task_record_exchange_sync_failure() {
-    // Break caught: a replacement exchanged into the task registry left its
-    // displaced replace-<uuid> record behind before the first directory sync,
-    // so reopening could not enumerate the durable rollback marker.
+fn reopen_recovers_first_replacement_residue_after_rollback_retry_removes_task() {
+    // Break caught: the first marker replacement exchanged and left its
+    // displaced replace-<uuid> record before fsync. The retry completed the
+    // rollback and removed the live task, leaving reopen unable to validate
+    // or discard the first residue.
     assert_submit_rolls_back_post_create_state(
         ClientStateWritePoint::AfterTaskReplacementExchangeBeforeFirstDirectorySync,
         "before submission report",

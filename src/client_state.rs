@@ -120,6 +120,7 @@ pub enum ClientStateConcurrencyPoint {
     SubmissionIntentReconciliationBeforeTransferLock,
     SubmissionIntentReconciliationAfterTransferLock,
     ObservationRefreshPublication,
+    TaskReplacementPreExchange,
 }
 
 /// A deterministic test hook for scheduler persistence races. Implementors
@@ -1450,7 +1451,7 @@ impl ClientStateStore {
         let Some(run) = candidate.run() else {
             return Ok(true);
         };
-        let tasks = self.list_tasks()?;
+        let tasks = self.list_tasks_locked()?;
         let active_task_turns = tasks
             .iter()
             .filter(|task| {
@@ -1868,6 +1869,12 @@ impl ClientStateStore {
                 &old,
                 &bytes,
                 || {
+                    self.reach_concurrency_point(
+                        ClientStateConcurrencyPoint::TaskReplacementPreExchange,
+                    );
+                    Ok(())
+                },
+                || {
                     if self.take_task_replacement_after_exchange_failure() {
                         return Err(io::Error::other(
                             injected_failure(
@@ -1884,6 +1891,14 @@ impl ClientStateStore {
     }
 
     pub fn list_tasks(&self) -> Result<Vec<LocalTaskRecord>, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        self.list_tasks_locked()
+    }
+
+    /// Lists task records while the caller holds the authoritative state lock.
+    /// QueueLock owns that lock, so queue capacity checks must use this helper
+    /// rather than attempting to acquire StateLock recursively.
+    fn list_tasks_locked(&self) -> Result<Vec<LocalTaskRecord>, WorkerError> {
         let tasks = self.tasks_dir()?;
         let names = tasks.list_names().map_err(WorkerError::Io)?;
         self.recover_task_replacement_residue(&tasks, &names)?;
@@ -1944,23 +1959,13 @@ impl ClientStateStore {
         Ok(())
     }
 
-    /// Removes every client-owned task artifact created during initial
-    /// submission. This is used only before a turn is handed to a runner.
-    pub fn remove_task_submission(&self, task_id: TaskId) -> Result<(), WorkerError> {
-        let record = self.load_task(task_id)?;
-        self.remove_task_submission_record(task_id)?;
-        if let Err(error) = self.remove_task_submission_turns(task_id) {
-            self.create_task(record)?;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    /// Removes the durable record after the caller has retired its prompt
-    /// tree and queue row, leaving no orphaned submission artifacts.
+    /// Validates and recovers replacement residue, then removes the durable
+    /// record after the caller has retired its prompt tree and queue row.
     pub fn remove_task_submission_record(&self, task_id: TaskId) -> Result<(), WorkerError> {
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let tasks = self.tasks_dir()?;
+        let names = tasks.list_names().map_err(WorkerError::Io)?;
+        self.recover_task_replacement_residue(&tasks, &names)?;
         let task_name = task_file_name(task_id)?;
         if self.take_fault(ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval) {
             return Err(injected_failure(
