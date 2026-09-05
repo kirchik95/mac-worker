@@ -286,7 +286,8 @@ impl<'a> TurnRunner<'a> {
             .remove_task_turn_after_terminal(turn_id, owner)?;
         let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
         if let Ok(project_path) = std::env::current_dir()
-            && let Ok(project) = ProjectState::load(self.runner, &project_path, &[])
+            && let Ok(project) =
+                ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
             && project.context.project_id == record.meta().project_id()
             && let Ok(transfer) =
                 TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
@@ -378,7 +379,8 @@ impl<'a> TurnRunner<'a> {
     ) -> Result<TurnOutcomeReport, WorkerError> {
         let initial_record = self.client_state.load_task(task_id)?;
         let project_path = std::env::current_dir().map_err(WorkerError::Io)?;
-        let project = ProjectState::load(self.runner, &project_path, &[])?;
+        let project =
+            ProjectState::load_for_task(self.runner, &project_path, &[], initial_record.meta())?;
         require_project_match(
             &project,
             initial_record.meta().project_id(),
@@ -1033,7 +1035,8 @@ impl<'a> TurnRunner<'a> {
             .client_state
             .remove_turn_prompt(record.meta().task_id(), turn_id);
         if let Ok(project_path) = std::env::current_dir()
-            && let Ok(project) = ProjectState::load(self.runner, &project_path, &[])
+            && let Ok(project) =
+                ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
             && project.context.project_id == record.meta().project_id()
             && let Ok(transfer) =
                 TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
@@ -1080,7 +1083,8 @@ impl<'a> TurnRunner<'a> {
         let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
         if abandoned
             && let Ok(project_path) = std::env::current_dir()
-            && let Ok(project) = ProjectState::load(self.runner, &project_path, &[])
+            && let Ok(project) =
+                ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
             && project.context.project_id == record.meta().project_id()
             && let Ok(transfer) =
                 TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)

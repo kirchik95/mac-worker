@@ -924,7 +924,8 @@ impl<'a> TaskClient<'a> {
             ));
         }
         let worker = task_worker(self.config, record.status())?;
-        let project = ProjectState::load(self.runner, &self.current_project()?, &[])?;
+        let project =
+            ProjectState::load_for_task(self.runner, &self.current_project()?, &[], record.meta())?;
         require_project_match(&project, record.meta())?;
         let transfer =
             TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
@@ -1629,7 +1630,8 @@ impl<'a> TaskClient<'a> {
         turn_id: TurnId,
         worker: String,
     ) -> Result<QueueEntry, WorkerError> {
-        let project = ProjectState::load(self.runner, &self.current_project()?, &[])?;
+        let project =
+            ProjectState::load_for_task(self.runner, &self.current_project()?, &[], record.meta())?;
         require_project_match(&project, record.meta())?;
         let now = current_time_millis()?;
         let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
@@ -1761,7 +1763,8 @@ impl<'a> TaskClient<'a> {
     }
 
     fn transfer_for_record(&self, record: &LocalTaskRecord) -> Result<TransferRepo, WorkerError> {
-        let project = ProjectState::load(self.runner, &self.current_project()?, &[])?;
+        let project =
+            ProjectState::load_for_task(self.runner, &self.current_project()?, &[], record.meta())?;
         require_project_match(&project, record.meta())?;
         TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
     }
@@ -1845,7 +1848,8 @@ impl<'a> TaskClient<'a> {
                     .copied()
             })
             .ok_or_else(|| task_error("TASK_INCONSISTENT", "queued task has no turn prompt"))?;
-        let project = ProjectState::load(self.runner, &self.current_project()?, &[])?;
+        let project =
+            ProjectState::load_for_task(self.runner, &self.current_project()?, &[], record.meta())?;
         require_project_match(&project, record.meta())?;
         let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
         let run = record
@@ -2003,7 +2007,8 @@ impl<'a> TaskClient<'a> {
     }
 
     fn release_task_base(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
-        let project = ProjectState::load(self.runner, &self.current_project()?, &[])?;
+        let project =
+            ProjectState::load_for_task(self.runner, &self.current_project()?, &[], record.meta())?;
         require_project_match(&project, record.meta())?;
         let transfer =
             TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;

@@ -60,6 +60,31 @@ impl<'a> ProjectInspector<'a> {
         &self,
         cwd: &Path,
     ) -> Result<(ProjectContext, Option<String>), WorkerError> {
+        let mut context = self.inspect_without_origin(cwd)?;
+        let origin = self.normalized_origin(cwd)?;
+        context.project_id = match &origin {
+            Some(origin) => hash_identity(b"origin\0", normalize_origin(origin)?.as_bytes()),
+            None => hash_identity(b"common-dir\0", context.common_dir.as_os_str().as_bytes()),
+        };
+        Ok((context, origin))
+    }
+
+    /// Inspects the local worktree without consulting the mutable Git origin.
+    ///
+    /// Durable task records supply the project identity after submission, so
+    /// recovery paths can retain their local filesystem context without
+    /// recomputing an origin-derived identity.
+    pub(crate) fn inspect_with_pinned_project_id(
+        &self,
+        cwd: &Path,
+        project_id: &str,
+    ) -> Result<ProjectContext, WorkerError> {
+        let mut context = self.inspect_without_origin(cwd)?;
+        context.project_id = project_id.to_owned();
+        Ok(context)
+    }
+
+    fn inspect_without_origin(&self, cwd: &Path) -> Result<ProjectContext, WorkerError> {
         let root = self.required_path(
             cwd,
             &["rev-parse", "--path-format=absolute", "--show-toplevel"],
@@ -101,28 +126,19 @@ impl<'a> ProjectInspector<'a> {
         let head = self.optional_utf8_scalar(cwd, &["rev-parse", "--verify", "HEAD"])?;
         let branch =
             self.optional_utf8_scalar(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-        let origin = self.normalized_origin(cwd)?;
-
-        let project_id = match &origin {
-            Some(origin) => hash_identity(b"origin\0", normalize_origin(origin)?.as_bytes()),
-            None => hash_identity(b"common-dir\0", common_dir.as_os_str().as_bytes()),
-        };
         let worktree_id = hash_identity(b"worktree\0", root.as_os_str().as_bytes());
 
-        Ok((
-            ProjectContext {
-                root,
-                relative_cwd,
-                git_dir,
-                common_dir,
-                head,
-                branch,
-                project_id,
-                worktree_id,
-                dirty,
-            },
-            origin,
-        ))
+        Ok(ProjectContext {
+            root,
+            relative_cwd,
+            git_dir,
+            common_dir,
+            head,
+            branch,
+            project_id: String::new(),
+            worktree_id,
+            dirty,
+        })
     }
 
     /// Returns the project's origin in the canonical form used by task

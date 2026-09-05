@@ -11,6 +11,7 @@ use crate::{
     project_config::ProjectSettings,
     requirements::RequirementDetector,
     snapshot::{Snapshot, SnapshotBuilder},
+    task::TaskMeta,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +75,28 @@ impl ProjectState {
         Ok(Self {
             context,
             origin,
+            settings,
+            requirements,
+        })
+    }
+
+    /// Loads current local project state for a durable task without reading
+    /// the mutable Git origin. The task's submit-time project identity is the
+    /// authoritative identity after submission.
+    pub fn load_for_task(
+        runner: &dyn ProcessRunner,
+        project: &Path,
+        cli_includes: &[String],
+        meta: &TaskMeta,
+    ) -> Result<Self, WorkerError> {
+        let context = ProjectInspector::new(runner)
+            .inspect_with_pinned_project_id(project, meta.project_id())?;
+        let settings = ProjectSettings::load(&context.root, cli_includes)?;
+        let detected = RequirementDetector::detect(&context.root)?;
+        let requirements = merge_project_requirements(&settings.requires, detected);
+        Ok(Self {
+            context,
+            origin: None,
             settings,
             requirements,
         })

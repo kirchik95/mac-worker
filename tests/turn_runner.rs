@@ -150,8 +150,6 @@ struct AcceptedThenTerminalRunner {
     probe_count: Mutex<u32>,
     facts_fresh: Mutex<bool>,
     base_release_failures: Mutex<u8>,
-    origin_read_count: Mutex<u32>,
-    change_origin_after_submit: Mutex<bool>,
 }
 
 #[derive(Clone)]
@@ -184,8 +182,6 @@ impl AcceptedThenTerminalRunner {
             probe_count: Mutex::new(0),
             facts_fresh: Mutex::new(false),
             base_release_failures: Mutex::new(0),
-            origin_read_count: Mutex::new(0),
-            change_origin_after_submit: Mutex::new(false),
         }
     }
 
@@ -264,8 +260,16 @@ impl AcceptedThenTerminalRunner {
             .and_then(|request| request.origin_url().map(str::to_owned))
     }
 
-    fn change_origin_after_submit(&self) {
-        *self.change_origin_after_submit.lock().unwrap() = true;
+    fn origin_read_count(&self) -> usize {
+        self.requests()
+            .iter()
+            .filter(|request| {
+                request.program == OsStr::new("/usr/bin/git")
+                    && request.args.iter().any(|arg| arg == "config")
+                    && request.args.iter().any(|arg| arg == "--get")
+                    && request.args.iter().any(|arg| arg == "remote.origin.url")
+            })
+            .count()
     }
 }
 
@@ -277,20 +281,6 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
         self.requests.lock().unwrap().push(request.clone());
 
         if request.program == OsStr::new("/usr/bin/git") {
-            if request.args.iter().any(|arg| arg == "config")
-                && request.args.iter().any(|arg| arg == "--get")
-                && request.args.iter().any(|arg| arg == "remote.origin.url")
-            {
-                let mut reads = self.origin_read_count.lock().unwrap();
-                *reads += 1;
-                if *self.change_origin_after_submit.lock().unwrap() && *reads > 3 {
-                    return Ok(ProcessResult {
-                        status: ExitStatus::from_raw(0),
-                        stdout: b"https://other.example.test/repo.git\n".to_vec(),
-                        stderr: Vec::new(),
-                    });
-                }
-            }
             if request.args.iter().any(|arg| arg == "update-ref")
                 && request.args.iter().any(|arg| arg == "-d")
                 && request
@@ -736,10 +726,31 @@ fn runner_uses_the_submit_time_local_push_target_after_origin_changes() {
             .any(|requirement| requirement == "origin:example.test"),
         "scheduler admission must retain the requirement derived at submission"
     );
-    fixture.runner.change_origin_after_submit();
+    assert_eq!(fixture.runner.origin_read_count(), 1);
+    fixture._repo.git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://other.example.test/repo.git",
+    ]);
+    assert_eq!(
+        String::from_utf8(
+            fixture
+                ._repo
+                .git(&["config", "--get", "remote.origin.url"])
+                .stdout,
+        )
+        .unwrap(),
+        "https://other.example.test/repo.git\n"
+    );
 
     fixture.run(&mut Vec::new()).unwrap();
 
+    assert_eq!(
+        fixture.runner.origin_read_count(),
+        1,
+        "post-submit execution must not read the mutable Git origin"
+    );
     assert_eq!(
         fixture.runner.submitted_turn_origin().as_deref(),
         Some("https://example.test/repo.git"),
