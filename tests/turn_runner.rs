@@ -941,8 +941,11 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
     }));
 
     let project = mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
-    let transfer = TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
-    assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
+    {
+        let transfer =
+            TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
+        assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
+    }
 
     let closed = client.close(task_id, true).unwrap();
     assert_eq!(closed.status().state(), TaskState::Abandoned);
