@@ -1445,7 +1445,7 @@ fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
     TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(request(), &mut Vec::new(), &mut Vec::new())
         .unwrap();
-    state.inject_write_failure_once(ClientStateWritePoint::BeforeSubmissionReport);
+    state.inject_write_failure_once(ClientStateWritePoint::AfterParkedTaskTurnPublication);
 
     thread::scope(|scope| {
         let submit = scope.spawn(|| {
@@ -1455,23 +1455,22 @@ fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
                 &mut Vec::new(),
             )
         });
-        if entered_rx.recv_timeout(Duration::from_millis(200)).is_ok() {
-            let owner = InlineRunnerExecutor
-                .start(&paths, TaskId::generate(), TurnId::generate())
-                .unwrap()
-                .process_identity();
-            let entry = state.unpark_oldest(owner).unwrap().unwrap();
-            state.adopt_row(entry.job_id(), owner).unwrap();
-            release_tx.send(()).unwrap();
-            let error = submit.join().unwrap().unwrap_err();
-            assert!(error.to_string().contains("before submission report"));
-            assert_eq!(state.list_tasks().unwrap().len(), 2);
-            assert!(state.queue_entry(entry.job_id()).unwrap().is_some());
-        } else {
-            let error = submit.join().unwrap().unwrap_err();
-            assert!(error.to_string().contains("before submission report"));
-            assert_eq!(state.list_tasks().unwrap().len(), 1);
-        }
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let owner = InlineRunnerExecutor
+            .start(&paths, TaskId::generate(), TurnId::generate())
+            .unwrap()
+            .process_identity();
+        let entry = state.unpark_oldest(owner).unwrap().unwrap();
+        state.adopt_row(entry.job_id(), owner).unwrap();
+        release_tx.send(()).unwrap();
+        let error = submit.join().unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("after parked task-turn publication")
+        );
+        assert_eq!(state.list_tasks().unwrap().len(), 2);
+        assert!(state.queue_entry(entry.job_id()).unwrap().is_some());
     });
 }
 

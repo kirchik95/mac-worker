@@ -93,6 +93,7 @@ pub enum ClientStateWritePoint {
     BeforeTaskSubmissionTurnsRemoval = 25,
     AfterTaskSubmissionRecordRemoval = 26,
     BeforeSubmissionReport = 27,
+    AfterParkedTaskTurnPublication = 28,
 }
 
 #[doc(hidden)]
@@ -2089,6 +2090,11 @@ impl ClientStateStore {
             Ok((entry.clone(), true))
         })?;
         self.reach_concurrency_point(ClientStateConcurrencyPoint::ParkedTaskTurnPublication);
+        if self.take_fault(ClientStateWritePoint::AfterParkedTaskTurnPublication) {
+            return Err(injected_failure(
+                ClientStateWritePoint::AfterParkedTaskTurnPublication,
+            ));
+        }
         Ok(entry)
     }
 
@@ -4822,6 +4828,9 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
             "after task submission record removal"
         }
         ClientStateWritePoint::BeforeSubmissionReport => "before submission report",
+        ClientStateWritePoint::AfterParkedTaskTurnPublication => {
+            "after parked task-turn publication"
+        }
         ClientStateWritePoint::BeforeTaskRollbackBaseRelease => "before task rollback base release",
         ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval => {
             "before task submission turns removal"

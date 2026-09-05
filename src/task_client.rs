@@ -727,54 +727,55 @@ impl<'a> TaskClient<'a> {
             let _ = transfer.release_base(self.runner, task_id);
             return Err(error);
         }
-        let (mut report, should_start) = match (|| -> Result<(TaskReport, bool), WorkerError> {
-            self.client_state
-                .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
-            let run_reference = match request.run_id {
-                Some(run_id) => {
-                    let run = self.client_state.load_run(run_id)?;
-                    Some(QueueRunReference::new(
-                        crate::job::RunId::new(run_id.to_string())?,
-                        run.max_parallel(),
-                    )?)
-                }
-                None => None,
-            };
-            let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
-            let owner = current_process_identity()?;
-            let entry = QueueEntry::new(
-                turn_id,
-                self.client_state.client_id(),
-                initial.context.project_id.clone(),
-                initial.context.worktree_id.clone(),
-                command.summary()?,
-                requirements,
-                request.preference.clone(),
-                QueueEntryKind::TaskTurn,
-                run_reference,
-                owner,
-                now,
-            )?;
-            let entry = self.client_state.enqueue(entry)?;
+        let (mut report, should_start, queued_turn) =
+            match (|| -> Result<(TaskReport, bool, TurnId), WorkerError> {
+                self.client_state
+                    .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
+                let run_reference = match request.run_id {
+                    Some(run_id) => {
+                        let run = self.client_state.load_run(run_id)?;
+                        Some(QueueRunReference::new(
+                            crate::job::RunId::new(run_id.to_string())?,
+                            run.max_parallel(),
+                        )?)
+                    }
+                    None => None,
+                };
+                let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
+                let owner = current_process_identity()?;
+                let entry = QueueEntry::new(
+                    turn_id,
+                    self.client_state.client_id(),
+                    initial.context.project_id.clone(),
+                    initial.context.worktree_id.clone(),
+                    command.summary()?,
+                    requirements,
+                    request.preference.clone(),
+                    QueueEntryKind::TaskTurn,
+                    run_reference,
+                    owner,
+                    now,
+                )?;
+                let entry = self.client_state.enqueue(entry)?;
 
-            let should_start =
-                request.attached || self.live_runner_count()? < self.config.workers.len();
-            self.client_state.submission_report_fault()?;
-            let report = self.report_for(task_id)?;
-            // Parking makes the row eligible for an independent runner to
-            // adopt. Complete every fallible local/reporting step first, so
-            // an error cannot compensate state whose ownership transferred.
-            if !should_start {
-                self.client_state.park_row(entry.job_id())?;
-            }
-            Ok((report, should_start))
-        })() {
-            Ok(report) => report,
-            Err(error) => {
-                self.rollback_submission(turn_id, &record_for_rollback, &transfer);
-                return Err(error);
-            }
-        };
+                let should_start =
+                    request.attached || self.live_runner_count()? < self.config.workers.len();
+                self.client_state.submission_report_fault()?;
+                let report = self.report_for(task_id)?;
+                Ok((report, should_start, entry.job_id()))
+            })() {
+                Ok(report) => report,
+                Err(error) => {
+                    self.rollback_submission(turn_id, &record_for_rollback, &transfer);
+                    return Err(error);
+                }
+            };
+        if !should_start {
+            // Parking publishes eligibility to an independent runner. A park
+            // error may therefore mean ownership already transferred, so
+            // preserve durable state for reconciliation.
+            self.client_state.park_row(queued_turn)?;
+        }
         if should_start {
             // A detached child may claim the row as soon as it is started.
             // Once that hand-off is attempted, retain the complete durable
