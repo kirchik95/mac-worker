@@ -2494,7 +2494,10 @@ mod tests {
             agent: AgentKind::Codex,
             model: None,
             policy: PermissionPolicy::Workspace,
-            source: TaskSource::Local { wip: false },
+            source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
             publish: vec![PublishMode::Fetch],
             publish_branch: None,
             base_oid: base_oid.clone(),
