@@ -141,7 +141,7 @@ prompt = """
 Move the billing HTTP client into packages/billing-client …
 """
 agent = "codex"
-publish = ["fetch"]
+publish = ["fetch", "push"]
 ```
 
 Top-level keys are defaults; each task may override them. Project defaults live in `.worker.toml`:
@@ -164,6 +164,32 @@ opencode = "unattended"
 
 Claude Code is deferred on the workers by operator decision. When it is enabled, put its token in an owner-only profile on each worker (`~/.config/mac-worker/env/agents.env`, mode `0600`) with `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. Codex uses its file-based login and needs no profile. mac-worker never creates, uploads, or prints a profile.
 
-These remain later phases, not this execution core or the phase-5e observer: `source = origin`, `publish = push`, Cursor Agent, OpenCode, and retention through `worker gc`. The batch-file example above shows those later keys so a future override is valid TOML; this core must reject them at preflight.
-
 Agent turns run with the worker account's full access: its files, processes, caches, agent configuration, and any credentials that account holds. A task workspace is not a security boundary. Only dispatch trusted prompts.
+
+## Phase 5d: origin publication, Cursor, and OpenCode
+
+Phase 5d extends the task core with origin-backed bases, optional origin publication, and Cursor and OpenCode turns. Dashboard task views remain phase 5e. Verify the exact installed grammar with the debug-build help before dispatching; the shapes below match `cargo run -q -- task submit --help` and `cargo run -q -- workers --help`.
+
+```text
+worker task submit --agent cursor --env-profile agents --prompt-file tasks/fix-login.md
+worker task submit --agent opencode --prompt-file tasks/update-api.md
+worker task submit --source origin --base main --agent codex --prompt "…"
+worker task submit --publish fetch --publish push --publish-branch feature/api --agent claude --prompt "…"
+worker workers --refresh
+worker task reconcile
+worker gc --apply
+```
+
+`worker task submit [OPTIONS]` help prints `--agent <AGENT>`, `--source <SOURCE>`, `--publish <PUBLISH>`, `--publish-branch <PUBLISH_BRANCH>`, and `--env-profile <ENV_PROFILE>`. Accepted `--source` values are `local` and `origin` (default from `.worker.toml`, else `local`). `--publish` is repeatable; accepted values are `fetch` and `push` (default from `.worker.toml`, else `fetch`). `--publish-branch` is valid only with `publish = push`. Accepted `--agent` values are `codex`, `claude`, `cursor`, and `opencode`. Claude Code remains deferred on the workers by operator decision.
+
+A project may set `source = "origin"` and `publish = ["fetch", "push"]` in `.worker.toml` or in a batch file. `source = origin` fails before task creation with `BASE_NOT_ON_ORIGIN` when the exact base is absent from the normalized origin; preparation fails with `BASE_UNAVAILABLE` when the worker cannot fetch or verify it. `publish = push` requires a committed base and the inventory capability `origin:<host>`, reserves a unique run branch, always performs fetch publication, and leaves the task open with `PUBLISH_FAILED` when origin rejects the push. `--wip` with push is `PUBLISH_REQUIRES_COMMITTED_BASE`. A pinned worker that lacks `origin:<host>` is `CAPABILITY_MISSING` and is not rerouted.
+
+As in the execution core, agent turns run with the worker account's full access. Cursor (`--agent cursor`) and OpenCode (`--agent opencode`) use bound sessions and pointer prompts. Cursor prebinds a chat before the first turn and launches with `--force`; OpenCode binds the session from its first JSON event and launches with `--auto`. Resume uses the recorded session reference and fails with `SESSION_UNBOUND` when it is absent. Profile values stay on the worker: they are never copied, logged, or returned through `worker workers`.
+
+Cursor headless turns need `CURSOR_API_KEY` in a secure env profile. The login keychain is locked in a non-interactive SSH session, so a keychain login is invisible over SSH; mac-worker will not unlock it. OpenCode uses file-based or provider login plus any provider variables that CLI needs in the same profile. OpenCode's worker-local server is loopback-only for the lifetime of that process. See [macOS worker setup](docs/setup-macos-worker.md) for the agent and profile caveats.
+
+Profile files are operator-provisioned owner-only files (`~/.config/mac-worker/env/<name>.env`, mode `0600`). mac-worker never creates, uploads, or prints a profile. An insecure (group- or world-readable) profile is reported as insecure and is never applied; naming it on a turn is `ENV_PROFILE_PERMISSIONS`.
+
+`worker workers --refresh` recollects agent, profile, and Git-identity facts. `worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks without submitting anything.
+
+`worker gc --apply` lands with Task 4 of the publication plan and is not yet a public command on this binary. When that task lands, `worker gc` previews every candidate with a reason and `worker gc --apply` applies the preview: idle open tasks close after task retention (default seven days) while the result branch is preserved; result branches prune after branch retention (default thirty days) or immediately on `worker task close --discard`; empty mirrors and transfer repositories become candidates only when no task or base ref protects them. `gc` never prunes another task's mirror ref. Native session deletion runs on discard only when the installed adapter exposes it.

@@ -13,6 +13,7 @@ use std::{
 };
 
 use mac_worker::{
+    agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
     config::{Config, WorkerEntry},
     error::{ProcessError, ProcessStream, WorkerError},
     lease::{LeaseSummary, SlotState},
@@ -1291,4 +1292,74 @@ fn human_unavailable_worker_keeps_error_missing_capabilities_and_unknown_swap_vi
             "missing {fragment:?} in {rendered:?}"
         );
     }
+}
+
+#[test]
+fn workers_output_includes_profile_keyed_facts_without_values() {
+    // Additive Task 1 grammar. Task 4 will add `gc` reports to the same
+    // workers/help surface; do not assert that command here.
+    let planted = "workers-command-profile-value-must-not-escape";
+    let output = CommandOutput::Workers(WorkersReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![WorkerHealth {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            status: HealthStatus::Ready,
+            probe: Some(ProbeResponse {
+                protocol_version: PROTOCOL_VERSION,
+                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+                hostname: "mini-1.local".into(),
+                arch: "arm64".into(),
+                os_version: "26.2".into(),
+                free_disk_bytes: 536_870_912,
+                total_disk_bytes: 1_073_741_824,
+                memory_pressure: MemoryPressure::Normal,
+                swap_used_bytes: None,
+                available_memory_bytes: None,
+                cpu_counters: None,
+                slot_state: SlotState::Idle,
+                active_lease: None,
+                capabilities: vec!["darwin-arm64".into(), "agent:cursor@agents".into()],
+                agent_facts: Some(AgentFacts {
+                    agents: vec![AgentProbe {
+                        name: "cursor".into(),
+                        version: Some("1.0.0".into()),
+                        auth: AgentAuth::Authenticated,
+                        auth_by_profile: vec![("agents".into(), AgentAuth::Authenticated)],
+                    }],
+                    env_profiles: vec![ProfileProbe {
+                        name: "agents".into(),
+                        secure: true,
+                    }],
+                    git_identity: true,
+                    collected_at_millis: 10,
+                }),
+                facts_age_millis: Some(1_000),
+            }),
+            missing_capabilities: Vec::new(),
+            error_code: None,
+            error_message: None,
+        }],
+    });
+
+    let rendered = output.render_human();
+    let json = output.render_json().unwrap();
+
+    for fragment in [
+        "agent facts age millis: 1000",
+        "git identity: configured",
+        "cursor 1.0.0: authenticated",
+        "agents: secure",
+        "agent:cursor@agents",
+    ] {
+        assert!(
+            rendered.contains(fragment),
+            "missing {fragment:?} in {rendered:?}"
+        );
+    }
+    assert!(!rendered.contains(planted));
+    assert!(!json.contains(planted));
+    assert!(json.contains("\"facts_age_millis\":1000"));
+    assert!(json.contains("\"secure\":true"));
+    assert!(!json.contains("/Users/"));
 }

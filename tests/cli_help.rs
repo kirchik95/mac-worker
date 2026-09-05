@@ -96,6 +96,35 @@ fn task_help_keeps_the_released_option_names_discoverable() {
 }
 
 #[test]
+fn task_submit_help_exposes_origin_publication_and_profile_options() {
+    // Additive Task 1–3 grammar. Task 4 adds `worker gc` to the same help
+    // surface; do not assert that command here.
+    let mut submit = Command::cargo_bin("worker").unwrap();
+    submit.args(["task", "submit", "--help"]);
+    submit
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--agent <AGENT>"))
+        .stdout(predicate::str::contains("--source <SOURCE>"))
+        .stdout(predicate::str::contains("--publish <PUBLISH>"))
+        .stdout(predicate::str::contains(
+            "--publish-branch <PUBLISH_BRANCH>",
+        ))
+        .stdout(predicate::str::contains("--env-profile <ENV_PROFILE>"));
+}
+
+#[test]
+fn workers_help_exposes_refresh() {
+    let mut command = Command::cargo_bin("worker").unwrap();
+    command.args(["workers", "--help"]);
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: worker workers"))
+        .stdout(predicate::str::contains("--refresh"));
+}
+
+#[test]
 fn cancel_parses_one_job_id_and_exposes_no_hidden_arguments() {
     let job_id = "018f0f4a6b5c7d8e9f00112233445566";
     let cli = Cli::try_parse_from(["worker", "cancel", job_id]).unwrap();
