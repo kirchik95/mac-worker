@@ -39,8 +39,8 @@ use mac_worker::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
     },
     task::{
-        ClosePolicy, RunId, RunRecord, TaskId, TaskLimits, TaskMeta, TaskOutcome, TaskState,
-        TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        ClosePolicy, RunId, RunRecord, RunnerState, TaskId, TaskLimits, TaskMeta, TaskOutcome,
+        TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
     },
     task_client::{TaskClient, TaskSubmitRequest},
     task_store::{
@@ -613,6 +613,7 @@ struct AcceptedThenTerminalFixture {
     executor: InlineRunnerExecutor,
     task_id: TaskId,
     turn_id: TurnId,
+    reported_runner: Option<RunnerState>,
 }
 
 impl AcceptedThenTerminalFixture {
@@ -666,6 +667,7 @@ impl AcceptedThenTerminalFixture {
             )
             .unwrap();
         let task_id = report.task_id();
+        let reported_runner = report.runner();
         let turn_id = state
             .queue_entry_for_task_turn(task_id)
             .unwrap()
@@ -682,6 +684,7 @@ impl AcceptedThenTerminalFixture {
             executor,
             task_id,
             turn_id,
+            reported_runner,
         }
     }
 
@@ -707,6 +710,18 @@ impl AcceptedThenTerminalFixture {
         ))
         .unwrap()
     }
+}
+
+#[test]
+fn successful_submission_reports_the_handed_off_runner() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+
+    assert_eq!(
+        fixture.reported_runner,
+        fixture.state.runner_liveness(fixture.task_id).unwrap()
+    );
+    assert_eq!(fixture.reported_runner, Some(RunnerState::Live));
 }
 
 fn assert_remote_turn_completed(

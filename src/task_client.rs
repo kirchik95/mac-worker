@@ -795,6 +795,7 @@ impl<'a> TaskClient<'a> {
             // Once that hand-off is attempted, retain the complete durable
             // submission for reconciliation instead of compensating it away.
             self.start_runner(task_id, turn_id)?;
+            report.runner = self.client_state.runner_liveness(task_id)?;
         }
         // The submitter no longer needs the repository after the queue row is
         // handed off.  Release its per-repository lock before an attached

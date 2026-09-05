@@ -97,6 +97,7 @@ pub enum ClientStateWritePoint {
     AfterTaskSubmissionTurnsRetirement = 29,
     AfterSubmissionIntentClearPublicationBeforeFinalSync = 30,
     AfterTaskReplacementExchangeBeforeFirstDirectorySync = 31,
+    AfterRunReplacementExchangeBeforeFirstDirectorySync = 32,
 }
 
 #[doc(hidden)]
@@ -2060,6 +2061,8 @@ impl ClientStateStore {
         let bytes = run_record_bytes(&record)?;
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;
+        let names = runs.list_names().map_err(WorkerError::Io)?;
+        self.recover_run_replacement_residue(&runs, &names)?;
         let name = run_file_name(run_id)?;
         match runs.write_private_atomic_no_replace(&name, &bytes) {
             Ok(()) => Ok(()),
@@ -2082,13 +2085,19 @@ impl ClientStateStore {
         if self.take_fault(ClientStateWritePoint::BeforeRunLoad) {
             return Err(injected_failure(ClientStateWritePoint::BeforeRunLoad));
         }
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;
+        let names = runs.list_names().map_err(WorkerError::Io)?;
+        self.recover_run_replacement_residue(&runs, &names)?;
         let name = run_file_name(run_id)?;
         read_run_from_dir(&runs, &name, run_id)
     }
 
     pub fn list_runs(&self) -> Result<Vec<RunRecord>, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;
+        let names = runs.list_names().map_err(WorkerError::Io)?;
+        self.recover_run_replacement_residue(&runs, &names)?;
         let mut names = runs.list_names().map_err(WorkerError::Io)?;
         names.retain(|name| name.as_slice() != ROOTED_FS_NAMESPACE);
         names.sort();
@@ -2108,6 +2117,78 @@ impl ClientStateStore {
             .collect()
     }
 
+    fn recover_run_replacement_residue(
+        &self,
+        runs: &RootedDir,
+        names: &[Vec<u8>],
+    ) -> Result<(), WorkerError> {
+        let has_replacement = names.iter().any(|name| is_private_replacement_name(name));
+        if has_replacement
+            || runs
+                .has_private_cleanup_residue()
+                .map_err(WorkerError::Io)?
+        {
+            runs.retry_pending_owned_regulars_matching(|name, _| is_private_replacement_name(name))
+                .map_err(WorkerError::Io)?;
+        }
+
+        for name in runs.list_names().map_err(WorkerError::Io)? {
+            if !is_private_replacement_name(&name) {
+                continue;
+            }
+            let name = std::str::from_utf8(&name)
+                .map_err(|_| invalid_state("run replacement residue is not UTF-8"))?;
+            let bytes = runs
+                .read_private_regular(name, MAX_STATE_FILE_BYTES as u64)
+                .map_err(WorkerError::Io)?;
+            let residue = parse_run_record(&bytes)?;
+            let run_id = residue.run_id();
+            let current = read_run_from_dir(runs, &run_file_name(run_id)?, run_id)?;
+            if residue.run_id() != current.run_id()
+                || residue.name() != current.name()
+                || residue.task_ids() != current.task_ids()
+                || residue.max_parallel() != current.max_parallel()
+                || residue.created_at_millis() != current.created_at_millis()
+            {
+                return Err(invalid_state(
+                    "run replacement residue is not bound to the live run record",
+                ));
+            }
+            runs.remove_owned_regular(name).map_err(WorkerError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn replace_run_record(
+        &self,
+        runs: &RootedDir,
+        name: &str,
+        old: &[u8],
+        replacement: &[u8],
+    ) -> Result<(), WorkerError> {
+        runs.replace_private_regular_exact_with_sync_hooks(
+            name,
+            old,
+            replacement,
+            || Ok(()),
+            || {
+                if self.take_fault(
+                    ClientStateWritePoint::AfterRunReplacementExchangeBeforeFirstDirectorySync,
+                ) {
+                    return Err(io::Error::other(
+                        injected_failure(
+                            ClientStateWritePoint::AfterRunReplacementExchangeBeforeFirstDirectorySync,
+                        )
+                        .to_string(),
+                    ));
+                }
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .map_err(WorkerError::Io)
+    }
+
     pub fn reserve_run_publish_branch(
         &self,
         run_id: RunId,
@@ -2115,6 +2196,8 @@ impl ClientStateStore {
     ) -> Result<RunRecord, WorkerError> {
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;
+        let names = runs.list_names().map_err(WorkerError::Io)?;
+        self.recover_run_replacement_residue(&runs, &names)?;
         let name = run_file_name(run_id)?;
         let old = runs
             .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
@@ -2125,8 +2208,7 @@ impl ClientStateStore {
         }
         let replacement = existing.reserve_publish_branch(branch)?;
         let bytes = run_record_bytes(&replacement)?;
-        runs.replace_private_regular_exact(&name, &old, &bytes)
-            .map_err(WorkerError::Io)?;
+        self.replace_run_record(&runs, &name, &old, &bytes)?;
         Ok(replacement)
     }
 
@@ -2138,6 +2220,8 @@ impl ClientStateStore {
     ) -> Result<RunRecord, WorkerError> {
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;
+        let names = runs.list_names().map_err(WorkerError::Io)?;
+        self.recover_run_replacement_residue(&runs, &names)?;
         let name = run_file_name(run_id)?;
         let old = runs
             .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
@@ -2148,8 +2232,7 @@ impl ClientStateStore {
         }
         let replacement = existing.reserve_publish_branch_for_task(task_id, branch)?;
         let bytes = run_record_bytes(&replacement)?;
-        runs.replace_private_regular_exact(&name, &old, &bytes)
-            .map_err(WorkerError::Io)?;
+        self.replace_run_record(&runs, &name, &old, &bytes)?;
         Ok(replacement)
     }
 
@@ -2165,6 +2248,8 @@ impl ClientStateStore {
         }
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;
+        let names = runs.list_names().map_err(WorkerError::Io)?;
+        self.recover_run_replacement_residue(&runs, &names)?;
         let name = run_file_name(run_id)?;
         let old = runs
             .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
@@ -2178,8 +2263,7 @@ impl ClientStateStore {
             return Ok(existing);
         }
         let bytes = run_record_bytes(&replacement)?;
-        runs.replace_private_regular_exact(&name, &old, &bytes)
-            .map_err(WorkerError::Io)?;
+        self.replace_run_record(&runs, &name, &old, &bytes)?;
         Ok(replacement)
     }
 
@@ -2196,6 +2280,8 @@ impl ClientStateStore {
         }
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;
+        let names = runs.list_names().map_err(WorkerError::Io)?;
+        self.recover_run_replacement_residue(&runs, &names)?;
         let name = run_file_name(run_id)?;
         let old = runs
             .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
@@ -2209,8 +2295,7 @@ impl ClientStateStore {
             return Ok(existing);
         }
         let bytes = run_record_bytes(&replacement)?;
-        runs.replace_private_regular_exact(&name, &old, &bytes)
-            .map_err(WorkerError::Io)?;
+        self.replace_run_record(&runs, &name, &old, &bytes)?;
         Ok(replacement)
     }
 
@@ -5089,6 +5174,9 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         }
         ClientStateWritePoint::AfterTaskReplacementExchangeBeforeFirstDirectorySync => {
             "after task replacement exchange before first directory sync"
+        }
+        ClientStateWritePoint::AfterRunReplacementExchangeBeforeFirstDirectorySync => {
+            "after run replacement exchange before first directory sync"
         }
     };
     WorkerError::Io(io::Error::other(format!(

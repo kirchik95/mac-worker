@@ -13,7 +13,10 @@ use std::{
 
 use mac_worker::{
     agent::{AdapterError, AgentKind, AgentOutcome, PermissionPolicy, TurnLimits},
-    client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore},
+    client_state::{
+        ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
+        ClientStateWritePoint,
+    },
     error::{ExitKind, WorkerError},
     job::{JobId, ProcessIdentity},
     task::{
@@ -572,6 +575,52 @@ fn task_enumeration_waits_for_a_pre_exchange_replacement_writer() {
             vec![expected]
         );
     });
+}
+
+#[test]
+fn reopen_recovers_run_reservation_replacement_residue_after_exchange_fsync_failure() {
+    // Break caught: releasing a task-owned publish reservation can exchange
+    // the updated run before its directory fsync fails. Reopening must remove
+    // the displaced replace-<uuid> record and retain the released run.
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let run_id = run_id();
+    let task_id = task_id();
+    let branch: BranchName = "release-candidate".parse().unwrap();
+    state
+        .create_run(RunRecord::new(run_id, None, vec![task_id], 1, 99).unwrap())
+        .unwrap();
+    state
+        .reserve_run_publish_branch_for_task(run_id, task_id, branch.clone())
+        .unwrap();
+
+    state.inject_write_failure_once(
+        ClientStateWritePoint::AfterRunReplacementExchangeBeforeFirstDirectorySync,
+    );
+    let error = state
+        .release_run_publish_branch_for_task(run_id, task_id, &branch)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("after run replacement exchange before first directory sync")
+    );
+
+    let reopened = ClientStateStore::open(&paths.state).unwrap();
+    let runs = reopened.list_runs().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_id(), run_id);
+    assert!(runs[0].publish_branches().is_empty());
+    assert!(
+        std::fs::read_dir(paths.state.join("runs"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("replace-"))
+    );
 }
 
 #[test]
