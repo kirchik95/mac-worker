@@ -43,6 +43,7 @@ const INSTALLATION_PREFIX: &str = ".mac-worker-installation-";
 const HOST_LAYOUT_FILE: &str = "layout.json";
 const CAPACITY_LOCK_FILE: &str = "capacity.lock";
 const ADMISSION_LOCK_FILE: &str = "admission.lock";
+const SESSION_LOCK_FILE: &str = "session.lock";
 const TRANSFER_DIRECTORY: &str = "transfer";
 const TRANSFER_LOCK_FILE: &str = "transfer.lock";
 const TRANSFER_IDENTITY_SUFFIX: &str = ".transfer-lock.json";
@@ -603,6 +604,16 @@ impl InstallationGuard {
 }
 
 impl Drop for InstallationGuard {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+pub(crate) struct SessionGuard {
+    file: File,
+}
+
+impl Drop for SessionGuard {
     fn drop(&mut self) {
         unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
@@ -1981,6 +1992,16 @@ impl HostStore {
     ) -> Result<T, WorkerError> {
         let _guard = InstallationGuard::acquire(&self.inner)?;
         operation()
+    }
+
+    pub(crate) fn session_lock(&self) -> Result<SessionGuard, WorkerError> {
+        let locks = self.open_directory("locks", false)?;
+        let file = locks.open_private_lock(SESSION_LOCK_FILE)?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(WorkerError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(SessionGuard { file })
     }
 
     pub fn begin_job(

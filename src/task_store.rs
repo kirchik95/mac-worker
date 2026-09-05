@@ -784,6 +784,11 @@ impl<'a> TaskStore<'a> {
 
     pub fn close(&self, request: &TaskCloseRequest) -> Result<TaskCloseResponse, WorkerError> {
         request.validate()?;
+        let _session_lock = self.store.session_lock()?;
+        self.close_locked(request)
+    }
+
+    fn close_locked(&self, request: &TaskCloseRequest) -> Result<TaskCloseResponse, WorkerError> {
         let task = self.open_existing_task(request.project_id(), request.task_id())?;
         let status = self.read_status(&task)?;
         if status.state() == TaskState::Active {
@@ -845,6 +850,7 @@ impl<'a> TaskStore<'a> {
         now_millis: u64,
     ) -> Result<Option<TaskStatus>, WorkerError> {
         validate_project_id(project_id)?;
+        let _session_lock = self.store.session_lock()?;
         let task = self.open_existing_task(project_id, task_id)?;
         let status = self.read_status(&task)?;
         if status.state() != TaskState::Open {
@@ -1271,6 +1277,16 @@ impl<'a> TaskStore<'a> {
     ) -> Result<(), WorkerError> {
         validate_project_id(project_id)?;
         binding.validate()?;
+        let _session_lock = self.store.session_lock()?;
+        self.bind_session_locked(project_id, task_id, binding)
+    }
+
+    fn bind_session_locked(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        binding: SessionBinding,
+    ) -> Result<(), WorkerError> {
         let task = self.open_existing_task(project_id, task_id)?;
         if task.entry_exists("session.json")? {
             let existing: SessionBinding = read_record(&task, "session.json")?;

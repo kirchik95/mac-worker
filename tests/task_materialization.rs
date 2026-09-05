@@ -8,7 +8,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 
@@ -269,6 +269,45 @@ impl ProcessRunner for NativeDeleteRunner {
             });
         }
         SystemProcessRunner.run(request)
+    }
+}
+
+#[derive(Clone)]
+struct BlockingDeleteRunner {
+    inner: NativeDeleteRunner,
+    delete_started: mpsc::Sender<()>,
+    release_delete: Arc<Mutex<mpsc::Receiver<()>>>,
+}
+
+impl BlockingDeleteRunner {
+    fn new(inner: NativeDeleteRunner) -> (Self, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (delete_started, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        (
+            Self {
+                inner,
+                delete_started,
+                release_delete: Arc::new(Mutex::new(release_receiver)),
+            },
+            started_receiver,
+            release_sender,
+        )
+    }
+}
+
+impl ProcessRunner for BlockingDeleteRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let is_delete = request.program.as_os_str() == OsStr::new("/bin/zsh")
+            && request
+                .args
+                .last()
+                .and_then(|argument| argument.to_str())
+                .is_some_and(|shell| shell.contains("'codex' 'delete'"));
+        if is_delete {
+            self.delete_started.send(()).unwrap();
+            self.release_delete.lock().unwrap().recv().unwrap();
+        }
+        self.inner.run(request)
     }
 }
 
@@ -738,6 +777,70 @@ fn discard_skips_native_deletion_when_another_task_references_the_session() {
         .unwrap();
 
     assert!(runner.delete_requests().is_empty());
+}
+
+#[test]
+fn discard_serializes_native_session_delete_with_a_concurrent_session_binding() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    prepare_task(&store, base_oid.clone());
+    TaskStore::new(&store, &SystemProcessRunner)
+        .publish_branch_into_mirror(PROJECT_ID, task_id())
+        .unwrap();
+    let shared = SessionBinding::new(AgentKind::Codex, "shared-session", 200).unwrap();
+    TaskStore::new(&store, &SystemProcessRunner)
+        .bind_session(PROJECT_ID, task_id(), shared.clone())
+        .unwrap();
+
+    let task_two = task_id_for(2);
+    prepare_task_for(
+        &store,
+        task_two,
+        job_id_for(11),
+        base_oid,
+        &SystemProcessRunner,
+    );
+
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    let inner = NativeDeleteRunner::new(workspace, true);
+    let (runner, delete_started, release_delete) = BlockingDeleteRunner::new(inner);
+    let close_store = store.clone();
+    let close_runner = runner.clone();
+    let close = std::thread::spawn(move || {
+        TaskStore::new(&close_store, &close_runner).close(&TaskCloseRequest::new(
+            PROJECT_ID,
+            task_id(),
+            true,
+        ))
+    });
+    delete_started
+        .recv_timeout(Duration::from_secs(1))
+        .expect("native deletion should start");
+
+    let (bind_started, bind_started_receiver) = mpsc::channel();
+    let (bind_result, bind_done) = mpsc::channel();
+    let bind_store = store.clone();
+    let bind = std::thread::spawn(move || {
+        bind_started.send(()).unwrap();
+        let result = TaskStore::new(&bind_store, &SystemProcessRunner)
+            .bind_session(PROJECT_ID, task_two, shared);
+        bind_result.send(result).unwrap();
+    });
+    bind_started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("session binding should start while deletion is blocked");
+    let bind_completed_during_delete = bind_done.recv_timeout(Duration::from_millis(250)).is_ok();
+
+    release_delete.send(()).unwrap();
+    close.join().unwrap().unwrap();
+    bind.join().unwrap();
+    bind_done
+        .recv_timeout(Duration::from_secs(1))
+        .expect("session binding should finish after discard")
+        .unwrap();
+    assert!(
+        !bind_completed_during_delete,
+        "session binding must wait while discard checks and deletes the session"
+    );
 }
 
 #[test]
