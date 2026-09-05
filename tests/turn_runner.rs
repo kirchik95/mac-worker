@@ -17,6 +17,7 @@ use mac_worker::{
     agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
     client_state::{ClientStateStore, ClientStateWritePoint},
     config::Config,
+    error::WorkerError,
     job::{
         AdmissionObservation, JobMeta, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
         LeaseRecord, LogChunk, LogChunkRequest, LogStream, ProcessIdentity, SubmitResponse,
@@ -148,6 +149,26 @@ struct AcceptedThenTerminalRunner {
     stdout_log_sent: Mutex<bool>,
     probe_count: Mutex<u32>,
     facts_fresh: Mutex<bool>,
+}
+
+#[derive(Clone)]
+struct ChildAdoptsThenFails {
+    state: ClientStateStore,
+}
+
+impl RunnerExecutor for ChildAdoptsThenFails {
+    fn start(
+        &self,
+        paths: &mac_worker::paths::PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        let identity = InlineRunnerExecutor.start(paths, task_id, turn_id)?;
+        self.state.adopt_row(turn_id, identity.process_identity())?;
+        Err(WorkerError::Protocol(
+            "simulated parent handoff failure after detached child adoption".into(),
+        ))
+    }
 }
 
 impl AcceptedThenTerminalRunner {
@@ -951,7 +972,11 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
     assert_eq!(closed.status().state(), TaskState::Abandoned);
 }
 
-fn assert_submit_rolls_back_post_create_state(fault: ClientStateWritePoint, expected_error: &str) {
+fn assert_submit_rolls_back_post_create_state(
+    fault: ClientStateWritePoint,
+    expected_error: &str,
+    expect_rollback: bool,
+) {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
     let repo = support::GitRepo::init();
     repo.write("base.txt", b"base\n");
@@ -1039,25 +1064,39 @@ fn assert_submit_rolls_back_post_create_state(fault: ClientStateWritePoint, expe
         error.to_string().contains(expected_error),
         "submit returned an unexpected error: {error}"
     );
-    assert!(state.list_tasks().unwrap().is_empty());
-    assert!(state.queue_snapshot().unwrap().entries().is_empty());
-    assert!(
-        state
-            .load_run(run_id)
+    if expect_rollback {
+        assert!(state.list_tasks().unwrap().is_empty());
+        assert!(state.queue_snapshot().unwrap().entries().is_empty());
+        assert!(
+            state
+                .load_run(run_id)
+                .unwrap()
+                .publish_branches()
+                .is_empty()
+        );
+        let turn_entries = std::fs::read_dir(paths.state.join("turns"))
             .unwrap()
-            .publish_branches()
-            .is_empty()
-    );
-    let turn_entries = std::fs::read_dir(paths.state.join("turns"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect::<Vec<_>>();
-    assert_eq!(turn_entries, vec![".mac-worker-rooted-fs"]);
-    assert!(
-        repo.git(&["for-each-ref", "refs/mac-worker/bases"])
-            .stdout
-            .is_empty()
-    );
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(turn_entries, vec![".mac-worker-rooted-fs"]);
+        assert!(
+            repo.git(&["for-each-ref", "refs/mac-worker/bases"])
+                .stdout
+                .is_empty()
+        );
+    } else {
+        let task = state.list_tasks().unwrap().pop().unwrap();
+        let entry = state
+            .queue_entry_for_task_turn(task.meta().task_id())
+            .unwrap()
+            .unwrap();
+        assert!(
+            state
+                .read_turn_prompt(task.meta().task_id(), entry.job_id())
+                .is_ok()
+        );
+        assert_eq!(state.load_run(run_id).unwrap().publish_branches().len(), 1);
+    }
 }
 
 #[test]
@@ -1065,6 +1104,7 @@ fn submit_rolls_back_post_create_state_when_prompt_write_fails() {
     assert_submit_rolls_back_post_create_state(
         ClientStateWritePoint::BeforeTurnPromptWrite,
         "before task turn prompt write",
+        true,
     );
 }
 
@@ -1073,6 +1113,7 @@ fn submit_rolls_back_post_create_state_when_run_reference_load_fails() {
     assert_submit_rolls_back_post_create_state(
         ClientStateWritePoint::BeforeRunLoad,
         "before run load",
+        true,
     );
 }
 
@@ -1081,5 +1122,80 @@ fn submit_rolls_back_post_create_state_when_queue_publication_fails() {
     assert_submit_rolls_back_post_create_state(
         ClientStateWritePoint::BeforePublish,
         "before publication",
+        true,
     );
+}
+
+#[test]
+fn submit_retains_complete_state_when_queue_rollback_fails() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::BeforeTaskReport,
+        "before task report",
+        false,
+    );
+}
+
+#[test]
+fn submit_preserves_state_when_detached_child_adopts_before_handoff_failure() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = AcceptedThenTerminalRunner::new();
+    let executor = ChildAdoptsThenFails {
+        state: state.clone(),
+    };
+
+    let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .submit(
+            TaskSubmitRequest {
+                agent: AgentKind::Codex,
+                model: None,
+                prompt: "make the change".into(),
+                project: repo.root().to_path_buf(),
+                base: "main".into(),
+                wip: true,
+                source: None,
+                publish: None,
+                publish_branch: None,
+                cli_includes: Vec::new(),
+                limits: TaskLimits::default(),
+                close_policy: ClosePolicy::Never,
+                env_profile: None,
+                preference: WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                wait_for_capacity: true,
+                attached: false,
+                run_id: None,
+            },
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("simulated parent handoff failure")
+    );
+    let tasks = state.list_tasks().unwrap();
+    assert_eq!(tasks.len(), 1);
+    let task_id = tasks[0].meta().task_id();
+    let entry = state.queue_entry_for_task_turn(task_id).unwrap().unwrap();
+    assert!(entry.owner_opt().is_some());
+    assert!(state.read_turn_prompt(task_id, entry.job_id()).is_ok());
+    let project =
+        mac_worker::project_state::ProjectState::load(&SystemProcessRunner, repo.root(), &[])
+            .unwrap();
+    let transfer = TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
+    assert!(transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
 }

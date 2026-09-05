@@ -704,6 +704,7 @@ impl<'a> TaskClient<'a> {
             request.wait_for_capacity,
             None,
         )?;
+        let record_for_rollback = record.clone();
         let reservation = match (request.run_id, reserved_branch.as_ref()) {
             (Some(run_id), Some(branch)) => match self
                 .client_state
@@ -726,7 +727,7 @@ impl<'a> TaskClient<'a> {
             let _ = transfer.release_base(self.runner, task_id);
             return Err(error);
         }
-        let mut report = match (|| -> Result<TaskReport, WorkerError> {
+        let (mut report, should_start) = match (|| -> Result<(TaskReport, bool), WorkerError> {
             self.client_state
                 .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
             let run_reference = match request.run_id {
@@ -762,17 +763,14 @@ impl<'a> TaskClient<'a> {
                 self.client_state.park_row(entry.job_id())?;
             }
 
-            let report = self.report_for(task_id)?;
-            if should_start {
-                self.start_runner(task_id, turn_id)?;
-            }
-            Ok(report)
+            self.client_state.submission_report_fault()?;
+            Ok((self.report_for(task_id)?, should_start))
         })() {
             Ok(report) => report,
             Err(error) => {
                 self.rollback_submission(
-                    task_id,
                     turn_id,
+                    &record_for_rollback,
                     &transfer,
                     request.run_id,
                     reserved_branch.as_ref(),
@@ -781,6 +779,12 @@ impl<'a> TaskClient<'a> {
                 return Err(error);
             }
         };
+        if should_start {
+            // A detached child may claim the row as soon as it is started.
+            // Once that hand-off is attempted, retain the complete durable
+            // submission for reconciliation instead of compensating it away.
+            self.start_runner(task_id, turn_id)?;
+        }
         // The submitter no longer needs the repository after the queue row is
         // handed off.  Release its per-repository lock before an attached
         // runner reopens the same repository in this process.
@@ -1664,21 +1668,54 @@ impl<'a> TaskClient<'a> {
 
     fn rollback_submission(
         &self,
-        task_id: TaskId,
         turn_id: TurnId,
+        record: &LocalTaskRecord,
         transfer: &TransferRepo,
         run_id: Option<RunId>,
         reserved_branch: Option<&BranchName>,
         reservation_exists: bool,
     ) {
-        let _ = self
+        if self
             .client_state
-            .remove_task_turn_for_submission_rollback(turn_id);
-        let _ = self.client_state.remove_task_submission(task_id);
-        if reservation_exists && let (Some(run_id), Some(branch)) = (run_id, reserved_branch) {
-            let _ = self.client_state.release_run_publish_branch(run_id, branch);
+            .remove_task_turn_for_submission_rollback(turn_id)
+            .is_err()
+        {
+            return;
         }
-        let _ = transfer.release_base(self.runner, task_id);
+        let Ok(status) = abandoned_status(record.status(), "SUBMISSION_ROLLBACK_INCOMPLETE") else {
+            return;
+        };
+        let Ok(abandoned) = record.clone().with_status(status).and_then(|record| {
+            record.with_abandon_code(Some("SUBMISSION_ROLLBACK_INCOMPLETE".to_owned()))
+        }) else {
+            return;
+        };
+        if self.client_state.update_task(abandoned).is_err() {
+            return;
+        }
+        if reservation_exists
+            && let (Some(run_id), Some(branch)) = (run_id, reserved_branch)
+            && self
+                .client_state
+                .release_run_publish_branch(run_id, branch)
+                .is_err()
+        {
+            return;
+        }
+        if transfer
+            .release_base(self.runner, record.meta().task_id())
+            .is_err()
+        {
+            return;
+        }
+        let Ok(()) = self
+            .client_state
+            .remove_task_submission(record.meta().task_id())
+        else {
+            // The terminal record remains durable and identifies the already
+            // released resources for reconciliation or operator cleanup.
+            return;
+        };
     }
 
     fn transfer_for_record(&self, record: &LocalTaskRecord) -> Result<TransferRepo, WorkerError> {

@@ -85,6 +85,7 @@ pub enum ClientStateWritePoint {
     CrashRollbackBeforeNestedCleanup = 17,
     BeforeTurnPromptWrite = 18,
     BeforeRunLoad = 19,
+    BeforeTaskReport = 20,
 }
 
 #[doc(hidden)]
@@ -1044,6 +1045,9 @@ impl ClientStateStore {
         &self,
         turn_id: TurnId,
     ) -> Result<Option<QueueEntry>, WorkerError> {
+        if self.take_fault(ClientStateWritePoint::BeforeTaskReport) {
+            return Err(injected_failure(ClientStateWritePoint::BeforeTaskReport));
+        }
         self.update_queue(|snapshot| {
             let Some(index) = snapshot
                 .entries
@@ -1773,16 +1777,16 @@ impl ClientStateStore {
     /// submission. This is used only before a turn is handed to a runner.
     pub fn remove_task_submission(&self, task_id: TaskId) -> Result<(), WorkerError> {
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
-        let tasks = self.tasks_dir()?;
-        let task_name = task_file_name(task_id)?;
-        match tasks.remove_owned_regular(&task_name) {
+        let turns = self.turns_dir()?;
+        match turns.remove_owned_child(&task_id.to_string()) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(WorkerError::Io(error)),
-        }
+        };
 
-        let turns = self.turns_dir()?;
-        match turns.remove_owned_child(&task_id.to_string()) {
+        let tasks = self.tasks_dir()?;
+        let task_name = task_file_name(task_id)?;
+        match tasks.remove_owned_regular(&task_name) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(WorkerError::Io(error)),
@@ -2168,6 +2172,16 @@ impl ClientStateStore {
     #[doc(hidden)]
     pub fn inject_write_failure_once(&self, point: ClientStateWritePoint) {
         self.inner.write_fault.store(point as u8, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn submission_report_fault(&self) -> Result<(), WorkerError> {
+        if self.inner.write_fault.load(Ordering::SeqCst)
+            == ClientStateWritePoint::BeforeTaskReport as u8
+        {
+            return Err(injected_failure(ClientStateWritePoint::BeforeTaskReport));
+        }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -4680,6 +4694,7 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         }
         ClientStateWritePoint::BeforeTurnPromptWrite => "before task turn prompt write",
         ClientStateWritePoint::BeforeRunLoad => "before run load",
+        ClientStateWritePoint::BeforeTaskReport => "before task report",
     };
     WorkerError::Io(io::Error::other(format!(
         "injected local state failure {label}"
