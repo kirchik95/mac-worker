@@ -37,7 +37,10 @@ use crate::{
         LocalTaskRecord, PublishMode, RunnerIdentity, TaskId, TaskOutcome, TaskSource, TaskState,
         TaskStatus, TurnId, TurnSummary,
     },
-    task_store::{TaskCancelRequest, TaskPrepareRequest, TaskSessionRequest, TaskStatusRequest},
+    task_store::{
+        TaskCancelRequest, TaskPrebindRequest, TaskPrepareRequest, TaskSessionRequest,
+        TaskStatusRequest,
+    },
     transfer::{RemoteJobClient, TransferIdentity},
     transfer_repo::TransferRepo,
     transport::{SshTransport, WorkersService},
@@ -472,6 +475,25 @@ impl<'a> TurnRunner<'a> {
         };
         let adapter = adapter_for(turn.agent());
         let remote = RemoteJobClient::new(self.runner);
+        let prebound = if !turn.resume() && adapter.prebind_session().is_some() {
+            Some(
+                remote
+                    .task_prebind(
+                        worker,
+                        &TaskPrebindRequest::discover(
+                            initial_record.meta().project_id(),
+                            task_id,
+                            turn.agent(),
+                            turn.env_profile().map(str::to_owned),
+                        ),
+                    )?
+                    .binding()
+                    .session_ref()
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         let session_ref = if turn.resume() {
             Some(
                 remote
@@ -484,16 +506,11 @@ impl<'a> TurnRunner<'a> {
                     .to_owned(),
             )
         } else {
-            None
+            prebound.clone()
         };
-        let launch = if turn.resume() {
+        let launch = if let Some(ref session) = session_ref {
             adapter
-                .resume_turn(
-                    &params,
-                    session_ref
-                        .as_deref()
-                        .expect("resumed turns have a session reference"),
-                )
+                .resume_turn(&params, session)
                 .map_err(|error| task_error("TURN_COMMAND_INVALID", error.to_string()))?
         } else {
             adapter
@@ -601,6 +618,18 @@ impl<'a> TurnRunner<'a> {
                     ));
                 }
                 if !turn.resume() {
+                    if let Some(ref session) = prebound {
+                        remote.task_prebind(
+                            worker,
+                            &TaskPrebindRequest::persist(
+                                initial_record.meta().project_id(),
+                                task_id,
+                                turn.agent(),
+                                turn.env_profile().map(str::to_owned),
+                                session,
+                            ),
+                        )?;
+                    }
                     self.persist_status(task_id, prepared.status().clone())?;
                 }
                 if prepared.status().state().is_terminal()

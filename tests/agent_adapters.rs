@@ -663,6 +663,18 @@ fn cursor_prebind_session_is_create_chat() {
 }
 
 #[test]
+fn current_adapters_have_no_native_session_delete_command() {
+    for kind in [
+        AgentKind::Codex,
+        AgentKind::Claude,
+        AgentKind::Cursor,
+        AgentKind::Opencode,
+    ] {
+        assert_eq!(adapter_for(kind).delete_session("session"), None);
+    }
+}
+
+#[test]
 fn opencode_first_turn_uses_argv_pointer_and_auto() {
     let launch = adapter_for(AgentKind::Opencode)
         .first_turn(&opencode_params(PermissionPolicy::Unattended))

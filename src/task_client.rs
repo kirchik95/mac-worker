@@ -2424,15 +2424,7 @@ fn agent_name(agent: AgentKind) -> &'static str {
 
 fn validate_task_agent(agent: AgentKind) -> Result<(), WorkerError> {
     match agent {
-        AgentKind::Codex | AgentKind::Claude => Ok(()),
-        AgentKind::Cursor => Err(task_error(
-            "TASK_CONFIG_INVALID",
-            "agent cursor is deferred to a later plan",
-        )),
-        AgentKind::Opencode => Err(task_error(
-            "TASK_CONFIG_INVALID",
-            "agent opencode is deferred to a later plan",
-        )),
+        AgentKind::Codex | AgentKind::Claude | AgentKind::Cursor | AgentKind::Opencode => Ok(()),
     }
 }
 

@@ -183,6 +183,99 @@ impl TaskSessionResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct TaskPrebindRequest {
+    protocol_version: u32,
+    project_id: String,
+    task_id: TaskId,
+    agent: String,
+    env_profile: Option<String>,
+    session_ref: Option<String>,
+}
+
+impl TaskPrebindRequest {
+    pub fn discover(
+        project_id: impl Into<String>,
+        task_id: TaskId,
+        agent: AgentKind,
+        env_profile: Option<String>,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            project_id: project_id.into(),
+            task_id,
+            agent: agent_name(agent).to_string(),
+            env_profile,
+            session_ref: None,
+        }
+    }
+
+    pub fn persist(
+        project_id: impl Into<String>,
+        task_id: TaskId,
+        agent: AgentKind,
+        env_profile: Option<String>,
+        session_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            project_id: project_id.into(),
+            task_id,
+            agent: agent_name(agent).to_string(),
+            env_profile,
+            session_ref: Some(session_ref.into()),
+        }
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub fn agent(&self) -> Result<AgentKind, WorkerError> {
+        parse_agent(&self.agent)
+    }
+
+    pub fn env_profile(&self) -> Option<&str> {
+        self.env_profile.as_deref()
+    }
+
+    pub fn session_ref(&self) -> Option<&str> {
+        self.session_ref.as_deref()
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), WorkerError> {
+        ensure_protocol(self.protocol_version)?;
+        validate_project_id(&self.project_id)?;
+        parse_agent(&self.agent)?;
+        if let Some(profile) = &self.env_profile
+            && (profile.is_empty()
+                || profile.len() > 128
+                || profile.contains('/')
+                || profile.contains('\\')
+                || profile == "."
+                || profile == "..")
+        {
+            return Err(task_error(
+                "TASK_CONFIG_INVALID",
+                "environment profile name is invalid",
+            ));
+        }
+        if let Some(session_ref) = &self.session_ref {
+            SessionBinding::new(parse_agent(&self.agent)?, session_ref, 1)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskCancelRequest {
     protocol_version: u32,
     project_id: String,
@@ -668,6 +761,7 @@ impl<'a> TaskStore<'a> {
         }
 
         let next_state = if request.discard() {
+            let _ = self.delete_native_session(request.project_id(), request.task_id());
             let mirror = self
                 .store
                 .mirror_if_present(request.project_id())?
@@ -1104,6 +1198,23 @@ impl<'a> TaskStore<'a> {
             let _ = replace_status_record(&task, status, state, Some(true))?;
         }
         task.sync_root()?;
+        Ok(())
+    }
+
+    fn delete_native_session(&self, project_id: &str, task_id: TaskId) -> Result<(), WorkerError> {
+        let Some(binding) = self.session(project_id, task_id)? else {
+            return Ok(());
+        };
+        let Some(argv) =
+            crate::agent::adapter_for(binding.agent()).delete_session(binding.session_ref())
+        else {
+            return Ok(());
+        };
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let request = crate::agent::prebind_login_request(&argv, &home, &[])?;
+        let _ = self.runner.run(&request);
         Ok(())
     }
 

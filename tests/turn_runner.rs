@@ -604,6 +604,19 @@ fn runner_refreshes_stale_agent_facts_before_claiming() {
 }
 
 #[test]
+fn codex_first_turn_does_not_prebind_a_session() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    fixture.run(&mut Vec::new()).unwrap();
+    assert!(fixture.runner.requests().iter().all(|request| {
+        request
+            .args
+            .iter()
+            .all(|arg| arg != HostOperation::TaskPrebind.command())
+    }));
+}
+
+#[test]
 fn follower_flush_error_detaches_runner_and_completes_remote_turn() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
     let fixture = AcceptedThenTerminalFixture::new();

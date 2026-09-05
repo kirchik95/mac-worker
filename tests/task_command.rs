@@ -14,6 +14,12 @@ fn task_commands_parse_the_documented_forms() {
             "worker", "task", "submit", "--agent", "codex", "--prompt", "x",
         ],
         vec![
+            "worker", "task", "submit", "--agent", "cursor", "--prompt", "x",
+        ],
+        vec![
+            "worker", "task", "submit", "--agent", "opencode", "--prompt", "x",
+        ],
+        vec![
             "worker",
             "task",
             "submit",

@@ -13,7 +13,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    agent::{AgentKind, PermissionPolicy, TurnLaunch, TurnLimits, render_shell},
+    agent::{
+        AgentKind, PermissionPolicy, TurnLaunch, TurnLimits, adapter_for,
+        parse_prebind_session_ref, prebind_login_request, render_shell,
+    },
     error::WorkerError,
     git_transport::GitTransport,
     host_store::{HostStore, PublicationReceipt, StagedJob, StagingNonce},
@@ -29,7 +32,9 @@ use crate::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskMeta, TaskOutcome,
         TaskSource, TaskStatus, TurnTerminal,
     },
-    task_store::{SessionBinding, TaskCloseRequest, TaskStore},
+    task_store::{
+        SessionBinding, TaskCloseRequest, TaskPrebindRequest, TaskSessionResponse, TaskStore,
+    },
 };
 
 pub const LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
@@ -1019,6 +1024,63 @@ fn ensure_session_binding(
     let binding = SessionBinding::new(adapter.kind(), session_ref, now_millis()?)?;
     task_store.bind_session(meta.project_id(), meta.task_id(), binding.clone())?;
     Ok(Some(binding))
+}
+
+pub fn prebind_session(
+    store: &HostStore,
+    runner: &dyn ProcessRunner,
+    request: &TaskPrebindRequest,
+    account_home: &Path,
+) -> Result<TaskSessionResponse, WorkerError> {
+    request.validate()?;
+    let task_store = TaskStore::new(store, runner);
+    match task_store.session(request.project_id(), request.task_id()) {
+        Ok(Some(binding)) => return Ok(TaskSessionResponse::new(binding)),
+        Ok(None) => {}
+        Err(error) if error.public_code() == "TASK_NOT_FOUND" => {}
+        Err(error) => return Err(error),
+    }
+    let agent = request.agent()?;
+    if let Some(session_ref) = request.session_ref() {
+        let binding = SessionBinding::new(agent, session_ref, now_millis()?)?;
+        task_store.bind_session(request.project_id(), request.task_id(), binding.clone())?;
+        return Ok(TaskSessionResponse::new(binding));
+    }
+    let argv = adapter_for(agent)
+        .prebind_session()
+        .ok_or_else(|| WorkerError::Task {
+            code: "TASK_CONFIG_INVALID",
+            message: "agent does not expose a session prebind command".into(),
+        })?;
+    let profile = match request.env_profile() {
+        Some(name) => EnvProfile::load(
+            &account_home
+                .join(".config")
+                .join("mac-worker")
+                .join("env")
+                .join(format!("{name}.env")),
+        )?,
+        None => EnvProfile::empty(),
+    };
+    let process = prebind_login_request(&argv, account_home, profile.entries())?;
+    let result = runner.run(&process).map_err(|error| WorkerError::Agent {
+        code: "AGENT_EXITED",
+        message: format!("session prebind failed: {error}"),
+    })?;
+    if !result.status.success() {
+        return Err(WorkerError::Agent {
+            code: "AGENT_EXITED",
+            message: "session prebind command failed".into(),
+        });
+    }
+    let session_ref = parse_prebind_session_ref(&result.stdout)?;
+    let binding = SessionBinding::new(agent, session_ref, now_millis()?)?;
+    match task_store.bind_session(request.project_id(), request.task_id(), binding.clone()) {
+        Ok(()) => {}
+        Err(error) if error.public_code() == "TASK_NOT_FOUND" => {}
+        Err(error) => return Err(error),
+    }
+    Ok(TaskSessionResponse::new(binding))
 }
 
 fn read_text(dir: &RootedDir, name: &str, max: u64) -> Result<String, WorkerError> {

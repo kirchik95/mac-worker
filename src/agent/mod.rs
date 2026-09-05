@@ -3,13 +3,21 @@ mod codex;
 mod cursor;
 mod opencode;
 
-use crate::process::ProcessResult;
+use std::{ffi::OsString, path::Path, time::Duration};
+
+use crate::{
+    error::WorkerError,
+    process::{ProcessPolicy, ProcessRequest, ProcessResult},
+};
 use claude::ClaudeAdapter;
 use codex::CodexAdapter;
 use cursor::CursorAdapter;
 use opencode::OpencodeAdapter;
 use serde::Deserialize;
 use serde_json::Value;
+
+const PREBIND_OUTPUT_LIMIT: usize = 4 * 1024;
+const PREBIND_DEADLINE: Duration = Duration::from_secs(15);
 
 pub const MAX_SUMMARY_BYTES: usize = 512;
 /// Structured result schema handed to every agent. Strict structured-output
@@ -286,6 +294,9 @@ pub trait AgentAdapter: Send + Sync {
     fn prebind_session(&self) -> Option<Vec<String>> {
         None
     }
+    fn delete_session(&self, _session_ref: &str) -> Option<Vec<String>> {
+        None
+    }
     fn parse_event(&self, line: &str) -> Option<AgentEvent>;
     fn session_ref(&self, events: &[AgentEvent]) -> Option<String> {
         events.iter().find_map(|event| match event {
@@ -367,6 +378,105 @@ fn combined_output(result: &ProcessResult) -> String {
         text.push_str(&String::from_utf8_lossy(&result.stderr));
     }
     text
+}
+
+pub fn render_prebind_shell(argv: &[String]) -> Result<String, AdapterError> {
+    if argv.is_empty() {
+        return Err(AdapterError::new("prebind argv is empty"));
+    }
+    let mut parts = Vec::with_capacity(argv.len());
+    for argument in argv {
+        parts.push(single_quote(argument)?);
+    }
+    Ok(format!("exec {}", parts.join(" ")))
+}
+
+pub fn prebind_login_request(
+    argv: &[String],
+    account_home: &Path,
+    extra_environment: &[(OsString, OsString)],
+) -> Result<ProcessRequest, WorkerError> {
+    let shell = render_prebind_shell(argv).map_err(|error| WorkerError::Agent {
+        code: "TURN_COMMAND_INVALID",
+        message: error.to_string(),
+    })?;
+    let user = account_home
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| OsString::from("worker"));
+    let mut environment = vec![
+        (
+            OsString::from("HOME"),
+            account_home.as_os_str().to_os_string(),
+        ),
+        (OsString::from("USER"), user.clone()),
+        (OsString::from("LOGNAME"), user),
+        (OsString::from("SHELL"), OsString::from("/bin/zsh")),
+    ];
+    environment.extend(extra_environment.iter().cloned());
+    Ok(ProcessRequest {
+        program: OsString::from("/bin/zsh"),
+        args: vec![
+            OsString::from("/bin/zsh"),
+            OsString::from("-lc"),
+            OsString::from(shell),
+        ],
+        environment,
+        environment_remove: Vec::new(),
+        stdin: None,
+        policy: ProcessPolicy {
+            stdout_limit: PREBIND_OUTPUT_LIMIT,
+            stderr_limit: PREBIND_OUTPUT_LIMIT,
+            deadline: PREBIND_DEADLINE,
+        },
+    })
+}
+
+pub fn parse_prebind_session_ref(stdout: &[u8]) -> Result<String, WorkerError> {
+    let text = std::str::from_utf8(stdout).map_err(|_| WorkerError::Task {
+        code: "TASK_SESSION_INVALID",
+        message: "prebind output is not UTF-8".into(),
+    })?;
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+        && let Some(session_ref) = json_session_id(&value)
+    {
+        return validate_prebind_id(session_ref);
+    }
+    if let Some(value) = extract_json_object(trimmed)
+        && let Some(session_ref) = json_session_id(&value)
+    {
+        return validate_prebind_id(session_ref);
+    }
+    let line = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    validate_prebind_id(line)
+}
+
+fn json_session_id(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("chatId").and_then(Value::as_str))
+        .or_else(|| value.get("chat_id").and_then(Value::as_str))
+        .or_else(|| value.get("session_id").and_then(Value::as_str))
+        .or_else(|| value.get("sessionID").and_then(Value::as_str))
+}
+
+fn validate_prebind_id(session_ref: &str) -> Result<String, WorkerError> {
+    if session_ref.is_empty()
+        || session_ref.len() > 256
+        || session_ref.chars().any(char::is_control)
+    {
+        return Err(WorkerError::Task {
+            code: "TASK_SESSION_INVALID",
+            message: "session reference is empty, too long, or contains a control character".into(),
+        });
+    }
+    Ok(session_ref.to_string())
 }
 
 pub fn render_shell(launch: &TurnLaunch) -> Result<String, AdapterError> {

@@ -256,6 +256,8 @@ pub enum HostCommand {
     TaskClose,
     #[command(name = "task-session")]
     TaskSession,
+    #[command(name = "task-prebind", hide = true)]
+    TaskPrebind,
     #[command(name = "task-cancel")]
     TaskCancel,
     #[command(name = "task-turn")]

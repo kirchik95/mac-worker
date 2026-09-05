@@ -2922,7 +2922,12 @@ fn pump_turn_output(
     let mut tail = VecDeque::with_capacity(crate::turn::LOG_TAIL_BYTES);
     let mut pending_line = Vec::new();
     let adapter = crate::agent::adapter_for(section.turn().agent());
-    let mut session_bound = false;
+    let mut session_bound =
+        crate::task_store::TaskStore::new(store, &crate::process::SystemProcessRunner)
+            .session(section.project_id(), section.turn().task_id())
+            .ok()
+            .flatten()
+            .is_some();
     let mut buffer = [0_u8; 64 * 1024];
 
     loop {

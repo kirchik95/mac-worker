@@ -31,8 +31,9 @@ use crate::{
     snapshot::Snapshot,
     task_store::{
         TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse,
-        TaskDiffRequest, TaskDiffResponse, TaskPrepareRequest, TaskPrepareResponse,
-        TaskSessionRequest, TaskSessionResponse, TaskStatusRequest, TaskStatusResponse,
+        TaskDiffRequest, TaskDiffResponse, TaskPrebindRequest, TaskPrepareRequest,
+        TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse, TaskStatusRequest,
+        TaskStatusResponse,
     },
     turn::{TaskTurnRequest, TaskTurnResponse},
 };
@@ -65,6 +66,7 @@ pub enum HostOperation {
     TaskDiff,
     TaskClose,
     TaskSession,
+    TaskPrebind,
     TaskCancel,
     TaskTurn,
     RefreshFacts,
@@ -86,6 +88,7 @@ impl HostOperation {
             Self::TaskDiff => "~/.local/bin/worker host task-diff",
             Self::TaskClose => "~/.local/bin/worker host task-close",
             Self::TaskSession => "~/.local/bin/worker host task-session",
+            Self::TaskPrebind => "~/.local/bin/worker host task-prebind",
             Self::TaskCancel => "~/.local/bin/worker host task-cancel",
             Self::TaskTurn => "~/.local/bin/worker host task-turn",
             Self::RefreshFacts => "~/.local/bin/worker host refresh-facts",
@@ -801,6 +804,23 @@ impl<'a> RemoteJobClient<'a> {
         let response: TaskSessionResponse = self.transport.request(
             worker,
             HostOperation::TaskSession,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )?;
+        if response.protocol_version() != crate::protocol::PROTOCOL_VERSION {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
+    }
+
+    pub fn task_prebind(
+        &self,
+        worker: &WorkerEntry,
+        request: &TaskPrebindRequest,
+    ) -> Result<TaskSessionResponse, WorkerError> {
+        let response: TaskSessionResponse = self.transport.request(
+            worker,
+            HostOperation::TaskPrebind,
             request,
             control_policy(MAX_CONTROL_DEADLINE),
         )?;

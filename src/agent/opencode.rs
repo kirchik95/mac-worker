@@ -48,6 +48,10 @@ impl AgentAdapter for OpencodeAdapter {
         ))
     }
 
+    fn delete_session(&self, _session_ref: &str) -> Option<Vec<String>> {
+        None
+    }
+
     fn parse_event(&self, line: &str) -> Option<AgentEvent> {
         let value = parse_json_line(line)?;
         match value.get("type").and_then(Value::as_str)? {

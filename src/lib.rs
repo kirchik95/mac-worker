@@ -44,8 +44,8 @@ use supervisor::{
 };
 use task_client::{TaskClient, TaskListFilter, TaskSubmitRequest, WaitSelector};
 use task_store::{
-    TaskCancelRequest, TaskCloseRequest, TaskDiffRequest, TaskPrepareRequest, TaskSessionRequest,
-    TaskStatusRequest, TaskStore,
+    TaskCancelRequest, TaskCloseRequest, TaskDiffRequest, TaskPrebindRequest, TaskPrepareRequest,
+    TaskSessionRequest, TaskStatusRequest, TaskStore,
 };
 use transfer::{
     HostTransferService, RemoteJobClient, RsyncServerExecutor, SystemRsyncServerExecutor,
@@ -344,6 +344,11 @@ fn execute_with_context(
             command: HostCommand::TaskSession,
         } => Err(WorkerError::Protocol(
             "host task-session requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::TaskPrebind,
+        } => Err(WorkerError::Protocol(
+            "host task-prebind requires the stdio execution boundary".into(),
         )),
         Command::Host {
             command: HostCommand::TaskCancel,
@@ -1296,6 +1301,14 @@ pub fn run_with_rsync_executor_in_context(
     if matches!(
         &cli.command,
         Command::Host {
+            command: HostCommand::TaskPrebind
+        }
+    ) {
+        return run_host_task_prebind(cli.config, runtime, runner, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
             command: HostCommand::TaskCancel
         }
     ) {
@@ -1674,6 +1687,26 @@ fn run_host_task_session(
         stdout,
         |request: TaskSessionRequest, store, runner| {
             TaskStore::new(store, runner).session_info(&request)
+        },
+    )
+}
+
+fn run_host_task_prebind(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    let home = runtime.home.clone();
+    run_host_task_control_endpoint(
+        config_override,
+        runtime,
+        runner,
+        stdin,
+        stdout,
+        move |request: TaskPrebindRequest, store, runner| {
+            crate::turn::prebind_session(store, runner, &request, &home)
         },
     )
 }
