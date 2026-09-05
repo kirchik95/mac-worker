@@ -13,6 +13,7 @@ use crate::{
     host_store::HostStore,
     inputs::RelativePath,
     job::{JobId, JobMeta, JobStatus},
+    lease::LeaseService,
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::PROTOCOL_VERSION,
     rooted_fs::{EntryKind, RootedDir},
@@ -341,10 +342,15 @@ impl<'a> HostGc<'a> {
     }
 
     fn collect(&self, request: &GcRequest) -> Result<(GcInventory, Vec<GcCandidate>), WorkerError> {
-        let mut inventory = GcInventory::default();
+        let mut inventory = GcInventory {
+            live_lease_job: LeaseService::new(self.store)
+                .load()?
+                .map(|lease| lease.job_id()),
+            ..GcInventory::default()
+        };
         let mut candidates = Vec::new();
         self.collect_tasks(request, &mut inventory, &mut candidates)?;
-        self.collect_jobs(request, &mut candidates)?;
+        self.collect_jobs(request, &inventory, &mut candidates)?;
         self.collect_mirrors(request, &inventory, &mut candidates)?;
         Ok((inventory, candidates))
     }
@@ -397,6 +403,8 @@ impl<'a> HostGc<'a> {
                 } else {
                     (false, false)
                 };
+                let active_work =
+                    self.task_has_active_work(&project, &meta, &status, inventory.live_lease_job)?;
                 let size_bytes = bounded_tree_size(&task)?;
                 let identifier = format!("{project}/{task_id}");
                 inventory.task_projects.insert(project.clone());
@@ -405,10 +413,12 @@ impl<'a> HostGc<'a> {
                     TaskSnapshot {
                         state: status.state(),
                         updated_at_millis: status.updated_at_millis(),
+                        active_work,
                     },
                 );
 
-                if status.state() == TaskState::Open
+                if !active_work
+                    && status.state() == TaskState::Open
                     && expired(
                         request.now_millis(),
                         status.updated_at_millis(),
@@ -426,7 +436,8 @@ impl<'a> HostGc<'a> {
                     )?;
                 }
 
-                if status.state().is_terminal()
+                if !active_work
+                    && status.state().is_terminal()
                     && (branch_exists || base_exists)
                     && expired(
                         request.now_millis(),
@@ -446,7 +457,7 @@ impl<'a> HostGc<'a> {
                         status.updated_at_millis(),
                         request.job_retention_millis(),
                     );
-                if metadata_expired {
+                if !active_work && metadata_expired {
                     push_candidate(
                         candidates,
                         GcCandidate::new(
@@ -462,9 +473,64 @@ impl<'a> HostGc<'a> {
         Ok(())
     }
 
+    fn task_has_active_work(
+        &self,
+        project: &str,
+        meta: &TaskMeta,
+        status: &TaskStatus,
+        live_lease_job: Option<JobId>,
+    ) -> Result<bool, WorkerError> {
+        for turn in status.turns() {
+            if turn.terminal().is_none() {
+                return Ok(true);
+            }
+            let job_id = turn.turn_id();
+            if live_lease_job == Some(job_id) {
+                return Ok(true);
+            }
+            let job_path = format!("jobs/{project}/{}/{job_id}", meta.worktree_id());
+            let job = match self.store.open_directory(&job_path, false) {
+                Ok(job) => job,
+                Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let job_status: JobStatus = read_gc_json(&job, "status.json", "turn job status")?;
+            if !job_status.state().is_terminal() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn task_id_has_active_work(&self, project: &str, task_id: TaskId) -> Result<bool, WorkerError> {
+        let task = match self
+            .store
+            .open_directory(&format!("tasks/{project}/{task_id}"), false)
+        {
+            Ok(task) => task,
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let meta: TaskMeta = read_gc_json(&task, "meta.json", "task metadata")?;
+        let status: TaskStatus = read_gc_json(&task, "status.json", "task status")?;
+        self.task_has_active_work(
+            project,
+            &meta,
+            &status,
+            LeaseService::new(self.store)
+                .load()?
+                .map(|lease| lease.job_id()),
+        )
+    }
+
     fn collect_jobs(
         &self,
         request: &GcRequest,
+        inventory: &GcInventory,
         candidates: &mut Vec<GcCandidate>,
     ) -> Result<(), WorkerError> {
         let jobs = self.store.open_directory("jobs", false)?;
@@ -512,6 +578,9 @@ impl<'a> HostGc<'a> {
                             mutable = true;
                             break;
                         }
+                    }
+                    if inventory.live_lease_job == Some(job_id) {
+                        continue;
                     }
                     if status.state().is_terminal()
                         && !mutable
@@ -576,7 +645,8 @@ impl<'a> HostGc<'a> {
                 let identifier = format!("{project}/{task_id}");
                 let protected_by_live_record =
                     inventory.tasks.get(&identifier).is_some_and(|task| {
-                        !task.state.is_terminal()
+                        task.active_work
+                            || !task.state.is_terminal()
                             || !expired(
                                 request.now_millis(),
                                 task.updated_at_millis,
@@ -627,6 +697,9 @@ impl<'a> HostGc<'a> {
         match candidate.kind() {
             "task" if candidate.reason() == "open task retention" => {
                 let (project, task_id) = parse_task_identifier(candidate.identifier())?;
+                if self.task_id_has_active_work(project, task_id)? {
+                    return Ok(false);
+                }
                 Ok(TaskStore::new(self.store, self.runner)
                     .close_for_retention(project, task_id, request.now_millis())?
                     .is_some())
@@ -640,6 +713,9 @@ impl<'a> HostGc<'a> {
                     && snapshot.state != TaskState::Abandoned
                     && snapshot.state != TaskState::Lost
                 {
+                    return Ok(false);
+                }
+                if self.task_id_has_active_work(project, task_id)? {
                     return Ok(false);
                 }
                 let task = match self
@@ -691,7 +767,8 @@ impl<'a> HostGc<'a> {
     ) -> Result<bool, WorkerError> {
         let (project, task_id) = parse_task_identifier(candidate.identifier())?;
         if let Some(snapshot) = inventory.tasks.get(candidate.identifier())
-            && (!snapshot.state.is_terminal()
+            && (snapshot.active_work
+                || !snapshot.state.is_terminal()
                 || !expired(
                     request.now_millis(),
                     snapshot.updated_at_millis,
@@ -699,6 +776,24 @@ impl<'a> HostGc<'a> {
                 ))
         {
             return Ok(false);
+        }
+        if let Some(snapshot) = inventory.tasks.get(candidate.identifier()) {
+            let task = self
+                .store
+                .open_directory(&format!("tasks/{project}/{task_id}"), false)?;
+            let meta: TaskMeta = read_gc_json(&task, "meta.json", "task metadata")?;
+            let status: TaskStatus = read_gc_json(&task, "status.json", "task status")?;
+            if self.task_has_active_work(
+                project,
+                &meta,
+                &status,
+                LeaseService::new(self.store)
+                    .load()?
+                    .map(|lease| lease.job_id()),
+            )? {
+                return Ok(false);
+            }
+            debug_assert_eq!(snapshot.state, status.state());
         }
         let mirror = match self.store.mirror_if_present(project)? {
             Some(mirror) => mirror,
@@ -738,6 +833,12 @@ impl<'a> HostGc<'a> {
         };
         let meta: JobMeta = read_gc_json(&job, "meta.json", "job metadata")?;
         let status: JobStatus = read_gc_json(&job, "status.json", "job status")?;
+        if LeaseService::new(self.store)
+            .load()?
+            .is_some_and(|lease| lease.job_id() == job_id)
+        {
+            return Ok(false);
+        }
         if meta.job_id() != job_id
             || meta.project_id() != project
             || meta.worktree_id() != worktree
@@ -794,6 +895,7 @@ impl<'a> HostGc<'a> {
 
 #[derive(Default)]
 struct GcInventory {
+    live_lease_job: Option<JobId>,
     tasks: BTreeMap<String, TaskSnapshot>,
     task_projects: BTreeSet<String>,
 }
@@ -801,6 +903,7 @@ struct GcInventory {
 struct TaskSnapshot {
     state: TaskState,
     updated_at_millis: u64,
+    active_work: bool,
 }
 
 fn candidate_rank(candidate: &GcCandidate) -> u8 {

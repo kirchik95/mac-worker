@@ -1,20 +1,21 @@
 #[allow(dead_code)]
 mod support;
 
-use std::{fs, path::Path, process::Command};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy},
     host_store::{HostGc, HostStore},
     job::{
-        ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseToken, RequestFingerprintMaterial,
+        ClientId, CommandSpec, JobId, JobMeta, JobStatus, LeaseAcquireRequest, LeaseToken,
+        RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
     process::SystemProcessRunner,
     protocol::MemoryPressure,
     task::{
         BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskSource, TaskState,
+        TaskMetaInput, TaskOutcome, TaskSource, TaskState, TurnSummary, TurnTerminal,
     },
     task_store::{SessionBinding, TaskStore},
     transfer_repo::{TransferGc, TransferRepo},
@@ -41,6 +42,26 @@ fn client_id() -> ClientId {
 
 fn lease_token() -> LeaseToken {
     LeaseToken::new(Uuid::from_u128(30))
+}
+
+fn lease_request(job: JobId) -> LeaseAcquireRequest {
+    LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            job,
+            client_id(),
+            lease_token(),
+            1,
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            "c".repeat(64),
+            String::new(),
+            30_000,
+            "heavy".into(),
+            CommandSpec::shell("true".into()).unwrap(),
+        )
+        .unwrap(),
+    )
 }
 
 fn git(path: &Path, args: &[&str]) -> String {
@@ -113,23 +134,7 @@ fn task_meta(task_id: TaskId, base_oid: BaseOid, created_at_millis: u64) -> Task
 }
 
 fn acquire_lease(store: &HostStore, job: JobId) {
-    let request = LeaseAcquireRequest::new(
-        RequestFingerprintMaterial::new(
-            job,
-            client_id(),
-            lease_token(),
-            1,
-            "mini-1".into(),
-            PROJECT_ID.into(),
-            PROJECT_ID.into(),
-            WORKTREE_ID.into(),
-            "c".repeat(64),
-            30_000,
-            "heavy".into(),
-            CommandSpec::shell("true".into()).unwrap(),
-        )
-        .unwrap(),
-    );
+    let request = lease_request(job);
     LeaseService::new(store)
         .acquire(
             &request,
@@ -142,6 +147,46 @@ fn acquire_lease(store: &HostStore, job: JobId) {
             1,
         )
         .unwrap();
+}
+
+fn release_lease(store: &HostStore, job: JobId) {
+    let request = lease_request(job);
+    store.record_abandoned(&request, 2).unwrap();
+    let lease = LeaseService::new(store).load().unwrap().unwrap();
+    let receipt = store.cleanup_job_owned(&lease).unwrap();
+    LeaseService::new(store)
+        .release_after_cleanup(&lease, &receipt)
+        .unwrap();
+}
+
+fn write_job(store: &HostStore, job: JobId, status: &JobStatus) {
+    let job_dir = store.job(PROJECT_ID, WORKTREE_ID, job).unwrap();
+    fs::create_dir_all(&job_dir).unwrap();
+    fs::set_permissions(
+        job_dir.parent().unwrap().parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(job_dir.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&job_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let request = lease_request(job);
+    let meta = JobMeta::new(request.material(), request.request_fingerprint().clone()).unwrap();
+    fs::write(
+        job_dir.join("meta.json"),
+        serde_json::to_vec(&meta).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(job_dir.join("meta.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        job_dir.join("status.json"),
+        serde_json::to_vec(status).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        job_dir.join("status.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
 }
 
 fn fixture() -> (TempDir, HostStore, GitRepo, BaseOid) {
@@ -184,6 +229,30 @@ fn prepare_task(store: &HostStore, task: TaskId, job: JobId, base_oid: &BaseOid)
 
 fn rewrite_status(store: &HostStore, task: TaskId, state: TaskState, updated_at_millis: u64) {
     let status = store.task_status(PROJECT_ID, task).unwrap();
+    let turns = if state.is_terminal() || state == TaskState::Open {
+        status
+            .turns()
+            .iter()
+            .map(|turn| {
+                if turn.terminal().is_some() {
+                    turn.clone()
+                } else {
+                    TurnSummary::new(
+                        turn.turn_number(),
+                        turn.turn_id(),
+                        Some(TurnTerminal::Lost),
+                        Some(TaskOutcome::Lost),
+                        Some(false),
+                        turn.log_truncated(),
+                        turn.started_at_millis(),
+                        Some(updated_at_millis),
+                    )
+                }
+            })
+            .collect()
+    } else {
+        status.turns().to_vec()
+    };
     let replacement = mac_worker::task::TaskStatus::new(
         state,
         status.last_outcome().cloned(),
@@ -194,7 +263,7 @@ fn rewrite_status(store: &HostStore, task: TaskId, state: TaskState, updated_at_
         status.questions().to_vec(),
         status.files_changed().to_vec(),
         status.diff_stat().map(str::to_owned),
-        status.turns().to_vec(),
+        turns,
         updated_at_millis,
     )
     .unwrap();
@@ -212,7 +281,9 @@ fn rewrite_status(store: &HostStore, task: TaskId, state: TaskState, updated_at_
 fn gc_closes_idle_open_task_but_preserves_result_branch_and_metadata() {
     let (_temp, store, _source, base_oid) = fixture();
     let task = task_id(1);
-    prepare_task(&store, task, job_id(1), &base_oid);
+    let job = job_id(1);
+    prepare_task(&store, task, job, &base_oid);
+    release_lease(&store, job);
     rewrite_status(&store, task, TaskState::Open, 1);
 
     let now = 1 + mac_worker::host_store::TASK_RETENTION_MILLIS;
@@ -257,7 +328,9 @@ fn gc_closes_idle_open_task_but_preserves_result_branch_and_metadata() {
 fn gc_prunes_expired_task_branch_without_removing_foreign_mirror_refs() {
     let (_temp, store, source, base_oid) = fixture();
     let task = task_id(1);
-    prepare_task(&store, task, job_id(1), &base_oid);
+    let job = job_id(1);
+    prepare_task(&store, task, job, &base_oid);
+    release_lease(&store, job);
     rewrite_status(&store, task, TaskState::Closed, 1);
     let mirror = store.mirror(PROJECT_ID).unwrap();
     let keep = Command::new("/usr/bin/git")
@@ -299,10 +372,73 @@ fn gc_prunes_expired_task_branch_without_removing_foreign_mirror_refs() {
 }
 
 #[test]
+fn gc_does_not_prune_a_terminal_task_with_a_live_turn_lease() {
+    let (_temp, store, _source, base_oid) = fixture();
+    let task = task_id(1);
+    let job = job_id(1);
+    prepare_task(&store, task, job, &base_oid);
+    rewrite_status(&store, task, TaskState::Closed, 1);
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap().unwrap().job_id(),
+        job
+    );
+    assert_eq!(
+        store.task_status(PROJECT_ID, task).unwrap().turns()[0].turn_id(),
+        job
+    );
+
+    let preview = HostGc::new(&store, &SystemProcessRunner)
+        .preview_at(u64::MAX / 2)
+        .unwrap();
+
+    assert!(!preview.candidates().iter().any(|candidate| {
+        candidate.kind() == "branch" && candidate.identifier() == format!("{PROJECT_ID}/{task}")
+    }));
+}
+
+#[test]
+fn gc_does_not_remove_a_terminal_job_while_its_lease_is_live() {
+    let (_temp, store, _source, _base_oid) = fixture();
+    let job = job_id(1);
+    acquire_lease(&store, job);
+    write_job(&store, job, &JobStatus::succeeded(1, 0, 0).unwrap());
+
+    let preview = HostGc::new(&store, &SystemProcessRunner)
+        .preview_at(u64::MAX / 2)
+        .unwrap();
+
+    assert!(!preview.candidates().iter().any(|candidate| {
+        candidate.kind() == "job"
+            && candidate.identifier() == format!("{PROJECT_ID}/{WORKTREE_ID}/{job}")
+    }));
+}
+
+#[test]
+fn gc_does_not_prune_a_task_with_a_nonterminal_turn_job() {
+    let (_temp, store, _source, base_oid) = fixture();
+    let task = task_id(1);
+    let job = job_id(1);
+    prepare_task(&store, task, job, &base_oid);
+    release_lease(&store, job);
+    rewrite_status(&store, task, TaskState::Closed, 1);
+    write_job(&store, job, &JobStatus::running(1, 100, 1, 200, 1).unwrap());
+
+    let preview = HostGc::new(&store, &SystemProcessRunner)
+        .preview_at(u64::MAX / 2)
+        .unwrap();
+
+    assert!(!preview.candidates().iter().any(|candidate| {
+        candidate.kind() == "branch" && candidate.identifier() == format!("{PROJECT_ID}/{task}")
+    }));
+}
+
+#[test]
 fn gc_expires_task_metadata_before_a_newer_result_branch() {
     let (_temp, store, _source, base_oid) = fixture();
     let task = task_id(1);
-    prepare_task(&store, task, job_id(1), &base_oid);
+    let job = job_id(1);
+    prepare_task(&store, task, job, &base_oid);
+    release_lease(&store, job);
     rewrite_status(&store, task, TaskState::Closed, 1);
     let mirror_path = store.mirror(PROJECT_ID).unwrap().path().to_path_buf();
 
@@ -335,7 +471,9 @@ fn gc_expires_task_metadata_before_a_newer_result_branch() {
 fn gc_prunes_orphaned_task_refs_after_task_metadata_retention() {
     let (_temp, store, _source, base_oid) = fixture();
     let task = task_id(1);
-    prepare_task(&store, task, job_id(1), &base_oid);
+    let job = job_id(1);
+    prepare_task(&store, task, job, &base_oid);
+    release_lease(&store, job);
     rewrite_status(&store, task, TaskState::Closed, 1);
     let mirror_path = store.mirror(PROJECT_ID).unwrap().path().to_path_buf();
 
@@ -381,7 +519,9 @@ fn gc_prunes_orphaned_task_refs_after_task_metadata_retention() {
 fn gc_does_not_touch_active_tasks_or_their_base_refs() {
     let (_temp, store, _source, base_oid) = fixture();
     let task = task_id(1);
-    prepare_task(&store, task, job_id(1), &base_oid);
+    let job = job_id(1);
+    prepare_task(&store, task, job, &base_oid);
+    release_lease(&store, job);
     rewrite_status(&store, task, TaskState::Active, 1);
 
     let now = u64::MAX / 2;
@@ -454,7 +594,9 @@ fn gc_is_idempotent_and_marks_empty_mirrors_only_after_all_refs_are_gone() {
 fn gc_never_requests_native_agent_session_deletion() {
     let (_temp, store, _source, base_oid) = fixture();
     let task = task_id(1);
-    prepare_task(&store, task, job_id(1), &base_oid);
+    let job = job_id(1);
+    prepare_task(&store, task, job, &base_oid);
+    release_lease(&store, job);
     TaskStore::new(&store, &SystemProcessRunner)
         .bind_session(
             PROJECT_ID,
