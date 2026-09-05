@@ -43,6 +43,7 @@ const TASK_COMMAND: &str = "task-turn";
 const TASK_CAPABILITY_PREFIX: &str = "agent:";
 const DEFAULT_GIT_NAME: &str = "mac-worker";
 const DEFAULT_GIT_EMAIL: &str = "mac-worker@localhost";
+const SUBMISSION_ROLLBACK_INCOMPLETE: &str = "SUBMISSION_ROLLBACK_INCOMPLETE";
 const WAIT_POLL: Duration = Duration::from_millis(100);
 const WAIT_MAX_POLL: Duration = Duration::from_secs(1);
 
@@ -768,14 +769,7 @@ impl<'a> TaskClient<'a> {
         })() {
             Ok(report) => report,
             Err(error) => {
-                self.rollback_submission(
-                    turn_id,
-                    &record_for_rollback,
-                    &transfer,
-                    request.run_id,
-                    reserved_branch.as_ref(),
-                    reservation.is_some(),
-                );
+                self.rollback_submission(turn_id, &record_for_rollback, &transfer);
                 return Err(error);
             }
         };
@@ -1033,6 +1027,31 @@ impl<'a> TaskClient<'a> {
     pub fn reconcile_runners(&self) -> Result<ReconcileReport, WorkerError> {
         let mut report = ReconcileReport::default();
         let owner = current_process_identity()?;
+
+        // A submit can fail while compensating its locally-created state.  A
+        // marked record is intentionally terminal and has never been handed
+        // to a runner, so finish that rollback before normal reconciliation
+        // can inspect or adopt its queue row.
+        for record in self.client_state.list_tasks()? {
+            if record.abandon_code() != Some(SUBMISSION_ROLLBACK_INCOMPLETE) {
+                continue;
+            }
+            let Ok(transfer) = self.transfer_for_record(&record) else {
+                continue;
+            };
+            let turn_id = self
+                .client_state
+                .queue_entry_for_task_turn(record.meta().task_id())?
+                .map(|entry| entry.job_id())
+                .or_else(|| {
+                    self.client_state
+                        .turn_ids_for_task(record.meta().task_id())
+                        .ok()?
+                        .last()
+                        .copied()
+                });
+            let _ = self.complete_submission_rollback(turn_id, &record, &transfer);
+        }
 
         // A task-turn row is owned by its runner in both waiting and
         // dispatching states.  A dead owner is normally adopted so the next
@@ -1671,51 +1690,75 @@ impl<'a> TaskClient<'a> {
         turn_id: TurnId,
         record: &LocalTaskRecord,
         transfer: &TransferRepo,
-        run_id: Option<RunId>,
-        reserved_branch: Option<&BranchName>,
-        reservation_exists: bool,
     ) {
-        if self
-            .client_state
-            .remove_task_turn_for_submission_rollback(turn_id)
-            .is_err()
+        let Ok(pending) = self.mark_submission_rollback(record) else {
+            return;
+        };
+        let _ = self.complete_submission_rollback(Some(turn_id), &pending, transfer);
+    }
+
+    fn mark_submission_rollback(
+        &self,
+        record: &LocalTaskRecord,
+    ) -> Result<LocalTaskRecord, WorkerError> {
+        if record.abandon_code() == Some(SUBMISSION_ROLLBACK_INCOMPLETE) {
+            return Ok(record.clone());
+        }
+        let status = abandoned_status(record.status(), SUBMISSION_ROLLBACK_INCOMPLETE)?;
+        let pending = record
+            .clone()
+            .with_status(status)?
+            .with_abandon_code(Some(SUBMISSION_ROLLBACK_INCOMPLETE.to_owned()))?;
+        // Do not begin compensation until the durable recovery marker exists.
+        // A transient replacement race is safe to retry here; if it persists,
+        // this returns with the original complete submission untouched.
+        if self.client_state.update_task(pending.clone()).is_err() {
+            self.client_state.update_task(pending.clone())?;
+        }
+        Ok(pending)
+    }
+
+    fn complete_submission_rollback(
+        &self,
+        turn_id: Option<TurnId>,
+        record: &LocalTaskRecord,
+        transfer: &TransferRepo,
+    ) -> Result<(), WorkerError> {
+        // Keep the marked record, prompt, and queue row together until all
+        // externally-referenced resources are released. Any failure leaves a
+        // terminal, non-runnable recovery record for the next reconcile.
+        if let (Some(run_id), Some(branch)) =
+            (record.meta().run_id(), record.meta().publish_branch())
         {
-            return;
+            self.client_state
+                .release_run_publish_branch(run_id, branch)?;
         }
-        let Ok(status) = abandoned_status(record.status(), "SUBMISSION_ROLLBACK_INCOMPLETE") else {
-            return;
-        };
-        let Ok(abandoned) = record.clone().with_status(status).and_then(|record| {
-            record.with_abandon_code(Some("SUBMISSION_ROLLBACK_INCOMPLETE".to_owned()))
-        }) else {
-            return;
-        };
-        if self.client_state.update_task(abandoned).is_err() {
-            return;
-        }
-        if reservation_exists
-            && let (Some(run_id), Some(branch)) = (run_id, reserved_branch)
-            && self
+        transfer.release_base(self.runner, record.meta().task_id())?;
+        let task_id = record.meta().task_id();
+        self.client_state.remove_task_submission_record(task_id)?;
+        let removed_queue = if let Some(turn_id) = turn_id {
+            match self
                 .client_state
-                .release_run_publish_branch(run_id, branch)
-                .is_err()
-        {
-            return;
-        }
-        if transfer
-            .release_base(self.runner, record.meta().task_id())
-            .is_err()
-        {
-            return;
-        }
-        let Ok(()) = self
-            .client_state
-            .remove_task_submission(record.meta().task_id())
-        else {
-            // The terminal record remains durable and identifies the already
-            // released resources for reconciliation or operator cleanup.
-            return;
+                .remove_task_turn_for_submission_rollback(turn_id)
+            {
+                Ok(entry) => entry,
+                Err(error) => {
+                    self.client_state.create_task(record.clone())?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
         };
+        if let Err(error) = self.client_state.remove_task_submission_turns(task_id) {
+            self.client_state.create_task(record.clone())?;
+            if let Some(entry) = removed_queue {
+                self.client_state
+                    .restore_task_turn_for_submission_rollback(entry)?;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn transfer_for_record(&self, record: &LocalTaskRecord) -> Result<TransferRepo, WorkerError> {

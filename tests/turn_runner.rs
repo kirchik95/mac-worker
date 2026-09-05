@@ -149,6 +149,7 @@ struct AcceptedThenTerminalRunner {
     stdout_log_sent: Mutex<bool>,
     probe_count: Mutex<u32>,
     facts_fresh: Mutex<bool>,
+    base_release_failures: Mutex<u8>,
 }
 
 #[derive(Clone)]
@@ -180,7 +181,14 @@ impl AcceptedThenTerminalRunner {
             stdout_log_sent: Mutex::new(false),
             probe_count: Mutex::new(0),
             facts_fresh: Mutex::new(false),
+            base_release_failures: Mutex::new(0),
         }
+    }
+
+    fn with_base_release_failure() -> Self {
+        let runner = Self::new();
+        *runner.base_release_failures.lock().unwrap() = 1;
+        runner
     }
 
     fn task_status(
@@ -248,6 +256,23 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
         self.requests.lock().unwrap().push(request.clone());
 
         if request.program == OsStr::new("/usr/bin/git") {
+            if request.args.iter().any(|arg| arg == "update-ref")
+                && request.args.iter().any(|arg| arg == "-d")
+                && request
+                    .args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().contains("refs/mac-worker/bases/"))
+            {
+                let mut failures = self.base_release_failures.lock().unwrap();
+                if *failures > 0 {
+                    *failures -= 1;
+                    return Ok(ProcessResult {
+                        status: ExitStatus::from_raw(1 << 8),
+                        stdout: Vec::new(),
+                        stderr: b"simulated base-release failure".to_vec(),
+                    });
+                }
+            }
             let is_result_fetch = request.args.iter().any(|arg| arg == "fetch")
                 && request.args.iter().any(|arg| {
                     arg.to_string_lossy().contains("refs/mac-worker/results/")
@@ -976,6 +1001,7 @@ fn assert_submit_rolls_back_post_create_state(
     fault: ClientStateWritePoint,
     expected_error: &str,
     expect_rollback: bool,
+    fail_base_release: bool,
 ) {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
     let repo = support::GitRepo::init();
@@ -1005,7 +1031,11 @@ fn assert_submit_rolls_back_post_create_state(
         "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
     )
     .unwrap();
-    let runner = AcceptedThenTerminalRunner::new();
+    let runner = if fail_base_release {
+        AcceptedThenTerminalRunner::with_base_release_failure()
+    } else {
+        AcceptedThenTerminalRunner::new()
+    };
     let executor = InlineRunnerExecutor;
     let client = TaskClient::new(&runner, &config, &paths, &state, &executor);
 
@@ -1040,10 +1070,14 @@ fn assert_submit_rolls_back_post_create_state(
                 prompt: "make the change".into(),
                 project: repo.root().to_path_buf(),
                 base: "main".into(),
-                wip: false,
+                wip: fail_base_release,
                 source: Some("local".into()),
-                publish: Some(vec!["fetch".into(), "push".into()]),
-                publish_branch: Some("rollback-test".into()),
+                publish: Some(if fail_base_release {
+                    vec!["fetch".into()]
+                } else {
+                    vec!["fetch".into(), "push".into()]
+                }),
+                publish_branch: (!fail_base_release).then_some("rollback-test".into()),
                 cli_includes: Vec::new(),
                 limits: TaskLimits::default(),
                 close_policy: ClosePolicy::Never,
@@ -1086,6 +1120,8 @@ fn assert_submit_rolls_back_post_create_state(
         );
     } else {
         let task = state.list_tasks().unwrap().pop().unwrap();
+        assert_eq!(task.status().state(), TaskState::Abandoned);
+        assert_eq!(task.abandon_code(), Some("SUBMISSION_ROLLBACK_INCOMPLETE"));
         let entry = state
             .queue_entry_for_task_turn(task.meta().task_id())
             .unwrap()
@@ -1095,7 +1131,21 @@ fn assert_submit_rolls_back_post_create_state(
                 .read_turn_prompt(task.meta().task_id(), entry.job_id())
                 .is_ok()
         );
-        assert_eq!(state.load_run(run_id).unwrap().publish_branches().len(), 1);
+        client.reconcile_runners().unwrap();
+        assert!(state.list_tasks().unwrap().is_empty());
+        assert!(state.queue_snapshot().unwrap().entries().is_empty());
+        assert!(
+            state
+                .load_run(run_id)
+                .unwrap()
+                .publish_branches()
+                .is_empty()
+        );
+        assert!(
+            repo.git(&["for-each-ref", "refs/mac-worker/bases"])
+                .stdout
+                .is_empty()
+        );
     }
 }
 
@@ -1105,6 +1155,7 @@ fn submit_rolls_back_post_create_state_when_prompt_write_fails() {
         ClientStateWritePoint::BeforeTurnPromptWrite,
         "before task turn prompt write",
         true,
+        false,
     );
 }
 
@@ -1114,6 +1165,7 @@ fn submit_rolls_back_post_create_state_when_run_reference_load_fails() {
         ClientStateWritePoint::BeforeRunLoad,
         "before run load",
         true,
+        false,
     );
 }
 
@@ -1123,6 +1175,7 @@ fn submit_rolls_back_post_create_state_when_queue_publication_fails() {
         ClientStateWritePoint::BeforePublish,
         "before publication",
         true,
+        false,
     );
 }
 
@@ -1131,6 +1184,57 @@ fn submit_retains_complete_state_when_queue_rollback_fails() {
     assert_submit_rolls_back_post_create_state(
         ClientStateWritePoint::BeforeTaskReport,
         "before task report",
+        false,
+        false,
+    );
+}
+
+#[test]
+fn submit_retries_rollback_after_reservation_release_failure() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::BeforeRunPublishBranchRelease,
+        "before run publish-branch release",
+        false,
+        false,
+    );
+}
+
+#[test]
+fn submit_retries_rollback_after_final_task_record_removal_failure() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval,
+        "before task submission record removal",
+        false,
+        false,
+    );
+}
+
+#[test]
+fn submit_restores_task_and_queue_after_prompt_tree_removal_failure() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval,
+        "before task submission turns removal",
+        false,
+        false,
+    );
+}
+
+#[test]
+fn submit_retries_rollback_after_base_release_failure() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::BeforeTaskRollbackBaseRelease,
+        "before task rollback base release",
+        false,
+        true,
+    );
+}
+
+#[test]
+fn submit_retries_rollback_after_marker_update_failure() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::BeforeTaskRollbackUpdate,
+        "before task rollback update",
+        true,
         false,
     );
 }

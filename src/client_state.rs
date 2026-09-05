@@ -86,6 +86,11 @@ pub enum ClientStateWritePoint {
     BeforeTurnPromptWrite = 18,
     BeforeRunLoad = 19,
     BeforeTaskReport = 20,
+    BeforeTaskRollbackUpdate = 21,
+    BeforeRunPublishBranchRelease = 22,
+    BeforeTaskSubmissionRecordRemoval = 23,
+    BeforeTaskRollbackBaseRelease = 24,
+    BeforeTaskSubmissionTurnsRemoval = 25,
 }
 
 #[doc(hidden)]
@@ -1066,6 +1071,43 @@ impl ClientStateStore {
         })
     }
 
+    /// Restores an exact task-turn row after a later submission-cleanup step
+    /// fails. The row retains its original queue ID, so it must be reinserted
+    /// through the queue transaction rather than published as a new entry.
+    pub fn restore_task_turn_for_submission_rollback(
+        &self,
+        entry: QueueEntry,
+    ) -> Result<(), WorkerError> {
+        if entry.client_id() != self.inner.client_id {
+            return Err(queue_error(
+                "QUEUE_CLIENT_MISMATCH",
+                "queue row belongs to another client identity",
+            ));
+        }
+        self.update_queue(|snapshot| {
+            if snapshot
+                .entries
+                .iter()
+                .any(|existing| existing.job_id() == entry.job_id())
+            {
+                return Ok(((), false));
+            }
+            if entry.queue_id().value() >= snapshot.next_id.value() {
+                return Err(queue_error(
+                    "QUEUE_ID_CONFLICT",
+                    "restored queue row has an invalid sequence ID",
+                ));
+            }
+            let index = snapshot
+                .entries
+                .iter()
+                .position(|existing| existing.queue_id().value() > entry.queue_id().value())
+                .unwrap_or(snapshot.entries.len());
+            snapshot.entries.insert(index, entry);
+            Ok(((), true))
+        })
+    }
+
     pub fn record_affinity(
         &self,
         project_id: &str,
@@ -1735,6 +1777,11 @@ impl ClientStateStore {
     }
 
     pub fn update_task(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
+        if self.take_fault(ClientStateWritePoint::BeforeTaskRollbackUpdate) {
+            return Err(injected_failure(
+                ClientStateWritePoint::BeforeTaskRollbackUpdate,
+            ));
+        }
         let task_id = replacement.meta().task_id();
         let bytes = task_record_bytes(&replacement)?;
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
@@ -1776,17 +1823,44 @@ impl ClientStateStore {
     /// Removes every client-owned task artifact created during initial
     /// submission. This is used only before a turn is handed to a runner.
     pub fn remove_task_submission(&self, task_id: TaskId) -> Result<(), WorkerError> {
+        let record = self.load_task(task_id)?;
+        self.remove_task_submission_record(task_id)?;
+        if let Err(error) = self.remove_task_submission_turns(task_id) {
+            self.create_task(record)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Removes the durable record before its prompt tree so a record-removal
+    /// failure cannot leave a terminal task without the prompt it describes.
+    pub fn remove_task_submission_record(&self, task_id: TaskId) -> Result<(), WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let tasks = self.tasks_dir()?;
+        let task_name = task_file_name(task_id)?;
+        if self.take_fault(ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval) {
+            return Err(injected_failure(
+                ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval,
+            ));
+        }
+        match tasks.remove_owned_regular(&task_name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WorkerError::Io(error)),
+        }
+    }
+
+    /// Removes the initial task prompt tree after its record and queue row
+    /// have been retired. Callers restore the record and row if this fails.
+    pub fn remove_task_submission_turns(&self, task_id: TaskId) -> Result<(), WorkerError> {
+        if self.take_fault(ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval) {
+            return Err(injected_failure(
+                ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval,
+            ));
+        }
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let turns = self.turns_dir()?;
         match turns.remove_owned_child(&task_id.to_string()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(WorkerError::Io(error)),
-        };
-
-        let tasks = self.tasks_dir()?;
-        let task_name = task_file_name(task_id)?;
-        match tasks.remove_owned_regular(&task_name) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(WorkerError::Io(error)),
@@ -1910,6 +1984,11 @@ impl ClientStateStore {
         run_id: RunId,
         branch: &BranchName,
     ) -> Result<RunRecord, WorkerError> {
+        if self.take_fault(ClientStateWritePoint::BeforeRunPublishBranchRelease) {
+            return Err(injected_failure(
+                ClientStateWritePoint::BeforeRunPublishBranchRelease,
+            ));
+        }
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;
         let name = run_file_name(run_id)?;
@@ -2176,12 +2255,31 @@ impl ClientStateStore {
 
     #[doc(hidden)]
     pub fn submission_report_fault(&self) -> Result<(), WorkerError> {
-        if self.inner.write_fault.load(Ordering::SeqCst)
-            == ClientStateWritePoint::BeforeTaskReport as u8
-        {
-            return Err(injected_failure(ClientStateWritePoint::BeforeTaskReport));
+        let point = match self.inner.write_fault.load(Ordering::SeqCst) {
+            value if value == ClientStateWritePoint::BeforeTaskReport as u8 => {
+                ClientStateWritePoint::BeforeTaskReport
+            }
+            value if value == ClientStateWritePoint::BeforeTaskRollbackUpdate as u8 => {
+                ClientStateWritePoint::BeforeTaskRollbackUpdate
+            }
+            value if value == ClientStateWritePoint::BeforeRunPublishBranchRelease as u8 => {
+                ClientStateWritePoint::BeforeRunPublishBranchRelease
+            }
+            value if value == ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval as u8 => {
+                ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval
+            }
+            value if value == ClientStateWritePoint::BeforeTaskRollbackBaseRelease as u8 => {
+                ClientStateWritePoint::BeforeTaskRollbackBaseRelease
+            }
+            value if value == ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval as u8 => {
+                ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval
+            }
+            _ => return Ok(()),
+        };
+        if self.inner.write_fault.load(Ordering::SeqCst) == point as u8 {
+            return Err(injected_failure(point));
         }
-        Ok(())
+        unreachable!("the write-fault point was matched above")
     }
 
     #[doc(hidden)]
@@ -4695,6 +4793,15 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         ClientStateWritePoint::BeforeTurnPromptWrite => "before task turn prompt write",
         ClientStateWritePoint::BeforeRunLoad => "before run load",
         ClientStateWritePoint::BeforeTaskReport => "before task report",
+        ClientStateWritePoint::BeforeTaskRollbackUpdate => "before task rollback update",
+        ClientStateWritePoint::BeforeRunPublishBranchRelease => "before run publish-branch release",
+        ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval => {
+            "before task submission record removal"
+        }
+        ClientStateWritePoint::BeforeTaskRollbackBaseRelease => "before task rollback base release",
+        ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval => {
+            "before task submission turns removal"
+        }
     };
     WorkerError::Io(io::Error::other(format!(
         "injected local state failure {label}"
