@@ -726,62 +726,65 @@ impl<'a> TaskClient<'a> {
             let _ = transfer.release_base(self.runner, task_id);
             return Err(error);
         }
-        if let Err(error) = self
-            .client_state
-            .write_turn_prompt(task_id, turn_id, &composed_prompt)
-        {
-            let _ = transfer.release_base(self.runner, task_id);
-            return Err(error);
-        }
+        let mut report = match (|| -> Result<TaskReport, WorkerError> {
+            self.client_state
+                .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
+            let run_reference = match request.run_id {
+                Some(run_id) => {
+                    let run = self.client_state.load_run(run_id)?;
+                    Some(QueueRunReference::new(
+                        crate::job::RunId::new(run_id.to_string())?,
+                        run.max_parallel(),
+                    )?)
+                }
+                None => None,
+            };
+            let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
+            let owner = current_process_identity()?;
+            let entry = QueueEntry::new(
+                turn_id,
+                self.client_state.client_id(),
+                initial.context.project_id.clone(),
+                initial.context.worktree_id.clone(),
+                command.summary()?,
+                requirements,
+                request.preference.clone(),
+                QueueEntryKind::TaskTurn,
+                run_reference,
+                owner,
+                now,
+            )?;
+            let entry = self.client_state.enqueue(entry)?;
 
-        let run_reference = match request.run_id {
-            Some(run_id) => {
-                let run = self.client_state.load_run(run_id)?;
-                Some(QueueRunReference::new(
-                    crate::job::RunId::new(run_id.to_string())?,
-                    run.max_parallel(),
-                )?)
+            let should_start =
+                request.attached || self.live_runner_count()? < self.config.workers.len();
+            if !should_start {
+                self.client_state.park_row(entry.job_id())?;
             }
-            None => None,
-        };
-        let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
-        let owner = current_process_identity()?;
-        let entry = QueueEntry::new(
-            turn_id,
-            self.client_state.client_id(),
-            initial.context.project_id.clone(),
-            initial.context.worktree_id.clone(),
-            command.summary()?,
-            requirements,
-            request.preference.clone(),
-            QueueEntryKind::TaskTurn,
-            run_reference,
-            owner,
-            now,
-        )?;
-        let entry = match self.client_state.enqueue(entry) {
-            Ok(entry) => entry,
+
+            let report = self.report_for(task_id)?;
+            if should_start {
+                self.start_runner(task_id, turn_id)?;
+            }
+            Ok(report)
+        })() {
+            Ok(report) => report,
             Err(error) => {
-                let _ = transfer.release_base(self.runner, task_id);
+                self.rollback_submission(
+                    task_id,
+                    turn_id,
+                    &transfer,
+                    request.run_id,
+                    reserved_branch.as_ref(),
+                    reservation.is_some(),
+                );
                 return Err(error);
             }
         };
-
-        let should_start =
-            request.attached || self.live_runner_count()? < self.config.workers.len();
-        if should_start {
-            if let Err(error) = self.start_runner(task_id, turn_id) {
-                return Err(self.fail_handoff(task_id, turn_id, transfer, error));
-            }
-        } else {
-            self.client_state.park_row(entry.job_id())?;
-        }
         // The submitter no longer needs the repository after the queue row is
         // handed off.  Release its per-repository lock before an attached
         // runner reopens the same repository in this process.
         drop(transfer);
-
-        let mut report = self.report_for(task_id)?;
         report.events.push(event_task_created(&report));
         if request.attached {
             let mut follow = stdout;
@@ -1657,6 +1660,25 @@ impl<'a> TaskClient<'a> {
         let _ = self.client_state.remove_queued(turn_id);
         let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
         let _ = self.client_state.update_task(record.clone());
+    }
+
+    fn rollback_submission(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        transfer: &TransferRepo,
+        run_id: Option<RunId>,
+        reserved_branch: Option<&BranchName>,
+        reservation_exists: bool,
+    ) {
+        let _ = self
+            .client_state
+            .remove_task_turn_for_submission_rollback(turn_id);
+        let _ = self.client_state.remove_task_submission(task_id);
+        if reservation_exists && let (Some(run_id), Some(branch)) = (run_id, reserved_branch) {
+            let _ = self.client_state.release_run_publish_branch(run_id, branch);
+        }
+        let _ = transfer.release_base(self.runner, task_id);
     }
 
     fn transfer_for_record(&self, record: &LocalTaskRecord) -> Result<TransferRepo, WorkerError> {

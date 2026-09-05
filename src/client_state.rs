@@ -83,6 +83,8 @@ pub enum ClientStateWritePoint {
     CrashCleanupBeforeNestedCleanup = 15,
     CrashRollbackAfterEntryMoved = 16,
     CrashRollbackBeforeNestedCleanup = 17,
+    BeforeTurnPromptWrite = 18,
+    BeforeRunLoad = 19,
 }
 
 #[doc(hidden)]
@@ -1035,6 +1037,31 @@ impl ClientStateStore {
         })
     }
 
+    /// Removes a task-turn row while compensating a failed initial task
+    /// submission.  No remote execution has begun at this point, so the row
+    /// has no durable owner state to preserve.
+    pub fn remove_task_turn_for_submission_rollback(
+        &self,
+        turn_id: TurnId,
+    ) -> Result<Option<QueueEntry>, WorkerError> {
+        self.update_queue(|snapshot| {
+            let Some(index) = snapshot
+                .entries
+                .iter()
+                .position(|entry| entry.job_id() == turn_id)
+            else {
+                return Ok((None, false));
+            };
+            if snapshot.entries[index].kind() != QueueEntryKind::TaskTurn {
+                return Err(queue_error(
+                    "QUEUE_KIND_CONFLICT",
+                    "queue row is not a task turn",
+                ));
+            }
+            Ok((Some(snapshot.entries.remove(index)), true))
+        })
+    }
+
     pub fn record_affinity(
         &self,
         project_id: &str,
@@ -1742,6 +1769,26 @@ impl ClientStateStore {
             .collect()
     }
 
+    /// Removes every client-owned task artifact created during initial
+    /// submission. This is used only before a turn is handed to a runner.
+    pub fn remove_task_submission(&self, task_id: TaskId) -> Result<(), WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let tasks = self.tasks_dir()?;
+        let task_name = task_file_name(task_id)?;
+        match tasks.remove_owned_regular(&task_name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+
+        let turns = self.turns_dir()?;
+        match turns.remove_owned_child(&task_id.to_string()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WorkerError::Io(error)),
+        }
+    }
+
     pub fn record_runner(
         &self,
         task_id: TaskId,
@@ -1803,6 +1850,9 @@ impl ClientStateStore {
     }
 
     pub fn load_run(&self, run_id: RunId) -> Result<RunRecord, WorkerError> {
+        if self.take_fault(ClientStateWritePoint::BeforeRunLoad) {
+            return Err(injected_failure(ClientStateWritePoint::BeforeRunLoad));
+        }
         let runs = self.runs_dir()?;
         let name = run_file_name(run_id)?;
         read_run_from_dir(&runs, &name, run_id)
@@ -2018,6 +2068,11 @@ impl ClientStateStore {
         turn_id: TurnId,
         prompt: &str,
     ) -> Result<(), WorkerError> {
+        if self.take_fault(ClientStateWritePoint::BeforeTurnPromptWrite) {
+            return Err(injected_failure(
+                ClientStateWritePoint::BeforeTurnPromptWrite,
+            ));
+        }
         if prompt.len() > crate::task::MAX_PROMPT_BYTES {
             return Err(queue_error(
                 "TASK_PROMPT_TOO_LARGE",
@@ -4623,6 +4678,8 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         ClientStateWritePoint::CrashRollbackBeforeNestedCleanup => {
             "before nested published rollback cleanup"
         }
+        ClientStateWritePoint::BeforeTurnPromptWrite => "before task turn prompt write",
+        ClientStateWritePoint::BeforeRunLoad => "before run load",
     };
     WorkerError::Io(io::Error::other(format!(
         "injected local state failure {label}"

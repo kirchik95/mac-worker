@@ -15,19 +15,19 @@ use std::{
 use mac_worker::{
     agent::AgentKind,
     agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
-    client_state::ClientStateStore,
+    client_state::{ClientStateStore, ClientStateWritePoint},
     config::Config,
     job::{
-        JobMeta, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LogChunk,
-        LogChunkRequest, LogStream, ProcessIdentity, SubmitResponse,
+        AdmissionObservation, JobMeta, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
+        LeaseRecord, LogChunk, LogChunkRequest, LogStream, ProcessIdentity, SubmitResponse,
     },
     lease::SlotState,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     scheduler::WorkerPreference,
     task::{
-        ClosePolicy, TaskId, TaskLimits, TaskMeta, TaskOutcome, TaskState, TaskStatus, TurnId,
-        TurnSummary, TurnTerminal,
+        ClosePolicy, RunId, RunRecord, TaskId, TaskLimits, TaskMeta, TaskOutcome, TaskState,
+        TaskStatus, TurnId, TurnSummary, TurnTerminal,
     },
     task_client::{TaskClient, TaskSubmitRequest},
     task_store::{
@@ -949,4 +949,137 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
 
     let closed = client.close(task_id, true).unwrap();
     assert_eq!(closed.status().state(), TaskState::Abandoned);
+}
+
+fn assert_submit_rolls_back_post_create_state(fault: ClientStateWritePoint, expected_error: &str) {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    assert!(
+        repo.git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/project.git"
+        ])
+        .status
+        .success()
+    );
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+
+    let state_root = tempfile::tempdir().unwrap();
+    let state_root_path = state_root.path().canonicalize().unwrap();
+    let paths = support::task_harness::paths(&state_root_path);
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let run_id = RunId::generate();
+    state
+        .create_run(RunRecord::new(run_id, None, vec![TaskId::generate()], 1, 1).unwrap())
+        .unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = AcceptedThenTerminalRunner::new();
+    let executor = InlineRunnerExecutor;
+    let client = TaskClient::new(&runner, &config, &paths, &state, &executor);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .admission_observation("mini-1", now, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec![
+                    "darwin-arm64".into(),
+                    "origin:github.com".into(),
+                    "agent:codex".into(),
+                ],
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+        })
+        .unwrap();
+    state.inject_write_failure_once(fault);
+
+    let error = client
+        .submit(
+            TaskSubmitRequest {
+                agent: AgentKind::Codex,
+                model: None,
+                prompt: "make the change".into(),
+                project: repo.root().to_path_buf(),
+                base: "main".into(),
+                wip: false,
+                source: Some("local".into()),
+                publish: Some(vec!["fetch".into(), "push".into()]),
+                publish_branch: Some("rollback-test".into()),
+                cli_includes: Vec::new(),
+                limits: TaskLimits::default(),
+                close_policy: ClosePolicy::Never,
+                env_profile: None,
+                preference: WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                wait_for_capacity: true,
+                attached: false,
+                run_id: Some(run_id),
+            },
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains(expected_error),
+        "submit returned an unexpected error: {error}"
+    );
+    assert!(state.list_tasks().unwrap().is_empty());
+    assert!(state.queue_snapshot().unwrap().entries().is_empty());
+    assert!(
+        state
+            .load_run(run_id)
+            .unwrap()
+            .publish_branches()
+            .is_empty()
+    );
+    let turn_entries = std::fs::read_dir(paths.state.join("turns"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(turn_entries, vec![".mac-worker-rooted-fs"]);
+    assert!(
+        repo.git(&["for-each-ref", "refs/mac-worker/bases"])
+            .stdout
+            .is_empty()
+    );
+}
+
+#[test]
+fn submit_rolls_back_post_create_state_when_prompt_write_fails() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::BeforeTurnPromptWrite,
+        "before task turn prompt write",
+    );
+}
+
+#[test]
+fn submit_rolls_back_post_create_state_when_run_reference_load_fails() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::BeforeRunLoad,
+        "before run load",
+    );
+}
+
+#[test]
+fn submit_rolls_back_post_create_state_when_queue_publication_fails() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::BeforePublish,
+        "before publication",
+    );
 }
