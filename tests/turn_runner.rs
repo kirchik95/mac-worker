@@ -171,6 +171,13 @@ struct ParkedSubmissionGate {
     used: AtomicBool,
 }
 
+struct SubmissionIntentRaceGate {
+    submit_entered: mpsc::Sender<()>,
+    submit_release: Mutex<mpsc::Receiver<()>>,
+    reconciliation_entered: mpsc::Sender<()>,
+    reconciliation_release: Mutex<mpsc::Receiver<()>>,
+}
+
 impl ClientStateConcurrencyHook for ParkedSubmissionGate {
     fn reach(&self, point: ClientStateConcurrencyPoint) {
         if point == ClientStateConcurrencyPoint::ParkedTaskTurnPublication
@@ -178,6 +185,22 @@ impl ClientStateConcurrencyHook for ParkedSubmissionGate {
         {
             self.entered.send(()).unwrap();
             self.release.lock().unwrap().recv().unwrap();
+        }
+    }
+}
+
+impl ClientStateConcurrencyHook for SubmissionIntentRaceGate {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        match point {
+            ClientStateConcurrencyPoint::SubmissionIntentClear => {
+                self.submit_entered.send(()).unwrap();
+                self.submit_release.lock().unwrap().recv().unwrap();
+            }
+            ClientStateConcurrencyPoint::SubmissionIntentReconciliationAfterTransferLock => {
+                self.reconciliation_entered.send(()).unwrap();
+                self.reconciliation_release.lock().unwrap().recv().unwrap();
+            }
+            _ => {}
         }
     }
 }
@@ -1537,6 +1560,209 @@ fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
         assert_eq!(state.list_tasks().unwrap().len(), 2);
         assert!(state.queue_entry(entry.job_id()).unwrap().is_some());
     });
+}
+
+#[test]
+fn reconciliation_does_not_rollback_a_submission_that_cleared_its_intent_while_waiting_for_transfer_lock()
+ {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
+    let (submit_entered_tx, submit_entered_rx) = mpsc::channel();
+    let (submit_release_tx, submit_release_rx) = mpsc::channel();
+    let (reconciliation_entered_tx, reconciliation_entered_rx) = mpsc::channel();
+    let (reconciliation_release_tx, reconciliation_release_rx) = mpsc::channel();
+    let state = Arc::new(
+        ClientStateStore::open_with_concurrency_hook(
+            &paths.state,
+            Arc::new(SubmissionIntentRaceGate {
+                submit_entered: submit_entered_tx,
+                submit_release: Mutex::new(submit_release_rx),
+                reconciliation_entered: reconciliation_entered_tx,
+                reconciliation_release: Mutex::new(reconciliation_release_rx),
+            }),
+        )
+        .unwrap(),
+    );
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = AcceptedThenTerminalRunner::new();
+    let executor = InlineRunnerExecutor;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .admission_observation("mini-1", now, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec!["darwin-arm64".into(), "agent:codex".into()],
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+        })
+        .unwrap();
+    let request = || TaskSubmitRequest {
+        agent: AgentKind::Codex,
+        model: None,
+        prompt: "make the change".into(),
+        project: repo.root().to_path_buf(),
+        base: "main".into(),
+        wip: true,
+        source: Some("local".into()),
+        publish: Some(vec!["fetch".into()]),
+        publish_branch: None,
+        cli_includes: Vec::new(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        preference: WorkerPreference::Pinned {
+            worker: "mini-1".into(),
+        },
+        wait_for_capacity: true,
+        attached: false,
+        run_id: None,
+    };
+
+    thread::scope(|scope| {
+        let submit = scope.spawn(|| {
+            TaskClient::new(&runner, &config, &paths, &state, &executor).submit(
+                request(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+        });
+        submit_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let reconcile = scope.spawn(|| {
+            TaskClient::new(&runner, &config, &paths, &state, &executor).reconcile_runners()
+        });
+        submit_release_tx.send(()).unwrap();
+        let report = submit.join().unwrap().unwrap();
+        let task_id = report.task_id();
+        reconciliation_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let handed_off = state.load_task(task_id).unwrap();
+        assert!(handed_off.submission_intent_turn_id().is_none());
+        assert!(handed_off.runner().is_some());
+        assert!(state.queue_entry_for_task_turn(task_id).unwrap().is_some());
+
+        reconciliation_release_tx.send(()).unwrap();
+        reconcile.join().unwrap().unwrap();
+
+        let retained = state.load_task(task_id).unwrap();
+        assert!(retained.submission_intent_turn_id().is_none());
+        assert!(retained.runner().is_some());
+        let entry = state.queue_entry_for_task_turn(task_id).unwrap().unwrap();
+        assert!(state.read_turn_prompt(task_id, entry.job_id()).is_ok());
+        let project =
+            mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+        let transfer =
+            TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
+        assert!(transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
+    });
+}
+
+#[test]
+fn reconciliation_keeps_pending_submission_intent_out_of_runner_startup_until_recovery_completes() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = AcceptedThenTerminalRunner::with_base_release_failure();
+    let executor = InlineRunnerExecutor;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .admission_observation("mini-1", now, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec!["darwin-arm64".into(), "agent:codex".into()],
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+        })
+        .unwrap();
+    state.inject_write_failure_once(ClientStateWritePoint::BeforeSubmissionReport);
+    state.inject_task_rollback_update_failures(2);
+
+    let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .submit(
+            TaskSubmitRequest {
+                agent: AgentKind::Codex,
+                model: None,
+                prompt: "make the change".into(),
+                project: repo.root().to_path_buf(),
+                base: "main".into(),
+                wip: true,
+                source: Some("local".into()),
+                publish: Some(vec!["fetch".into()]),
+                publish_branch: None,
+                cli_includes: Vec::new(),
+                limits: TaskLimits::default(),
+                close_policy: ClosePolicy::Never,
+                env_profile: None,
+                preference: WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                wait_for_capacity: true,
+                attached: false,
+                run_id: None,
+            },
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("before submission report"));
+
+    let pending = state.list_tasks().unwrap().pop().unwrap();
+    let task_id = pending.meta().task_id();
+    assert!(pending.submission_intent_turn_id().is_some());
+    let first = TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .reconcile_runners()
+        .unwrap();
+    assert_eq!(first.started_runners(), 0);
+    let retained = state.load_task(task_id).unwrap();
+    assert!(retained.submission_intent_turn_id().is_some());
+    assert!(retained.runner().is_none());
+    let entry = state.queue_entry_for_task_turn(task_id).unwrap().unwrap();
+    assert!(state.read_turn_prompt(task_id, entry.job_id()).is_ok());
+    assert!(!runner.requests().iter().any(|request| {
+        request
+            .args
+            .iter()
+            .any(|argument| argument == HostOperation::TaskTurn.command())
+    }));
+
+    TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .reconcile_runners()
+        .unwrap();
+    assert!(state.list_tasks().unwrap().is_empty());
+    assert!(state.queue_snapshot().unwrap().entries().is_empty());
 }
 
 #[test]

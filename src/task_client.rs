@@ -767,7 +767,7 @@ impl<'a> TaskClient<'a> {
                 self.client_state.submission_report_fault()?;
                 let report = self.report_for(task_id)?;
                 self.client_state
-                    .update_task(record_for_rollback.without_submission_intent()?)?;
+                    .clear_submission_intent(record_for_rollback.without_submission_intent()?)?;
                 Ok((report, should_start, entry.job_id()))
             })() {
                 Ok(report) => report,
@@ -1041,29 +1041,45 @@ impl<'a> TaskClient<'a> {
         // A submit can fail while compensating its locally-created state. The
         // pre-handoff intent is durable from initial task creation; the
         // rollback marker is a stronger terminal form of that intent. Both
-        // are safe to compensate before normal reconciliation can adopt a row.
+        // are safe to compensate only while the turn is still pre-handoff.
         for record in self.client_state.list_tasks()? {
-            if record.abandon_code() != Some(SUBMISSION_ROLLBACK_INCOMPLETE)
-                && record.submission_intent_turn_id().is_none()
-            {
+            if !submission_recovery_pending(&record) {
                 continue;
             }
+            let expected_turn_id = submission_recovery_turn_id(&record);
             let Ok(transfer) = self.transfer_for_record(&record) else {
                 continue;
             };
+            self.client_state
+                .submission_intent_reconciliation_after_transfer_lock();
+            // The transfer lock can wait behind the submitter. Never act on
+            // the pre-lock snapshot: the submitter may have cleared its
+            // intent and handed this exact row to a live runner meanwhile.
+            let Ok(current) = self.client_state.load_task(record.meta().task_id()) else {
+                continue;
+            };
+            if !submission_recovery_pending(&current)
+                || expected_turn_id.is_some()
+                    && submission_recovery_turn_id(&current) != expected_turn_id
+            {
+                continue;
+            }
             let turn_id = self
                 .client_state
-                .queue_entry_for_task_turn(record.meta().task_id())?
+                .queue_entry_for_task_turn(current.meta().task_id())?
                 .map(|entry| entry.job_id())
-                .or(record.submission_intent_turn_id())
+                .or(expected_turn_id)
                 .or_else(|| {
                     self.client_state
-                        .turn_ids_for_task(record.meta().task_id())
+                        .turn_ids_for_task(current.meta().task_id())
                         .ok()?
                         .last()
                         .copied()
                 });
-            let _ = self.complete_submission_rollback(turn_id, &record, &transfer);
+            if !self.submission_rollback_is_safe(&current, turn_id)? {
+                continue;
+            }
+            let _ = self.complete_submission_rollback(turn_id, &current, &transfer);
         }
 
         // A task-turn row is owned by its runner in both waiting and
@@ -1075,6 +1091,11 @@ impl<'a> TaskClient<'a> {
         for entry in self.client_state.queue_snapshot()?.entries().iter() {
             if entry.kind() != QueueEntryKind::TaskTurn
                 || matches!(entry.state(), QueueState::Parked)
+            {
+                continue;
+            }
+            if let Some(task_id) = self.client_state.task_id_for_turn(entry.job_id())?
+                && self.task_has_submission_recovery_pending(task_id)?
             {
                 continue;
             }
@@ -1113,6 +1134,9 @@ impl<'a> TaskClient<'a> {
         // worker lost a task, so a failed refresh leaves the local record
         // untouched for a later reconciliation.
         for record in self.client_state.list_tasks()? {
+            if submission_recovery_pending(&record) {
+                continue;
+            }
             if matches!(
                 record.status().state(),
                 TaskState::Closed | TaskState::Abandoned | TaskState::Lost
@@ -1126,6 +1150,9 @@ impl<'a> TaskClient<'a> {
         // queue publication. Recreate only the task-turn row, retaining the
         // original task and turn identifiers.
         for record in self.client_state.list_tasks()? {
+            if submission_recovery_pending(&record) {
+                continue;
+            }
             if matches!(
                 record.status().state(),
                 TaskState::Queued | TaskState::Active
@@ -1139,6 +1166,9 @@ impl<'a> TaskClient<'a> {
         }
 
         for record in self.client_state.list_tasks()? {
+            if submission_recovery_pending(&record) {
+                continue;
+            }
             if matches!(
                 record.status().state(),
                 TaskState::Closed | TaskState::Abandoned | TaskState::Lost
@@ -1856,6 +1886,12 @@ impl<'a> TaskClient<'a> {
         record: &LocalTaskRecord,
         owner: ProcessIdentity,
     ) -> Result<QueueEntry, WorkerError> {
+        if submission_recovery_pending(record) {
+            return Err(task_error(
+                "TASK_SUBMISSION_RECOVERY_PENDING",
+                "task submission recovery is incomplete",
+            ));
+        }
         let turn_id = pending_turn_id(record.status())
             .or_else(|| {
                 self.client_state
@@ -1910,6 +1946,12 @@ impl<'a> TaskClient<'a> {
         task_id: TaskId,
         turn_id: TurnId,
     ) -> Result<RunnerIdentity, WorkerError> {
+        if self.task_has_submission_recovery_pending(task_id)? {
+            return Err(task_error(
+                "TASK_SUBMISSION_RECOVERY_PENDING",
+                "task submission recovery is incomplete",
+            ));
+        }
         let identity = self.executor.start(self.paths, task_id, turn_id)?;
         self.client_state
             .record_runner(task_id, Some(identity.clone()))?;
@@ -1935,6 +1977,10 @@ impl<'a> TaskClient<'a> {
             .ok_or_else(|| {
                 task_error("TASK_INCONSISTENT", "parked task turn has no task record")
             })?;
+        if self.task_has_submission_recovery_pending(task_id)? {
+            self.client_state.park_row(entry.job_id())?;
+            return Ok(false);
+        }
         if let Err(error) = self.start_runner(task_id, entry.job_id()) {
             if let Ok(record) = self.client_state.load_task(task_id)
                 && let Ok(status) = abandoned_status(record.status(), "RUNNER_HANDOFF_FAILED")
@@ -1958,6 +2004,30 @@ impl<'a> TaskClient<'a> {
             ));
         }
         Ok(true)
+    }
+
+    fn task_has_submission_recovery_pending(&self, task_id: TaskId) -> Result<bool, WorkerError> {
+        Ok(submission_recovery_pending(
+            &self.client_state.load_task(task_id)?,
+        ))
+    }
+
+    fn submission_rollback_is_safe(
+        &self,
+        record: &LocalTaskRecord,
+        turn_id: Option<TurnId>,
+    ) -> Result<bool, WorkerError> {
+        if record.runner().is_some() || record.status().state() == TaskState::Active {
+            return Ok(false);
+        }
+        let Some(turn_id) = turn_id else {
+            return Ok(true);
+        };
+        let Some(entry) = self.client_state.queue_entry(turn_id)? else {
+            return Ok(true);
+        };
+        Ok(matches!(entry.state(), QueueState::Waiting { .. })
+            && entry.owner_opt() == Some(entry.enqueue_owner()))
     }
 
     fn report_for(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
@@ -2218,6 +2288,17 @@ fn pending_turn_id(status: &TaskStatus) -> Option<TurnId> {
         .last()
         .filter(|turn| turn.terminal().is_none())
         .map(TurnSummary::turn_id)
+}
+
+fn submission_recovery_turn_id(record: &LocalTaskRecord) -> Option<TurnId> {
+    record
+        .submission_intent_turn_id()
+        .or(record.submission_rollback_turn_id())
+}
+
+fn submission_recovery_pending(record: &LocalTaskRecord) -> bool {
+    record.abandon_code() == Some(SUBMISSION_ROLLBACK_INCOMPLETE)
+        || submission_recovery_turn_id(record).is_some()
 }
 
 fn is_wait_terminal(state: TaskState) -> bool {

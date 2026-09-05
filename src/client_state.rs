@@ -113,6 +113,8 @@ pub enum ClientStateConcurrencyPoint {
     QueuePublication,
     ParkedTaskTurnPublication,
     ClaimRunCapEvaluation,
+    SubmissionIntentClear,
+    SubmissionIntentReconciliationAfterTransferLock,
     ObservationRefreshPublication,
 }
 
@@ -1382,6 +1384,19 @@ impl ClientStateStore {
         if let Some(hook) = &self.inner.concurrency_hook {
             hook.reach(point);
         }
+    }
+
+    #[doc(hidden)]
+    pub fn clear_submission_intent(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
+        self.reach_concurrency_point(ClientStateConcurrencyPoint::SubmissionIntentClear);
+        self.update_task(replacement)
+    }
+
+    #[doc(hidden)]
+    pub fn submission_intent_reconciliation_after_transfer_lock(&self) {
+        self.reach_concurrency_point(
+            ClientStateConcurrencyPoint::SubmissionIntentReconciliationAfterTransferLock,
+        );
     }
 
     fn owner_is_live_or_ambiguous(
