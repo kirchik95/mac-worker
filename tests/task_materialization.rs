@@ -844,6 +844,35 @@ fn discard_serializes_native_session_delete_with_a_concurrent_session_binding() 
 }
 
 #[test]
+fn discard_rejects_a_late_session_binding_on_the_terminal_task() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    prepare_task(&store, base_oid);
+    TaskStore::new(&store, &SystemProcessRunner)
+        .publish_branch_into_mirror(PROJECT_ID, task_id())
+        .unwrap();
+    TaskStore::new(&store, &SystemProcessRunner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), true))
+        .unwrap();
+
+    let error = TaskStore::new(&store, &SystemProcessRunner)
+        .bind_session(
+            PROJECT_ID,
+            task_id(),
+            SessionBinding::new(AgentKind::Codex, "late-session", 200).unwrap(),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.public_code(), "TASK_CLOSED");
+    assert!(
+        !store
+            .task_dir(PROJECT_ID, task_id())
+            .unwrap()
+            .join("session.json")
+            .exists()
+    );
+}
+
+#[test]
 fn session_binding_is_owner_only_idempotent_and_strict() {
     let (_temp, store, base_oid) = store_with_mirror();
     acquire_lease(&store);

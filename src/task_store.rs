@@ -1288,6 +1288,13 @@ impl<'a> TaskStore<'a> {
         binding: SessionBinding,
     ) -> Result<(), WorkerError> {
         let task = self.open_existing_task(project_id, task_id)?;
+        let status = self.read_status(&task)?;
+        if status.state().is_terminal() {
+            return Err(task_error(
+                "TASK_CLOSED",
+                "terminal tasks cannot accept a session binding",
+            ));
+        }
         if task.entry_exists("session.json")? {
             let existing: SessionBinding = read_record(&task, "session.json")?;
             if existing.agent() != binding.agent()
@@ -1301,7 +1308,6 @@ impl<'a> TaskStore<'a> {
         } else {
             write_record_once(&task, "session.json", &binding)?;
         }
-        let status = self.read_status(&task)?;
         if !status.session_present() {
             let state = status.state();
             let _ = replace_status_record(&task, status, state, Some(true))?;
