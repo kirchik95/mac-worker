@@ -73,7 +73,10 @@ fn sanitized_phase_five_d_evidence_has_origin_and_adapter_rows_without_secrets()
     assert!(evidence.contains("Source origin and push publication"));
     assert!(evidence.contains("Cursor"));
     assert!(evidence.contains("OpenCode"));
-    assert!(evidence.contains("PENDING LIVE RUN"));
+    assert!(evidence.contains("26 job candidates"));
+    assert!(evidence.contains("legacy protocol"));
+    assert!(evidence.contains("not proven"));
+    assert!(!evidence.contains("PENDING LIVE RUN"));
     assert!(!evidence.contains("PLANTED_SECRET"));
     assert!(!evidence.contains("/Users/"));
 }

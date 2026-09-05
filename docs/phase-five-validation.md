@@ -1,6 +1,6 @@
 # Phase 5 validation record
 
-Phase 5 adds agent tasks: submit a prompt, run a headless coding agent on a Mac mini, and collect the result as a Git branch. This record is the sanitized template for the three-worker live acceptance in spec section 20.2 items 1 to 5 and 7 to 10. Item 6 (`source = origin` and `publish = push`), the Cursor and OpenCode adapter rows, and retention through `worker gc` are recorded in the Phase 5d section below; this worktree did not run them.
+Phase 5 adds agent tasks: submit a prompt, run a headless coding agent on a Mac mini, and collect the result as a Git branch. This record is the sanitized template for the three-worker live acceptance in spec section 20.2 items 1 to 5 and 7 to 10. Item 6 (`source = origin` and `publish = push`), the Cursor and OpenCode adapter rows, and retention through `worker gc` are recorded in the Phase 5d section below; this run records their sanitized outcomes.
 
 This record covers the fresh v7 live acceptance against the resumed-turn supervisor revision. Attempts 1 to 5, including the superseded v4, v5, and v6 roots, are not evidence for this run; their tasks were closed or abandoned before the corrected v7 run. The v7 setup gate reached three ready workers with authenticated Codex 0.153.2. No profile was created, uploaded, printed, or used.
 
@@ -22,7 +22,7 @@ The post-rebase local gate was run against the final source. It is not a substit
 
 ## Live three-worker acceptance
 
-The v7 run used a fresh isolated root and a copied three-worker inventory. Claude Code is deferred by operator decision; Codex is the only agent for this run. The dashboard tasks view was observed separately. Source origin, push publication, Cursor, OpenCode, and worker gc are Phase 5d rows below and remain `PENDING LIVE RUN`.
+The v7 run used a fresh isolated root and a copied three-worker inventory. Claude Code is deferred by operator decision; Codex is the only agent for this run. The dashboard tasks view was observed separately. Source origin, push publication, Cursor, OpenCode, and worker gc are Phase 5d rows below with their live or explicitly unproven outcomes.
 
 | Required evidence | Sanitized record |
 | --- | --- |
@@ -38,7 +38,7 @@ The v7 run used a fresh isolated root and a copied three-worker inventory. Claud
 | 3. cancel during a turn, then say | Task `73cf7888` on mini-1: the first turn was cancelled, the resumed turn ran the required test but hit the read-only `.git` gate, and a corrective same-session follow-up completed `done`. Cancel-then-resume completion was proven. |
 | 4. Follow-up pinned to a busy worker | Busy holder `fa39e6f5` stayed on mini-3; its pinned follow-up did not migrate. Independent idle-first task `c65fedde` was admitted on mini-1 and completed. Live task projection exposed no blocking-code field. |
 | 5. --wip base | Task `bc81e32a` preserved the source clone’s HEAD, index, intentional dirty state, and diff-check result. After the marker-only untracked input was excluded from preflight, the turn ran; the read-only task sandbox blocked the agent’s attempted commit, but the publisher produced temporary result head `d3f58fb4`, which fetched successfully. `--publish push` was refused at preflight with `TASK_CONFIG_INVALID` (exit 64), with no task or remote mutation. |
-| 6. `source = origin` and `publish = push` | PENDING LIVE RUN |
+| 6. `source = origin` and `publish = push` | The origin scaffold and capability refresh completed, but the loopback `ls-remote` check stopped at SSH authentication (exit 2); no source/push task or item-6 failure task was created. See Phase 5d. |
 | 7. Disconnect and killed runner | Two `logs -f` followers disconnected and reattached to the same turn. A `submit --wait` disconnect and a separately validated killed runner each reconciled with one runner replacement; status/logs reconnected by the original task/turn. No second turn was accepted. Probe tasks were terminalized during cleanup. |
 | 8. Dashboard observe and shutdown | While item 1 was active, the loopback dashboard showed total 5, queued 2, active 3, and task/run counts matching the CLI; its active-job projection was 0. Selected detail and bounded stdout matched the active CLI state. Final snapshot showed all five closed and no active/queued records. |
 | 9. Retained metadata privacy | Fixed-script count-only scans found marker `0` and secret `0` everywhere; local records `0`; worker records `0/1/0` for mini-1/2/3. The single mini-2 record hit was a `tasks/<project>/<task>/status.json`; count-only correlation showed its task was created before 2026-09-04 22:00 local, so it predates the redaction fix (an attempt-4/5 task). Application-log counts are transparency-only: local `16`, mini-1 `66`, mini-2 `80`, mini-3 `52`. |
@@ -70,9 +70,9 @@ The live record states that the validated helper and client revisions matched, w
 
 ## Phase 5d
 
-This section is the sanitized skeleton for spec section 20.2 item 6 plus the Cursor, OpenCode, and retention rows. Every evidence cell is `PENDING LIVE RUN` until an operator-authorized live gate. This worktree did not contact a worker.
+This section records the sanitized outcome for spec section 20.2 item 6 plus the Cursor, OpenCode, and retention rows. Live adapter turns were withheld when the refreshed worker facts did not provide authenticated agents or secure profiles; no credentials or profile values were created, uploaded, or printed.
 
-Required evidence to collect on that run, without recording secrets or complete local paths:
+Evidence captured or explicitly not proven, without recording secrets or complete local paths:
 
 - Source origin and push publication: exact base preflight; `origin:<host>` routing; branch appears as `--publish-branch`; exit/state
 - Cursor env-profile turn: `prebind_session` before first turn; profile-keyed capability; same chat on say; exit/state
@@ -81,10 +81,10 @@ Required evidence to collect on that run, without recording secrets or complete 
 
 | Acceptance item | Exact-object / session | Capability / policy | Publication / continuity | Exit / state |
 | --- | --- | --- | --- | --- |
-| Source origin and push publication | PENDING LIVE RUN | PENDING LIVE RUN | PENDING LIVE RUN | PENDING LIVE RUN |
-| Cursor env-profile turn | PENDING LIVE RUN | PENDING LIVE RUN | PENDING LIVE RUN | PENDING LIVE RUN |
-| OpenCode env-profile turn | PENDING LIVE RUN | PENDING LIVE RUN | PENDING LIVE RUN | PENDING LIVE RUN |
-| Retention and discard | PENDING LIVE RUN | PENDING LIVE RUN | PENDING LIVE RUN | PENDING LIVE RUN |
+| Source origin and push publication | The kit began the throwaway origin setup, but its required worker-side advertisement check (`VERIFY_FROM_ALIAS` via mini-1) failed with SSH public-key authentication; local loopback independently prompted for a password. No source/push task object was created. | All three refreshes reported ready with the configured origin capability; the worker-to-origin authentication prerequisite was unavailable. | Item 6, including `--publish-branch` and push-failure checks, was not run; no item-6 branch/ref mutation was made. | Origin preparation exited 2 at the advertisement check; live origin/source/push publication was not proven. |
+| Cursor env-profile turn | Local fake transport exercised `prebind_session` before the first turn and retained its binding for `say`. | Live refresh reported Cursor unknown and no secure env profile; no credential creation, upload, or printing. | Live first turn and `say` were withheld; worker-side chat continuity was not proven. | Local Cursor/OpenCode adapter suite: 13 passed; live Cursor state not run. |
+| OpenCode env-profile turn | Local fake transport exercised JSON session binding, `--auto`, the pointer prompt, and resume. | Live refresh reported OpenCode unknown and no secure env profile; no credential creation, upload, or printing. | Live first turn and `say` were withheld; worker-side session continuity was not proven. | Local Cursor/OpenCode adapter suite: 13 passed; live OpenCode state not run. |
+| Retention and discard | Complete release-binary fleet preview (protocol 4, apply false) listed 26 job candidates, all reason `legacy protocol` (15/6/5 across the three workers), plus two unreadable-record warnings; transfer candidates were 0. | The owner-only locked apply was authorized; legacy candidates are listed but protected from deletion, and no non-legacy candidate was selected. No task close/discard was invoked, so native session deletion was not exercised. | Apply exited 0 with 26 candidates and 0 applied; the post-apply preview exited 0 with the same 26 legacy candidates, 0 applied, and 0 transfer candidates. The retained legacy candidates survived. | Before/after counts were unchanged: local config/state/cache/data 1/4/0/0; worker data files 1837/1039/847 and installed helper present on all three. Preview/apply/post-preview warnings were 2/28/2. |
 
 ### Operator checklist
 
@@ -97,4 +97,4 @@ Required evidence to collect on that run, without recording secrets or complete 
 
 ## Delivery boundary
 
-The v7 Codex record above does not complete Phase 5d. Item 6, Cursor, OpenCode, and `worker gc` stay `PENDING LIVE RUN` until the operator-authorized live gate. Claude Code remains deferred on the workers by operator decision unless the operator records a later decision here.
+The v7 Codex record above is supplemented by these Phase 5d outcomes. Item 6 and live Cursor/OpenCode turns remain unproven because worker-to-origin SSH authentication and authenticated adapter profiles were unavailable. Retention preview/apply completed with legacy candidates preserved and no candidate applied. Claude Code remains deferred on the workers by operator decision unless the operator records a later decision here.
