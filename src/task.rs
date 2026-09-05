@@ -190,7 +190,7 @@ impl TaskTitle {
 pub enum TaskSource {
     Local {
         wip: bool,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         push_target: Option<PushTarget>,
     },
     Origin {
@@ -589,9 +589,6 @@ impl TaskMeta {
     }
 
     pub fn origin_requirement(&self) -> Option<String> {
-        if !self.publish.contains(&PublishMode::Push) {
-            return None;
-        }
         self.source.origin_requirement().ok().flatten()
     }
 

@@ -335,6 +335,15 @@ fn local_task_record_never_persists_the_transfer_alternates_path() {
 }
 
 #[test]
+fn legacy_fetch_only_local_records_retain_their_canonical_bytes_without_push_target() {
+    let current = String::from_utf8(sample_record().canonical_bytes().unwrap()).unwrap();
+    let legacy = current.replace(",\"push_target\":null", "");
+    let parsed: LocalTaskRecord = serde_json::from_str(&legacy).unwrap();
+
+    assert_eq!(parsed.canonical_bytes().unwrap(), legacy.as_bytes());
+}
+
+#[test]
 fn local_task_record_never_persists_prompt_content() {
     let secret = "token=planted-secret at /Users/alice/.ssh/id_ed25519";
     let prompt = format!("Investigate the deployment failure\n\n{secret}");

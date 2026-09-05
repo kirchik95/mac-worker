@@ -403,6 +403,8 @@ impl<'a> JobService<'a> {
         // publication.
         if let Some(disposition) = self.store.disposition(job_id)? {
             require_matching_accepted(&disposition, &submit)?;
+            let replay_meta = task_store.load_meta(material.project_id(), turn.task_id())?;
+            validate_turn_origin(&replay_meta, request.origin_url())?;
             let task_status = task_store.load_status(material.project_id(), turn.task_id())?;
             if let Some(lease) = self
                 .leases
