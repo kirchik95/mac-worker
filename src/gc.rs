@@ -34,6 +34,9 @@ const MAX_GC_REF_BYTES: usize = 1024 * 1024;
 const GC_GIT_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GC_GIT_DEADLINE: Duration = Duration::from_secs(30);
 const GC_GIT_PROGRAM: &str = "/usr/bin/git";
+const GC_REASON_LEGACY_PROTOCOL: &str = "legacy protocol";
+const GC_REASON_UNREADABLE_RECORD: &str = "unreadable record";
+const GC_REASON_INCONSISTENT_RECORD: &str = "inconsistent record";
 
 const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
     "GIT_DIR",
@@ -316,7 +319,7 @@ impl<'a> HostGc<'a> {
     pub fn run(&self, request: &GcRequest) -> Result<GcReport, WorkerError> {
         request.validate()?;
         self.store.with_gc_lock(|| {
-            let (inventory, mut candidates) = self.collect(request)?;
+            let (inventory, mut candidates, mut warnings) = self.collect(request)?;
             candidates.sort_by(|left, right| {
                 candidate_rank(left)
                     .cmp(&candidate_rank(right))
@@ -324,7 +327,6 @@ impl<'a> HostGc<'a> {
                     .then_with(|| left.reason.cmp(&right.reason))
             });
             let mut applied = Vec::new();
-            let mut warnings = Vec::new();
             if request.apply() {
                 for candidate in &candidates {
                     if self.apply_candidate(candidate, &inventory, request, &mut warnings)? {
@@ -341,18 +343,25 @@ impl<'a> HostGc<'a> {
         })
     }
 
-    fn collect(&self, request: &GcRequest) -> Result<(GcInventory, Vec<GcCandidate>), WorkerError> {
-        let mut inventory = GcInventory {
-            live_lease_job: LeaseService::new(self.store)
-                .load()?
-                .map(|lease| lease.job_id()),
-            ..GcInventory::default()
-        };
+    fn collect(
+        &self,
+        request: &GcRequest,
+    ) -> Result<(GcInventory, Vec<GcCandidate>, Vec<String>), WorkerError> {
+        let mut warnings = Vec::new();
+        let mut inventory = GcInventory::default();
+        match LeaseService::new(self.store).load() {
+            Ok(lease) => inventory.live_lease_job = lease.map(|lease| lease.job_id()),
+            Err(error) => {
+                inventory.lease_uncertain = true;
+                push_warning(&mut warnings, "lease record unreadable; GC kept records");
+                let _ = error;
+            }
+        }
         let mut candidates = Vec::new();
-        self.collect_tasks(request, &mut inventory, &mut candidates)?;
-        self.collect_jobs(request, &inventory, &mut candidates)?;
-        self.collect_mirrors(request, &inventory, &mut candidates)?;
-        Ok((inventory, candidates))
+        self.collect_tasks(request, &mut inventory, &mut candidates, &mut warnings)?;
+        self.collect_jobs(request, &inventory, &mut candidates, &mut warnings)?;
+        self.collect_mirrors(request, &inventory, &mut candidates, &mut warnings)?;
+        Ok((inventory, candidates, warnings))
     }
 
     fn collect_tasks(
@@ -360,115 +369,191 @@ impl<'a> HostGc<'a> {
         request: &GcRequest,
         inventory: &mut GcInventory,
         candidates: &mut Vec<GcCandidate>,
+        warnings: &mut Vec<String>,
     ) -> Result<(), WorkerError> {
         let tasks = self.store.open_directory("tasks", false)?;
         for raw_project in tasks.list_names()? {
             if is_rooted_namespace(&raw_project) {
                 continue;
             }
-            let project = parse_digest_component(&raw_project, "task project")?;
-            let project_dir = tasks
-                .open_child_directory(&relative(&project)?, false)
-                .map_err(WorkerError::Io)?;
+            let project = match parse_digest_component(&raw_project, "task project") {
+                Ok(project) => project,
+                Err(_) => {
+                    push_warning(warnings, "unreadable task project record");
+                    continue;
+                }
+            };
+            let project_dir = match tasks.open_child_directory(&relative(&project)?, false) {
+                Ok(project_dir) => project_dir,
+                Err(_) => {
+                    inventory.uncertain_task_projects.insert(project.clone());
+                    push_warning(warnings, "unreadable task project record");
+                    continue;
+                }
+            };
             for raw_task in project_dir.list_names()? {
                 if is_rooted_namespace(&raw_task) {
                     continue;
                 }
-                let task_name = parse_utf8(&raw_task, "task directory")?;
-                let task_id = task_name.parse::<TaskId>().map_err(|_| {
-                    gc_metadata("task directory", "task directory name is not a task ID")
-                })?;
-                let task = project_dir
-                    .open_child_directory(&relative(&task_name)?, false)
-                    .map_err(WorkerError::Io)?;
-                let meta: TaskMeta = read_gc_json(&task, "meta.json", "task metadata")?;
-                let status: TaskStatus = read_gc_json(&task, "status.json", "task status")?;
-                if meta.project_id() != project || meta.task_id() != task_id {
-                    return Err(gc_metadata(
-                        &format!("tasks/{project}/{task_name}"),
-                        "task metadata does not match its rooted path",
-                    ));
-                }
-                let branch_ref = format!("refs/heads/task/{task_id}");
-                let base_ref = format!("refs/mac-worker/bases/{task_id}");
-                let (branch_exists, base_exists) = if status.state().is_terminal() {
-                    if let Some(mirror) = self.store.mirror_if_present(&project)? {
-                        (
-                            git_ref_exists(self.runner, mirror.path(), &branch_ref)?,
-                            git_ref_exists(self.runner, mirror.path(), &base_ref)?,
-                        )
-                    } else {
-                        (false, false)
+                let task_name = match parse_utf8(&raw_task, "task directory") {
+                    Ok(task_name) => task_name,
+                    Err(_) => {
+                        inventory.uncertain_task_projects.insert(project.clone());
+                        push_warning(warnings, "unreadable task record");
+                        continue;
                     }
-                } else {
-                    (false, false)
                 };
-                let active_work =
-                    self.task_has_active_work(&project, &meta, &status, inventory.live_lease_job)?;
-                let size_bytes = bounded_tree_size(&task)?;
+                let task_id = match task_name.parse::<TaskId>() {
+                    Ok(task_id) => task_id,
+                    Err(_) => {
+                        inventory.uncertain_task_projects.insert(project.clone());
+                        push_warning(warnings, "inconsistent task record");
+                        continue;
+                    }
+                };
                 let identifier = format!("{project}/{task_id}");
+                let task = match project_dir.open_child_directory(&relative(&task_name)?, false) {
+                    Ok(task) => task,
+                    Err(_) => {
+                        inventory.uncertain_task_projects.insert(project.clone());
+                        push_record_warning(
+                            warnings,
+                            "task",
+                            &identifier,
+                            GC_REASON_UNREADABLE_RECORD,
+                        );
+                        continue;
+                    }
+                };
                 inventory.task_projects.insert(project.clone());
-                inventory.tasks.insert(
-                    identifier.clone(),
-                    TaskSnapshot {
-                        state: status.state(),
-                        updated_at_millis: status.updated_at_millis(),
-                        active_work,
-                    },
+                let result = self.collect_task_record(
+                    request,
+                    inventory,
+                    candidates,
+                    &project,
+                    task_id,
+                    &identifier,
+                    &task,
                 );
-
-                if !active_work
-                    && status.state() == TaskState::Open
-                    && expired(
-                        request.now_millis(),
-                        status.updated_at_millis(),
-                        request.task_retention_millis(),
-                    )
+                let Err(error) = result else {
+                    continue;
+                };
+                inventory.uncertain_task_projects.insert(project.clone());
+                if is_legacy_protocol_record(&task, "meta.json", &error)
+                    || is_legacy_protocol_record(&task, "status.json", &error)
                 {
                     push_candidate(
                         candidates,
-                        GcCandidate::new(
-                            "task",
-                            identifier.clone(),
-                            size_bytes,
-                            "open task retention",
-                        )?,
+                        GcCandidate::new("task", identifier, 0, GC_REASON_LEGACY_PROTOCOL)?,
                     )?;
-                }
-
-                if !active_work
-                    && status.state().is_terminal()
-                    && (branch_exists || base_exists)
-                    && expired(
-                        request.now_millis(),
-                        status.updated_at_millis(),
-                        request.branch_retention_millis(),
-                    )
-                {
-                    push_candidate(
-                        candidates,
-                        GcCandidate::new("branch", identifier.clone(), 0, "branch retention")?,
-                    )?;
-                }
-
-                let metadata_expired = status.state().is_terminal()
-                    && expired(
-                        request.now_millis(),
-                        status.updated_at_millis(),
-                        request.job_retention_millis(),
+                } else {
+                    push_record_warning(
+                        warnings,
+                        "task",
+                        &identifier,
+                        record_failure_reason(&error),
                     );
-                if !active_work && metadata_expired {
-                    push_candidate(
-                        candidates,
-                        GcCandidate::new(
-                            "task",
-                            identifier,
-                            size_bytes,
-                            "task metadata retention",
-                        )?,
-                    )?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keeps the rooted record context explicit at the boundary.
+    fn collect_task_record(
+        &self,
+        request: &GcRequest,
+        inventory: &mut GcInventory,
+        candidates: &mut Vec<GcCandidate>,
+        project: &str,
+        task_id: TaskId,
+        identifier: &str,
+        task: &RootedDir,
+    ) -> Result<(), WorkerError> {
+        let meta: TaskMeta = read_gc_json(task, "meta.json", "task metadata")?;
+        let status: TaskStatus = read_gc_json(task, "status.json", "task status")?;
+        if meta.project_id() != project || meta.task_id() != task_id {
+            return Err(gc_metadata(
+                &format!("tasks/{project}/{task_id}"),
+                "task metadata does not match its rooted path",
+            ));
+        }
+        let branch_ref = format!("refs/heads/task/{task_id}");
+        let base_ref = format!("refs/mac-worker/bases/{task_id}");
+        let (branch_exists, base_exists) = if status.state().is_terminal() {
+            if let Some(mirror) = self.store.mirror_if_present(project)? {
+                (
+                    git_ref_exists(self.runner, mirror.path(), &branch_ref)?,
+                    git_ref_exists(self.runner, mirror.path(), &base_ref)?,
+                )
+            } else {
+                (false, false)
+            }
+        } else {
+            (false, false)
+        };
+        let active_work = inventory.lease_uncertain
+            || self.task_has_active_work(project, &meta, &status, inventory.live_lease_job)?;
+        let size_bytes = bounded_tree_size(task)?;
+        inventory.tasks.insert(
+            identifier.to_owned(),
+            TaskSnapshot {
+                state: status.state(),
+                updated_at_millis: status.updated_at_millis(),
+                active_work,
+            },
+        );
+
+        if !active_work
+            && status.state() == TaskState::Open
+            && expired(
+                request.now_millis(),
+                status.updated_at_millis(),
+                request.task_retention_millis(),
+            )
+        {
+            push_candidate(
+                candidates,
+                GcCandidate::new(
+                    "task",
+                    identifier.to_owned(),
+                    size_bytes,
+                    "open task retention",
+                )?,
+            )?;
+        }
+
+        if !active_work
+            && status.state().is_terminal()
+            && (branch_exists || base_exists)
+            && expired(
+                request.now_millis(),
+                status.updated_at_millis(),
+                request.branch_retention_millis(),
+            )
+        {
+            push_candidate(
+                candidates,
+                GcCandidate::new("branch", identifier.to_owned(), 0, "branch retention")?,
+            )?;
+        }
+
+        let metadata_expired = status.state().is_terminal()
+            && expired(
+                request.now_millis(),
+                status.updated_at_millis(),
+                request.job_retention_millis(),
+            );
+        if !active_work && metadata_expired {
+            push_candidate(
+                candidates,
+                GcCandidate::new(
+                    "task",
+                    identifier.to_owned(),
+                    size_bytes,
+                    "task metadata retention",
+                )?,
+            )?;
         }
         Ok(())
     }
@@ -532,76 +617,171 @@ impl<'a> HostGc<'a> {
         request: &GcRequest,
         inventory: &GcInventory,
         candidates: &mut Vec<GcCandidate>,
+        warnings: &mut Vec<String>,
     ) -> Result<(), WorkerError> {
         let jobs = self.store.open_directory("jobs", false)?;
         for raw_project in jobs.list_names()? {
             if is_rooted_namespace(&raw_project) {
                 continue;
             }
-            let project = parse_digest_component(&raw_project, "job project")?;
-            let project_dir = jobs
-                .open_child_directory(&relative(&project)?, false)
-                .map_err(WorkerError::Io)?;
+            let project = match parse_digest_component(&raw_project, "job project") {
+                Ok(project) => project,
+                Err(_) => {
+                    push_warning(warnings, "unreadable job project record");
+                    continue;
+                }
+            };
+            let project_dir = match jobs.open_child_directory(&relative(&project)?, false) {
+                Ok(project_dir) => project_dir,
+                Err(_) => {
+                    push_warning(warnings, "unreadable job project record");
+                    continue;
+                }
+            };
             for raw_worktree in project_dir.list_names()? {
                 if is_rooted_namespace(&raw_worktree) {
                     continue;
                 }
-                let worktree = parse_digest_component(&raw_worktree, "job worktree")?;
-                let worktree_dir = project_dir
-                    .open_child_directory(&relative(&worktree)?, false)
-                    .map_err(WorkerError::Io)?;
+                let worktree = match parse_digest_component(&raw_worktree, "job worktree") {
+                    Ok(worktree) => worktree,
+                    Err(_) => {
+                        push_warning(warnings, "unreadable job worktree record");
+                        continue;
+                    }
+                };
+                let worktree_dir =
+                    match project_dir.open_child_directory(&relative(&worktree)?, false) {
+                        Ok(worktree_dir) => worktree_dir,
+                        Err(_) => {
+                            push_warning(warnings, "unreadable job worktree record");
+                            continue;
+                        }
+                    };
                 for raw_job in worktree_dir.list_names()? {
                     if is_rooted_namespace(&raw_job) {
                         continue;
                     }
-                    let job_name = parse_utf8(&raw_job, "job directory")?;
-                    let job_id = job_name.parse::<JobId>().map_err(|_| {
-                        gc_metadata("job directory", "job directory name is not a job ID")
-                    })?;
-                    let job = worktree_dir
-                        .open_child_directory(&relative(&job_name)?, false)
-                        .map_err(WorkerError::Io)?;
-                    let meta: JobMeta = read_gc_json(&job, "meta.json", "job metadata")?;
-                    let status: JobStatus = read_gc_json(&job, "status.json", "job status")?;
-                    if meta.job_id() != job_id
-                        || meta.project_id() != project
-                        || meta.worktree_id() != worktree
-                    {
-                        return Err(gc_metadata(
-                            &format!("jobs/{project}/{worktree}/{job_id}"),
-                            "job metadata does not match its rooted path",
-                        ));
-                    }
-                    let mut mutable = false;
-                    for name in ["workspace", "home", "tmp", "execution.json"] {
-                        if job.entry_exists(name)? {
-                            mutable = true;
-                            break;
+                    let job_name = match parse_utf8(&raw_job, "job directory") {
+                        Ok(job_name) => job_name,
+                        Err(_) => {
+                            push_warning(warnings, "unreadable job record");
+                            continue;
                         }
-                    }
-                    if inventory.live_lease_job == Some(job_id) {
+                    };
+                    let job_id = match job_name.parse::<JobId>() {
+                        Ok(job_id) => job_id,
+                        Err(_) => {
+                            push_warning(warnings, "inconsistent job record");
+                            continue;
+                        }
+                    };
+                    let identifier = format!("{project}/{worktree}/{job_id}");
+                    let job = match worktree_dir.open_child_directory(&relative(&job_name)?, false)
+                    {
+                        Ok(job) => job,
+                        Err(_) => {
+                            push_record_warning(
+                                warnings,
+                                "job",
+                                &identifier,
+                                GC_REASON_UNREADABLE_RECORD,
+                            );
+                            continue;
+                        }
+                    };
+                    let result = self.collect_job_record(
+                        request,
+                        inventory,
+                        candidates,
+                        &project,
+                        &worktree,
+                        job_id,
+                        &identifier,
+                        &job,
+                    );
+                    let Err(error) = result else {
                         continue;
-                    }
-                    if status.state().is_terminal()
-                        && !mutable
-                        && expired(
-                            request.now_millis(),
-                            status.updated_at_millis(),
-                            request.job_retention_millis(),
-                        )
+                    };
+                    if is_legacy_protocol_record(&job, "meta.json", &error)
+                        || is_legacy_protocol_record(&job, "status.json", &error)
                     {
                         push_candidate(
                             candidates,
-                            GcCandidate::new(
-                                "job",
-                                format!("{project}/{worktree}/{job_id}"),
-                                bounded_tree_size(&job)?,
-                                "job retention",
-                            )?,
+                            GcCandidate::new("job", identifier, 0, GC_REASON_LEGACY_PROTOCOL)?,
                         )?;
+                    } else {
+                        push_record_warning(
+                            warnings,
+                            "job",
+                            &identifier,
+                            record_failure_reason(&error),
+                        );
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keeps the rooted record context explicit at the boundary.
+    fn collect_job_record(
+        &self,
+        request: &GcRequest,
+        inventory: &GcInventory,
+        candidates: &mut Vec<GcCandidate>,
+        project: &str,
+        worktree: &str,
+        job_id: JobId,
+        identifier: &str,
+        job: &RootedDir,
+    ) -> Result<(), WorkerError> {
+        let meta: JobMeta = read_gc_json(job, "meta.json", "job metadata")?;
+        let status: JobStatus = read_gc_json(job, "status.json", "job status")?;
+        if meta.job_id() != job_id || meta.project_id() != project || meta.worktree_id() != worktree
+        {
+            return Err(gc_metadata(
+                &format!("jobs/{project}/{worktree}/{job_id}"),
+                "job metadata does not match its rooted path",
+            ));
+        }
+        let index = self.store.open_directory("job-index", false)?;
+        let lock_namespace = self.store.open_directory("locks/jobs", false)?;
+        if !index.entry_exists(&format!("{job_id}.json"))?
+            || !lock_namespace.entry_exists(&format!("{job_id}.lock.json"))?
+            || !lock_namespace.entry_exists(&job_id.to_string())?
+        {
+            return Err(gc_metadata(
+                &format!("jobs/{project}/{worktree}/{job_id}"),
+                "job record sibling state is incomplete",
+            ));
+        }
+        if inventory.lease_uncertain || inventory.live_lease_job == Some(job_id) {
+            return Ok(());
+        }
+        let mut mutable = false;
+        for name in ["workspace", "home", "tmp", "execution.json"] {
+            if job.entry_exists(name)? {
+                mutable = true;
+                break;
+            }
+        }
+        if status.state().is_terminal()
+            && !mutable
+            && expired(
+                request.now_millis(),
+                status.updated_at_millis(),
+                request.job_retention_millis(),
+            )
+        {
+            push_candidate(
+                candidates,
+                GcCandidate::new(
+                    "job",
+                    identifier.to_owned(),
+                    bounded_tree_size(job)?,
+                    "job retention",
+                )?,
+            )?;
         }
         Ok(())
     }
@@ -611,79 +791,104 @@ impl<'a> HostGc<'a> {
         request: &GcRequest,
         inventory: &GcInventory,
         candidates: &mut Vec<GcCandidate>,
+        warnings: &mut Vec<String>,
     ) -> Result<(), WorkerError> {
         let repos = self.store.open_directory("repos", false)?;
         for raw_name in repos.list_names()? {
             if is_rooted_namespace(&raw_name) {
                 continue;
             }
-            let name = parse_utf8(&raw_name, "mirror directory")?;
-            let project = name.strip_suffix(".git").ok_or_else(|| {
-                gc_metadata("mirror directory", "mirror name does not end in .git")
-            })?;
-            if !is_lower_hex(project, 64) {
-                return Err(gc_metadata(
-                    "mirror directory",
-                    "mirror project ID is invalid",
-                ));
-            }
-            let mirror = repos
-                .open_child_directory(&relative(&name)?, false)
-                .map_err(WorkerError::Io)?;
-            let refs = git_ref_names(self.runner, mirror.path())?;
-            let ref_ages = git_task_ref_ages(self.runner, mirror.path())?;
-            for (reference, created_at_millis) in ref_ages {
-                let Some(task_text) = reference
-                    .strip_prefix("refs/heads/task/")
-                    .or_else(|| reference.strip_prefix("refs/mac-worker/bases/"))
-                else {
+            let name = match parse_utf8(&raw_name, "mirror directory") {
+                Ok(name) => name,
+                Err(_) => {
+                    push_warning(warnings, "unreadable mirror record");
                     continue;
-                };
-                let Ok(task_id) = task_text.parse::<TaskId>() else {
-                    return Err(gc_metadata("mirror ref", "task ref name is invalid"));
-                };
-                let identifier = format!("{project}/{task_id}");
-                let protected_by_live_record =
-                    inventory.tasks.get(&identifier).is_some_and(|task| {
-                        task.active_work
-                            || !task.state.is_terminal()
-                            || !expired(
-                                request.now_millis(),
-                                task.updated_at_millis,
-                                request.branch_retention_millis(),
-                            )
-                    });
-                if !protected_by_live_record
-                    && expired(
-                        request.now_millis(),
-                        created_at_millis,
-                        request.branch_retention_millis(),
-                    )
-                    && !candidates.iter().any(|candidate| {
-                        candidate.kind() == "branch" && candidate.identifier() == identifier
-                    })
-                {
-                    push_candidate(
-                        candidates,
-                        GcCandidate::new("branch", identifier, 0, "branch retention")?,
-                    )?;
                 }
+            };
+            let project = match name.strip_suffix(".git") {
+                Some(project) if is_lower_hex(project, 64) => project,
+                _ => {
+                    push_warning(warnings, "inconsistent mirror record");
+                    continue;
+                }
+            };
+            let result =
+                self.collect_mirror_record(request, inventory, candidates, &repos, &name, project);
+            if let Err(error) = result {
+                push_record_warning(warnings, "mirror", project, record_failure_reason(&error));
             }
-            if !refs.is_empty()
-                || inventory.task_projects.contains(project)
-                || !expired(
-                    request.now_millis(),
-                    rooted_modified_millis(&mirror)?,
-                    request.branch_retention_millis(),
-                )
-            {
+        }
+        Ok(())
+    }
+
+    fn collect_mirror_record(
+        &self,
+        request: &GcRequest,
+        inventory: &GcInventory,
+        candidates: &mut Vec<GcCandidate>,
+        repos: &RootedDir,
+        name: &str,
+        project: &str,
+    ) -> Result<(), WorkerError> {
+        let mirror = repos
+            .open_child_directory(&relative(name)?, false)
+            .map_err(WorkerError::Io)?;
+        let refs = git_ref_names(self.runner, mirror.path())?;
+        let ref_ages = git_task_ref_ages(self.runner, mirror.path())?;
+        for (reference, created_at_millis) in ref_ages {
+            let Some(task_text) = reference
+                .strip_prefix("refs/heads/task/")
+                .or_else(|| reference.strip_prefix("refs/mac-worker/bases/"))
+            else {
+                continue;
+            };
+            let task_id = task_text
+                .parse::<TaskId>()
+                .map_err(|_| gc_metadata("mirror ref", "task ref name is invalid"))?;
+            if inventory.uncertain_task_projects.contains(project) {
                 continue;
             }
-            push_candidate(
-                candidates,
-                GcCandidate::new("mirror", project, 0, "empty mirror retention")?,
-            )?;
+            let identifier = format!("{project}/{task_id}");
+            let protected_by_live_record = inventory.tasks.get(&identifier).is_some_and(|task| {
+                task.active_work
+                    || !task.state.is_terminal()
+                    || !expired(
+                        request.now_millis(),
+                        task.updated_at_millis,
+                        request.branch_retention_millis(),
+                    )
+            });
+            if !protected_by_live_record
+                && expired(
+                    request.now_millis(),
+                    created_at_millis,
+                    request.branch_retention_millis(),
+                )
+                && !candidates.iter().any(|candidate| {
+                    candidate.kind() == "branch" && candidate.identifier() == identifier
+                })
+            {
+                push_candidate(
+                    candidates,
+                    GcCandidate::new("branch", identifier, 0, "branch retention")?,
+                )?;
+            }
         }
+        if !refs.is_empty()
+            || inventory.task_projects.contains(project)
+            || inventory.uncertain_task_projects.contains(project)
+            || !expired(
+                request.now_millis(),
+                rooted_modified_millis(&mirror)?,
+                request.branch_retention_millis(),
+            )
+        {
+            return Ok(());
+        }
+        push_candidate(
+            candidates,
+            GcCandidate::new("mirror", project, 0, "empty mirror retention")?,
+        )?;
         Ok(())
     }
 
@@ -695,6 +900,15 @@ impl<'a> HostGc<'a> {
         warnings: &mut Vec<String>,
     ) -> Result<bool, WorkerError> {
         match candidate.kind() {
+            "task" if candidate.reason() == GC_REASON_LEGACY_PROTOCOL => {
+                push_record_warning(
+                    warnings,
+                    "task",
+                    candidate.identifier(),
+                    GC_REASON_LEGACY_PROTOCOL,
+                );
+                Ok(false)
+            }
             "task" if candidate.reason() == "open task retention" => {
                 let (project, task_id) = parse_task_identifier(candidate.identifier())?;
                 if self.task_id_has_active_work(project, task_id)? {
@@ -749,7 +963,16 @@ impl<'a> HostGc<'a> {
                 Ok(true)
             }
             "branch" => self.apply_branch(candidate, inventory, request, warnings),
-            "job" => self.apply_job(candidate, request),
+            "job" if candidate.reason() == GC_REASON_LEGACY_PROTOCOL => {
+                push_record_warning(
+                    warnings,
+                    "job",
+                    candidate.identifier(),
+                    GC_REASON_LEGACY_PROTOCOL,
+                );
+                Ok(false)
+            }
+            "job" => self.apply_job(candidate, request, warnings),
             "mirror" => self.apply_mirror(candidate, inventory, request),
             _ => Err(gc_protocol(
                 "GC_CANDIDATE_INVALID",
@@ -814,7 +1037,12 @@ impl<'a> HostGc<'a> {
         Ok(removed)
     }
 
-    fn apply_job(&self, candidate: &GcCandidate, request: &GcRequest) -> Result<bool, WorkerError> {
+    fn apply_job(
+        &self,
+        candidate: &GcCandidate,
+        request: &GcRequest,
+        warnings: &mut Vec<String>,
+    ) -> Result<bool, WorkerError> {
         let (project, worktree, job_id) = parse_job_identifier(candidate.identifier())?;
         let parent = match self
             .store
@@ -833,6 +1061,20 @@ impl<'a> HostGc<'a> {
         };
         let meta: JobMeta = read_gc_json(&job, "meta.json", "job metadata")?;
         let status: JobStatus = read_gc_json(&job, "status.json", "job status")?;
+        let index = self.store.open_directory("job-index", false)?;
+        let lock_namespace = self.store.open_directory("locks/jobs", false)?;
+        if !index.entry_exists(&format!("{job_id}.json"))?
+            || !lock_namespace.entry_exists(&format!("{job_id}.lock.json"))?
+            || !lock_namespace.entry_exists(&job_id.to_string())?
+        {
+            push_record_warning(
+                warnings,
+                "job",
+                candidate.identifier(),
+                GC_REASON_INCONSISTENT_RECORD,
+            );
+            return Ok(false);
+        }
         if LeaseService::new(self.store)
             .load()?
             .is_some_and(|lease| lease.job_id() == job_id)
@@ -868,7 +1110,10 @@ impl<'a> HostGc<'a> {
         request: &GcRequest,
     ) -> Result<bool, WorkerError> {
         let project = candidate.identifier();
-        if inventory.task_projects.contains(project) || !is_lower_hex(project, 64) {
+        if inventory.task_projects.contains(project)
+            || inventory.uncertain_task_projects.contains(project)
+            || !is_lower_hex(project, 64)
+        {
             return Ok(false);
         }
         let repos = self.store.open_directory("repos", false)?;
@@ -896,8 +1141,10 @@ impl<'a> HostGc<'a> {
 #[derive(Default)]
 struct GcInventory {
     live_lease_job: Option<JobId>,
+    lease_uncertain: bool,
     tasks: BTreeMap<String, TaskSnapshot>,
     task_projects: BTreeSet<String>,
+    uncertain_task_projects: BTreeSet<String>,
 }
 
 struct TaskSnapshot {
@@ -934,6 +1181,39 @@ fn push_warning(warnings: &mut Vec<String>, warning: &str) {
     if warnings.len() < 64 && !warnings.iter().any(|existing| existing == warning) {
         warnings.push(warning.to_owned());
     }
+}
+
+fn push_record_warning(warnings: &mut Vec<String>, kind: &str, identifier: &str, reason: &str) {
+    let leaf = identifier.rsplit('/').next().unwrap_or(identifier);
+    let warning = match reason {
+        GC_REASON_INCONSISTENT_RECORD => format!("inconsistent {kind} record {leaf}"),
+        GC_REASON_LEGACY_PROTOCOL => format!("legacy protocol {kind} record {leaf}"),
+        _ => format!("unreadable {kind} record {leaf}"),
+    };
+    push_warning(warnings, &warning);
+}
+
+fn record_failure_reason(error: &WorkerError) -> &'static str {
+    let message = error.to_string();
+    if message.contains("does not match")
+        || message.contains("is not a")
+        || message.contains("missing")
+        || message.contains("incomplete")
+    {
+        GC_REASON_INCONSISTENT_RECORD
+    } else {
+        GC_REASON_UNREADABLE_RECORD
+    }
+}
+
+fn is_legacy_protocol_record(directory: &RootedDir, name: &str, error: &WorkerError) -> bool {
+    error.to_string().contains("incompatible protocol version")
+        || directory
+            .read_private_regular(name, MAX_GC_FILE_BYTES)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.get("protocol_version")?.as_u64())
+            .is_some_and(|version| version < u64::from(PROTOCOL_VERSION))
 }
 
 fn expired(now_millis: u64, updated_at_millis: u64, retention_millis: u64) -> bool {

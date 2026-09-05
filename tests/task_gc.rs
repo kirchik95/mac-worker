@@ -27,6 +27,9 @@ use uuid::Uuid;
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OTHER_PROJECT_ID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const LEGACY_PROJECT_ID: &str = "ac2486b82bd3f012ce72f1ba60cad94aeef2f8dfe10329ce5451794ec87b3bd1";
+const LEGACY_WORKTREE_ID: &str = "e59fa72efe82e49c977312206e4bfa7bbe82b3b5afc238fa2694800244e27532";
+const LEGACY_JOB_ID: &str = "14aff6a4642846809f24a0bf9e13b441";
 
 fn task_id(value: u128) -> TaskId {
     TaskId::new(Uuid::from_u128(value))
@@ -187,6 +190,50 @@ fn write_job(store: &HostStore, job: JobId, status: &JobStatus) {
         fs::Permissions::from_mode(0o600),
     )
     .unwrap();
+    ensure_job_siblings(store, job);
+}
+
+fn ensure_job_siblings(store: &HostStore, job: JobId) {
+    drop(store.admission_lock(job).unwrap());
+    let index = store.job_index(job).unwrap();
+    if !index.exists() {
+        fs::write(&index, b"{}").unwrap();
+        fs::set_permissions(index, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+fn write_legacy_fixture_job(store: &HostStore) -> (String, JobId) {
+    let job: JobId = LEGACY_JOB_ID.parse().unwrap();
+    let job_dir = store
+        .job(LEGACY_PROJECT_ID, LEGACY_WORKTREE_ID, job)
+        .unwrap();
+    fs::create_dir_all(&job_dir).unwrap();
+    fs::set_permissions(
+        job_dir.parent().unwrap().parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(job_dir.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&job_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        job_dir.join("meta.json"),
+        include_bytes!("fixtures/gc/legacy-job-meta-v3.json"),
+    )
+    .unwrap();
+    fs::set_permissions(job_dir.join("meta.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        job_dir.join("status.json"),
+        include_bytes!("fixtures/gc/legacy-job-status.json"),
+    )
+    .unwrap();
+    fs::set_permissions(
+        job_dir.join("status.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    ensure_job_siblings(store, job);
+    let identifier = format!("{LEGACY_PROJECT_ID}/{LEGACY_WORKTREE_ID}/{job}");
+    (identifier, job)
 }
 
 fn fixture() -> (TempDir, HostStore, GitRepo, BaseOid) {
@@ -551,11 +598,121 @@ fn gc_fails_closed_on_malformed_task_metadata() {
     )
     .unwrap();
 
-    let error = HostGc::new(&store, &SystemProcessRunner)
+    let report = HostGc::new(&store, &SystemProcessRunner)
         .preview_at(u64::MAX / 2)
-        .unwrap_err();
-    assert_eq!(error.public_code(), "GC_METADATA_INVALID");
+        .unwrap();
+    assert!(
+        report
+            .warnings()
+            .iter()
+            .any(|warning| { warning.contains("unreadable task record") })
+    );
     assert!(store.task_dir(PROJECT_ID, task).unwrap().exists());
+}
+
+#[test]
+fn gc_preview_reports_legacy_job_metadata_without_aborting_other_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let (legacy_identifier, legacy_job) = write_legacy_fixture_job(&store);
+    let valid_job = job_id(99);
+    write_job(&store, valid_job, &JobStatus::succeeded(1, 0, 0).unwrap());
+
+    let report = HostGc::new(&store, &SystemProcessRunner)
+        .preview_at(u64::MAX / 2)
+        .unwrap();
+    assert!(report.candidates().iter().any(|candidate| {
+        candidate.kind() == "job"
+            && candidate.identifier() == legacy_identifier
+            && candidate.reason() == "legacy protocol"
+    }));
+    assert!(report.candidates().iter().any(|candidate| {
+        candidate.kind() == "job"
+            && candidate.identifier() == format!("{PROJECT_ID}/{WORKTREE_ID}/{valid_job}")
+            && candidate.reason() == "job retention"
+    }));
+
+    let applied = HostGc::new(&store, &SystemProcessRunner)
+        .apply_at(u64::MAX / 2)
+        .unwrap();
+    assert!(
+        !applied
+            .applied()
+            .iter()
+            .any(|candidate| { candidate.identifier() == legacy_identifier })
+    );
+    assert!(
+        store
+            .job(LEGACY_PROJECT_ID, LEGACY_WORKTREE_ID, legacy_job)
+            .unwrap()
+            .exists()
+    );
+}
+
+#[test]
+fn gc_preview_reports_a_legacy_task_record_without_aborting() {
+    let (_temp, store, _source, base_oid) = fixture();
+    let task = task_id(101);
+    prepare_task(&store, task, job_id(101), &base_oid);
+    release_lease(&store, job_id(101));
+    let status_path = store
+        .task_dir(PROJECT_ID, task)
+        .unwrap()
+        .join("status.json");
+    let mut status: serde_json::Value =
+        serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+    status
+        .as_object_mut()
+        .unwrap()
+        .insert("protocol_version".into(), serde_json::json!(3));
+    fs::write(status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+
+    let report = HostGc::new(&store, &SystemProcessRunner)
+        .preview_at(u64::MAX / 2)
+        .unwrap();
+    assert!(report.candidates().iter().any(|candidate| {
+        candidate.kind() == "task"
+            && candidate.identifier() == format!("{PROJECT_ID}/{task}")
+            && candidate.reason() == "legacy protocol"
+    }));
+}
+
+#[test]
+fn gc_preview_warns_and_keeps_a_job_with_missing_index_and_lock_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let job = job_id(100);
+    write_job(&store, job, &JobStatus::succeeded(1, 0, 0).unwrap());
+
+    let index = store.job_index(job).unwrap();
+    fs::remove_file(index).unwrap();
+    let index_path = store.job_index(job).unwrap();
+    let root = index_path.parent().unwrap().parent().unwrap();
+    fs::remove_file(root.join("locks/jobs").join(format!("{job}.lock.json"))).unwrap();
+    fs::remove_file(
+        root.join("locks/jobs")
+            .join(job.to_string())
+            .join("admission.lock"),
+    )
+    .unwrap();
+
+    let report = HostGc::new(&store, &SystemProcessRunner)
+        .preview_at(u64::MAX / 2)
+        .unwrap();
+    let identifier = format!("{PROJECT_ID}/{WORKTREE_ID}/{job}");
+    assert!(
+        !report
+            .candidates()
+            .iter()
+            .any(|candidate| { candidate.identifier() == identifier })
+    );
+    assert!(
+        report
+            .warnings()
+            .iter()
+            .any(|warning| { warning.contains("inconsistent job record") })
+    );
+    assert!(store.job(PROJECT_ID, WORKTREE_ID, job).unwrap().exists());
 }
 
 #[test]
@@ -634,17 +791,28 @@ fn transfer_gc_previews_and_removes_only_an_unreferenced_empty_transfer_repo() {
         TransferRepo::open_or_create(&temp.path().join("cache"), &source.root().join(".git"))
             .unwrap();
     let repo_path = transfer.path().to_path_buf();
+    let repo_id = transfer.repo_id().to_owned();
+    let malformed_path = temp.path().join("cache/transfer/not-a-transfer-repo");
+    fs::create_dir_all(&malformed_path).unwrap();
+    fs::set_permissions(&malformed_path, fs::Permissions::from_mode(0o700)).unwrap();
     let now = u64::MAX / 2;
     let preview = TransferGc::new(&temp.path().join("cache"), &SystemProcessRunner)
         .preview_at(now)
         .unwrap();
     assert!(preview.candidates().iter().any(|candidate| {
-        candidate.kind() == "transfer_repo" && candidate.identifier() == transfer.repo_id()
+        candidate.kind() == "transfer_repo" && candidate.identifier() == repo_id
     }));
+    assert!(
+        preview
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("inconsistent transfer repository record"))
+    );
     TransferGc::new(&temp.path().join("cache"), &SystemProcessRunner)
         .apply_at(now)
         .unwrap();
     assert!(!repo_path.exists());
+    assert!(malformed_path.exists());
 }
 
 #[test]
@@ -679,6 +847,7 @@ fn transfer_gc_can_collect_stale_result_refs_without_collecting_base_refs() {
         TransferRepo::open_or_create(&temp.path().join("cache"), &source.root().join(".git"))
             .unwrap();
     let repo_path = transfer.path().to_path_buf();
+    let repo_id = transfer.repo_id().to_owned();
     let task = task_id(1);
     set_ref(&repo_path, &format!("refs/mac-worker/results/{task}"), &oid);
 
@@ -686,7 +855,7 @@ fn transfer_gc_can_collect_stale_result_refs_without_collecting_base_refs() {
         .preview_at(u64::MAX / 2)
         .unwrap();
     assert!(report.candidates().iter().any(|candidate| {
-        candidate.kind() == "transfer_repo" && candidate.identifier() == transfer.repo_id()
+        candidate.kind() == "transfer_repo" && candidate.identifier() == repo_id
     }));
     assert!(repo_path.exists());
 }

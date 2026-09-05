@@ -179,43 +179,16 @@ impl<'a> TransferGc<'a> {
             Err(error) => return Err(error.into()),
         };
         let mut candidates = Vec::new();
+        let mut warnings = Vec::new();
         for raw_name in parent.list_names()? {
             if raw_name.as_slice() == b".mac-worker-rooted-fs" {
                 continue;
             }
-            let name = std::str::from_utf8(&raw_name).map_err(|_| {
-                WorkerError::Protocol("GC_METADATA_INVALID: transfer repo name is not UTF-8".into())
-            })?;
-            let Some(repo_id) = name.strip_suffix(".git") else {
-                return Err(WorkerError::Protocol(
-                    "GC_METADATA_INVALID: transfer repo name does not end in .git".into(),
-                ));
-            };
-            if !is_lower_hex(repo_id, 64) {
-                return Err(WorkerError::Protocol(
-                    "GC_METADATA_INVALID: transfer repo ID is invalid".into(),
-                ));
+            let result =
+                self.collect_transfer_record(&parent, &raw_name, now_millis, &mut candidates);
+            if let Err(error) = result {
+                push_transfer_record_warning(&mut warnings, &error);
             }
-            if self.protected_repo_ids.contains(repo_id) {
-                continue;
-            }
-            let repo = parent
-                .open_child_directory(&relative_transfer(name)?, false)
-                .map_err(WorkerError::Io)?;
-            let refs = git_ref_names(self.runner, repo.path())?;
-            if !transfer_refs_are_collectable(&refs) {
-                continue;
-            }
-            let modified = crate::gc::rooted_modified_millis(&repo)?;
-            if now_millis.saturating_sub(modified) < crate::gc::BRANCH_RETENTION_MILLIS {
-                continue;
-            }
-            candidates.push(GcCandidate::new(
-                "transfer_repo",
-                repo_id,
-                0,
-                "transfer repository retention",
-            )?);
         }
         candidates.sort_by(|left, right| left.identifier().cmp(right.identifier()));
         let mut applied = Vec::new();
@@ -226,7 +199,50 @@ impl<'a> TransferGc<'a> {
                 }
             }
         }
-        Ok(GcReport::new(apply, candidates, applied, Vec::new()))
+        Ok(GcReport::new(apply, candidates, applied, warnings))
+    }
+
+    fn collect_transfer_record(
+        &self,
+        parent: &RootedDir,
+        raw_name: &[u8],
+        now_millis: u64,
+        candidates: &mut Vec<GcCandidate>,
+    ) -> Result<(), WorkerError> {
+        let name = std::str::from_utf8(raw_name).map_err(|_| {
+            WorkerError::Protocol("GC_METADATA_INVALID: transfer repo name is not UTF-8".into())
+        })?;
+        let Some(repo_id) = name.strip_suffix(".git") else {
+            return Err(WorkerError::Protocol(
+                "GC_METADATA_INVALID: transfer repo name does not end in .git".into(),
+            ));
+        };
+        if !is_lower_hex(repo_id, 64) {
+            return Err(WorkerError::Protocol(
+                "GC_METADATA_INVALID: transfer repo ID is invalid".into(),
+            ));
+        }
+        if self.protected_repo_ids.contains(repo_id) {
+            return Ok(());
+        }
+        let repo = parent
+            .open_child_directory(&relative_transfer(name)?, false)
+            .map_err(WorkerError::Io)?;
+        let refs = git_ref_names(self.runner, repo.path())?;
+        if !transfer_refs_are_collectable(&refs) {
+            return Ok(());
+        }
+        let modified = crate::gc::rooted_modified_millis(&repo)?;
+        if now_millis.saturating_sub(modified) < crate::gc::BRANCH_RETENTION_MILLIS {
+            return Ok(());
+        }
+        candidates.push(GcCandidate::new(
+            "transfer_repo",
+            repo_id,
+            0,
+            "transfer repository retention",
+        )?);
+        Ok(())
     }
 
     fn apply_candidate(
@@ -254,6 +270,18 @@ impl<'a> TransferGc<'a> {
         }
         parent.remove_owned_child(&name)?;
         Ok(true)
+    }
+}
+
+fn push_transfer_record_warning(warnings: &mut Vec<String>, error: &WorkerError) {
+    let warning =
+        if error.to_string().contains("name") || error.to_string().contains("ID is invalid") {
+            "inconsistent transfer repository record"
+        } else {
+            "unreadable transfer repository record"
+        };
+    if warnings.len() < 64 && !warnings.iter().any(|existing| existing == warning) {
+        warnings.push(warning.to_owned());
     }
 }
 
