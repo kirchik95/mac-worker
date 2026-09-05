@@ -787,6 +787,7 @@ fn parse_prebind_accepts_json_ids_and_plain_lines() {
     );
     assert!(parse_prebind_session_ref(b"warning: retrying\nchat-plain\n").is_err());
     assert!(parse_prebind_session_ref(br#"created {"id":"chat-json"}"#).is_err());
+    assert!(parse_prebind_session_ref(br#"{"status":"ok"}"#).is_err());
     assert!(parse_prebind_session_ref(b"").is_err());
     assert!(parse_prebind_session_ref(b"has\x01control").is_err());
 }
