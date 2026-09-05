@@ -8,14 +8,22 @@ use std::{
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{self, ExitStatus},
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::{
     agent::AgentKind,
     agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
-    client_state::{ClientStateStore, ClientStateWritePoint},
+    client_state::{
+        ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
+        ClientStateWritePoint,
+    },
     config::Config,
     error::WorkerError,
     job::{
@@ -155,6 +163,23 @@ struct AcceptedThenTerminalRunner {
 #[derive(Clone)]
 struct ChildAdoptsThenFails {
     state: ClientStateStore,
+}
+
+struct ParkedSubmissionGate {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    used: AtomicBool,
+}
+
+impl ClientStateConcurrencyHook for ParkedSubmissionGate {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == ClientStateConcurrencyPoint::ParkedTaskTurnPublication
+            && !self.used.swap(true, Ordering::SeqCst)
+        {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+    }
 }
 
 impl RunnerExecutor for ChildAdoptsThenFails {
@@ -1083,6 +1108,7 @@ fn assert_submit_rolls_back_post_create_state(
     expected_error: &str,
     expect_rollback: bool,
     fail_base_release: bool,
+    default_publish_branch: bool,
 ) {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
     let repo = support::GitRepo::init();
@@ -1158,7 +1184,8 @@ fn assert_submit_rolls_back_post_create_state(
                 } else {
                     vec!["fetch".into(), "push".into()]
                 }),
-                publish_branch: (!fail_base_release).then_some("rollback-test".into()),
+                publish_branch: (!fail_base_release && !default_publish_branch)
+                    .then_some("rollback-test".into()),
                 cli_includes: Vec::new(),
                 limits: TaskLimits::default(),
                 close_policy: ClosePolicy::Never,
@@ -1203,15 +1230,24 @@ fn assert_submit_rolls_back_post_create_state(
         let task = state.list_tasks().unwrap().pop().unwrap();
         assert_eq!(task.status().state(), TaskState::Abandoned);
         assert_eq!(task.abandon_code(), Some("SUBMISSION_ROLLBACK_INCOMPLETE"));
-        let entry = state
-            .queue_entry_for_task_turn(task.meta().task_id())
-            .unwrap()
-            .unwrap();
-        assert!(
-            state
-                .read_turn_prompt(task.meta().task_id(), entry.job_id())
-                .is_ok()
-        );
+        if fault == ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval {
+            assert!(
+                state
+                    .queue_entry_for_task_turn(task.meta().task_id())
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            let entry = state
+                .queue_entry_for_task_turn(task.meta().task_id())
+                .unwrap()
+                .unwrap();
+            assert!(
+                state
+                    .read_turn_prompt(task.meta().task_id(), entry.job_id())
+                    .is_ok()
+            );
+        }
         client.reconcile_runners().unwrap();
         assert!(state.list_tasks().unwrap().is_empty());
         assert!(state.queue_snapshot().unwrap().entries().is_empty());
@@ -1237,6 +1273,7 @@ fn submit_rolls_back_post_create_state_when_prompt_write_fails() {
         "before task turn prompt write",
         true,
         false,
+        false,
     );
 }
 
@@ -1246,6 +1283,7 @@ fn submit_rolls_back_post_create_state_when_run_reference_load_fails() {
         ClientStateWritePoint::BeforeRunLoad,
         "before run load",
         true,
+        false,
         false,
     );
 }
@@ -1257,6 +1295,7 @@ fn submit_rolls_back_post_create_state_when_queue_publication_fails() {
         "before publication",
         true,
         false,
+        false,
     );
 }
 
@@ -1265,6 +1304,7 @@ fn submit_retains_complete_state_when_queue_rollback_fails() {
     assert_submit_rolls_back_post_create_state(
         ClientStateWritePoint::BeforeTaskReport,
         "before task report",
+        false,
         false,
         false,
     );
@@ -1277,6 +1317,7 @@ fn submit_retries_rollback_after_reservation_release_failure() {
         "before run publish-branch release",
         false,
         false,
+        false,
     );
 }
 
@@ -1285,6 +1326,7 @@ fn submit_retries_rollback_after_final_task_record_removal_failure() {
     assert_submit_rolls_back_post_create_state(
         ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval,
         "before task submission record removal",
+        false,
         false,
         false,
     );
@@ -1297,6 +1339,7 @@ fn submit_restores_task_and_queue_after_prompt_tree_removal_failure() {
         "before task submission turns removal",
         false,
         false,
+        false,
     );
 }
 
@@ -1307,7 +1350,129 @@ fn submit_retries_rollback_after_base_release_failure() {
         "before task rollback base release",
         false,
         true,
+        false,
     );
+}
+
+#[test]
+fn submit_rolls_back_the_effective_default_run_publish_branch() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::BeforeSubmissionReport,
+        "before submission report",
+        true,
+        false,
+        true,
+    );
+}
+
+#[test]
+fn restart_after_post_record_retirement_fault_leaves_no_unmarked_submission_artifacts() {
+    assert_submit_rolls_back_post_create_state(
+        ClientStateWritePoint::AfterTaskSubmissionRecordRemoval,
+        "after task submission record removal",
+        true,
+        false,
+        false,
+    );
+}
+
+#[test]
+fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let state = Arc::new(
+        ClientStateStore::open_with_concurrency_hook(
+            &paths.state,
+            Arc::new(ParkedSubmissionGate {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                used: AtomicBool::new(false),
+            }),
+        )
+        .unwrap(),
+    );
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = AcceptedThenTerminalRunner::new();
+    let executor = InlineRunnerExecutor;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .admission_observation("mini-1", now, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec!["darwin-arm64".into(), "agent:codex".into()],
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+        })
+        .unwrap();
+    let request = || TaskSubmitRequest {
+        agent: AgentKind::Codex,
+        model: None,
+        prompt: "make the change".into(),
+        project: repo.root().to_path_buf(),
+        base: "main".into(),
+        wip: true,
+        source: Some("local".into()),
+        publish: Some(vec!["fetch".into()]),
+        publish_branch: None,
+        cli_includes: Vec::new(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        preference: WorkerPreference::Pinned {
+            worker: "mini-1".into(),
+        },
+        wait_for_capacity: true,
+        attached: false,
+        run_id: None,
+    };
+    TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .submit(request(), &mut Vec::new(), &mut Vec::new())
+        .unwrap();
+    state.inject_write_failure_once(ClientStateWritePoint::BeforeSubmissionReport);
+
+    thread::scope(|scope| {
+        let submit = scope.spawn(|| {
+            TaskClient::new(&runner, &config, &paths, &state, &executor).submit(
+                request(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+        });
+        if entered_rx.recv_timeout(Duration::from_millis(200)).is_ok() {
+            let owner = InlineRunnerExecutor
+                .start(&paths, TaskId::generate(), TurnId::generate())
+                .unwrap()
+                .process_identity();
+            let entry = state.unpark_oldest(owner).unwrap().unwrap();
+            state.adopt_row(entry.job_id(), owner).unwrap();
+            release_tx.send(()).unwrap();
+            let error = submit.join().unwrap().unwrap_err();
+            assert!(error.to_string().contains("before submission report"));
+            assert_eq!(state.list_tasks().unwrap().len(), 2);
+            assert!(state.queue_entry(entry.job_id()).unwrap().is_some());
+        } else {
+            let error = submit.join().unwrap().unwrap_err();
+            assert!(error.to_string().contains("before submission report"));
+            assert_eq!(state.list_tasks().unwrap().len(), 1);
+        }
+    });
 }
 
 #[test]
@@ -1316,6 +1481,7 @@ fn submit_retries_rollback_after_marker_update_failure() {
         ClientStateWritePoint::BeforeTaskRollbackUpdate,
         "before task rollback update",
         true,
+        false,
         false,
     );
 }

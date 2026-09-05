@@ -759,12 +759,15 @@ impl<'a> TaskClient<'a> {
 
             let should_start =
                 request.attached || self.live_runner_count()? < self.config.workers.len();
+            self.client_state.submission_report_fault()?;
+            let report = self.report_for(task_id)?;
+            // Parking makes the row eligible for an independent runner to
+            // adopt. Complete every fallible local/reporting step first, so
+            // an error cannot compensate state whose ownership transferred.
             if !should_start {
                 self.client_state.park_row(entry.job_id())?;
             }
-
-            self.client_state.submission_report_fault()?;
-            Ok((self.report_for(task_id)?, should_start))
+            Ok((report, should_start))
         })() {
             Ok(report) => report,
             Err(error) => {
@@ -1728,37 +1731,36 @@ impl<'a> TaskClient<'a> {
         // Keep the marked record, prompt, and queue row together until all
         // externally-referenced resources are released. Any failure leaves a
         // terminal, non-runnable recovery record for the next reconcile.
-        if let (Some(run_id), Some(branch)) =
-            (record.meta().run_id(), record.meta().publish_branch())
+        if let Some(run_id) = record.meta().run_id()
+            && record.meta().publish().contains(&PublishMode::Push)
         {
+            let branch = record
+                .meta()
+                .publish_branch()
+                .cloned()
+                .unwrap_or_else(|| BranchName::for_task(record.meta().task_id()));
             self.client_state
-                .release_run_publish_branch(run_id, branch)?;
+                .release_run_publish_branch(run_id, &branch)?;
         }
         transfer.release_base(self.runner, record.meta().task_id())?;
         let task_id = record.meta().task_id();
-        self.client_state.remove_task_submission_record(task_id)?;
         let removed_queue = if let Some(turn_id) = turn_id {
-            match self
-                .client_state
-                .remove_task_turn_for_submission_rollback(turn_id)
-            {
-                Ok(entry) => entry,
-                Err(error) => {
-                    self.client_state.create_task(record.clone())?;
-                    return Err(error);
-                }
-            }
+            self.client_state
+                .remove_task_turn_for_submission_rollback(turn_id)?
         } else {
             None
         };
         if let Err(error) = self.client_state.remove_task_submission_turns(task_id) {
-            self.client_state.create_task(record.clone())?;
             if let Some(entry) = removed_queue {
                 self.client_state
                     .restore_task_turn_for_submission_rollback(entry)?;
             }
             return Err(error);
         }
+        // The rollback marker stays durable until queue and prompt retirement
+        // complete. If this final removal faults after its rename, no queue or
+        // prompt artifact remains without a discoverable task record.
+        self.client_state.remove_task_submission_record(task_id)?;
         Ok(())
     }
 

@@ -91,6 +91,8 @@ pub enum ClientStateWritePoint {
     BeforeTaskSubmissionRecordRemoval = 23,
     BeforeTaskRollbackBaseRelease = 24,
     BeforeTaskSubmissionTurnsRemoval = 25,
+    AfterTaskSubmissionRecordRemoval = 26,
+    BeforeSubmissionReport = 27,
 }
 
 #[doc(hidden)]
@@ -107,6 +109,7 @@ pub enum ClientStateCreationRacePoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientStateConcurrencyPoint {
     QueuePublication,
+    ParkedTaskTurnPublication,
     ClaimRunCapEvaluation,
     ObservationRefreshPublication,
 }
@@ -1844,7 +1847,14 @@ impl ClientStateStore {
             ));
         }
         match tasks.remove_owned_regular(&task_name) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if self.take_fault(ClientStateWritePoint::AfterTaskSubmissionRecordRemoval) {
+                    return Err(injected_failure(
+                        ClientStateWritePoint::AfterTaskSubmissionRecordRemoval,
+                    ));
+                }
+                Ok(())
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(WorkerError::Io(error)),
         }
@@ -2073,11 +2083,13 @@ impl ClientStateStore {
     }
 
     pub fn park_row(&self, job_id: JobId) -> Result<QueueEntry, WorkerError> {
-        self.update_queue(|snapshot| {
+        let entry = self.update_queue(|snapshot| {
             let entry = find_queue_entry_mut(snapshot, job_id)?;
             entry.park()?;
             Ok((entry.clone(), true))
-        })
+        })?;
+        self.reach_concurrency_point(ClientStateConcurrencyPoint::ParkedTaskTurnPublication);
+        Ok(entry)
     }
 
     pub fn unpark_oldest(&self, owner: ProcessIdentity) -> Result<Option<QueueEntry>, WorkerError> {
@@ -2255,6 +2267,11 @@ impl ClientStateStore {
 
     #[doc(hidden)]
     pub fn submission_report_fault(&self) -> Result<(), WorkerError> {
+        if self.take_fault(ClientStateWritePoint::BeforeSubmissionReport) {
+            return Err(injected_failure(
+                ClientStateWritePoint::BeforeSubmissionReport,
+            ));
+        }
         let point = match self.inner.write_fault.load(Ordering::SeqCst) {
             value if value == ClientStateWritePoint::BeforeTaskReport as u8 => {
                 ClientStateWritePoint::BeforeTaskReport
@@ -2273,6 +2290,9 @@ impl ClientStateStore {
             }
             value if value == ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval as u8 => {
                 ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval
+            }
+            value if value == ClientStateWritePoint::AfterTaskSubmissionRecordRemoval as u8 => {
+                ClientStateWritePoint::AfterTaskSubmissionRecordRemoval
             }
             _ => return Ok(()),
         };
@@ -4798,6 +4818,10 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval => {
             "before task submission record removal"
         }
+        ClientStateWritePoint::AfterTaskSubmissionRecordRemoval => {
+            "after task submission record removal"
+        }
+        ClientStateWritePoint::BeforeSubmissionReport => "before submission report",
         ClientStateWritePoint::BeforeTaskRollbackBaseRelease => "before task rollback base release",
         ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval => {
             "before task submission turns removal"
