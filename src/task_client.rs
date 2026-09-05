@@ -712,7 +712,7 @@ impl<'a> TaskClient<'a> {
         let reservation = match (request.run_id, reserved_branch.as_ref()) {
             (Some(run_id), Some(branch)) => match self
                 .client_state
-                .reserve_run_publish_branch(run_id, branch.clone())
+                .reserve_run_publish_branch_for_task(run_id, task_id, branch.clone())
             {
                 Ok(run) => Some(run),
                 Err(error) => {
@@ -726,7 +726,9 @@ impl<'a> TaskClient<'a> {
             if reservation.is_some()
                 && let (Some(run_id), Some(branch)) = (request.run_id, reserved_branch.as_ref())
             {
-                let _ = self.client_state.release_run_publish_branch(run_id, branch);
+                let _ = self
+                    .client_state
+                    .release_run_publish_branch_for_task(run_id, task_id, branch);
             }
             let _ = transfer.release_base(self.runner, task_id);
             return Err(error);
@@ -1047,6 +1049,8 @@ impl<'a> TaskClient<'a> {
                 continue;
             }
             let expected_turn_id = submission_recovery_turn_id(&record);
+            self.client_state
+                .submission_intent_reconciliation_before_transfer_lock();
             let Ok(transfer) = self.transfer_for_record(&record) else {
                 continue;
             };
@@ -1091,6 +1095,12 @@ impl<'a> TaskClient<'a> {
         for entry in self.client_state.queue_snapshot()?.entries().iter() {
             if entry.kind() != QueueEntryKind::TaskTurn
                 || matches!(entry.state(), QueueState::Parked)
+            {
+                continue;
+            }
+            if self
+                .submission_recovery_task_for_turn(entry.job_id())?
+                .is_some()
             {
                 continue;
             }
@@ -1781,8 +1791,11 @@ impl<'a> TaskClient<'a> {
                 .publish_branch()
                 .cloned()
                 .unwrap_or_else(|| BranchName::for_task(record.meta().task_id()));
-            self.client_state
-                .release_run_publish_branch(run_id, &branch)?;
+            self.client_state.release_run_publish_branch_for_task(
+                run_id,
+                record.meta().task_id(),
+                &branch,
+            )?;
         }
         transfer.release_base(self.runner, record.meta().task_id())?;
         let task_id = record.meta().task_id();
@@ -1972,8 +1985,8 @@ impl<'a> TaskClient<'a> {
             return Ok(false);
         };
         let task_id = self
-            .client_state
-            .task_id_for_turn(entry.job_id())?
+            .submission_recovery_task_for_turn(entry.job_id())?
+            .or(self.client_state.task_id_for_turn(entry.job_id())?)
             .ok_or_else(|| {
                 task_error("TASK_INCONSISTENT", "parked task turn has no task record")
             })?;
@@ -2010,6 +2023,24 @@ impl<'a> TaskClient<'a> {
         Ok(submission_recovery_pending(
             &self.client_state.load_task(task_id)?,
         ))
+    }
+
+    /// Finds a pre-handoff task turn from the durable submission marker. A
+    /// rollback can retire the prompt tree before a later cleanup fault, so
+    /// directory-only turn lookup cannot establish ownership in that window.
+    fn submission_recovery_task_for_turn(
+        &self,
+        turn_id: TurnId,
+    ) -> Result<Option<TaskId>, WorkerError> {
+        Ok(self
+            .client_state
+            .list_tasks()?
+            .into_iter()
+            .find(|record| {
+                submission_recovery_pending(record)
+                    && submission_recovery_turn_id(record) == Some(turn_id)
+            })
+            .map(|record| record.meta().task_id()))
     }
 
     fn submission_rollback_is_safe(

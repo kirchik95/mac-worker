@@ -27,13 +27,17 @@ use mac_worker::{
     config::Config,
     error::WorkerError,
     job::{
-        AdmissionObservation, JobMeta, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseRecord, LogChunk, LogChunkRequest, LogStream, ProcessIdentity, SubmitResponse,
+        AdmissionObservation, CommandSummary, JobMeta, JobStatus, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseRecord, LogChunk, LogChunkRequest, LogStream, ProcessIdentity,
+        QueueEntry, QueueEntryKind, SubmitResponse,
     },
     lease::SlotState,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     scheduler::WorkerPreference,
+    supervisor::{
+        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    },
     task::{
         ClosePolicy, RunId, RunRecord, TaskId, TaskLimits, TaskMeta, TaskOutcome, TaskState,
         TaskStatus, TurnId, TurnSummary, TurnTerminal,
@@ -178,6 +182,35 @@ struct SubmissionIntentRaceGate {
     reconciliation_release: Mutex<mpsc::Receiver<()>>,
 }
 
+#[derive(Clone, Copy)]
+struct DeadOwnerInspector {
+    dead_owner: ProcessIdentity,
+}
+
+impl ProcessInspector for DeadOwnerInspector {
+    fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+        ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7)
+    }
+
+    fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+        if expected == self.dead_owner {
+            ProcessObservation::Absent
+        } else {
+            ProcessObservation::Matching {
+                process_group: expected.pid(),
+            }
+        }
+    }
+
+    fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
+        ProcessGroupObservation::Ambiguous
+    }
+
+    fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
+        ProcessGroupMembership::Ambiguous
+    }
+}
+
 impl ClientStateConcurrencyHook for ParkedSubmissionGate {
     fn reach(&self, point: ClientStateConcurrencyPoint) {
         if point == ClientStateConcurrencyPoint::ParkedTaskTurnPublication
@@ -196,7 +229,7 @@ impl ClientStateConcurrencyHook for SubmissionIntentRaceGate {
                 self.submit_entered.send(()).unwrap();
                 self.submit_release.lock().unwrap().recv().unwrap();
             }
-            ClientStateConcurrencyPoint::SubmissionIntentReconciliationAfterTransferLock => {
+            ClientStateConcurrencyPoint::SubmissionIntentReconciliationBeforeTransferLock => {
                 self.reconciliation_entered.send(()).unwrap();
                 self.reconciliation_release.lock().unwrap().recv().unwrap();
             }
@@ -1465,6 +1498,244 @@ fn restart_recovers_after_turn_tree_retirement_fault_with_a_durable_rollback_mar
 }
 
 #[test]
+fn reconciliation_excludes_retired_pending_rollback_turn_before_dead_owner_adoption() {
+    // Break caught: recovery used only the prompt-tree mapping, so a second
+    // cleanup fault let reconciliation adopt a dead owner after the tree had
+    // already been retired.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = AcceptedThenTerminalRunner::new();
+    let executor = InlineRunnerExecutor;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .admission_observation("mini-1", now, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec!["darwin-arm64".into(), "agent:codex".into()],
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+        })
+        .unwrap();
+    state.inject_write_failure_once(ClientStateWritePoint::BeforeSubmissionReport);
+    state.inject_submission_rollback_cleanup_failure_once(
+        ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement,
+    );
+
+    let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .submit(
+            TaskSubmitRequest {
+                agent: AgentKind::Codex,
+                model: None,
+                prompt: "make the change".into(),
+                project: repo.root().to_path_buf(),
+                base: "main".into(),
+                wip: true,
+                source: Some("local".into()),
+                publish: Some(vec!["fetch".into()]),
+                publish_branch: None,
+                cli_includes: Vec::new(),
+                limits: TaskLimits::default(),
+                close_policy: ClosePolicy::Never,
+                env_profile: None,
+                preference: WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                wait_for_capacity: true,
+                attached: false,
+                run_id: None,
+            },
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("before submission report"));
+
+    let pending = state.list_tasks().unwrap().pop().unwrap();
+    let task_id = pending.meta().task_id();
+    let turn_id = pending.submission_rollback_turn_id().unwrap();
+    assert!(state.turn_ids_for_task(task_id).unwrap().is_empty());
+
+    let dead_owner = ProcessIdentity::new(424_242, 4_242_427).unwrap();
+    state
+        .remove_task_turn_for_submission_rollback(turn_id)
+        .unwrap();
+    state
+        .enqueue(
+            QueueEntry::new(
+                turn_id,
+                state.client_id(),
+                pending.meta().project_id().to_owned(),
+                pending.meta().worktree_id().to_owned(),
+                CommandSummary::argv(1).unwrap(),
+                Vec::new(),
+                WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                QueueEntryKind::TaskTurn,
+                None,
+                dead_owner,
+                now,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let restarted = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        DeadOwnerInspector { dead_owner },
+    )
+    .unwrap();
+    restarted.inject_write_failure_once(ClientStateWritePoint::BeforeTaskReport);
+    TaskClient::new(&runner, &config, &paths, &restarted, &executor)
+        .reconcile_runners()
+        .unwrap();
+    let retained = restarted.queue_entry(turn_id).unwrap().unwrap();
+    assert_eq!(retained.owner_opt(), Some(&dead_owner));
+    assert!(restarted.load_task(task_id).is_ok());
+
+    TaskClient::new(&runner, &config, &paths, &restarted, &executor)
+        .reconcile_runners()
+        .unwrap();
+    assert!(restarted.load_task(task_id).is_err());
+    assert!(restarted.queue_entry(turn_id).unwrap().is_none());
+}
+
+#[test]
+fn rollback_retry_does_not_release_a_later_tasks_reacquired_run_publish_branch() {
+    // Break caught: a rollback retried by task A released a branch-name-only
+    // reservation that task B had acquired after A's earlier compensation.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    assert!(
+        repo.git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/project.git",
+        ])
+        .status
+        .success()
+    );
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let run_id = RunId::generate();
+    state
+        .create_run(
+            RunRecord::new(
+                run_id,
+                None,
+                vec![TaskId::generate(), TaskId::generate()],
+                2,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 2\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = AcceptedThenTerminalRunner::new();
+    let executor = InlineRunnerExecutor;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .admission_observation("mini-1", now, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec![
+                    "darwin-arm64".into(),
+                    "origin:github.com".into(),
+                    "agent:codex".into(),
+                ],
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+        })
+        .unwrap();
+    let request = || TaskSubmitRequest {
+        agent: AgentKind::Codex,
+        model: None,
+        prompt: "make the change".into(),
+        project: repo.root().to_path_buf(),
+        base: "main".into(),
+        wip: false,
+        source: Some("local".into()),
+        publish: Some(vec!["fetch".into(), "push".into()]),
+        publish_branch: Some("shared-branch".into()),
+        cli_includes: Vec::new(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        preference: WorkerPreference::Pinned {
+            worker: "mini-1".into(),
+        },
+        wait_for_capacity: true,
+        attached: false,
+        run_id: Some(run_id),
+    };
+
+    state.inject_write_failure_once(ClientStateWritePoint::BeforeRunPublishBranchRelease);
+    let first_error = TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .submit(request(), &mut Vec::new(), &mut Vec::new())
+        .unwrap_err();
+    assert!(
+        first_error
+            .to_string()
+            .contains("before run publish-branch release")
+    );
+    let task_a = state.list_tasks().unwrap().pop().unwrap().meta().task_id();
+
+    // B's initial public submit reconciles A first. Let that first retry
+    // release A's reservation but stop before queue retirement, leaving A's
+    // durable rollback record for the later retry below.
+    state.inject_write_failure_once(ClientStateWritePoint::BeforeTaskReport);
+    let task_b = TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .submit(request(), &mut Vec::new(), &mut Vec::new())
+        .unwrap()
+        .task_id();
+    let handed_off_b = state.load_task(task_b).unwrap();
+    assert!(handed_off_b.submission_intent_turn_id().is_none());
+    assert!(handed_off_b.runner().is_some());
+
+    TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .reconcile_runners()
+        .unwrap();
+    assert!(state.load_task(task_a).is_err());
+    assert!(state.load_task(task_b).is_ok());
+    assert_eq!(
+        state.load_run(run_id).unwrap().publish_branches(),
+        &["shared-branch".parse().unwrap()]
+    );
+}
+
+#[test]
 fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
     let repo = support::GitRepo::init();
@@ -1647,12 +1918,12 @@ fn reconciliation_does_not_rollback_a_submission_that_cleared_its_intent_while_w
         let reconcile = scope.spawn(|| {
             TaskClient::new(&runner, &config, &paths, &state, &executor).reconcile_runners()
         });
-        submit_release_tx.send(()).unwrap();
-        let report = submit.join().unwrap().unwrap();
-        let task_id = report.task_id();
         reconciliation_entered_rx
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
+        submit_release_tx.send(()).unwrap();
+        let report = submit.join().unwrap().unwrap();
+        let task_id = report.task_id();
         let handed_off = state.load_task(task_id).unwrap();
         assert!(handed_off.submission_intent_turn_id().is_none());
         assert!(handed_off.runner().is_some());

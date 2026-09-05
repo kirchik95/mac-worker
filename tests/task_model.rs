@@ -21,6 +21,7 @@ const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const BASE_OID: &str = "0123456789abcdef0123456789abcdef01234567";
 const REPO_ID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const LEGACY_FETCH_ONLY_LOCAL_RECORD: &str = r#"{"meta":{"task_id":"00000000000000000000000000000001","run_id":"00000000000000000000000000000002","project_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","worktree_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","agent":"codex","model":"gpt-5","policy":"workspace","source":{"kind":"local","wip":false},"publish":["fetch"],"publish_branch":null,"base_oid":"0123456789abcdef0123456789abcdef01234567","limits":{"turn":{"timeout_millis":1800000,"max_turns":null,"max_budget_usd_cents":null},"max_followups":10},"close_policy":"done","env_profile":null,"git_identity":{"name":"Ada Lovelace","email":"ada@example.test"},"title":"Fix the flaky login spec","created_at_millis":1700000000000},"status":{"state":"queued","last_outcome":null,"worker":null,"session_present":false,"head_oid":null,"summary":null,"questions":[],"files_changed":[],"diff_stat":null,"turns":[{"turn_number":1,"turn_id":"018f0f4a6b5c7d8e9f00112233445566","terminal":null,"outcome":null,"agent_committed":null,"log_truncated":false,"started_at_millis":null,"ended_at_millis":null}],"updated_at_millis":1700000000000},"status_observed_at_millis":null,"runner":{"pid":42,"start_time_micros":1700000000001},"fetched_head":null,"repo_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","pinned_worker":"mini-1","wait_for_capacity":true,"abandon_code":null}"#;
+const LEGACY_RUN_RECORD_WITH_RESERVATION: &str = r#"{"run_id":"00000000000000000000000000000002","name":"batch-1","task_ids":["00000000000000000000000000000001"],"max_parallel":2,"created_at_millis":99,"reserved_publish_branches":["release-candidate"]}"#;
 
 fn task_id() -> TaskId {
     TaskId::new(Uuid::from_u128(1))
@@ -689,6 +690,15 @@ fn run_record_reserves_each_publish_branch_only_once() {
     assert_eq!(reserved.publish_branches(), std::slice::from_ref(&branch));
     let duplicate = reserved.reserve_publish_branch(branch).unwrap_err();
     assert_eq!(duplicate.public_code(), "TASK_CONFIG_INVALID");
+}
+
+#[test]
+fn legacy_run_publish_reservation_remains_canonical_without_an_owner() {
+    let parsed: RunRecord = serde_json::from_str(LEGACY_RUN_RECORD_WITH_RESERVATION).unwrap();
+    assert_eq!(
+        parsed.canonical_bytes().unwrap(),
+        LEGACY_RUN_RECORD_WITH_RESERVATION.as_bytes()
+    );
 }
 
 #[test]

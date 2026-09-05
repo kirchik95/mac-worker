@@ -114,6 +114,7 @@ pub enum ClientStateConcurrencyPoint {
     ParkedTaskTurnPublication,
     ClaimRunCapEvaluation,
     SubmissionIntentClear,
+    SubmissionIntentReconciliationBeforeTransferLock,
     SubmissionIntentReconciliationAfterTransferLock,
     ObservationRefreshPublication,
 }
@@ -1399,6 +1400,13 @@ impl ClientStateStore {
         );
     }
 
+    #[doc(hidden)]
+    pub fn submission_intent_reconciliation_before_transfer_lock(&self) {
+        self.reach_concurrency_point(
+            ClientStateConcurrencyPoint::SubmissionIntentReconciliationBeforeTransferLock,
+        );
+    }
+
     fn owner_is_live_or_ambiguous(
         &self,
         row_owner: &ProcessIdentity,
@@ -2026,6 +2034,29 @@ impl ClientStateStore {
         Ok(replacement)
     }
 
+    pub fn reserve_run_publish_branch_for_task(
+        &self,
+        run_id: RunId,
+        task_id: TaskId,
+        branch: BranchName,
+    ) -> Result<RunRecord, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let runs = self.runs_dir()?;
+        let name = run_file_name(run_id)?;
+        let old = runs
+            .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
+            .map_err(WorkerError::Io)?;
+        let existing = parse_run_record(&old)?;
+        if existing.run_id() != run_id {
+            return Err(invalid_state("run filename and record identity differ"));
+        }
+        let replacement = existing.reserve_publish_branch_for_task(task_id, branch)?;
+        let bytes = run_record_bytes(&replacement)?;
+        runs.replace_private_regular_exact(&name, &old, &bytes)
+            .map_err(WorkerError::Io)?;
+        Ok(replacement)
+    }
+
     pub fn release_run_publish_branch(
         &self,
         run_id: RunId,
@@ -2047,6 +2078,37 @@ impl ClientStateStore {
             return Err(invalid_state("run filename and record identity differ"));
         }
         let replacement = existing.release_publish_branch(branch);
+        if replacement == existing {
+            return Ok(existing);
+        }
+        let bytes = run_record_bytes(&replacement)?;
+        runs.replace_private_regular_exact(&name, &old, &bytes)
+            .map_err(WorkerError::Io)?;
+        Ok(replacement)
+    }
+
+    pub fn release_run_publish_branch_for_task(
+        &self,
+        run_id: RunId,
+        task_id: TaskId,
+        branch: &BranchName,
+    ) -> Result<RunRecord, WorkerError> {
+        if self.take_fault(ClientStateWritePoint::BeforeRunPublishBranchRelease) {
+            return Err(injected_failure(
+                ClientStateWritePoint::BeforeRunPublishBranchRelease,
+            ));
+        }
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let runs = self.runs_dir()?;
+        let name = run_file_name(run_id)?;
+        let old = runs
+            .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
+            .map_err(WorkerError::Io)?;
+        let existing = parse_run_record(&old)?;
+        if existing.run_id() != run_id {
+            return Err(invalid_state("run filename and record identity differ"));
+        }
+        let replacement = existing.release_publish_branch_for_task(task_id, branch);
         if replacement == existing {
             return Ok(existing);
         }

@@ -1455,6 +1455,14 @@ pub struct RunRecord {
     max_parallel: u32,
     created_at_millis: u64,
     reserved_publish_branches: Vec<BranchName>,
+    reserved_publish_branch_owners: Vec<RunPublishBranchOwner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunPublishBranchOwner {
+    branch: BranchName,
+    task_id: TaskId,
 }
 
 impl RunRecord {
@@ -1472,6 +1480,7 @@ impl RunRecord {
             max_parallel,
             created_at_millis,
             reserved_publish_branches: Vec::new(),
+            reserved_publish_branch_owners: Vec::new(),
         };
         record.validate()?;
         Ok(record)
@@ -1517,12 +1526,39 @@ impl RunRecord {
         Ok(replacement)
     }
 
+    pub fn reserve_publish_branch_for_task(
+        &self,
+        task_id: TaskId,
+        branch: BranchName,
+    ) -> Result<Self, WorkerError> {
+        let mut replacement = self.reserve_publish_branch(branch.clone())?;
+        replacement
+            .reserved_publish_branch_owners
+            .push(RunPublishBranchOwner { branch, task_id });
+        replacement.validate()?;
+        Ok(replacement)
+    }
+
     pub fn release_publish_branch(&self, branch: &BranchName) -> Self {
         let mut replacement = self.clone();
         replacement
             .reserved_publish_branches
             .retain(|reserved| reserved != branch);
         replacement
+            .reserved_publish_branch_owners
+            .retain(|owner| &owner.branch != branch);
+        replacement
+    }
+
+    pub fn release_publish_branch_for_task(&self, task_id: TaskId, branch: &BranchName) -> Self {
+        if self
+            .reserved_publish_branch_owners
+            .iter()
+            .any(|owner| owner.branch == *branch && owner.task_id != task_id)
+        {
+            return self.clone();
+        }
+        self.release_publish_branch(branch)
     }
 
     fn validate(&self) -> Result<(), WorkerError> {
@@ -1540,6 +1576,19 @@ impl RunRecord {
         {
             return Err(task_config("publish branches must be unique in a run"));
         }
+        if self.reserved_publish_branch_owners.iter().any(|owner| {
+            !self.reserved_publish_branches.contains(&owner.branch)
+                || self
+                    .reserved_publish_branch_owners
+                    .iter()
+                    .filter(|candidate| candidate.branch == owner.branch)
+                    .count()
+                    != 1
+        }) {
+            return Err(task_config(
+                "publish branch ownership must match unique reserved branches",
+            ));
+        }
         Ok(())
     }
 }
@@ -1547,13 +1596,24 @@ impl RunRecord {
 impl Serialize for RunRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("RunRecord", 6)?;
+        let fields = if self.reserved_publish_branch_owners.is_empty() {
+            6
+        } else {
+            7
+        };
+        let mut record = serializer.serialize_struct("RunRecord", fields)?;
         record.serialize_field("run_id", &self.run_id)?;
         record.serialize_field("name", &self.name)?;
         record.serialize_field("task_ids", &self.task_ids)?;
         record.serialize_field("max_parallel", &self.max_parallel)?;
         record.serialize_field("created_at_millis", &self.created_at_millis)?;
         record.serialize_field("reserved_publish_branches", &self.reserved_publish_branches)?;
+        if !self.reserved_publish_branch_owners.is_empty() {
+            record.serialize_field(
+                "reserved_publish_branch_owners",
+                &self.reserved_publish_branch_owners,
+            )?;
+        }
         record.end()
     }
 }
@@ -1569,6 +1629,8 @@ impl<'de> Deserialize<'de> for RunRecord {
             max_parallel: u32,
             created_at_millis: u64,
             reserved_publish_branches: Vec<BranchName>,
+            #[serde(default)]
+            reserved_publish_branch_owners: Vec<RunPublishBranchOwner>,
         }
         let wire: Wire = deserialize_unique_object(deserializer)?;
         let mut record = Self::new(
@@ -1584,6 +1646,8 @@ impl<'de> Deserialize<'de> for RunRecord {
                 .reserve_publish_branch(branch)
                 .map_err(de::Error::custom)?;
         }
+        record.reserved_publish_branch_owners = wire.reserved_publish_branch_owners;
+        record.validate().map_err(de::Error::custom)?;
         Ok(record)
     }
 }
