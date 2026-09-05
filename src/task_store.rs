@@ -28,6 +28,9 @@ const GIT_STDOUT_LIMIT: usize = 2 * 1024 * 1024;
 const GIT_STDERR_LIMIT: usize = 128 * 1024;
 const GIT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const MAX_TASK_RECORD_BYTES: u64 = 1024 * 1024;
+const MAX_CLOSE_WARNINGS: usize = 8;
+const MAX_CLOSE_WARNING_BYTES: usize = 256;
+const NATIVE_SESSION_DELETE_WARNING: &str = "native agent session deletion failed";
 const GIT_CONFIG_GLOBAL: &str = "GIT_CONFIG_GLOBAL";
 const GIT_CONFIG_NOSYSTEM: &str = "GIT_CONFIG_NOSYSTEM";
 const GIT_TERMINAL_PROMPT: &str = "GIT_TERMINAL_PROMPT";
@@ -588,6 +591,8 @@ impl TaskCloseRequest {
 pub struct TaskCloseResponse {
     protocol_version: u32,
     status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 impl TaskCloseResponse {
@@ -595,6 +600,15 @@ impl TaskCloseResponse {
         Self {
             protocol_version: PROTOCOL_VERSION,
             status,
+            warnings: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_warnings(status: TaskStatus, warnings: Vec<String>) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            status,
+            warnings,
         }
     }
 
@@ -604,6 +618,26 @@ impl TaskCloseResponse {
 
     pub fn status(&self) -> &TaskStatus {
         &self.status
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), WorkerError> {
+        ensure_protocol(self.protocol_version)?;
+        if self.warnings.len() > MAX_CLOSE_WARNINGS
+            || self.warnings.iter().any(|warning| {
+                warning.is_empty()
+                    || warning.len() > MAX_CLOSE_WARNING_BYTES
+                    || warning.chars().any(char::is_control)
+            })
+        {
+            return Err(WorkerError::Protocol(
+                "invalid task close warning metadata".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -760,8 +794,8 @@ impl<'a> TaskStore<'a> {
                 .remove_owned_child_committed(&task, "workspace")?;
         }
 
+        let mut warnings = Vec::new();
         let next_state = if request.discard() {
-            let _ = self.delete_native_session(request.project_id(), request.task_id());
             let mirror = self
                 .store
                 .mirror_if_present(request.project_id())?
@@ -771,13 +805,19 @@ impl<'a> TaskStore<'a> {
                 &mirror,
                 &format!("refs/mac-worker/bases/{}", request.task_id()),
             )?;
+            if self
+                .delete_native_session(request.project_id(), request.task_id())
+                .is_err()
+            {
+                push_close_warning(&mut warnings, NATIVE_SESSION_DELETE_WARNING);
+            }
             TaskState::Abandoned
         } else {
             TaskState::Closed
         };
         let status = replace_status_record(&task, status, next_state, None)?;
         task.sync_root()?;
-        Ok(TaskCloseResponse::new(status))
+        Ok(TaskCloseResponse::with_warnings(status, warnings))
     }
 
     /// Closes an idle open task as part of retention GC.  Retention closure
@@ -1250,12 +1290,83 @@ impl<'a> TaskStore<'a> {
         else {
             return Ok(());
         };
+        if self.session_referenced_elsewhere(project_id, task_id, &binding)? {
+            return Ok(());
+        }
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_default();
         let request = crate::agent::prebind_login_request(&argv, &home, &[])?;
-        let _ = self.runner.run(&request);
+        let result = self.runner.run(&request)?;
+        if !result.status.success() {
+            return Err(WorkerError::Agent {
+                code: "AGENT_SESSION_DELETE_FAILED",
+                message: "native session deletion command failed".into(),
+            });
+        }
         Ok(())
+    }
+
+    fn session_referenced_elsewhere(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        binding: &SessionBinding,
+    ) -> Result<bool, WorkerError> {
+        let tasks = match self.store.open_directory("tasks", false) {
+            Ok(tasks) => tasks,
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        for raw_project in tasks.list_names()? {
+            if raw_project.as_slice() == b".mac-worker-rooted-fs" {
+                continue;
+            }
+            let other_project = std::str::from_utf8(&raw_project).map_err(|_| {
+                task_error(
+                    "TASK_INCONSISTENT",
+                    "task project directory name is not valid UTF-8",
+                )
+            })?;
+            validate_project_id(other_project)?;
+            let project_tasks = self
+                .store
+                .open_directory(&format!("tasks/{other_project}"), false)?;
+            for raw_task in project_tasks.list_names()? {
+                if raw_task.as_slice() == b".mac-worker-rooted-fs" {
+                    continue;
+                }
+                let other_task_id = std::str::from_utf8(&raw_task)
+                    .map_err(|_| {
+                        task_error(
+                            "TASK_INCONSISTENT",
+                            "task directory name is not valid UTF-8",
+                        )
+                    })?
+                    .parse::<TaskId>()
+                    .map_err(|_| {
+                        task_error("TASK_INCONSISTENT", "task directory name is not a task ID")
+                    })?;
+                if other_project == project_id && other_task_id == task_id {
+                    continue;
+                }
+                let other_task =
+                    self.store
+                        .open_task_directory(other_project, other_task_id, false)?;
+                if !other_task.entry_exists("session.json")? {
+                    continue;
+                }
+                let other_binding: SessionBinding = read_record(&other_task, "session.json")?;
+                if other_binding.agent() == binding.agent()
+                    && other_binding.session_ref() == binding.session_ref()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub fn session(
@@ -1765,6 +1876,17 @@ fn task_error(code: &'static str, message: impl Into<String>) -> WorkerError {
     WorkerError::Task {
         code,
         message: message.into(),
+    }
+}
+
+fn push_close_warning(warnings: &mut Vec<String>, warning: &str) {
+    if warnings.len() < MAX_CLOSE_WARNINGS
+        && !warning.is_empty()
+        && warning.len() <= MAX_CLOSE_WARNING_BYTES
+        && !warning.chars().any(char::is_control)
+        && !warnings.iter().any(|existing| existing == warning)
+    {
+        warnings.push(warning.to_owned());
     }
 }
 

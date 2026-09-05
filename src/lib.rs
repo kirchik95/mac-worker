@@ -1057,18 +1057,19 @@ fn write_task_report(
     stdout: &mut dyn Write,
 ) -> Result<(), WorkerError> {
     if json {
-        write_json_line(
-            stdout,
-            &serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
-                "task_id": report.task_id().to_string(),
-                "run_id": report.run_id().map(|id| id.to_string()),
-                "status": report.status(),
-                "runner": report.runner(),
-                "events": report.events(),
-                "exit_code": report.exit_code(),
-            }),
-        )
+        let mut response = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "task_id": report.task_id().to_string(),
+            "run_id": report.run_id().map(|id| id.to_string()),
+            "status": report.status(),
+            "runner": report.runner(),
+            "events": report.events(),
+            "exit_code": report.exit_code(),
+        });
+        if !report.warnings().is_empty() {
+            response["warnings"] = serde_json::json!(report.warnings());
+        }
+        write_json_line(stdout, &response)
     } else {
         let worker = report.status().worker().unwrap_or("unassigned");
         writeln!(
@@ -1077,6 +1078,9 @@ fn write_task_report(
             report.task_id(),
             task_state_name(report.status().state())
         )?;
+        for warning in report.warnings() {
+            writeln!(stdout, "warning: {warning}")?;
+        }
         stdout.flush()?;
         Ok(())
     }

@@ -48,8 +48,14 @@ impl AgentAdapter for OpencodeAdapter {
         ))
     }
 
-    fn delete_session(&self, _session_ref: &str) -> Option<Vec<String>> {
-        None
+    fn delete_session(&self, session_ref: &str) -> Option<Vec<String>> {
+        let session_ref = require_session_ref(session_ref).ok()?;
+        Some(vec![
+            self.binary().into(),
+            "session".into(),
+            "delete".into(),
+            session_ref.into(),
+        ])
     }
 
     fn parse_event(&self, line: &str) -> Option<AgentEvent> {

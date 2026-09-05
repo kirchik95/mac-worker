@@ -71,6 +71,16 @@ impl AgentAdapter for CodexAdapter {
         ))
     }
 
+    fn delete_session(&self, session_ref: &str) -> Option<Vec<String>> {
+        let session_ref = require_session_ref(session_ref).ok()?;
+        Some(vec![
+            self.binary().into(),
+            "delete".into(),
+            "--force".into(),
+            session_ref.into(),
+        ])
+    }
+
     fn parse_event(&self, line: &str) -> Option<AgentEvent> {
         let value = parse_json_line(line)?;
         match value.get("type").and_then(Value::as_str)? {

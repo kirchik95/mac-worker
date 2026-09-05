@@ -663,15 +663,33 @@ fn cursor_prebind_session_is_create_chat() {
 }
 
 #[test]
-fn current_adapters_have_no_native_session_delete_command() {
-    for kind in [
-        AgentKind::Codex,
-        AgentKind::Claude,
-        AgentKind::Cursor,
-        AgentKind::Opencode,
-    ] {
-        assert_eq!(adapter_for(kind).delete_session("session"), None);
-    }
+fn native_session_delete_commands_match_the_documented_cli_help() {
+    assert_eq!(
+        adapter_for(AgentKind::Codex).delete_session("session"),
+        Some(vec![
+            "codex".into(),
+            "delete".into(),
+            "--force".into(),
+            "session".into(),
+        ])
+    );
+    assert_eq!(
+        adapter_for(AgentKind::Opencode).delete_session("session"),
+        Some(vec![
+            "opencode".into(),
+            "session".into(),
+            "delete".into(),
+            "session".into(),
+        ])
+    );
+    assert_eq!(
+        adapter_for(AgentKind::Claude).delete_session("session"),
+        None
+    );
+    assert_eq!(
+        adapter_for(AgentKind::Cursor).delete_session("session"),
+        None
+    );
 }
 
 #[test]

@@ -2,7 +2,15 @@
 mod support;
 
 use std::os::unix::process::ExitStatusExt;
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    ffi::OsStr,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy},
@@ -12,7 +20,7 @@ use mac_worker::{
         ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseToken, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
-    process::SystemProcessRunner,
+    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::MemoryPressure,
     task::{
         BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
@@ -31,11 +39,19 @@ const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn task_id() -> TaskId {
-    TaskId::new(Uuid::from_u128(1))
+    task_id_for(1)
+}
+
+fn task_id_for(value: u128) -> TaskId {
+    TaskId::new(Uuid::from_u128(value))
 }
 
 fn job_id() -> JobId {
-    JobId::new(Uuid::from_u128(10))
+    job_id_for(10)
+}
+
+fn job_id_for(value: u128) -> JobId {
+    JobId::new(Uuid::from_u128(value))
 }
 
 fn client_id() -> ClientId {
@@ -47,8 +63,12 @@ fn lease_token() -> LeaseToken {
 }
 
 fn task_meta(base_oid: BaseOid) -> TaskMeta {
+    task_meta_for(task_id(), base_oid)
+}
+
+fn task_meta_for(task_id: TaskId, base_oid: BaseOid) -> TaskMeta {
     TaskMeta::new(TaskMetaInput {
-        task_id: task_id(),
+        task_id,
         run_id: None,
         project_id: PROJECT_ID.into(),
         worktree_id: WORKTREE_ID.into(),
@@ -129,8 +149,12 @@ fn store_with_mirror() -> (TempDir, HostStore, BaseOid) {
 }
 
 fn transfer_guard(store: &HostStore) -> (AdmissionGuard, TransferGuard) {
-    let admission = store.admission_lock(job_id()).unwrap();
-    let transfer = store.transfer_lock_after(&admission, job_id()).unwrap();
+    transfer_guard_for(store, job_id())
+}
+
+fn transfer_guard_for(store: &HostStore, job: JobId) -> (AdmissionGuard, TransferGuard) {
+    let admission = store.admission_lock(job).unwrap();
+    let transfer = store.transfer_lock_after(&admission, job).unwrap();
     (admission, transfer)
 }
 
@@ -139,10 +163,87 @@ fn prepare_request(base_oid: BaseOid) -> TaskPrepareRequest {
 }
 
 fn prepare_task(store: &HostStore, base_oid: BaseOid) {
-    let (_admission, transfer) = transfer_guard(store);
-    TaskStore::new(store, &SystemProcessRunner)
-        .prepare(&prepare_request(base_oid), &transfer)
+    prepare_task_for(store, task_id(), job_id(), base_oid, &SystemProcessRunner);
+}
+
+fn prepare_task_for(
+    store: &HostStore,
+    task: TaskId,
+    job: JobId,
+    base_oid: BaseOid,
+    runner: &dyn ProcessRunner,
+) {
+    let (_admission, transfer) = transfer_guard_for(store, job);
+    TaskStore::new(store, runner)
+        .prepare(
+            &TaskPrepareRequest::new(task_meta_for(task, base_oid), job, "mini-1"),
+            &transfer,
+        )
         .unwrap();
+}
+
+#[derive(Clone)]
+struct NativeDeleteRunner {
+    requests: Arc<Mutex<Vec<ProcessRequest>>>,
+    workspace: PathBuf,
+    delete_success: bool,
+    workspace_removed_at_delete: Arc<Mutex<Option<bool>>>,
+}
+
+impl NativeDeleteRunner {
+    fn new(workspace: PathBuf, delete_success: bool) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            workspace,
+            delete_success,
+            workspace_removed_at_delete: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn delete_requests(&self) -> Vec<ProcessRequest> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.program.as_os_str() == OsStr::new("/bin/zsh")
+                    && request
+                        .args
+                        .last()
+                        .and_then(|argument| argument.to_str())
+                        .is_some_and(|shell| shell.contains("'codex' 'delete'"))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn workspace_removed_at_delete(&self) -> bool {
+        self.workspace_removed_at_delete
+            .lock()
+            .unwrap()
+            .expect("native delete was invoked")
+    }
+}
+
+impl ProcessRunner for NativeDeleteRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.requests.lock().unwrap().push(request.clone());
+        let is_delete = request.program.as_os_str() == OsStr::new("/bin/zsh")
+            && request
+                .args
+                .last()
+                .and_then(|argument| argument.to_str())
+                .is_some_and(|shell| shell.contains("'codex' 'delete'"));
+        if is_delete {
+            *self.workspace_removed_at_delete.lock().unwrap() = Some(!self.workspace.exists());
+            return Ok(ProcessResult {
+                status: ExitStatus::from_raw(if self.delete_success { 0 } else { 1 << 8 }),
+                stdout: Vec::new(),
+                stderr: b"delete failed at /private/worker/secret-session-store".to_vec(),
+            });
+        }
+        SystemProcessRunner.run(request)
+    }
 }
 
 #[test]
@@ -472,6 +573,102 @@ fn close_removes_only_workspace_and_discard_prunes_published_refs() {
         &mirror,
         &format!("refs/mac-worker/bases/{}", task_id())
     ));
+}
+
+#[test]
+fn discard_deletes_codex_session_after_workspace_removal_with_bounded_argv() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    acquire_lease(&store);
+    prepare_task(&store, base_oid);
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    TaskStore::new(&store, &SystemProcessRunner)
+        .publish_branch_into_mirror(PROJECT_ID, task_id())
+        .unwrap();
+    TaskStore::new(&store, &SystemProcessRunner)
+        .bind_session(
+            PROJECT_ID,
+            task_id(),
+            SessionBinding::new(AgentKind::Codex, "session-1", 200).unwrap(),
+        )
+        .unwrap();
+
+    let runner = NativeDeleteRunner::new(workspace.clone(), true);
+    let response = TaskStore::new(&store, &runner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), true))
+        .unwrap();
+
+    assert_eq!(response.status().state(), TaskState::Abandoned);
+    assert!(runner.workspace_removed_at_delete());
+    let requests = runner.delete_requests();
+    assert_eq!(requests.len(), 1);
+    let shell = requests[0].args.last().unwrap().to_string_lossy();
+    assert_eq!(shell, "exec 'codex' 'delete' '--force' 'session-1'");
+    assert_eq!(requests[0].policy.deadline, Duration::from_secs(15));
+    assert!(!shell.contains("prompt.md"));
+    assert!(!shell.contains(workspace.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn discard_records_a_bounded_warning_when_native_session_deletion_fails() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    acquire_lease(&store);
+    prepare_task(&store, base_oid);
+    TaskStore::new(&store, &SystemProcessRunner)
+        .publish_branch_into_mirror(PROJECT_ID, task_id())
+        .unwrap();
+    TaskStore::new(&store, &SystemProcessRunner)
+        .bind_session(
+            PROJECT_ID,
+            task_id(),
+            SessionBinding::new(AgentKind::Codex, "session-1", 200).unwrap(),
+        )
+        .unwrap();
+
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    let runner = NativeDeleteRunner::new(workspace, false);
+    let response = TaskStore::new(&store, &runner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), true))
+        .unwrap();
+
+    assert_eq!(response.status().state(), TaskState::Abandoned);
+    let encoded = serde_json::to_string(&response).unwrap();
+    assert!(encoded.contains("\"warnings\""));
+    assert!(!encoded.contains("session-1"));
+    assert!(!encoded.contains("secret-session-store"));
+}
+
+#[test]
+fn discard_skips_native_deletion_when_another_task_references_the_session() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    acquire_lease(&store);
+    prepare_task(&store, base_oid.clone());
+    let task_two = task_id_for(2);
+    let job_two = job_id_for(11);
+    prepare_task_for(&store, task_two, job_two, base_oid, &SystemProcessRunner);
+
+    TaskStore::new(&store, &SystemProcessRunner)
+        .publish_branch_into_mirror(PROJECT_ID, task_id())
+        .unwrap();
+    let shared = SessionBinding::new(AgentKind::Codex, "shared-session", 200).unwrap();
+    assert!(
+        mac_worker::agent::adapter_for(AgentKind::Codex)
+            .delete_session(shared.session_ref())
+            .is_some()
+    );
+    TaskStore::new(&store, &SystemProcessRunner)
+        .bind_session(PROJECT_ID, task_id(), shared.clone())
+        .unwrap();
+    TaskStore::new(&store, &SystemProcessRunner)
+        .bind_session(PROJECT_ID, task_two, shared)
+        .unwrap();
+
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    let runner = NativeDeleteRunner::new(workspace, true);
+    TaskStore::new(&store, &runner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), true))
+        .unwrap();
+
+    assert!(runner.delete_requests().is_empty());
 }
 
 #[test]

@@ -808,6 +808,7 @@ impl<'a> RemoteJobClient<'a> {
         if response.protocol_version() != crate::protocol::PROTOCOL_VERSION {
             return Err(invalid_remote_response());
         }
+        response.validate().map_err(|_| invalid_remote_response())?;
         Ok(response)
     }
 

@@ -79,6 +79,7 @@ pub struct TaskReport {
     task_id: TaskId,
     run_id: Option<RunId>,
     status: TaskStatus,
+    warnings: Vec<String>,
     events: Vec<serde_json::Value>,
     runner: Option<RunnerState>,
     exit_code: Option<u8>,
@@ -95,6 +96,10 @@ impl TaskReport {
 
     pub fn status(&self) -> &TaskStatus {
         &self.status
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     pub fn events(&self) -> &[serde_json::Value] {
@@ -998,10 +1003,13 @@ impl<'a> TaskClient<'a> {
             worker,
             &crate::task_store::TaskCloseRequest::new(record.meta().project_id(), task_id, discard),
         )?;
+        let warnings = response.warnings().to_vec();
         self.client_state
             .update_task(record.with_status(response.status().clone())?)?;
         self.release_task_base(&record)?;
-        self.report_for(task_id)
+        let mut report = self.report_for(task_id)?;
+        report.warnings = warnings;
+        Ok(report)
     }
 
     pub fn reconcile_runners(&self) -> Result<ReconcileReport, WorkerError> {
@@ -1825,6 +1833,7 @@ impl<'a> TaskClient<'a> {
             task_id,
             run_id: record.meta().run_id(),
             status: record.status().clone(),
+            warnings: Vec::new(),
             events: Vec::new(),
             runner: self.client_state.runner_liveness(task_id)?,
             exit_code: None,
@@ -1850,6 +1859,7 @@ impl<'a> TaskClient<'a> {
             task_id: record.meta().task_id(),
             run_id: record.meta().run_id(),
             status,
+            warnings: Vec::new(),
             events: Vec::new(),
             runner: self.client_state.runner_liveness(record.meta().task_id())?,
             exit_code: None,

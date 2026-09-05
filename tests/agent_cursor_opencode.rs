@@ -832,13 +832,39 @@ fn host_prebind_runs_create_chat_in_the_login_shell_with_profile_values() {
 }
 
 #[test]
-fn adapters_do_not_expose_a_native_delete_command() {
+fn adapters_expose_only_documented_native_delete_commands() {
+    assert_eq!(
+        adapter_for(AgentKind::Codex).delete_session("00000000-0000-0000-0000-000000000001"),
+        Some(vec![
+            "codex".into(),
+            "delete".into(),
+            "--force".into(),
+            "00000000-0000-0000-0000-000000000001".into(),
+        ])
+    );
+    assert_eq!(
+        adapter_for(AgentKind::Opencode).delete_session("ses0001"),
+        Some(vec![
+            "opencode".into(),
+            "session".into(),
+            "delete".into(),
+            "ses0001".into(),
+        ])
+    );
     assert_eq!(
         adapter_for(AgentKind::Cursor).delete_session("chat0001"),
         None
     );
     assert_eq!(
-        adapter_for(AgentKind::Opencode).delete_session("ses0001"),
+        adapter_for(AgentKind::Claude).delete_session("session-1"),
         None
     );
+}
+
+#[test]
+fn native_delete_rejects_unbound_or_control_session_references() {
+    for kind in [AgentKind::Codex, AgentKind::Opencode] {
+        assert_eq!(adapter_for(kind).delete_session(""), None);
+        assert_eq!(adapter_for(kind).delete_session("session\n1"), None);
+    }
 }
