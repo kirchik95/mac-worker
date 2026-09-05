@@ -856,10 +856,9 @@ impl<'a> TaskStore<'a> {
         if status.state() != TaskState::Open {
             return Ok(None);
         }
-        if task.entry_exists("workspace")? {
+        let workspace_present = task.entry_exists("workspace")?;
+        if workspace_present {
             task.validate_private_entry("workspace")?;
-            self.store
-                .remove_owned_child_committed(&task, "workspace")?;
         }
         let next = TaskStatus::new(
             TaskState::Closed,
@@ -875,6 +874,10 @@ impl<'a> TaskStore<'a> {
             now_millis,
         )?;
         let next = replace_status_bytes(&task, status, next)?;
+        if workspace_present {
+            self.store
+                .remove_owned_child_committed(&task, "workspace")?;
+        }
         task.sync_root()?;
         Ok(Some(next))
     }
