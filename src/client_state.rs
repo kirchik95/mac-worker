@@ -95,6 +95,7 @@ pub enum ClientStateWritePoint {
     BeforeSubmissionReport = 27,
     AfterParkedTaskTurnPublication = 28,
     AfterTaskSubmissionTurnsRetirement = 29,
+    AfterSubmissionIntentClearPublicationBeforeFinalSync = 30,
 }
 
 #[doc(hidden)]
@@ -114,6 +115,7 @@ pub enum ClientStateConcurrencyPoint {
     ParkedTaskTurnPublication,
     ClaimRunCapEvaluation,
     SubmissionIntentClear,
+    SubmissionIntentClearResultUncertain,
     SubmissionIntentReconciliationBeforeTransferLock,
     SubmissionIntentReconciliationAfterTransferLock,
     ObservationRefreshPublication,
@@ -1390,7 +1392,25 @@ impl ClientStateStore {
     #[doc(hidden)]
     pub fn clear_submission_intent(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
         self.reach_concurrency_point(ClientStateConcurrencyPoint::SubmissionIntentClear);
-        self.update_task(replacement)
+        let result = self.update_task_before_final_sync(replacement, || {
+            if self.take_fault(
+                ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync,
+            ) {
+                return Err(io::Error::other(
+                    injected_failure(
+                        ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync,
+                    )
+                    .to_string(),
+                ));
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.reach_concurrency_point(
+                ClientStateConcurrencyPoint::SubmissionIntentClearResultUncertain,
+            );
+        }
+        result
     }
 
     #[doc(hidden)]
@@ -1809,6 +1829,17 @@ impl ClientStateStore {
     }
 
     pub fn update_task(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
+        self.update_task_before_final_sync(replacement, || Ok(()))
+    }
+
+    fn update_task_before_final_sync<F>(
+        &self,
+        replacement: LocalTaskRecord,
+        before_final_sync: F,
+    ) -> Result<(), WorkerError>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
         if self.take_task_rollback_update_failure()
             || self.take_fault(ClientStateWritePoint::BeforeTaskRollbackUpdate)
         {
@@ -1829,7 +1860,7 @@ impl ClientStateStore {
             return Err(invalid_state("task filename and record identity differ"));
         }
         tasks
-            .replace_private_regular_exact(&name, &old, &bytes)
+            .replace_private_regular_exact_before_final_sync(&name, &old, &bytes, before_final_sync)
             .map_err(WorkerError::Io)
     }
 
@@ -4973,6 +5004,9 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         }
         ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement => {
             "after task submission turns retirement"
+        }
+        ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync => {
+            "after submission intent-clear publication before final sync"
         }
     };
     WorkerError::Io(io::Error::other(format!(

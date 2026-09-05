@@ -1739,6 +1739,19 @@ impl RootedDir {
         expected: &[u8],
         replacement: &[u8],
     ) -> io::Result<()> {
+        self.replace_private_regular_exact_before_final_sync(name, expected, replacement, || Ok(()))
+    }
+
+    pub(crate) fn replace_private_regular_exact_before_final_sync<F>(
+        &self,
+        name: &str,
+        expected: &[u8],
+        replacement: &[u8],
+        before_final_sync: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
         self.verify_root_name()?;
         let target = CString::new(name).map_err(interior_nul_error)?;
         let before = stat_at(self.root.as_raw_fd(), &target)?;
@@ -1810,6 +1823,7 @@ impl RootedDir {
         if !same_file(&final_binding, &replacement_opened) {
             return Err(os_error(libc::ESTALE));
         }
+        before_final_sync()?;
         cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
     }
 

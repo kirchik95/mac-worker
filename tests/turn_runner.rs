@@ -182,6 +182,11 @@ struct SubmissionIntentRaceGate {
     reconciliation_release: Mutex<mpsc::Receiver<()>>,
 }
 
+struct SubmissionIntentClearFailureGate {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
 #[derive(Clone, Copy)]
 struct DeadOwnerInspector {
     dead_owner: ProcessIdentity,
@@ -234,6 +239,15 @@ impl ClientStateConcurrencyHook for SubmissionIntentRaceGate {
                 self.reconciliation_release.lock().unwrap().recv().unwrap();
             }
             _ => {}
+        }
+    }
+}
+
+impl ClientStateConcurrencyHook for SubmissionIntentClearFailureGate {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == ClientStateConcurrencyPoint::SubmissionIntentClearResultUncertain {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
         }
     }
 }
@@ -1942,6 +1956,137 @@ fn reconciliation_does_not_rollback_a_submission_that_cleared_its_intent_while_w
         let transfer =
             TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
         assert!(transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
+    });
+}
+
+#[test]
+fn intent_clear_fsync_failure_does_not_restore_a_stale_submission_snapshot_after_adoption() {
+    // Break caught: a clear that publishes before its final sync can return an
+    // error after reconciliation has adopted the row. Submit must not then
+    // write its pre-handoff rollback snapshot over the runner identity.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
+    let (clear_entered_tx, clear_entered_rx) = mpsc::channel();
+    let (clear_release_tx, clear_release_rx) = mpsc::channel();
+    let state = Arc::new(
+        ClientStateStore::open_with_concurrency_hook(
+            &paths.state,
+            Arc::new(SubmissionIntentClearFailureGate {
+                entered: clear_entered_tx,
+                release: Mutex::new(clear_release_rx),
+            }),
+        )
+        .unwrap(),
+    );
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = AcceptedThenTerminalRunner::new();
+    let executor = InlineRunnerExecutor;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .admission_observation("mini-1", now, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec!["darwin-arm64".into(), "agent:codex".into()],
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+        })
+        .unwrap();
+    state.inject_write_failure_once(
+        ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync,
+    );
+
+    let request = || TaskSubmitRequest {
+        agent: AgentKind::Codex,
+        model: None,
+        prompt: "make the change".into(),
+        project: repo.root().to_path_buf(),
+        base: "main".into(),
+        wip: true,
+        source: Some("local".into()),
+        publish: Some(vec!["fetch".into()]),
+        publish_branch: None,
+        cli_includes: Vec::new(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        preference: WorkerPreference::Pinned {
+            worker: "mini-1".into(),
+        },
+        wait_for_capacity: true,
+        attached: false,
+        run_id: None,
+    };
+
+    thread::scope(|scope| {
+        let submit = scope.spawn(|| {
+            TaskClient::new(&runner, &config, &paths, &state, &executor).submit(
+                request(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+        });
+        clear_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let published = state.list_tasks().unwrap().pop().unwrap();
+        let task_id = published.meta().task_id();
+        let turn_id = state
+            .queue_entry_for_task_turn(task_id)
+            .unwrap()
+            .unwrap()
+            .job_id();
+        assert!(published.submission_intent_turn_id().is_none());
+
+        let dead_owner = ProcessIdentity::new(424_243, 4_242_437).unwrap();
+        state.adopt_row(turn_id, dead_owner).unwrap();
+        state.inject_submission_rollback_cleanup_failure_once(
+            ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement,
+        );
+        let reconciler = ClientStateStore::open_with_owner_inspector(
+            &paths.state,
+            DeadOwnerInspector { dead_owner },
+        )
+        .unwrap();
+        TaskClient::new(&runner, &config, &paths, &reconciler, &executor)
+            .reconcile_runners()
+            .unwrap();
+        assert!(reconciler.load_task(task_id).unwrap().runner().is_some());
+
+        clear_release_tx.send(()).unwrap();
+        let error = submit.join().unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("after submission intent-clear publication before final sync")
+        );
+
+        let retained = reconciler.load_task(task_id).unwrap();
+        assert!(retained.runner().is_some());
+        assert!(reconciler.queue_entry(turn_id).unwrap().is_some());
+        assert!(reconciler.read_turn_prompt(task_id, turn_id).is_ok());
+
+        let outcome = TurnRunner::new(&runner, &config, &paths, &reconciler, &executor)
+            .run(task_id, turn_id, None)
+            .unwrap();
+        assert_eq!(outcome.status().state(), TaskState::Closed);
+        assert!(reconciler.queue_entry(turn_id).unwrap().is_none());
+        assert!(reconciler.read_turn_prompt(task_id, turn_id).is_err());
     });
 }
 

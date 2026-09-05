@@ -768,8 +768,6 @@ impl<'a> TaskClient<'a> {
                     request.attached || self.live_runner_count()? < self.config.workers.len();
                 self.client_state.submission_report_fault()?;
                 let report = self.report_for(task_id)?;
-                self.client_state
-                    .clear_submission_intent(record_for_rollback.without_submission_intent()?)?;
                 Ok((report, should_start, entry.job_id()))
             })() {
                 Ok(report) => report,
@@ -778,6 +776,14 @@ impl<'a> TaskClient<'a> {
                     return Err(error);
                 }
             };
+        // Intent clearance is the submission handoff boundary. Its atomic
+        // replacement can publish the clear before the final directory sync
+        // reports an error, so this caller cannot safely compensate from its
+        // pre-handoff snapshot. Retain the complete durable submission for
+        // reconciliation rather than overwriting a runner that may already
+        // have adopted the published row.
+        self.client_state
+            .clear_submission_intent(record_for_rollback.without_submission_intent()?)?;
         if !should_start {
             // Parking publishes eligibility to an independent runner. A park
             // error may therefore mean ownership already transferred, so
