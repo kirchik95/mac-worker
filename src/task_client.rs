@@ -703,7 +703,11 @@ impl<'a> TaskClient<'a> {
             pinned_worker,
             request.wait_for_capacity,
             None,
-        )?;
+        )?
+        // The intent is written in the initial task-record creation, before
+        // any prompt, queue, report, or marker update can fail. Reconciliation
+        // may compensate only while this marker remains present.
+        .with_submission_intent_turn_id(turn_id)?;
         let record_for_rollback = record.clone();
         let reservation = match (request.run_id, reserved_branch.as_ref()) {
             (Some(run_id), Some(branch)) => match self
@@ -762,6 +766,8 @@ impl<'a> TaskClient<'a> {
                     request.attached || self.live_runner_count()? < self.config.workers.len();
                 self.client_state.submission_report_fault()?;
                 let report = self.report_for(task_id)?;
+                self.client_state
+                    .update_task(record_for_rollback.without_submission_intent()?)?;
                 Ok((report, should_start, entry.job_id()))
             })() {
                 Ok(report) => report,
@@ -1032,12 +1038,14 @@ impl<'a> TaskClient<'a> {
         let mut report = ReconcileReport::default();
         let owner = current_process_identity()?;
 
-        // A submit can fail while compensating its locally-created state.  A
-        // marked record is intentionally terminal and has never been handed
-        // to a runner, so finish that rollback before normal reconciliation
-        // can inspect or adopt its queue row.
+        // A submit can fail while compensating its locally-created state. The
+        // pre-handoff intent is durable from initial task creation; the
+        // rollback marker is a stronger terminal form of that intent. Both
+        // are safe to compensate before normal reconciliation can adopt a row.
         for record in self.client_state.list_tasks()? {
-            if record.abandon_code() != Some(SUBMISSION_ROLLBACK_INCOMPLETE) {
+            if record.abandon_code() != Some(SUBMISSION_ROLLBACK_INCOMPLETE)
+                && record.submission_intent_turn_id().is_none()
+            {
                 continue;
             }
             let Ok(transfer) = self.transfer_for_record(&record) else {
@@ -1047,6 +1055,7 @@ impl<'a> TaskClient<'a> {
                 .client_state
                 .queue_entry_for_task_turn(record.meta().task_id())?
                 .map(|entry| entry.job_id())
+                .or(record.submission_intent_turn_id())
                 .or_else(|| {
                     self.client_state
                         .turn_ids_for_task(record.meta().task_id())
@@ -1731,9 +1740,9 @@ impl<'a> TaskClient<'a> {
         record: &LocalTaskRecord,
         transfer: &TransferRepo,
     ) -> Result<(), WorkerError> {
-        // Keep the marked record, prompt, and queue row together until all
-        // externally-referenced resources are released. Any failure leaves a
-        // terminal, non-runnable recovery record for the next reconcile.
+        // Keep the durable intent or marker, prompt, and queue row together
+        // until all externally-referenced resources are released. Any failure
+        // leaves a recovery record for the next reconcile.
         if let Some(run_id) = record.meta().run_id()
             && record.meta().publish().contains(&PublishMode::Push)
         {
@@ -1747,7 +1756,9 @@ impl<'a> TaskClient<'a> {
         }
         transfer.release_base(self.runner, record.meta().task_id())?;
         let task_id = record.meta().task_id();
-        let removed_queue = if let Some(turn_id) = turn_id.or(record.submission_rollback_turn_id())
+        let removed_queue = if let Some(turn_id) = turn_id
+            .or(record.submission_rollback_turn_id())
+            .or(record.submission_intent_turn_id())
         {
             self.client_state
                 .remove_task_turn_for_submission_rollback(turn_id)?

@@ -1226,11 +1226,21 @@ fn assert_submit_rolls_back_post_create_state(
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(turn_entries, vec![".mac-worker-rooted-fs"]);
-        assert!(
-            repo.git(&["for-each-ref", "refs/mac-worker/bases"])
-                .stdout
-                .is_empty()
-        );
+        let project =
+            mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+        let transfer =
+            TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
+        let base_refs = process::Command::new("/usr/bin/git")
+            .args([
+                "--git-dir",
+                &transfer.path().to_string_lossy(),
+                "for-each-ref",
+                "refs/mac-worker/bases",
+            ])
+            .output()
+            .unwrap();
+        assert!(base_refs.status.success());
+        assert!(base_refs.stdout.is_empty());
     } else {
         let task = state.list_tasks().unwrap().pop().unwrap();
         assert_eq!(task.status().state(), TaskState::Abandoned);
@@ -1251,9 +1261,12 @@ fn assert_submit_rolls_back_post_create_state(
             );
             let project =
                 mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
-            let transfer =
-                TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
-            assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
+            {
+                let transfer =
+                    TransferRepo::open_or_create(&paths.cache, &project.context.common_dir)
+                        .unwrap();
+                assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
+            }
 
             let reopened = ClientStateStore::open(&paths.state).unwrap();
             let recovered = reopened.load_task(task_id).unwrap();
@@ -1277,6 +1290,8 @@ fn assert_submit_rolls_back_post_create_state(
                 .map(|entry| entry.unwrap().file_name())
                 .collect::<Vec<_>>();
             assert_eq!(turn_entries, vec![".mac-worker-rooted-fs"]);
+            let transfer =
+                TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
             assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
         } else if fault == ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval {
             assert!(
@@ -1533,6 +1548,117 @@ fn submit_retries_rollback_after_marker_update_failure() {
         false,
         false,
     );
+}
+
+#[test]
+fn restart_recovers_prompt_failure_when_every_rollback_marker_write_fails() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    assert!(
+        repo.git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/project.git",
+        ])
+        .status
+        .success()
+    );
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let run_id = RunId::generate();
+    state
+        .create_run(RunRecord::new(run_id, None, vec![TaskId::generate()], 1, 1).unwrap())
+        .unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = AcceptedThenTerminalRunner::new();
+    let executor = InlineRunnerExecutor;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .admission_observation("mini-1", now, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec![
+                    "darwin-arm64".into(),
+                    "origin:github.com".into(),
+                    "agent:codex".into(),
+                ],
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+        })
+        .unwrap();
+    state.inject_write_failure_once(ClientStateWritePoint::BeforeTurnPromptWrite);
+    state.inject_task_rollback_update_failures(2);
+
+    let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .submit(
+            TaskSubmitRequest {
+                agent: AgentKind::Codex,
+                model: None,
+                prompt: "make the change".into(),
+                project: repo.root().to_path_buf(),
+                base: "main".into(),
+                wip: false,
+                source: Some("local".into()),
+                publish: Some(vec!["fetch".into(), "push".into()]),
+                publish_branch: Some("rollback-test".into()),
+                cli_includes: Vec::new(),
+                limits: TaskLimits::default(),
+                close_policy: ClosePolicy::Never,
+                env_profile: None,
+                preference: WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                wait_for_capacity: true,
+                attached: false,
+                run_id: Some(run_id),
+            },
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("before task turn prompt write"));
+
+    let pending = state.list_tasks().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].status().state(), TaskState::Queued);
+    let task_id = pending[0].meta().task_id();
+
+    let reopened = ClientStateStore::open(&paths.state).unwrap();
+    TaskClient::new(&runner, &config, &paths, &reopened, &executor)
+        .reconcile_runners()
+        .unwrap();
+    assert!(reopened.list_tasks().unwrap().is_empty());
+    assert!(reopened.queue_snapshot().unwrap().entries().is_empty());
+    assert!(
+        reopened
+            .load_run(run_id)
+            .unwrap()
+            .publish_branches()
+            .is_empty()
+    );
+    let turn_entries = std::fs::read_dir(paths.state.join("turns"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(turn_entries, vec![".mac-worker-rooted-fs"]);
+    let project = mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+    let transfer = TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
+    assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
 }
 
 #[test]

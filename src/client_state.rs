@@ -192,6 +192,7 @@ struct ClientStateInner {
     owner_inspector: Arc<dyn ProcessInspector>,
     concurrency_hook: Option<Arc<dyn ClientStateConcurrencyHook>>,
     write_fault: Arc<AtomicU8>,
+    task_rollback_update_failures: AtomicU8,
     submission_rollback_cleanup_fault: AtomicU8,
     sync_counts: Arc<SyncCounters>,
     cleanup_pause: Mutex<Option<Arc<CleanupPauseState>>>,
@@ -525,6 +526,7 @@ impl ClientStateStore {
                 owner_inspector,
                 concurrency_hook,
                 write_fault,
+                task_rollback_update_failures: AtomicU8::new(0),
                 submission_rollback_cleanup_fault: AtomicU8::new(0),
                 sync_counts,
                 cleanup_pause: Mutex::new(None),
@@ -1784,7 +1786,9 @@ impl ClientStateStore {
     }
 
     pub fn update_task(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
-        if self.take_fault(ClientStateWritePoint::BeforeTaskRollbackUpdate) {
+        if self.take_task_rollback_update_failure()
+            || self.take_fault(ClientStateWritePoint::BeforeTaskRollbackUpdate)
+        {
             return Err(injected_failure(
                 ClientStateWritePoint::BeforeTaskRollbackUpdate,
             ));
@@ -2289,6 +2293,13 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    pub fn inject_task_rollback_update_failures(&self, count: u8) {
+        self.inner
+            .task_rollback_update_failures
+            .store(count, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
     pub fn inject_submission_rollback_cleanup_failure_once(&self, point: ClientStateWritePoint) {
         assert!(matches!(
             point,
@@ -2397,6 +2408,19 @@ impl ClientStateStore {
         self.inner
             .write_fault
             .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn take_task_rollback_update_failure(&self) -> bool {
+        self.inner
+            .task_rollback_update_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                if remaining == 0 {
+                    None
+                } else {
+                    Some(remaining - 1)
+                }
+            })
             .is_ok()
     }
 
