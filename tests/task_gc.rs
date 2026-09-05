@@ -33,6 +33,7 @@ const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const LEGACY_PROJECT_ID: &str = "ac2486b82bd3f012ce72f1ba60cad94aeef2f8dfe10329ce5451794ec87b3bd1";
 const LEGACY_WORKTREE_ID: &str = "e59fa72efe82e49c977312206e4bfa7bbe82b3b5afc238fa2694800244e27532";
 const LEGACY_JOB_ID: &str = "14aff6a4642846809f24a0bf9e13b441";
+const LEGACY_JOB_ID_MINI2: &str = "4ce2435b1eb34c18b24dbb42fa7e3a31";
 
 fn task_id(value: u128) -> TaskId {
     TaskId::new(Uuid::from_u128(value))
@@ -206,7 +207,21 @@ fn ensure_job_siblings(store: &HostStore, job: JobId) {
 }
 
 fn write_legacy_fixture_job(store: &HostStore) -> (String, JobId) {
-    let job: JobId = LEGACY_JOB_ID.parse().unwrap();
+    write_legacy_fixture_job_from(
+        store,
+        LEGACY_JOB_ID,
+        include_bytes!("fixtures/gc/legacy-job-meta-v3.json"),
+        include_bytes!("fixtures/gc/legacy-job-status.json"),
+    )
+}
+
+fn write_legacy_fixture_job_from(
+    store: &HostStore,
+    job_name: &str,
+    meta: &[u8],
+    status: &[u8],
+) -> (String, JobId) {
+    let job: JobId = job_name.parse().unwrap();
     let job_dir = store
         .job(LEGACY_PROJECT_ID, LEGACY_WORKTREE_ID, job)
         .unwrap();
@@ -218,17 +233,9 @@ fn write_legacy_fixture_job(store: &HostStore) -> (String, JobId) {
     .unwrap();
     fs::set_permissions(job_dir.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&job_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(
-        job_dir.join("meta.json"),
-        include_bytes!("fixtures/gc/legacy-job-meta-v3.json"),
-    )
-    .unwrap();
+    fs::write(job_dir.join("meta.json"), meta).unwrap();
     fs::set_permissions(job_dir.join("meta.json"), fs::Permissions::from_mode(0o600)).unwrap();
-    fs::write(
-        job_dir.join("status.json"),
-        include_bytes!("fixtures/gc/legacy-job-status.json"),
-    )
-    .unwrap();
+    fs::write(job_dir.join("status.json"), status).unwrap();
     fs::set_permissions(
         job_dir.join("status.json"),
         fs::Permissions::from_mode(0o600),
@@ -618,6 +625,12 @@ fn gc_preview_reports_legacy_job_metadata_without_aborting_other_records() {
     let temp = tempfile::tempdir().unwrap();
     let store = HostStore::open(&temp.path().join("host")).unwrap();
     let (legacy_identifier, legacy_job) = write_legacy_fixture_job(&store);
+    let (legacy_mini2_identifier, legacy_mini2_job) = write_legacy_fixture_job_from(
+        &store,
+        LEGACY_JOB_ID_MINI2,
+        include_bytes!("fixtures/gc/legacy-job-meta-v3-mini2.json"),
+        include_bytes!("fixtures/gc/legacy-job-status-v3-mini2.json"),
+    );
     let valid_job = job_id(99);
     write_job(&store, valid_job, &JobStatus::succeeded(1, 0, 0).unwrap());
 
@@ -627,6 +640,11 @@ fn gc_preview_reports_legacy_job_metadata_without_aborting_other_records() {
     assert!(report.candidates().iter().any(|candidate| {
         candidate.kind() == "job"
             && candidate.identifier() == legacy_identifier
+            && candidate.reason() == "legacy protocol"
+    }));
+    assert!(report.candidates().iter().any(|candidate| {
+        candidate.kind() == "job"
+            && candidate.identifier() == legacy_mini2_identifier
             && candidate.reason() == "legacy protocol"
     }));
     assert!(report.candidates().iter().any(|candidate| {
@@ -647,6 +665,12 @@ fn gc_preview_reports_legacy_job_metadata_without_aborting_other_records() {
     assert!(
         store
             .job(LEGACY_PROJECT_ID, LEGACY_WORKTREE_ID, legacy_job)
+            .unwrap()
+            .exists()
+    );
+    assert!(
+        store
+            .job(LEGACY_PROJECT_ID, LEGACY_WORKTREE_ID, legacy_mini2_job)
             .unwrap()
             .exists()
     );
