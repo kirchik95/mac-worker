@@ -443,16 +443,17 @@ pub fn parse_prebind_session_ref(stdout: &[u8]) -> Result<String, WorkerError> {
     {
         return validate_prebind_id(session_ref);
     }
-    if let Some(value) = extract_json_object(trimmed)
-        && let Some(session_ref) = json_session_id(&value)
-    {
-        return validate_prebind_id(session_ref);
-    }
-    let line = trimmed
+    let mut lines = trimmed
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("");
+        .filter(|line| !line.is_empty());
+    let line = lines.next().unwrap_or("");
+    if lines.next().is_some() {
+        return Err(WorkerError::Task {
+            code: "TASK_SESSION_INVALID",
+            message: "prebind output contains multiple non-empty lines".into(),
+        });
+    }
     validate_prebind_id(line)
 }
 
@@ -469,11 +470,13 @@ fn json_session_id(value: &Value) -> Option<&str> {
 fn validate_prebind_id(session_ref: &str) -> Result<String, WorkerError> {
     if session_ref.is_empty()
         || session_ref.len() > 256
-        || session_ref.chars().any(char::is_control)
+        || session_ref
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
     {
         return Err(WorkerError::Task {
             code: "TASK_SESSION_INVALID",
-            message: "session reference is empty, too long, or contains a control character".into(),
+            message: "session reference is empty, too long, or contains whitespace/control".into(),
         });
     }
     Ok(session_ref.to_string())
