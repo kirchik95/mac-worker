@@ -109,10 +109,13 @@ impl AgentAdapter for OpencodeAdapter {
 fn classify_opencode_auth(result: &ProcessResult) -> AuthProbeResult {
     let text = combined_output(result);
     let trimmed = text.trim();
-    if trimmed.is_empty()
-        || trimmed.to_ascii_lowercase().contains("no credentials")
-        || trimmed.to_ascii_lowercase().contains("not authenticated")
-    {
+    if trimmed.is_empty() {
+        return AuthProbeResult::Unknown;
+    }
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "no credentials" | "no credentials found" | "not authenticated"
+    ) {
         return AuthProbeResult::Unauthenticated;
     }
 
@@ -121,10 +124,49 @@ fn classify_opencode_auth(result: &ProcessResult) -> AuthProbeResult {
     };
     match value {
         Value::Array(values) if values.is_empty() => AuthProbeResult::Unauthenticated,
-        Value::Array(_) => AuthProbeResult::Authenticated,
-        Value::Object(values) if values.is_empty() => AuthProbeResult::Unauthenticated,
-        Value::Object(_) => AuthProbeResult::Authenticated,
+        Value::Array(values) if values.iter().any(is_configured_provider) => {
+            AuthProbeResult::Authenticated
+        }
+        Value::Array(_) => AuthProbeResult::Unknown,
+        Value::Object(values) => classify_provider_object(&values),
         _ => AuthProbeResult::Unknown,
+    }
+}
+
+fn classify_provider_object(values: &serde_json::Map<String, Value>) -> AuthProbeResult {
+    if let Some(providers) = values.get("providers") {
+        return match providers {
+            Value::Array(values) if values.is_empty() => AuthProbeResult::Unauthenticated,
+            Value::Array(values) if values.iter().any(is_configured_provider) => {
+                AuthProbeResult::Authenticated
+            }
+            Value::Array(_) => AuthProbeResult::Unknown,
+            _ => AuthProbeResult::Unknown,
+        };
+    }
+    if values.is_empty()
+        || values.keys().any(|key| {
+            matches!(
+                key.to_ascii_lowercase().as_str(),
+                "error" | "message" | "status" | "authenticated" | "loggedin"
+            )
+        })
+    {
+        AuthProbeResult::Unknown
+    } else {
+        AuthProbeResult::Authenticated
+    }
+}
+
+fn is_configured_provider(value: &Value) -> bool {
+    match value {
+        Value::String(name) => !name.trim().is_empty(),
+        Value::Object(values) => values
+            .get("provider")
+            .or_else(|| values.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty()),
+        _ => false,
     }
 }
 

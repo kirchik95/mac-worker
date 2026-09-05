@@ -94,13 +94,31 @@ impl AgentAdapter for CursorAdapter {
 }
 
 fn classify_cursor_auth(result: &ProcessResult) -> AuthProbeResult {
-    let text = combined_output(result).to_ascii_lowercase();
-    if text.contains("not authenticated")
-        || text.contains("not logged in")
-        || text.contains("unauthenticated")
-    {
+    let text = combined_output(result);
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let Some(line) = lines.next() else {
+        return AuthProbeResult::Unknown;
+    };
+    if lines.next().is_some() {
+        return AuthProbeResult::Unknown;
+    }
+
+    let line = line.to_ascii_lowercase();
+    if matches!(
+        line.as_str(),
+        "not authenticated" | "not logged in" | "unauthenticated" | "authenticated: false"
+    ) {
         AuthProbeResult::Unauthenticated
-    } else if text.contains("authenticated") || text.contains("logged in") {
+    } else if matches!(
+        line.as_str(),
+        "authenticated" | "logged in" | "authenticated: true"
+    ) || line
+        .strip_prefix("authenticated as ")
+        .is_some_and(|user| !user.trim().is_empty())
+        || line
+            .strip_prefix("logged in as ")
+            .is_some_and(|user| !user.trim().is_empty())
+    {
         AuthProbeResult::Authenticated
     } else {
         AuthProbeResult::Unknown

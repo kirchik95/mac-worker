@@ -69,6 +69,32 @@ fn every_adapter_owns_its_auth_probe_command_and_classifier() {
     }
 }
 
+#[test]
+fn ambiguous_agent_auth_output_is_not_projected_as_authenticated() {
+    let cursor = adapter_for(AgentKind::Cursor).auth_probe();
+    assert_eq!(
+        cursor.classify(&result(b"Authenticated: false\n")),
+        AuthProbeResult::Unauthenticated
+    );
+    assert_eq!(
+        cursor.classify(&result(
+            b"Authenticated as test-user\nwarning: status cache is stale\n"
+        )),
+        AuthProbeResult::Unknown
+    );
+
+    let opencode = adapter_for(AgentKind::Opencode).auth_probe();
+    assert_eq!(opencode.classify(&result(b"")), AuthProbeResult::Unknown);
+    assert_eq!(
+        opencode.classify(&result(br#"{"error":"not authenticated"}"#)),
+        AuthProbeResult::Unknown
+    );
+    assert_eq!(
+        opencode.classify(&result(br#"{"status":"ok"}"#)),
+        AuthProbeResult::Unknown
+    );
+}
+
 #[derive(Clone, Default)]
 struct RecordingRunner {
     requests: Arc<Mutex<Vec<ProcessRequest>>>,
