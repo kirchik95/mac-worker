@@ -80,8 +80,8 @@ impl RunnerExecutor for InlineRunnerExecutor {
     }
 }
 
-/// Production executor.  The child has its own session and writes only to
-/// the owner-readable runner log.  All task/turn inputs are reloaded by the
+/// Production executor. The child has its own session and writes only through
+/// the runner's explicit log writer. All task/turn inputs are reloaded by the
 /// child through the hidden `runner` command.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DetachedRunnerExecutor;
@@ -109,7 +109,7 @@ impl RunnerExecutor for DetachedRunnerExecutor {
             .map_err(WorkerError::Io)?;
         fs::set_permissions(&log_path, fs::Permissions::from_mode(RUNNER_LOG_MODE))
             .map_err(WorkerError::Io)?;
-        let stderr = log.try_clone().map_err(WorkerError::Io)?;
+        drop(log);
         let executable = std::env::current_exe().map_err(WorkerError::Io)?;
         let mut command = Command::new(executable);
         if !paths.config.as_os_str().is_empty() {
@@ -120,8 +120,8 @@ impl RunnerExecutor for DetachedRunnerExecutor {
             .arg(task_id.to_string())
             .arg(turn_id.to_string())
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(stderr));
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         // The supervisor/runner must not share the caller's process group:
         // Ctrl-C and terminal teardown are local client concerns.
         unsafe {

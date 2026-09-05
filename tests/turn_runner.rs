@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{self, ExitStatus},
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::{
@@ -81,6 +81,34 @@ fn detached_executor_creates_private_runner_log_and_directory() {
     assert_eq!(
         fs::metadata(log).unwrap().permissions().mode() & 0o777,
         0o600
+    );
+}
+
+#[test]
+fn detached_runner_does_not_mirror_child_stdio_into_owner_log() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(temp.path());
+    let task_id = TaskId::generate();
+    let turn_id = TurnId::generate();
+
+    DetachedRunnerExecutor
+        .start(&paths, task_id, turn_id)
+        .unwrap();
+    let log =
+        support::task_harness::runner_log(temp.path(), &task_id.to_string(), &turn_id.to_string());
+    let child_output = (0..50).find_map(|_| {
+        let bytes = fs::read(&log).unwrap();
+        if bytes.is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+            None
+        } else {
+            Some(bytes)
+        }
+    });
+
+    assert!(
+        child_output.is_none(),
+        "detached child stdout/stderr must not be mirrored into the owner log"
     );
 }
 
