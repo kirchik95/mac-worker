@@ -31,7 +31,7 @@ use crate::{
     },
     task_view::{
         TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
-        project_task_list,
+        project_task_list_with_blocking_codes,
     },
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
@@ -837,8 +837,15 @@ impl<'a> TaskClient<'a> {
             .into_iter()
             .filter(|run| filter.run_id.is_none_or(|run_id| run.run_id() == run_id))
             .collect::<Vec<_>>();
-        let projection = project_task_list(&records, &runs, &runner_states, &freshness)
-            .map_err(task_view_error)?;
+        let blocking_codes = self.client_state.task_blocking_codes(self.config)?;
+        let projection = project_task_list_with_blocking_codes(
+            &records,
+            &runs,
+            &runner_states,
+            &freshness,
+            &blocking_codes,
+        )
+        .map_err(task_view_error)?;
         Ok(TaskListReport { projection })
     }
 

@@ -1098,13 +1098,24 @@ fn write_task_list_report(
         )
     } else {
         for task in report.tasks() {
-            writeln!(
-                stdout,
-                "{}: {} ({})",
-                task.task_id,
-                task_state_name(task.state),
-                task.worker.as_deref().unwrap_or("unassigned")
-            )?;
+            if let Some(blocking_code) = task.blocking_code.as_deref() {
+                writeln!(
+                    stdout,
+                    "{}: {} ({}) blocking: {}",
+                    task.task_id,
+                    task_state_name(task.state),
+                    task.worker.as_deref().unwrap_or("unassigned"),
+                    blocking_code
+                )?;
+            } else {
+                writeln!(
+                    stdout,
+                    "{}: {} ({})",
+                    task.task_id,
+                    task_state_name(task.state),
+                    task.worker.as_deref().unwrap_or("unassigned")
+                )?;
+            }
         }
         stdout.flush()?;
         Ok(())

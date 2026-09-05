@@ -1023,6 +1023,7 @@ fn fixture_detail() -> TaskDetailProjection {
             title: "Repair login".into(),
             agent: "codex".into(),
             state: TaskState::Active,
+            blocking_code: None,
             last_outcome: None,
             worker: Some("mini-1".into()),
             branch: BranchName::for_task(task_id),

@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::{
     agent::AgentKind,
     redaction::RedactionBoundary,
+    scheduler::QueueBlockingReason,
     task::{
         BaseOid, BranchName, LocalTaskRecord, RunId, RunProgress, RunRecord, RunnerState, TaskId,
         TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
@@ -39,6 +40,7 @@ pub struct TaskListRow {
     pub title: String,
     pub agent: String,
     pub state: TaskState,
+    pub blocking_code: Option<String>,
     pub last_outcome: Option<TaskOutcome>,
     pub worker: Option<String>,
     pub branch: BranchName,
@@ -166,6 +168,16 @@ pub fn project_task_list(
     runner_states: &HashMap<TaskId, Option<RunnerState>>,
     freshness: &HashMap<TaskId, TaskFreshness>,
 ) -> Result<TaskListProjection, TaskViewError> {
+    project_task_list_with_blocking_codes(records, runs, runner_states, freshness, &HashMap::new())
+}
+
+pub fn project_task_list_with_blocking_codes(
+    records: &[LocalTaskRecord],
+    runs: &[RunRecord],
+    runner_states: &HashMap<TaskId, Option<RunnerState>>,
+    freshness: &HashMap<TaskId, TaskFreshness>,
+    blocking_codes: &HashMap<TaskId, String>,
+) -> Result<TaskListProjection, TaskViewError> {
     let mut states = HashMap::with_capacity(records.len());
     for record in records {
         states.insert(record.meta().task_id(), record.status().state());
@@ -199,6 +211,7 @@ pub fn project_task_list(
                     .copied()
                     .unwrap_or(TaskFreshness::Current),
                 run_position,
+                blocking_codes.get(&task_id).cloned(),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -248,7 +261,7 @@ pub fn project_task_detail(
     freshness: TaskFreshness,
 ) -> Result<TaskDetailProjection, TaskViewError> {
     let boundary = RedactionBoundary::from_env();
-    let task = task_list_row(record, status, runner, freshness, None)?;
+    let task = task_list_row(record, status, runner, freshness, None, None)?;
     let turns = status
         .turns()
         .iter()
@@ -298,6 +311,7 @@ fn task_list_row(
     runner: Option<RunnerState>,
     freshness: TaskFreshness,
     run_position: Option<u32>,
+    blocking_code: Option<String>,
 ) -> Result<TaskListRow, TaskViewError> {
     let boundary = RedactionBoundary::from_env();
     let turn_count =
@@ -316,6 +330,7 @@ fn task_list_row(
         title: boundary.title(record.meta().title().as_str()),
         agent: agent_name(record.meta().agent()).to_owned(),
         state: status.state(),
+        blocking_code,
         last_outcome: status
             .last_outcome()
             .map(|outcome| redact_outcome(outcome, &boundary)),
@@ -330,6 +345,16 @@ fn task_list_row(
         updated_at_millis: status.updated_at_millis(),
         active_turn_id,
     })
+}
+
+pub(crate) fn queue_blocking_code(reason: Option<&QueueBlockingReason>) -> &'static str {
+    match reason {
+        Some(QueueBlockingReason::PinnedWorkerBusy { .. }) => "PINNED_WORKER_BUSY",
+        Some(QueueBlockingReason::CapabilityMissing { .. }) => "CAPABILITY_MISSING",
+        Some(QueueBlockingReason::RunCap) => "RUN_MAX_PARALLEL",
+        Some(QueueBlockingReason::NoEligibleWorker) => "NO_COMPATIBLE_IDLE_WORKER",
+        None => "WAITING_FOR_DISPATCH",
+    }
 }
 
 fn project_turn(turn: &TurnSummary, boundary: &RedactionBoundary) -> TaskTurnProjection {

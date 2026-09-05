@@ -11,7 +11,7 @@ use mac_worker::{
     },
     task_view::{
         TaskDetailProjection, TaskFreshness, TaskListJson, TaskListProjection, project_task_detail,
-        project_task_list,
+        project_task_list, project_task_list_with_blocking_codes,
     },
 };
 use serde::Serialize;
@@ -246,6 +246,36 @@ fn fixture_detail() -> TaskDetailProjection {
     .expect("valid task detail projection")
 }
 
+fn queued_record() -> LocalTaskRecord {
+    let record = terminal_record();
+    let status = TaskStatus::new(
+        TaskState::Queued,
+        None,
+        None,
+        false,
+        Some(record.meta().base_oid().clone()),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        Vec::new(),
+        1_700_000_000_500,
+    )
+    .expect("valid queued status");
+    LocalTaskRecord::new(
+        record.meta().clone(),
+        status,
+        None,
+        None,
+        None,
+        record.repo_id().to_owned(),
+        None,
+        true,
+        None,
+    )
+    .expect("valid queued record")
+}
+
 #[test]
 fn cli_and_snapshot_projection_fields_are_identical() {
     let projection = fixture_projection();
@@ -331,6 +361,32 @@ fn detail_redacts_failure_reasons_controls_paths_and_tokens() {
     assert!(encoded.contains("[path]"));
     assert!(!encoded.contains("~/private"));
     assert!(encoded.chars().all(|character| !character.is_control()));
+}
+
+#[test]
+fn queued_task_projection_includes_blocking_code_in_cli_and_snapshot() {
+    let task = queued_record();
+    let task_id = task.meta().task_id();
+    let blocking_codes = HashMap::from([(task_id, "CAPABILITY_MISSING".to_owned())]);
+    let projection = project_task_list_with_blocking_codes(
+        &[task],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+        &blocking_codes,
+    )
+    .expect("valid queued task projection");
+
+    assert_eq!(
+        projection.tasks[0].blocking_code.as_deref(),
+        Some("CAPABILITY_MISSING")
+    );
+    let cli = serde_json::to_value(TaskListJson::new(PROTOCOL_VERSION, projection.clone()))
+        .expect("serialize CLI projection");
+    let snapshot = serde_json::to_value(SnapshotProjection { projection })
+        .expect("serialize dashboard projection");
+    assert_eq!(cli["tasks"], snapshot["tasks"]);
+    assert_eq!(cli["tasks"][0]["blocking_code"], "CAPABILITY_MISSING");
 }
 
 fn assert_absent_keys_and_values(value: &serde_json::Value, forbidden: &[&str]) {

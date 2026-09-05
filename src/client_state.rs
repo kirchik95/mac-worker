@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::{CStr, CString, OsStr},
     fs::File,
     io::{self, Read, Write},
@@ -626,6 +626,31 @@ impl ClientStateStore {
                 })
             })
             .collect()
+    }
+
+    /// Reads waiting task-turn rows and their cached scheduler blocking codes
+    /// without refreshing worker observations or changing queue state.
+    pub fn task_blocking_codes(
+        &self,
+        config: &Config,
+    ) -> Result<HashMap<TaskId, String>, WorkerError> {
+        let mut codes = HashMap::new();
+        for row in self.queue_rows_with_blocking_reasons(config)? {
+            let entry = row.entry();
+            if entry.kind() != QueueEntryKind::TaskTurn
+                || !matches!(entry.state(), QueueState::Waiting { .. })
+            {
+                continue;
+            }
+            let Some(task_id) = self.task_id_for_turn(entry.job_id())? else {
+                continue;
+            };
+            codes.insert(
+                task_id,
+                crate::task_view::queue_blocking_code(row.blocking_reason()).to_owned(),
+            );
+        }
+        Ok(codes)
     }
 
     pub fn adopt_row(

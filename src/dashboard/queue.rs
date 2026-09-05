@@ -12,7 +12,6 @@ use crate::{
     },
     error::WorkerError,
     job::{CommandSummary, QueueEntryKind, QueueState},
-    scheduler::QueueBlockingReason,
     task::{RunId, TaskId, TurnId},
 };
 
@@ -114,7 +113,8 @@ impl DashboardQueueReader for ClientStateDashboardQueueReader {
                     command_summary: project_command_summary(entry.command_summary()),
                     created_at_millis: entry.enqueued_at_millis(),
                     requirements: entry.requirements().to_vec(),
-                    blocking_code: dashboard_blocking_code(row.blocking_reason()).into(),
+                    blocking_code: crate::task_view::queue_blocking_code(row.blocking_reason())
+                        .into(),
                 })
             })
             .collect()
@@ -197,16 +197,6 @@ fn project_command_summary(summary: &CommandSummary) -> DashboardCommandSummary 
             mode: DashboardCommandMode::Shell,
             arg_count: None,
         },
-    }
-}
-
-fn dashboard_blocking_code(reason: Option<&QueueBlockingReason>) -> &'static str {
-    match reason {
-        Some(QueueBlockingReason::PinnedWorkerBusy { .. }) => "PINNED_WORKER_BUSY",
-        Some(QueueBlockingReason::CapabilityMissing { .. }) => "CAPABILITY_MISSING",
-        Some(QueueBlockingReason::RunCap) => "RUN_MAX_PARALLEL",
-        Some(QueueBlockingReason::NoEligibleWorker) => "NO_COMPATIBLE_IDLE_WORKER",
-        None => "WAITING_FOR_DISPATCH",
     }
 }
 

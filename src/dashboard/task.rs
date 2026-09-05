@@ -17,7 +17,8 @@ use crate::{
     task::{LocalTaskRecord, TaskId, TaskState, TaskStatus, TurnId},
     task_store::TaskStatusRequest,
     task_view::{
-        TaskDetailProjection, TaskFreshness, TaskViewError, project_task_detail, project_task_list,
+        TaskDetailProjection, TaskFreshness, TaskViewError, project_task_detail,
+        project_task_list_with_blocking_codes,
     },
 };
 
@@ -155,6 +156,7 @@ pub(crate) fn collect_task_projection(
 ) -> Result<DashboardTaskCollection, DashboardError> {
     let records = state.list_tasks().map_err(map_local_error)?;
     let runs = state.list_runs().map_err(map_local_error)?;
+    let blocking_codes = state.task_blocking_codes(config).map_err(map_local_error)?;
     let started = Instant::now();
     let mut effective_records = Vec::with_capacity(records.len());
     let mut runner_states = HashMap::with_capacity(records.len());
@@ -200,8 +202,14 @@ pub(crate) fn collect_task_projection(
         freshness.insert(task_id, task_freshness);
     }
 
-    let projection = project_task_list(&effective_records, &runs, &runner_states, &freshness)
-        .map_err(map_task_view_error)?;
+    let projection = project_task_list_with_blocking_codes(
+        &effective_records,
+        &runs,
+        &runner_states,
+        &freshness,
+        &blocking_codes,
+    )
+    .map_err(map_task_view_error)?;
     Ok(DashboardTaskCollection { projection, errors })
 }
 
