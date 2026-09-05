@@ -93,6 +93,10 @@ fn ambiguous_agent_auth_output_is_not_projected_as_authenticated() {
         opencode.classify(&result(br#"{"status":"ok"}"#)),
         AuthProbeResult::Unknown
     );
+    assert_eq!(
+        opencode.classify(&result(br#"{"version":"1"}"#)),
+        AuthProbeResult::Unknown
+    );
 }
 
 #[derive(Clone, Default)]

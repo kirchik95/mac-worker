@@ -134,27 +134,16 @@ fn classify_opencode_auth(result: &ProcessResult) -> AuthProbeResult {
 }
 
 fn classify_provider_object(values: &serde_json::Map<String, Value>) -> AuthProbeResult {
-    if let Some(providers) = values.get("providers") {
-        return match providers {
-            Value::Array(values) if values.is_empty() => AuthProbeResult::Unauthenticated,
-            Value::Array(values) if values.iter().any(is_configured_provider) => {
-                AuthProbeResult::Authenticated
-            }
-            Value::Array(_) => AuthProbeResult::Unknown,
-            _ => AuthProbeResult::Unknown,
-        };
-    }
-    if values.is_empty()
-        || values.keys().any(|key| {
-            matches!(
-                key.to_ascii_lowercase().as_str(),
-                "error" | "message" | "status" | "authenticated" | "loggedin"
-            )
-        })
-    {
-        AuthProbeResult::Unknown
-    } else {
-        AuthProbeResult::Authenticated
+    let Some(providers) = values.get("providers") else {
+        return AuthProbeResult::Unknown;
+    };
+    match providers {
+        Value::Array(values) if values.is_empty() => AuthProbeResult::Unauthenticated,
+        Value::Array(values) if values.iter().any(is_configured_provider) => {
+            AuthProbeResult::Authenticated
+        }
+        Value::Array(_) => AuthProbeResult::Unknown,
+        _ => AuthProbeResult::Unknown,
     }
 }
 
