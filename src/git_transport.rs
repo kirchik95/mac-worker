@@ -28,6 +28,7 @@ const GIT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const GIT_CONFIG_GLOBAL: &str = "GIT_CONFIG_GLOBAL";
 const GIT_CONFIG_NOSYSTEM: &str = "GIT_CONFIG_NOSYSTEM";
 const GIT_TERMINAL_PROMPT: &str = "GIT_TERMINAL_PROMPT";
+const ORIGIN_GIT_SSH_COMMAND: &str = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes";
 const ORIGIN_PREFLIGHT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const ORIGIN_PREFLIGHT_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -144,7 +145,7 @@ impl<'a> GitTransport<'a> {
             .runner
             .run(&git_request(
                 mirror.path(),
-                None,
+                Some(ORIGIN_GIT_SSH_COMMAND.to_owned()),
                 vec![
                     OsString::from("fetch"),
                     OsString::from("--no-write-fetch-head"),
@@ -178,7 +179,7 @@ impl<'a> GitTransport<'a> {
             .runner
             .run(&git_request(
                 mirror.path(),
-                None,
+                Some(ORIGIN_GIT_SSH_COMMAND.to_owned()),
                 vec![
                     OsString::from("push"),
                     OsString::from("--no-verify"),
@@ -473,6 +474,7 @@ fn origin_request(origin: String) -> ProcessRequest {
         program: GIT_PROGRAM.into(),
         args: vec![OsString::from("ls-remote"), origin.into()],
         environment: vec![
+            ("GIT_SSH_COMMAND".into(), ORIGIN_GIT_SSH_COMMAND.into()),
             (GIT_CONFIG_GLOBAL.into(), "/dev/null".into()),
             (GIT_CONFIG_NOSYSTEM.into(), "1".into()),
             (GIT_TERMINAL_PROMPT.into(), "0".into()),

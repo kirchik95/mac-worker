@@ -109,6 +109,11 @@ fn origin_preflight_requires_the_exact_advertised_object_and_redacts_the_url() {
         request.args[1], "https://example.test/repo.git",
         "only the normalized origin may reach Git"
     );
+    assert!(request.environment.iter().any(|(name, value)| {
+        name == "GIT_SSH_COMMAND"
+            && value
+                == "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
+    }));
     assert!(!format!("{error:?}").contains("secret"));
 }
 
@@ -164,6 +169,11 @@ fn origin_fetch_uses_only_the_normalized_url_and_exact_base_oid() {
     );
     assert!(args.iter().any(|arg| arg == base.as_str()));
     assert!(!args.iter().any(|arg| arg.contains("secret")));
+    assert!(request.environment.iter().any(|(name, value)| {
+        name == "GIT_SSH_COMMAND"
+            && value
+                == "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
+    }));
 }
 
 #[test]
@@ -195,6 +205,11 @@ fn origin_push_uses_the_fixed_task_ref_and_normalized_destination() {
         args.iter()
             .any(|arg| { arg == &format!("refs/heads/task/{task}:refs/heads/release-candidate") })
     );
+    assert!(request.environment.iter().any(|(name, value)| {
+        name == "GIT_SSH_COMMAND"
+            && value
+                == "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
+    }));
     assert!(!args.iter().any(|arg| arg.contains("secret")));
 }
 
