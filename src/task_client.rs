@@ -776,6 +776,10 @@ impl<'a> TaskClient<'a> {
         } else {
             self.client_state.park_row(entry.job_id())?;
         }
+        // The submitter no longer needs the repository after the queue row is
+        // handed off.  Release its per-repository lock before an attached
+        // runner reopens the same repository in this process.
+        drop(transfer);
 
         let mut report = self.report_for(task_id)?;
         report.events.push(event_task_created(&report));
