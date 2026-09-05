@@ -806,7 +806,7 @@ impl<'a> TaskStore<'a> {
         } else {
             TaskState::Closed
         };
-        let status = replace_status_record(&task, status, next_state, None)?;
+        let status = replace_status_record_at(&task, status, next_state, None, now_millis()?)?;
 
         if task.entry_exists("workspace")? {
             task.validate_private_entry("workspace")?;
@@ -1809,6 +1809,22 @@ fn replace_status_record(
     state: TaskState,
     session_present: Option<bool>,
 ) -> Result<TaskStatus, WorkerError> {
+    replace_status_record_at(
+        directory,
+        current.clone(),
+        state,
+        session_present,
+        current.updated_at_millis(),
+    )
+}
+
+fn replace_status_record_at(
+    directory: &RootedDir,
+    current: TaskStatus,
+    state: TaskState,
+    session_present: Option<bool>,
+    updated_at_millis: u64,
+) -> Result<TaskStatus, WorkerError> {
     let next = TaskStatus::new(
         state,
         current.last_outcome().cloned(),
@@ -1820,7 +1836,7 @@ fn replace_status_record(
         current.files_changed().to_vec(),
         current.diff_stat().map(str::to_owned),
         current.turns().to_vec(),
-        current.updated_at_millis(),
+        updated_at_millis,
     )?;
     replace_status_bytes(directory, current, next.clone())?;
     Ok(next)

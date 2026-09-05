@@ -24,7 +24,7 @@ use mac_worker::{
     protocol::MemoryPressure,
     task::{
         BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskState,
+        TaskMetaInput, TaskState, TaskStatus,
     },
     task_store::{
         MAX_DIFF_BYTES, SessionBinding, TaskCloseRequest, TaskDiffRequest, TaskPrepareRequest,
@@ -180,6 +180,32 @@ fn prepare_task_for(
             &transfer,
         )
         .unwrap();
+}
+
+fn rewrite_status(store: &HostStore, task: TaskId, state: TaskState, updated_at_millis: u64) {
+    let status = store.task_status(PROJECT_ID, task).unwrap();
+    let replacement = TaskStatus::new(
+        state,
+        status.last_outcome().cloned(),
+        status.worker().map(str::to_owned),
+        status.session_present(),
+        status.head_oid().cloned(),
+        status.summary().map(str::to_owned),
+        status.questions().to_vec(),
+        status.files_changed().to_vec(),
+        status.diff_stat().map(str::to_owned),
+        status.turns().to_vec(),
+        updated_at_millis,
+    )
+    .unwrap();
+    fs::write(
+        store
+            .task_dir(PROJECT_ID, task)
+            .unwrap()
+            .join("status.json"),
+        serde_json::to_vec(&replacement).unwrap(),
+    )
+    .unwrap();
 }
 
 #[derive(Clone)]
@@ -597,6 +623,25 @@ fn discard_keeps_task_intact_when_the_mirror_is_missing() {
         store.task_status(PROJECT_ID, task_id()).unwrap().state(),
         TaskState::Open
     );
+}
+
+#[test]
+fn explicit_close_refreshes_the_task_retention_timestamp() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    acquire_lease(&store);
+    prepare_task(&store, base_oid);
+    TaskStore::new(&store, &SystemProcessRunner)
+        .publish_branch_into_mirror(PROJECT_ID, task_id())
+        .unwrap();
+    rewrite_status(&store, task_id(), TaskState::Open, 1);
+
+    TaskStore::new(&store, &SystemProcessRunner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap();
+
+    let status = store.task_status(PROJECT_ID, task_id()).unwrap();
+    assert_eq!(status.state(), TaskState::Closed);
+    assert!(status.updated_at_millis() > 1);
 }
 
 #[test]
