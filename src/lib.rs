@@ -1548,6 +1548,18 @@ struct GcFleetReport {
     transfer: GcReport,
 }
 
+fn protected_transfer_repo_ids(tasks: Vec<crate::task::LocalTaskRecord>) -> Vec<String> {
+    tasks
+        .into_iter()
+        .filter(|task| {
+            !task.status().state().is_terminal()
+                || task.runner().is_some()
+                || task.fetched_head().is_none()
+        })
+        .map(|task| task.repo_id().to_owned())
+        .collect()
+}
+
 fn run_gc_command(
     config_override: Option<PathBuf>,
     runtime: &RuntimeContext,
@@ -1562,12 +1574,7 @@ fn run_gc_command(
         let config = Config::load(&paths.config)?;
         let client_state = ClientStateStore::open(&paths.state)?;
         let now = current_time_millis()?;
-        let protected_repo_ids = client_state
-            .list_tasks()?
-            .into_iter()
-            .filter(|task| !task.status().state().is_terminal() || task.runner().is_some())
-            .map(|task| task.repo_id().to_owned())
-            .collect::<Vec<_>>();
+        let protected_repo_ids = protected_transfer_repo_ids(client_state.list_tasks()?);
         let transfer =
             TransferGc::new(&paths.cache, runner).with_protected_repo_ids(protected_repo_ids);
         let transfer = if apply {
@@ -2461,7 +2468,86 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::{config::Config, error::WorkerError, paths::PathLayout, task::ClosePolicy};
+    use uuid::Uuid;
+
+    use crate::{
+        agent::{AgentKind, PermissionPolicy},
+        config::Config,
+        error::WorkerError,
+        job::JobId,
+        paths::PathLayout,
+        task::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits,
+            TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary,
+            TurnTerminal,
+        },
+    };
+
+    fn terminal_task_record(fetched_head: Option<BaseOid>) -> LocalTaskRecord {
+        let task_id = TaskId::new(Uuid::from_u128(1));
+        let base_oid: BaseOid = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
+        let meta = TaskMeta::new(TaskMetaInput {
+            task_id,
+            run_id: None,
+            project_id: "a".repeat(64),
+            worktree_id: "b".repeat(64),
+            agent: AgentKind::Codex,
+            model: None,
+            policy: PermissionPolicy::Workspace,
+            source: TaskSource::Local { wip: false },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            base_oid: base_oid.clone(),
+            limits: TaskLimits::default(),
+            close_policy: ClosePolicy::Never,
+            env_profile: None,
+            git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+            title: None,
+            prompt: "retain until fetched".into(),
+            created_at_millis: 1,
+        })
+        .unwrap();
+        let status = TaskStatus::new(
+            TaskState::Closed,
+            Some(TaskOutcome::Done),
+            Some("mini-1".into()),
+            false,
+            Some(base_oid.clone()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec![TurnSummary::new(
+                1,
+                JobId::new(Uuid::from_u128(2)),
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+                Some(true),
+                false,
+                Some(1),
+                Some(2),
+            )],
+            2,
+        )
+        .unwrap();
+        let repo_id = if fetched_head.is_some() {
+            "d".repeat(64)
+        } else {
+            "c".repeat(64)
+        };
+        LocalTaskRecord::new(
+            meta,
+            status,
+            None,
+            None,
+            fetched_head,
+            repo_id,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn task_close_policy_defaults_to_done() {
@@ -2469,6 +2555,18 @@ mod tests {
             super::parse_task_close_policy(None).unwrap(),
             ClosePolicy::Done
         );
+    }
+
+    #[test]
+    fn terminal_tasks_without_fetched_results_protect_their_transfer_repo() {
+        let pending = terminal_task_record(None);
+        let fetched = terminal_task_record(Some(
+            "0123456789abcdef0123456789abcdef01234567".parse().unwrap(),
+        ));
+
+        let protected = super::protected_transfer_repo_ids(vec![pending, fetched]);
+
+        assert_eq!(protected, vec!["c".repeat(64)]);
     }
 
     #[test]
