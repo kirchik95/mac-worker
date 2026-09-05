@@ -696,6 +696,7 @@ fn alternates_write_does_not_follow_a_symlink() {
     let alternates = transfer.path().join("objects/info/alternates");
     fs::remove_file(&alternates).unwrap();
     symlink(&planted, &alternates).unwrap();
+    drop(transfer);
 
     let error = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap_err();
     assert!(

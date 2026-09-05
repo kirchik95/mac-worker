@@ -1,7 +1,10 @@
 #[allow(dead_code)]
 mod support;
 
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    fs, os::unix::fs::PermissionsExt, path::Path, process::Command, sync::mpsc, thread,
+    time::Duration,
+};
 
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy},
@@ -792,6 +795,7 @@ fn transfer_gc_previews_and_removes_only_an_unreferenced_empty_transfer_repo() {
             .unwrap();
     let repo_path = transfer.path().to_path_buf();
     let repo_id = transfer.repo_id().to_owned();
+    drop(transfer);
     let malformed_path = temp.path().join("cache/transfer/not-a-transfer-repo");
     fs::create_dir_all(&malformed_path).unwrap();
     fs::set_permissions(&malformed_path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -816,6 +820,33 @@ fn transfer_gc_previews_and_removes_only_an_unreferenced_empty_transfer_repo() {
 }
 
 #[test]
+fn transfer_gc_waits_for_a_live_transfer_repository_handle() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"base\n");
+    source.commit_all("base");
+    let transfer =
+        TransferRepo::open_or_create(&temp.path().join("cache"), &source.root().join(".git"))
+            .unwrap();
+    let cache = temp.path().join("cache");
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let runner = SystemProcessRunner;
+        let report = TransferGc::new(&cache, &runner).preview_at(u64::MAX / 2);
+        sender.send(report).unwrap();
+    });
+
+    assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(transfer);
+    let report = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("transfer GC should continue after the repository handle drops")
+        .unwrap();
+    assert_eq!(report.candidates().len(), 1);
+    handle.join().unwrap();
+}
+
+#[test]
 fn transfer_gc_keeps_a_repo_with_a_live_base_ref() {
     let temp = tempfile::tempdir().unwrap();
     let source = GitRepo::init();
@@ -828,6 +859,7 @@ fn transfer_gc_keeps_a_repo_with_a_live_base_ref() {
     let repo_path = transfer.path().to_path_buf();
     let task = task_id(1);
     set_ref(&repo_path, &format!("refs/mac-worker/bases/{task}"), &oid);
+    drop(transfer);
 
     let report = TransferGc::new(&temp.path().join("cache"), &SystemProcessRunner)
         .apply_at(u64::MAX / 2)
@@ -850,6 +882,7 @@ fn transfer_gc_can_collect_stale_result_refs_without_collecting_base_refs() {
     let repo_id = transfer.repo_id().to_owned();
     let task = task_id(1);
     set_ref(&repo_path, &format!("refs/mac-worker/results/{task}"), &oid);
+    drop(transfer);
 
     let report = TransferGc::new(&temp.path().join("cache"), &SystemProcessRunner)
         .preview_at(u64::MAX / 2)

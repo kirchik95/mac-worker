@@ -1,11 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    fs,
+    fmt,
+    fs::{self, File},
     io::{self, Read},
+    os::fd::AsRawFd,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::Arc,
     time::Duration,
 };
 
@@ -125,12 +128,44 @@ impl ImportReceipt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferRepo {
     path: PathBuf,
     repo_id: String,
     alternates_target: PathBuf,
+    _repo_lock: Arc<File>,
 }
+
+impl fmt::Debug for TransferRepo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransferRepo")
+            .field("path", &self.path)
+            .field("repo_id", &self.repo_id)
+            .field("alternates_target", &self.alternates_target)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for TransferRepo {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            repo_id: self.repo_id.clone(),
+            alternates_target: self.alternates_target.clone(),
+            _repo_lock: self._repo_lock.clone(),
+        }
+    }
+}
+
+impl PartialEq for TransferRepo {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.repo_id == other.repo_id
+            && self.alternates_target == other.alternates_target
+    }
+}
+
+impl Eq for TransferRepo {}
 
 /// Garbage collection for the MacBook-side transfer namespace.  A transfer
 /// repository is eligible only when it has no base refs, contains only stale
@@ -181,7 +216,8 @@ impl<'a> TransferGc<'a> {
         let mut candidates = Vec::new();
         let mut warnings = Vec::new();
         for raw_name in parent.list_names()? {
-            if raw_name.as_slice() == b".mac-worker-rooted-fs" {
+            if raw_name.as_slice() == b".mac-worker-rooted-fs" || is_transfer_lock_entry(&raw_name)
+            {
                 continue;
             }
             let result =
@@ -225,6 +261,7 @@ impl<'a> TransferGc<'a> {
         if self.protected_repo_ids.contains(repo_id) {
             return Ok(());
         }
+        let _repo_lock = lock_transfer_repo(parent, repo_id)?;
         let repo = parent
             .open_child_directory(&relative_transfer(name)?, false)
             .map_err(WorkerError::Io)?;
@@ -255,6 +292,7 @@ impl<'a> TransferGc<'a> {
         if !is_lower_hex(repo_id, 64) || self.protected_repo_ids.contains(repo_id) {
             return Ok(false);
         }
+        let _repo_lock = lock_transfer_repo(parent, repo_id)?;
         let name = format!("{repo_id}.git");
         if !parent.entry_exists(&name)? {
             return Ok(false);
@@ -283,6 +321,24 @@ fn push_transfer_record_warning(warnings: &mut Vec<String>, error: &WorkerError)
     if warnings.len() < 64 && !warnings.iter().any(|existing| existing == warning) {
         warnings.push(warning.to_owned());
     }
+}
+
+fn lock_transfer_repo(parent: &RootedDir, repo_id: &str) -> Result<Arc<File>, WorkerError> {
+    let file = parent.open_private_lock(&format!("{repo_id}.lock"))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(WorkerError::Io(io::Error::last_os_error()));
+    }
+    Ok(Arc::new(file))
+}
+
+fn is_transfer_lock_entry(raw_name: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(raw_name) else {
+        return false;
+    };
+    let Some(repo_id) = name.strip_suffix(".lock") else {
+        return false;
+    };
+    is_lower_hex(repo_id, 64)
 }
 
 fn relative_transfer(path: &str) -> Result<RelativePath, WorkerError> {
@@ -318,7 +374,8 @@ impl TransferRepo {
             fs::canonicalize(cache_root).map_err(WorkerError::Io)?
         };
         let transfer_parent = cache_root.join("transfer");
-        let _transfer_ns = open_or_create_owner_only_dir(&transfer_parent)?;
+        let transfer_ns = open_or_create_owner_only_dir(&transfer_parent)?;
+        let repo_lock = lock_transfer_repo(&transfer_ns, &repo_id)?;
         let path = transfer_parent.join(format!("{repo_id}.git"));
         let repo_dir = open_or_create_owner_only_dir(&path)?;
         if !repo_dir.entry_exists("HEAD")? {
@@ -341,6 +398,7 @@ impl TransferRepo {
             path,
             repo_id,
             alternates_target,
+            _repo_lock: repo_lock,
         };
         transfer.verify_alternates()?;
         Ok(transfer)
