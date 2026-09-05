@@ -1167,7 +1167,12 @@ fn assert_submit_rolls_back_post_create_state(
             )
         })
         .unwrap();
-    state.inject_write_failure_once(fault);
+    if fault == ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement {
+        state.inject_write_failure_once(ClientStateWritePoint::BeforeSubmissionReport);
+        state.inject_submission_rollback_cleanup_failure_once(fault);
+    } else {
+        state.inject_write_failure_once(fault);
+    }
 
     let error = client
         .submit(
@@ -1230,7 +1235,50 @@ fn assert_submit_rolls_back_post_create_state(
         let task = state.list_tasks().unwrap().pop().unwrap();
         assert_eq!(task.status().state(), TaskState::Abandoned);
         assert_eq!(task.abandon_code(), Some("SUBMISSION_ROLLBACK_INCOMPLETE"));
-        if fault == ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval {
+        if fault == ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement {
+            let task_id = task.meta().task_id();
+            assert!(state.queue_entry_for_task_turn(task_id).unwrap().is_none());
+            assert_eq!(state.queue_snapshot().unwrap().entries().len(), 1);
+            assert!(
+                std::fs::metadata(paths.state.join("turns").join(task_id.to_string())).is_err()
+            );
+            assert!(
+                state
+                    .load_run(run_id)
+                    .unwrap()
+                    .publish_branches()
+                    .is_empty()
+            );
+            let project =
+                mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+            let transfer =
+                TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
+            assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
+
+            let reopened = ClientStateStore::open(&paths.state).unwrap();
+            let recovered = reopened.load_task(task_id).unwrap();
+            assert_eq!(
+                recovered.abandon_code(),
+                Some("SUBMISSION_ROLLBACK_INCOMPLETE")
+            );
+            let recovered_client = TaskClient::new(&runner, &config, &paths, &reopened, &executor);
+            recovered_client.reconcile_runners().unwrap();
+            assert!(reopened.list_tasks().unwrap().is_empty());
+            assert!(reopened.queue_snapshot().unwrap().entries().is_empty());
+            assert!(
+                reopened
+                    .load_run(run_id)
+                    .unwrap()
+                    .publish_branches()
+                    .is_empty()
+            );
+            let turn_entries = std::fs::read_dir(paths.state.join("turns"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(turn_entries, vec![".mac-worker-rooted-fs"]);
+            assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
+        } else if fault == ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval {
             assert!(
                 state
                     .queue_entry_for_task_turn(task.meta().task_id())
@@ -1248,21 +1296,23 @@ fn assert_submit_rolls_back_post_create_state(
                     .is_ok()
             );
         }
-        client.reconcile_runners().unwrap();
-        assert!(state.list_tasks().unwrap().is_empty());
-        assert!(state.queue_snapshot().unwrap().entries().is_empty());
-        assert!(
-            state
-                .load_run(run_id)
-                .unwrap()
-                .publish_branches()
-                .is_empty()
-        );
-        assert!(
-            repo.git(&["for-each-ref", "refs/mac-worker/bases"])
-                .stdout
-                .is_empty()
-        );
+        if fault != ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement {
+            client.reconcile_runners().unwrap();
+            assert!(state.list_tasks().unwrap().is_empty());
+            assert!(state.queue_snapshot().unwrap().entries().is_empty());
+            assert!(
+                state
+                    .load_run(run_id)
+                    .unwrap()
+                    .publish_branches()
+                    .is_empty()
+            );
+            let project =
+                mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+            let transfer =
+                TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
+            assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{}", task.meta().task_id())));
+        }
     }
 }
 
@@ -1366,11 +1416,11 @@ fn submit_rolls_back_the_effective_default_run_publish_branch() {
 }
 
 #[test]
-fn restart_after_post_record_retirement_fault_leaves_no_unmarked_submission_artifacts() {
+fn restart_recovers_after_turn_tree_retirement_fault_with_a_durable_rollback_marker() {
     assert_submit_rolls_back_post_create_state(
-        ClientStateWritePoint::AfterTaskSubmissionRecordRemoval,
-        "after task submission record removal",
-        true,
+        ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement,
+        "before submission report",
+        false,
         false,
         false,
     );

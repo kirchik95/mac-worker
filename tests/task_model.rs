@@ -1,5 +1,9 @@
+#[allow(dead_code)]
+mod support;
+
 use mac_worker::{
     agent::{AdapterError, AgentKind, AgentOutcome, PermissionPolicy, TurnLimits},
+    client_state::ClientStateStore,
     error::{ExitKind, WorkerError},
     job::{JobId, ProcessIdentity},
     task::{
@@ -16,6 +20,7 @@ const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const BASE_OID: &str = "0123456789abcdef0123456789abcdef01234567";
 const REPO_ID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const LEGACY_FETCH_ONLY_LOCAL_RECORD: &str = r#"{"meta":{"task_id":"00000000000000000000000000000001","run_id":"00000000000000000000000000000002","project_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","worktree_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","agent":"codex","model":"gpt-5","policy":"workspace","source":{"kind":"local","wip":false},"publish":["fetch"],"publish_branch":null,"base_oid":"0123456789abcdef0123456789abcdef01234567","limits":{"turn":{"timeout_millis":1800000,"max_turns":null,"max_budget_usd_cents":null},"max_followups":10},"close_policy":"done","env_profile":null,"git_identity":{"name":"Ada Lovelace","email":"ada@example.test"},"title":"Fix the flaky login spec","created_at_millis":1700000000000},"status":{"state":"queued","last_outcome":null,"worker":null,"session_present":false,"head_oid":null,"summary":null,"questions":[],"files_changed":[],"diff_stat":null,"turns":[{"turn_number":1,"turn_id":"018f0f4a6b5c7d8e9f00112233445566","terminal":null,"outcome":null,"agent_committed":null,"log_truncated":false,"started_at_millis":null,"ended_at_millis":null}],"updated_at_millis":1700000000000},"status_observed_at_millis":null,"runner":{"pid":42,"start_time_micros":1700000000001},"fetched_head":null,"repo_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","pinned_worker":"mini-1","wait_for_capacity":true,"abandon_code":null}"#;
 
 fn task_id() -> TaskId {
     TaskId::new(Uuid::from_u128(1))
@@ -335,12 +340,31 @@ fn local_task_record_never_persists_the_transfer_alternates_path() {
 }
 
 #[test]
-fn legacy_fetch_only_local_records_retain_their_canonical_bytes_without_push_target() {
-    let current = String::from_utf8(sample_record().canonical_bytes().unwrap()).unwrap();
-    let legacy = current.replace(",\"push_target\":null", "");
-    let parsed: LocalTaskRecord = serde_json::from_str(&legacy).unwrap();
+fn legacy_fetch_only_local_record_remains_canonical_when_reopened_through_client_state() {
+    let parsed: LocalTaskRecord = serde_json::from_str(LEGACY_FETCH_ONLY_LOCAL_RECORD).unwrap();
+    assert_eq!(
+        parsed.canonical_bytes().unwrap(),
+        LEGACY_FETCH_ONLY_LOCAL_RECORD.as_bytes()
+    );
 
-    assert_eq!(parsed.canonical_bytes().unwrap(), legacy.as_bytes());
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    state.create_task(parsed.clone()).unwrap();
+    let record_path = paths
+        .state
+        .join("tasks")
+        .join(format!("{}.json", parsed.meta().task_id()));
+    std::fs::write(&record_path, LEGACY_FETCH_ONLY_LOCAL_RECORD).unwrap();
+    drop(state);
+
+    let reopened = ClientStateStore::open(&paths.state).unwrap();
+    assert_eq!(reopened.load_task(parsed.meta().task_id()).unwrap(), parsed);
+    assert_eq!(reopened.list_tasks().unwrap(), vec![parsed]);
+    assert_eq!(
+        std::fs::read(record_path).unwrap(),
+        LEGACY_FETCH_ONLY_LOCAL_RECORD.as_bytes()
+    );
 }
 
 #[test]

@@ -94,6 +94,7 @@ pub enum ClientStateWritePoint {
     AfterTaskSubmissionRecordRemoval = 26,
     BeforeSubmissionReport = 27,
     AfterParkedTaskTurnPublication = 28,
+    AfterTaskSubmissionTurnsRetirement = 29,
 }
 
 #[doc(hidden)]
@@ -191,6 +192,7 @@ struct ClientStateInner {
     owner_inspector: Arc<dyn ProcessInspector>,
     concurrency_hook: Option<Arc<dyn ClientStateConcurrencyHook>>,
     write_fault: Arc<AtomicU8>,
+    submission_rollback_cleanup_fault: AtomicU8,
     sync_counts: Arc<SyncCounters>,
     cleanup_pause: Mutex<Option<Arc<CleanupPauseState>>>,
 }
@@ -523,6 +525,7 @@ impl ClientStateStore {
                 owner_inspector,
                 concurrency_hook,
                 write_fault,
+                submission_rollback_cleanup_fault: AtomicU8::new(0),
                 sync_counts,
                 cleanup_pause: Mutex::new(None),
             }),
@@ -1871,7 +1874,21 @@ impl ClientStateStore {
         }
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let turns = self.turns_dir()?;
-        match turns.remove_owned_child(&task_id.to_string()) {
+        let after_durable_turn_tree_retirement = || {
+            if self.take_submission_rollback_cleanup_fault(
+                ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement,
+            ) {
+                return Err(io::Error::other(
+                    injected_failure(ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement)
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        };
+        match turns.remove_owned_child_with_cleanup_hook(
+            &task_id.to_string(),
+            &after_durable_turn_tree_retirement,
+        ) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(WorkerError::Io(error)),
@@ -2272,6 +2289,17 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    pub fn inject_submission_rollback_cleanup_failure_once(&self, point: ClientStateWritePoint) {
+        assert!(matches!(
+            point,
+            ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement
+        ));
+        self.inner
+            .submission_rollback_cleanup_fault
+            .store(point as u8, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
     pub fn submission_report_fault(&self) -> Result<(), WorkerError> {
         if self.take_fault(ClientStateWritePoint::BeforeSubmissionReport) {
             return Err(injected_failure(
@@ -2368,6 +2396,13 @@ impl ClientStateStore {
     fn take_fault(&self, point: ClientStateWritePoint) -> bool {
         self.inner
             .write_fault
+            .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn take_submission_rollback_cleanup_fault(&self, point: ClientStateWritePoint) -> bool {
+        self.inner
+            .submission_rollback_cleanup_fault
             .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
@@ -4834,6 +4869,9 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         ClientStateWritePoint::BeforeTaskRollbackBaseRelease => "before task rollback base release",
         ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval => {
             "before task submission turns removal"
+        }
+        ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement => {
+            "after task submission turns retirement"
         }
     };
     WorkerError::Io(io::Error::other(format!(

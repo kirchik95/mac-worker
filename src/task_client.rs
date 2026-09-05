@@ -1696,7 +1696,7 @@ impl<'a> TaskClient<'a> {
         record: &LocalTaskRecord,
         transfer: &TransferRepo,
     ) {
-        let Ok(pending) = self.mark_submission_rollback(record) else {
+        let Ok(pending) = self.mark_submission_rollback(record, turn_id) else {
             return;
         };
         let _ = self.complete_submission_rollback(Some(turn_id), &pending, transfer);
@@ -1705,6 +1705,7 @@ impl<'a> TaskClient<'a> {
     fn mark_submission_rollback(
         &self,
         record: &LocalTaskRecord,
+        turn_id: TurnId,
     ) -> Result<LocalTaskRecord, WorkerError> {
         if record.abandon_code() == Some(SUBMISSION_ROLLBACK_INCOMPLETE) {
             return Ok(record.clone());
@@ -1713,7 +1714,8 @@ impl<'a> TaskClient<'a> {
         let pending = record
             .clone()
             .with_status(status)?
-            .with_abandon_code(Some(SUBMISSION_ROLLBACK_INCOMPLETE.to_owned()))?;
+            .with_abandon_code(Some(SUBMISSION_ROLLBACK_INCOMPLETE.to_owned()))?
+            .with_submission_rollback_turn_id(turn_id)?;
         // Do not begin compensation until the durable recovery marker exists.
         // A transient replacement race is safe to retry here; if it persists,
         // this returns with the original complete submission untouched.
@@ -1745,7 +1747,8 @@ impl<'a> TaskClient<'a> {
         }
         transfer.release_base(self.runner, record.meta().task_id())?;
         let task_id = record.meta().task_id();
-        let removed_queue = if let Some(turn_id) = turn_id {
+        let removed_queue = if let Some(turn_id) = turn_id.or(record.submission_rollback_turn_id())
+        {
             self.client_state
                 .remove_task_turn_for_submission_rollback(turn_id)?
         } else {

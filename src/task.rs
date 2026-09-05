@@ -1141,6 +1141,7 @@ pub struct LocalTaskRecord {
     pinned_worker: Option<String>,
     wait_for_capacity: bool,
     abandon_code: Option<String>,
+    submission_rollback_turn_id: Option<TurnId>,
 }
 
 impl LocalTaskRecord {
@@ -1166,6 +1167,7 @@ impl LocalTaskRecord {
             pinned_worker,
             wait_for_capacity,
             abandon_code,
+            submission_rollback_turn_id: None,
         };
         record.validate()?;
         Ok(record)
@@ -1212,6 +1214,10 @@ impl LocalTaskRecord {
         self.abandon_code.as_deref()
     }
 
+    pub fn submission_rollback_turn_id(&self) -> Option<TurnId> {
+        self.submission_rollback_turn_id
+    }
+
     pub fn repo_id(&self) -> &str {
         &self.repo_id
     }
@@ -1236,7 +1242,7 @@ impl LocalTaskRecord {
     }
 
     pub fn with_status(&self, status: TaskStatus) -> Result<Self, WorkerError> {
-        Self::new(
+        let mut replacement = Self::new(
             self.meta.clone(),
             status,
             self.status_observed_at_millis,
@@ -1246,14 +1252,16 @@ impl LocalTaskRecord {
             self.pinned_worker.clone(),
             self.wait_for_capacity,
             self.abandon_code.clone(),
-        )
+        )?;
+        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
+        Ok(replacement)
     }
 
     pub fn with_status_observed_at(
         &self,
         observed_at_millis: Option<u64>,
     ) -> Result<Self, WorkerError> {
-        Self::new(
+        let mut replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             observed_at_millis,
@@ -1263,11 +1271,13 @@ impl LocalTaskRecord {
             self.pinned_worker.clone(),
             self.wait_for_capacity,
             self.abandon_code.clone(),
-        )
+        )?;
+        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
+        Ok(replacement)
     }
 
     pub fn with_runner(&self, runner: Option<RunnerIdentity>) -> Result<Self, WorkerError> {
-        Self::new(
+        let mut replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             self.status_observed_at_millis,
@@ -1277,11 +1287,13 @@ impl LocalTaskRecord {
             self.pinned_worker.clone(),
             self.wait_for_capacity,
             self.abandon_code.clone(),
-        )
+        )?;
+        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
+        Ok(replacement)
     }
 
     pub fn with_fetched_head(&self, fetched_head: Option<BaseOid>) -> Result<Self, WorkerError> {
-        Self::new(
+        let mut replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             self.status_observed_at_millis,
@@ -1291,11 +1303,13 @@ impl LocalTaskRecord {
             self.pinned_worker.clone(),
             self.wait_for_capacity,
             self.abandon_code.clone(),
-        )
+        )?;
+        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
+        Ok(replacement)
     }
 
     pub fn with_abandon_code(&self, abandon_code: Option<String>) -> Result<Self, WorkerError> {
-        Self::new(
+        let mut replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             self.status_observed_at_millis,
@@ -1305,7 +1319,16 @@ impl LocalTaskRecord {
             self.pinned_worker.clone(),
             self.wait_for_capacity,
             abandon_code,
-        )
+        )?;
+        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
+        Ok(replacement)
+    }
+
+    pub fn with_submission_rollback_turn_id(&self, turn_id: TurnId) -> Result<Self, WorkerError> {
+        let mut replacement = self.clone();
+        replacement.submission_rollback_turn_id = Some(turn_id);
+        replacement.validate()?;
+        Ok(replacement)
     }
 
     fn validate(&self) -> Result<(), WorkerError> {
@@ -1318,6 +1341,13 @@ impl LocalTaskRecord {
         if let Some(code) = &self.abandon_code {
             validate_optional_text(code, 128, "abandon code")?;
         }
+        if self.submission_rollback_turn_id.is_some()
+            && self.abandon_code.as_deref() != Some("SUBMISSION_ROLLBACK_INCOMPLETE")
+        {
+            return Err(task_config(
+                "submission rollback turn requires an incomplete rollback marker",
+            ));
+        }
         Ok(())
     }
 }
@@ -1325,7 +1355,7 @@ impl LocalTaskRecord {
 impl Serialize for LocalTaskRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("LocalTaskRecord", 9)?;
+        let mut record = serializer.serialize_struct("LocalTaskRecord", 10)?;
         record.serialize_field("meta", &self.meta)?;
         record.serialize_field("status", &self.status)?;
         record.serialize_field("status_observed_at_millis", &self.status_observed_at_millis)?;
@@ -1335,6 +1365,9 @@ impl Serialize for LocalTaskRecord {
         record.serialize_field("pinned_worker", &self.pinned_worker)?;
         record.serialize_field("wait_for_capacity", &self.wait_for_capacity)?;
         record.serialize_field("abandon_code", &self.abandon_code)?;
+        if let Some(turn_id) = self.submission_rollback_turn_id {
+            record.serialize_field("submission_rollback_turn_id", &turn_id)?;
+        }
         record.end()
     }
 }
@@ -1353,9 +1386,11 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             pinned_worker: Option<String>,
             wait_for_capacity: bool,
             abandon_code: Option<String>,
+            #[serde(default)]
+            submission_rollback_turn_id: Option<TurnId>,
         }
         let wire: Wire = deserialize_unique_object(deserializer)?;
-        Self::new(
+        let mut record = Self::new(
             wire.meta,
             wire.status,
             wire.status_observed_at_millis,
@@ -1366,7 +1401,10 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             wire.wait_for_capacity,
             wire.abandon_code,
         )
-        .map_err(de::Error::custom)
+        .map_err(de::Error::custom)?;
+        record.submission_rollback_turn_id = wire.submission_rollback_turn_id;
+        record.validate().map_err(de::Error::custom)?;
+        Ok(record)
     }
 }
 
