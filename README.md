@@ -168,7 +168,7 @@ Agent turns run with the worker account's full access: its files, processes, cac
 
 ## Phase 5d: origin publication, Cursor, and OpenCode
 
-Phase 5d extends the task core with origin-backed bases, optional origin publication, and Cursor and OpenCode turns. Dashboard task views remain phase 5e. Verify the exact installed grammar with the debug-build help before dispatching; the shapes below match `cargo run -q -- task submit --help` and `cargo run -q -- workers --help`.
+Phase 5d extends the task core with origin-backed bases, optional origin publication, Cursor and OpenCode turns, and retention through `worker gc`. Dashboard task views remain phase 5e. Verify the exact installed grammar with the debug-build help before dispatching; the shapes below match `cargo run -q -- task submit --help`, `cargo run -q -- workers --help`, and `cargo run -q -- gc --help`.
 
 ```text
 worker task submit --agent cursor --env-profile agents --prompt-file tasks/fix-login.md
@@ -192,4 +192,4 @@ Profile files are operator-provisioned owner-only files (`~/.config/mac-worker/e
 
 `worker workers --refresh` recollects agent, profile, and Git-identity facts. `worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks without submitting anything.
 
-`worker gc --apply` lands with Task 4 of the publication plan and is not yet a public command on this binary. When that task lands, `worker gc` previews every candidate with a reason and `worker gc --apply` applies the preview: idle open tasks close after task retention (default seven days) while the result branch is preserved; result branches prune after branch retention (default thirty days) or immediately on `worker task close --discard`; empty mirrors and transfer repositories become candidates only when no task or base ref protects them. `gc` never prunes another task's mirror ref. Native session deletion runs on discard only when the installed adapter exposes it.
+`worker gc [OPTIONS]` help prints `--apply`. Without `--apply`, `worker gc` previews every candidate with a reason. `worker gc --apply` applies the preview: idle open tasks close after task retention (default seven days) while the result branch is preserved; result branches prune after branch retention (default thirty days) or immediately on `worker task close --discard`; empty mirrors and transfer repositories become candidates only when no task or base ref protects them. `gc` never prunes another task's mirror ref. Native session deletion runs on discard only when the installed adapter exposes it.

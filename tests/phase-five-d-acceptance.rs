@@ -30,6 +30,7 @@ fn worker_help() -> String {
         command_help(&["task", "--help"]),
         command_help(&["task", "submit", "--help"]),
         command_help(&["workers", "--help"]),
+        command_help(&["gc", "--help"]),
         command_help(&["task", "reconcile", "--help"]),
         command_help(&["task", "close", "--help"]),
     ]
@@ -47,6 +48,8 @@ fn phase_five_d_help_and_readme_document_origin_cursor_opencode_and_gc() {
     assert!(help.contains("Usage: worker workers"));
     assert!(help.contains("--refresh"));
     assert!(help.contains("reconcile"));
+    assert!(help.contains("Usage: worker gc"));
+    assert!(help.contains("--apply"));
 
     let readme = read_repository("README.md");
     for phrase in [
@@ -128,4 +131,11 @@ fn phase_five_d_json_output_keeps_publication_codes_sanitized() {
     help.assert().success().stdout(predicate::str::contains(
         "--publish-branch <PUBLISH_BRANCH>",
     ));
+
+    let mut gc = Command::cargo_bin("worker").unwrap();
+    gc.args(["--json", "gc", "--help"]);
+    gc.assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: worker gc [OPTIONS]"))
+        .stdout(predicate::str::contains("--apply"));
 }

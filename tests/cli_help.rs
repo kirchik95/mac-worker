@@ -24,7 +24,7 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
         .stdout(predicate::str::contains("gc"))
         .stdout(predicate::str::contains("host").not());
 
-    for public_command in ["dashboard", "run", "status", "logs", "cancel", "task"] {
+    for public_command in ["dashboard", "run", "status", "logs", "cancel", "task", "gc"] {
         let mut command = Command::cargo_bin("worker").unwrap();
         command.args([public_command, "--help"]);
         command
@@ -97,8 +97,6 @@ fn task_help_keeps_the_released_option_names_discoverable() {
 
 #[test]
 fn task_submit_help_exposes_origin_publication_and_profile_options() {
-    // Additive Task 1–3 grammar. Task 4 adds `worker gc` to the same help
-    // surface; do not assert that command here.
     let mut submit = Command::cargo_bin("worker").unwrap();
     submit.args(["task", "submit", "--help"]);
     submit
@@ -122,6 +120,17 @@ fn workers_help_exposes_refresh() {
         .success()
         .stdout(predicate::str::contains("Usage: worker workers"))
         .stdout(predicate::str::contains("--refresh"));
+}
+
+#[test]
+fn gc_help_exposes_preview_usage_and_apply() {
+    let mut command = Command::cargo_bin("worker").unwrap();
+    command.args(["gc", "--help"]);
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: worker gc [OPTIONS]"))
+        .stdout(predicate::str::contains("--apply"));
 }
 
 #[test]

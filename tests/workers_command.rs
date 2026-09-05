@@ -1296,8 +1296,8 @@ fn human_unavailable_worker_keeps_error_missing_capabilities_and_unknown_swap_vi
 
 #[test]
 fn workers_output_includes_profile_keyed_facts_without_values() {
-    // Additive Task 1 grammar. Task 4 will add `gc` reports to the same
-    // workers/help surface; do not assert that command here.
+    // Additive Task 1 grammar: workers reports names, secure state, and age
+    // without profile values. Retention reports belong to `worker gc`.
     let planted = "workers-command-profile-value-must-not-escape";
     let output = CommandOutput::Workers(WorkersReport {
         protocol_version: PROTOCOL_VERSION,
