@@ -1,9 +1,11 @@
 use serde_json::Value;
 
+use crate::process::ProcessResult;
+
 use super::{
-    AdapterError, AgentAdapter, AgentEvent, AgentKind, StructuredResult, TurnLaunch, TurnParams,
-    argv_pointer_launch, bound_summary, parse_json_line, require_session_ref,
-    resolve_trailer_result, validate_params,
+    AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthProbe, AuthProbeResult,
+    StructuredResult, TurnLaunch, TurnParams, argv_pointer_launch, bound_summary, combined_output,
+    parse_json_line, require_session_ref, resolve_trailer_result, validate_params,
 };
 
 const ENV_NAMES: [&str; 1] = ["CURSOR_API_KEY"];
@@ -17,6 +19,10 @@ impl AgentAdapter for CursorAdapter {
 
     fn binary(&self) -> &'static str {
         "cursor-agent"
+    }
+
+    fn auth_probe(&self) -> AuthProbe {
+        AuthProbe::new(&["status"], classify_cursor_auth)
     }
 
     fn first_turn(&self, params: &TurnParams) -> Result<TurnLaunch, AdapterError> {
@@ -80,6 +86,20 @@ impl AgentAdapter for CursorAdapter {
             last_message_file,
             &result_candidates(stream),
         ))
+    }
+}
+
+fn classify_cursor_auth(result: &ProcessResult) -> AuthProbeResult {
+    let text = combined_output(result).to_ascii_lowercase();
+    if text.contains("not authenticated")
+        || text.contains("not logged in")
+        || text.contains("unauthenticated")
+    {
+        AuthProbeResult::Unauthenticated
+    } else if text.contains("authenticated") || text.contains("logged in") {
+        AuthProbeResult::Authenticated
+    } else {
+        AuthProbeResult::Unknown
     }
 }
 

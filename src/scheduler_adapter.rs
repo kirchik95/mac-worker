@@ -49,7 +49,13 @@ impl SchedulerProbeAdapter {
                             SlotState::Idle => CandidateSlot::Idle,
                             SlotState::Busy => CandidateSlot::Busy,
                         };
-                        let mut capabilities = probe.capabilities.clone();
+                        let mut capabilities = probe
+                            .capabilities
+                            .iter()
+                            .filter(|capability| !is_origin_capability(capability))
+                            .cloned()
+                            .collect();
+                        append_inventory_origin_capabilities(&mut capabilities, worker);
                         append_agent_capabilities(
                             &mut capabilities,
                             probe.agent_facts.as_ref(),
@@ -77,6 +83,25 @@ impl SchedulerProbeAdapter {
             })
             .collect()
     }
+}
+
+fn append_inventory_origin_capabilities(
+    capabilities: &mut Vec<String>,
+    worker: &crate::config::WorkerEntry,
+) {
+    for capability in worker
+        .capabilities
+        .iter()
+        .filter(|capability| is_origin_capability(capability))
+    {
+        push_unique(capabilities, capability.clone());
+    }
+}
+
+fn is_origin_capability(capability: &str) -> bool {
+    capability
+        .strip_prefix("origin:")
+        .is_some_and(|host| !host.is_empty())
 }
 
 fn append_agent_capabilities(

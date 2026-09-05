@@ -1,9 +1,11 @@
 use serde_json::Value;
 
+use crate::process::ProcessResult;
+
 use super::{
-    AdapterError, AgentAdapter, AgentEvent, AgentKind, StructuredResult, TurnLaunch, TurnParams,
-    argv_pointer_launch, bound_summary, json_i32, parse_json_line, require_session_ref,
-    resolve_trailer_result, validate_params,
+    AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthProbe, AuthProbeResult,
+    StructuredResult, TurnLaunch, TurnParams, argv_pointer_launch, bound_summary, combined_output,
+    json_i32, parse_json_line, require_session_ref, resolve_trailer_result, validate_params,
 };
 
 pub(super) struct OpencodeAdapter;
@@ -15,6 +17,10 @@ impl AgentAdapter for OpencodeAdapter {
 
     fn binary(&self) -> &'static str {
         "opencode"
+    }
+
+    fn auth_probe(&self) -> AuthProbe {
+        AuthProbe::new(&["auth", "list"], classify_opencode_auth)
     }
 
     fn first_turn(&self, params: &TurnParams) -> Result<TurnLaunch, AdapterError> {
@@ -87,6 +93,28 @@ impl AgentAdapter for OpencodeAdapter {
             last_message_file,
             &result_candidates(stream),
         ))
+    }
+}
+
+fn classify_opencode_auth(result: &ProcessResult) -> AuthProbeResult {
+    let text = combined_output(result);
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed.to_ascii_lowercase().contains("no credentials")
+        || trimmed.to_ascii_lowercase().contains("not authenticated")
+    {
+        return AuthProbeResult::Unauthenticated;
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return AuthProbeResult::Unknown;
+    };
+    match value {
+        Value::Array(values) if values.is_empty() => AuthProbeResult::Unauthenticated,
+        Value::Array(_) => AuthProbeResult::Authenticated,
+        Value::Object(values) if values.is_empty() => AuthProbeResult::Unauthenticated,
+        Value::Object(_) => AuthProbeResult::Authenticated,
+        _ => AuthProbeResult::Unknown,
     }
 }
 

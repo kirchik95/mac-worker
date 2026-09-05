@@ -3,6 +3,7 @@ mod codex;
 mod cursor;
 mod opencode;
 
+use crate::process::ProcessResult;
 use claude::ClaudeAdapter;
 use codex::CodexAdapter;
 use cursor::CursorAdapter;
@@ -240,9 +241,42 @@ impl AdapterError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthProbeResult {
+    Authenticated,
+    Unauthenticated,
+    Unknown,
+}
+
+#[derive(Clone, Copy)]
+pub struct AuthProbe {
+    args: &'static [&'static str],
+    classifier: fn(&ProcessResult) -> AuthProbeResult,
+}
+
+impl AuthProbe {
+    pub const fn new(
+        args: &'static [&'static str],
+        classifier: fn(&ProcessResult) -> AuthProbeResult,
+    ) -> Self {
+        Self { args, classifier }
+    }
+
+    pub fn args(&self) -> &'static [&'static str] {
+        self.args
+    }
+
+    pub fn classify(&self, result: &ProcessResult) -> AuthProbeResult {
+        (self.classifier)(result)
+    }
+}
+
 pub trait AgentAdapter: Send + Sync {
     fn kind(&self) -> AgentKind;
     fn binary(&self) -> &'static str;
+    fn auth_probe(&self) -> AuthProbe {
+        default_auth_probe(self.kind())
+    }
     fn first_turn(&self, params: &TurnParams) -> Result<TurnLaunch, AdapterError>;
     fn resume_turn(
         &self,
@@ -287,6 +321,52 @@ pub fn adapter_for(kind: AgentKind) -> &'static dyn AgentAdapter {
         AgentKind::Cursor => &CursorAdapter,
         AgentKind::Opencode => &OpencodeAdapter,
     }
+}
+
+fn default_auth_probe(kind: AgentKind) -> AuthProbe {
+    match kind {
+        AgentKind::Codex => AuthProbe::new(&["login", "status"], classify_codex_auth),
+        AgentKind::Claude => AuthProbe::new(&["auth", "status"], classify_claude_auth),
+        AgentKind::Cursor | AgentKind::Opencode => AuthProbe::new(&[], classify_unknown_auth),
+    }
+}
+
+fn classify_unknown_auth(_result: &ProcessResult) -> AuthProbeResult {
+    AuthProbeResult::Unknown
+}
+
+fn classify_codex_auth(result: &ProcessResult) -> AuthProbeResult {
+    let text = combined_output(result).to_ascii_lowercase();
+    if text.contains("not logged in")
+        || text.contains("logged out")
+        || text.contains("not authenticated")
+    {
+        AuthProbeResult::Unauthenticated
+    } else if text.contains("logged in") {
+        AuthProbeResult::Authenticated
+    } else {
+        AuthProbeResult::Unknown
+    }
+}
+
+fn classify_claude_auth(result: &ProcessResult) -> AuthProbeResult {
+    let Ok(value) = serde_json::from_slice::<Value>(&result.stdout) else {
+        return AuthProbeResult::Unknown;
+    };
+    match value.get("loggedIn").and_then(Value::as_bool) {
+        Some(true) => AuthProbeResult::Authenticated,
+        Some(false) => AuthProbeResult::Unauthenticated,
+        None => AuthProbeResult::Unknown,
+    }
+}
+
+fn combined_output(result: &ProcessResult) -> String {
+    let mut text = String::from_utf8_lossy(&result.stdout).into_owned();
+    if !result.stderr.is_empty() {
+        text.push('\n');
+        text.push_str(&String::from_utf8_lossy(&result.stderr));
+    }
+    text
 }
 
 pub fn render_shell(launch: &TurnLaunch) -> Result<String, AdapterError> {

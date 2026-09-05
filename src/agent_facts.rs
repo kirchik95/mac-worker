@@ -13,7 +13,7 @@ use serde::{
 use serde_json::{Map, Value};
 
 use crate::{
-    agent::{AgentKind, adapter_for},
+    agent::{AgentKind, AuthProbe, AuthProbeResult, adapter_for},
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
 };
 
@@ -400,8 +400,9 @@ where
         let Some(binary) = resolve_binary(runner, adapter.binary()) else {
             continue;
         };
+        let auth_probe = adapter.auth_probe();
         let version = run_version(runner, &binary, login_environment.clone());
-        let auth = run_auth(runner, &binary, kind, login_environment.clone());
+        let auth = run_auth(runner, &binary, &auth_probe, login_environment.clone());
         let auth_by_profile = profiles
             .iter()
             .filter(|profile| profile.profile_is_secure())
@@ -410,7 +411,7 @@ where
                 environment.extend(profile.profile_entries());
                 (
                     profile.profile_name().to_owned(),
-                    run_auth(runner, &binary, kind, environment),
+                    run_auth(runner, &binary, &auth_probe, environment),
                 )
             })
             .collect();
@@ -443,15 +444,6 @@ fn agent_name(kind: AgentKind) -> &'static str {
         AgentKind::Claude => "claude",
         AgentKind::Cursor => "cursor",
         AgentKind::Opencode => "opencode",
-    }
-}
-
-fn auth_args(kind: AgentKind) -> &'static [&'static str] {
-    match kind {
-        AgentKind::Codex => &["login", "status"],
-        AgentKind::Claude => &["auth", "status"],
-        AgentKind::Cursor => &["status"],
-        AgentKind::Opencode => &["auth", "list"],
     }
 }
 
@@ -522,13 +514,13 @@ fn run_version(
 fn run_auth(
     runner: &dyn ProcessRunner,
     binary: &OsString,
-    kind: AgentKind,
+    probe: &AuthProbe,
     environment: Vec<(OsString, OsString)>,
 ) -> AgentAuth {
     let Some(result) = run_process(
         runner,
         binary.clone(),
-        auth_args(kind).iter().map(OsString::from).collect(),
+        probe.args().iter().map(OsString::from).collect(),
         environment,
     ) else {
         return AgentAuth::Unknown;
@@ -541,11 +533,10 @@ fn run_auth(
         return AgentAuth::Unknown;
     }
 
-    match kind {
-        AgentKind::Codex => classify_codex_auth(&result),
-        AgentKind::Claude => classify_claude_auth(&result),
-        AgentKind::Cursor => classify_cursor_auth(&result),
-        AgentKind::Opencode => classify_opencode_auth(&result),
+    match probe.classify(&result) {
+        AuthProbeResult::Authenticated => AgentAuth::Authenticated,
+        AuthProbeResult::Unauthenticated => AgentAuth::Unauthenticated,
+        AuthProbeResult::Unknown => AgentAuth::Unknown,
     }
 }
 
@@ -593,76 +584,6 @@ fn contains_auth_probe_error(result: &ProcessResult) -> bool {
             .iter()
             .any(|marker| text.contains(marker))
         })
-}
-
-fn classify_codex_auth(result: &ProcessResult) -> AgentAuth {
-    let text = combined_output(result).to_ascii_lowercase();
-    if text.contains("not logged in")
-        || text.contains("logged out")
-        || text.contains("not authenticated")
-    {
-        AgentAuth::Unauthenticated
-    } else if text.contains("logged in") {
-        AgentAuth::Authenticated
-    } else {
-        AgentAuth::Unknown
-    }
-}
-
-fn classify_claude_auth(result: &ProcessResult) -> AgentAuth {
-    let Ok(value) = serde_json::from_slice::<Value>(&result.stdout) else {
-        return AgentAuth::Unknown;
-    };
-    match value.get("loggedIn").and_then(Value::as_bool) {
-        Some(true) => AgentAuth::Authenticated,
-        Some(false) => AgentAuth::Unauthenticated,
-        None => AgentAuth::Unknown,
-    }
-}
-
-fn classify_cursor_auth(result: &ProcessResult) -> AgentAuth {
-    let text = combined_output(result).to_ascii_lowercase();
-    if text.contains("not authenticated")
-        || text.contains("not logged in")
-        || text.contains("unauthenticated")
-    {
-        AgentAuth::Unauthenticated
-    } else if text.contains("authenticated") || text.contains("logged in") {
-        AgentAuth::Authenticated
-    } else {
-        AgentAuth::Unknown
-    }
-}
-
-fn classify_opencode_auth(result: &ProcessResult) -> AgentAuth {
-    let text = combined_output(result);
-    let trimmed = text.trim();
-    if trimmed.is_empty()
-        || trimmed.to_ascii_lowercase().contains("no credentials")
-        || trimmed.to_ascii_lowercase().contains("not authenticated")
-    {
-        return AgentAuth::Unauthenticated;
-    }
-
-    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-        return AgentAuth::Unknown;
-    };
-    match value {
-        Value::Array(values) if values.is_empty() => AgentAuth::Unauthenticated,
-        Value::Array(_) => AgentAuth::Authenticated,
-        Value::Object(values) if values.is_empty() => AgentAuth::Unauthenticated,
-        Value::Object(_) => AgentAuth::Authenticated,
-        _ => AgentAuth::Unknown,
-    }
-}
-
-fn combined_output(result: &ProcessResult) -> String {
-    let mut text = String::from_utf8_lossy(&result.stdout).into_owned();
-    if !result.stderr.is_empty() {
-        text.push('\n');
-        text.push_str(&String::from_utf8_lossy(&result.stderr));
-    }
-    text
 }
 
 fn parse_version(output: &[u8]) -> Option<String> {

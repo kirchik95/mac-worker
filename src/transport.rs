@@ -387,7 +387,7 @@ impl<R: ProcessRunner> SshTransport<R> {
                 );
             }
         };
-        let probe: ProbeResponse = match decode_probe_response(response) {
+        let mut probe: ProbeResponse = match decode_probe_response(response) {
             Ok(probe) => probe,
             Err(error) => {
                 return (
@@ -446,6 +446,7 @@ impl<R: ProcessRunner> SshTransport<R> {
             );
         }
 
+        append_inventory_origin_capabilities(worker, &mut probe);
         let missing = missing_capabilities(required_capabilities, &probe);
         if !missing.is_empty() {
             let capability_kind = if required_capabilities == worker.capabilities.as_slice() {
@@ -620,6 +621,24 @@ fn valid_os_version(value: &str) -> bool {
 
 fn valid_capability(value: &str) -> bool {
     valid_lowercase_identifier(value, MAX_CAPABILITY_BYTES)
+}
+
+fn append_inventory_origin_capabilities(worker: &WorkerEntry, probe: &mut ProbeResponse) {
+    for capability in worker
+        .capabilities
+        .iter()
+        .filter(|capability| is_origin_capability(capability))
+    {
+        if !probe.capabilities.contains(capability) {
+            probe.capabilities.push(capability.clone());
+        }
+    }
+}
+
+fn is_origin_capability(capability: &str) -> bool {
+    capability
+        .strip_prefix("origin:")
+        .is_some_and(|host| !host.is_empty())
 }
 
 fn valid_lowercase_identifier(value: &str, max_bytes: usize) -> bool {
