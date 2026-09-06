@@ -97,6 +97,22 @@ fn ambiguous_agent_auth_output_is_not_projected_as_authenticated() {
         opencode.classify(&result(br#"{"version":"1"}"#)),
         AuthProbeResult::Unknown
     );
+    // OpenCode 1.18 prints a decorated human listing, not JSON.
+    let listing = b"\x1b[0m\n\xe2\x94\x8c  Credentials \x1b[90m~/.local/share/opencode/auth.json\n\xe2\x94\x82\n\xe2\x97\x8f  GitHub Copilot \x1b[90moauth\n\xe2\x94\x82\n\xe2\x97\x8f  OpenCode Go \x1b[90mapi\n\xe2\x94\x94\n";
+    assert_eq!(
+        opencode.classify(&result(listing)),
+        AuthProbeResult::Authenticated
+    );
+    let empty_listing =
+        b"\xe2\x94\x8c  Credentials \x1b[90m~/.local/share/opencode/auth.json\n\xe2\x94\x94\n";
+    assert_eq!(
+        opencode.classify(&result(empty_listing)),
+        AuthProbeResult::Unauthenticated
+    );
+    assert_eq!(
+        opencode.classify(&result(b"No credentials found\n")),
+        AuthProbeResult::Unauthenticated
+    );
 }
 
 #[derive(Clone, Default)]

@@ -120,7 +120,7 @@ fn classify_opencode_auth(result: &ProcessResult) -> AuthProbeResult {
     }
 
     let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-        return AuthProbeResult::Unknown;
+        return classify_credentials_listing(trimmed);
     };
     match value {
         Value::Array(values) if values.is_empty() => AuthProbeResult::Unauthenticated,
@@ -131,6 +131,66 @@ fn classify_opencode_auth(result: &ProcessResult) -> AuthProbeResult {
         Value::Object(values) => classify_provider_object(&values),
         _ => AuthProbeResult::Unknown,
     }
+}
+
+/// `opencode auth list` (1.18) prints a decorated human listing rather than
+/// JSON: a `Credentials <store>` header followed by one `<provider> <api|oauth>`
+/// line per stored credential, with ANSI colour codes and box-drawing glyphs.
+/// Any provider line with a credential type is an authenticated store; a
+/// header without provider lines is an unauthenticated one.
+fn classify_credentials_listing(text: &str) -> AuthProbeResult {
+    let plain = strip_ansi(text);
+    let mut saw_header = false;
+    let mut providers = 0usize;
+    for raw in plain.lines() {
+        let line = raw
+            .trim_matches(|character: char| {
+                character.is_whitespace() || !(character.is_ascii_graphic() || character == ' ')
+            })
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("Credentials") {
+            saw_header = true;
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower == "no credentials" || lower == "no credentials found" {
+            return AuthProbeResult::Unauthenticated;
+        }
+        let credential_type = line.rsplit(' ').next().unwrap_or("").to_ascii_lowercase();
+        if matches!(credential_type.as_str(), "api" | "oauth" | "wellknown")
+            && line.len() > credential_type.len() + 1
+        {
+            providers += 1;
+        }
+    }
+    match (saw_header, providers) {
+        (_, count) if count > 0 => AuthProbeResult::Authenticated,
+        (true, 0) => AuthProbeResult::Unauthenticated,
+        _ => AuthProbeResult::Unknown,
+    }
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(character);
+    }
+    out
 }
 
 fn classify_provider_object(values: &serde_json::Map<String, Value>) -> AuthProbeResult {
