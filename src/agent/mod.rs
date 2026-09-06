@@ -31,6 +31,7 @@ pub const SCHEMA_FILE_NAME: &str = "result.schema.json";
 pub const LAST_MESSAGE_FILE_NAME: &str = "last.md";
 pub const PROMPT_FILE_NAME: &str = "prompt.md";
 pub const PROMPT_POINTER: &str = "Read the task from $MAC_WORKER_TURN_DIR/prompt.md and follow it.";
+pub const OPENCODE_RESULT_INSTRUCTION: &str = "OpenCode: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence or add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"questions\", and string-array \"files_changed\".";
 
 const SCHEMA_PLACEHOLDER: &str = "{schema}";
 const LAST_MESSAGE_PLACEHOLDER: &str = "{last_message}";
@@ -42,6 +43,13 @@ pub enum AgentKind {
     Claude,
     Cursor,
     Opencode,
+}
+
+pub fn result_instruction(agent: AgentKind) -> Option<&'static str> {
+    match agent {
+        AgentKind::Opencode => Some(OPENCODE_RESULT_INSTRUCTION),
+        AgentKind::Codex | AgentKind::Claude | AgentKind::Cursor => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -670,8 +678,32 @@ fn resolve_structured_result(
     StructuredResult::unknown()
 }
 
+fn resolve_last_structured_result(
+    last_message_file: Option<&str>,
+    stream_candidates: &[String],
+) -> StructuredResult {
+    for text in last_message_file
+        .into_iter()
+        .chain(stream_candidates.iter().map(String::as_str))
+    {
+        if let Some(result) = parse_last_structured_result(text) {
+            return result;
+        }
+    }
+    StructuredResult::unknown()
+}
+
 fn parse_structured_result(text: &str) -> Option<StructuredResult> {
     let value = extract_json_object(text)?;
+    parse_structured_result_value(value)
+}
+
+fn parse_last_structured_result(text: &str) -> Option<StructuredResult> {
+    let value = extract_last_json_object(text)?;
+    parse_structured_result_value(value)
+}
+
+fn parse_structured_result_value(value: Value) -> Option<StructuredResult> {
     #[derive(Deserialize)]
     #[serde(rename_all = "snake_case")]
     enum WireStatus {
@@ -718,6 +750,23 @@ fn extract_json_object(text: &str) -> Option<Value> {
         Ok(value) if value.is_object() => Some(value),
         _ => None,
     }
+}
+
+fn extract_last_json_object(text: &str) -> Option<Value> {
+    let mut last = None;
+    for (start, character) in text.char_indices() {
+        if character != '{' {
+            continue;
+        }
+        let mut deserializer =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>();
+        if let Some(Ok(value)) = deserializer.next()
+            && value.is_object()
+        {
+            last = Some(value);
+        }
+    }
+    last
 }
 
 fn json_i32(value: &Value, key: &str) -> Option<i32> {

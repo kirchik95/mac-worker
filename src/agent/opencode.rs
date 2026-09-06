@@ -5,7 +5,8 @@ use crate::process::ProcessResult;
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthProbe, AuthProbeResult,
     StructuredResult, TurnLaunch, TurnParams, argv_pointer_launch, bound_summary, combined_output,
-    json_i32, parse_json_line, require_session_ref, resolve_trailer_result, validate_params,
+    json_i32, parse_json_line, require_session_ref, resolve_last_structured_result,
+    validate_params,
 };
 
 pub(super) struct OpencodeAdapter;
@@ -99,7 +100,7 @@ impl AgentAdapter for OpencodeAdapter {
         stream: &str,
         last_message_file: Option<&str>,
     ) -> Result<StructuredResult, AdapterError> {
-        Ok(resolve_trailer_result(
+        Ok(resolve_last_structured_result(
             last_message_file,
             &result_candidates(stream),
         ))

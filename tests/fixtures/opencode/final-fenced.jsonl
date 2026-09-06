@@ -1,0 +1,3 @@
+{"type":"step_start","timestamp":1,"sessionID":"ses_fixture_fenced","part":{"id":"prt_1","messageID":"msg_1","sessionID":"ses_fixture_fenced","type":"step-start"}}
+{"type":"text","timestamp":2,"sessionID":"ses_fixture_fenced","part":{"id":"prt_2","messageID":"msg_1","sessionID":"ses_fixture_fenced","type":"text","text":"```json\n{\"status\":\"done\",\"summary\":\"fenced result\",\"questions\":[],\"files_changed\":[\"fenced.txt\"]}\n```"}}
+{"type":"step_finish","timestamp":3,"sessionID":"ses_fixture_fenced","part":{"id":"prt_3","reason":"stop","messageID":"msg_1","sessionID":"ses_fixture_fenced","type":"step-finish"}}

@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Deserializer};
 
 use crate::{
-    agent::{AgentKind, PermissionPolicy, TurnLimits, adapter_for},
+    agent::{AgentKind, PermissionPolicy, TurnLimits, adapter_for, result_instruction},
     client_state::ClientStateStore,
     config::{Config, WorkerEntry},
     error::WorkerError,
@@ -645,6 +645,7 @@ impl<'a> TaskClient<'a> {
         let composed_prompt = compose_turn_prompt(
             task_id,
             1,
+            request.agent,
             base.oid(),
             initial.context.branch.as_deref(),
             &request.prompt,
@@ -1305,8 +1306,15 @@ impl<'a> TaskClient<'a> {
             .head_oid()
             .cloned()
             .unwrap_or_else(|| record.meta().base_oid().clone());
-        let composed_prompt =
-            compose_turn_prompt(task_id, turn_number, &base_oid, None, &message, true);
+        let composed_prompt = compose_turn_prompt(
+            task_id,
+            turn_number,
+            record.meta().agent(),
+            &base_oid,
+            None,
+            &message,
+            true,
+        );
         validate_prompt(&composed_prompt)?;
         self.client_state
             .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
@@ -2545,6 +2553,7 @@ fn effective_task_limits(
 fn compose_turn_prompt(
     task_id: TaskId,
     turn_number: u32,
+    agent: AgentKind,
     base_oid: &BaseOid,
     branch: Option<&str>,
     user_prompt: &str,
@@ -2556,8 +2565,11 @@ fn compose_turn_prompt(
     } else {
         ""
     };
+    let result_instruction = result_instruction(agent)
+        .map(|instruction| format!("\n\n{instruction}"))
+        .unwrap_or_default();
     format!(
-        "mac-worker task context\n\nTask ID: {task_id}\nTurn: {turn_number}\nBase commit: {base_oid}\nBase branch: {branch}\n\n{continuation}You are working in an isolated task worktree. Make changes only there. Do not switch branches, push, or modify the user's repository. Leave your changes in the task worktree for publication.\n\nUser request:\n{user_prompt}\n"
+        "mac-worker task context\n\nTask ID: {task_id}\nTurn: {turn_number}\nBase commit: {base_oid}\nBase branch: {branch}\n\n{continuation}You are working in an isolated task worktree. Make changes only there. Do not switch branches, push, or modify the user's repository. Leave your changes in the task worktree for publication.\n\nUser request:\n{user_prompt}{result_instruction}\n"
     )
 }
 

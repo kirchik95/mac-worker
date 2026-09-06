@@ -29,6 +29,11 @@ fn fixture(name: &str) -> String {
         .unwrap_or_else(|error| panic!("fixture {name} must be readable: {error}"))
 }
 
+fn opencode_fixture(name: &str) -> String {
+    fs::read_to_string(format!("tests/fixtures/opencode/{name}"))
+        .unwrap_or_else(|error| panic!("OpenCode fixture {name} must be readable: {error}"))
+}
+
 fn fixture_lines(name: &str) -> impl Iterator<Item = String> {
     fixture(name)
         .lines()
@@ -562,6 +567,7 @@ fn render_shell_rejects_an_argument_containing_nul() {
 
 const CURSOR_SESSION: &str = "00000000-0000-4000-8000-0000000000c1";
 const OPENCODE_SESSION: &str = "ses_PLACEHOLDER";
+const OPENCODE_LIVE_SESSION: &str = "ses_f8a1b792bffeJSvEZ94X826hDO";
 
 fn cursor_params(policy: PermissionPolicy) -> TurnParams {
     let mut params = params(policy);
@@ -855,6 +861,62 @@ fn opencode_stream_yields_session_ref_and_normalized_events() {
         AgentEvent::FileChange { paths } if paths == &["src/agent/opencode.rs"]
     )));
     assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
+}
+
+#[test]
+fn opencode_extracts_pure_json_from_the_last_assistant_text_fixture() {
+    let result = adapter_for(AgentKind::Opencode)
+        .extract_result(&opencode_fixture("run-format-json.jsonl"), None)
+        .unwrap();
+    assert_eq!(result.status(), ResultStatus::Done);
+    assert_eq!(result.summary(), "note created");
+    assert_eq!(result.files_changed(), &["note.txt"]);
+}
+
+#[test]
+fn opencode_extracts_json_fence_from_the_last_assistant_text_fixture() {
+    let result = adapter_for(AgentKind::Opencode)
+        .extract_result(&opencode_fixture("final-fenced.jsonl"), None)
+        .unwrap();
+    assert_eq!(result.status(), ResultStatus::Done);
+    assert_eq!(result.summary(), "fenced result");
+    assert_eq!(result.files_changed(), &["fenced.txt"]);
+}
+
+#[test]
+fn opencode_extracts_the_last_json_object_from_prose_fixture() {
+    let result = adapter_for(AgentKind::Opencode)
+        .extract_result(&opencode_fixture("final-prose.jsonl"), None)
+        .unwrap();
+    assert_eq!(result.status(), ResultStatus::NeedsInput);
+    assert_eq!(result.summary(), "review is needed");
+    assert_eq!(result.questions(), &["Which target?"]);
+    assert_eq!(result.files_changed(), &["prose.txt"]);
+}
+
+#[test]
+fn opencode_without_json_remains_unknown() {
+    let result = adapter_for(AgentKind::Opencode)
+        .extract_result(&opencode_fixture("no-result.jsonl"), None)
+        .unwrap();
+    assert_eq!(result.status(), ResultStatus::Unknown);
+}
+
+#[test]
+fn opencode_live_fixture_captures_the_first_event_session_id() {
+    let adapter = adapter_for(AgentKind::Opencode);
+    let events: Vec<AgentEvent> = opencode_fixture("run-format-json.jsonl")
+        .lines()
+        .filter_map(|line| adapter.parse_event(line))
+        .collect();
+    assert!(matches!(
+        events.first(),
+        Some(AgentEvent::SessionStarted { session_ref }) if session_ref == OPENCODE_LIVE_SESSION
+    ));
+    assert_eq!(
+        adapter.session_ref(&events).as_deref(),
+        Some(OPENCODE_LIVE_SESSION)
+    );
 }
 
 #[test]

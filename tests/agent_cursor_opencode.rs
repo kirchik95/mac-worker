@@ -69,6 +69,7 @@ struct HostState {
     calls: Vec<String>,
     session: Option<String>,
     last_shell: String,
+    last_prompt: String,
     child_env: BTreeMap<String, String>,
     task: Option<(TaskMeta, TurnId)>,
     turn_submitted: bool,
@@ -90,6 +91,7 @@ impl RecordingHost {
                 calls: Vec::new(),
                 session: None,
                 last_shell: String::new(),
+                last_prompt: String::new(),
                 child_env: BTreeMap::new(),
                 task: None,
                 turn_submitted: false,
@@ -112,6 +114,10 @@ impl RecordingHost {
 
     fn last_shell(&self) -> String {
         self.state.lock().unwrap().last_shell.clone()
+    }
+
+    fn last_prompt(&self) -> String {
+        self.state.lock().unwrap().last_prompt.clone()
     }
 
     fn child_env(&self, name: &str) -> Option<String> {
@@ -326,8 +332,10 @@ impl ProcessRunner for RecordingHost {
             }
             value if value == HostOperation::TaskTurn.command() => {
                 let turn: TaskTurnRequest = decode_request(request)?;
+                let prompt = turn.prompt().to_owned();
                 let mut state = self.state.lock().unwrap();
                 state.calls.push("task-turn".into());
+                state.last_prompt = prompt;
                 state.turn_submitted = true;
                 if let Some(session) = state.stream_session.clone() {
                     state.session = Some(session);
@@ -541,6 +549,10 @@ impl TaskHarness {
         self.runner.last_shell()
     }
 
+    fn last_prompt(&self) -> String {
+        self.runner.last_prompt()
+    }
+
     fn child_env(&self, name: &str) -> Option<String> {
         self.runner.child_env(name)
     }
@@ -707,6 +719,20 @@ fn opencode_first_turn_includes_auto_and_the_quoted_prompt_pointer() {
     assert!(!harness.last_shell().contains(FIRST_PROMPT));
     assert!(!harness.last_shell().contains("--workspace"));
     assert!(!harness.last_shell().contains("/Users/"));
+}
+
+#[test]
+fn opencode_prompt_requires_an_exact_json_final_message() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let harness = TaskHarness::opencode();
+    harness.submit_first_turn().unwrap();
+    let prompt = harness.last_prompt();
+    assert!(prompt.contains("OpenCode"));
+    assert!(
+        prompt.contains("end your final message with exactly the JSON object and nothing after it")
+    );
+    assert!(prompt.contains("Do not wrap it in a Markdown code fence or add prose"));
+    assert!(prompt.contains("\"files_changed\""));
 }
 
 #[test]

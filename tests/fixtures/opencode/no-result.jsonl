@@ -1,0 +1,3 @@
+{"type":"step_start","timestamp":1,"sessionID":"ses_fixture_missing","part":{"id":"prt_1","messageID":"msg_1","sessionID":"ses_fixture_missing","type":"step-start"}}
+{"type":"text","timestamp":2,"sessionID":"ses_fixture_missing","part":{"id":"prt_2","messageID":"msg_1","sessionID":"ses_fixture_missing","type":"text","text":"I finished the task, but there is no structured result."}}
+{"type":"step_finish","timestamp":3,"sessionID":"ses_fixture_missing","part":{"id":"prt_3","reason":"stop","messageID":"msg_1","sessionID":"ses_fixture_missing","type":"step-finish"}}
