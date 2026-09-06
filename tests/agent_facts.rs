@@ -413,7 +413,10 @@ fn keychain_unlock_failures_are_unknown_with_a_safe_reason() {
     assert!(!text.contains("profile-password"));
     assert!(!text.contains("/tmp/profile.keychain-db"));
     let parsed: AgentFacts = serde_json::from_str(&text).unwrap();
-    assert_eq!(parsed.canonical_bytes().unwrap(), facts.canonical_bytes().unwrap());
+    assert_eq!(
+        parsed.canonical_bytes().unwrap(),
+        facts.canonical_bytes().unwrap()
+    );
 }
 
 #[test]
