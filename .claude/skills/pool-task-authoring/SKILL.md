@@ -1,9 +1,15 @@
 ---
 name: pool-task-authoring
-description: "Turn an objective into independent, testable prompts for headless agents in the mac-worker pool."
+description: "Turn an objective into independent, testable prompts for headless agents in the mac-worker pool. Use before every pool dispatch, on an explicit /pool-task-authoring call, and when the user asks to prepare work for the pool: «подготовь задачи для пула», «нарежь на задачи для mini», «напиши бриф для пула», «prepare tasks for the pool», «write a brief for the workers»."
 ---
 
 # Pool Task Authoring
+
+## When To Use
+
+- Before every `pool-dispatch` submit that does not already have a prompt file.
+- The user invokes `/pool-task-authoring` explicitly.
+- The user asks to prepare, slice, or brief work for the pool: «подготовь задачи для пула», «нарежь на задачи для mini», «напиши бриф для пула», "prepare tasks for the pool", "write a brief for the workers".
 
 Use this skill to turn an objective into tasks that a headless coding agent can finish in one turn. Keep the text tool-agnostic so it can also be used as `AGENTS.md` material.
 

@@ -1,9 +1,17 @@
 ---
 name: pool-dispatch
-description: "Dispatch independent coding tasks through the mac-worker pool and collect their results."
+description: "Dispatch independent coding tasks through the mac-worker pool and collect their results. Use on an explicit /pool-dispatch call, or whenever the user asks to run work in the pool or on the Mac minis: «отправь выполняться в пул», «отправь в пул», «запусти в пуле», «запусти на mini», «через worker task», «send it to the pool», «run it on the minis», «dispatch to the workers»."
 ---
 
 # Pool Dispatch
+
+## When To Use
+
+- The user invokes `/pool-dispatch` explicitly.
+- The user asks to run work in the pool or on the minis, in any wording: «отправь выполняться в пул», «отправь в пул», «запусти в пуле», «запусти на mini», «через worker task», "send it to the pool", "run it on the minis", "dispatch to the workers".
+- The user asks to check, follow, answer, or fetch a pool task: «что с задачей в пуле», «забери результат», «ответь агенту», "task status", "fetch the result".
+
+Before the first submit, write the brief with `pool-task-authoring` unless the user already supplied a prompt file. Do not send work to the pool on your own initiative without one of the triggers above; when work merely looks parallelisable, say so and ask.
 
 This skill is the mechanical task loop. One task is one independent unit of work. The pool chooses workers. Never choose a worker yourself.
 
