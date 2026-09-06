@@ -1,7 +1,9 @@
 use mac_worker::{
+    agent::Question,
     redaction::{
         MAX_CHANGED_FILE_BYTES, MAX_CHANGED_FILE_COUNT, MAX_FAILURE_REASON_BYTES,
-        MAX_QUESTION_BYTES, MAX_QUESTION_COUNT, MAX_SUMMARY_BYTES, RedactionBoundary,
+        MAX_QUESTION_BYTES, MAX_QUESTION_COUNT, MAX_QUESTION_OPTION_BYTES,
+        MAX_QUESTION_OPTION_COUNT, MAX_SUMMARY_BYTES, RedactionBoundary,
     },
     task::{TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal},
 };
@@ -54,19 +56,39 @@ fn summary_redacts_other_users_home_and_temp_paths() {
 #[test]
 fn questions_redact_and_bound_each_item_and_the_list() {
     let questions = boundary().questions([
-        "open /Users/alice/.env please".to_owned(),
-        "paste sk-live-abcdefghijklmnopqrstuvwxyz".to_owned(),
-        "x".repeat(MAX_QUESTION_BYTES + 40),
+        Question::open("open /Users/alice/.env please"),
+        Question::open("paste sk-live-abcdefghijklmnopqrstuvwxyz"),
+        Question::open("x".repeat(MAX_QUESTION_BYTES + 40)),
     ]);
     assert_eq!(questions.len(), 3);
-    assert!(!questions[0].contains("/Users/alice"));
-    assert!(questions[0].contains("[path]"));
-    assert!(!questions[1].contains("sk-live-"));
-    assert!(questions[1].contains("[token]"));
-    assert!(questions[2].len() <= MAX_QUESTION_BYTES);
+    assert!(!questions[0].text().contains("/Users/alice"));
+    assert!(questions[0].text().contains("[path]"));
+    assert!(!questions[1].text().contains("sk-live-"));
+    assert!(questions[1].text().contains("[token]"));
+    assert!(questions[2].text().len() <= MAX_QUESTION_BYTES);
 
-    let many = (0..MAX_QUESTION_COUNT + 5).map(|index| format!("q{index}"));
+    let many = (0..MAX_QUESTION_COUNT + 5).map(|index| Question::open(format!("q{index}")));
     assert_eq!(boundary().questions(many).len(), MAX_QUESTION_COUNT);
+}
+
+#[test]
+fn question_options_are_redacted_bounded_and_capped() {
+    let questions = boundary().questions([Question::new(
+        "which base?",
+        (0..MAX_QUESTION_OPTION_COUNT + 4)
+            .map(|index| match index {
+                0 => "open /Users/alice/.env".to_owned(),
+                1 => "y".repeat(MAX_QUESTION_OPTION_BYTES + 40),
+                other => format!("option-{other}"),
+            })
+            .collect(),
+    )]);
+
+    let options = questions[0].options();
+    assert_eq!(options.len(), MAX_QUESTION_OPTION_COUNT);
+    assert!(!options[0].contains("/Users/alice"));
+    assert!(options[0].contains("[path]"));
+    assert!(options[1].len() <= MAX_QUESTION_OPTION_BYTES);
 }
 
 #[test]
@@ -171,8 +193,18 @@ proptest! {
         prop_assert!(reason.len() <= MAX_FAILURE_REASON_BYTES);
         let title = boundary.title(&input);
         prop_assert!(title.len() <= mac_worker::redaction::MAX_TITLE_BYTES);
-        let questions = boundary.questions([&input, &input, &input]);
+        let questions = boundary.questions([
+            Question::new(input.clone(), vec![input.clone()]),
+            Question::open(input.clone()),
+            Question::open(input.clone()),
+        ]);
         prop_assert!(questions.len() <= MAX_QUESTION_COUNT);
+        for question in &questions {
+            prop_assert!(question.text().len() <= MAX_QUESTION_BYTES);
+            for option in question.options() {
+                prop_assert!(option.len() <= MAX_QUESTION_OPTION_BYTES);
+            }
+        }
         let files = boundary.changed_files([&input, &input]);
         prop_assert!(files.len() <= MAX_CHANGED_FILE_COUNT);
     }

@@ -74,6 +74,7 @@ fn task_meta_for(task_id: TaskId, base_oid: BaseOid) -> TaskMeta {
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: mac_worker::task::TaskSource::Local {
             wip: false,
@@ -328,6 +329,7 @@ fn origin_prepare_fetches_the_exact_base_before_workspace_creation() {
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: mac_worker::task::TaskSource::Origin {
             url: "https://example.test/repo.git".into(),

@@ -13,7 +13,7 @@ use std::{
 };
 
 use mac_worker::{
-    agent::{AdapterError, AgentKind, AgentOutcome, PermissionPolicy, TurnLimits},
+    agent::{AdapterError, AgentKind, AgentOutcome, PermissionPolicy, Question, TurnLimits},
     client_state::{
         ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
         ClientStateWritePoint,
@@ -71,6 +71,7 @@ fn fields_with_prompt(prompt: String) -> TaskMetaInput {
         worktree_id: WORKTREE_ID.to_owned(),
         agent: AgentKind::Codex,
         model: Some("gpt-5".into()),
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
@@ -249,6 +250,100 @@ fn task_meta_bounds_prompt_and_summary_hides_it() {
     let json = serde_json::to_value(meta.summary()).unwrap();
     assert_eq!(json["title"], "Fix the flaky login spec");
     assert!(json.get("prompt").is_none() && json.get("session_ref").is_none());
+}
+
+#[test]
+fn task_meta_round_trips_the_recorded_reasoning_effort() {
+    let mut fields = fields_with_prompt("Fix the flaky login spec".into());
+    fields.model = Some("gpt-5.6-luna".into());
+    fields.effort = Some("max".into());
+    let meta = TaskMeta::new(fields).unwrap();
+    assert_eq!(meta.effort(), Some("max"));
+
+    let json = serde_json::to_value(&meta).unwrap();
+    assert_eq!(json["effort"], "max");
+    let restored: TaskMeta = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.effort(), Some("max"));
+
+    // A task without an effort writes no key at all, so records created before
+    // the field existed keep their exact bytes and still load.
+    let without = TaskMeta::new(fields_with_prompt("Fix the flaky login spec".into())).unwrap();
+    let json = serde_json::to_value(&without).unwrap();
+    assert!(json.get("effort").is_none());
+    let restored: TaskMeta = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.effort(), None);
+
+    let mut invalid = fields_with_prompt("Fix the flaky login spec".into());
+    invalid.effort = Some("max\" -c sandbox_mode=\"danger-full-access".into());
+    assert_eq!(
+        TaskMeta::new(invalid).unwrap_err().public_code(),
+        "TASK_CONFIG_INVALID"
+    );
+}
+
+#[test]
+fn questions_keep_their_options_and_read_back_plain_strings() {
+    let status = TaskStatus::new(
+        TaskState::Open,
+        Some(TaskOutcome::NeedsInput),
+        Some("mini-1".into()),
+        true,
+        None,
+        Some("pick a base".into()),
+        vec![
+            Question::new("Which base?", vec!["main".into(), "release".into()]),
+            Question::open("Anything else?"),
+        ],
+        Vec::new(),
+        None,
+        Vec::new(),
+        1_700,
+    )
+    .unwrap();
+
+    let json = serde_json::to_value(&status).unwrap();
+    assert_eq!(json["questions"][0]["text"], "Which base?");
+    assert_eq!(json["questions"][0]["options"][1], "release");
+    // An open question stays a bare string, so records written before options
+    // existed round-trip byte for byte.
+    assert_eq!(json["questions"][1], "Anything else?");
+
+    let restored: TaskStatus = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.questions(), status.questions());
+
+    let legacy: TaskStatus = serde_json::from_value(serde_json::json!({
+        "state": "open",
+        "last_outcome": {"kind": "needs_input"},
+        "worker": "mini-1",
+        "session_present": true,
+        "head_oid": null,
+        "summary": "pick a base",
+        "questions": ["Which base?"],
+        "files_changed": [],
+        "diff_stat": null,
+        "turns": [],
+        "updated_at_millis": 1_700,
+    }))
+    .unwrap();
+    assert_eq!(legacy.questions(), &[Question::open("Which base?")]);
+}
+
+#[test]
+fn outcome_kind_names_match_the_serialized_tag() {
+    for outcome in [
+        TaskOutcome::Done,
+        TaskOutcome::NeedsInput,
+        TaskOutcome::Blocked,
+        TaskOutcome::Unknown,
+        TaskOutcome::failed("agent exited 2"),
+        TaskOutcome::Cancelled,
+        TaskOutcome::TimedOut,
+        TaskOutcome::Lost,
+    ] {
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["kind"], outcome.kind());
+        assert!(TaskOutcome::KINDS.contains(&outcome.kind()));
+    }
 }
 
 #[test]

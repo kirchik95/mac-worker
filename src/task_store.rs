@@ -9,7 +9,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 
 use crate::{
-    agent::AgentKind,
+    agent::{AgentKind, Question},
     error::WorkerError,
     git_transport::GitTransport,
     host_store::{HostStore, TransferGuard},
@@ -1133,7 +1133,7 @@ impl<'a> TaskStore<'a> {
         log_truncated: bool,
         head_oid: Option<BaseOid>,
         summary: Option<String>,
-        questions: Vec<String>,
+        questions: Vec<Question>,
         files_changed: Vec<String>,
         diff_stat: Option<String>,
         close: bool,

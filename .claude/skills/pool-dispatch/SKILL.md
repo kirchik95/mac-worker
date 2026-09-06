@@ -26,7 +26,7 @@ Exact public grammar in the current release. The execution-core scope restrictio
 ```text
 worker task submit [options] (--prompt TEXT | --prompt-file PATH) [--title TEXT]
 worker task batch FILE [--name NAME] [--max-parallel N] [--wait]
-worker task list [--run RUN_ID] [--state STATE] [--full]
+worker task list [--run RUN_ID] [--state STATE] [--outcome KIND] [--full]
 worker task status TASK_ID [--full]
 worker task logs [-f] TASK_ID [--turn N] [--raw]
 worker task diff TASK_ID [--stat]
@@ -45,7 +45,8 @@ worker dashboard [--port N] [--no-open]   # read-only observer on loopback with 
 
 ```text
 --agent codex|claude|cursor|opencode     optional; defaults from [task].default_agent
---model ID                               optional, agent-specific
+--model ID                               optional, agent-specific; default from [task].model
+--effort LEVEL                           optional reasoning effort; default from [task].effort
 --project PATH                           default: current worktree
 --base REF                               default: HEAD
 --wip                                    include uncommitted changes as a temporary base commit
@@ -70,7 +71,7 @@ Without `--wait`, `submit`, `batch`, and `say` return as soon as the task record
 
 The current release accepts `source = local|origin` and `publish = fetch|push`; `--publish-branch` is valid only with `push`, and a `--wip` base cannot push (`PUBLISH_REQUIRES_COMMITTED_BASE`). Agents on this pool:
 
-- `codex`: pass `--model gpt-5.6-luna`; reasoning effort comes from the worker's Codex config, not from the CLI.
+- `codex`: pass `--model gpt-5.6-luna --effort max`. The effort reaches Codex as `-c model_reasoning_effort="max"`; without the flag the worker's own Codex configuration decides. Only Codex reads it — the other agents ignore it.
 - `opencode`: no model flag uses the worker's default (OpenCode Zen, Muse Spark 1.3, free); OpenCode Go models are `--model opencode-go/<model>`.
 - `cursor`: always `--env-profile agents`; that worker-side profile carries the Cursor login and the login-keychain unlock. Never read or copy it.
 - `claude`: deferred on the workers by operator decision; do not submit it until the operator enables it.
@@ -120,7 +121,13 @@ worker task status <id>
 worker task diff <id> --stat
 ```
 
-For a task that reports `needs_input`, write the answer to a message file and send it as a new turn:
+List exactly the tasks waiting on an answer:
+
+```text
+worker task list --state open --outcome needs-input --json
+```
+
+For a task that reports `needs_input`, read its questions from `worker task status <id> --json`: each question is `{"text": …, "options": [...]}`, and a question with no options is a bare string. When a question offers options, answer with one of them verbatim. Write the answer to a message file and send it as a new turn:
 
 ```text
 worker task say <id> --message-file <file> --wait

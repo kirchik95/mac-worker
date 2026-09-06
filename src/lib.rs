@@ -755,6 +755,7 @@ fn run_task_subcommand(
         TaskCommand::Submit {
             agent,
             model,
+            effort,
             prompt,
             prompt_file,
             title,
@@ -787,6 +788,7 @@ fn run_task_subcommand(
                 TaskSubmitRequest {
                     agent: task_agent,
                     model,
+                    effort,
                     prompt,
                     project,
                     base,
@@ -842,10 +844,20 @@ fn run_task_subcommand(
                 Ok(0)
             }
         }
-        TaskCommand::List { run, state, full } => {
+        TaskCommand::List {
+            run,
+            state,
+            outcome,
+            full,
+        } => {
             let filter = TaskListFilter {
                 run_id: run,
                 state: state.as_deref().map(parse_task_state).transpose()?,
+                outcome: outcome
+                    .as_deref()
+                    .map(parse_task_outcome_kind)
+                    .transpose()?
+                    .map(str::to_owned),
                 full,
             };
             let report = client.list(filter)?;
@@ -1062,6 +1074,19 @@ fn make_task_limits(
     crate::task::TaskLimits::new(turn, max_followups.unwrap_or(defaults.max_followups))
 }
 
+/// Accepts either the serialized kind (`needs_input`) or its dashed spelling
+/// (`needs-input`), so the orchestrator loop can use whichever it already has.
+fn parse_task_outcome_kind(value: &str) -> Result<&'static str, WorkerError> {
+    let normalized = value.replace('-', "_");
+    crate::task::TaskOutcome::KINDS
+        .into_iter()
+        .find(|kind| *kind == normalized)
+        .ok_or(WorkerError::Task {
+            code: "TASK_CONFIG_INVALID",
+            message: "unknown task outcome".into(),
+        })
+}
+
 fn parse_task_state(value: &str) -> Result<crate::task::TaskState, WorkerError> {
     match value {
         "queued" => Ok(crate::task::TaskState::Queued),
@@ -1178,7 +1203,7 @@ fn write_task_result_report(
             writeln!(
                 stdout,
                 "questions: {}",
-                report.status().questions().join("; ")
+                render_questions(report.status().questions())
             )?;
         }
         if !report.status().files_changed().is_empty() {
@@ -1274,6 +1299,22 @@ fn write_json_line<T: Serialize>(stdout: &mut dyn Write, value: &T) -> Result<()
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())
+}
+
+/// Renders questions for the human output, appending the answers an agent will
+/// accept so a reader sees the same options the JSON output carries.
+fn render_questions(questions: &[crate::agent::Question]) -> String {
+    questions
+        .iter()
+        .map(|question| {
+            if question.options().is_empty() {
+                question.text().to_owned()
+            } else {
+                format!("{} [{}]", question.text(), question.options().join(" | "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn task_state_name(state: crate::task::TaskState) -> &'static str {
@@ -2635,6 +2676,7 @@ mod tests {
             worktree_id: "b".repeat(64),
             agent: AgentKind::Codex,
             model: None,
+            effort: None,
             policy: PermissionPolicy::Workspace,
             source: TaskSource::Local {
                 wip: false,

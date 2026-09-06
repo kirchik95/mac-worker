@@ -1,8 +1,12 @@
 use std::{fmt, path::PathBuf};
 
+use crate::agent::Question;
+
 pub const MAX_SUMMARY_BYTES: usize = 4 * 1024;
 pub const MAX_QUESTION_BYTES: usize = 1024;
 pub const MAX_QUESTION_COUNT: usize = 16;
+pub const MAX_QUESTION_OPTION_BYTES: usize = 256;
+pub const MAX_QUESTION_OPTION_COUNT: usize = 8;
 pub const MAX_CHANGED_FILE_BYTES: usize = 256;
 pub const MAX_CHANGED_FILE_COUNT: usize = 256;
 pub const MAX_FAILURE_REASON_BYTES: usize = 1024;
@@ -107,14 +111,29 @@ impl RedactionBoundary {
         self.text(input, MAX_TITLE_BYTES)
     }
 
-    pub fn questions<I, S>(&self, items: I) -> Vec<String>
+    pub fn question_option(&self, input: &str) -> String {
+        self.text(input, MAX_QUESTION_OPTION_BYTES)
+    }
+
+    pub fn questions<I, Q>(&self, items: I) -> Vec<Question>
     where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
+        I: IntoIterator<Item = Q>,
+        Q: std::borrow::Borrow<Question>,
     {
         items
             .into_iter()
-            .map(|item| self.question(item.as_ref()))
+            .map(|item| {
+                let question = item.borrow();
+                Question::new(
+                    self.question(question.text()),
+                    question
+                        .options()
+                        .iter()
+                        .map(|option| self.question_option(option))
+                        .take(MAX_QUESTION_OPTION_COUNT)
+                        .collect(),
+                )
+            })
             .take(MAX_QUESTION_COUNT)
             .collect()
     }

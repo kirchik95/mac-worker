@@ -6,7 +6,7 @@ use std::{
 };
 
 use mac_worker::{
-    agent::AgentKind,
+    agent::{AgentKind, Question},
     client_state::ClientStateStore,
     config::Config,
     error::WorkerError,
@@ -28,7 +28,7 @@ use mac_worker::{
         RunnerIdentity, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
         TaskState, TaskStatus, TurnSummary, TurnTerminal,
     },
-    task_client::TaskClient,
+    task_client::{TaskClient, TaskListFilter},
     task_store::{TaskCloseRequest, TaskCloseResponse, TaskStatusResponse},
     transfer::HostOperation,
     turn_runner::InlineRunnerExecutor,
@@ -226,6 +226,7 @@ fn task_record(
         worktree_id,
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: mac_worker::agent::PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
@@ -298,6 +299,7 @@ fn origin_queued_task_record(
         worktree_id,
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: mac_worker::agent::PermissionPolicy::Workspace,
         source: TaskSource::Origin {
             url: "https://origin.example.test/repo.git".into(),
@@ -426,6 +428,7 @@ fn active_task(store: &ClientStateStore, task_number: u128, turn_id: JobId) {
         worktree_id: WORKTREE_ID.into(),
         agent: mac_worker::agent::AgentKind::Codex,
         model: None,
+        effort: None,
         policy: mac_worker::agent::PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
@@ -474,6 +477,83 @@ fn active_task(store: &ClientStateStore, task_number: u128, turn_id: JobId) {
             .unwrap(),
         )
         .unwrap();
+}
+
+#[test]
+fn task_list_filters_by_last_outcome_for_the_orchestrator_loop() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+
+    let done = task_record(
+        TaskId::new(Uuid::from_u128(950)),
+        job(951),
+        TaskState::Open,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        None,
+    );
+    let waiting_id = TaskId::new(Uuid::from_u128(952));
+    let waiting = task_record(
+        waiting_id,
+        job(953),
+        TaskState::Open,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        None,
+    );
+    let waiting_status = TaskStatus::new(
+        TaskState::Open,
+        Some(TaskOutcome::NeedsInput),
+        Some("mini-1".into()),
+        true,
+        None,
+        Some("pick a base".into()),
+        vec![Question::new(
+            "Which base?",
+            vec!["main".into(), "release".into()],
+        )],
+        Vec::new(),
+        None,
+        Vec::new(),
+        3,
+    )
+    .unwrap();
+    let waiting = waiting.with_status(waiting_status.clone()).unwrap();
+    store.create_task(done).unwrap();
+    store.create_task(waiting).unwrap();
+
+    let remote = TaskRemoteRunner::new(waiting_status);
+    let config = task_config();
+    let executor = InlineRunnerExecutor;
+    let client = TaskClient::new(&remote, &config, &paths, &store, &executor);
+
+    let all = client.list(TaskListFilter::default()).unwrap();
+    assert_eq!(all.tasks().len(), 2);
+
+    let waiting_rows = client
+        .list(TaskListFilter {
+            outcome: Some("needs_input".into()),
+            ..TaskListFilter::default()
+        })
+        .unwrap();
+    assert_eq!(waiting_rows.tasks().len(), 1);
+    assert_eq!(waiting_rows.tasks()[0].task_id, waiting_id);
+
+    let none = client
+        .list(TaskListFilter {
+            state: Some(TaskState::Active),
+            outcome: Some("needs_input".into()),
+            ..TaskListFilter::default()
+        })
+        .unwrap();
+    assert!(none.tasks().is_empty());
 }
 
 #[test]

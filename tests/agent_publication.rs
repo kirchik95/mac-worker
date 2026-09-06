@@ -33,6 +33,7 @@ fn task_meta(source: TaskSource, publish: Vec<PublishMode>) -> TaskMeta {
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source,
         publish,
@@ -128,6 +129,7 @@ fn an_origin_url_must_be_normalized_before_it_enters_the_task_record() {
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: TaskSource::Origin {
             url: "https://user:secret@EXAMPLE.test/repo.git?token=secret".into(),

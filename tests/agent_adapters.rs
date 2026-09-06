@@ -2,7 +2,7 @@ use std::fs;
 
 use mac_worker::agent::{
     AgentEvent, AgentKind, AgentOutcome, PROMPT_POINTER, PermissionPolicy, PromptDelivery,
-    RESULT_SCHEMA_JSON, ResultStatus, TurnLaunch, TurnLimits, TurnParams, adapter_for,
+    Question, RESULT_SCHEMA_JSON, ResultStatus, TurnLaunch, TurnLimits, TurnParams, adapter_for,
     render_shell,
 };
 use uuid::Uuid;
@@ -15,6 +15,7 @@ fn params(policy: PermissionPolicy) -> TurnParams {
     TurnParams {
         kind: AgentKind::Codex,
         model: None,
+        effort: None,
         policy,
         limits: TurnLimits::new(DEFAULT_TIMEOUT_MILLIS, None, None).unwrap(),
         session_seed: Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001),
@@ -361,7 +362,10 @@ fn structured_results_cover_needs_input_and_blocked() {
         .extract_result(&fixture("codex-needs-input.jsonl"), None)
         .unwrap();
     assert_eq!(needs_input.status(), ResultStatus::NeedsInput);
-    assert_eq!(needs_input.questions(), &["Which crate should be renamed?"]);
+    assert_eq!(
+        needs_input.questions(),
+        &[Question::open("Which crate should be renamed?")]
+    );
 
     let claude = adapter_for(AgentKind::Claude);
     assert_eq!(
@@ -408,7 +412,7 @@ fn extract_result_prefers_the_last_message_file() {
         .unwrap();
     assert_eq!(result.status(), ResultStatus::NeedsInput);
     assert_eq!(result.summary(), "from file");
-    assert_eq!(result.questions(), &["q"]);
+    assert_eq!(result.questions(), &[Question::open("q")]);
 }
 
 #[test]
@@ -508,6 +512,142 @@ fn result_schema_json_is_strict_structured_output_compatible() {
         value["additionalProperties"],
         serde_json::Value::Bool(false)
     );
+}
+
+#[test]
+fn question_items_are_strict_structured_output_compatible() {
+    let value: serde_json::Value = serde_json::from_str(RESULT_SCHEMA_JSON).unwrap();
+    let item = &value["properties"]["questions"]["items"];
+    assert_eq!(item["type"], "object");
+    let mut keys: Vec<_> = item["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["options", "text"]);
+    let mut required: Vec<String> = item["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_str().unwrap().to_owned())
+        .collect();
+    required.sort();
+    assert_eq!(required, keys);
+    assert_eq!(item["additionalProperties"], serde_json::Value::Bool(false));
+    assert_eq!(item["properties"]["options"]["items"]["type"], "string");
+}
+
+#[test]
+fn codex_passes_reasoning_effort_as_a_config_override_on_both_turns() {
+    let mut with_effort = params(PermissionPolicy::Workspace);
+    with_effort.model = Some("gpt-5.6-luna".into());
+    with_effort.effort = Some("max".into());
+    let codex = adapter_for(AgentKind::Codex);
+
+    for launch in [
+        codex.first_turn(&with_effort).unwrap(),
+        codex.resume_turn(&with_effort, "thread-1").unwrap(),
+    ] {
+        assert!(
+            launch
+                .args()
+                .windows(2)
+                .any(|w| w[0] == "-m" && w[1] == "gpt-5.6-luna")
+        );
+        assert!(
+            launch
+                .args()
+                .windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=\"max\""),
+            "effort override missing from {:?}",
+            launch.args()
+        );
+    }
+
+    let without = codex
+        .first_turn(&params(PermissionPolicy::Workspace))
+        .unwrap();
+    assert!(
+        !without
+            .args()
+            .iter()
+            .any(|argument| argument.starts_with("model_reasoning_effort="))
+    );
+}
+
+#[test]
+fn an_unsafe_effort_value_is_rejected_before_launch() {
+    let mut params = params(PermissionPolicy::Workspace);
+    params.effort = Some("max\" -c sandbox_mode=\"danger-full-access".into());
+    assert!(adapter_for(AgentKind::Codex).first_turn(&params).is_err());
+
+    params.effort = Some(String::new());
+    assert!(adapter_for(AgentKind::Codex).first_turn(&params).is_err());
+
+    params.effort = Some("x".repeat(33));
+    assert!(adapter_for(AgentKind::Codex).first_turn(&params).is_err());
+}
+
+#[test]
+fn agents_without_a_reasoning_effort_flag_ignore_it() {
+    for kind in [AgentKind::Claude, AgentKind::Cursor, AgentKind::Opencode] {
+        let mut params = params(PermissionPolicy::Unattended);
+        params.kind = kind;
+        params.effort = Some("max".into());
+        let launch = adapter_for(kind).first_turn(&params).unwrap();
+        assert!(
+            !launch
+                .args()
+                .iter()
+                .any(|argument| argument.contains("model_reasoning_effort"))
+        );
+    }
+}
+
+#[test]
+fn structured_questions_carry_options_and_plain_strings_still_parse() {
+    let codex = adapter_for(AgentKind::Codex);
+    let structured = codex
+        .extract_result(
+            "",
+            Some(
+                r#"{"status":"needs_input","summary":"pick a base","questions":[{"text":"Which base?","options":["main","release"]},{"text":"Anything else?","options":[]}],"files_changed":[]}"#,
+            ),
+        )
+        .unwrap();
+    assert_eq!(structured.status(), ResultStatus::NeedsInput);
+    assert_eq!(
+        structured.questions(),
+        &[
+            Question::new("Which base?", vec!["main".into(), "release".into()]),
+            Question::open("Anything else?"),
+        ]
+    );
+
+    // A decorated question is refused like any other unknown field on the
+    // result, so a malformed object never becomes a silently empty question.
+    let decorated = codex
+        .extract_result(
+            "",
+            Some(
+                r#"{"status":"needs_input","summary":"pick a base","questions":[{"text":"Which base?","options":[],"required":true}],"files_changed":[]}"#,
+            ),
+        )
+        .unwrap();
+    assert_eq!(decorated.status(), ResultStatus::Unknown);
+
+    // Agents that keep emitting bare strings stay supported.
+    let legacy = codex
+        .extract_result(
+            "",
+            Some(
+                r#"{"status":"needs_input","summary":"pick a base","questions":["Which base?"],"files_changed":[]}"#,
+            ),
+        )
+        .unwrap();
+    assert_eq!(legacy.questions(), &[Question::open("Which base?")]);
 }
 
 #[test]
@@ -890,7 +1030,7 @@ fn opencode_extracts_the_last_json_object_from_prose_fixture() {
         .unwrap();
     assert_eq!(result.status(), ResultStatus::NeedsInput);
     assert_eq!(result.summary(), "review is needed");
-    assert_eq!(result.questions(), &["Which target?"]);
+    assert_eq!(result.questions(), &[Question::open("Which target?")]);
     assert_eq!(result.files_changed(), &["prose.txt"]);
 }
 
@@ -961,7 +1101,10 @@ fn trailer_results_cover_needs_input_and_blocked() {
         .extract_result(&fixture("cursor-needs-input.jsonl"), None)
         .unwrap();
     assert_eq!(needs_input.status(), ResultStatus::NeedsInput);
-    assert_eq!(needs_input.questions(), &["Which crate should be renamed?"]);
+    assert_eq!(
+        needs_input.questions(),
+        &[Question::open("Which crate should be renamed?")]
+    );
     assert_eq!(
         cursor
             .extract_result(&fixture("cursor-blocked.jsonl"), None)
@@ -975,7 +1118,10 @@ fn trailer_results_cover_needs_input_and_blocked() {
         .extract_result(&fixture("opencode-needs-input.jsonl"), None)
         .unwrap();
     assert_eq!(needs_input.status(), ResultStatus::NeedsInput);
-    assert_eq!(needs_input.questions(), &["Which crate should be renamed?"]);
+    assert_eq!(
+        needs_input.questions(),
+        &[Question::open("Which crate should be renamed?")]
+    );
     assert_eq!(
         opencode
             .extract_result(&fixture("opencode-blocked.jsonl"), None)
@@ -996,7 +1142,7 @@ fn trailer_extract_prefers_the_last_message_file() {
         .unwrap();
     assert_eq!(result.status(), ResultStatus::NeedsInput);
     assert_eq!(result.summary(), "from file");
-    assert_eq!(result.questions(), &["q"]);
+    assert_eq!(result.questions(), &[Question::open("q")]);
 }
 
 #[test]

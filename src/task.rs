@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    agent::{AgentKind, AgentOutcome, PermissionPolicy, TurnLimits},
+    agent::{AgentKind, AgentOutcome, PermissionPolicy, Question, TurnLimits},
     error::WorkerError,
     job::{JobId, ProcessIdentity},
     redaction::RedactionBoundary,
@@ -345,6 +345,32 @@ impl TaskOutcome {
         }
     }
 
+    /// The serialized `kind` tag of this outcome, without its payload. Filters
+    /// and reports compare kinds, never the redacted failure reason.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::NeedsInput => "needs_input",
+            Self::Blocked => "blocked",
+            Self::Unknown => "unknown",
+            Self::Failed { .. } => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Lost => "lost",
+        }
+    }
+
+    pub const KINDS: [&'static str; 8] = [
+        "done",
+        "needs_input",
+        "blocked",
+        "unknown",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "lost",
+    ];
+
     fn redact(self, boundary: &RedactionBoundary) -> Self {
         match self {
             Self::Failed { reason } => Self::Failed {
@@ -481,6 +507,7 @@ pub struct TaskMetaInput {
     pub worktree_id: String,
     pub agent: AgentKind,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub policy: PermissionPolicy,
     pub source: TaskSource,
     pub publish: Vec<PublishMode>,
@@ -503,6 +530,7 @@ pub struct TaskMeta {
     worktree_id: String,
     agent: AgentKind,
     model: Option<String>,
+    effort: Option<String>,
     policy: PermissionPolicy,
     source: TaskSource,
     publish: Vec<PublishMode>,
@@ -530,6 +558,7 @@ impl TaskMeta {
             worktree_id: input.worktree_id,
             agent: input.agent,
             model: input.model,
+            effort: input.effort,
             policy: input.policy,
             source: input.source,
             publish: input.publish,
@@ -572,6 +601,10 @@ impl TaskMeta {
 
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    pub fn effort(&self) -> Option<&str> {
+        self.effort.as_deref()
     }
 
     pub fn source(&self) -> &TaskSource {
@@ -650,6 +683,10 @@ impl TaskMeta {
         if let Some(model) = &self.model {
             validate_optional_text(model, MAX_IDENTITY_BYTES, "model")?;
         }
+        if let Some(effort) = &self.effort {
+            crate::agent::validate_effort(effort)
+                .map_err(|error| task_config(error.to_string()))?;
+        }
         if let Some(profile) = &self.env_profile {
             validate_optional_text(profile, MAX_IDENTITY_BYTES, "env profile")?;
         }
@@ -713,13 +750,19 @@ impl TaskMeta {
 impl Serialize for TaskMeta {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("TaskMeta", 17)?;
+        // `effort` is omitted when unset so a record written before it existed
+        // re-serializes byte for byte and keeps its canonical bytes.
+        let mut record =
+            serializer.serialize_struct("TaskMeta", 17 + usize::from(self.effort.is_some()))?;
         record.serialize_field("task_id", &self.task_id)?;
         record.serialize_field("run_id", &self.run_id)?;
         record.serialize_field("project_id", &self.project_id)?;
         record.serialize_field("worktree_id", &self.worktree_id)?;
         record.serialize_field("agent", &AgentKindWire::from(self.agent))?;
         record.serialize_field("model", &self.model)?;
+        if self.effort.is_some() {
+            record.serialize_field("effort", &self.effort)?;
+        }
         record.serialize_field("policy", &PermissionPolicyWire::from(self.policy))?;
         record.serialize_field("source", &self.source)?;
         record.serialize_field("publish", &self.publish)?;
@@ -746,6 +789,8 @@ impl<'de> Deserialize<'de> for TaskMeta {
             worktree_id: String,
             agent: AgentKindWire,
             model: Option<String>,
+            #[serde(default)]
+            effort: Option<String>,
             policy: PermissionPolicyWire,
             source: TaskSource,
             publish: Vec<PublishMode>,
@@ -766,6 +811,7 @@ impl<'de> Deserialize<'de> for TaskMeta {
             worktree_id: wire.worktree_id,
             agent: wire.agent.into(),
             model: wire.model,
+            effort: wire.effort,
             policy: wire.policy.into(),
             source: wire.source,
             publish: wire.publish,
@@ -952,7 +998,7 @@ pub struct TaskStatus {
     session_present: bool,
     head_oid: Option<BaseOid>,
     summary: Option<String>,
-    questions: Vec<String>,
+    questions: Vec<Question>,
     files_changed: Vec<String>,
     diff_stat: Option<String>,
     turns: Vec<TurnSummary>,
@@ -968,7 +1014,7 @@ impl TaskStatus {
         session_present: bool,
         head_oid: Option<BaseOid>,
         summary: Option<String>,
-        questions: Vec<String>,
+        questions: Vec<Question>,
         files_changed: Vec<String>,
         diff_stat: Option<String>,
         turns: Vec<TurnSummary>,
@@ -1019,7 +1065,7 @@ impl TaskStatus {
         self.summary.as_deref()
     }
 
-    pub fn questions(&self) -> &[String] {
+    pub fn questions(&self) -> &[Question] {
         &self.questions
     }
 
@@ -1083,7 +1129,7 @@ impl<'de> Deserialize<'de> for TaskStatus {
             session_present: bool,
             head_oid: Option<BaseOid>,
             summary: Option<String>,
-            questions: Vec<String>,
+            questions: Vec<Question>,
             files_changed: Vec<String>,
             diff_stat: Option<String>,
             turns: Vec<TurnSummary>,

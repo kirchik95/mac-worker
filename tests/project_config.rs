@@ -83,6 +83,31 @@ max_followups = 7
 }
 
 #[test]
+fn project_task_settings_carry_model_and_effort_and_reject_unsafe_effort() {
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        br#"version = 1
+[task]
+default_agent = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+"#,
+    );
+    let settings = ProjectSettings::load(repo.root(), &[]).unwrap();
+    assert_eq!(settings.task.model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(settings.task.effort.as_deref(), Some("max"));
+
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        b"version = 1\n[task]\neffort = \"max\\\" -c sandbox_mode=\\\"danger-full-access\"\n",
+    );
+    let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
+    assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
+}
+
+#[test]
 fn task_client_uses_the_project_default_agent_when_cli_omits_one() {
     let repo = GitRepo::init();
     repo.write(

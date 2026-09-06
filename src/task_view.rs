@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt};
 use serde::Serialize;
 
 use crate::{
-    agent::{AgentKind, PermissionPolicy},
+    agent::{AgentKind, PermissionPolicy, Question},
     redaction::RedactionBoundary,
     scheduler::QueueBlockingReason,
     task::{
@@ -74,7 +74,7 @@ pub struct TaskDetailProjection {
     pub head_oid: Option<BaseOid>,
     pub session_present: bool,
     pub summary: Option<String>,
-    pub questions: Vec<String>,
+    pub questions: Vec<Question>,
     pub files_changed: Vec<String>,
     pub diff_stat: Option<String>,
     pub fetch_command: String,
@@ -334,7 +334,10 @@ fn task_list_row(
         title: boundary.title(record.meta().title().as_str()),
         agent: agent_name(record.meta().agent()).to_owned(),
         model: record.meta().model().map(|model| boundary.text(model, 256)),
-        effort: None,
+        effort: record
+            .meta()
+            .effort()
+            .map(|effort| boundary.text(effort, 256)),
         permissions: Some(permission_name(record.meta().policy()).to_owned()),
         env_profile: record
             .meta()

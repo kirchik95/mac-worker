@@ -124,6 +124,7 @@ fn task_meta(task_id: TaskId, base_oid: BaseOid, created_at_millis: u64) -> Task
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,

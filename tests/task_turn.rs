@@ -15,7 +15,7 @@ use std::{
 
 use mac_worker::{
     agent::{
-        AgentKind, PermissionPolicy, PromptDelivery, TurnLaunch, TurnLimits, TurnParams,
+        AgentKind, PermissionPolicy, PromptDelivery, Question, TurnLaunch, TurnLimits, TurnParams,
         adapter_for,
     },
     error::WorkerError,
@@ -78,6 +78,7 @@ fn material(prompt: &str) -> TurnMaterial {
         task_id(),
         1,
         AgentKind::Codex,
+        None,
         None,
         PermissionPolicy::Workspace,
         TurnLimits::new(30_000, None, None).unwrap(),
@@ -269,6 +270,7 @@ fn prepared_task_turn_with_options(
         1,
         AgentKind::Codex,
         None,
+        None,
         PermissionPolicy::Workspace,
         turn_limits.clone(),
         base_oid.clone(),
@@ -326,6 +328,7 @@ fn prepared_task_turn_with_options(
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: task_source,
         publish,
@@ -372,7 +375,7 @@ fn turn_material_commits_prompt_through_the_digest_slot_without_v1_fields() {
     assert!(json["base_oid"].is_string());
     assert!(json.get("prompt").is_none());
     assert!(json.get("session_ref").is_none());
-    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
     assert_eq!(SUPERVISION_VERSION, 3);
 }
 
@@ -899,6 +902,7 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
         1,
         AgentKind::Codex,
         None,
+        None,
         PermissionPolicy::Workspace,
         turn_limits.clone(),
         base_oid.clone(),
@@ -956,6 +960,7 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
@@ -1032,7 +1037,7 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
     assert_eq!(response.task().summary(), Some("finished at [path]"));
     assert_eq!(
         response.task().questions(),
-        &["why is [path] locked?".to_owned()]
+        &[Question::open("why is [path] locked?")]
     );
     assert!(response.task().session_present());
     assert_eq!(response.task().turns()[0].agent_committed(), Some(false));
@@ -1104,6 +1109,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
         2,
         AgentKind::Codex,
         None,
+        None,
         PermissionPolicy::Workspace,
         first_request.turn().limits().clone(),
         base_oid.clone(),
@@ -1116,6 +1122,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
     let params = TurnParams {
         kind: resume_turn.agent(),
         model: resume_turn.model().map(str::to_owned),
+        effort: None,
         policy: resume_turn.policy(),
         limits: resume_turn.limits().clone(),
         session_seed: resume_turn.session_seed(),
@@ -1218,6 +1225,7 @@ fn successful_codex_turn_without_a_bound_session_fails_publication() {
         1,
         AgentKind::Codex,
         None,
+        None,
         PermissionPolicy::Workspace,
         turn_limits.clone(),
         base_oid.clone(),
@@ -1275,6 +1283,7 @@ fn successful_codex_turn_without_a_bound_session_fails_publication() {
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
@@ -1360,6 +1369,7 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
         1,
         AgentKind::Codex,
         None,
+        None,
         PermissionPolicy::Workspace,
         turn_limits.clone(),
         base_oid.clone(),
@@ -1417,6 +1427,7 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,

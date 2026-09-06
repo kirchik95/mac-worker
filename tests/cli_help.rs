@@ -108,7 +108,47 @@ fn task_submit_help_exposes_origin_publication_and_profile_options() {
         .stdout(predicate::str::contains(
             "--publish-branch <PUBLISH_BRANCH>",
         ))
-        .stdout(predicate::str::contains("--env-profile <ENV_PROFILE>"));
+        .stdout(predicate::str::contains("--env-profile <ENV_PROFILE>"))
+        .stdout(predicate::str::contains("--model <MODEL>"))
+        .stdout(predicate::str::contains("--effort <EFFORT>"));
+}
+
+#[test]
+fn task_submit_parses_model_and_effort() {
+    let cli = Cli::try_parse_from([
+        "worker",
+        "task",
+        "submit",
+        "--agent",
+        "codex",
+        "--model",
+        "gpt-5.6-luna",
+        "--effort",
+        "max",
+        "--prompt",
+        "fix the flaky login spec",
+    ])
+    .unwrap();
+    let WorkerCommand::Task {
+        command: mac_worker::cli::TaskCommand::Submit { model, effort, .. },
+    } = cli.command
+    else {
+        panic!("expected a task submit command");
+    };
+    assert_eq!(model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(effort.as_deref(), Some("max"));
+}
+
+#[test]
+fn task_list_parses_the_outcome_filter() {
+    let cli = Cli::try_parse_from(["worker", "task", "list", "--outcome", "needs-input"]).unwrap();
+    let WorkerCommand::Task {
+        command: mac_worker::cli::TaskCommand::List { outcome, .. },
+    } = cli.command
+    else {
+        panic!("expected a task list command");
+    };
+    assert_eq!(outcome.as_deref(), Some("needs-input"));
 }
 
 #[test]

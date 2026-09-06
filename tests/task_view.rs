@@ -54,13 +54,18 @@ fn task_limits() -> TaskLimits {
 }
 
 fn task_meta(task: TaskId, title: &str, created_at_millis: u64) -> TaskMeta {
-    TaskMeta::new(TaskMetaInput {
+    TaskMeta::new(meta_fields(task, title, created_at_millis)).expect("valid task meta")
+}
+
+fn meta_fields(task: TaskId, title: &str, created_at_millis: u64) -> TaskMetaInput {
+    TaskMetaInput {
         task_id: task,
         run_id: Some(run_id()),
         project_id: PROJECT_ID.into(),
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: Some("gpt-5".into()),
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
@@ -80,8 +85,27 @@ fn task_meta(task: TaskId, title: &str, created_at_millis: u64) -> TaskMeta {
             home_path()
         ),
         created_at_millis,
-    })
-    .expect("valid task metadata")
+    }
+}
+
+/// Builds the active record with an explicit reasoning effort, so the row can
+/// prove it reports what the task recorded rather than a fixed placeholder.
+fn active_record_with_effort(effort: Option<&str>) -> LocalTaskRecord {
+    let record = active_record();
+    let mut fields = meta_fields(task_id(1), "Repair login", 1_700_000_000_000);
+    fields.effort = effort.map(str::to_owned);
+    LocalTaskRecord::new(
+        TaskMeta::new(fields).expect("valid task meta"),
+        record.status().clone(),
+        None,
+        None,
+        None,
+        REPO_ID.into(),
+        Some("mini-1".into()),
+        true,
+        None,
+    )
+    .expect("valid active record")
 }
 
 fn active_record() -> LocalTaskRecord {
@@ -119,7 +143,7 @@ fn active_record() -> LocalTaskRecord {
             "<script>alert(1)</script> summary at {home}/private with {TOKEN}\nnext"
         )),
         vec![
-            format!("{home}/repo/src/lib.rs"),
+            format!("{home}/repo/src/lib.rs").into(),
             "src/main.rs".into(),
             "~/private/token.txt".into(),
         ],
@@ -186,6 +210,32 @@ fn terminal_record() -> LocalTaskRecord {
         None,
     )
     .expect("valid terminal record")
+}
+
+#[test]
+fn a_task_row_reports_the_effort_the_task_recorded_and_nothing_when_it_did_not() {
+    let runner_states = HashMap::from([(task_id(1), None)]);
+    let freshness = HashMap::from([(task_id(1), TaskFreshness::Current)]);
+
+    let recorded = project_task_list(
+        &[active_record_with_effort(Some("max"))],
+        &fixture_runs(),
+        &runner_states,
+        &freshness,
+    )
+    .expect("valid task projection");
+    assert_eq!(recorded.tasks[0].effort.as_deref(), Some("max"));
+
+    // A task that set none leaves the worker's own default in force, and the
+    // row says so by reporting nothing rather than guessing that default.
+    let absent = project_task_list(
+        &[active_record_with_effort(None)],
+        &fixture_runs(),
+        &runner_states,
+        &freshness,
+    )
+    .expect("valid task projection");
+    assert_eq!(absent.tasks[0].effort, None);
 }
 
 fn fixture_records() -> Vec<LocalTaskRecord> {

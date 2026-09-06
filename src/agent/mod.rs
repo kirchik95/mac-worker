@@ -25,14 +25,14 @@ pub const MAX_SUMMARY_BYTES: usize = 512;
 /// `required` lists every property and `additionalProperties` is false, so
 /// optional fields are required-but-possibly-empty arrays; the parser still
 /// defaults them when an agent omits them.
-pub const RESULT_SCHEMA_JSON: &str = r#"{"type":"object","properties":{"status":{"enum":["done","needs_input","blocked"]},"summary":{"type":"string"},"questions":{"type":"array","items":{"type":"string"}},"files_changed":{"type":"array","items":{"type":"string"}}},"required":["status","summary","questions","files_changed"],"additionalProperties":false}"#;
+pub const RESULT_SCHEMA_JSON: &str = r#"{"type":"object","properties":{"status":{"enum":["done","needs_input","blocked"]},"summary":{"type":"string"},"questions":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"required":["text","options"],"additionalProperties":false}},"files_changed":{"type":"array","items":{"type":"string"}}},"required":["status","summary","questions","files_changed"],"additionalProperties":false}"#;
 pub const TURN_DIR_ENV: &str = "MAC_WORKER_TURN_DIR";
 pub const SCHEMA_FILE_NAME: &str = "result.schema.json";
 pub const LAST_MESSAGE_FILE_NAME: &str = "last.md";
 pub const PROMPT_FILE_NAME: &str = "prompt.md";
 pub const PROMPT_POINTER: &str = "Read the task from $MAC_WORKER_TURN_DIR/prompt.md and follow it.";
-pub const OPENCODE_RESULT_INSTRUCTION: &str = "OpenCode: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence or add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"questions\", and string-array \"files_changed\".";
-pub const CURSOR_RESULT_INSTRUCTION: &str = "Cursor: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence, do not render it as Markdown, and do not add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"questions\", and string-array \"files_changed\".";
+pub const OPENCODE_RESULT_INSTRUCTION: &str = "OpenCode: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence or add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", and array \"questions\" whose items are objects with string \"text\" and string-array \"options\"; use an empty \"options\" array for an open question.";
+pub const CURSOR_RESULT_INSTRUCTION: &str = "Cursor: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence, do not render it as Markdown, and do not add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", and array \"questions\" whose items are objects with string \"text\" and string-array \"options\"; use an empty \"options\" array for an open question.";
 
 const SCHEMA_PLACEHOLDER: &str = "{schema}";
 const LAST_MESSAGE_PLACEHOLDER: &str = "{last_message}";
@@ -115,9 +115,32 @@ impl TurnLimits {
 pub struct TurnParams {
     pub kind: AgentKind,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub policy: PermissionPolicy,
     pub limits: TurnLimits,
     pub session_seed: uuid::Uuid,
+}
+
+/// Reasoning effort is interpolated into agent configuration arguments, so it
+/// is restricted to the characters every supported agent accepts unquoted.
+pub const MAX_EFFORT_BYTES: usize = 32;
+
+pub fn validate_effort(effort: &str) -> Result<(), AdapterError> {
+    if effort.is_empty() {
+        return Err(AdapterError::new("effort must not be empty"));
+    }
+    if effort.len() > MAX_EFFORT_BYTES {
+        return Err(AdapterError::new("effort must not exceed 32 bytes"));
+    }
+    if !effort
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(AdapterError::new(
+            "effort must contain only ASCII letters, digits, '-', or '_'",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,11 +227,87 @@ pub enum ResultStatus {
     Unknown,
 }
 
+/// One question an agent ends a turn with. `options` carries the machine
+/// readable answers the agent will accept, so an orchestrator can pick a key
+/// instead of parsing prose; an empty list means the question is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    text: String,
+    options: Vec<String>,
+}
+
+impl Question {
+    pub fn new(text: impl Into<String>, options: Vec<String>) -> Self {
+        Self {
+            text: text.into(),
+            options,
+        }
+    }
+
+    pub fn open(text: impl Into<String>) -> Self {
+        Self::new(text, Vec::new())
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn options(&self) -> &[String] {
+        &self.options
+    }
+}
+
+impl From<String> for Question {
+    fn from(text: String) -> Self {
+        Self::open(text)
+    }
+}
+
+impl From<&str> for Question {
+    fn from(text: &str) -> Self {
+        Self::open(text)
+    }
+}
+
+impl serde::Serialize for Question {
+    /// A question without options stays a plain string on the wire, so records
+    /// written before options existed round-trip unchanged.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.options.is_empty() {
+            return serializer.serialize_str(&self.text);
+        }
+        use serde::ser::SerializeStruct;
+        let mut record = serializer.serialize_struct("Question", 2)?;
+        record.serialize_field("text", &self.text)?;
+        record.serialize_field("options", &self.options)?;
+        record.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Question {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Wire {
+            Text(String),
+            Structured {
+                text: String,
+                #[serde(default)]
+                options: Vec<String>,
+            },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Text(text) => Self::open(text),
+            Wire::Structured { text, options } => Self::new(text, options),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredResult {
     status: ResultStatus,
     summary: String,
-    questions: Vec<String>,
+    questions: Vec<Question>,
     files_changed: Vec<String>,
 }
 
@@ -221,7 +320,7 @@ impl StructuredResult {
         &self.summary
     }
 
-    pub fn questions(&self) -> &[String] {
+    pub fn questions(&self) -> &[Question] {
         &self.questions
     }
 
@@ -606,6 +705,9 @@ fn require_session_ref(session_ref: &str) -> Result<&str, AdapterError> {
 }
 
 fn validate_params(params: &TurnParams) -> Result<(), AdapterError> {
+    if let Some(effort) = &params.effort {
+        validate_effort(effort)?;
+    }
     params.limits.validate()
 }
 
@@ -706,7 +808,7 @@ fn parse_structured_result_value(value: Value) -> Option<StructuredResult> {
         status: WireStatus,
         summary: String,
         #[serde(default)]
-        questions: Vec<String>,
+        questions: Vec<Question>,
         #[serde(default)]
         files_changed: Vec<String>,
     }

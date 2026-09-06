@@ -680,7 +680,7 @@ fn task_record(
         worker.is_some(),
         Some(BASE_OID.parse().unwrap()),
         Some(format!("summary {SECRET}")),
-        vec![format!("question {SECRET}")],
+        vec![format!("question {SECRET}").into()],
         vec!["src/login.rs".into(), "/Users/alice/private.rs".into()],
         Some(format!("diff {SECRET}")),
         turns,
@@ -695,6 +695,7 @@ fn task_record(
             worktree_id: WORKTREE_ID.into(),
             agent: AgentKind::Codex,
             model: Some("gpt-5".into()),
+            effort: None,
             policy: PermissionPolicy::Workspace,
             source: TaskSource::Local {
                 wip: false,

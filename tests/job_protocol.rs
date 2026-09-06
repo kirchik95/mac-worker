@@ -300,12 +300,12 @@ fn fingerprint_uses_the_canonical_material_in_fixed_field_order() {
     assert_eq!(
         serde_json::to_string(&material).unwrap(),
         format!(
-            r#"{{"protocol_version":4,"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","lease_token":"{LEASE_TOKEN}","created_at_millis":100,"worker_name":"mini-1","project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","manifest_digest":"{MANIFEST_DIGEST}","relative_working_dir":"packages/app","timeout_millis":30000,"resource_class":"heavy","command":{{"mode":"argv","argv":["npm","test"]}}}}"#
+            r#"{{"protocol_version":5,"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","lease_token":"{LEASE_TOKEN}","created_at_millis":100,"worker_name":"mini-1","project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","manifest_digest":"{MANIFEST_DIGEST}","relative_working_dir":"packages/app","timeout_millis":30000,"resource_class":"heavy","command":{{"mode":"argv","argv":["npm","test"]}}}}"#
         )
     );
     assert_eq!(
         material.fingerprint().to_string(),
-        "e888b6e19dc72560aa44a5fdd2e6ba0dc49f8db837130150150a027099b89805"
+        "593bce1d8af8712d50e8255889e20edfd0074c014092e40b2eddeb1ac9a7c525"
     );
 }
 
@@ -423,7 +423,7 @@ fn material_rejects_noncanonical_identifiers_and_duplicate_json_fields() {
         .is_err()
     );
     assert!(serde_json::from_str::<RequestFingerprintMaterial>(&format!(
-        r#"{{"protocol_version":4,"protocol_version":4,"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","lease_token":"{LEASE_TOKEN}","worker_name":"mini-1","project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","manifest_digest":"{MANIFEST_DIGEST}","relative_working_dir":"","timeout_millis":1,"resource_class":"heavy","command":{{"mode":"shell","shell":"true"}}}}"#
+        r#"{{"protocol_version":5,"protocol_version":5,"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","lease_token":"{LEASE_TOKEN}","worker_name":"mini-1","project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","manifest_digest":"{MANIFEST_DIGEST}","relative_working_dir":"","timeout_millis":1,"resource_class":"heavy","command":{{"mode":"shell","shell":"true"}}}}"#
     )).is_err());
 }
 
@@ -499,7 +499,7 @@ fn streaming_events_are_versioned_strict_ndjson_records() {
 
 #[test]
 fn protocol_and_exit_kinds_keep_their_wire_contracts() {
-    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
     assert_eq!(
         WorkerError::Capacity {
             code: "CAPACITY_BUSY",
@@ -527,7 +527,7 @@ fn task8_query_dtos_round_trip_canonically_without_command_or_token_leaks() {
     let status_json = serde_json::to_string(&status_request).unwrap();
     assert_eq!(
         status_json,
-        format!(r#"{{"protocol_version":4,"job_id":"{JOB_ID}"}}"#)
+        format!(r#"{{"protocol_version":5,"job_id":"{JOB_ID}"}}"#)
     );
     assert_eq!(
         serde_json::from_str::<StatusRequest>(&status_json).unwrap(),
@@ -536,7 +536,7 @@ fn task8_query_dtos_round_trip_canonically_without_command_or_token_leaks() {
 
     let response = status_response(101);
     let response_json = serde_json::to_string(&response).unwrap();
-    assert!(response_json.starts_with(r#"{"protocol_version":4,"meta":{"#));
+    assert!(response_json.starts_with(r#"{"protocol_version":5,"meta":{"#));
     assert_eq!(
         serde_json::from_str::<StatusResponse>(&response_json).unwrap(),
         response
@@ -547,7 +547,7 @@ fn task8_query_dtos_round_trip_canonically_without_command_or_token_leaks() {
     assert_eq!(
         log_request_json,
         format!(
-            r#"{{"protocol_version":4,"job_id":"{JOB_ID}","stream":"stderr","offset":7,"limit":65537}}"#
+            r#"{{"protocol_version":5,"job_id":"{JOB_ID}","stream":"stderr","offset":7,"limit":65537}}"#
         )
     );
     assert_eq!(
@@ -595,13 +595,13 @@ fn task8_query_dtos_round_trip_canonically_without_command_or_token_leaks() {
 fn task8_query_dtos_reject_missing_unknown_duplicate_trailing_and_invalid_values() {
     // Catches permissive endpoint DTO parsing that could bind a query or
     // recovery decision to an ambiguous identity or incompatible helper.
-    let valid_status = format!(r#"{{"protocol_version":4,"job_id":"{JOB_ID}"}}"#);
+    let valid_status = format!(r#"{{"protocol_version":5,"job_id":"{JOB_ID}"}}"#);
     for invalid in [
         format!(r#"{{"job_id":"{JOB_ID}"}}"#),
         format!(r#"{{"protocol_version":1,"job_id":"{JOB_ID}"}}"#),
-        r#"{"protocol_version":4,"job_id":"BAD"}"#.to_string(),
-        format!(r#"{{"protocol_version":4,"job_id":"{JOB_ID}","extra":true}}"#),
-        format!(r#"{{"protocol_version":4,"protocol_version":4,"job_id":"{JOB_ID}"}}"#),
+        r#"{"protocol_version":5,"job_id":"BAD"}"#.to_string(),
+        format!(r#"{{"protocol_version":5,"job_id":"{JOB_ID}","extra":true}}"#),
+        format!(r#"{{"protocol_version":5,"protocol_version":5,"job_id":"{JOB_ID}"}}"#),
         format!("{valid_status} true"),
     ] {
         assert!(
@@ -612,16 +612,16 @@ fn task8_query_dtos_reject_missing_unknown_duplicate_trailing_and_invalid_values
 
     for invalid in [
         format!(
-            r#"{{"protocol_version":4,"job_id":"{JOB_ID}","stream":"stdout","offset":0,"limit":-1}}"#
+            r#"{{"protocol_version":5,"job_id":"{JOB_ID}","stream":"stdout","offset":0,"limit":-1}}"#
         ),
         format!(
-            r#"{{"protocol_version":4,"job_id":"{JOB_ID}","stream":"stdout","offset":0,"limit":4294967296}}"#
+            r#"{{"protocol_version":5,"job_id":"{JOB_ID}","stream":"stdout","offset":0,"limit":4294967296}}"#
         ),
         format!(
-            r#"{{"protocol_version":4,"job_id":"{JOB_ID}","stream":"stdin","offset":0,"limit":1}}"#
+            r#"{{"protocol_version":5,"job_id":"{JOB_ID}","stream":"stdin","offset":0,"limit":1}}"#
         ),
         format!(
-            r#"{{"protocol_version":4,"job_id":"{JOB_ID}","stream":"stdout","offset":0,"limit":1,"limit":2}}"#
+            r#"{{"protocol_version":5,"job_id":"{JOB_ID}","stream":"stdout","offset":0,"limit":1,"limit":2}}"#
         ),
     ] {
         assert!(
@@ -681,7 +681,7 @@ fn resolution_outcomes_uncertainty_and_host_errors_are_strict_and_bounded() {
     }
     assert_eq!(
         serde_json::to_string(&ResolveOrAbandonResponse::abandoned()).unwrap(),
-        r#"{"protocol_version":4,"outcome":"abandoned"}"#
+        r#"{"protocol_version":5,"outcome":"abandoned"}"#
     );
     assert!(ResolveOrAbandonResponse::cleanup_pending("").is_err());
     assert!(
@@ -690,7 +690,7 @@ fn resolution_outcomes_uncertainty_and_host_errors_are_strict_and_bounded() {
     );
     assert!(
         serde_json::from_str::<ResolveOrAbandonResponse>(
-            r#"{"protocol_version":4,"outcome":"abandoned","response":null}"#
+            r#"{"protocol_version":5,"outcome":"abandoned","response":null}"#
         )
         .is_err()
     );
@@ -706,7 +706,7 @@ fn resolution_outcomes_uncertainty_and_host_errors_are_strict_and_bounded() {
     let error_json = serde_json::to_string(&error).unwrap();
     assert_eq!(
         error_json,
-        r#"{"protocol_version":4,"error":{"code":"JOB_NOT_FOUND","message":"job was not found"}}"#
+        r#"{"protocol_version":5,"error":{"code":"JOB_NOT_FOUND","message":"job was not found"}}"#
     );
     assert_eq!(
         serde_json::from_str::<HostControlError>(&error_json).unwrap(),
@@ -718,7 +718,7 @@ fn resolution_outcomes_uncertainty_and_host_errors_are_strict_and_bounded() {
     assert!(HostControlError::new("CODE", "X".repeat(4097)).is_err());
     assert!(
         serde_json::from_str::<HostControlError>(
-            r#"{"protocol_version":4,"error":{"code":"A","code":"B","message":"m"}}"#
+            r#"{"protocol_version":5,"error":{"code":"A","code":"B","message":"m"}}"#
         )
         .is_err()
     );
@@ -750,7 +750,7 @@ fn host_control_error_messages_reject_control_characters_but_allow_unicode_and_s
         );
 
         let wire = serde_json::json!({
-            "protocol_version": 4,
+            "protocol_version": 5,
             "error": {
                 "code": "HOST_REQUEST_FAILED",
                 "message": message,

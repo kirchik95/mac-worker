@@ -475,6 +475,26 @@ test('task detail renders result and normalized timeline as text', async () => {
   assert.equal(harness.nodes['task-detail'].querySelector('img'), null);
 });
 
+test('a question with options renders its answers as text beside the question', async () => {
+  const detail = taskDetailFixture(MALICIOUS_LABEL);
+  detail.questions = [
+    { text: 'Which base should the fix land on?', options: ['main', 'release-2'] },
+    { text: 'Anything else?', options: [] },
+    'a bare string is still an open question',
+  ];
+  const harness = createHarness(taskSnapshotFixture(), {
+    [`/api/v1/tasks/${TASK_ACTIVE}`]: detail,
+  });
+  const client = createDashboardClient(harness);
+  await client.openTask(TASK_ACTIVE);
+
+  const text = harness.nodes['task-detail'].textContent;
+  assert.match(text, /Which base should the fix land on\? · main \| release-2/);
+  assert.match(text, /Anything else\?/);
+  assert.match(text, /a bare string is still an open question/);
+  assert.equal(harness.nodes['task-detail'].querySelector('img'), null);
+});
+
 test('active task logs poll every second with independent byte cursors', async () => {
   const harness = createHarness(taskSnapshotFixture(), taskLogResponses());
   const client = createDashboardClient(harness);

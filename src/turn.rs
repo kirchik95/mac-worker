@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     agent::{
-        AgentKind, PermissionPolicy, TurnLaunch, TurnLimits, adapter_for,
+        AgentKind, PermissionPolicy, Question, TurnLaunch, TurnLimits, adapter_for,
         parse_prebind_session_ref, prebind_login_request, render_shell,
     },
     error::WorkerError,
@@ -49,6 +49,7 @@ pub struct TurnMaterial {
     turn_number: u32,
     agent: AgentKind,
     model: Option<String>,
+    effort: Option<String>,
     policy: PermissionPolicy,
     limits: TurnLimits,
     base_oid: BaseOid,
@@ -65,6 +66,7 @@ impl TurnMaterial {
         turn_number: u32,
         agent: AgentKind,
         model: Option<String>,
+        effort: Option<String>,
         policy: PermissionPolicy,
         limits: TurnLimits,
         base_oid: BaseOid,
@@ -78,6 +80,7 @@ impl TurnMaterial {
             turn_number,
             agent,
             model,
+            effort,
             policy,
             limits,
             base_oid,
@@ -96,6 +99,7 @@ impl TurnMaterial {
         turn_number: u32,
         agent: AgentKind,
         model: Option<String>,
+        effort: Option<String>,
         policy: PermissionPolicy,
         limits: TurnLimits,
         base_oid: BaseOid,
@@ -116,6 +120,7 @@ impl TurnMaterial {
             turn_number,
             agent,
             model,
+            effort,
             policy,
             limits,
             base_oid,
@@ -177,6 +182,10 @@ impl TurnMaterial {
         self.model.as_deref()
     }
 
+    pub fn effort(&self) -> Option<&str> {
+        self.effort.as_deref()
+    }
+
     pub fn policy(&self) -> PermissionPolicy {
         self.policy
     }
@@ -216,6 +225,10 @@ impl TurnMaterial {
         if let Some(model) = &self.model {
             validate_text(model, 256, "model")?;
         }
+        if let Some(effort) = &self.effort {
+            crate::agent::validate_effort(effort)
+                .map_err(|error| turn_error("TURN_INVALID", error.to_string()))?;
+        }
         if let Some(profile) = &self.env_profile {
             validate_text(profile, 128, "environment profile")?;
             if profile.contains('/') || profile.contains('\\') || profile == "." || profile == ".."
@@ -236,11 +249,17 @@ impl TurnMaterial {
 impl serde::Serialize for TurnMaterial {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("TurnMaterial", 11)?;
+        // Omitted when unset so a turn without an effort keeps the canonical
+        // bytes, and therefore the digest, it had before the field existed.
+        let mut record =
+            serializer.serialize_struct("TurnMaterial", 11 + usize::from(self.effort.is_some()))?;
         record.serialize_field("task_id", &self.task_id)?;
         record.serialize_field("turn_number", &self.turn_number)?;
         record.serialize_field("agent", &agent_name(self.agent))?;
         record.serialize_field("model", &self.model)?;
+        if self.effort.is_some() {
+            record.serialize_field("effort", &self.effort)?;
+        }
         record.serialize_field("policy", &policy_name(self.policy))?;
         record.serialize_field("limits", &TurnLimitsWire::from(&self.limits))?;
         record.serialize_field("base_oid", &self.base_oid)?;
@@ -261,6 +280,8 @@ impl<'de> serde::Deserialize<'de> for TurnMaterial {
             turn_number: u32,
             agent: String,
             model: Option<String>,
+            #[serde(default)]
+            effort: Option<String>,
             policy: String,
             limits: TurnLimitsWire,
             base_oid: BaseOid,
@@ -277,6 +298,7 @@ impl<'de> serde::Deserialize<'de> for TurnMaterial {
             wire.turn_number,
             parse_agent(&wire.agent).map_err(D::Error::custom)?,
             wire.model,
+            wire.effort,
             parse_policy(&wire.policy).map_err(D::Error::custom)?,
             wire.limits.into_limits().map_err(D::Error::custom)?,
             wire.base_oid,
@@ -680,7 +702,7 @@ pub struct TurnResult {
     log_truncated: bool,
     head_oid: Option<BaseOid>,
     summary: Option<String>,
-    questions: Vec<String>,
+    questions: Vec<Question>,
     files_changed: Vec<String>,
     diff_stat: Option<String>,
 }
@@ -1175,7 +1197,7 @@ impl TurnResult {
         self.summary.as_deref()
     }
 
-    pub fn questions(&self) -> &[String] {
+    pub fn questions(&self) -> &[Question] {
         &self.questions
     }
 
