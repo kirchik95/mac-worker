@@ -35,7 +35,7 @@ Use `--base HEAD` when the task should start from the current committed work. Sa
 
 Use `--wip` when the task must include the current uncommitted changes. State which untracked inputs are included. A WIP base is a temporary commit; `publish = push` is rejected for it (`PUBLISH_REQUIRES_COMMITTED_BASE`).
 
-Say explicitly when the task must not push. The agent must commit its completed work, but the orchestrator only fetches the result and decides what happens next.
+Say explicitly that the task must not run git. The agent leaves its changes in the task worktree; the publisher commits them after the turn, and the orchestrator fetches the result branch and decides what happens next.
 
 ## Write The Brief
 
@@ -46,11 +46,11 @@ Every brief should contain these parts, in this order:
 3. **Boundaries:** files or areas allowed, forbidden files, and actions the agent must not take. State that it must not switch branches, push, open a merge request, or touch another worktree unless the task explicitly requires it.
 4. **Exact steps:** the implementation sequence. Prefer failing tests first, minimal implementation, focused verification, then the final check.
 5. **Gate:** exact verification commands and the acceptance condition. If any of those commands is timing-sensitive, require a serial rerun under load.
-6. **Report:** the required final message, including changed files, tests, commit hash, and any blocker or unverified claim.
+6. **Report:** the required final message, including changed files, tests, and any blocker or unverified claim.
 
-Tell the agent to commit completed work with a descriptive message. A successful task is not complete merely because files changed: the requested behavior must be verified and the commit must exist.
+Do not ask the agent to commit, switch branches, or push: on Codex the sandbox keeps `.git` read-only and the attempt ends the turn `blocked`. A successful task is not complete merely because files changed: the requested behavior must be verified by the gate.
 
-The prompt preamble already tells the agent to work in a dedicated task branch, commit, avoid interactive questions, and finish with a structured result. Keep task-specific instructions concrete and do not put secrets in the prompt.
+The prompt preamble already tells the agent that it works in an isolated task worktree, must not switch branches or push, leaves its changes for publication, and, for Cursor and OpenCode, must end with exactly the JSON result object. Keep task-specific instructions concrete and do not put secrets in the prompt.
 
 ## Headless-run lessons
 
@@ -60,6 +60,7 @@ These constraints come from live headless turns. Keep the brief itself tool-agno
 - **A zero process exit is not success.** Some agents, including Codex, exit `0` while the structured status is `blocked`. Read `status` from the result envelope. Return `done` only when that field is `done` and the gate passed. Treat `blocked` as a failed turn even when the CLI exited zero.
 - **Headless agents cannot ask questions.** There is no TTY and no permission prompt. Every decision the agent needs must be in the brief: names, paths, commands, acceptance numbers, and what to do on the obvious branches. If a decision is genuinely missing, the agent must finish the turn with `needs_input` or `blocked` and a concrete question. Do not write "ask me if unsure."
 - **Name forbidden files when several tasks share a repository.** "Do not edit unrelated files" is not enough. List the exact paths or directories another in-flight task owns, and list the paths this task must not touch. Two tasks on one repository are still one-repo-per-task only if their write sets are disjoint and each brief says so.
+- **Do not displace the structured result.** Cursor and OpenCode have no output schema; the preamble demands a bare JSON object as the last message. A brief that asks for a Markdown summary at the end pushes the JSON out and the outcome becomes `unknown`. Ask for the summary inside the JSON `summary` field.
 - **Timing-sensitive tests need a serial rerun under load.** A single green run in an idle worktree is not the gate when the change can race. Say so in the Gate: run the focused tests once, then rerun them serially (not in a wide parallel harness) while other work is in flight, and treat a flake on that rerun as `blocked`.
 
 ## Read The Result
@@ -76,9 +77,9 @@ If the turn fails, inspect the structured result and logs before authoring a fol
 
 | Work type | Agent |
 |---|---|
-| Rust implementation, Rust tests, builds, or work needing shell judgement | Codex |
-| TypeScript or frontend implementation | Cursor |
-| Second opinion or documentation | OpenCode |
+| Rust implementation, Rust tests, builds, or work needing shell judgement | Codex, `--model gpt-5.6-luna` |
+| TypeScript or frontend implementation | Cursor, `--env-profile agents` |
+| Second opinion or documentation | OpenCode, default Zen model or `--model opencode-go/<model>` |
 | Claude Code on workers | Deferred by the operator for now |
 
 Routing is guidance for `--agent`; do not invent worker names or SSH destinations. The pool selects the worker.
@@ -106,7 +107,7 @@ Allowed: the validator, its unit tests, and the API error mapping. Do not edit p
 2. Run the focused test command and confirm the failures are caused by missing validation.
 3. Implement the smallest validation change.
 4. Run the focused tests and the repository formatter.
-5. Commit the completed work as `fix: validate request ids`.
+5. Leave the changes uncommitted in the worktree; do not run git.
 
 ## Gate
 
@@ -114,7 +115,7 @@ Run `cargo test --locked --test request_validation` and `cargo fmt --check`. Bot
 
 ## Report
 
-Report the commit hash, changed files, test result, and any remaining limitation. Return `done` only when the gate passes; return `blocked` with the exact failing command otherwise.
+Report the changed files, the test result, and any remaining limitation. Return `done` only when the gate passes; return `blocked` with the exact failing command otherwise.
 ```
 
 ## Example Batch File
@@ -136,7 +137,7 @@ title = "Extract billing client"
 prompt = """
 Move the billing HTTP client into packages/billing-client …
 """
-agent = "claude"
+agent = "opencode"
 publish = ["fetch", "push"]
 publish_branch = "feat/billing-client"
 ```

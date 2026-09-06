@@ -16,7 +16,7 @@ The CLI is the only interface. The skill contains no scheduling logic.
 Exact public grammar in the current release. The execution-core scope restrictions below still apply.
 
 ```text
-worker task submit [options] (--prompt TEXT | --prompt-file PATH)
+worker task submit [options] (--prompt TEXT | --prompt-file PATH) [--title TEXT]
 worker task batch FILE [--name NAME] [--max-parallel N] [--wait]
 worker task list [--run RUN_ID] [--state STATE] [--full]
 worker task status TASK_ID [--full]
@@ -30,7 +30,7 @@ worker task close TASK_ID [--discard]
 worker task wait (--task-id TASK_ID | --run RUN_ID) [--timeout DURATION]
 worker task reconcile     # re-own dead runners and re-enqueue orphaned tasks without submitting anything
 worker workers [--refresh]
-worker dashboard          # the tasks-and-runs view is a later phase
+worker dashboard [--port N] [--no-open]   # read-only observer on loopback with the tasks-and-runs view
 ```
 
 `submit` options:
@@ -60,7 +60,14 @@ Without `--wait`, `submit`, `batch`, and `say` return as soon as the task record
 
 `--json` on any command emits the same typed records the dashboard consumes; `submit`, `say`, `logs -f`, and `wait` emit versioned NDJSON events, with log chunks base64-encoded as in v1.
 
-This execution core accepts `source = local` and `publish = fetch` only. `source = origin`, `publish = push`, `--publish-branch`, `--agent cursor`, and `--agent opencode` are later phases and must be rejected at preflight. Claude Code is deferred on the workers by operator decision; do not submit `--agent claude` until the operator enables it.
+The current release accepts `source = local|origin` and `publish = fetch|push`; `--publish-branch` is valid only with `push`, and a `--wip` base cannot push (`PUBLISH_REQUIRES_COMMITTED_BASE`). Agents on this pool:
+
+- `codex`: pass `--model gpt-5.6-luna`; reasoning effort comes from the worker's Codex config, not from the CLI.
+- `opencode`: no model flag uses the worker's default (OpenCode Zen, Muse Spark 1.3, free); OpenCode Go models are `--model opencode-go/<model>`.
+- `cursor`: always `--env-profile agents`; that worker-side profile carries the Cursor login and the login-keychain unlock. Never read or copy it.
+- `claude`: deferred on the workers by operator decision; do not submit it until the operator enables it.
+
+Watch the pool while tasks run: `worker dashboard --port 8765 --no-open`, then open `http://127.0.0.1:8765`.
 
 ## Submit
 
@@ -150,6 +157,8 @@ worker task close <id>
 - Keep task identifiers and the run identifier; do not infer them from display order.
 - Keep tasks independent. Do not use one task's workspace as another task's workspace.
 - Never write a message into a running agent. Conversation is `say` between turns only.
+- Never ask an agent to commit, switch branches, or push. The publisher commits the worktree changes after the turn; on Codex the sandbox keeps `.git` read-only and a commit attempt ends the turn `blocked`.
+- A task with the default `--close-on done` closes itself after a `done` turn. `close --discard` also deletes the agent's session on the worker.
 - Read the durable task outcome as well as the process exit status. A zero exit with status `blocked` is a failed turn.
 
 ## Exit Codes
