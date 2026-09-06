@@ -925,3 +925,73 @@ fn prebind_login_request_runs_the_command_through_a_login_shell() {
     );
     assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "prebind-ok");
 }
+
+fn cursor_fixture(name: &str) -> String {
+    fs::read_to_string(format!("tests/fixtures/cursor/{name}"))
+        .unwrap_or_else(|error| panic!("Cursor fixture {name} must be readable: {error}"))
+}
+
+#[test]
+fn cursor_live_markdown_final_message_stays_unknown() {
+    // Captured from a live Cursor turn on a worker: the agent rendered the
+    // contract as Markdown instead of a JSON object.
+    let result = adapter_for(AgentKind::Cursor)
+        .extract_result(&cursor_fixture("stream-json.jsonl"), None)
+        .unwrap();
+    assert_eq!(result.status(), mac_worker::agent::ResultStatus::Unknown);
+}
+
+#[test]
+fn cursor_extracts_the_json_object_ending_the_final_message() {
+    let result = adapter_for(AgentKind::Cursor)
+        .extract_result(&cursor_fixture("final-json.jsonl"), None)
+        .unwrap();
+    assert_eq!(result.status(), mac_worker::agent::ResultStatus::Done);
+    assert_eq!(result.summary(), "smoke file created");
+    assert_eq!(result.files_changed(), &["scratch/cursor-smoke.txt"]);
+}
+
+#[test]
+fn cursor_extracts_a_fenced_json_object_from_the_final_message() {
+    let result = adapter_for(AgentKind::Cursor)
+        .extract_result(&cursor_fixture("final-fenced.jsonl"), None)
+        .unwrap();
+    assert_eq!(result.status(), mac_worker::agent::ResultStatus::Done);
+    assert_eq!(result.summary(), "smoke file created");
+}
+
+#[test]
+fn cursor_extracts_needs_input_from_the_final_message() {
+    let result = adapter_for(AgentKind::Cursor)
+        .extract_result(&cursor_fixture("final-needs-input.jsonl"), None)
+        .unwrap();
+    assert_eq!(result.status(), mac_worker::agent::ResultStatus::NeedsInput);
+    assert_eq!(result.questions(), &["alpha or beta?"]);
+}
+
+#[test]
+fn cursor_live_fixture_captures_the_session_id() {
+    let adapter = adapter_for(AgentKind::Cursor);
+    let events: Vec<mac_worker::agent::AgentEvent> = cursor_fixture("stream-json.jsonl")
+        .lines()
+        .filter_map(|line| adapter.parse_event(line))
+        .collect();
+    assert!(matches!(
+        events.first(),
+        Some(mac_worker::agent::AgentEvent::SessionStarted { session_ref }) if session_ref == "2df4613a-3015-46d8-9f06-b595b06988f4"
+    ));
+}
+
+#[test]
+fn cursor_prompt_requires_an_exact_json_final_message() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let harness = TaskHarness::cursor();
+    harness.submit_first_turn().unwrap();
+    let prompt = harness.last_prompt();
+    assert!(prompt.contains("Cursor:"));
+    assert!(
+        prompt.contains("end your final message with exactly the JSON object and nothing after it")
+    );
+    assert!(prompt.contains("do not render it as Markdown"));
+    assert!(prompt.contains("\"files_changed\""));
+}

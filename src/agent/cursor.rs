@@ -6,7 +6,8 @@ use crate::process::ProcessResult;
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthProbe, AuthProbeResult,
     StructuredResult, TurnLaunch, TurnParams, argv_pointer_launch, bound_summary, combined_output,
-    parse_json_line, require_session_ref, resolve_trailer_result, strip_ansi, validate_params,
+    parse_json_line, require_session_ref, resolve_last_structured_result, strip_ansi,
+    validate_params,
 };
 
 const ENV_NAMES: [&str; 1] = ["CURSOR_API_KEY"];
@@ -87,7 +88,7 @@ impl AgentAdapter for CursorAdapter {
         stream: &str,
         last_message_file: Option<&str>,
     ) -> Result<StructuredResult, AdapterError> {
-        Ok(resolve_trailer_result(
+        Ok(resolve_last_structured_result(
             last_message_file,
             &result_candidates(stream),
         ))
