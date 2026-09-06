@@ -3977,6 +3977,7 @@ mod tests {
             1,
             AgentKind::Codex,
             None,
+            None,
             PermissionPolicy::Workspace,
             TurnLimits::new(30_000, None, None).unwrap(),
             base_oid,

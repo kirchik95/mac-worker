@@ -61,6 +61,7 @@ fn task_meta(task: TaskId, title: &str, created_at_millis: u64) -> TaskMeta {
         worktree_id: WORKTREE_ID.into(),
         agent: AgentKind::Codex,
         model: Some("gpt-5".into()),
+        effort: None,
         policy: PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
@@ -119,7 +120,7 @@ fn active_record() -> LocalTaskRecord {
             "<script>alert(1)</script> summary at {home}/private with {TOKEN}\nnext"
         )),
         vec![
-            format!("{home}/repo/src/lib.rs"),
+            format!("{home}/repo/src/lib.rs").into(),
             "src/main.rs".into(),
             "~/private/token.txt".into(),
         ],

@@ -471,6 +471,7 @@ impl TaskHarness {
             TaskSubmitRequest {
                 agent: self.runner.agent,
                 model: None,
+                effort: None,
                 prompt: prompt.into(),
                 project: std::env::current_dir().unwrap(),
                 base: "main".into(),
@@ -742,6 +743,7 @@ fn cursor_workspace_policy_records_permission_fallback() {
             &mac_worker::agent::TurnParams {
                 kind: AgentKind::Cursor,
                 model: None,
+                effort: None,
                 policy: PermissionPolicy::Workspace,
                 limits: mac_worker::agent::TurnLimits::new(45 * 60 * 1000, None, None).unwrap(),
                 session_seed: uuid::Uuid::from_u128(1),
@@ -966,7 +968,10 @@ fn cursor_extracts_needs_input_from_the_final_message() {
         .extract_result(&cursor_fixture("final-needs-input.jsonl"), None)
         .unwrap();
     assert_eq!(result.status(), mac_worker::agent::ResultStatus::NeedsInput);
-    assert_eq!(result.questions(), &["alpha or beta?"]);
+    assert_eq!(
+        result.questions(),
+        &[mac_worker::agent::Question::open("alpha or beta?")]
+    );
 }
 
 #[test]

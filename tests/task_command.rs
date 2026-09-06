@@ -191,6 +191,31 @@ agent = "claude"
 }
 
 #[test]
+fn batch_file_carries_model_and_effort_as_defaults_and_per_task_overrides() {
+    let parsed: BatchFile = toml::from_str(
+        r#"
+version = 1
+agent = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+[[tasks]]
+prompt = "inherit the defaults"
+
+[[tasks]]
+prompt = "override the effort"
+effort = "medium"
+"#,
+    )
+    .expect("model and effort must be accepted as batch defaults");
+
+    assert_eq!(parsed.defaults.model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(parsed.defaults.effort.as_deref(), Some("max"));
+    assert_eq!(parsed.tasks[0].effort, None);
+    assert_eq!(parsed.tasks[1].effort.as_deref(), Some("medium"));
+}
+
+#[test]
 fn batch_file_defaults_to_version_one_and_local_fetch() {
     let parsed: BatchFile = toml::from_str(
         r#"

@@ -644,6 +644,7 @@ impl AcceptedThenTerminalFixture {
                 TaskSubmitRequest {
                     agent: AgentKind::Codex,
                     model: None,
+                    effort: None,
                     prompt: "make the change".into(),
                     project: repo.root().to_path_buf(),
                     base: "main".into(),
@@ -1125,6 +1126,7 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
             TaskSubmitRequest {
                 agent: AgentKind::Codex,
                 model: None,
+                effort: None,
                 prompt: "make the change".into(),
                 project: repo.root().to_path_buf(),
                 base: "main".into(),
@@ -1267,6 +1269,7 @@ fn assert_submit_rolls_back_post_create_state(
             TaskSubmitRequest {
                 agent: AgentKind::Codex,
                 model: None,
+                effort: None,
                 prompt: "make the change".into(),
                 project: repo.root().to_path_buf(),
                 base: "main".into(),
@@ -1613,6 +1616,7 @@ fn reconciliation_excludes_retired_pending_rollback_turn_before_dead_owner_adopt
             TaskSubmitRequest {
                 agent: AgentKind::Codex,
                 model: None,
+                effort: None,
                 prompt: "make the change".into(),
                 project: repo.root().to_path_buf(),
                 base: "main".into(),
@@ -1752,6 +1756,7 @@ fn rollback_retry_does_not_release_a_later_tasks_reacquired_run_publish_branch()
     let request = || TaskSubmitRequest {
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         prompt: "make the change".into(),
         project: repo.root().to_path_buf(),
         base: "main".into(),
@@ -1853,6 +1858,7 @@ fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
     let request = || TaskSubmitRequest {
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         prompt: "make the change".into(),
         project: repo.root().to_path_buf(),
         base: "main".into(),
@@ -1955,6 +1961,7 @@ fn reconciliation_does_not_rollback_a_submission_that_cleared_its_intent_while_w
     let request = || TaskSubmitRequest {
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         prompt: "make the change".into(),
         project: repo.root().to_path_buf(),
         base: "main".into(),
@@ -2069,6 +2076,7 @@ fn intent_clear_fsync_failure_does_not_restore_a_stale_submission_snapshot_after
     let request = || TaskSubmitRequest {
         agent: AgentKind::Codex,
         model: None,
+        effort: None,
         prompt: "make the change".into(),
         project: repo.root().to_path_buf(),
         base: "main".into(),
@@ -2187,6 +2195,7 @@ fn reconciliation_keeps_pending_submission_intent_out_of_runner_startup_until_re
             TaskSubmitRequest {
                 agent: AgentKind::Codex,
                 model: None,
+                effort: None,
                 prompt: "make the change".into(),
                 project: repo.root().to_path_buf(),
                 base: "main".into(),
@@ -2307,6 +2316,7 @@ fn restart_recovers_prompt_failure_when_every_rollback_marker_write_fails() {
             TaskSubmitRequest {
                 agent: AgentKind::Codex,
                 model: None,
+                effort: None,
                 prompt: "make the change".into(),
                 project: repo.root().to_path_buf(),
                 base: "main".into(),
@@ -2383,6 +2393,7 @@ fn submit_preserves_state_when_detached_child_adopts_before_handoff_failure() {
             TaskSubmitRequest {
                 agent: AgentKind::Codex,
                 model: None,
+                effort: None,
                 prompt: "make the change".into(),
                 project: repo.root().to_path_buf(),
                 base: "main".into(),

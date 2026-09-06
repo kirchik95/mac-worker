@@ -31,6 +31,7 @@ impl AgentAdapter for CodexAdapter {
             SCHEMA_PLACEHOLDER.into(),
         ];
         push_model(&mut args, params);
+        push_effort(&mut args, params);
         push_first_turn_policy(&mut args, params.policy);
         args.push("-".into());
         Ok(TurnLaunch::new(
@@ -60,6 +61,7 @@ impl AgentAdapter for CodexAdapter {
             SCHEMA_PLACEHOLDER.into(),
         ];
         push_model(&mut args, params);
+        push_effort(&mut args, params);
         push_resume_policy(&mut args, params.policy);
         args.push("-".into());
         Ok(TurnLaunch::new(
@@ -118,6 +120,15 @@ fn push_model(args: &mut Vec<String>, params: &TurnParams) {
     if let Some(model) = &params.model {
         args.push("-m".into());
         args.push(model.clone());
+    }
+}
+
+/// Codex takes reasoning effort as a config override rather than a flag. The
+/// value is validated by `validate_params` before it reaches this point.
+fn push_effort(args: &mut Vec<String>, params: &TurnParams) {
+    if let Some(effort) = &params.effort {
+        args.push("-c".into());
+        args.push(format!("model_reasoning_effort=\"{effort}\""));
     }
 }
 

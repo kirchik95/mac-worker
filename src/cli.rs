@@ -106,6 +106,8 @@ pub enum TaskCommand {
         agent: Option<String>,
         #[arg(long, value_parser = non_empty_text)]
         model: Option<String>,
+        #[arg(long, value_parser = non_empty_text)]
+        effort: Option<String>,
         #[arg(
             long,
             conflicts_with = "prompt_file",
@@ -169,6 +171,8 @@ pub enum TaskCommand {
         run: Option<RunId>,
         #[arg(long, value_parser = non_empty_text)]
         state: Option<String>,
+        #[arg(long, value_parser = non_empty_text)]
+        outcome: Option<String>,
         #[arg(long)]
         full: bool,
     },

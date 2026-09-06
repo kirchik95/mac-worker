@@ -562,8 +562,8 @@ fn outdated_layout_fails_closed_until_hidden_setup_migrates_it() {
 }
 
 #[test]
-fn protocol_three_probe_fixture_is_a_protocol_mismatch_and_new_fixtures_derive_from_v4() {
-    assert_eq!(PROTOCOL_VERSION, 4);
+fn protocol_three_probe_fixture_is_a_protocol_mismatch_and_new_fixtures_derive_from_v5() {
+    assert_eq!(PROTOCOL_VERSION, 5);
     let mut old = serde_json::json!({
         "protocol_version": 3,
         "supervision_version": 2,

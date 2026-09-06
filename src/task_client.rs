@@ -50,6 +50,7 @@ const WAIT_MAX_POLL: Duration = Duration::from_secs(1);
 pub struct TaskSubmitRequest {
     pub agent: AgentKind,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub prompt: String,
     pub project: PathBuf,
     pub base: String,
@@ -71,6 +72,9 @@ pub struct TaskSubmitRequest {
 pub struct TaskListFilter {
     pub run_id: Option<RunId>,
     pub state: Option<TaskState>,
+    /// Canonical `TaskOutcome::kind` name; `needs_input` is the orchestrator's
+    /// query for tasks waiting on an answer.
+    pub outcome: Option<String>,
     pub full: bool,
 }
 
@@ -268,6 +272,8 @@ impl<'de> Deserialize<'de> for BatchFile {
             #[serde(default)]
             model: Option<String>,
             #[serde(default)]
+            effort: Option<String>,
+            #[serde(default)]
             base: Option<String>,
             #[serde(default)]
             wip: Option<bool>,
@@ -298,6 +304,7 @@ impl<'de> Deserialize<'de> for BatchFile {
         let has_flat_defaults = [
             wire.agent.is_some(),
             wire.model.is_some(),
+            wire.effort.is_some(),
             wire.base.is_some(),
             wire.wip.is_some(),
             wire.timeout.is_some(),
@@ -325,6 +332,9 @@ impl<'de> Deserialize<'de> for BatchFile {
         }
         if wire.model.is_some() {
             defaults.model = wire.model;
+        }
+        if wire.effort.is_some() {
+            defaults.effort = wire.effort;
         }
         if let Some(base) = wire.base {
             defaults.base = base;
@@ -378,6 +388,8 @@ pub struct BatchDefaults {
     pub agent: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default = "default_base_name")]
     pub base: String,
     #[serde(default)]
@@ -409,6 +421,7 @@ impl Default for BatchDefaults {
         Self {
             agent: default_agent_name(),
             model: None,
+            effort: None,
             base: default_base_name(),
             wip: false,
             timeout: None,
@@ -438,6 +451,8 @@ pub struct BatchTask {
     pub agent: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default)]
     pub base: Option<String>,
     #[serde(default)]
@@ -549,6 +564,8 @@ impl<'a> TaskClient<'a> {
             .env_profile
             .clone()
             .or_else(|| settings.env_profile.clone());
+        let model = request.model.clone().or_else(|| settings.model.clone());
+        let effort = request.effort.clone().or_else(|| settings.effort.clone());
         let publish_names = request.publish.as_deref().unwrap_or(&settings.publish);
         let publish = parse_publish_modes(publish_names)?;
         let source_name = request.source.as_deref().unwrap_or(&settings.source);
@@ -663,7 +680,8 @@ impl<'a> TaskClient<'a> {
             project_id: initial.context.project_id.clone(),
             worktree_id: initial.context.worktree_id.clone(),
             agent: request.agent,
-            model: request.model.clone(),
+            model,
+            effort,
             policy,
             source,
             publish,
@@ -839,6 +857,13 @@ impl<'a> TaskClient<'a> {
                 filter
                     .state
                     .is_none_or(|state| task.status().state() == state)
+            })
+            .filter(|task| {
+                filter.outcome.as_deref().is_none_or(|kind| {
+                    task.status()
+                        .last_outcome()
+                        .is_some_and(|outcome| outcome.kind() == kind)
+                })
             })
             .collect::<Vec<_>>();
 
@@ -1657,6 +1682,7 @@ impl<'a> TaskClient<'a> {
         Ok(TaskSubmitRequest {
             agent,
             model: task.model.clone().or_else(|| defaults.model.clone()),
+            effort: task.effort.clone().or_else(|| defaults.effort.clone()),
             prompt: read_batch_prompt(task, batch_dir)?,
             project: project.to_path_buf(),
             base: task.base.clone().unwrap_or_else(|| defaults.base.clone()),

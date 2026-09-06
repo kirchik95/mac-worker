@@ -36,6 +36,8 @@ pub struct TaskSettings {
     pub source: String,
     pub publish: Vec<String>,
     pub env_profile: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub default_agent: String,
     pub timeout: Duration,
     pub max_followups: u32,
@@ -108,6 +110,10 @@ struct RawTaskSettings {
     publish: Vec<String>,
     #[serde(default)]
     env_profile: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default = "default_task_agent")]
     default_agent: String,
     #[serde(default = "default_task_timeout")]
@@ -124,6 +130,8 @@ impl Default for RawTaskSettings {
             source: default_task_source(),
             publish: default_task_publish(),
             env_profile: None,
+            model: None,
+            effort: None,
             default_agent: default_task_agent(),
             timeout: default_task_timeout(),
             max_followups: default_task_max_followups(),
@@ -326,6 +334,13 @@ fn validate_task_settings(raw: RawTaskSettings) -> Result<TaskSettings, WorkerEr
     if let Some(profile) = &raw.env_profile {
         validate_task_text(profile, "task environment profile")?;
     }
+    if let Some(model) = &raw.model {
+        validate_task_text(model, "task model")?;
+    }
+    if let Some(effort) = &raw.effort {
+        crate::agent::validate_effort(effort)
+            .map_err(|error| task_config(format!("task effort {error} (TASK_CONFIG_INVALID)")))?;
+    }
     let timeout = humantime::parse_duration(&raw.timeout)
         .map_err(|_| task_config("task timeout must be a valid duration (TASK_CONFIG_INVALID)"))?;
     if timeout.is_zero() || timeout > Duration::from_secs(24 * 60 * 60) {
@@ -350,6 +365,8 @@ fn validate_task_settings(raw: RawTaskSettings) -> Result<TaskSettings, WorkerEr
         source: raw.source,
         publish,
         env_profile: raw.env_profile,
+        model: raw.model,
+        effort: raw.effort,
         default_agent: raw.default_agent,
         timeout,
         max_followups: raw.max_followups,

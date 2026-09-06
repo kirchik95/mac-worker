@@ -310,6 +310,18 @@ export function createDashboardClient({ document, fetch, timers }) {
     return button;
   };
 
+  // A question is a plain string when it is open, and an object carrying the
+  // answers the agent will accept when it offers options. Both stay text only.
+  const questionLabel = (value) => {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    const text = typeof value.text === 'string' ? value.text : '';
+    const options = Array.isArray(value.options)
+      ? value.options.filter((option) => typeof option === 'string')
+      : [];
+    return options.length ? `${text} · ${options.join(' | ')}` : text;
+  };
+
   const appendResultList = (container, label, values, className) => {
     if (!values?.length) return;
     const wrapper = element('div', className);
@@ -346,7 +358,12 @@ export function createDashboardClient({ document, fetch, timers }) {
       element('p', 'task-result-card__label', `Result · ${outcomeSummary(task.last_outcome)}`),
       element('p', 'task-result-card__summary', detail.summary ?? 'No summary reported.'),
     );
-    appendResultList(result, 'Questions', detail.questions, 'task-result-card__questions');
+    appendResultList(
+      result,
+      'Questions',
+      Array.isArray(detail.questions) ? detail.questions.map(questionLabel) : detail.questions,
+      'task-result-card__questions',
+    );
     appendResultList(result, 'Changed files', detail.files_changed, 'task-result-card__files');
     if (detail.diff_stat != null) {
       result.append(element('p', 'task-result-card__files', `Diff stat · ${detail.diff_stat}`));

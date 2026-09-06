@@ -100,14 +100,16 @@ Phase 5 adds agent tasks: submit a prompt instead of a command, run a headless c
 
 The orchestrator loop is documented in [`.claude/skills/pool-dispatch/SKILL.md`](.claude/skills/pool-dispatch/SKILL.md). How to write a brief is in [`.claude/skills/pool-task-authoring/SKILL.md`](.claude/skills/pool-task-authoring/SKILL.md). The three-Mac live procedure is [docs/phase-five-acceptance-runbook.md](docs/phase-five-acceptance-runbook.md); the sanitized record template is [docs/phase-five-validation.md](docs/phase-five-validation.md).
 
-Prepare each worker first using the [macOS worker setup guide](docs/setup-macos-worker.md). After a helper that migrates the host layout or collects agent facts for the first time, rerun `worker setup` on every worker.
+Prepare each worker first using the [macOS worker setup guide](docs/setup-macos-worker.md). After a helper that migrates the host layout or collects agent facts for the first time, rerun `worker setup` on every worker. This release moves the protocol to version 5 because the turn material and the task status changed shape, so `worker setup` must be rerun on every worker before it is eligible again.
 
 Task commands:
 
 ```text
 worker task submit --agent codex --prompt-file tasks/fix-login.md
+worker task submit --agent codex --model gpt-5.6-luna --effort max --prompt-file tasks/fix-login.md
 worker task batch tasks/sprint.toml --max-parallel 3
 worker task list --run <run_id> --json
+worker task list --state open --outcome needs-input --json
 worker task wait --run <run_id>
 worker task say <task_id> --message-file answer.md --wait
 worker task result <task_id> --json
@@ -119,6 +121,12 @@ worker workers --refresh
 
 `worker workers --refresh` recollects agent, profile, and Git-identity facts. `worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks without submitting anything.
 
+`--model` and `--effort` are recorded with the task and reach only the agents that accept them: Codex takes the effort as `-c model_reasoning_effort="<value>"` on the first turn and on resume, while Claude, Cursor, and OpenCode ignore it as they already ignore `--max-turns` and `--max-budget`. An effort value may contain only ASCII letters, digits, `-`, and `_`, and at most 32 bytes.
+
+`worker task list --outcome <kind>` filters by the recorded last outcome (`done`, `needs_input`, `blocked`, `unknown`, `failed`, `cancelled`, `timed_out`, `lost`; the dashed spelling is accepted) and composes with `--state`. `--state open --outcome needs-input` lists the tasks waiting on an answer.
+
+An agent's questions carry the answers it will accept: `worker task status --json` and `worker task result --json` report each question as `{"text": …, "options": [...]}`, and a question with no options stays a bare string. Answer with `worker task say`.
+
 For an individual task, use `worker task wait --task-id <task_id>`; `worker task wait --run <run_id>` waits for every task in a run.
 
 A batch file looks like this:
@@ -126,6 +134,8 @@ A batch file looks like this:
 ```toml
 version = 1
 agent = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
 base = "main"
 source = "local"
 publish = ["fetch"]
@@ -152,6 +162,8 @@ source = "local"
 publish = ["fetch"]
 env_profile = "agents"
 default_agent = "codex"
+model = "gpt-5.6-luna"     # optional; --model wins
+effort = "max"             # optional; --effort wins
 timeout = "45m"
 max_followups = 10
 

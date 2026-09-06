@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt};
 use serde::Serialize;
 
 use crate::{
-    agent::AgentKind,
+    agent::{AgentKind, Question},
     redaction::RedactionBoundary,
     scheduler::QueueBlockingReason,
     task::{
@@ -70,7 +70,7 @@ pub struct TaskDetailProjection {
     pub head_oid: Option<BaseOid>,
     pub session_present: bool,
     pub summary: Option<String>,
-    pub questions: Vec<String>,
+    pub questions: Vec<Question>,
     pub files_changed: Vec<String>,
     pub diff_stat: Option<String>,
     pub fetch_command: String,

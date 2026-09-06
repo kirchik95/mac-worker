@@ -455,6 +455,7 @@ impl<'a> TurnRunner<'a> {
             turn_number,
             initial_record.meta().agent(),
             initial_record.meta().model().map(str::to_owned),
+            initial_record.meta().effort().map(str::to_owned),
             initial_record.meta().policy(),
             turn_limits.clone(),
             initial_record
@@ -470,6 +471,7 @@ impl<'a> TurnRunner<'a> {
         let params = TurnParams {
             kind: turn.agent(),
             model: turn.model().map(str::to_owned),
+            effort: turn.effort().map(str::to_owned),
             policy: turn.policy(),
             limits: turn_limits,
             session_seed: turn.session_seed(),

@@ -126,7 +126,7 @@ The rule that keeps tasks isolated from one another is structural: a turn is one
 ```text
 worker task submit [options] (--prompt TEXT | --prompt-file PATH)
 worker task batch FILE [--run-name NAME] [--max-parallel N]
-worker task list [--run RUN_ID] [--state STATE]
+worker task list [--run RUN_ID] [--state STATE] [--outcome KIND]
 worker task status TASK_ID
 worker task logs [-f] TASK_ID [--turn N] [--raw]
 worker task diff TASK_ID [--stat]
@@ -145,7 +145,8 @@ worker dashboard          # extended with tasks and runs
 
 ```text
 --agent codex|claude|cursor|opencode     required
---model ID                               optional, agent-specific
+--model ID                               optional, agent-specific; default from .worker.toml
+--effort LEVEL                           optional reasoning effort, passed to agents that accept one
 --project PATH                           default: current worktree
 --base REF                               default: HEAD
 --wip                                    include uncommitted changes as a temporary base commit
@@ -183,6 +184,8 @@ worker task fetch 8f3a…
 ```toml
 version = 1
 agent = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
 base = "main"
 source = "local"
 publish = ["fetch"]
@@ -214,6 +217,8 @@ source = "local"
 publish = ["fetch"]
 env_profile = "agents"
 default_agent = "codex"
+model = "gpt-5.6-luna"     # optional; the CLI flag wins
+effort = "max"             # optional reasoning effort; the CLI flag wins
 timeout = "45m"
 max_followups = 10
 
@@ -406,9 +411,11 @@ The structured result is:
 ```json
 { "status": "done" | "needs_input" | "blocked",
   "summary": "…",
-  "questions": ["…"],
+  "questions": [{ "text": "…", "options": ["…"] }],
   "files_changed": ["…"] }
 ```
+
+A question's `options` are the answers the agent will accept, so an orchestrator selects one instead of parsing prose; an empty list means the question is open. A question without options is stored and returned as a bare string, so records written before options existed round-trip unchanged and an agent that still emits a string array is still understood.
 
 Codex and Claude Code are asked for it through their schema options. Cursor Agent and OpenCode are asked to end with a fenced `mac-worker-result` JSON block, which the adapter extracts; a missing or malformed block yields `status: "unknown"` and does not fail the turn. The preamble contains no secrets, paths beyond the workspace-relative branch name, or worker identity.
 
@@ -514,7 +521,8 @@ Batch jobs and task turns share the same lease, so a worker runs at most one of 
 
 - `logs -f` follows the normalized event stream: assistant messages, tool calls with bounded summaries, file changes, commands with exit codes, usage, and turn end, rendered by the adapter's parser on the client. `--raw` streams the raw stdout bytes instead. Both resume from byte offsets and survive disconnects.
 - `diff` runs `git diff` (or `--stat`) against `base_oid` in the workspace through a hidden host command, using a private copy of the workspace index so it never refreshes or locks the agent's index. It is read-only, bounded to 512 KiB per call with an explicit truncation flag, and always includes committed and uncommitted changes since the base.
-- `status` shows the task state, last outcome, summary, questions, session presence, branch, diff summary, turn history, and runner state.
+- `status` shows the task state, last outcome, summary, questions with their options, session presence, branch, diff summary, turn history, and runner state.
+- `list --outcome KIND` filters by the recorded `last_outcome` kind and composes with `--state`; `--state open --outcome needs_input` is the orchestrator's query for tasks waiting on an answer.
 - `say` is the only way to talk to the agent; it always starts a new turn.
 - `cancel` stops the active turn's process group exactly as v1 cancellation does, then leaves the task `open`.
 
@@ -731,3 +739,12 @@ Revision 2.3 incorporates the Task 0 spike record (`docs/agent-task-spike.md`):
 - Confirmed for Codex: the `thread.started` event carries the session identifier, the `-o` file holds the schema-shaped result, resume after `TERM` keeps the session and both edits, `codex delete --force` removes the canonical session, and a failing turn can exit `0` with structured status `blocked`, which is why exit classification consults the structured status first.
 - Git's automatic identity fallback produced a commit on a worker without a configured identity, confirming that the launcher must export the recorded identity.
 - Claude Code is deferred on the workers by operator decision for now; its adapter is encoded from help text and unverified live. The memory profile remains unproven because the offline Cargo cache on the worker could not run the suite; it is re-measured during phase 5 acceptance.
+
+Revision 2.4 adds reasoning-effort passthrough and structured question options:
+
+- `submit`, batch files, and `.worker.toml` carry `effort` beside `model`; the value is recorded in the task metadata and the turn material, and reaches only the agents that accept one. Codex receives `-c model_reasoning_effort="<value>"` on the first turn and on resume; Claude, Cursor, and OpenCode ignore it exactly as they already ignore `max_turns` and `max_budget_usd`. The value is restricted to ASCII letters, digits, `-`, and `_`, at most 32 bytes, so it cannot smuggle a second configuration override into the launcher argv.
+- `effort` is written into the task record and the turn material only when it is set, and is defaulted when absent, so a task created before the field existed keeps its exact canonical bytes and its turn digest and still loads after the upgrade.
+- `.worker.toml` also gains `model`, so a project that always uses one model and effort configures both once. The CLI flag wins over the project default, and a batch task's key wins over its batch defaults.
+- A question is now `{ "text", "options" }`. Options are bounded like every other agent-supplied field: at most 8 per question, 256 bytes each, redacted through the same boundary. A question with no options serializes as a bare string, so existing records and agents that still emit string arrays keep working.
+- `worker task list` gains `--outcome KIND`, matching the serialized `last_outcome` tag and accepting the dashed spelling, so the orchestrator loop can ask for `needs_input` without reading every row.
+- `PROTOCOL_VERSION` moves to 5 because both the turn material and the task status changed shape; every worker needs `worker setup` rerun before it is eligible again.
