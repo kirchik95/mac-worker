@@ -2737,6 +2737,25 @@ mod tests {
     }
 
     #[test]
+    fn outcome_filter_accepts_every_kind_in_both_spellings() {
+        for kind in crate::task::TaskOutcome::KINDS {
+            assert_eq!(super::parse_task_outcome_kind(kind).unwrap(), kind);
+            assert_eq!(
+                super::parse_task_outcome_kind(&kind.replace('_', "-")).unwrap(),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn outcome_filter_rejects_an_unknown_kind() {
+        for value in ["nonsense", "", "Done"] {
+            let error = super::parse_task_outcome_kind(value).unwrap_err();
+            assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
+        }
+    }
+
+    #[test]
     fn task_close_policy_defaults_to_done() {
         assert_eq!(
             super::parse_task_close_policy(None).unwrap(),
