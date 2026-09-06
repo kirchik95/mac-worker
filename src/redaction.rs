@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 pub const MAX_SUMMARY_BYTES: usize = 4 * 1024;
 pub const MAX_QUESTION_BYTES: usize = 1024;
@@ -23,9 +23,20 @@ const COMMON_PATH_PREFIXES: &[&str] = &[
     "/tmp/",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RedactionBoundary {
     homes: Vec<String>,
+    secrets: Vec<String>,
+}
+
+impl fmt::Debug for RedactionBoundary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedactionBoundary")
+            .field("home_count", &self.homes.len())
+            .field("secret_count", &self.secrets.len())
+            .finish()
+    }
 }
 
 impl RedactionBoundary {
@@ -53,7 +64,23 @@ impl RedactionBoundary {
             }
         }
         homes.sort_by_key(|home| std::cmp::Reverse(home.len()));
-        Self { homes }
+        Self {
+            homes,
+            secrets: Vec::new(),
+        }
+    }
+
+    pub fn with_secrets<I, S>(mut self, secrets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for secret in secrets {
+            push_unique(&mut self.secrets, escape_controls(secret.as_ref()));
+        }
+        self.secrets
+            .sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        self
     }
 
     pub fn summary(&self, input: &str) -> String {
@@ -111,8 +138,11 @@ impl RedactionBoundary {
     }
 
     fn redact(&self, input: &str) -> String {
+        let input = self.secrets.iter().fold(input.to_owned(), |input, secret| {
+            input.replace(secret, TOKEN_PLACEHOLDER)
+        });
         redact_tokens(&redact_home_paths(
-            &self.redact_tilde_paths(input),
+            &self.redact_tilde_paths(&input),
             &self.homes,
         ))
     }

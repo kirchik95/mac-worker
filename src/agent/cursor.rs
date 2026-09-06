@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use crate::keychain::KEYCHAIN_LOCKED_REASON;
 use crate::process::ProcessResult;
 
 use super::{
@@ -95,6 +96,12 @@ impl AgentAdapter for CursorAdapter {
 
 fn classify_cursor_auth(result: &ProcessResult) -> AuthProbeResult {
     let text = combined_output(result);
+    if text.lines().any(|line| {
+        line.to_ascii_lowercase()
+            .contains("macos login keychain is locked")
+    }) {
+        return AuthProbeResult::UnknownWithReason(KEYCHAIN_LOCKED_REASON);
+    }
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     let Some(line) = lines.next() else {
         return AuthProbeResult::Unknown;

@@ -413,6 +413,67 @@ fn env_profile_requires_owner_only_regular_file_and_does_not_debug_values() {
 }
 
 #[test]
+fn keychain_profile_values_are_consumed_and_never_exported() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("agents.env");
+    fs::write(
+        &path,
+        "CURSOR_API_KEY=cursor-key\nMAC_WORKER_KEYCHAIN_PASSWORD=profile-password\nMAC_WORKER_KEYCHAIN_PATH=/tmp/custom.keychain-db\n",
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let profile = EnvProfile::load(&path).unwrap();
+    assert_eq!(profile.names(), &["CURSOR_API_KEY"]);
+    let debug = format!("{profile:?}");
+    assert!(!debug.contains("profile-password"));
+    assert!(!debug.contains("/tmp/custom.keychain-db"));
+
+    let turn = material("prompt");
+    let section = TurnSection::new(
+        turn.clone(),
+        "b".repeat(64),
+        GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+    )
+    .unwrap();
+    let command = CommandSpec::shell("exec 'codex' '-'".into()).unwrap();
+    let plan = LaunchPlan::turn(
+        &command,
+        &lease(command.clone(), turn.digest()),
+        &section,
+        std::path::Path::new("/Users/worker"),
+        &profile,
+        section.git_identity(),
+    )
+    .unwrap();
+    assert!(
+        plan.env()
+            .iter()
+            .any(|(name, value)| { name == "CURSOR_API_KEY" && value == "cursor-key" })
+    );
+    assert!(
+        plan.env()
+            .iter()
+            .all(|(name, _)| name != "MAC_WORKER_KEYCHAIN_PASSWORD")
+    );
+    assert!(
+        plan.env()
+            .iter()
+            .all(|(name, _)| name != "MAC_WORKER_KEYCHAIN_PATH")
+    );
+}
+
+#[test]
+fn keychain_unlock_failure_is_a_durable_turn_error_code() {
+    let status = JobStatus::accepted(1)
+        .unwrap()
+        .into_infrastructure_terminal(JobState::Lost, 2, 0, 0, "KEYCHAIN_UNLOCK_FAILED".into())
+        .unwrap();
+    assert_eq!(status.state(), JobState::Lost);
+    assert_eq!(status.error_code(), Some("KEYCHAIN_UNLOCK_FAILED"));
+}
+
+#[test]
 fn turn_material_round_trips_canonically() {
     let original = material("prompt");
     let bytes = serde_json::to_vec(&original).unwrap();

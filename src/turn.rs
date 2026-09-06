@@ -1064,16 +1064,24 @@ pub fn prebind_session(
             message: "agent does not expose a session prebind command".into(),
         })?;
     let profile = match request.env_profile() {
-        Some(name) => EnvProfile::load(
+        Some(name) => EnvProfile::load_for_home(
             &account_home
                 .join(".config")
                 .join("mac-worker")
                 .join("env")
                 .join(format!("{name}.env")),
+            account_home,
         )?,
         None => EnvProfile::empty(),
     };
     let process = prebind_login_request(&argv, account_home, profile.entries())?;
+    if let Some(config) = profile.keychain() {
+        crate::keychain::unlock_keychain_if_supported(
+            runner,
+            config,
+            &profile.redaction_boundary(account_home),
+        )?;
+    }
     let result = runner.run(&process).map_err(|error| WorkerError::Agent {
         code: "AGENT_EXITED",
         message: format!("session prebind failed: {error}"),
@@ -1184,6 +1192,7 @@ impl TurnResult {
 pub struct EnvProfile {
     names: Vec<String>,
     entries: Vec<(OsString, OsString)>,
+    keychain: Option<crate::keychain::KeychainUnlockConfig>,
 }
 
 impl fmt::Debug for EnvProfile {
@@ -1201,10 +1210,18 @@ impl EnvProfile {
         Self {
             names: Vec::new(),
             entries: Vec::new(),
+            keychain: None,
         }
     }
 
     pub fn load(path: &Path) -> Result<Self, WorkerError> {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        Self::load_for_home(path, &home)
+    }
+
+    pub(crate) fn load_for_home(path: &Path, home: &Path) -> Result<Self, WorkerError> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -1250,6 +1267,7 @@ impl EnvProfile {
             .map_err(|_| turn_error("ENV_PROFILE_INVALID", "env profile is not UTF-8"))?;
         let mut entries = Vec::new();
         let mut seen = BTreeMap::new();
+        let mut keychain_entries = Vec::new();
         for (line_number, raw_line) in text.lines().enumerate() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -1262,26 +1280,21 @@ impl EnvProfile {
                 )
             })?;
             validate_env_name(name)?;
-            if worker_controlled_env_name(name) {
-                return Err(turn_error(
-                    "ENV_PROFILE_INVALID",
-                    "env profile cannot override worker-controlled variables",
-                ));
-            }
-            if value.len() > MAX_ENV_VALUE_BYTES
-                || value.contains('\0')
-                || value.contains('\n')
-                || value.contains('\r')
-            {
-                return Err(turn_error(
-                    "ENV_PROFILE_INVALID",
-                    "env profile value is invalid",
-                ));
-            }
             if seen.insert(name.to_owned(), ()).is_some() {
                 return Err(turn_error(
                     "ENV_PROFILE_INVALID",
                     "env profile repeats a variable",
+                ));
+            }
+            validate_env_value(value)?;
+            if crate::keychain::is_reserved_env_name(name) {
+                keychain_entries.push((OsString::from(name), OsString::from(value)));
+                continue;
+            }
+            if worker_controlled_env_name(name) {
+                return Err(turn_error(
+                    "ENV_PROFILE_INVALID",
+                    "env profile cannot override worker-controlled variables",
                 ));
             }
             entries.push((OsString::from(name), OsString::from(value)));
@@ -1290,7 +1303,12 @@ impl EnvProfile {
             .iter()
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
-        Ok(Self { names, entries })
+        let keychain = crate::keychain::KeychainUnlockConfig::from_entries(&keychain_entries, home);
+        Ok(Self {
+            names,
+            entries,
+            keychain,
+        })
     }
 
     pub fn names(&self) -> &[String] {
@@ -1299,6 +1317,34 @@ impl EnvProfile {
 
     pub(crate) fn entries(&self) -> &[(OsString, OsString)] {
         &self.entries
+    }
+
+    pub(crate) fn keychain(&self) -> Option<&crate::keychain::KeychainUnlockConfig> {
+        self.keychain.as_ref()
+    }
+
+    pub(crate) fn all_entries(&self) -> Vec<(OsString, OsString)> {
+        let mut entries = self.entries.clone();
+        if let Some(keychain) = &self.keychain {
+            entries.push((
+                crate::keychain::PASSWORD_ENV_NAME.into(),
+                keychain.password().to_os_string(),
+            ));
+            entries.push((
+                crate::keychain::PATH_ENV_NAME.into(),
+                keychain.path().as_os_str().to_os_string(),
+            ));
+        }
+        entries
+    }
+
+    pub(crate) fn redaction_boundary(&self, home: &Path) -> RedactionBoundary {
+        let secrets = self
+            .all_entries()
+            .into_iter()
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        RedactionBoundary::new(home).with_secrets(secrets)
     }
 }
 
@@ -1414,6 +1460,20 @@ fn validate_env_name(name: &str) -> Result<(), WorkerError> {
     Ok(())
 }
 
+fn validate_env_value(value: &str) -> Result<(), WorkerError> {
+    if value.len() > MAX_ENV_VALUE_BYTES
+        || value.contains('\0')
+        || value.contains('\n')
+        || value.contains('\r')
+    {
+        return Err(turn_error(
+            "ENV_PROFILE_INVALID",
+            "env profile value is invalid",
+        ));
+    }
+    Ok(())
+}
+
 fn worker_controlled_env_name(name: &str) -> bool {
     matches!(
         name,
@@ -1433,6 +1493,8 @@ fn worker_controlled_env_name(name: &str) -> bool {
             | "GIT_AUTHOR_EMAIL"
             | "GIT_COMMITTER_NAME"
             | "GIT_COMMITTER_EMAIL"
+            | crate::keychain::PASSWORD_ENV_NAME
+            | crate::keychain::PATH_ENV_NAME
     )
 }
 

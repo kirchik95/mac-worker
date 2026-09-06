@@ -73,6 +73,7 @@ pub mod inputs;
 pub mod install;
 pub mod job;
 pub mod job_service;
+pub mod keychain;
 pub mod lease;
 pub mod manifest;
 pub mod output;

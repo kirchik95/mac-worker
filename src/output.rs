@@ -241,6 +241,13 @@ fn extend_indented(lines: &mut Vec<String>, rendered: &str) {
     lines.extend(rendered.lines().map(|line| format!("  {line}")));
 }
 
+fn render_agent_auth(auth: crate::agent_facts::AgentAuth) -> String {
+    match auth.reason() {
+        Some(reason) => format!("{} ({reason})", auth.as_str()),
+        None => auth.as_str().to_owned(),
+    }
+}
+
 fn render_doctor_worker_health(worker: &crate::protocol::WorkerHealth) -> String {
     if worker.status == crate::protocol::HealthStatus::Ready
         && worker
@@ -331,10 +338,10 @@ fn render_worker_health_with_labels(
                         "    {} {}: {}",
                         agent.name,
                         version,
-                        agent.auth.as_str()
+                        render_agent_auth(agent.auth)
                     ));
                     for (profile, auth) in &agent.auth_by_profile {
-                        lines.push(format!("      {profile}: {}", auth.as_str()));
+                        lines.push(format!("      {profile}: {}", render_agent_auth(*auth)));
                     }
                 }
             }

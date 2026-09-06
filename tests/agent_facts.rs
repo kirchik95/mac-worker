@@ -22,6 +22,7 @@ enum Scenario {
     AmbiguousOpenCode,
     InvalidUtf8Cursor,
     LoginPathUnavailable,
+    KeychainUnlockFailure,
 }
 
 const LOGIN_PATH: &str = "/opt/tools:/usr/local/bin:/usr/bin:/bin";
@@ -60,6 +61,15 @@ impl ProcessRunner for FakeProcessRunner {
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+
+        if program == "/usr/bin/security" {
+            assert_eq!(self.scenario, Scenario::KeychainUnlockFailure);
+            assert_eq!(request.environment, Vec::<(OsString, OsString)>::new());
+            assert_eq!(request.stdin, Some(b"profile-password\n".to_vec()));
+            return Ok(failure(
+                b"security: profile-password /tmp/profile.keychain-db\n",
+            ));
+        }
 
         if program == "zsh" && args == ["-lc", "printf %s \"$PATH\""] {
             assert!(request.environment.is_empty());
@@ -202,6 +212,26 @@ fn profiles() -> Vec<EnvProfile> {
             entries: vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "unsafe-value".into())],
         },
     ]
+}
+
+fn keychain_profiles() -> Vec<EnvProfile> {
+    let mut profiles = profiles();
+    profiles.push(EnvProfile {
+        name: "keychain".into(),
+        secure: true,
+        entries: vec![
+            ("CURSOR_API_KEY".into(), "cursor-profile-key".into()),
+            (
+                "MAC_WORKER_KEYCHAIN_PASSWORD".into(),
+                "profile-password".into(),
+            ),
+            (
+                "MAC_WORKER_KEYCHAIN_PATH".into(),
+                "/tmp/profile.keychain-db".into(),
+            ),
+        ],
+    });
+    profiles
 }
 
 #[test]
@@ -364,6 +394,26 @@ fn ambiguous_network_and_non_utf8_auth_outputs_are_unknown() {
         .unwrap();
     assert_eq!(cursor.auth, AgentAuth::Unknown);
     assert_eq!(cursor.auth_by_profile[0].1, AgentAuth::Unknown);
+}
+
+#[test]
+fn keychain_unlock_failures_are_unknown_with_a_safe_reason() {
+    let runner = FakeProcessRunner::new(Scenario::KeychainUnlockFailure);
+    let facts = collect_agent_facts_at(&runner, &keychain_profiles(), COLLECTED_AT);
+
+    for agent in &facts.agents {
+        assert_eq!(
+            agent.auth_by_profile.last().map(|(_, auth)| *auth),
+            Some(AgentAuth::UnknownWithReason("keychain unlock failed"))
+        );
+    }
+    let bytes = facts.canonical_bytes().unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains(r#""state":"unknown","reason":"keychain unlock failed""#));
+    assert!(!text.contains("profile-password"));
+    assert!(!text.contains("/tmp/profile.keychain-db"));
+    let parsed: AgentFacts = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed.canonical_bytes().unwrap(), facts.canonical_bytes().unwrap());
 }
 
 #[test]

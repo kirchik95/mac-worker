@@ -462,12 +462,12 @@ The pool can run these agents. Install them on the worker account's login-shell 
 | --- | --- | --- |
 | Codex | In use now | File-based login on the worker. No env profile is required. |
 | Claude Code | Deferred on the workers by operator decision | Env profile (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`). Not authenticated on the workers today. |
-| Cursor Agent | Adapter exists; not wired into the CLI until a later plan | Env profile (`CURSOR_API_KEY`). Keychain login is invisible over SSH. |
+| Cursor Agent | Adapter exists; not wired into the CLI until a later plan | Env profile (`CURSOR_API_KEY`). A keychain-backed login also needs the host-only keychain variables below. |
 | OpenCode | Adapter exists; not wired into the CLI until a later plan | File-based or provider login, plus any provider variables the agent needs in an env profile. |
 
 The binary named `agent` on a worker is unrelated; Cursor must be invoked as `cursor-agent`.
 
-Keychain-backed logins are invisible to a non-interactive SSH session: the login keychain is locked when no GUI session is present. Only a file-based login (Codex today) or an environment profile works for headless turns. mac-worker will not unlock the keychain.
+Keychain-backed Cursor logins need special handling on a headless worker. With no GUI session, the macOS login keychain is locked and Cursor refuses commands, including its version and status probes. mac-worker unlocks the configured keychain in the same launch session immediately before Cursor probes, prebinds, and turns. Codex's file-based login and OpenCode's file-based or provider login do not need these keychain variables.
 
 ## 7. Env profiles
 
@@ -477,7 +477,17 @@ Place one file per profile on each worker:
 ~/.config/mac-worker/env/<name>.env
 ```
 
-The file must be a regular file with mode `0600`, owned by the worker account. Write one `KEY=value` per line. Do not put a profile in the project, and do not ask mac-worker to create, upload, or print one.
+The file must be a regular file with mode `0600`, owned by the worker account. On each mini, the operator provisions it and pastes the values themselves:
+
+```sh
+umask 077
+mkdir -p ~/.config/mac-worker/env
+chmod 700 ~/.config/mac-worker/env
+$EDITOR ~/.config/mac-worker/env/<name>.env
+chmod 600 ~/.config/mac-worker/env/<name>.env
+```
+
+Write one `KEY=value` per line. Do not put a profile in the project, and do not ask mac-worker to create, upload, or print one.
 
 Variables each adapter reads from a profile:
 
@@ -488,7 +498,17 @@ Variables each adapter reads from a profile:
 | Cursor Agent | `CURSOR_API_KEY` |
 | OpenCode | whatever provider variables that CLI needs |
 
-mac-worker reads a profile only to inject those names into the agent's environment and to run a read-only authentication check. It never copies, forwards, prints, or records values. Records may list variable names.
+For a keychain-backed Cursor login, the host consumes these reserved names and never exports them to Cursor:
+
+```text
+MAC_WORKER_KEYCHAIN_PASSWORD=<paste the login-keychain password>
+# Optional; defaults to $HOME/Library/Keychains/login.keychain-db
+MAC_WORKER_KEYCHAIN_PATH=<paste an alternate keychain path if needed>
+```
+
+The password is passed to `/usr/bin/security unlock-keychain` on stdin, never on the command line. mac-worker never prints, records, uploads, or forwards either reserved value; the ordinary agent variables are the only profile values injected into the agent environment.
+
+mac-worker reads a profile to inject the ordinary agent variables into the agent's environment and to run a read-only authentication check. It consumes the reserved keychain variables itself. It never copies, forwards, prints, or records values. Records may list variable names.
 
 A profile that is group- or world-readable is reported by the probe as insecure. A turn that names that profile is refused with `ENV_PROFILE_PERMISSIONS` before the agent starts. The probe that reports profiles, and the turn that refuses them, arrive with phase 5; the file and its mode are required now.
 

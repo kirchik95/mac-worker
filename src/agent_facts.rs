@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     fmt,
+    path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,6 +31,7 @@ pub enum AgentAuth {
     Authenticated,
     Unauthenticated,
     Unknown,
+    UnknownWithReason(&'static str),
 }
 
 impl AgentAuth {
@@ -37,27 +39,71 @@ impl AgentAuth {
         match self {
             Self::Authenticated => "authenticated",
             Self::Unauthenticated => "unauthenticated",
-            Self::Unknown => "unknown",
+            Self::Unknown | Self::UnknownWithReason(_) => "unknown",
+        }
+    }
+
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::UnknownWithReason(reason) => Some(reason),
+            Self::Authenticated | Self::Unauthenticated | Self::Unknown => None,
         }
     }
 }
 
 impl Serialize for AgentAuth {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
+        match self {
+            Self::UnknownWithReason(reason) => {
+                let mut record = serializer.serialize_struct("AgentAuth", 2)?;
+                record.serialize_field("state", "unknown")?;
+                record.serialize_field("reason", reason)?;
+                record.end()
+            }
+            other => serializer.serialize_str(other.as_str()),
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for AgentAuth {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        match String::deserialize(deserializer)?.as_str() {
-            "authenticated" => Ok(Self::Authenticated),
-            "unauthenticated" => Ok(Self::Unauthenticated),
-            "unknown" => Ok(Self::Unknown),
-            value => Err(de::Error::custom(format!(
-                "unknown agent authentication state `{value}`"
-            ))),
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(value) => match value.as_str() {
+                "authenticated" => Ok(Self::Authenticated),
+                "unauthenticated" => Ok(Self::Unauthenticated),
+                "unknown" => Ok(Self::Unknown),
+                value => Err(de::Error::custom(format!(
+                    "unknown agent authentication state `{value}`"
+                ))),
+            },
+            Value::Object(mut object) => {
+                let state = object
+                    .remove("state")
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                let reason = object
+                    .remove("reason")
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                if state.as_deref() != Some("unknown") || !object.is_empty() {
+                    return Err(de::Error::custom("invalid agent authentication state"));
+                }
+                match reason.as_deref() {
+                    Some(reason) => known_auth_reason(reason)
+                        .map(Self::UnknownWithReason)
+                        .ok_or_else(|| de::Error::custom("unknown agent authentication reason")),
+                    None => Ok(Self::Unknown),
+                }
+            }
+            _ => Err(de::Error::custom("agent authentication state is not valid")),
         }
+    }
+}
+
+fn known_auth_reason(value: &str) -> Option<&'static str> {
+    match value {
+        crate::keychain::UNLOCK_FAILED_REASON => Some(crate::keychain::UNLOCK_FAILED_REASON),
+        crate::keychain::KEYCHAIN_LOCKED_REASON => Some(crate::keychain::KEYCHAIN_LOCKED_REASON),
+        _ => None,
     }
 }
 
@@ -224,6 +270,9 @@ pub trait ProfileInput {
     fn profile_name(&self) -> &str;
     fn profile_is_secure(&self) -> bool;
     fn profile_entries(&self) -> Vec<(OsString, OsString)>;
+    fn keychain_config(&self) -> Option<crate::keychain::KeychainUnlockConfig> {
+        None
+    }
 }
 
 impl ProfileInput for EnvProfile {
@@ -236,7 +285,18 @@ impl ProfileInput for EnvProfile {
     }
 
     fn profile_entries(&self) -> Vec<(OsString, OsString)> {
-        self.entries.clone()
+        self.entries
+            .iter()
+            .filter(|(name, _)| !crate::keychain::is_reserved_env_name(&name.to_string_lossy()))
+            .cloned()
+            .collect()
+    }
+
+    fn keychain_config(&self) -> Option<crate::keychain::KeychainUnlockConfig> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        crate::keychain::KeychainUnlockConfig::from_entries(&self.entries, &home)
     }
 }
 
@@ -265,6 +325,10 @@ impl<T: ProfileInput + ?Sized> ProfileInput for &T {
 
     fn profile_entries(&self) -> Vec<(OsString, OsString)> {
         (**self).profile_entries()
+    }
+
+    fn keychain_config(&self) -> Option<crate::keychain::KeychainUnlockConfig> {
+        (**self).keychain_config()
     }
 }
 
@@ -409,10 +473,18 @@ where
             .map(|profile| {
                 let mut environment = login_environment.clone();
                 environment.extend(profile.profile_entries());
-                (
-                    profile.profile_name().to_owned(),
-                    run_auth(runner, &binary, &auth_probe, environment),
-                )
+                let auth = match profile.keychain_config() {
+                    Some(config) if unlock_for_probe(runner, &config) => {
+                        // A keychain-backed profile applies to both agent
+                        // probes. The version is not exposed per profile,
+                        // but it still needs to run in the unlocked session.
+                        let _ = run_version(runner, &binary, environment.clone());
+                        run_auth(runner, &binary, &auth_probe, environment)
+                    }
+                    Some(_) => AgentAuth::UnknownWithReason(crate::keychain::UNLOCK_FAILED_REASON),
+                    None => run_auth(runner, &binary, &auth_probe, environment),
+                };
+                (profile.profile_name().to_owned(), auth)
             })
             .collect();
         agents.push(AgentProbe {
@@ -525,18 +597,41 @@ fn run_auth(
     ) else {
         return AgentAuth::Unknown;
     };
-    if !result.status.success()
-        || !is_valid_utf8(&result.stdout)
-        || !is_valid_utf8(&result.stderr)
-        || contains_auth_probe_error(&result)
-    {
+    if !is_valid_utf8(&result.stdout) || !is_valid_utf8(&result.stderr) {
         return AgentAuth::Unknown;
     }
 
-    match probe.classify(&result) {
+    let classification = probe.classify(&result);
+    if let AuthProbeResult::UnknownWithReason(reason) = classification {
+        return AgentAuth::UnknownWithReason(reason);
+    }
+    if !result.status.success() || contains_auth_probe_error(&result) {
+        return AgentAuth::Unknown;
+    }
+    match classification {
         AuthProbeResult::Authenticated => AgentAuth::Authenticated,
         AuthProbeResult::Unauthenticated => AgentAuth::Unauthenticated,
-        AuthProbeResult::Unknown => AgentAuth::Unknown,
+        AuthProbeResult::Unknown | AuthProbeResult::UnknownWithReason(_) => AgentAuth::Unknown,
+    }
+}
+
+fn unlock_for_probe(
+    runner: &dyn ProcessRunner,
+    config: &crate::keychain::KeychainUnlockConfig,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::keychain::unlock_keychain(
+            runner,
+            config,
+            &crate::redaction::RedactionBoundary::from_env(),
+        )
+        .is_ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (runner, config);
+        false
     }
 }
 

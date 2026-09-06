@@ -200,6 +200,26 @@ fn normal_process_receives_the_complete_stdin_payload() {
 }
 
 #[test]
+fn new_session_process_runs_without_a_tty() {
+    let request = ProcessRequest {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "test ! -t 0".into()],
+        environment: Vec::new(),
+        environment_remove: Vec::new(),
+        stdin: None,
+        policy: policy(1024, 1024, Duration::from_secs(2)),
+    };
+
+    let result = SystemProcessRunner.run_in_new_session(&request).unwrap();
+
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
 fn nonzero_exit_remains_authoritative_after_stdin_broken_pipe() {
     // Regression: a fast SSH rejection closed stdin while the parent was
     // uploading, and the writer's BrokenPipe hid the remote exit and stderr.

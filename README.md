@@ -186,7 +186,19 @@ A project may set `source = "origin"` and `publish = ["fetch", "push"]` in `.wor
 
 As in the execution core, agent turns run with the worker account's full access. Cursor (`--agent cursor`) and OpenCode (`--agent opencode`) use bound sessions and pointer prompts. Cursor prebinds a chat before the first turn and launches with `--force`; OpenCode binds the session from its first JSON event and launches with `--auto`. Resume uses the recorded session reference and fails with `SESSION_UNBOUND` when it is absent. Profile values stay on the worker: they are never copied, logged, or returned through `worker workers`.
 
-Cursor headless turns need `CURSOR_API_KEY` in a secure env profile. The login keychain is locked in a non-interactive SSH session, so a keychain login is invisible over SSH; mac-worker will not unlock it. OpenCode uses file-based or provider login plus any provider variables that CLI needs in the same profile. OpenCode's worker-local server is loopback-only for the lifetime of that process. See [macOS worker setup](docs/setup-macos-worker.md) for the agent and profile caveats.
+Cursor headless turns need `CURSOR_API_KEY` in a secure env profile. If Cursor's login is backed by the macOS login keychain, the keychain must be unlocked in the same headless launch session because Cursor refuses commands while that keychain is locked. On each mini, an operator can add the host-only `MAC_WORKER_KEYCHAIN_PASSWORD` and optional `MAC_WORKER_KEYCHAIN_PATH` to the profile; mac-worker sends the password to `/usr/bin/security` on stdin immediately before Cursor probes, prebinds, and turns. The default path is `$HOME/Library/Keychains/login.keychain-db`.
+
+Provision the profile on each mini yourself, pasting the values directly into the owner-only file:
+
+```sh
+umask 077
+mkdir -p ~/.config/mac-worker/env
+chmod 700 ~/.config/mac-worker/env
+$EDITOR ~/.config/mac-worker/env/agents.env
+chmod 600 ~/.config/mac-worker/env/agents.env
+```
+
+The file may contain `CURSOR_API_KEY=…`, `MAC_WORKER_KEYCHAIN_PASSWORD=…`, and, when needed, `MAC_WORKER_KEYCHAIN_PATH=…`. mac-worker never prints, records, uploads, or exports the two host-only values. Codex and OpenCode do not need keychain unlock variables. OpenCode uses file-based or provider login plus any provider variables that CLI needs in the same profile. OpenCode's worker-local server is loopback-only for the lifetime of that process. See [macOS worker setup](docs/setup-macos-worker.md) for the agent and profile caveats.
 
 Profile files are operator-provisioned owner-only files (`~/.config/mac-worker/env/<name>.env`, mode `0600`). mac-worker never creates, uploads, or prints a profile. An insecure (group- or world-readable) profile is reported as insecure and is never applied; naming it on a turn is `ENV_PROFILE_PERMISSIONS`.
 

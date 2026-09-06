@@ -1770,12 +1770,13 @@ impl<'a> Supervisor<'a> {
             }
         };
         let profile = match section.turn().env_profile() {
-            Some(name) => match EnvProfile::load(
+            Some(name) => match EnvProfile::load_for_home(
                 &account_home
                     .join(".config")
                     .join("mac-worker")
                     .join("env")
                     .join(format!("{name}.env")),
+                &account_home,
             ) {
                 Ok(profile) => profile,
                 Err(error) => {
@@ -1919,6 +1920,25 @@ impl<'a> Supervisor<'a> {
                 );
             }
         };
+        if let Some(config) = profile.keychain()
+            && let Err(error) = crate::keychain::unlock_keychain_if_supported(
+                &crate::process::SystemProcessRunner,
+                config,
+                &profile.redaction_boundary(&account_home),
+            )
+        {
+            return self.finish_turn_prelaunch_failure(
+                lease,
+                job,
+                guard,
+                &meta,
+                &section,
+                status_bytes,
+                status,
+                "KEYCHAIN_UNLOCK_FAILED",
+                error,
+            );
+        }
         let (mut child, output) = match GatedChild::spawn_turn(
             &command,
             task_workspace.raw_directory_fd(),
@@ -3902,6 +3922,9 @@ fn injected_supervisor_fault(boundary: &str) -> WorkerError {
 
 fn prelaunch_error_code(error: &WorkerError) -> &'static str {
     match error {
+        WorkerError::Protocol(message) if message.starts_with("KEYCHAIN_UNLOCK_FAILED:") => {
+            "KEYCHAIN_UNLOCK_FAILED"
+        }
         WorkerError::Protocol(message) if message.starts_with("EXECUTABLE_NOT_FOUND:") => {
             "EXECUTABLE_NOT_FOUND"
         }

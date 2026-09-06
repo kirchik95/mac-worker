@@ -397,6 +397,24 @@ fn workers_output_reports_facts_and_age_without_profile_values() {
 }
 
 #[test]
+fn workers_output_includes_agent_auth_reasons() {
+    let mut facts = facts(1);
+    facts.agents[0].auth = AgentAuth::UnknownWithReason("keychain locked");
+    facts.agents[0].auth_by_profile = vec![(
+        "agents".into(),
+        AgentAuth::UnknownWithReason("keychain unlock failed"),
+    )];
+    let report = mac_worker::protocol::WorkersReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![health_with_facts(facts)],
+    };
+
+    let output = CommandOutput::Workers(report).render_human();
+    assert!(output.contains("codex 0.152.1: unknown (keychain locked)"));
+    assert!(output.contains("agents: unknown (keychain unlock failed)"));
+}
+
+#[test]
 fn refresh_uses_the_runtime_home_without_loading_inventory() {
     // Break caught: the hidden host command reads client inventory or skips
     // the runtime account home while discovering profiles.

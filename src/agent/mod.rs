@@ -262,6 +262,7 @@ pub enum AuthProbeResult {
     Authenticated,
     Unauthenticated,
     Unknown,
+    UnknownWithReason(&'static str),
 }
 
 #[derive(Clone, Copy)]

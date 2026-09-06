@@ -115,6 +115,17 @@ fn ambiguous_agent_auth_output_is_not_projected_as_authenticated() {
     );
 }
 
+#[test]
+fn cursor_reports_a_locked_login_keychain_with_an_operator_reason() {
+    let cursor = adapter_for(AgentKind::Cursor).auth_probe();
+    assert_eq!(
+        cursor.classify(&result(
+            b"Error: Your macOS login keychain is locked. Run security unlock-keychain and try again.\nadditional diagnostics\n",
+        )),
+        AuthProbeResult::UnknownWithReason("keychain locked")
+    );
+}
+
 #[derive(Clone, Default)]
 struct RecordingRunner {
     requests: Arc<Mutex<Vec<ProcessRequest>>>,

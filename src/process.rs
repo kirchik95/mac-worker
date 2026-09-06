@@ -50,6 +50,10 @@ pub struct ProcessResult {
 
 pub trait ProcessRunner: Send + Sync {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError>;
+
+    fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.run(request)
+    }
 }
 
 impl<T: ProcessRunner + ?Sized> ProcessRunner for &T {
@@ -63,6 +67,20 @@ pub struct SystemProcessRunner;
 
 impl ProcessRunner for SystemProcessRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.run_with_session(request, false)
+    }
+
+    fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.run_with_session(request, true)
+    }
+}
+
+impl SystemProcessRunner {
+    fn run_with_session(
+        &self,
+        request: &ProcessRequest,
+        new_session: bool,
+    ) -> Result<ProcessResult, WorkerError> {
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
@@ -70,8 +88,20 @@ impl ProcessRunner for SystemProcessRunner {
         for key in &request.environment_remove {
             command.env_remove(key);
         }
+        if new_session {
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        } else {
+            command.process_group(0);
+        }
         command
-            .process_group(0)
             .stdin(if request.stdin.is_some() {
                 Stdio::piped()
             } else {

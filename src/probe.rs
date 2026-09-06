@@ -291,8 +291,8 @@ fn load_env_profiles(home: &Path) -> Result<Vec<AgentEnvProfile>, WorkerError> {
         if !valid_profile_name(name) {
             continue;
         }
-        let profile = match TurnEnvProfile::load(&entry.path()) {
-            Ok(profile) => AgentEnvProfile::new(name, true, profile.entries().to_vec()),
+        let profile = match TurnEnvProfile::load_for_home(&entry.path(), home) {
+            Ok(profile) => AgentEnvProfile::new(name, true, profile.all_entries()),
             Err(_) => AgentEnvProfile::new(name, false, Vec::new()),
         };
         profiles.push(profile);
