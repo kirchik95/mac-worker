@@ -219,7 +219,7 @@ fn a_task_row_reports_the_effort_the_task_recorded_and_nothing_when_it_did_not()
 
     let recorded = project_task_list(
         &[active_record_with_effort(Some("max"))],
-        &fixture_runs(),
+        &[],
         &runner_states,
         &freshness,
     )
@@ -230,7 +230,7 @@ fn a_task_row_reports_the_effort_the_task_recorded_and_nothing_when_it_did_not()
     // row says so by reporting nothing rather than guessing that default.
     let absent = project_task_list(
         &[active_record_with_effort(None)],
-        &fixture_runs(),
+        &[],
         &runner_states,
         &freshness,
     )
