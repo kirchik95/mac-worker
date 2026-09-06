@@ -54,6 +54,7 @@ fn snapshot_v1_serializes_the_complete_projection_contract() {
                     "message": "worker observation timed out",
                 }],
             },
+            "project_defaults": null,
             "workers": [
                 {
                     "name": "mini-unobserved",
@@ -61,6 +62,7 @@ fn snapshot_v1_serializes_the_complete_projection_contract() {
                     "freshness": "offline",
                     "observed_at_millis": null,
                     "hostname": null,
+                    "agent_facts": null,
                     "slot": {
                         "state": "idle",
                         "capacity": 1,
@@ -84,6 +86,7 @@ fn snapshot_v1_serializes_the_complete_projection_contract() {
                     "freshness": "current",
                     "observed_at_millis": 1_725_000_000_099_u64,
                     "hostname": "mini-observed.local",
+                    "agent_facts": null,
                     "slot": {
                         "state": "busy",
                         "capacity": 1,
@@ -353,6 +356,7 @@ fn fixture_snapshot() -> DashboardSnapshot {
             freshness: Freshness::Current,
             errors: Vec::new(),
         },
+        project_defaults: None,
         task_view: TaskListProjection::empty(),
         workers: vec![DashboardWorker {
             name: "mini-a".into(),
@@ -360,6 +364,7 @@ fn fixture_snapshot() -> DashboardSnapshot {
             freshness: Freshness::Current,
             observed_at_millis: Some(1_725_000_000_000),
             hostname: Some("mini-a.local".into()),
+            agent_facts: None,
             slot: SlotSummary {
                 state: DashboardSlotState::Idle,
                 capacity: 1,
@@ -395,6 +400,7 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
                 "worker observation timed out",
             )],
         },
+        project_defaults: None,
         task_view: TaskListProjection::empty(),
         workers: vec![
             DashboardWorker {
@@ -403,6 +409,7 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
                 freshness: Freshness::Offline,
                 observed_at_millis: None,
                 hostname: None,
+                agent_facts: None,
                 slot: SlotSummary {
                     state: DashboardSlotState::Idle,
                     capacity: 1,
@@ -426,6 +433,7 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
                 freshness: Freshness::Current,
                 observed_at_millis: Some(1_725_000_000_099),
                 hostname: Some("mini-observed.local".into()),
+                agent_facts: None,
                 slot: SlotSummary {
                     state: DashboardSlotState::Busy,
                     capacity: 1,

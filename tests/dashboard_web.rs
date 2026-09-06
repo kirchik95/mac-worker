@@ -53,6 +53,19 @@ async fn loopback_router_serves_embedded_assets_snapshot_and_security_headers() 
     assert_security(&asset);
     assert!(!body_text(&asset).contains("https://"));
 
+    for name in [
+        "plex-sans-regular.ttf",
+        "plex-sans-medium.ttf",
+        "plex-mono-regular.ttf",
+    ] {
+        let font = request(&host, &format!("/assets/{name}"), &host);
+        assert_eq!(font.status, 200);
+        assert_eq!(content_type(&font), "font/ttf");
+        assert!(font.body.len() > 10_000);
+        assert_security(&font);
+    }
+    assert_eq!(request(&host, "/assets/private.ttf", &host).status, 404);
+
     let snapshot = request(&host, "/api/v1/snapshot", &host);
     assert_eq!(snapshot.status, 200);
     assert_eq!(snapshot.header("cache-control"), Some("no-store"));
@@ -249,6 +262,7 @@ async fn http_fixture_preserves_mixed_freshness_fifo_terminal_cursors_and_read_o
         )),
         log_source: logs,
         task_source: Arc::new(FixtureTaskSource::default()),
+        settings_source: None,
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     let host = listener_host(&server);
@@ -312,6 +326,7 @@ async fn two_http_clients_share_one_in_flight_snapshot_refresh() {
         )),
         log_source: Arc::new(RecordingLogs::new(job(job_id(1)))),
         task_source: Arc::new(FixtureTaskSource::default()),
+        settings_source: None,
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     let host = listener_host(&server);
@@ -352,6 +367,7 @@ async fn started_server_with_task_source(
         service,
         log_source: logs.clone(),
         task_source,
+        settings_source: None,
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     (server, logs)
@@ -483,6 +499,7 @@ impl DashboardDataSource for FakeSource {
                 freshness: Freshness::Current,
                 observed_at_millis: Some(1_000),
                 hostname: Some("mini-1.local".into()),
+                agent_facts: None,
                 slot: SlotSummary {
                     state: DashboardSlotState::Idle,
                     capacity: 1,
@@ -817,6 +834,7 @@ fn worker_observation(name: &str, observed_at_millis: u64) -> Observation {
             freshness: Freshness::Current,
             observed_at_millis: Some(observed_at_millis),
             hostname: Some(format!("{name}.local")),
+            agent_facts: None,
             slot: SlotSummary {
                 state: DashboardSlotState::Idle,
                 capacity: 1,
@@ -1022,6 +1040,10 @@ fn fixture_detail() -> TaskDetailProjection {
             run_position: Some(1),
             title: "Repair login".into(),
             agent: "codex".into(),
+            model: None,
+            effort: None,
+            permissions: Some("workspace".into()),
+            env_profile: None,
             state: TaskState::Active,
             blocking_code: None,
             last_outcome: None,

@@ -71,7 +71,7 @@ fn task_meta(task: TaskId, title: &str, created_at_millis: u64) -> TaskMeta {
         base_oid: BASE_OID.parse().expect("valid base OID"),
         limits: task_limits(),
         close_policy: ClosePolicy::Done,
-        env_profile: Some("production-secret-profile".into()),
+        env_profile: Some("team-ci".into()),
         git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test")
             .expect("valid git identity"),
         title: Some(title.into()),
@@ -358,7 +358,7 @@ fn detail_redacts_failure_reasons_controls_paths_and_tokens() {
 
     assert!(!encoded.contains(&home_path()));
     assert!(!encoded.contains(TOKEN));
-    assert!(!encoded.contains("production-secret-profile"));
+    assert_eq!(value["task"]["env_profile"], "team-ci");
     assert!(!encoded.contains("prompt text must stay private"));
     assert!(!encoded.contains("session_ref=private"));
     assert!(encoded.contains("[path]"));

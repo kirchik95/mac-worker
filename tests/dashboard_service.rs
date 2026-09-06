@@ -9,6 +9,7 @@ use std::{
 };
 
 use mac_worker::{
+    agent_facts::{AgentFacts, FACTS_TTL},
     dashboard::{
         cache::{CpuCounters, OBSERVATION_TTL_MILLIS, Observation},
         model::{
@@ -24,8 +25,14 @@ use mac_worker::{
             MAX_COLLECTION_ERRORS, MAX_RECENT_TERMINAL_JOBS, MonotonicClock,
             WORKER_COLLECTION_DEADLINE, WorkerObservationResult,
         },
+        source::project_worker,
     },
     job::JobId,
+    lease::SlotState,
+    protocol::{
+        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+        WorkerHealth as ProbeWorkerHealth,
+    },
     task_view::TaskListProjection,
 };
 
@@ -146,6 +153,36 @@ fn cache_normalization_stale_expiry_and_rejected_timestamps_have_exact_shapes() 
         offline_worker("mini-1", "INVALID_OBSERVATION_TIMESTAMP")
     );
     assert_read_only(&source);
+}
+
+#[test]
+fn current_and_cached_workers_recheck_their_own_agent_facts_freshness() {
+    let source = FakeSource::new();
+    let wall = ManualClock::new(10_000);
+    let observed = project_worker(&worker_with_facts(u64::MAX - 1, FACTS_TTL - 5), 10_000).unwrap();
+    source.set_workers(vec![WorkerObservationResult::Current(observed)]);
+
+    let service = DashboardService::new(source.clone(), wall.clone(), ManualMonotonic::new(0));
+    let snapshot = service.snapshot(Default::default()).unwrap();
+
+    assert_eq!(snapshot.workers[0].freshness, Freshness::Current);
+    assert_eq!(
+        snapshot.workers[0].agent_facts.as_ref().unwrap().freshness,
+        mac_worker::dashboard::model::AgentFactsFreshness::Current
+    );
+
+    wall.set(10_006);
+    source.set_workers(vec![WorkerObservationResult::Failed {
+        worker_name: "mini-1".into(),
+        error: error("WORKER_DOWN", "current probe failed"),
+    }]);
+    let cached = service.snapshot(Default::default()).unwrap();
+
+    assert_eq!(cached.workers[0].freshness, Freshness::Stale);
+    assert_eq!(
+        cached.workers[0].agent_facts.as_ref().unwrap().freshness,
+        mac_worker::dashboard::model::AgentFactsFreshness::Stale
+    );
 }
 
 #[test]
@@ -528,6 +565,9 @@ fn waiter_timeout_without_prior_snapshot_returns_fixed_offline_fallback() {
 #[test]
 fn waiter_timeout_with_prior_snapshot_preserves_data_revision_and_generation_time() {
     let source = FakeSource::new();
+    source.set_workers(vec![WorkerObservationResult::Current(
+        project_worker(&worker_with_facts(u64::MAX - 1, 0), 500).unwrap(),
+    )]);
     let monotonic = ManualMonotonic::new(0);
     let deadlines =
         DashboardDeadlines::new(Duration::from_millis(1), Duration::from_millis(1)).unwrap();
@@ -548,7 +588,13 @@ fn waiter_timeout_with_prior_snapshot_preserves_data_revision_and_generation_tim
     let stale = service.snapshot(Default::default()).unwrap();
     assert_eq!(stale.revision, completed.revision);
     assert_eq!(stale.generated_at_millis, completed.generated_at_millis);
-    assert_eq!(stale.workers, completed.workers);
+    assert_eq!(completed.workers[0].freshness, Freshness::Current);
+    assert_eq!(stale.workers[0].freshness, Freshness::Stale);
+    assert_eq!(
+        stale.workers[0].agent_facts.as_ref().unwrap().freshness,
+        mac_worker::dashboard::model::AgentFactsFreshness::Current,
+        "worker connectivity and agent-facts age remain independent"
+    );
     assert_eq!(stale.active_jobs, completed.active_jobs);
     assert_eq!(stale.recent_jobs, completed.recent_jobs);
     assert_eq!(stale.queue, completed.queue);
@@ -985,6 +1031,7 @@ fn observation(worker_name: &str, observed_at_millis: u64, hostname: &str) -> Ob
             freshness: Freshness::Current,
             observed_at_millis: Some(observed_at_millis),
             hostname: Some(hostname.into()),
+            agent_facts: None,
             slot: idle_slot(),
             capabilities: vec!["swift".into()],
             missing_capabilities: Vec::new(),
@@ -1000,6 +1047,40 @@ fn observation(worker_name: &str, observed_at_millis: u64, hostname: &str) -> Ob
         },
         observed_at_millis,
         cpu_counters: None,
+    }
+}
+
+fn worker_with_facts(collected_at_millis: u64, facts_age_millis: u64) -> ProbeWorkerHealth {
+    ProbeWorkerHealth {
+        name: "mini-1".into(),
+        ssh: "operator@mini-1.internal".into(),
+        status: HealthStatus::Ready,
+        probe: Some(ProbeResponse {
+            protocol_version: PROTOCOL_VERSION,
+            supervision_version: SUPERVISION_VERSION,
+            hostname: "mini-1.local".into(),
+            arch: "arm64".into(),
+            os_version: "26.2".into(),
+            free_disk_bytes: 100,
+            total_disk_bytes: 200,
+            memory_pressure: MemoryPressure::Normal,
+            swap_used_bytes: None,
+            available_memory_bytes: None,
+            cpu_counters: None,
+            slot_state: SlotState::Idle,
+            active_lease: None,
+            capabilities: vec!["swift".into()],
+            agent_facts: Some(AgentFacts {
+                agents: Vec::new(),
+                env_profiles: Vec::new(),
+                git_identity: false,
+                collected_at_millis,
+            }),
+            facts_age_millis: Some(facts_age_millis),
+        }),
+        missing_capabilities: Vec::new(),
+        error_code: None,
+        error_message: None,
     }
 }
 
@@ -1022,6 +1103,7 @@ fn offline_worker(worker_name: &str, error_code: &str) -> DashboardWorker {
         freshness: Freshness::Offline,
         observed_at_millis: None,
         hostname: None,
+        agent_facts: None,
         slot: idle_slot(),
         capabilities: Vec::new(),
         missing_capabilities: Vec::new(),
@@ -1142,6 +1224,7 @@ fn empty_timeout_snapshot(generated_at_millis: u64) -> DashboardSnapshot {
                 "dashboard refresh wait timed out",
             )],
         },
+        project_defaults: None,
         task_view: TaskListProjection::empty(),
         workers: Vec::new(),
         queue: Vec::new(),

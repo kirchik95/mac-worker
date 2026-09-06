@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt};
 use serde::Serialize;
 
 use crate::{
-    agent::AgentKind,
+    agent::{AgentKind, PermissionPolicy},
     redaction::RedactionBoundary,
     scheduler::QueueBlockingReason,
     task::{
@@ -39,6 +39,10 @@ pub struct TaskListRow {
     pub run_position: Option<u32>,
     pub title: String,
     pub agent: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub permissions: Option<String>,
+    pub env_profile: Option<String>,
     pub state: TaskState,
     pub blocking_code: Option<String>,
     pub last_outcome: Option<TaskOutcome>,
@@ -329,6 +333,13 @@ fn task_list_row(
         run_position,
         title: boundary.title(record.meta().title().as_str()),
         agent: agent_name(record.meta().agent()).to_owned(),
+        model: record.meta().model().map(|model| boundary.text(model, 256)),
+        effort: None,
+        permissions: Some(permission_name(record.meta().policy()).to_owned()),
+        env_profile: record
+            .meta()
+            .env_profile()
+            .map(|profile| boundary.text(profile, 128)),
         state: status.state(),
         blocking_code,
         last_outcome: status
@@ -412,5 +423,12 @@ fn agent_name(agent: AgentKind) -> &'static str {
         AgentKind::Claude => "claude",
         AgentKind::Cursor => "cursor",
         AgentKind::Opencode => "opencode",
+    }
+}
+
+fn permission_name(policy: PermissionPolicy) -> &'static str {
+    match policy {
+        PermissionPolicy::Workspace => "workspace",
+        PermissionPolicy::Unattended => "unattended",
     }
 }

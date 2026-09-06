@@ -3,6 +3,7 @@ pub mod command;
 pub mod model;
 pub mod queue;
 pub mod service;
+pub mod settings;
 pub mod source;
 pub mod task;
 pub mod web;

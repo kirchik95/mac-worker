@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createDashboardClient } from '../src/dashboard/static/dashboard.mjs';
+import { createDashboardClient, agentConnection } from '../src/dashboard/static/dashboard.mjs';
 
 const JOB_A = '0123456789abcdef0123456789abcdef';
 const JOB_B = 'fedcba9876543210fedcba9876543210';
@@ -13,6 +13,441 @@ const TASK_LOST = 'task-lost';
 const RUN_ALPHA = 'run-alpha';
 const RUN_BETA = 'run-beta';
 const MALICIOUS_LABEL = '<img src=x onerror=1>';
+const SETTINGS_FORGE = '/api/v1/workers/mini-forge/agent-settings';
+const SETTINGS_ANVIL = '/api/v1/workers/mini-anvil/agent-settings';
+
+test('agent connections respect worker freshness and authentication profile', () => {
+  const worker = { freshness: 'current', agent_facts: { freshness: 'current', agents: [
+    { name: 'cursor', version: '1.0', auth: 'authenticated', auth_by_profile: [
+      { profile: 'agents', auth: 'unauthenticated' },
+    ] },
+  ] } };
+  assert.equal(agentConnection(worker, 'cursor', null).label, 'Connected');
+  assert.equal(agentConnection(worker, 'cursor', 'agents').label, 'Sign-in needed');
+  assert.equal(agentConnection(worker, 'cursor', 'missing').label, 'Unknown');
+  assert.equal(agentConnection({ ...worker, freshness: 'stale' }, 'cursor', null).label, 'Unknown');
+  worker.agent_facts.freshness = 'stale';
+  assert.equal(agentConnection(worker, 'cursor', null).label, 'Unknown');
+  assert.equal(agentConnection(null, 'cursor', null).label, 'Unknown');
+});
+
+test('navigation and Settings load native defaults without inventing task values', async () => {
+  const harness = createHarness(taskSnapshotFixture());
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+  assert.equal(harness.document.node('page-settings').hidden, false);
+  assert.equal(harness.document.node('page-overview').hidden, true);
+  assert.match(harness.document.node('agent-list').textContent, /Codex/);
+  assert.match(harness.document.node('agent-detail').textContent, /Not reported/);
+  assert.match(harness.document.node('project-defaults').textContent, /Unavailable/);
+  assert.ok(harness.fetchCalls.some(({ path }) => path === SETTINGS_FORGE));
+  await harness.document.node('nav-tasks').click();
+  assert.equal(harness.document.node('page-tasks').hidden, false);
+  assert.equal(harness.document.node('nav-tasks').getAttribute('aria-current'), 'page');
+});
+
+test('Settings renders native defaults and keeps a draft through snapshot polls', async () => {
+  const snapshot = taskSnapshotFixture();
+  const settings = agentSettingsFixture({
+    codex: { model: 'gpt-5.6-sol', effort: 'high' },
+  });
+  const harness = fakeEnvironment({ snapshot, settingsByWorker: { 'mini-forge': settings } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+
+  assert.match(harness.document.node('agent-list').textContent, /Default model gpt-5\.6-sol/);
+  assert.match(harness.document.node('agent-detail').textContent, /Native default/);
+  const modelInput = findByTestId(harness.document.node('agent-detail'), 'agent-settings-model');
+  assert.equal(modelInput.value, 'gpt-5.6-sol');
+  const originalInput = modelInput;
+  modelInput.value = 'draft-model';
+  modelInput.dispatchEvent(new Event('input'));
+  assert.match(harness.document.node('agent-list').textContent, /gpt-5\.6-sol/);
+  assert.doesNotMatch(harness.document.node('agent-list').textContent, /draft-model/);
+
+  snapshot.revision += 1;
+  await client.refreshSnapshot();
+
+  assert.equal(findByTestId(harness.document.node('agent-detail'), 'agent-settings-model'), originalInput);
+  assert.equal(modelInput.value, 'draft-model');
+  assert.match(harness.document.node('agent-detail').textContent, /Latest task/);
+});
+
+test('Cancel restores the cached native defaults without saving', async () => {
+  const settings = agentSettingsFixture({ codex: { model: 'gpt-5.6-sol', effort: 'high' } });
+  const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+
+  const modelInput = findByTestId(harness.document.node('agent-detail'), 'agent-settings-model');
+  modelInput.value = 'draft-model';
+  modelInput.dispatchEvent(new Event('input'));
+  await findByTestId(harness.document.node('agent-detail'), 'agent-settings-cancel').click();
+
+  assert.equal(findByTestId(harness.document.node('agent-detail'), 'agent-settings-model').value, 'gpt-5.6-sol');
+  assert.equal(harness.fetchCalls.filter(({ options }) => options?.method === 'POST').length, 0);
+});
+
+test('Saving native defaults sends the explicit payload and protected headers', async () => {
+  const settings = agentSettingsFixture({ codex: { model: 'gpt-5.6-sol', effort: 'high' } });
+  const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+
+  const detail = harness.document.node('agent-detail');
+  const modelInput = findByTestId(detail, 'agent-settings-model');
+  const effort = findByTestId(detail, 'agent-settings-effort');
+  modelInput.value = 'gpt-5.6-pro';
+  modelInput.dispatchEvent(new Event('input'));
+  effort.value = 'max';
+  effort.dispatchEvent(new Event('change'));
+  await findByTestId(detail, 'agent-settings-save').click();
+
+  const save = harness.fetchCalls.find(({ options }) => options?.method === 'POST');
+  assert.ok(save);
+  assert.equal(save.path, SETTINGS_FORGE);
+  assert.deepEqual(save.options.headers, {
+    'Content-Type': 'application/json',
+    'X-Mac-Worker-Settings': '1',
+    Origin: 'http://127.0.0.1:59623',
+  });
+  assert.deepEqual(JSON.parse(save.options.body), {
+    agent: 'codex',
+    model: 'gpt-5.6-pro',
+    effort: 'max',
+    revision: settings.agents[0].revision,
+  });
+  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'gpt-5.6-pro');
+});
+
+test('Settings shows loading and failure states while keeping retry available', async () => {
+  const pending = deferred();
+  const harness = fakeEnvironment({ deferredResponses: { [SETTINGS_FORGE]: [pending.promise] } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  const opening = harness.document.node('nav-settings').click();
+  assert.match(harness.document.node('agent-detail').textContent, /Loading native defaults/);
+  pending.resolve(response(agentSettingsFixture(), true));
+  await opening;
+
+  const failed = fakeEnvironment({
+    settingsRouteResponses: { [SETTINGS_FORGE]: [response({ error: { code: 'SETTINGS_UNAVAILABLE', message: 'worker settings unavailable' } }, false, 503)] },
+  });
+  const failedClient = createDashboardClient(failed);
+  await failedClient.refreshSnapshot();
+  await failed.document.node('nav-settings').click();
+  assert.match(failed.document.node('agent-detail').textContent, /Load failed/);
+  assert.match(failed.document.node('agent-detail').textContent, /worker settings unavailable/);
+  assert.equal(failed.document.node('settings-refresh').disabled, false);
+});
+
+test('a failed refresh with cached data keeps the draft but disables the editor', async () => {
+  const initial = agentSettingsFixture({ codex: { model: 'initial-model' } });
+  const harness = fakeEnvironment({
+    settingsByWorker: { 'mini-forge': initial },
+    settingsRouteResponses: {
+      [SETTINGS_FORGE]: [
+        response(initial),
+        response({ error: { code: 'SETTINGS_UNAVAILABLE', message: 'refresh unavailable' } }, false, 503),
+        response(initial),
+      ],
+    },
+  });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+
+  const detail = harness.document.node('agent-detail');
+  const modelInput = findByTestId(detail, 'agent-settings-model');
+  modelInput.value = 'draft-model';
+  modelInput.dispatchEvent(new Event('input'));
+  await harness.document.node('settings-refresh').click();
+
+  assert.match(detail.textContent, /Load failed/);
+  assert.match(detail.textContent, /refresh unavailable/);
+  assert.equal(findByTestId(detail, 'agent-settings-model'), undefined);
+  assert.equal(harness.document.node('settings-refresh').disabled, false);
+  const codexRow = findByTag(harness.document.node('agent-list'), 'BUTTON')
+    .find((row) => row.getAttribute('data-agent') === 'codex');
+  assert.match(codexRow.textContent, /Load failed/);
+
+  await harness.document.node('settings-refresh').click();
+  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'draft-model');
+});
+
+test('conflicts retain the draft and refresh its revision before retry', async () => {
+  const initial = agentSettingsFixture({ codex: { model: 'gpt-5.6-sol', effort: 'high' } });
+  const refreshed = agentSettingsFixture({ codex: { model: 'gpt-5.6-codex', effort: 'high' } });
+  const harness = fakeEnvironment({
+    settingsByWorker: { 'mini-forge': initial },
+    settingsRouteResponses: {
+      [SETTINGS_FORGE]: [response(initial), response(refreshed)],
+      [`${SETTINGS_FORGE}#save`]: [response({ error: { code: 'SETTINGS_CONFLICT', message: 'native settings changed; refresh and retry' } }, false, 409)],
+    },
+  });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+  const detail = harness.document.node('agent-detail');
+  const modelInput = findByTestId(detail, 'agent-settings-model');
+  modelInput.value = 'draft-model';
+  modelInput.dispatchEvent(new Event('input'));
+  await findByTestId(detail, 'agent-settings-save').click();
+
+  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'draft-model');
+  assert.match(detail.textContent, /native settings changed/i);
+  const getCalls = harness.fetchCalls.filter(({ path, options }) => path === SETTINGS_FORGE && !options?.method);
+  assert.equal(getCalls.length, 2);
+
+  await findByTestId(detail, 'agent-settings-save').click();
+  const saves = harness.fetchCalls.filter(({ options }) => options?.method === 'POST');
+  assert.equal(saves.length, 2);
+  assert.equal(JSON.parse(saves[1].options.body).revision, refreshed.agents[0].revision);
+});
+
+test('out-of-order worker settings responses cannot replace the current worker', async () => {
+  const forge = deferred();
+  const anvil = deferred();
+  const harness = fakeEnvironment({
+    deferredResponses: { [SETTINGS_FORGE]: [forge.promise], [SETTINGS_ANVIL]: [anvil.promise] },
+  });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  const opening = harness.document.node('nav-settings').click();
+  harness.nodes['settings-worker'].value = 'mini-anvil';
+  harness.nodes['settings-worker'].dispatchEvent(new Event('change'));
+  anvil.resolve(response(agentSettingsFixture({ codex: { model: 'anvil-model', effort: null } })));
+  await Promise.resolve();
+  forge.resolve(response(agentSettingsFixture({ codex: { model: 'forge-model', effort: null } })));
+  await opening;
+  await Promise.resolve();
+
+  assert.equal(harness.nodes['settings-worker'].value, 'mini-anvil');
+  assert.equal(findByTestId(harness.document.node('agent-detail'), 'agent-settings-model').value, 'anvil-model');
+  assert.doesNotMatch(harness.document.node('agent-detail').textContent, /forge-model/);
+});
+
+test('a late save response cannot replace a newly selected agent', async () => {
+  const saveResponse = deferred();
+  const harness = fakeEnvironment({
+    settingsByWorker: { 'mini-forge': agentSettingsFixture() },
+    settingsRouteResponses: { [`${SETTINGS_FORGE}#save`]: [saveResponse.promise] },
+  });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+  const detail = harness.document.node('agent-detail');
+  const modelInput = findByTestId(detail, 'agent-settings-model');
+  modelInput.value = 'codex-draft';
+  modelInput.dispatchEvent(new Event('input'));
+  const saving = findByTestId(detail, 'agent-settings-save').click();
+  const agentRows = findByTag(harness.document.node('agent-list'), 'BUTTON');
+  await agentRows[1].click();
+  saveResponse.resolve(response({
+    ...agentSettingsFixture().agents[0],
+    model: 'codex-saved',
+  }));
+  await saving;
+
+  assert.match(detail.textContent, /Cursor/);
+  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'claude-3-7-sonnet');
+  assert.doesNotMatch(detail.textContent, /codex-saved/);
+});
+
+test('Settings distinguishes missing agents, unsupported OpenCode effort, and unverified effort', async () => {
+  const settings = agentSettingsFixture();
+  settings.agents = settings.agents.filter((entry) => entry.agent !== 'claude');
+  const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+
+  const rows = findByTag(harness.document.node('agent-list'), 'BUTTON');
+  const cursorRow = rows.find((row) => row.getAttribute('data-agent') === 'cursor');
+  const opencodeRow = rows.find((row) => row.getAttribute('data-agent') === 'opencode');
+  const claudeRow = rows.find((row) => row.getAttribute('data-agent') === 'claude');
+  assert.match(cursorRow.textContent, /high/);
+  assert.match(cursorRow.textContent, /Choices unavailable/);
+  assert.match(opencodeRow.textContent, /Not supported/);
+  assert.match(claudeRow.textContent, /Unavailable/);
+  assert.doesNotMatch(claudeRow.textContent, /CLI default/);
+
+  await opencodeRow.click();
+  assert.match(harness.document.node('agent-detail').textContent, /Not supported/);
+});
+
+test('Cursor can clear an unverified effort before changing its model', async () => {
+  const settings = agentSettingsFixture({
+    cursor: { model: 'grok-4.6', effort: 'high', effort_options: [] },
+  });
+  const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+  const cursorRow = findByTag(harness.document.node('agent-list'), 'BUTTON')
+    .find((row) => row.getAttribute('data-agent') === 'cursor');
+  await cursorRow.click();
+
+  const detail = harness.document.node('agent-detail');
+  const modelInput = findByTestId(detail, 'agent-settings-model');
+  modelInput.value = 'gpt-5';
+  modelInput.dispatchEvent(new Event('input'));
+  await findByTestId(detail, 'agent-settings-effort-reset').click();
+  assert.match(detail.textContent, /CLI default/);
+  await findByTestId(detail, 'agent-settings-save').click();
+
+  const save = harness.fetchCalls.find(({ options }) => options?.method === 'POST');
+  assert.deepEqual(JSON.parse(save.options.body), {
+    agent: 'cursor',
+    model: 'gpt-5',
+    effort: null,
+    revision: settings.agents.find((entry) => entry.agent === 'cursor').revision,
+  });
+});
+
+test('Use CLI default stays visible through polling and a save error, then Cancel restores the saved value', async () => {
+  const snapshot = taskSnapshotFixture();
+  const settings = agentSettingsFixture({
+    cursor: { model: 'grok-4.6', effort: 'high', effort_options: [] },
+  });
+  const harness = fakeEnvironment({
+    snapshot,
+    settingsByWorker: { 'mini-forge': settings },
+    settingsRouteResponses: {
+      [`${SETTINGS_FORGE}#save`]: [response({ error: { code: 'SETTINGS_UNAVAILABLE', message: 'save unavailable' } }, false, 503)],
+    },
+  });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+  const cursorRow = findByTag(harness.document.node('agent-list'), 'BUTTON')
+    .find((row) => row.getAttribute('data-agent') === 'cursor');
+  await cursorRow.click();
+
+  const detail = harness.document.node('agent-detail');
+  assert.equal(findByTestId(detail, 'agent-settings-effort').value, 'high');
+  await findByTestId(detail, 'agent-settings-effort-reset').click();
+  assert.equal(findByTestId(detail, 'agent-settings-effort').value, 'CLI default');
+  assert.match(cursorRow.textContent, /high/);
+
+  snapshot.revision += 1;
+  await client.refreshSnapshot();
+  assert.equal(findByTestId(detail, 'agent-settings-effort').value, 'CLI default');
+
+  await findByTestId(detail, 'agent-settings-save').click();
+  assert.equal(findByTestId(detail, 'agent-settings-effort').value, 'CLI default');
+  assert.equal(findByTestId(detail, 'agent-settings-save').disabled, false);
+  assert.match(detail.textContent, /save unavailable/);
+
+  await findByTestId(detail, 'agent-settings-cancel').click();
+  assert.equal(findByTestId(detail, 'agent-settings-effort').value, 'high');
+});
+
+test('Codex can clear an unverified effort before changing its model', async () => {
+  const settings = agentSettingsFixture({
+    codex: { model: 'grok-4.6', effort: 'high', effort_options: [] },
+  });
+  const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+
+  const detail = harness.document.node('agent-detail');
+  const modelInput = findByTestId(detail, 'agent-settings-model');
+  modelInput.value = 'gpt-5';
+  modelInput.dispatchEvent(new Event('input'));
+  await findByTestId(detail, 'agent-settings-effort-reset').click();
+  await findByTestId(detail, 'agent-settings-save').click();
+
+  const save = harness.fetchCalls.find(({ options }) => options?.method === 'POST');
+  assert.deepEqual(JSON.parse(save.options.body), {
+    agent: 'codex',
+    model: 'gpt-5',
+    effort: null,
+    revision: settings.agents.find((entry) => entry.agent === 'codex').revision,
+  });
+});
+
+test('readonly unavailable entries never look like CLI defaults', async () => {
+  const settings = agentSettingsFixture({
+    codex: { model: null, effort: null, writable: false, message: 'native configuration is invalid' },
+  });
+  const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+
+  const codexRow = findByTag(harness.document.node('agent-list'), 'BUTTON')
+    .find((row) => row.getAttribute('data-agent') === 'codex');
+  assert.match(codexRow.textContent, /Unavailable/);
+  assert.doesNotMatch(codexRow.textContent, /CLI default/);
+  await codexRow.click();
+  assert.match(harness.document.node('agent-detail').textContent, /Unavailable/);
+});
+
+test('malformed settings responses fail safely and retain the draft', async () => {
+  const malformedGet = fakeEnvironment({
+    settingsRouteResponses: {
+      [SETTINGS_FORGE]: [response({ agents: [{ agent: 'codex', model: null }] })],
+    },
+  });
+  const malformedGetClient = createDashboardClient(malformedGet);
+  await malformedGetClient.refreshSnapshot();
+  await malformedGet.document.node('nav-settings').click();
+  assert.match(malformedGet.document.node('agent-detail').textContent, /Load failed/);
+
+  const malformedSave = fakeEnvironment({
+    settingsRouteResponses: {
+      [`${SETTINGS_FORGE}#save`]: [response({ agent: 'codex' })],
+    },
+  });
+  const malformedSaveClient = createDashboardClient(malformedSave);
+  await malformedSaveClient.refreshSnapshot();
+  await malformedSave.document.node('nav-settings').click();
+  const detail = malformedSave.document.node('agent-detail');
+  const modelInput = findByTestId(detail, 'agent-settings-model');
+  modelInput.value = 'draft-model';
+  modelInput.dispatchEvent(new Event('input'));
+  await findByTestId(detail, 'agent-settings-save').click();
+  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'draft-model');
+  assert.equal(findByTestId(detail, 'agent-settings-save').disabled, false);
+  assert.match(detail.textContent, /response was invalid/i);
+});
+
+test('a refresh already in flight cannot overwrite a successful save', async () => {
+  const initial = agentSettingsFixture({ codex: { model: 'initial-model' } });
+  const refreshResponse = deferred();
+  const saved = {
+    ...initial.agents.find((entry) => entry.agent === 'codex'),
+    model: 'saved-model',
+    revision: 's'.repeat(64),
+  };
+  const harness = fakeEnvironment({
+    settingsRouteResponses: {
+      [SETTINGS_FORGE]: [response(initial), refreshResponse.promise],
+      [`${SETTINGS_FORGE}#save`]: [response(saved)],
+    },
+  });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+  const detail = harness.document.node('agent-detail');
+  const modelInput = findByTestId(detail, 'agent-settings-model');
+  modelInput.value = 'saved-model';
+  modelInput.dispatchEvent(new Event('input'));
+  const refreshing = harness.document.node('settings-refresh').click();
+  await Promise.resolve();
+  const saving = findByTestId(detail, 'agent-settings-save').click();
+  await saving;
+  refreshResponse.resolve(response(initial));
+  await refreshing;
+
+  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'saved-model');
+});
 
 test('task filters are client-side and never call a mutating endpoint', async () => {
   const harness = createHarness(taskSnapshotFixture());
@@ -52,6 +487,58 @@ test('active task logs poll every second with independent byte cursors', async (
   assert.equal(harness.nodes['task-stderr-log'].textContent, 'err-1err-2');
 });
 
+test('a completed task drains recorded output before stopping its log timer', async () => {
+  const detail = taskDetailFixture();
+  detail.task.state = 'closed';
+  detail.task.active_turn_id = null;
+  detail.turns[1].terminal = 'succeeded';
+  const harness = createHarness(taskSnapshotFixture(), {
+    [`/api/v1/tasks/${TASK_ACTIVE}`]: detail,
+    [`/api/v1/tasks/${TASK_ACTIVE}/turns/${JOB_A}/logs?stream=stdout&offset=0&limit=65536`]: logChunk('stdout', 0, 4, 'ZG9uZQ=='),
+    [`/api/v1/tasks/${TASK_ACTIVE}/turns/${JOB_A}/logs?stream=stderr&offset=0&limit=65536`]: logChunk('stderr', 0, 0, ''),
+    [`/api/v1/tasks/${TASK_ACTIVE}/turns/${JOB_A}/logs?stream=stdout&offset=4&limit=65536`]: logChunk('stdout', 4, 4, ''),
+  });
+  const client = createDashboardClient(harness);
+  client.start();
+  await client.openTask(TASK_ACTIVE);
+  await harness.timers.tick(1_000);
+  await harness.timers.tick(1_000);
+  assert.equal(harness.nodes['task-stdout-log'].textContent, 'done');
+  assert.deepEqual(client.taskOffsets(), { stdout: 4, stderr: 0 });
+  assert.deepEqual([...harness.timers.intervals.values()].filter((timer) => !timer.cleared).map((timer) => timer.delay), [2_000]);
+});
+
+test('Settings uses latest task settings for the selected worker and keeps remote labels as text', async () => {
+  const snapshot = taskSnapshotFixture();
+  snapshot.tasks[1] = { ...snapshot.tasks[1], model: MALICIOUS_LABEL, effort: null, permissions: 'full-auto', env_profile: 'agents' };
+  snapshot.workers[0].agent_facts = { freshness: 'current', agents: [{ name: 'codex', version: '1.2.3', auth: 'unauthenticated', auth_by_profile: [{ profile: 'agents', auth: 'authenticated' }] }] };
+  snapshot.project_defaults = { default_agent: 'codex', timeout_seconds: 1800, max_followups: 10, source: 'local', publish: ['fetch'], env_profile: null, permissions: {} };
+  const harness = createHarness(snapshot);
+  await createDashboardClient(harness).refreshSnapshot();
+  assert.match(harness.nodes['agent-detail'].textContent, /Connected/);
+  assert.match(harness.nodes['agent-detail'].textContent, /<img src=x onerror=1>/);
+  assert.match(harness.nodes['agent-detail'].textContent, /Not reported/);
+  assert.equal(findByTag(harness.document.root, 'IMG').length, 0);
+  harness.nodes['settings-worker'].value = 'mini-anvil';
+  harness.nodes['settings-worker'].dispatchEvent(new Event('change'));
+  assert.match(harness.nodes['agent-detail'].textContent, /Unknown/);
+  assert.doesNotMatch(harness.nodes['agent-detail'].textContent, /<img/);
+});
+
+test('a failed snapshot makes cached agent connections and worker readings stale', async () => {
+  const snapshot = taskSnapshotFixture();
+  snapshot.workers[0].agent_facts = { freshness: 'current', agents: [{ name: 'codex', auth: 'authenticated', auth_by_profile: [] }] };
+  const env = fakeEnvironment({ deferredResponses: { '/api/v1/snapshot': [
+    response(snapshot), response({ error: { message: 'offline' } }, false),
+  ] } });
+  const client = createDashboardClient(env);
+  await client.refreshSnapshot();
+  assert.match(env.document.node('agent-detail').textContent, /Connected/);
+  await client.refreshSnapshot();
+  assert.doesNotMatch(env.document.node('agent-detail').textContent, /Connected/);
+  assert.equal(env.document.node('worker-grid').children[0].getAttribute('data-state'), 'stale');
+});
+
 test('worker cards show task title and agent without losing active turn identity', async () => {
   const harness = createHarness(taskSnapshotFixture());
   await createDashboardClient(harness).refreshSnapshot();
@@ -59,8 +546,37 @@ test('worker cards show task title and agent without losing active turn identity
   assert.match(harness.nodes['worker-grid'].textContent, /codex/);
 });
 
+test('overview selects an active task once and preserves the user navigation on a new turn', async () => {
+  const snapshot = taskSnapshotFixture();
+  const detail = taskDetailFixture();
+  const harness = createHarness(snapshot, { [`/api/v1/tasks/${TASK_ACTIVE}`]: detail });
+  const client = createDashboardClient(harness);
+  client.start();
+  await client.refreshSnapshot();
+  assert.equal(harness.fetchCalls.filter(({ path }) => path === `/api/v1/tasks/${TASK_ACTIVE}`).length, 1);
+  await harness.document.node('nav-settings').click();
+  detail.task.active_turn_id = 'turn-new';
+  detail.task.turn_count = 3;
+  detail.turns[1].terminal = 'succeeded';
+  detail.turns.push({ turn_id: 'turn-new', turn_number: 3, terminal: null });
+  snapshot.tasks[1].active_turn_id = 'turn-new';
+  snapshot.tasks[1].turn_count = 3;
+  snapshot.revision += 1;
+  await client.refreshSnapshot();
+  assert.equal(harness.document.node('page-settings').hidden, false);
+  assert.match(harness.document.node('inspector-label').textContent, /Turn 3/);
+  assert.deepEqual(client.taskOffsets(), { stdout: 0, stderr: 0 });
+  await client.refreshTaskLogs();
+  assert.ok(harness.fetchCalls.some(({ path }) => path.includes('/turns/turn-new/logs?stream=stdout&offset=0')));
+  const detailCalls = harness.fetchCalls.filter(({ path }) => path === `/api/v1/tasks/${TASK_ACTIVE}`).length;
+  await client.refreshSnapshot();
+  assert.equal(harness.fetchCalls.filter(({ path }) => path === `/api/v1/tasks/${TASK_ACTIVE}`).length, detailCalls);
+});
+
 test('startup polls only the snapshot endpoint at the required cadence', async () => {
-  const env = fakeEnvironment();
+  const snapshot = snapshotFixture();
+  snapshot.tasks = [];
+  const env = fakeEnvironment({ snapshot });
   const client = createDashboardClient(env);
 
   client.start();
@@ -108,7 +624,8 @@ test('renderer populates every region while keeping labels and command data safe
   assert.match(env.document.node('queue-list').textContent, /Job fedcba987654/);
   assert.doesNotMatch(env.document.root.textContent, /DO NOT RENDER/);
 
-  const controls = findByTag(env.document.root, 'BUTTON');
+  const controls = [...findByTag(env.document.node('active-jobs'), 'BUTTON'),
+    ...findByTag(env.document.node('recent-jobs'), 'BUTTON')];
   assert.ok(controls.length > 0);
   const accessibleNames = controls.map((control) => {
     assert.equal(control.getAttribute('aria-label'), null);
@@ -638,6 +1155,8 @@ function fakeEnvironment({
   logs = {},
   deferredResponses = {},
   taskRouteResponses = {},
+  settingsByWorker = {},
+  settingsRouteResponses = {},
 } = {}) {
   const fetchDouble = new FakeFetch({
     snapshot,
@@ -647,6 +1166,8 @@ function fakeEnvironment({
     logs,
     deferredResponses,
     taskRouteResponses,
+    settingsByWorker,
+    settingsRouteResponses,
   });
   const fetch = fetchDouble.fetch.bind(fetchDouble);
   fetch.calls = fetchDouble.calls;
@@ -667,6 +1188,15 @@ function fakeEnvironment({
       'job-detail',
       'stdout-log',
       'stderr-log',
+      'nav-overview', 'nav-tasks', 'nav-history', 'nav-settings',
+      'page-overview', 'page-tasks', 'page-history', 'page-settings',
+      'pool-summary', 'slots-summary', 'tasks-summary', 'queue-count', 'queue-attention',
+      'overview-progress', 'inspector-label', 'inspector-title', 'inspector-meta',
+      'inspector-runner', 'inspector-branch', 'inspector-run', 'inspector-empty',
+      'console-stdout', 'console-stderr', 'console-details',
+      'tab-stdout', 'tab-stderr', 'tab-details', 'settings-worker', 'settings-summary',
+      'agent-list', 'agent-detail', 'project-defaults', 'agent-workers', 'agent-worker-title',
+      'settings-count', 'settings-refresh',
       'task-filter-run',
       'task-filter-state',
       'task-filter-worker',
@@ -716,6 +1246,8 @@ class FakeNode {
     this._textContent = '';
     this.className = '';
     this.value = '';
+    this.disabled = false;
+    this.readOnly = false;
   }
 
   get textContent() {
@@ -779,6 +1311,11 @@ class FakeDocument {
   constructor() {
     this.root = new FakeNode('main', this);
     this.nodes = new Map();
+    this.defaultView = {
+      location: { hash: '', origin: 'http://127.0.0.1:59623' },
+      history: { pushState() {} },
+      addEventListener() {},
+    };
     for (const id of [
       'task-filter-run',
       'task-filter-state',
@@ -800,6 +1337,15 @@ class FakeDocument {
       'job-detail',
       'stdout-log',
       'stderr-log',
+      'nav-overview', 'nav-tasks', 'nav-history', 'nav-settings',
+      'page-overview', 'page-tasks', 'page-history', 'page-settings',
+      'pool-summary', 'slots-summary', 'tasks-summary', 'queue-count', 'queue-attention',
+      'overview-progress', 'inspector-label', 'inspector-title', 'inspector-meta',
+      'inspector-runner', 'inspector-branch', 'inspector-run', 'inspector-empty',
+      'console-stdout', 'console-stderr', 'console-details',
+      'tab-stdout', 'tab-stderr', 'tab-details', 'settings-worker', 'settings-summary',
+      'agent-list', 'agent-detail', 'project-defaults', 'agent-workers', 'agent-worker-title',
+      'settings-count', 'settings-refresh',
     ]) {
       const tag = id.endsWith('-log') ? 'pre' : id.startsWith('task-filter-') ? 'select' : 'section';
       const node = new FakeNode(tag, this);
@@ -826,7 +1372,7 @@ class FakeDocument {
 }
 
 class FakeFetch {
-  constructor({ snapshot, snapshotError, details, taskDetails, logs, deferredResponses, taskRouteResponses }) {
+  constructor({ snapshot, snapshotError, details, taskDetails, logs, deferredResponses, taskRouteResponses, settingsByWorker, settingsRouteResponses }) {
     this.snapshot = snapshot;
     this.snapshotError = snapshotError;
     this.details = details;
@@ -834,6 +1380,8 @@ class FakeFetch {
     this.logs = new Map(Object.entries(logs));
     this.deferredResponses = new Map(Object.entries(deferredResponses));
     this.taskRouteResponses = new Map(Object.entries(taskRouteResponses));
+    this.settingsByWorker = new Map(Object.entries(settingsByWorker));
+    this.settingsRouteResponses = new Map(Object.entries(settingsRouteResponses));
     this.calls = [];
   }
 
@@ -847,6 +1395,24 @@ class FakeFetch {
 
     const taskRouteResponse = this.taskRouteResponses.get(path);
     if (taskRouteResponse?.length) return taskRouteResponse.shift();
+
+    const settingsMatch = path.match(/^\/api\/v1\/workers\/([^/]+)\/agent-settings$/);
+    if (settingsMatch) {
+      const worker = decodeURIComponent(settingsMatch[1]);
+      const routeKey = options?.method === 'POST' ? `${path}#save` : path;
+      const settingsRouteResponse = this.settingsRouteResponses.get(routeKey);
+      if (settingsRouteResponse?.length) return settingsRouteResponse.shift();
+      if (options?.method === 'POST') {
+        const payload = JSON.parse(options.body);
+        const settings = this.settingsByWorker.get(worker) ?? agentSettingsFixture();
+        const next = structuredClone(settings);
+        const entry = next.agents.find((value) => value.agent === payload.agent);
+        Object.assign(entry, { model: payload.model, effort: payload.effort, revision: `${entry.revision.slice(0, -1)}s` });
+        this.settingsByWorker.set(worker, next);
+        return response(entry);
+      }
+      return response(this.settingsByWorker.get(worker) ?? agentSettingsFixture());
+    }
 
     const taskDetailMatch = path.match(/^\/api\/v1\/tasks\/([^/?]+)$/);
     if (taskDetailMatch) {
@@ -933,10 +1499,10 @@ class FakeTimers {
   }
 }
 
-function response(body, ok = true) {
+function response(body, ok = true, status = ok ? 200 : 503) {
   return {
     ok,
-    status: ok ? 200 : 503,
+    status,
     async json() {
       return structuredClone(body);
     },
@@ -961,8 +1527,55 @@ function findByTag(node, tagName) {
   ];
 }
 
+function findByTestId(node, testId) {
+  return allNodes(node).find((candidate) => candidate.getAttribute('data-testid') === testId);
+}
+
 function allNodes(node) {
   return [node, ...node.children.flatMap(allNodes)];
+}
+
+function agentSettingsFixture(overrides = {}) {
+  const defaults = {
+    codex: {
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      effort_options: ['low', 'medium', 'high', 'xhigh', 'max'],
+      source: 'native-codex',
+    },
+    cursor: {
+      model: 'claude-3-7-sonnet',
+      effort: 'high',
+      effort_options: [],
+      source: 'native-cursor',
+    },
+    opencode: {
+      model: 'opencode/default',
+      effort: null,
+      effort_options: [],
+      source: 'native-opencode',
+    },
+    claude: {
+      model: 'claude-sonnet',
+      effort: 'high',
+      effort_options: ['low', 'medium', 'high', 'xhigh', 'max'],
+      source: 'native-claude',
+    },
+  };
+  return {
+    agents: Object.entries(defaults).map(([agent, value], index) => ({
+      agent,
+      model: null,
+      effort: null,
+      effort_options: [],
+      source: `native-${agent}`,
+      revision: `${String(index + 1).repeat(64)}`,
+      writable: true,
+      message: null,
+      ...value,
+      ...(overrides[agent] ?? {}),
+    })),
+  };
 }
 
 function snapshotFixture() {
@@ -1252,3 +1865,23 @@ function taskLogResponses() {
 function logChunk(stream, offset, nextOffset, data) {
   return { stream, offset, next_offset: nextOffset, data };
 }
+
+test('automatic refresh recovers from transient task-detail failure', async () => {
+  const snapshot = taskSnapshotFixture();
+  const detail = taskDetailFixture();
+  const path = `/api/v1/tasks/${TASK_ACTIVE}`;
+  const env = fakeEnvironment({snapshot, taskDetails: {[TASK_ACTIVE]: detail}, deferredResponses: {[path]: [response(detail), response({error: {message: 'temporary failure'}}, false)]}});
+  const client = createDashboardClient(env);
+  client.start();
+  await client.refreshSnapshot();
+  snapshot.tasks[1].state = 'closed';
+  snapshot.tasks[1].active_turn_id = null;
+  snapshot.revision += 1;
+  await client.refreshSnapshot();
+  detail.task.state = 'closed';
+  detail.task.active_turn_id = null;
+  detail.turns[1].terminal = 'succeeded';
+  snapshot.revision += 1;
+  await client.refreshSnapshot();
+  assert.equal(env.document.node('inspector-title').textContent, detail.task.title);
+});

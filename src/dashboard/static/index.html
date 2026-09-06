@@ -1,222 +1,378 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light">
-    <title>Mac Worker · Machine Floor</title>
-    <link rel="stylesheet" href="/assets/dashboard.css">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>mac-worker · Your personal pool</title>
+    <link rel="stylesheet" href="/assets/dashboard.css" />
   </head>
   <body>
-    <header class="status-rail">
-      <div class="brand-mark" aria-label="Mac Worker dashboard">
-        <span class="brand-mark__stamp" aria-hidden="true">MW</span>
-        <span>
-          <strong>Machine Floor</strong>
-          <small>Local worker control panel</small>
-        </span>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="topbar">
+      <a class="brand" href="#overview" aria-label="mac-worker overview"
+        ><span class="brand__mark" aria-hidden="true"
+          ><i></i><i></i><i></i><i></i></span
+        ><span>mac-worker</span></a
+      >
+      <nav class="navigation" aria-label="Main navigation">
+        <a id="nav-overview" href="#overview" aria-current="page">Overview</a
+        ><a id="nav-tasks" href="#tasks">Tasks</a
+        ><a id="nav-history" href="#history">Run history</a
+        ><a id="nav-settings" href="#settings">Settings</a>
+      </nav>
+      <div class="snapshot-status">
+        <span
+          id="rail-state-indicator"
+          class="state-led"
+          data-state="offline"
+          aria-hidden="true"
+        ></span
+        ><span id="last-updated">Awaiting snapshot</span>
       </div>
-      <div class="rail-status">
-        <span id="rail-state-indicator" class="rail-status__light" data-state="offline" aria-hidden="true"></span>
-        <span id="refresh-status" aria-live="polite">Awaiting first local snapshot…</span>
-      </div>
-      <p id="last-updated" class="rail-time">No observations yet</p>
     </header>
-
-    <main>
-      <section class="floor-section floor-section--machines" aria-labelledby="workers-heading">
-        <div class="section-heading">
-          <div>
-            <p class="section-index">Bay 01</p>
-            <h1 id="workers-heading">Three-machine floor</h1>
+    <main id="main">
+      <section
+        id="page-overview"
+        class="page overview"
+        aria-label="Pool overview"
+      >
+        <div class="pool-summary">
+          <p id="pool-summary">
+            Your personal pool · Waiting for worker observations
+          </p>
+          <div class="pool-totals">
+            <p>
+              <strong id="slots-summary">— / —</strong
+              ><span>Slots occupied</span>
+            </p>
+            <p><strong id="tasks-summary">—</strong><span>Total tasks</span></p>
           </div>
-          <p>Slot state is authoritative. Host readings explain the load.</p>
         </div>
         <div id="worker-grid" data-testid="worker-grid" class="worker-grid">
           <p class="empty-state">Waiting for worker observations…</p>
         </div>
+        <div class="overview-work">
+          <div class="queue-column">
+            <section class="panel queue-panel" aria-labelledby="queue-heading">
+              <div class="panel-heading">
+                <h2 id="queue-heading">
+                  Queue <span id="queue-count" class="count">0</span>
+                </h2>
+                <span class="eyebrow">Next up</span>
+              </div>
+              <div id="queue-list" data-testid="queue-list" class="queue-list">
+                <p class="empty-state">Waiting for queue state…</p>
+              </div>
+              <p id="queue-attention" class="queue-attention">
+                No observations yet
+              </p>
+            </section>
+            <section
+              class="panel progress-panel"
+              aria-labelledby="progress-heading"
+            >
+              <div class="panel-heading">
+                <h2 id="progress-heading">Run progress</h2>
+                <a href="#history">View runs ↗</a>
+              </div>
+              <div id="overview-progress">
+                <p class="empty-state">No tasks recorded</p>
+              </div>
+            </section>
+          </div>
+          <section class="panel inspector" aria-labelledby="inspector-title">
+            <header class="inspector-heading">
+              <div class="inspector-identity">
+                <p id="inspector-label" class="eyebrow">Task output</p>
+                <h2 id="inspector-title">Select a task to inspect</h2>
+              </div>
+              <div id="inspector-meta" class="launch-meta"></div>
+            </header>
+            <div class="console-tabs">
+              <div role="tablist" aria-label="Task inspection">
+                <button
+                  id="tab-stdout"
+                  role="tab"
+                  aria-selected="true"
+                  aria-controls="console-stdout"
+                  type="button"
+                >
+                  Standard output</button
+                ><button
+                  id="tab-stderr"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="console-stderr"
+                  tabindex="-1"
+                  type="button"
+                >
+                  Standard error</button
+                ><button
+                  id="tab-details"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="console-details"
+                  tabindex="-1"
+                  type="button"
+                >
+                  Task details
+                </button>
+              </div>
+              <span id="inspector-runner" class="runner-label"
+                >No task selected</span
+              >
+            </div>
+            <div class="console-body">
+              <div
+                id="console-stdout"
+                role="tabpanel"
+                aria-labelledby="tab-stdout"
+              >
+                <p id="inspector-empty" class="console-empty">
+                  Select an active worker or a task from the Tasks tab to view
+                  its output.
+                </p>
+                <pre
+                  id="task-stdout-log"
+                  data-testid="task-stdout-log"
+                  tabindex="0"
+                  aria-label="Task standard output log"
+                ></pre>
+              </div>
+              <div
+                id="console-stderr"
+                role="tabpanel"
+                aria-labelledby="tab-stderr"
+                hidden
+              >
+                <pre
+                  id="task-stderr-log"
+                  data-testid="task-stderr-log"
+                  tabindex="0"
+                  aria-label="Task standard error log"
+                ></pre>
+              </div>
+              <div
+                id="console-details"
+                role="tabpanel"
+                aria-labelledby="tab-details"
+                hidden
+              >
+                <div
+                  id="task-detail"
+                  data-testid="task-detail"
+                  class="task-detail"
+                >
+                  <p class="empty-state">
+                    Select a task to inspect its record.
+                  </p>
+                </div>
+                <div
+                  id="task-timeline"
+                  data-testid="task-timeline"
+                  class="task-timeline"
+                ></div>
+              </div>
+            </div>
+            <footer class="inspector-footer">
+              <span id="inspector-branch">No branch selected</span
+              ><a id="inspector-run" href="#history">View run history ↗</a>
+            </footer>
+          </section>
+        </div>
       </section>
-
-      <div class="operations-grid">
-        <section class="floor-section" aria-labelledby="queue-heading">
-          <div class="section-heading section-heading--compact">
-            <div>
-              <p class="section-index">Rack 02</p>
-              <h2 id="queue-heading">Queue</h2>
-            </div>
-            <span class="section-key">FIFO</span>
-          </div>
-          <div id="queue-list" data-testid="queue-list" class="ticket-stack">
-            <p class="empty-state">Waiting for queue state…</p>
-          </div>
-        </section>
-
-        <section class="floor-section" aria-labelledby="active-heading">
-          <div class="section-heading section-heading--compact">
-            <div>
-              <p class="section-index">Bench 03</p>
-              <h2 id="active-heading">Active work</h2>
-            </div>
-            <span class="section-key">Live</span>
-          </div>
-          <div id="active-jobs" data-testid="active-jobs" class="ticket-stack">
-            <p class="empty-state">Waiting for active jobs…</p>
-          </div>
-        </section>
-      </div>
-
-      <section class="floor-section task-section" aria-labelledby="tasks-heading">
-        <div class="section-heading section-heading--compact">
-          <div>
-            <p class="section-index">Ledger 04</p>
-            <h2 id="tasks-heading">Tasks &amp; runs</h2>
-          </div>
-          <span class="section-key">Read only</span>
+      <section
+        id="page-tasks"
+        class="page"
+        aria-labelledby="tasks-heading"
+        hidden
+      >
+        <div class="page-heading">
+          <h1 id="tasks-heading">Tasks</h1>
+          <p>All work in your pool</p>
         </div>
-
-        <div class="task-progress-shell">
-          <div class="task-subheading">
-            <div>
-              <p class="eyebrow">Run progress</p>
-              <h3>Durable task pool</h3>
+        <section class="panel task-ledger">
+          <div class="task-filters" aria-label="Task filters">
+            <div class="task-filter">
+              <label for="task-filter-run">Run</label
+              ><select id="task-filter-run" data-testid="task-filter-run">
+                <option value="">All runs</option>
+              </select>
             </div>
-            <span class="read-only-label">Immutable observation</span>
-          </div>
-          <div id="run-progress" data-testid="run-progress" class="run-progress" aria-live="polite">
-            <p class="empty-state">Waiting for task runs…</p>
-          </div>
-        </div>
-
-        <div class="task-filters" aria-label="Task filters">
-          <div class="task-filter">
-            <label for="task-filter-run">Run</label>
-            <select id="task-filter-run" data-testid="task-filter-run">
-              <option value="">All runs</option>
-            </select>
-          </div>
-          <div class="task-filter">
-            <label for="task-filter-state">State</label>
-            <select id="task-filter-state" data-testid="task-filter-state">
-              <option value="">All states</option>
-            </select>
-          </div>
-          <div class="task-filter">
-            <label for="task-filter-worker">Worker</label>
-            <select id="task-filter-worker" data-testid="task-filter-worker">
-              <option value="">All workers</option>
-            </select>
-          </div>
-          <div class="task-filter">
-            <label for="task-filter-agent">Agent</label>
-            <select id="task-filter-agent" data-testid="task-filter-agent">
-              <option value="">All agents</option>
-            </select>
-          </div>
-        </div>
-
-        <div class="task-table-shell">
-          <div class="task-table-heading">
-            <div>
-              <p class="eyebrow">Task table</p>
-              <p class="task-table-caption">State, authority, and scheduler position</p>
+            <div class="task-filter">
+              <label for="task-filter-state">State</label
+              ><select id="task-filter-state" data-testid="task-filter-state">
+                <option value="">All states</option>
+              </select>
             </div>
-            <span class="section-key">No controls</span>
+            <div class="task-filter">
+              <label for="task-filter-worker">Worker</label
+              ><select id="task-filter-worker" data-testid="task-filter-worker">
+                <option value="">All workers</option>
+              </select>
+            </div>
+            <div class="task-filter">
+              <label for="task-filter-agent">Agent</label
+              ><select id="task-filter-agent" data-testid="task-filter-agent">
+                <option value="">All agents</option>
+              </select>
+            </div>
           </div>
-          <div id="task-list" data-testid="task-list" class="task-list" role="list" aria-label="Tasks">
+          <div
+            id="task-list"
+            data-testid="task-list"
+            class="task-list"
+            aria-label="Tasks"
+          >
             <p class="empty-state">Waiting for durable tasks…</p>
           </div>
+        </section>
+      </section>
+      <section
+        id="page-history"
+        class="page"
+        aria-labelledby="history-heading"
+        hidden
+      >
+        <div class="page-heading">
+          <h1 id="history-heading">Run history</h1>
+          <p>Runs, active jobs and completed work</p>
         </div>
-
-        <div class="task-inspector" aria-label="Selected task inspection">
-          <div class="task-panel">
-            <div class="task-panel__heading">
-              <div>
-                <p class="eyebrow">Immutable detail</p>
-                <h3>Task record</h3>
-              </div>
-              <span class="read-only-label">Read only</span>
-            </div>
-            <div id="task-detail" data-testid="task-detail" class="task-detail">
-              <p class="empty-state">Select a task to inspect its immutable record.</p>
-            </div>
-          </div>
-
-          <div class="task-panel">
-            <div class="task-panel__heading">
-              <div>
-                <p class="eyebrow">Normalized timeline</p>
-                <h3>Turn history</h3>
-              </div>
-              <span class="section-key">Text only</span>
-            </div>
-            <div id="task-timeline" data-testid="task-timeline" class="task-timeline">
-              <p class="empty-state">Turn history appears after a task is selected.</p>
-            </div>
-          </div>
+        <section class="panel history-progress">
+          <div class="panel-heading"><h2>Task runs</h2></div>
+          <div
+            id="run-progress"
+            data-testid="run-progress"
+            class="run-progress"
+          ></div>
+        </section>
+        <div class="history-grid">
+          <section class="panel">
+            <div class="panel-heading"><h2>Active jobs</h2></div>
+            <div
+              id="active-jobs"
+              data-testid="active-jobs"
+              class="ticket-stack"
+            ></div>
+          </section>
+          <section class="panel">
+            <div class="panel-heading"><h2>Recent jobs</h2></div>
+            <div
+              id="recent-jobs"
+              data-testid="recent-jobs"
+              class="ticket-stack"
+            ></div>
+          </section>
         </div>
-
-        <div class="task-panel task-log-panel">
-          <div class="task-panel__heading">
-            <div>
-              <p class="eyebrow">Raw turn logs</p>
-              <h3>Active output</h3>
-            </div>
-            <span class="section-key">Bounded · read only</span>
+        <section
+          class="panel legacy-inspector"
+          aria-label="Selected job inspection"
+        >
+          <div class="panel-heading"><h2>Job inspection</h2></div>
+          <div id="job-detail" data-testid="job-detail">
+            <p class="empty-state">
+              Select a job to inspect its record and logs.
+            </p>
           </div>
           <div class="console-grid">
             <figure class="console">
-              <figcaption><span>Task standard output</span><code>stdout</code></figcaption>
-              <pre id="task-stdout-log" data-testid="task-stdout-log" tabindex="0" aria-label="Task standard output log"></pre>
+              <figcaption>Standard output</figcaption>
+              <pre
+                id="stdout-log"
+                data-testid="stdout-log"
+                tabindex="0"
+                aria-label="Job standard output log"
+              ></pre>
             </figure>
             <figure class="console">
-              <figcaption><span>Task standard error</span><code>stderr</code></figcaption>
-              <pre id="task-stderr-log" data-testid="task-stderr-log" tabindex="0" aria-label="Task standard error log"></pre>
+              <figcaption>Standard error</figcaption>
+              <pre
+                id="stderr-log"
+                data-testid="stderr-log"
+                tabindex="0"
+                aria-label="Job standard error log"
+              ></pre>
             </figure>
           </div>
-        </div>
+        </section>
       </section>
-
-      <section class="floor-section" aria-labelledby="history-heading">
-        <div class="section-heading section-heading--compact">
-          <div>
-            <p class="section-index">Ledger 05</p>
-            <h2 id="history-heading">Recent tickets</h2>
+      <section
+        id="page-settings"
+        class="page settings"
+        aria-labelledby="settings-heading"
+        hidden
+      >
+        <div class="page-heading">
+          <h1 id="settings-heading">Settings</h1>
+          <p id="settings-summary">Waiting for agent observations</p>
+        </div>
+        <div class="settings-scope">
+          <div class="settings-scope__label">
+            Agents <span id="settings-count" class="count">4</span>
           </div>
-          <span class="section-key">Read only</span>
+          <p>Native agent defaults and latest launches</p>
+          <label class="worker-select" for="settings-worker"
+            ><span>Worker</span
+            ><select
+              id="settings-worker"
+              aria-label="Worker for agent settings"
+            ></select
+          ></label>
+          <button
+            id="settings-refresh"
+            class="button button--quiet settings-refresh"
+            type="button"
+          >Refresh native defaults</button>
         </div>
-        <div id="recent-jobs" data-testid="recent-jobs" class="ticket-stack ticket-stack--history">
-          <p class="empty-state">Waiting for retained history…</p>
-        </div>
-      </section>
-
-      <section class="floor-section detail-section" aria-labelledby="detail-heading">
-        <div class="section-heading section-heading--compact">
-          <div>
-            <p class="section-index">Scope 06</p>
-            <h2 id="detail-heading">Job detail</h2>
+        <div class="settings-grid">
+          <div class="settings-main-column">
+            <section class="panel agents-panel" aria-label="Agent connections">
+              <div class="agent-table-heading" aria-hidden="true">
+                <span>Agent</span><span>Connection</span><span>Default model</span
+                ><span>Default effort</span><span></span>
+              </div>
+              <div id="agent-list"></div>
+              <p class="settings-note">
+                Native defaults come from each worker's user settings. Latest
+                task values remain labeled separately in the detail view.
+              </p>
+            </section>
+            <section
+              class="panel defaults-panel"
+              aria-labelledby="defaults-heading"
+            >
+              <div class="panel-heading">
+                <h2 id="defaults-heading">Project defaults</h2>
+                <span class="eyebrow">Launch directory</span>
+              </div>
+              <div id="project-defaults" class="project-defaults"></div>
+            </section>
           </div>
-          <span class="section-key">Immutable record</span>
-        </div>
-        <div id="job-detail" data-testid="job-detail" class="job-detail">
-          <p class="empty-state">Select a ticket to inspect its durable record and logs.</p>
-        </div>
-
-        <div class="console-grid">
-          <figure class="console">
-            <figcaption><span>Standard output</span><code>stdout</code></figcaption>
-            <pre id="stdout-log" data-testid="stdout-log" tabindex="0" aria-label="Standard output log"></pre>
-          </figure>
-          <figure class="console">
-            <figcaption><span>Standard error</span><code>stderr</code></figcaption>
-            <pre id="stderr-log" data-testid="stderr-log" tabindex="0" aria-label="Standard error log"></pre>
-          </figure>
+          <div class="settings-side-column">
+            <aside
+              id="agent-detail"
+              class="panel agent-detail"
+              aria-label="Selected agent settings"
+            ></aside>
+            <section
+              class="panel agent-workers-panel"
+              aria-labelledby="agent-worker-title"
+            >
+              <div class="panel-heading">
+                <h2 id="agent-worker-title">Agent across workers</h2>
+              </div>
+              <div id="agent-workers"></div>
+            </section>
+          </div>
         </div>
       </section>
     </main>
-
-    <footer>
-      <span>Loopback session</span>
-      <span>No controls · no telemetry · no external resources</span>
+    <footer class="app-footer">
+      <span><span class="footer-led" aria-hidden="true"></span> LOCAL POOL</span
+      ><span id="refresh-status" aria-live="polite"
+        >Awaiting first local snapshot…</span
+      >
     </footer>
     <script type="module" src="/assets/dashboard.mjs"></script>
   </body>

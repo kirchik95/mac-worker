@@ -5,6 +5,7 @@ use std::{
 };
 
 use mac_worker::{
+    agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
     client_state::ClientStateStore,
     config::{Config, WorkerEntry},
     dashboard::{
@@ -65,6 +66,95 @@ fn source_uses_typed_probe_data_without_exposing_ssh() {
     assert!(fixture.remote.status_calls().is_empty());
     assert!(fixture.remote.log_calls().is_empty());
     assert!(fixture.remote.mutating_calls().is_empty());
+}
+
+#[test]
+fn source_projects_only_allowlisted_agent_facts_and_profile_auth() {
+    let mut report = ready_report(job_id(91));
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: vec![
+            AgentProbe::new(
+                "codex",
+                Some("0.42.0".into()),
+                AgentAuth::UnknownWithReason("keychain_locked"),
+                vec![
+                    ("team-ci".into(), AgentAuth::Authenticated),
+                    ("review".into(), AgentAuth::Unauthenticated),
+                ],
+            )
+            .unwrap(),
+        ],
+        env_profiles: vec![ProfileProbe::new("team-ci", true).unwrap()],
+        git_identity: true,
+        collected_at_millis: u64::MAX - 1,
+    });
+    probe.facts_age_millis = Some(FACTS_TTL + 99);
+
+    let fixture = Fixture::new(report);
+    let rows = fixture.source().collect_workers(Duration::from_secs(7));
+    let WorkerObservationResult::Current(observation) = rows.into_iter().next().unwrap() else {
+        panic!("ready probe must project to a current observation");
+    };
+    let facts = observation.worker.agent_facts.as_ref().unwrap();
+    assert_eq!(facts.collected_at_millis, u64::MAX - 1);
+    assert_eq!(facts.agents[0].auth, "unknown");
+    assert_eq!(facts.agents[0].auth_by_profile[0].profile, "team-ci");
+    assert_eq!(facts.agents[0].auth_by_profile[0].auth, "authenticated");
+
+    let value = serde_json::to_value(facts).unwrap();
+    assert_eq!(value["freshness"], "stale");
+    assert!(value.get("git_identity").is_none());
+    assert!(value.get("env_profiles").is_none());
+    assert!(!value.to_string().contains("keychain_locked"));
+}
+
+#[test]
+fn source_keeps_fresh_facts_current_despite_an_old_remote_timestamp() {
+    let mut report = ready_report(job_id(91));
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: false,
+        collected_at_millis: 1,
+    });
+    probe.facts_age_millis = Some(0);
+
+    let fixture = Fixture::new(report);
+    let rows = fixture.source().collect_workers(Duration::from_secs(7));
+    let WorkerObservationResult::Current(observation) = rows.into_iter().next().unwrap() else {
+        panic!("ready probe must project to a current observation");
+    };
+
+    let value = serde_json::to_value(observation.worker.agent_facts.unwrap()).unwrap();
+    assert_eq!(value["collected_at_millis"], 1);
+    assert_eq!(value["freshness"], "current");
+}
+
+#[test]
+fn source_keeps_agent_facts_unavailable_when_facts_or_worker_age_is_missing() {
+    let fixture = Fixture::new(ready_report(job_id(91)));
+    let rows = fixture.source().collect_workers(Duration::from_secs(7));
+    let WorkerObservationResult::Current(observation) = rows.into_iter().next().unwrap() else {
+        panic!("ready probe must project to a current observation");
+    };
+
+    assert_eq!(observation.worker.agent_facts, None);
+
+    let mut report = ready_report(job_id(92));
+    report.workers[0].probe.as_mut().unwrap().agent_facts = Some(AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: false,
+        collected_at_millis: 1,
+    });
+    let fixture = Fixture::new(report);
+    let rows = fixture.source().collect_workers(Duration::from_secs(7));
+    let WorkerObservationResult::Current(observation) = rows.into_iter().next().unwrap() else {
+        panic!("ready probe must project to a current observation");
+    };
+    assert_eq!(observation.worker.agent_facts, None);
 }
 
 #[test]

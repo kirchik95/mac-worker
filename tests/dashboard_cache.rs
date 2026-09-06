@@ -306,6 +306,7 @@ fn observation(
             freshness: Freshness::Stale,
             observed_at_millis: None,
             hostname: Some(format!("{worker_name}.local")),
+            agent_facts: None,
             slot: SlotSummary {
                 state: DashboardSlotState::Idle,
                 capacity: 1,

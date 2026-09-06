@@ -975,6 +975,22 @@ impl RootedDir {
         self.verify_root_name()
     }
 
+    /// Verifies the retained directory chain and applies a caller-owned
+    /// policy to the actual fstat results for every opened directory.
+    ///
+    /// Callers that accept a broader directory policy than the private
+    /// workspace namespace can use this without weakening `verify_bound` for
+    /// existing users.
+    pub(crate) fn verify_bound_with_policy<F>(&self, policy: F) -> io::Result<()>
+    where
+        F: Fn(&libc::stat) -> bool,
+    {
+        for binding in &self.lineage {
+            binding.verify_with_policy(&policy)?;
+        }
+        self.verify_self_with_policy(&policy)
+    }
+
     pub(crate) fn verify_descriptors_cloexec(&self) -> io::Result<()> {
         self.verify_root_name()?;
         require_fd_cloexec(self.root.as_raw_fd())?;
@@ -3870,6 +3886,13 @@ impl RootedDir {
     }
 
     fn verify_self(&self) -> io::Result<()> {
+        self.verify_self_with_policy(|_| true)
+    }
+
+    fn verify_self_with_policy<F>(&self, policy: F) -> io::Result<()>
+    where
+        F: Fn(&libc::stat) -> bool,
+    {
         let current = stat_at(self.parent.as_raw_fd(), &self.root_name)?;
         if file_type(current.st_mode) == libc::S_IFLNK {
             return Err(os_error(libc::ELOOP));
@@ -3883,6 +3906,12 @@ impl RootedDir {
         let opened = stat_fd(self.root.as_raw_fd())?;
         if !same_file(&current, &opened) {
             return Err(os_error(libc::ESTALE));
+        }
+        if !policy(&current) || !policy(&opened) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "opened directory does not satisfy its caller policy",
+            ));
         }
         if let Some(device) = self.security_device {
             require_private_directory_on_device(&current, device)?;
@@ -3909,6 +3938,13 @@ impl RootedDir {
 
 impl DirectoryBinding {
     fn verify(&self) -> io::Result<()> {
+        self.verify_with_policy(&|_| true)
+    }
+
+    fn verify_with_policy<F>(&self, policy: &F) -> io::Result<()>
+    where
+        F: Fn(&libc::stat) -> bool,
+    {
         let current = stat_at(self.parent.as_raw_fd(), &self.name)?;
         let opened = stat_fd(self.directory.as_raw_fd())?;
         if file_type(current.st_mode) != libc::S_IFDIR
@@ -3920,6 +3956,12 @@ impl DirectoryBinding {
             || !same_file(&current, &opened)
         {
             return Err(os_error(libc::ESTALE));
+        }
+        if !policy(&current) || !policy(&opened) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "opened directory does not satisfy its caller policy",
+            ));
         }
         if let Some(device) = self.security_device {
             require_private_directory_on_device(&current, device)?;

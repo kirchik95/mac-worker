@@ -1,10 +1,13 @@
-use std::{future::Future, io::Write, pin::Pin, process::Command as ProcessCommand, sync::Arc};
+use std::{
+    future::Future, io::Write, path::Path, pin::Pin, process::Command as ProcessCommand, sync::Arc,
+};
 
 use crate::{
     client_state::ClientStateStore,
     config::Config,
     dashboard::{
         service::{DashboardService, SystemClock, SystemMonotonicClock},
+        settings::{DashboardSettingsSource, SystemDashboardSettingsSource},
         source::{
             DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource,
             MacWorkerLogSource, SystemDashboardRemoteReader, SystemDashboardWorkerReader,
@@ -14,6 +17,7 @@ use crate::{
     },
     error::WorkerError,
     process::{ProcessRunner, SystemProcessRunner},
+    project_config::ProjectSettings,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,17 +54,33 @@ pub struct SystemDashboardLauncher {
 
 impl SystemDashboardLauncher {
     pub fn from_system(config: Arc<Config>, local_jobs: Arc<ClientStateStore>) -> Self {
+        Self::from_system_for_directory(config, local_jobs, None)
+    }
+
+    pub fn from_system_for_directory(
+        config: Arc<Config>,
+        local_jobs: Arc<ClientStateStore>,
+        launch_directory: Option<&Path>,
+    ) -> Self {
         let runner: Arc<dyn ProcessRunner> = Arc::new(SystemProcessRunner);
         let workers: Arc<dyn DashboardWorkerReader> =
             Arc::new(SystemDashboardWorkerReader::new(Arc::clone(&runner)));
         let remote: Arc<dyn DashboardRemoteReader> =
-            Arc::new(SystemDashboardRemoteReader::new(runner));
-        let source = MacWorkerDashboardSource::new(
+            Arc::new(SystemDashboardRemoteReader::new(Arc::clone(&runner)));
+        let settings_source: Arc<dyn DashboardSettingsSource> = Arc::new(
+            SystemDashboardSettingsSource::new(Arc::clone(&config), Arc::clone(&runner)),
+        );
+        let mut source = MacWorkerDashboardSource::new(
             Arc::clone(&config),
             workers,
             Arc::clone(&local_jobs),
             Arc::clone(&remote),
         );
+        if let Some(settings) =
+            launch_directory.and_then(|directory| ProjectSettings::load(directory, &[]).ok())
+        {
+            source = source.with_project_settings(settings);
+        }
         let task_source: Arc<dyn DashboardTaskSource> = Arc::new(MacWorkerTaskSource::new(
             Arc::clone(&config),
             Arc::clone(&local_jobs),
@@ -76,6 +96,7 @@ impl SystemDashboardLauncher {
                 )),
                 log_source,
                 task_source,
+                settings_source: Some(settings_source),
             }),
         }
     }

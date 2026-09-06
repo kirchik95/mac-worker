@@ -6,6 +6,7 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::to_bytes,
     extract::{Path, RawQuery, Request, State},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
@@ -15,11 +16,13 @@ use axum::{
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 
 use crate::{
+    agent_settings::{AgentSettingsError, AgentSettingsSaveRequest, validate_save_request},
     dashboard::{
         model::{ApiError, DashboardError, DashboardJob, DashboardLogChunk},
         service::{
             Clock, DashboardDataSource, DashboardService, DashboardSnapshotRequest, MonotonicClock,
         },
+        settings::DashboardSettingsSource,
         task::DashboardTaskSource,
     },
     job::{JobId, LogStream},
@@ -27,6 +30,7 @@ use crate::{
 };
 
 const MAX_LOG_LIMIT: u32 = 65_536;
+const MAX_SETTINGS_REQUEST_BYTES: usize = 8_192;
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'";
 
 const INDEX_HTML: &str = include_str!("static/index.html");
@@ -48,6 +52,7 @@ pub struct DashboardHttpState<S, C, M> {
     pub service: Arc<DashboardService<S, C, M>>,
     pub log_source: Arc<dyn DashboardLogSource>,
     pub task_source: Arc<dyn DashboardTaskSource>,
+    pub settings_source: Option<Arc<dyn DashboardSettingsSource>>,
 }
 
 pub struct DashboardHttpServer {
@@ -143,6 +148,7 @@ where
         .route("/", get(index))
         .route("/assets/dashboard.css", get(stylesheet))
         .route("/assets/dashboard.mjs", get(script))
+        .route("/assets/{font}", get(font))
         .route("/api/v1/snapshot", get(snapshot::<S, C, M>))
         .route(
             "/api/v1/tasks/{task_id}/turns/{turn_id}/logs",
@@ -151,6 +157,10 @@ where
         .route("/api/v1/tasks/{task_id}", get(task_detail::<S, C, M>))
         .route("/api/v1/jobs/{job_id}", get(job_detail::<S, C, M>))
         .route("/api/v1/jobs/{job_id}/logs", get(log_chunk::<S, C, M>))
+        .route(
+            "/api/v1/workers/{worker_name}/agent-settings",
+            get(agent_settings_get::<S, C, M>).post(agent_settings_post::<S, C, M>),
+        )
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -227,6 +237,16 @@ async fn script() -> Response {
     embedded_asset("application/javascript; charset=utf-8", DASHBOARD_MJS)
 }
 
+async fn font(Path(name): Path<String>) -> Response {
+    let bytes: &'static [u8] = match name.as_str() {
+        "plex-sans-regular.ttf" => include_bytes!("static/fonts/plex-sans-regular.ttf"),
+        "plex-sans-medium.ttf" => include_bytes!("static/fonts/plex-sans-medium.ttf"),
+        "plex-mono-regular.ttf" => include_bytes!("static/fonts/plex-mono-regular.ttf"),
+        _ => return not_found().await,
+    };
+    ([(header::CONTENT_TYPE, "font/ttf")], bytes).into_response()
+}
+
 async fn snapshot<S, C, M>(State(state): State<AppState<S, C, M>>) -> Response
 where
     S: DashboardDataSource,
@@ -248,6 +268,123 @@ where
             ),
         ),
     }
+}
+
+async fn agent_settings_get<S, C, M>(
+    State(state): State<AppState<S, C, M>>,
+    Path(worker_name): Path<String>,
+) -> Response
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
+    let Some(source) = state.dashboard.settings_source.clone() else {
+        return settings_error(ApiError::new(
+            "SETTINGS_UNAVAILABLE",
+            "native settings are unavailable on this worker",
+        ));
+    };
+    if !source.worker_exists(&worker_name) {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            ApiError::new("WORKER_NOT_FOUND", "configured worker was not found"),
+        );
+    }
+    match tokio::task::spawn_blocking(move || source.read(&worker_name)).await {
+        Ok(Ok(settings)) => api_json(StatusCode::OK, settings),
+        Ok(Err(error)) => settings_error(error),
+        Err(_) => settings_error(ApiError::new(
+            "SETTINGS_UNAVAILABLE",
+            "native settings are unavailable on this worker",
+        )),
+    }
+}
+
+async fn agent_settings_post<S, C, M>(
+    State(state): State<AppState<S, C, M>>,
+    Path(worker_name): Path<String>,
+    request: Request,
+) -> Response
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
+    let Some(source) = state.dashboard.settings_source.clone() else {
+        return settings_error(ApiError::new(
+            "SETTINGS_UNAVAILABLE",
+            "native settings are unavailable on this worker",
+        ));
+    };
+    if !source.worker_exists(&worker_name) {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            ApiError::new("WORKER_NOT_FOUND", "configured worker was not found"),
+        );
+    }
+    if !request_has_settings_headers(&request, &state.expected_host) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            ApiError::new(
+                "SETTINGS_REQUEST_INVALID",
+                "settings save requires same-origin JSON and the settings header",
+            ),
+        );
+    }
+    let body = match to_bytes(request.into_body(), MAX_SETTINGS_REQUEST_BYTES + 1).await {
+        Ok(body) if body.len() <= MAX_SETTINGS_REQUEST_BYTES => body,
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ApiError::new(
+                    "SETTINGS_REQUEST_INVALID",
+                    "settings request exceeds 8192 bytes",
+                ),
+            );
+        }
+    };
+    let save: AgentSettingsSaveRequest = match serde_json::from_slice(&body) {
+        Ok(save) => save,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ApiError::new("SETTINGS_REQUEST_INVALID", "settings request was invalid"),
+            );
+        }
+    };
+    if let Err(error) = validate_save_request(&save) {
+        return settings_request_error(error);
+    }
+    match tokio::task::spawn_blocking(move || source.save(&worker_name, &save)).await {
+        Ok(Ok(settings)) => api_json(StatusCode::OK, settings),
+        Ok(Err(error)) => settings_error(error),
+        Err(_) => settings_error(ApiError::new(
+            "SETTINGS_UNAVAILABLE",
+            "native settings are unavailable on this worker",
+        )),
+    }
+}
+
+fn request_has_settings_headers(request: &Request, expected_host: &str) -> bool {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+    let custom_header = request
+        .headers()
+        .get("x-mac-worker-settings")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "1");
+    let expected_origin = format!("http://{expected_host}");
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected_origin);
+    content_type && custom_header && origin
 }
 
 async fn job_detail<S, C, M>(
@@ -411,6 +548,24 @@ fn source_error(error: ApiError) -> Response {
         StatusCode::BAD_GATEWAY
     };
     api_error(status, error)
+}
+
+fn settings_error(error: ApiError) -> Response {
+    let status = match error.code.as_str() {
+        "SETTINGS_CONFLICT" => StatusCode::CONFLICT,
+        "SETTINGS_INVALID" | "SETTINGS_REQUEST_INVALID" => StatusCode::BAD_REQUEST,
+        "WORKER_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "SETTINGS_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    api_error(status, error)
+}
+
+fn settings_request_error(error: AgentSettingsError) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        ApiError::new(error.code(), error.safe_message()),
+    )
 }
 
 fn task_source_error(error: ApiError) -> Response {

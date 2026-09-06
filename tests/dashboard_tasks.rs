@@ -24,6 +24,7 @@ use mac_worker::{
         QueueEntryKind, QueueRunReference, RunId as QueueRunId, StatusResponse,
     },
     lease::SlotState,
+    project_config::ProjectSettings,
     protocol::{
         HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
         WorkerHealth as ProbeWorkerHealth, WorkersReport,
@@ -125,7 +126,26 @@ fn active_worker_card_maps_turn_identity_to_task_title_and_agent() {
     assert_eq!(active.task_id, snapshot.task_view.tasks[0].task_id);
     assert_eq!(active.title, "Repair login");
     assert_eq!(active.agent, "codex");
+    assert_eq!(active.model.as_deref(), Some("gpt-5"));
+    assert_eq!(active.effort, None);
     assert_eq!(active.turn_number, 1);
+}
+
+#[test]
+fn task_projection_exposes_only_bounded_recorded_execution_settings() {
+    let snapshot = DashboardTaskHarness::active_local_task()
+        .snapshot()
+        .unwrap();
+    let row = &snapshot.task_view.tasks[0];
+
+    assert_eq!(row.model.as_deref(), Some("gpt-5"));
+    assert_eq!(row.effort, None);
+    assert_eq!(row.permissions.as_deref(), Some("workspace"));
+    assert_eq!(row.env_profile.as_deref(), Some("team-ci"));
+
+    let encoded = serde_json::to_string(&snapshot).unwrap();
+    assert!(!encoded.contains("ada@example.test"));
+    assert!(!encoded.contains(SECRET));
 }
 
 #[test]
@@ -144,6 +164,49 @@ fn dashboard_snapshot_and_cli_task_list_keep_the_same_projection_fields() {
     assert_eq!(cli["runs"], snapshot_json["runs"]);
     assert_eq!(cli["progress"], snapshot_json["progress"]);
     assert_eq!(cli["protocol_version"], PROTOCOL_VERSION);
+}
+
+#[test]
+fn missing_project_file_projects_the_real_launch_defaults() {
+    let harness = DashboardTaskHarness::active_local_task();
+    let launch_directory = tempfile::tempdir().unwrap();
+    let mut settings = ProjectSettings::load(launch_directory.path(), &[]).unwrap();
+    settings
+        .task
+        .permissions
+        .insert("/Users/alice/private-agent".into(), "workspace".into());
+    let source = MacWorkerDashboardSource::new(
+        Arc::clone(&harness.config),
+        Arc::clone(&harness.workers) as Arc<dyn DashboardWorkerReader>,
+        Arc::clone(&harness.state),
+        Arc::clone(&harness.remote) as Arc<dyn DashboardRemoteReader>,
+    )
+    .with_project_settings(settings);
+
+    let snapshot = DashboardService::new(source, FixedClock, FixedClock)
+        .snapshot(Default::default())
+        .unwrap();
+    let defaults = snapshot.project_defaults.unwrap();
+
+    assert_eq!(defaults.default_agent, "codex");
+    assert_eq!(defaults.timeout_seconds, 45 * 60);
+    assert_eq!(defaults.max_followups, 10);
+    assert_eq!(defaults.source, "local");
+    assert_eq!(defaults.publish, vec!["fetch"]);
+    assert_eq!(defaults.env_profile, None);
+    assert_eq!(
+        defaults.permissions.get("codex").map(String::as_str),
+        Some("workspace")
+    );
+    assert_eq!(
+        defaults.permissions.get("claude").map(String::as_str),
+        Some("unattended")
+    );
+    assert!(
+        !serde_json::to_string(&defaults)
+            .unwrap()
+            .contains("/Users/alice")
+    );
 }
 
 #[test]
@@ -642,7 +705,7 @@ fn task_record(
             base_oid: BASE_OID.parse().unwrap(),
             limits: TaskLimits::new(TurnLimits::new(60_000, None, None).unwrap(), 2).unwrap(),
             close_policy: ClosePolicy::Done,
-            env_profile: Some("secret-profile".into()),
+            env_profile: Some("team-ci".into()),
             git_identity: GitIdentity::new("Ada", "ada@example.test").unwrap(),
             title: Some("Repair login".into()),
             prompt: format!("private prompt {SECRET}"),
@@ -684,7 +747,6 @@ fn assert_safe_snapshot(snapshot: &DashboardSnapshot) {
     let encoded = serde_json::to_string(&value).unwrap();
     for forbidden in [
         SECRET,
-        "secret-profile",
         "prompt",
         "session_ref",
         "operator@",

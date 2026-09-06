@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    agent_settings::{
+        AgentDefaultSettings, AgentSettingsGetRequest, AgentSettingsList, AgentSettingsSaveRequest,
+    },
     config::WorkerEntry,
     error::{ProcessError, ProcessStream, WorkerError},
     gc::{GcReport, GcRequest},
@@ -74,6 +77,8 @@ pub enum HostOperation {
     RefreshFacts,
     Cancel,
     Reconcile,
+    AgentSettingsGet,
+    AgentSettingsSet,
 }
 
 impl HostOperation {
@@ -97,6 +102,8 @@ impl HostOperation {
             Self::RefreshFacts => "~/.local/bin/worker host refresh-facts",
             Self::Cancel => "~/.local/bin/worker host cancel",
             Self::Reconcile => "~/.local/bin/worker host reconcile",
+            Self::AgentSettingsGet => "~/.local/bin/worker host agent-settings-get",
+            Self::AgentSettingsSet => "~/.local/bin/worker host agent-settings-set",
         }
     }
 }
@@ -683,6 +690,31 @@ impl<'a> SshJsonTransport<'a> {
             ));
         }
         Ok(response)
+    }
+
+    pub fn agent_settings_get(
+        &self,
+        worker: &WorkerEntry,
+    ) -> Result<AgentSettingsList, WorkerError> {
+        self.request(
+            worker,
+            HostOperation::AgentSettingsGet,
+            &AgentSettingsGetRequest::default(),
+            control_policy(MAX_CONTROL_DEADLINE),
+        )
+    }
+
+    pub fn agent_settings_set(
+        &self,
+        worker: &WorkerEntry,
+        request: &AgentSettingsSaveRequest,
+    ) -> Result<AgentDefaultSettings, WorkerError> {
+        self.request(
+            worker,
+            HostOperation::AgentSettingsSet,
+            request,
+            control_policy(MAX_CONTROL_DEADLINE),
+        )
     }
 }
 

@@ -269,6 +269,10 @@ pub enum HostCommand {
     TaskCancel,
     #[command(name = "task-turn")]
     TaskTurn,
+    #[command(name = "agent-settings-get")]
+    AgentSettingsGet,
+    #[command(name = "agent-settings-set")]
+    AgentSettingsSet,
     #[command(name = "receive-pack")]
     ReceivePack {
         job_id: HiddenComponent,

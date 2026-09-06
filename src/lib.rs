@@ -6,6 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use agent_settings::{AgentSettingsGetRequest, AgentSettingsSaveRequest, NativeAgentSettingsStore};
 use cli::{Cli, Command, HiddenComponent, HostCommand, TaskCommand};
 use client_state::ClientStateStore;
 use config::{Config, WorkerEntry};
@@ -60,6 +61,7 @@ use turn_runner::{DetachedRunnerExecutor, InlineRunnerExecutor, TurnRunner};
 
 pub mod agent;
 pub mod agent_facts;
+pub mod agent_settings;
 pub mod cli;
 pub mod client_state;
 pub mod config;
@@ -149,6 +151,14 @@ impl RuntimeContext {
             RuntimeCurrentDir::Process => std::env::current_dir().map_err(WorkerError::Io),
             RuntimeCurrentDir::Fixed(current_dir) => Ok(current_dir.clone()),
         }
+    }
+
+    pub(crate) fn home(&self) -> &std::path::Path {
+        &self.home
+    }
+
+    pub(crate) fn environment(&self) -> &BTreeMap<OsString, OsString> {
+        &self.environment
     }
 }
 
@@ -372,6 +382,16 @@ fn execute_with_context(
             command: HostCommand::TaskTurn,
         } => Err(WorkerError::Protocol(
             "host task-turn requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::AgentSettingsGet,
+        } => Err(WorkerError::Protocol(
+            "host agent-settings-get requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::AgentSettingsSet,
+        } => Err(WorkerError::Protocol(
+            "host agent-settings-set requires the stdio execution boundary".into(),
         )),
     }
 }
@@ -620,7 +640,12 @@ fn run_dashboard_command(
         let paths = discover_paths(config_override, runtime)?;
         let config = std::sync::Arc::new(Config::load(&paths.config)?);
         let client_state = std::sync::Arc::new(ClientStateStore::open(&paths.state)?);
-        let launcher = SystemDashboardLauncher::from_system(config, client_state);
+        let launch_directory = runtime.current_dir().ok();
+        let launcher = SystemDashboardLauncher::from_system_for_directory(
+            config,
+            client_state,
+            launch_directory.as_deref(),
+        );
         let opener = SystemBrowserOpener;
         let async_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1366,6 +1391,22 @@ pub fn run_with_rsync_executor_in_context(
     if matches!(
         &cli.command,
         Command::Host {
+            command: HostCommand::AgentSettingsGet
+        }
+    ) {
+        return run_host_agent_settings_get(runtime, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::AgentSettingsSet
+        }
+    ) {
+        return run_host_agent_settings_set(runtime, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
             command: HostCommand::LeaseAcquire
         }
     ) {
@@ -1989,6 +2030,89 @@ fn run_host_reconcile(
             )
         },
     )
+}
+
+fn run_host_agent_settings_get(
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_agent_settings_endpoint(
+        runtime,
+        stdin,
+        stdout,
+        |request: AgentSettingsGetRequest, store| {
+            let _ = request;
+            Ok(store.read_all())
+        },
+    )
+}
+
+fn run_host_agent_settings_set(
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_agent_settings_endpoint(
+        runtime,
+        stdin,
+        stdout,
+        |request: AgentSettingsSaveRequest, store| {
+            store.save(&request).map_err(|error| {
+                WorkerError::Protocol(format!("{}: {}", error.code(), error.safe_message()))
+            })
+        },
+    )
+}
+
+fn run_host_agent_settings_endpoint<Req, Res>(
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    operation: impl FnOnce(Req, &NativeAgentSettingsStore) -> Result<Res, WorkerError>,
+) -> u8
+where
+    Req: DeserializeOwned + Serialize,
+    Res: Serialize,
+{
+    const LIMIT: usize = 8192;
+    let result = (|| -> Result<Res, WorkerError> {
+        let mut bytes = Vec::new();
+        stdin.take((LIMIT + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > LIMIT {
+            return Err(WorkerError::Protocol(
+                "SETTINGS_INVALID: settings request exceeded 8192 bytes".into(),
+            ));
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let request = Req::deserialize(&mut deserializer).map_err(|_| {
+            WorkerError::Protocol("SETTINGS_INVALID: settings request was invalid".into())
+        })?;
+        deserializer.end().map_err(|_| {
+            WorkerError::Protocol("SETTINGS_INVALID: settings request was invalid".into())
+        })?;
+        let canonical = serde_json::to_vec(&request).map_err(|_| {
+            WorkerError::Protocol("SETTINGS_INVALID: settings request was invalid".into())
+        })?;
+        if canonical != bytes {
+            return Err(WorkerError::Protocol(
+                "SETTINGS_INVALID: settings request was not canonical JSON".into(),
+            ));
+        }
+        let store = NativeAgentSettingsStore::new(runtime.home())
+            .with_environment(runtime.environment().clone());
+        operation(request, &store)
+    })();
+
+    let exit = result.as_ref().map_or_else(WorkerError::exit_code, |_| 0);
+    let write_result = match result {
+        Ok(response) => serde_json::to_writer(&mut *stdout, &response),
+        Err(error) => serde_json::to_writer(&mut *stdout, &versioned_host_error(&error)),
+    };
+    if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
+        return crate::error::ExitKind::Io as u8;
+    }
+    exit
 }
 
 fn run_host_task_control_endpoint<Req, Res>(

@@ -4,14 +4,17 @@ use std::{
 };
 
 use crate::{
+    agent_facts::AgentFacts,
     client_state::ClientStateStore,
     config::{Config, WorkerEntry},
     dashboard::{
         cache::{CpuCounters, Observation},
         model::{
-            ApiError, DashboardCommandMode, DashboardCommandSummary, DashboardError, DashboardJob,
-            DashboardJobState, DashboardLogChunk, DashboardMemoryPressure, DashboardSlotState,
-            DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
+            ApiError, DashboardAgent, DashboardAgentFacts, DashboardCommandMode,
+            DashboardCommandSummary, DashboardError, DashboardJob, DashboardJobState,
+            DashboardLogChunk, DashboardMemoryPressure, DashboardProfileAuth,
+            DashboardProjectDefaults, DashboardSlotState, DashboardWorker, Freshness, SlotSummary,
+            SystemSummary, WorkerHealth,
         },
         queue::ClientStateDashboardQueueReader,
         service::{
@@ -25,10 +28,12 @@ use crate::{
     job::{JobId, JobState, JobStatus, LocalJobRecord, LogChunk, LogStream, StatusResponse},
     lease::SlotState,
     process::{ProcessRunner, SystemProcessRunner},
+    project_config::ProjectSettings,
     protocol::{
         CpuCounters as ProbeCpuCounters, HealthStatus, MemoryPressure,
         WorkerHealth as ProbeWorkerHealth, WorkersReport,
     },
+    redaction::RedactionBoundary,
     task_store::{TaskStatusRequest, TaskStatusResponse},
     transfer::RemoteJobClient,
     transport::{SshTransport, WorkersService},
@@ -167,6 +172,7 @@ pub struct MacWorkerDashboardSource {
     pub local_jobs: Arc<ClientStateStore>,
     pub remote: Arc<dyn DashboardRemoteReader>,
     pub queue: Arc<dyn DashboardQueueReader>,
+    pub project_defaults: Option<DashboardProjectDefaults>,
 }
 
 impl MacWorkerDashboardSource {
@@ -196,7 +202,13 @@ impl MacWorkerDashboardSource {
             local_jobs,
             remote,
             queue,
+            project_defaults: None,
         }
+    }
+
+    pub fn with_project_settings(mut self, settings: ProjectSettings) -> Self {
+        self.project_defaults = Some(project_defaults(&settings));
+        self
     }
 
     fn authoritative_job(
@@ -225,6 +237,10 @@ impl MacWorkerDashboardSource {
 }
 
 impl DashboardDataSource for MacWorkerDashboardSource {
+    fn project_defaults(&self) -> Option<DashboardProjectDefaults> {
+        self.project_defaults.clone()
+    }
+
     fn configured_workers(&self) -> Result<Vec<String>, DashboardError> {
         Ok(self
             .config
@@ -402,6 +418,14 @@ pub fn project_worker(
             freshness: Freshness::Current,
             observed_at_millis: Some(observed_at_millis),
             hostname: Some(probe.hostname.clone()),
+            agent_facts: match (&probe.agent_facts, probe.facts_age_millis) {
+                (Some(facts), Some(facts_age_millis)) => Some(project_agent_facts(
+                    facts,
+                    facts_age_millis,
+                    observed_at_millis,
+                )),
+                _ => None,
+            },
             slot: SlotSummary {
                 state: match probe.slot_state {
                     SlotState::Idle => DashboardSlotState::Idle,
@@ -430,6 +454,62 @@ pub fn project_worker(
         observed_at_millis,
         cpu_counters: probe.cpu_counters.clone().and_then(cache_counters),
     })
+}
+
+fn project_agent_facts(
+    facts: &AgentFacts,
+    facts_age_millis: u64,
+    observed_at_millis: u64,
+) -> DashboardAgentFacts {
+    let boundary = RedactionBoundary::from_env();
+    let agents = facts
+        .agents
+        .iter()
+        .map(|agent| DashboardAgent {
+            name: boundary.text(&agent.name, 128),
+            version: agent
+                .version
+                .as_deref()
+                .map(|version| boundary.text(version, 128)),
+            auth: agent.auth.as_str().to_owned(),
+            auth_by_profile: agent
+                .auth_by_profile
+                .iter()
+                .map(|(profile, auth)| DashboardProfileAuth {
+                    profile: boundary.text(profile, 128),
+                    auth: auth.as_str().to_owned(),
+                })
+                .collect(),
+        })
+        .collect();
+    DashboardAgentFacts::from_observation(
+        facts.collected_at_millis(),
+        facts_age_millis,
+        observed_at_millis,
+        agents,
+    )
+}
+
+fn project_defaults(settings: &ProjectSettings) -> DashboardProjectDefaults {
+    let boundary = RedactionBoundary::from_env();
+    DashboardProjectDefaults {
+        default_agent: boundary.text(&settings.task.default_agent, 128),
+        timeout_seconds: settings.task.timeout.as_secs(),
+        max_followups: settings.task.max_followups,
+        source: settings.task.source.clone(),
+        publish: settings.task.publish.clone(),
+        env_profile: settings
+            .task
+            .env_profile
+            .as_deref()
+            .map(|profile| boundary.text(profile, 128)),
+        permissions: settings
+            .task
+            .permissions
+            .iter()
+            .map(|(agent, policy)| (boundary.text(agent, 128), policy.clone()))
+            .collect(),
+    }
 }
 
 pub fn cache_counters(counters: ProbeCpuCounters) -> Option<CpuCounters> {

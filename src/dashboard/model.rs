@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{
@@ -7,6 +7,7 @@ use serde::{
 };
 
 use crate::{
+    agent_facts::FACTS_TTL,
     job::{JobId, LogChunk, LogStream, MAX_LOG_CHUNK_BYTES},
     task::{RunId, RunProgress, RunnerState, TaskId, TurnId},
     task_view::TaskListProjection,
@@ -29,6 +30,7 @@ pub struct DashboardSnapshot {
     pub revision: u64,
     pub generated_at_millis: u64,
     pub collection: CollectionSummary,
+    pub project_defaults: Option<DashboardProjectDefaults>,
     #[serde(flatten)]
     pub task_view: TaskListProjection,
     pub workers: Vec<DashboardWorker>,
@@ -79,6 +81,80 @@ pub enum WorkerHealth {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DashboardProjectDefaults {
+    pub default_agent: String,
+    pub timeout_seconds: u64,
+    pub max_followups: u32,
+    pub source: String,
+    pub publish: Vec<String>,
+    pub env_profile: Option<String>,
+    pub permissions: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentFactsFreshness {
+    Current,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DashboardAgentFacts {
+    pub collected_at_millis: u64,
+    pub freshness: AgentFactsFreshness,
+    pub agents: Vec<DashboardAgent>,
+    #[serde(skip)]
+    freshness_age_at_observation_millis: u64,
+    #[serde(skip)]
+    freshness_observed_at_millis: u64,
+}
+
+impl DashboardAgentFacts {
+    pub(crate) fn from_observation(
+        collected_at_millis: u64,
+        facts_age_millis: u64,
+        observed_at_millis: u64,
+        agents: Vec<DashboardAgent>,
+    ) -> Self {
+        let mut facts = Self {
+            collected_at_millis,
+            freshness: AgentFactsFreshness::Current,
+            agents,
+            freshness_age_at_observation_millis: facts_age_millis,
+            freshness_observed_at_millis: observed_at_millis,
+        };
+        facts.refresh_freshness(observed_at_millis);
+        facts
+    }
+
+    pub(crate) fn refresh_freshness(&mut self, now_millis: u64) {
+        let elapsed = now_millis.saturating_sub(self.freshness_observed_at_millis);
+        let age = self
+            .freshness_age_at_observation_millis
+            .saturating_add(elapsed);
+        self.freshness = if age > FACTS_TTL {
+            AgentFactsFreshness::Stale
+        } else {
+            AgentFactsFreshness::Current
+        };
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DashboardAgent {
+    pub name: String,
+    pub version: Option<String>,
+    pub auth: String,
+    pub auth_by_profile: Vec<DashboardProfileAuth>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DashboardProfileAuth {
+    pub profile: String,
+    pub auth: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct DashboardWorker {
     pub name: String,
@@ -86,6 +162,7 @@ pub struct DashboardWorker {
     pub freshness: Freshness,
     pub observed_at_millis: Option<u64>,
     pub hostname: Option<String>,
+    pub agent_facts: Option<DashboardAgentFacts>,
     pub slot: SlotSummary,
     pub capabilities: Vec<String>,
     pub missing_capabilities: Vec<String>,
@@ -99,6 +176,8 @@ pub struct DashboardActiveTask {
     pub task_id: TaskId,
     pub title: String,
     pub agent: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub turn_number: u32,
     pub started_at_millis: Option<u64>,
     pub runner: Option<RunnerState>,
@@ -106,7 +185,7 @@ pub struct DashboardActiveTask {
 
 impl Serialize for DashboardActiveTask {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut record = serializer.serialize_struct("DashboardActiveTask", 6)?;
+        let mut record = serializer.serialize_struct("DashboardActiveTask", 8)?;
         record.serialize_field("task_id", &self.task_id)?;
         record.serialize_field(
             "title",
@@ -115,6 +194,20 @@ impl Serialize for DashboardActiveTask {
         record.serialize_field(
             "agent",
             &sanitize_bounded(&self.agent, MAX_PROJECT_LABEL_CHARS),
+        )?;
+        record.serialize_field(
+            "model",
+            &self
+                .model
+                .as_deref()
+                .map(|model| sanitize_bounded(model, 256)),
+        )?;
+        record.serialize_field(
+            "effort",
+            &self
+                .effort
+                .as_deref()
+                .map(|effort| sanitize_bounded(effort, 128)),
         )?;
         record.serialize_field("turn_number", &self.turn_number)?;
         record.serialize_field("started_at_millis", &self.started_at_millis)?;

@@ -220,6 +220,7 @@ impl DashboardLauncher for RecordingLauncher {
                 service: Arc::new(DashboardService::new(source, FixedClock, FixedClock)),
                 log_source: logs,
                 task_source,
+                settings_source: None,
             });
             let server = DashboardHttpServer::bind(Some(0), state)
                 .await

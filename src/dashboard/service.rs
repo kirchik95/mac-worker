@@ -13,14 +13,14 @@ use crate::{
         cache::{Observation, ObservationCache},
         model::{
             CollectionSummary, DASHBOARD_API_VERSION, DashboardActiveTask, DashboardError,
-            DashboardJob, DashboardJobState, DashboardQueueEntry, DashboardSlotState,
-            DashboardSnapshot, DashboardWorker, Freshness, SlotSummary, SystemSummary,
-            WorkerHealth,
+            DashboardJob, DashboardJobState, DashboardProjectDefaults, DashboardQueueEntry,
+            DashboardSlotState, DashboardSnapshot, DashboardWorker, Freshness, SlotSummary,
+            SystemSummary, WorkerHealth,
         },
     },
     job::JobId,
     task::TaskState,
-    task_view::TaskListProjection,
+    task_view::{TaskFreshness, TaskListProjection},
 };
 
 pub const MAX_RECENT_TERMINAL_JOBS: usize = 100;
@@ -142,6 +142,10 @@ impl DashboardTaskCollection {
 pub struct DashboardSnapshotRequest;
 
 pub trait DashboardDataSource: Send + Sync + 'static {
+    fn project_defaults(&self) -> Option<DashboardProjectDefaults> {
+        None
+    }
+
     fn configured_workers(&self) -> Result<Vec<String>, DashboardError>;
     fn collect_workers(&self, deadline: Duration) -> Vec<WorkerObservationResult>;
     fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError>;
@@ -330,6 +334,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         };
 
         let generated_at_millis = self.clock.now_millis();
+        refresh_agent_facts_freshness(&mut workers, generated_at_millis);
         let revision = self.next_revision()?;
         Ok(DashboardSnapshot {
             api_version: DASHBOARD_API_VERSION,
@@ -339,6 +344,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                 freshness: Freshness::Current,
                 errors,
             },
+            project_defaults: self.source.project_defaults(),
             task_view,
             workers,
             queue,
@@ -557,6 +563,17 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         if let Some(completed) = lock_recover(&self.completed).as_ref() {
             let mut fallback = completed.as_ref().clone();
             fallback.collection.freshness = Freshness::Stale;
+            for worker in &mut fallback.workers {
+                if worker.freshness == Freshness::Current {
+                    worker.freshness = Freshness::Stale;
+                }
+            }
+            for task in &mut fallback.task_view.tasks {
+                if task.freshness == TaskFreshness::Current {
+                    task.freshness = TaskFreshness::Stale;
+                }
+            }
+            refresh_agent_facts_freshness(&mut fallback.workers, self.clock.now_millis());
             push_error(&mut fallback.collection.errors, timeout);
             return fallback;
         }
@@ -569,6 +586,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                 freshness: Freshness::Offline,
                 errors: vec![timeout],
             },
+            project_defaults: self.source.project_defaults(),
             task_view: DashboardTaskCollection::empty().projection,
             workers: Vec::new(),
             queue: Vec::new(),
@@ -593,10 +611,20 @@ fn enrich_active_tasks(workers: &mut [DashboardWorker], task_view: &TaskListProj
             task_id: task.task_id,
             title: task.title.clone(),
             agent: task.agent.clone(),
+            model: task.model.clone(),
+            effort: task.effort.clone(),
             turn_number: task.turn_count,
             started_at_millis: None,
             runner: task.runner,
         });
+    }
+}
+
+fn refresh_agent_facts_freshness(workers: &mut [DashboardWorker], now_millis: u64) {
+    for worker in workers {
+        if let Some(facts) = &mut worker.agent_facts {
+            facts.refresh_freshness(now_millis);
+        }
     }
 }
 
@@ -725,6 +753,7 @@ fn offline_worker(worker_name: &str, error: DashboardError) -> DashboardWorker {
         freshness: Freshness::Offline,
         observed_at_millis: None,
         hostname: None,
+        agent_facts: None,
         slot: SlotSummary {
             state: DashboardSlotState::Idle,
             capacity: 1,
