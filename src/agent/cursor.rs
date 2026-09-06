@@ -6,7 +6,7 @@ use crate::process::ProcessResult;
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthProbe, AuthProbeResult,
     StructuredResult, TurnLaunch, TurnParams, argv_pointer_launch, bound_summary, combined_output,
-    parse_json_line, require_session_ref, resolve_trailer_result, validate_params,
+    parse_json_line, require_session_ref, resolve_trailer_result, strip_ansi, validate_params,
 };
 
 const ENV_NAMES: [&str; 1] = ["CURSOR_API_KEY"];
@@ -95,41 +95,65 @@ impl AgentAdapter for CursorAdapter {
 }
 
 fn classify_cursor_auth(result: &ProcessResult) -> AuthProbeResult {
-    let text = combined_output(result);
+    let text = strip_ansi(&combined_output(result));
     if text.lines().any(|line| {
         line.to_ascii_lowercase()
             .contains("macos login keychain is locked")
     }) {
         return AuthProbeResult::UnknownWithReason(KEYCHAIN_LOCKED_REASON);
     }
-    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-    let Some(line) = lines.next() else {
-        return AuthProbeResult::Unknown;
-    };
-    if lines.next().is_some() {
-        return AuthProbeResult::Unknown;
+    // Every non-empty line must be a recognised status line and all of them
+    // must agree; anything else is ambiguous and stays unknown.
+    let mut verdict = None;
+    for line in text.lines().map(normalize_status_line) {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(authenticated) = classify_status_line(&line) else {
+            return AuthProbeResult::Unknown;
+        };
+        match verdict {
+            None => verdict = Some(authenticated),
+            Some(previous) if previous != authenticated => return AuthProbeResult::Unknown,
+            Some(_) => {}
+        }
     }
+    match verdict {
+        Some(true) => AuthProbeResult::Authenticated,
+        Some(false) => AuthProbeResult::Unauthenticated,
+        None => AuthProbeResult::Unknown,
+    }
+}
 
-    let line = line.to_ascii_lowercase();
+fn normalize_status_line(line: &str) -> String {
+    line.trim()
+        .trim_start_matches(|character: char| !character.is_alphanumeric())
+        .trim_end_matches(['!', '.'])
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn classify_status_line(line: &str) -> Option<bool> {
+    if matches!(line, "unauthenticated" | "authenticated: false")
+        || line.starts_with("not logged in")
+        || line.starts_with("not authenticated")
+    {
+        return Some(false);
+    }
     if matches!(
-        line.as_str(),
-        "not authenticated" | "not logged in" | "unauthenticated" | "authenticated: false"
-    ) {
-        AuthProbeResult::Unauthenticated
-    } else if matches!(
-        line.as_str(),
-        "authenticated" | "logged in" | "authenticated: true"
+        line,
+        "authenticated" | "logged in" | "authenticated: true" | "login successful"
     ) || line
         .strip_prefix("authenticated as ")
         .is_some_and(|user| !user.trim().is_empty())
         || line
             .strip_prefix("logged in as ")
             .is_some_and(|user| !user.trim().is_empty())
+        || line.starts_with("logged in (")
     {
-        AuthProbeResult::Authenticated
-    } else {
-        AuthProbeResult::Unknown
+        return Some(true);
     }
+    None
 }
 
 fn cursor_args(model: Option<&str>, session_ref: &str) -> Vec<String> {

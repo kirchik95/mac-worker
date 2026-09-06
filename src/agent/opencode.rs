@@ -5,7 +5,7 @@ use crate::process::ProcessResult;
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthProbe, AuthProbeResult,
     StructuredResult, TurnLaunch, TurnParams, argv_pointer_launch, bound_summary, combined_output,
-    json_i32, parse_json_line, require_session_ref, resolve_last_structured_result,
+    json_i32, parse_json_line, require_session_ref, resolve_last_structured_result, strip_ansi,
     validate_params,
 };
 
@@ -172,26 +172,6 @@ fn classify_credentials_listing(text: &str) -> AuthProbeResult {
         (true, 0) => AuthProbeResult::Unauthenticated,
         _ => AuthProbeResult::Unknown,
     }
-}
-
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for next in chars.by_ref() {
-                    if next.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        out.push(character);
-    }
-    out
 }
 
 fn classify_provider_object(values: &serde_json::Map<String, Value>) -> AuthProbeResult {

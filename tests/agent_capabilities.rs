@@ -116,6 +116,32 @@ fn ambiguous_agent_auth_output_is_not_projected_as_authenticated() {
 }
 
 #[test]
+fn cursor_status_login_output_is_authenticated() {
+    let cursor = adapter_for(AgentKind::Cursor).auth_probe();
+    // cursor-agent 2026.09 prints two lines after a keychain-backed login.
+    assert_eq!(
+        cursor.classify(&result(
+            "\u{1b}[32m\u{2713}\u{1b}[0m Login successful!\nLogged in (unable to fetch user details)\n".as_bytes()
+        )),
+        AuthProbeResult::Authenticated
+    );
+    assert_eq!(
+        cursor.classify(&result(b"Logged in as user@example.invalid\n")),
+        AuthProbeResult::Authenticated
+    );
+    assert_eq!(
+        cursor.classify(&result(
+            "\u{2717} Not logged in. Run cursor-agent login.\n".as_bytes()
+        )),
+        AuthProbeResult::Unauthenticated
+    );
+    assert_eq!(
+        cursor.classify(&result(b"Login successful!\nNot logged in\n")),
+        AuthProbeResult::Unknown
+    );
+}
+
+#[test]
 fn cursor_reports_a_locked_login_keychain_with_an_operator_reason() {
     let cursor = adapter_for(AgentKind::Cursor).auth_probe();
     assert_eq!(

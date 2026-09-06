@@ -776,3 +776,23 @@ fn json_i32(value: &Value, key: &str) -> Option<i32> {
         .and_then(Value::as_i64)
         .and_then(|n| i32::try_from(n).ok())
 }
+
+pub(super) fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(character);
+    }
+    out
+}
