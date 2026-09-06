@@ -425,11 +425,8 @@ pub fn prebind_login_request(
     environment.extend(extra_environment.iter().cloned());
     Ok(ProcessRequest {
         program: OsString::from("/bin/zsh"),
-        args: vec![
-            OsString::from("/bin/zsh"),
-            OsString::from("-lc"),
-            OsString::from(shell),
-        ],
+        // `args` never repeats the program: the runner supplies argv[0].
+        args: vec![OsString::from("-lc"), OsString::from(shell)],
         environment,
         environment_remove: Vec::new(),
         stdin: None,

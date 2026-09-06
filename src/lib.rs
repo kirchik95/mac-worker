@@ -2105,10 +2105,27 @@ fn versioned_host_error(error: &WorkerError) -> HostControlError {
         WorkerError::Snapshot { code, .. } => (*code, "snapshot operation failed"),
         WorkerError::Git { code, .. } => (*code, "Git operation failed"),
         WorkerError::Task { code, .. } => (*code, "task operation failed"),
+        WorkerError::Agent { code, .. } => (*code, "agent operation failed"),
         WorkerError::Io(_) => ("HOST_IO", "host state operation failed"),
         _ => ("INVALID_REQUEST", "host request was invalid"),
     };
     HostControlError::new(code, message).expect("fixed host error is valid")
+}
+
+#[cfg(test)]
+mod versioned_host_error_tests {
+    use super::*;
+
+    #[test]
+    fn agent_errors_keep_their_code_on_the_wire() {
+        let error = versioned_host_error(&WorkerError::Agent {
+            code: "AGENT_EXITED",
+            message: "session prebind command failed".into(),
+        });
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(wire["error"]["code"], "AGENT_EXITED");
+        assert_eq!(wire["error"]["message"], "agent operation failed");
+    }
 }
 
 fn run_host_supervise(

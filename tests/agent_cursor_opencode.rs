@@ -897,3 +897,31 @@ fn native_delete_rejects_unbound_or_control_session_references() {
         assert_eq!(adapter_for(kind).delete_session("session\n1"), None);
     }
 }
+
+#[test]
+fn prebind_login_request_runs_the_command_through_a_login_shell() {
+    let home = tempfile::tempdir().unwrap();
+    let request = prebind_login_request(
+        &["/bin/echo".to_string(), "prebind-ok".to_string()],
+        home.path(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(request.program, "/bin/zsh");
+    assert_eq!(
+        request.args,
+        vec![
+            std::ffi::OsString::from("-lc"),
+            std::ffi::OsString::from("exec '/bin/echo' 'prebind-ok'"),
+        ]
+    );
+    let result = mac_worker::process::SystemProcessRunner
+        .run(&request)
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "prebind-ok");
+}
