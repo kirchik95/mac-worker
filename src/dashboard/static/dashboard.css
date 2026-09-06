@@ -1013,6 +1013,21 @@ select:focus {
 .settings-field select {
   width: 100%;
 }
+.settings-field--checkbox {
+  align-content: start;
+}
+.settings-field__checkbox-row {
+  display: flex;
+  align-items: center;
+  min-height: 36px;
+}
+.settings-field--checkbox input[type="checkbox"] {
+  width: 18px;
+  min-height: 18px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
 .settings-field__hint {
   color: var(--muted);
   font-size: 10px;
@@ -1022,6 +1037,12 @@ select:focus {
   min-height: 28px;
   padding: 5px 8px;
   font-size: 10px;
+}
+.settings-field__reset-slot {
+  justify-self: start;
+}
+.settings-field__reset-slot:empty {
+  display: none;
 }
 .settings-field__value {
   display: block;

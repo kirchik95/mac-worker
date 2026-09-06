@@ -79,6 +79,9 @@ fn entry() -> AgentDefaultSettings {
         model: Some("gpt-test".into()),
         effort: Some("high".into()),
         effort_options: vec!["low".into(), "high".into()],
+        model_options: vec![],
+        fast: None,
+        fast_supported: false,
         source: "fixture".into(),
         revision: Some("a".repeat(64)),
         writable: true,
@@ -217,6 +220,7 @@ async fn settings_routes_read_and_protect_save() {
         agent: "codex".into(),
         model: Some("gpt-next".into()),
         effort: Some("high".into()),
+        fast: None,
         revision: "a".repeat(64),
     })
     .unwrap();
@@ -260,6 +264,7 @@ async fn settings_reject_unknown_worker_before_save() {
         agent: "codex".into(),
         model: Some("gpt-next".into()),
         effort: Some("high".into()),
+        fast: None,
         revision: "a".repeat(64),
     })
     .unwrap();
@@ -294,6 +299,7 @@ async fn settings_rejects_invalid_save_variants_before_source_and_maps_conflict(
         agent: "codex".into(),
         model: Some("gpt-next".into()),
         effort: Some("high".into()),
+        fast: None,
         revision: "a".repeat(64),
     })
     .unwrap();
@@ -374,6 +380,17 @@ async fn settings_rejects_invalid_save_variants_before_source_and_maps_conflict(
     .unwrap();
     assert_eq!(
         request(&address, "POST", path, &valid_headers, &missing_effort).status,
+        400
+    );
+    let missing_fast = serde_json::to_vec(&serde_json::json!({
+        "agent": "codex",
+        "model": "gpt-next",
+        "effort": "high",
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }))
+    .unwrap();
+    assert_eq!(
+        request(&address, "POST", path, &valid_headers, &missing_fast).status,
         400
     );
     assert_eq!(

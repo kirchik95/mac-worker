@@ -62,16 +62,16 @@ test('Settings renders native defaults and keeps a draft through snapshot polls'
   const modelInput = findByTestId(harness.document.node('agent-detail'), 'agent-settings-model');
   assert.equal(modelInput.value, 'gpt-5.6-sol');
   const originalInput = modelInput;
-  modelInput.value = 'draft-model';
-  modelInput.dispatchEvent(new Event('input'));
+  modelInput.value = 'gpt-5.6-pro';
+  modelInput.dispatchEvent(new Event('change'));
   assert.match(harness.document.node('agent-list').textContent, /gpt-5\.6-sol/);
-  assert.doesNotMatch(harness.document.node('agent-list').textContent, /draft-model/);
+  assert.doesNotMatch(harness.document.node('agent-list').textContent, /gpt-5\.6-pro · Fast/);
 
   snapshot.revision += 1;
   await client.refreshSnapshot();
 
   assert.equal(findByTestId(harness.document.node('agent-detail'), 'agent-settings-model'), originalInput);
-  assert.equal(modelInput.value, 'draft-model');
+  assert.equal(modelInput.value, 'gpt-5.6-pro');
   assert.match(harness.document.node('agent-detail').textContent, /Latest task/);
 });
 
@@ -83,8 +83,8 @@ test('Cancel restores the cached native defaults without saving', async () => {
   await harness.document.node('nav-settings').click();
 
   const modelInput = findByTestId(harness.document.node('agent-detail'), 'agent-settings-model');
-  modelInput.value = 'draft-model';
-  modelInput.dispatchEvent(new Event('input'));
+  modelInput.value = 'gpt-5.6-pro';
+  modelInput.dispatchEvent(new Event('change'));
   await findByTestId(harness.document.node('agent-detail'), 'agent-settings-cancel').click();
 
   assert.equal(findByTestId(harness.document.node('agent-detail'), 'agent-settings-model').value, 'gpt-5.6-sol');
@@ -102,8 +102,8 @@ test('Saving native defaults sends the explicit payload and protected headers', 
   const modelInput = findByTestId(detail, 'agent-settings-model');
   const effort = findByTestId(detail, 'agent-settings-effort');
   modelInput.value = 'gpt-5.6-pro';
-  modelInput.dispatchEvent(new Event('input'));
-  effort.value = 'max';
+  modelInput.dispatchEvent(new Event('change'));
+  effort.value = 'high';
   effort.dispatchEvent(new Event('change'));
   await findByTestId(detail, 'agent-settings-save').click();
 
@@ -118,10 +118,156 @@ test('Saving native defaults sends the explicit payload and protected headers', 
   assert.deepEqual(JSON.parse(save.options.body), {
     agent: 'codex',
     model: 'gpt-5.6-pro',
-    effort: 'max',
+    effort: 'high',
+    fast: null,
     revision: settings.agents[0].revision,
   });
   assert.equal(findByTestId(detail, 'agent-settings-model').value, 'gpt-5.6-pro');
+});
+
+test('model selection updates dependent effort and Fast controls immediately', async () => {
+  const settings = agentSettingsFixture({
+    codex: { model: 'gpt-5.6-sol', effort: 'max', fast: true, fast_supported: true },
+  });
+  const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+
+  const detail = harness.document.node('agent-detail');
+  const model = findByTestId(detail, 'agent-settings-model');
+  const originalModel = model;
+  assert.equal(model.tagName, 'SELECT');
+  assert.equal(model.value, 'gpt-5.6-sol');
+  assert.match(model.textContent, /GPT-5\.6-Sol/);
+  const fast = findByTestId(detail, 'agent-settings-fast');
+  assert.equal(fast.checked, true);
+
+  model.value = 'gpt-5.6-pro';
+  model.dispatchEvent(new Event('change'));
+
+  assert.equal(findByTestId(detail, 'agent-settings-model'), originalModel);
+  assert.equal(findByTestId(detail, 'agent-settings-effort').value, '');
+  assert.equal(findByTestId(detail, 'agent-settings-fast').checked, false);
+  assert.equal(findByTestId(detail, 'agent-settings-fast').disabled, true);
+  assert.match(detail.textContent, /reset to CLI default/i);
+});
+
+test('Cursor Fast off saves explicit false and reset returns to CLI default', async () => {
+  const settings = agentSettingsFixture({
+    cursor: { model: 'grok-4.6', effort: 'high', fast: true, fast_supported: true },
+  });
+  const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+  const cursorRow = findByTag(harness.document.node('agent-list'), 'BUTTON')
+    .find((row) => row.getAttribute('data-agent') === 'cursor');
+  await cursorRow.click();
+
+  const detail = harness.document.node('agent-detail');
+  const fast = findByTestId(detail, 'agent-settings-fast');
+  assert.equal(fast.checked, true);
+  fast.checked = false;
+  fast.dispatchEvent(new Event('change'));
+  assert.match(detail.textContent, /Fast explicitly off/);
+  assert.ok(findByTestId(detail, 'agent-settings-fast-reset'));
+  await findByTestId(detail, 'agent-settings-save').click();
+
+  const firstSave = harness.fetchCalls.find(({ options }) => options?.method === 'POST');
+  assert.equal(JSON.parse(firstSave.options.body).fast, false);
+  assert.equal(findByTestId(detail, 'agent-settings-fast').checked, false);
+
+  const reset = findByTestId(detail, 'agent-settings-fast-reset');
+  assert.ok(reset);
+  await reset.click();
+  assert.match(detail.textContent, /CLI default/);
+  assert.equal(findByTestId(detail, 'agent-settings-fast').checked, false);
+  await findByTestId(detail, 'agent-settings-save').click();
+  const saves = harness.fetchCalls.filter(({ options }) => options?.method === 'POST');
+  assert.equal(JSON.parse(saves[1].options.body).fast, null);
+});
+
+test('Fast draft survives a save error and Cancel restores the saved value', async () => {
+  const settings = agentSettingsFixture({
+    cursor: { model: 'grok-4.6', effort: 'high', fast: true, fast_supported: true },
+  });
+  const harness = fakeEnvironment({
+    settingsByWorker: { 'mini-forge': settings },
+    settingsRouteResponses: {
+      [`${SETTINGS_FORGE}#save`]: [response({
+        error: { code: 'SETTINGS_UNAVAILABLE', message: 'save unavailable' },
+      }, false, 503)],
+    },
+  });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+  const cursorRow = findByTag(harness.document.node('agent-list'), 'BUTTON')
+    .find((row) => row.getAttribute('data-agent') === 'cursor');
+  await cursorRow.click();
+
+  const detail = harness.document.node('agent-detail');
+  const fast = findByTestId(detail, 'agent-settings-fast');
+  fast.checked = false;
+  fast.dispatchEvent(new Event('change'));
+  await findByTestId(detail, 'agent-settings-save').click();
+
+  assert.equal(findByTestId(detail, 'agent-settings-fast').checked, false);
+  assert.equal(findByTestId(detail, 'agent-settings-save').disabled, false);
+  assert.match(detail.textContent, /save unavailable/);
+  await findByTestId(detail, 'agent-settings-cancel').click();
+  assert.equal(findByTestId(detail, 'agent-settings-fast').checked, true);
+});
+
+test('unknown current model remains selectable and unsupported Fast can be reset', async () => {
+  const settings = agentSettingsFixture({
+    codex: { model: 'legacy-model', effort: 'legacy-effort', fast: true, fast_supported: false },
+  });
+  const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
+  const client = createDashboardClient(harness);
+  await client.refreshSnapshot();
+  await harness.document.node('nav-settings').click();
+
+  const detail = harness.document.node('agent-detail');
+  const model = findByTestId(detail, 'agent-settings-model');
+  assert.equal(model.value, 'legacy-model');
+  assert.match(model.textContent, /legacy-model/);
+  const fast = findByTestId(detail, 'agent-settings-fast');
+  assert.equal(fast.checked, true);
+  assert.equal(fast.disabled, true);
+  await findByTestId(detail, 'agent-settings-fast-reset').click();
+  assert.equal(findByTestId(detail, 'agent-settings-fast').checked, false);
+  assert.match(detail.textContent, /CLI default/);
+});
+
+test('strict Settings DTO validation rejects malformed model options and Fast fields', async () => {
+  const malformedCases = [
+    (settings) => { settings.agents[0].model_options[0].fast_supported = 'true'; },
+    (settings) => { settings.agents[0].model_options[1].id = settings.agents[0].model_options[0].id; },
+    (settings) => { settings.agents[0].model_options[0].extra = true; },
+    (settings) => { settings.agents[0].model_options[0].label = ' '; },
+    (settings) => { settings.agents[0].model_options[0].effort_options[0] = 'high effort'; },
+    (settings) => {
+      const option = settings.agents[0].model_options[0];
+      settings.agents[0].model_options = Array.from({ length: 65 }, (_, index) => ({
+        ...option,
+        id: `model-${index}`,
+      }));
+    },
+    (settings) => { delete settings.agents[0].fast; },
+  ];
+  for (const mutate of malformedCases) {
+    const malformed = agentSettingsFixture();
+    mutate(malformed);
+    const harness = fakeEnvironment({
+      settingsRouteResponses: { [SETTINGS_FORGE]: [response(malformed)] },
+    });
+    const client = createDashboardClient(harness);
+    await client.refreshSnapshot();
+    await harness.document.node('nav-settings').click();
+    assert.match(harness.document.node('agent-detail').textContent, /Load failed/);
+  }
 });
 
 test('Settings shows loading and failure states while keeping retry available', async () => {
@@ -163,8 +309,8 @@ test('a failed refresh with cached data keeps the draft but disables the editor'
 
   const detail = harness.document.node('agent-detail');
   const modelInput = findByTestId(detail, 'agent-settings-model');
-  modelInput.value = 'draft-model';
-  modelInput.dispatchEvent(new Event('input'));
+  modelInput.value = 'gpt-5.6-pro';
+  modelInput.dispatchEvent(new Event('change'));
   await harness.document.node('settings-refresh').click();
 
   assert.match(detail.textContent, /Load failed/);
@@ -176,7 +322,7 @@ test('a failed refresh with cached data keeps the draft but disables the editor'
   assert.match(codexRow.textContent, /Load failed/);
 
   await harness.document.node('settings-refresh').click();
-  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'draft-model');
+  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'gpt-5.6-pro');
 });
 
 test('conflicts retain the draft and refresh its revision before retry', async () => {
@@ -194,11 +340,11 @@ test('conflicts retain the draft and refresh its revision before retry', async (
   await harness.document.node('nav-settings').click();
   const detail = harness.document.node('agent-detail');
   const modelInput = findByTestId(detail, 'agent-settings-model');
-  modelInput.value = 'draft-model';
-  modelInput.dispatchEvent(new Event('input'));
+  modelInput.value = 'gpt-5.6-pro';
+  modelInput.dispatchEvent(new Event('change'));
   await findByTestId(detail, 'agent-settings-save').click();
 
-  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'draft-model');
+  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'gpt-5.6-pro');
   assert.match(detail.textContent, /native settings changed/i);
   const getCalls = harness.fetchCalls.filter(({ path, options }) => path === SETTINGS_FORGE && !options?.method);
   assert.equal(getCalls.length, 2);
@@ -242,8 +388,8 @@ test('a late save response cannot replace a newly selected agent', async () => {
   await harness.document.node('nav-settings').click();
   const detail = harness.document.node('agent-detail');
   const modelInput = findByTestId(detail, 'agent-settings-model');
-  modelInput.value = 'codex-draft';
-  modelInput.dispatchEvent(new Event('input'));
+  modelInput.value = 'gpt-5.6-pro';
+  modelInput.dispatchEvent(new Event('change'));
   const saving = findByTestId(detail, 'agent-settings-save').click();
   const agentRows = findByTag(harness.document.node('agent-list'), 'BUTTON');
   await agentRows[1].click();
@@ -259,7 +405,9 @@ test('a late save response cannot replace a newly selected agent', async () => {
 });
 
 test('Settings distinguishes missing agents, unsupported OpenCode effort, and unverified effort', async () => {
-  const settings = agentSettingsFixture();
+  const settings = agentSettingsFixture({
+    cursor: { effort_options: [], model_options: [] },
+  });
   settings.agents = settings.agents.filter((entry) => entry.agent !== 'claude');
   const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
   const client = createDashboardClient(harness);
@@ -282,7 +430,7 @@ test('Settings distinguishes missing agents, unsupported OpenCode effort, and un
 
 test('Cursor can clear an unverified effort before changing its model', async () => {
   const settings = agentSettingsFixture({
-    cursor: { model: 'grok-4.6', effort: 'high', effort_options: [] },
+    cursor: { model: 'grok-4.6', effort: 'high', effort_options: [], model_options: [] },
   });
   const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
   const client = createDashboardClient(harness);
@@ -294,17 +442,18 @@ test('Cursor can clear an unverified effort before changing its model', async ()
 
   const detail = harness.document.node('agent-detail');
   const modelInput = findByTestId(detail, 'agent-settings-model');
-  modelInput.value = 'gpt-5';
-  modelInput.dispatchEvent(new Event('input'));
   await findByTestId(detail, 'agent-settings-effort-reset').click();
   assert.match(detail.textContent, /CLI default/);
+  modelInput.value = '';
+  modelInput.dispatchEvent(new Event('change'));
   await findByTestId(detail, 'agent-settings-save').click();
 
   const save = harness.fetchCalls.find(({ options }) => options?.method === 'POST');
   assert.deepEqual(JSON.parse(save.options.body), {
     agent: 'cursor',
-    model: 'gpt-5',
+    model: null,
     effort: null,
+    fast: null,
     revision: settings.agents.find((entry) => entry.agent === 'cursor').revision,
   });
 });
@@ -312,7 +461,7 @@ test('Cursor can clear an unverified effort before changing its model', async ()
 test('Use CLI default stays visible through polling and a save error, then Cancel restores the saved value', async () => {
   const snapshot = taskSnapshotFixture();
   const settings = agentSettingsFixture({
-    cursor: { model: 'grok-4.6', effort: 'high', effort_options: [] },
+    cursor: { model: 'grok-4.6', effort: 'high', effort_options: [], model_options: [] },
   });
   const harness = fakeEnvironment({
     snapshot,
@@ -349,7 +498,7 @@ test('Use CLI default stays visible through polling and a save error, then Cance
 
 test('Codex can clear an unverified effort before changing its model', async () => {
   const settings = agentSettingsFixture({
-    codex: { model: 'grok-4.6', effort: 'high', effort_options: [] },
+    codex: { model: 'grok-4.6', effort: 'high', effort_options: [], model_options: [] },
   });
   const harness = fakeEnvironment({ settingsByWorker: { 'mini-forge': settings } });
   const client = createDashboardClient(harness);
@@ -358,16 +507,16 @@ test('Codex can clear an unverified effort before changing its model', async () 
 
   const detail = harness.document.node('agent-detail');
   const modelInput = findByTestId(detail, 'agent-settings-model');
-  modelInput.value = 'gpt-5';
-  modelInput.dispatchEvent(new Event('input'));
-  await findByTestId(detail, 'agent-settings-effort-reset').click();
+  modelInput.value = 'gpt-5.6-pro';
+  modelInput.dispatchEvent(new Event('change'));
   await findByTestId(detail, 'agent-settings-save').click();
 
   const save = harness.fetchCalls.find(({ options }) => options?.method === 'POST');
   assert.deepEqual(JSON.parse(save.options.body), {
     agent: 'codex',
-    model: 'gpt-5',
+    model: 'gpt-5.6-pro',
     effort: null,
+    fast: null,
     revision: settings.agents.find((entry) => entry.agent === 'codex').revision,
   });
 });
@@ -410,10 +559,10 @@ test('malformed settings responses fail safely and retain the draft', async () =
   await malformedSave.document.node('nav-settings').click();
   const detail = malformedSave.document.node('agent-detail');
   const modelInput = findByTestId(detail, 'agent-settings-model');
-  modelInput.value = 'draft-model';
-  modelInput.dispatchEvent(new Event('input'));
+  modelInput.value = 'gpt-5.6-pro';
+  modelInput.dispatchEvent(new Event('change'));
   await findByTestId(detail, 'agent-settings-save').click();
-  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'draft-model');
+  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'gpt-5.6-pro');
   assert.equal(findByTestId(detail, 'agent-settings-save').disabled, false);
   assert.match(detail.textContent, /response was invalid/i);
 });
@@ -423,7 +572,7 @@ test('a refresh already in flight cannot overwrite a successful save', async () 
   const refreshResponse = deferred();
   const saved = {
     ...initial.agents.find((entry) => entry.agent === 'codex'),
-    model: 'saved-model',
+    model: 'gpt-5.6-pro',
     revision: 's'.repeat(64),
   };
   const harness = fakeEnvironment({
@@ -437,8 +586,8 @@ test('a refresh already in flight cannot overwrite a successful save', async () 
   await harness.document.node('nav-settings').click();
   const detail = harness.document.node('agent-detail');
   const modelInput = findByTestId(detail, 'agent-settings-model');
-  modelInput.value = 'saved-model';
-  modelInput.dispatchEvent(new Event('input'));
+  modelInput.value = 'gpt-5.6-pro';
+  modelInput.dispatchEvent(new Event('change'));
   const refreshing = harness.document.node('settings-refresh').click();
   await Promise.resolve();
   const saving = findByTestId(detail, 'agent-settings-save').click();
@@ -446,7 +595,7 @@ test('a refresh already in flight cannot overwrite a successful save', async () 
   refreshResponse.resolve(response(initial));
   await refreshing;
 
-  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'saved-model');
+  assert.equal(findByTestId(detail, 'agent-settings-model').value, 'gpt-5.6-pro');
 });
 
 test('task filters are client-side and never call a mutating endpoint', async () => {
@@ -1266,6 +1415,7 @@ class FakeNode {
     this._textContent = '';
     this.className = '';
     this.value = '';
+    this.checked = false;
     this.disabled = false;
     this.readOnly = false;
   }
@@ -1427,7 +1577,12 @@ class FakeFetch {
         const settings = this.settingsByWorker.get(worker) ?? agentSettingsFixture();
         const next = structuredClone(settings);
         const entry = next.agents.find((value) => value.agent === payload.agent);
-        Object.assign(entry, { model: payload.model, effort: payload.effort, revision: `${entry.revision.slice(0, -1)}s` });
+        Object.assign(entry, {
+          model: payload.model,
+          effort: payload.effort,
+          fast: payload.fast,
+          revision: `${entry.revision.slice(0, -1)}s`,
+        });
         this.settingsByWorker.set(worker, next);
         return response(entry);
       }
@@ -1556,29 +1711,55 @@ function allNodes(node) {
 }
 
 function agentSettingsFixture(overrides = {}) {
+  const codexEfforts = ['low', 'medium', 'high', 'xhigh', 'max'];
+  const cursorEfforts = ['low', 'medium', 'high'];
+  const claudeEfforts = ['low', 'medium', 'high', 'xhigh', 'max'];
   const defaults = {
     codex: {
       model: 'gpt-5.6-sol',
       effort: 'max',
-      effort_options: ['low', 'medium', 'high', 'xhigh', 'max'],
+      effort_options: codexEfforts,
+      model_options: [
+        { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', effort_options: codexEfforts, fast_supported: true },
+        { id: 'gpt-5.6-pro', label: 'GPT-5.6-Pro', effort_options: ['low', 'medium', 'high'], fast_supported: false },
+      ],
+      fast: null,
+      fast_supported: true,
       source: 'native-codex',
     },
     cursor: {
       model: 'claude-3-7-sonnet',
       effort: 'high',
-      effort_options: [],
+      effort_options: cursorEfforts,
+      model_options: [
+        { id: 'claude-3-7-sonnet', label: 'Claude 3.7 Sonnet', effort_options: cursorEfforts, fast_supported: false },
+        { id: 'grok-4.6', label: 'Grok 4.6', effort_options: ['high'], fast_supported: true },
+      ],
+      fast: null,
+      fast_supported: false,
       source: 'native-cursor',
     },
     opencode: {
       model: 'opencode/default',
       effort: null,
       effort_options: [],
+      model_options: [
+        { id: 'opencode/default', label: 'Default', effort_options: [], fast_supported: false },
+      ],
+      fast: null,
+      fast_supported: false,
       source: 'native-opencode',
     },
     claude: {
       model: 'claude-sonnet',
       effort: 'high',
-      effort_options: ['low', 'medium', 'high', 'xhigh', 'max'],
+      effort_options: claudeEfforts,
+      model_options: [
+        { id: 'sonnet', label: 'Sonnet', effort_options: claudeEfforts, fast_supported: false },
+        { id: 'opus', label: 'Opus', effort_options: claudeEfforts, fast_supported: false },
+      ],
+      fast: null,
+      fast_supported: false,
       source: 'native-claude',
     },
   };
@@ -1588,6 +1769,9 @@ function agentSettingsFixture(overrides = {}) {
       model: null,
       effort: null,
       effort_options: [],
+      model_options: [],
+      fast: null,
+      fast_supported: false,
       source: `native-${agent}`,
       revision: `${String(index + 1).repeat(64)}`,
       writable: true,

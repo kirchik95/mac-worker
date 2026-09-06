@@ -83,7 +83,7 @@ If the turn fails, inspect the structured result and logs before authoring a fol
 
 | Work type | Agent |
 |---|---|
-| Rust implementation, Rust tests, builds, or work needing shell judgement | Codex, `--model gpt-5.6-luna` |
+| Rust implementation, Rust tests, builds, or work needing shell judgement | Codex, `--model gpt-6-astra --effort xhigh` |
 | TypeScript or frontend implementation | Cursor, `--env-profile agents` |
 | Second opinion or documentation | OpenCode, default Zen model or `--model opencode-go/<model>` |
 | Claude Code on workers | Deferred by the operator for now |

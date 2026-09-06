@@ -2,8 +2,8 @@ use std::os::unix::process::ExitStatusExt;
 use std::{fs, path::Path, process::ExitStatus, sync::Mutex};
 
 use mac_worker::agent_settings::{
-    AgentDefaultSettings, AgentSettingsList, AgentSettingsSaveRequest, NativeAgentSettingsStore,
-    SETTINGS_AGENT_IDS,
+    AgentDefaultSettings, AgentSettingsList, AgentSettingsSaveRequest, ModelOption,
+    NativeAgentSettingsStore, SETTINGS_AGENT_IDS,
 };
 use mac_worker::{
     config::WorkerEntry,
@@ -43,6 +43,7 @@ fn reads_and_updates_codex_without_reformatting_unrelated_toml() {
             agent: "codex".into(),
             model: Some("gpt-new".into()),
             effort: Some("max".into()),
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
@@ -82,6 +83,7 @@ model_reasoning_effort = "high" # root effort
             agent: "codex".into(),
             model: Some("gpt-new".into()),
             effort: Some("max".into()),
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
@@ -120,6 +122,7 @@ fn codex_effort_choices_follow_the_selected_model_cache_entry() {
             agent: "codex".into(),
             model: None,
             effort: Some("ultra".into()),
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap_err();
@@ -153,6 +156,7 @@ fn reads_and_updates_claude_root_fields_only() {
             agent: "claude".into(),
             model: None,
             effort: Some("max".into()),
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
@@ -196,6 +200,7 @@ fn stale_revision_does_not_overwrite_source() {
             agent: "codex".into(),
             model: Some("after".into()),
             effort: None,
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap_err();
@@ -230,6 +235,7 @@ fn updates_cursor_canonical_model_and_preserves_other_parameters() {
             agent: "cursor".into(),
             model: Some("new".into()),
             effort: None,
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
@@ -301,6 +307,7 @@ fn cursor_preserves_an_unlisted_current_effort_and_resets_active_selection_as_a_
             agent: "cursor".into(),
             model: Some("old".into()),
             effort: Some("custom".into()),
+            fast: None,
             revision: settings.revision.clone().unwrap(),
         })
         .unwrap();
@@ -311,6 +318,7 @@ fn cursor_preserves_an_unlisted_current_effort_and_resets_active_selection_as_a_
             agent: "cursor".into(),
             model: None,
             effort: None,
+            fast: None,
             revision,
         })
         .unwrap();
@@ -403,6 +411,7 @@ fn cursor_clearing_effort_removes_the_parameter_element() {
             agent: "cursor".into(),
             model: Some("same".into()),
             effort: None,
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
@@ -443,12 +452,55 @@ fn updates_opencode_jsonc_and_preserves_comments() {
             agent: "opencode".into(),
             model: Some("new".into()),
             effort: None,
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
     let updated = fs::read_to_string(path).unwrap();
     assert!(updated.contains("// keep"));
     assert!(updated.contains("\"model\": \"new\""));
+}
+
+#[test]
+fn opencode_catalog_keeps_provider_ids_but_does_not_advertise_unsaveable_effort() {
+    let home = tempdir().unwrap();
+    let config_directory = home.path().join(".config/opencode");
+    fs::create_dir_all(&config_directory).unwrap();
+    fs::write(
+        config_directory.join("opencode.json"),
+        "{\"model\":\"opencode/gpt-5.6-luna\"}\n",
+    )
+    .unwrap();
+    let cache_directory = home.path().join(".cache/opencode");
+    fs::create_dir_all(&cache_directory).unwrap();
+    fs::write(
+        cache_directory.join("models.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "opencode": {
+                "models": {
+                    "gpt-5.6-luna": {
+                        "name": "GPT-5.6 Luna",
+                        "reasoning_options": [{"type": "effort", "values": ["low", "max"]}]
+                    }
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let settings = store(home.path()).read("opencode").unwrap();
+    assert_eq!(settings.model.as_deref(), Some("opencode/gpt-5.6-luna"));
+    let option = settings
+        .model_options
+        .iter()
+        .find(|option| option.id == "opencode/gpt-5.6-luna")
+        .unwrap();
+    assert_eq!(option.label, "GPT-5.6 Luna");
+    assert!(option.effort_options.is_empty());
+    assert!(!option.fast_supported);
+    assert_eq!(settings.effort_options, Vec::<String>::new());
+    assert_eq!(settings.fast, None);
 }
 
 #[test]
@@ -464,6 +516,7 @@ fn inserts_missing_jsonc_field_before_a_trailing_comma() {
             agent: "opencode".into(),
             model: Some("new".into()),
             effort: None,
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
@@ -507,6 +560,7 @@ fn opencode_jsonc_override_wins_and_revision_covers_both_documents() {
             agent: "opencode".into(),
             model: Some("next".into()),
             effort: None,
+            fast: None,
             revision,
         })
         .unwrap_err();
@@ -545,6 +599,7 @@ fn opencode_edits_lower_source_when_jsonc_only_overlays_unrelated_keys() {
             agent: "opencode".into(),
             model: Some("next".into()),
             effort: None,
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
@@ -578,6 +633,7 @@ fn opencode_clear_overlay_reveals_lower_model_and_revision_tracks_both_files() {
             agent: "opencode".into(),
             model: None,
             effort: None,
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
@@ -604,11 +660,25 @@ fn missing_opencode_null_save_does_not_create_native_directories() {
             agent: "opencode".into(),
             model: None,
             effort: None,
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
     assert_eq!(saved.model, None);
     assert_eq!(saved.effort, None);
+    assert!(!home.path().join(".config").exists());
+
+    let settings = store(home.path()).read("opencode").unwrap();
+    let saved = store(home.path())
+        .save(&AgentSettingsSaveRequest {
+            agent: "opencode".into(),
+            model: None,
+            effort: None,
+            fast: Some(false),
+            revision: settings.revision.unwrap(),
+        })
+        .unwrap();
+    assert_eq!(saved.fast, None);
     assert!(!home.path().join(".config").exists());
 }
 
@@ -633,6 +703,7 @@ fn clearing_codex_setting_preserves_its_inline_comment() {
             agent: "codex".into(),
             model: None,
             effort: Some("high".into()),
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
@@ -661,6 +732,7 @@ fn read_only_native_source_is_readable_but_not_reported_writable() {
             agent: "claude".into(),
             model: Some("replacement".into()),
             effort: None,
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap_err();
@@ -754,6 +826,7 @@ fn malformed_source_is_reported_and_never_rewritten() {
             agent: "claude".into(),
             model: Some("replacement".into()),
             effort: None,
+            fast: None,
             revision: entry.revision.unwrap(),
         })
         .unwrap_err();
@@ -770,6 +843,7 @@ fn missing_file_save_creates_private_native_document() {
             agent: "claude".into(),
             model: Some("claude-new".into()),
             effort: Some("high".into()),
+            fast: None,
             revision: settings.revision.unwrap(),
         })
         .unwrap();
@@ -857,6 +931,9 @@ fn typed_settings_transport_keeps_user_values_in_json_stdin() {
         model: Some("model-from-host".into()),
         effort: Some("max".into()),
         effort_options: vec!["max".into()],
+        model_options: vec![],
+        fast: None,
+        fast_supported: false,
         source: "native-claude".into(),
         revision: Some("b".repeat(64)),
         writable: true,
@@ -877,6 +954,7 @@ fn typed_settings_transport_keeps_user_values_in_json_stdin() {
         agent: "claude".into(),
         model: Some("model with spaces".into()),
         effort: Some("max".into()),
+        fast: None,
         revision: "a".repeat(64),
     };
     let _ = SshJsonTransport::new(&runner)
@@ -895,4 +973,286 @@ fn typed_settings_transport_keeps_user_values_in_json_stdin() {
         process.args.last().unwrap().to_string_lossy(),
         HostOperation::AgentSettingsSet.command()
     );
+}
+
+#[test]
+fn codex_catalog_exposes_luna_max_and_fast_capability_with_bounded_visible_order() {
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".codex")).unwrap();
+    fs::write(
+        home.path().join(".codex/config.toml"),
+        "model = \"gpt-5.6-luna\"\nmodel_reasoning_effort = \"max\"\nservice_tier = \"priority\"\n",
+    )
+    .unwrap();
+    fs::write(
+        home.path().join(".codex/models_cache.json"),
+        r#"{"models":[
+          {"slug":"hidden-current","display_name":"Hidden Current","visibility":"hide","priority":2,"supported_reasoning_levels":[{"effort":"max"}],"additional_speed_tiers":["fast"]},
+          {"slug":"gpt-5.6-luna","display_name":"GPT-5.6-Luna","visibility":"list","priority":8,"supported_reasoning_levels":[{"effort":"low"},{"effort":"max"}],"additional_speed_tiers":["fast"],"service_tiers":[{"id":"priority"}]},
+          {"slug":"gpt-6-astra","display_name":"GPT-6-Astra","visibility":"list","priority":1,"supported_reasoning_levels":[{"effort":"max"}],"additional_speed_tiers":[]},
+          {"slug":"bad\nmodel","display_name":"bad","visibility":"list","priority":0,"supported_reasoning_levels":[{"effort":"max"}]}
+        ]}"#,
+    )
+    .unwrap();
+
+    let settings = store(home.path()).read("codex").unwrap();
+    assert_eq!(settings.model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(settings.effort.as_deref(), Some("max"));
+    assert_eq!(settings.fast, Some(true));
+    assert!(settings.fast_supported);
+    assert_eq!(
+        settings.model_options,
+        vec![
+            ModelOption {
+                id: "gpt-6-astra".into(),
+                label: "GPT-6-Astra".into(),
+                effort_options: vec!["max".into()],
+                fast_supported: false,
+            },
+            ModelOption {
+                id: "gpt-5.6-luna".into(),
+                label: "GPT-5.6-Luna".into(),
+                effort_options: vec!["low".into(), "max".into()],
+                fast_supported: true,
+            },
+        ]
+    );
+}
+
+#[test]
+fn codex_catalog_retains_hidden_current_model_at_the_option_bound() {
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".codex")).unwrap();
+    fs::write(
+        home.path().join(".codex/config.toml"),
+        "model = \"gpt-hidden\"\nmodel_reasoning_effort = \"max\"\nservice_tier = \"fast\"\n",
+    )
+    .unwrap();
+    let mut models = Vec::new();
+    for index in 0..64 {
+        models.push(serde_json::json!({
+            "slug": format!("visible-{index}"),
+            "visibility": "list",
+            "priority": index,
+            "supported_reasoning_levels": [{"effort": "low"}],
+        }));
+    }
+    models.push(serde_json::json!({
+        "slug": "gpt-hidden",
+        "visibility": "hide",
+        "priority": 999,
+        "supported_reasoning_levels": [{"effort": "max"}],
+        "additional_speed_tiers": ["fast"],
+    }));
+    fs::write(
+        home.path().join(".codex/models_cache.json"),
+        serde_json::to_vec(&serde_json::json!({"models": models})).unwrap(),
+    )
+    .unwrap();
+
+    let settings = store(home.path()).read("codex").unwrap();
+    assert_eq!(settings.model_options.len(), 64);
+    let current = settings.model_options.last().unwrap();
+    assert_eq!(current.id, "gpt-hidden");
+    assert_eq!(current.effort_options, vec!["max"]);
+    assert!(current.fast_supported);
+}
+
+#[test]
+fn codex_missing_catalog_keeps_current_values_readable_and_saveable() {
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".codex")).unwrap();
+    let path = home.path().join(".codex/config.toml");
+    fs::write(
+        &path,
+        "model = \"gpt-unlisted\"\nmodel_reasoning_effort = \"custom\"\nservice_tier = \"fast\"\n",
+    )
+    .unwrap();
+
+    let settings = store(home.path()).read("codex").unwrap();
+    assert_eq!(settings.model_options.len(), 1);
+    assert_eq!(settings.model_options[0].id, "gpt-unlisted");
+    assert_eq!(settings.effort.as_deref(), Some("custom"));
+    assert_eq!(settings.fast, Some(true));
+    assert!(!settings.fast_supported);
+
+    let saved = store(home.path())
+        .save(&AgentSettingsSaveRequest {
+            agent: "codex".into(),
+            model: Some("gpt-unlisted".into()),
+            effort: Some("custom".into()),
+            fast: Some(true),
+            revision: settings.revision.unwrap(),
+        })
+        .unwrap();
+    assert_eq!(saved.effort.as_deref(), Some("custom"));
+    assert_eq!(saved.fast, Some(true));
+    assert!(
+        fs::read_to_string(path)
+            .unwrap()
+            .contains("service_tier = \"fast\"")
+    );
+}
+
+#[test]
+fn codex_fast_aliases_write_fast_and_clear_known_tiers_without_erasing_unknown_tiers() {
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".codex")).unwrap();
+    fs::write(
+        home.path().join(".codex/config.toml"),
+        "# keep\nmodel = \"gpt-5.6-luna\"\nmodel_reasoning_effort = \"max\"\nservice_tier = \"priority\"\nplan_mode_reasoning_effort = \"high\"\n",
+    )
+    .unwrap();
+    fs::write(
+        home.path().join(".codex/models_cache.json"),
+        r#"{"models":[{"slug":"gpt-5.6-luna","display_name":"GPT-5.6-Luna","visibility":"list","priority":8,"supported_reasoning_levels":[{"effort":"max"}],"additional_speed_tiers":["fast"]}]}"#,
+    )
+    .unwrap();
+
+    let settings = store(home.path()).read("codex").unwrap();
+    let saved = store(home.path())
+        .save(&AgentSettingsSaveRequest {
+            agent: "codex".into(),
+            model: Some("gpt-5.6-luna".into()),
+            effort: Some("max".into()),
+            fast: Some(false),
+            revision: settings.revision.unwrap(),
+        })
+        .unwrap();
+    assert_eq!(saved.fast, None);
+    let updated = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+    assert!(!updated.contains("service_tier"));
+    assert!(updated.contains("# keep"));
+    assert!(updated.contains("plan_mode_reasoning_effort = \"high\""));
+
+    let settings = store(home.path()).read("codex").unwrap();
+    let saved = store(home.path())
+        .save(&AgentSettingsSaveRequest {
+            agent: "codex".into(),
+            model: None,
+            effort: None,
+            fast: Some(true),
+            revision: settings.revision.unwrap(),
+        })
+        .unwrap();
+    assert_eq!(saved.fast, Some(true));
+    assert!(
+        fs::read_to_string(home.path().join(".codex/config.toml"))
+            .unwrap()
+            .contains("service_tier = \"fast\"")
+    );
+
+    fs::write(
+        home.path().join(".codex/config.toml"),
+        "model = \"gpt-5.6-luna\"\nmodel_reasoning_effort = \"max\"\nservice_tier = \"flex\"\n",
+    )
+    .unwrap();
+    let settings = store(home.path()).read("codex").unwrap();
+    assert_eq!(settings.fast, None);
+    store(home.path())
+        .save(&AgentSettingsSaveRequest {
+            agent: "codex".into(),
+            model: None,
+            effort: None,
+            fast: None,
+            revision: settings.revision.unwrap(),
+        })
+        .unwrap();
+    assert!(
+        fs::read_to_string(home.path().join(".codex/config.toml"))
+            .unwrap()
+            .contains("service_tier = \"flex\"")
+    );
+}
+
+#[test]
+fn cursor_catalog_reads_grok_high_fast_strings_and_synchronizes_both_parameter_arrays() {
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".cursor")).unwrap();
+    let path = home.path().join(".cursor/cli-config.json");
+    fs::write(
+        &path,
+        r#"{
+  "model": {"modelId": "old", "displayName": "Old"},
+  "selectedModel": {"modelId": "old", "parameters": [{"id":"effort","value":"low"},{"id":"fast","value":"false"}]},
+  "modelParameters": {
+    "old": [{"id":"effort","value":"low"},{"id":"fast","value":"false"},{"id":"context","value":"1m"}],
+    "grok-4.6": [{"id":"effort","value":"high"},{"id":"fast","value":"true"},{"id":"context","value":"1m"}]
+  },
+  "modelParameterKeys": ["old", "grok-4.6"]
+}
+"#,
+    )
+    .unwrap();
+    let settings = store(home.path()).read("cursor").unwrap();
+    assert_eq!(settings.fast, Some(false));
+    assert!(settings.fast_supported);
+    assert!(settings.model_options.iter().any(|option| {
+        option.id == "grok-4.6" && option.effort_options == vec!["high"] && option.fast_supported
+    }));
+
+    let saved = store(home.path())
+        .save(&AgentSettingsSaveRequest {
+            agent: "cursor".into(),
+            model: Some("grok-4.6".into()),
+            effort: Some("high".into()),
+            fast: Some(true),
+            revision: settings.revision.unwrap(),
+        })
+        .unwrap();
+    assert_eq!(saved.model.as_deref(), Some("grok-4.6"));
+    assert_eq!(saved.effort.as_deref(), Some("high"));
+    assert_eq!(saved.fast, Some(true));
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    for parameters in [
+        &document["selectedModel"]["parameters"],
+        &document["modelParameters"]["grok-4.6"],
+    ] {
+        assert!(
+            parameters
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|parameter| { parameter["id"] == "effort" && parameter["value"] == "high" })
+        );
+        assert!(
+            parameters
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|parameter| { parameter["id"] == "fast" && parameter["value"] == "true" })
+        );
+    }
+}
+
+#[test]
+fn save_request_requires_nullable_fast_key() {
+    let valid = serde_json::json!({
+        "agent": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "max",
+        "fast": null,
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    });
+    assert!(serde_json::from_value::<AgentSettingsSaveRequest>(valid).is_ok());
+    let mut missing = serde_json::json!({
+        "agent": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "max",
+        "fast": null,
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    });
+    for field in ["model", "effort", "fast"] {
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<AgentSettingsSaveRequest>(missing.clone()).is_err());
+        missing[field] = serde_json::Value::Null;
+    }
+    let all_null = serde_json::json!({
+        "agent": "codex",
+        "model": null,
+        "effort": null,
+        "fast": null,
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    });
+    assert!(serde_json::from_value::<AgentSettingsSaveRequest>(all_null).is_ok());
 }

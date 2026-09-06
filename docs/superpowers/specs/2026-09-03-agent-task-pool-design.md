@@ -277,7 +277,7 @@ At most one runner per configured worker waits for capacity at any time. Younger
 
 The runner's lifetime is the capacity wait plus the turn: it exits after recording the terminal outcome and importing the result, after the turn is `lost`, after a pre-acceptance failure has been resolved or abandoned, or when the local task record says the task was cancelled before acceptance. It holds no lock while waiting for capacity, during SSH, or during Git transport.
 
-The runner never decides task state on its own: it records what the worker reported. A killed runner leaves the remote turn untouched. Recovery is cooperative and lock-protected, and it runs only in mutating commands: `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and the explicit `worker task reconcile`. Each of these first refreshes the tasks it is about to act on from their recorded workers, re-owns dead-owner rows, re-enqueues `queued` tasks whose row is missing, and starts a replacement runner for any waiting row or active turn that has no live runner, within the per-worker cap. `worker task wait` does this on every poll, so a batch that outlived its submitting shell still completes. `list`, `status`, `result`, `diff`, `logs`, and the dashboard never mutate anything and never start a process; they show a dead runner as `dead` and a stale row as stale. No process is ever started for a task that is `open`, `closed`, `abandoned`, or `lost`.
+The runner never decides task state on its own: it records what the worker reported. A killed runner leaves the remote turn untouched. Recovery is cooperative and lock-protected, and it runs only in mutating commands: `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and the explicit `worker task reconcile`. Each of these first refreshes the tasks it is about to act on from their recorded workers, re-owns dead-owner rows, re-enqueues `queued` tasks whose row is missing, and starts a replacement runner for any waiting row or active turn that has no live runner, within the per-worker cap. `worker task wait` does this on every poll, so a batch that outlived its submitting shell still completes. `list`, `status`, `result`, `diff`, `logs`, and dashboard task views never mutate task state or start a process; they show a dead runner as `dead` and a stale row as stale. The dashboard's authorized native agent-settings save is outside task lifecycle state. No process is ever started for a task that is `open`, `closed`, `abandoned`, or `lost`.
 
 With `--wait`, the foreground command performs the runner's work itself and additionally follows the event log; it is the row's owner for that turn.
 
@@ -597,7 +597,7 @@ The dashboard projection gains, under the existing read-only and loopback rules:
 - task detail replaces raw stdout with the normalized event timeline, keeps the raw log, and adds a result card with summary, questions, files changed, and the exact `fetch` command;
 - the log panel polls once per second while a turn is active, as in the dashboard design.
 
-Dashboard cancel and any mutating control remain deferred, as the dashboard design requires. `worker task list --json` and the snapshot endpoint share one projection, so the orchestrating agent and the browser see identical state.
+Dashboard task cancellation and other task-lifecycle mutating controls remain deferred, as the dashboard design requires. The native model, effort, and Fast Settings Save operation is already authorized and remains available as a separate settings operation; it changes the selected agent's native defaults without changing task state. `worker task list --json` and the snapshot endpoint share one projection, so the orchestrating agent and the browser see identical state.
 
 ## 20. Verification strategy
 
@@ -661,7 +661,7 @@ Each of these requires its own review before implementation:
 - **Interactive mode.** A turn that runs the agent's TUI inside a Herdr pane on the worker, attachable with Herdr's remote session support, so the user can type to the agent and answer its prompts. It trades the exit-code completion signal for Herdr's heuristic agent states and weakens limits; it must be an explicit `--interactive` flag, never a default.
 - **Long-lived Claude turns.** Claude Code accepts streaming JSON input, so one process could stay alive across follow-ups and accept messages while working. This changes the "no message into a running agent" rule and is deferred until the turn model is proven.
 - **Merge request creation** by mac-worker after `push`.
-- **Dashboard cancel** and other mutating controls, under the dashboard design's token and same-origin requirements.
+- **Dashboard task cancel** and other task-lifecycle mutating controls, under the dashboard design's token and same-origin requirements. The native model, effort, and Fast Settings Save operation is already authorized and is outside this deferral.
 - **Non-loopback dashboard access**, for example over Tailscale, for watching long runs from another device.
 - **Multiple slots per worker** for lighter agent workloads.
 

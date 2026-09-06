@@ -71,7 +71,7 @@ Without `--wait`, `submit`, `batch`, and `say` return as soon as the task record
 
 The current release accepts `source = local|origin` and `publish = fetch|push`; `--publish-branch` is valid only with `push`, and a `--wip` base cannot push (`PUBLISH_REQUIRES_COMMITTED_BASE`). Agents on this pool:
 
-- `codex`: pass `--model gpt-5.6-luna --effort max`. The effort reaches Codex as `-c model_reasoning_effort="max"`; without the flag the worker's own Codex configuration decides. Only Codex reads it — the other agents ignore it.
+- `codex`: pass `--model gpt-6-astra --effort xhigh` (the pool default; the workers' own Codex configuration is set to the same values). The effort reaches Codex as `-c model_reasoning_effort="xhigh"`; without the flag the worker's own Codex configuration decides. Only Codex reads it — the other agents ignore it.
 - `opencode`: no model flag uses the worker's default (OpenCode Zen, Muse Spark 1.3, free); OpenCode Go models are `--model opencode-go/<model>`.
 - `cursor`: always `--env-profile agents`; that worker-side profile carries the Cursor login and the login-keychain unlock. Never read or copy it.
 - `claude`: deferred on the workers by operator decision; do not submit it until the operator enables it.

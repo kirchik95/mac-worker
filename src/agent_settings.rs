@@ -25,15 +25,28 @@ use crate::rooted_fs::RootedDir;
 pub const SETTINGS_AGENT_IDS: [&str; 4] = ["codex", "cursor", "opencode", "claude"];
 pub const MAX_SETTINGS_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_SETTINGS_MODEL_BYTES: usize = 256;
+pub const MAX_SETTINGS_LABEL_BYTES: usize = 256;
 pub const MAX_SETTINGS_EFFORT_BYTES: usize = 32;
+pub const MAX_SETTINGS_MODEL_OPTIONS: usize = 64;
+pub const MAX_SETTINGS_EFFORT_OPTIONS: usize = 32;
 pub const MAX_SETTINGS_REVISION_BYTES: usize = 128;
+pub const MAX_OPENCODE_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 
 // Cursor exposes effort as a model-specific parameter but the installed CLI
 // does not publish a stable global enum.  Keep the current value readable and
-// leave the field uneditable until a connected model advertises its choices.
+// only advertise values found in the native remembered-model cache.
 const CURSOR_EFFORT_OPTIONS: &[&str] = &[];
 const CLAUDE_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const MISSING_REVISION_MARKER: &[u8] = b"mac-worker-agent-settings-missing-v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOption {
+    pub id: String,
+    pub label: String,
+    pub effort_options: Vec<String>,
+    pub fast_supported: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +55,9 @@ pub struct AgentDefaultSettings {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub effort_options: Vec<String>,
+    pub model_options: Vec<ModelOption>,
+    pub fast: Option<bool>,
+    pub fast_supported: bool,
     pub source: String,
     pub revision: Option<String>,
     pub writable: bool,
@@ -59,6 +75,7 @@ pub struct AgentSettingsSaveRequest {
     pub agent: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub fast: Option<bool>,
     pub revision: String,
 }
 
@@ -71,8 +88,12 @@ impl<'de> Deserialize<'de> for AgentSettingsSaveRequest {
         #[serde(deny_unknown_fields)]
         struct Wire {
             agent: String,
+            #[serde(default, deserialize_with = "deserialize_present_nullable")]
             model: Option<Option<String>>,
+            #[serde(default, deserialize_with = "deserialize_present_nullable")]
             effort: Option<Option<String>>,
+            #[serde(default, deserialize_with = "deserialize_present_nullable")]
+            fast: Option<Option<bool>>,
             revision: String,
         }
 
@@ -83,13 +104,25 @@ impl<'de> Deserialize<'de> for AgentSettingsSaveRequest {
         let effort = wire
             .effort
             .ok_or_else(|| serde::de::Error::missing_field("effort"))?;
+        let fast = wire
+            .fast
+            .ok_or_else(|| serde::de::Error::missing_field("fast"))?;
         Ok(Self {
             agent: wire.agent,
             model,
             effort,
+            fast,
             revision: wire.revision,
         })
     }
+}
+
+fn deserialize_present_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -190,18 +223,26 @@ impl NativeAgentSettingsStore {
         let source = read_source(&path)?;
         let revision = Some(source_revision(kind.id(), source.as_deref()));
         let writable = source_writable(&path, source.as_deref());
-        let (model, effort, mut message) = match source.as_deref() {
+        let (model, effort, fast, mut message) = match source.as_deref() {
             None => (
+                None,
                 None,
                 None,
                 Some("native configuration file is not present".to_owned()),
             ),
             Some(bytes) => {
                 let values = self.parse_values(kind, bytes)?;
-                (values.model, values.effort, values.message)
+                (values.model, values.effort, values.fast, values.message)
             }
         };
-        let effort_options = self.effort_options(kind, model.as_deref());
+        let model_options = self.model_options(kind, model.as_deref());
+        let selected_option = model
+            .as_deref()
+            .and_then(|model| model_options.iter().find(|option| option.id == model));
+        let effort_options = selected_option
+            .map(|option| option.effort_options.clone())
+            .unwrap_or_else(|| self.effort_options(kind, model.as_deref()));
+        let fast_supported = selected_option.is_some_and(|option| option.fast_supported);
         if message.is_none()
             && kind == AgentKind::Codex
             && model.is_some()
@@ -220,6 +261,9 @@ impl NativeAgentSettingsStore {
             model,
             effort,
             effort_options,
+            model_options,
+            fast,
+            fast_supported,
             source: kind.source().to_owned(),
             revision,
             writable,
@@ -245,7 +289,11 @@ impl NativeAgentSettingsStore {
         if request.revision != initial_revision {
             return Err(AgentSettingsError::conflict());
         }
-        if initial.is_none() && request.model.is_none() && request.effort.is_none() {
+        if initial.is_none()
+            && request.model.is_none()
+            && request.effort.is_none()
+            && request.fast.is_none()
+        {
             return self.read(kind.id());
         }
         ensure_parent_chain(&path)?;
@@ -270,18 +318,21 @@ impl NativeAgentSettingsStore {
             .as_deref()
             .or_else(|| parsed.as_ref().and_then(|values| values.model.as_deref()));
         let effort_options = self.effort_options(kind, target_model);
-        let unchanged_cursor_effort = kind == AgentKind::Cursor
-            && request.model.as_deref()
-                == parsed.as_ref().and_then(|values| values.model.as_deref())
+        let unchanged_effort = request.model.as_deref()
+            == parsed.as_ref().and_then(|values| values.model.as_deref())
             && request.effort.as_deref()
                 == parsed.as_ref().and_then(|values| values.effort.as_deref());
         if request.effort.as_deref().is_some_and(|effort| {
-            !effort_options.iter().any(|value| value == effort) && !unchanged_cursor_effort
+            !effort_options.iter().any(|value| value == effort) && !unchanged_effort
         }) {
             return Err(AgentSettingsError::invalid(
                 "requested effort is not supported by this native agent",
             ));
         }
+        let unchanged_fast = request.model.as_deref()
+            == parsed.as_ref().and_then(|values| values.model.as_deref())
+            && request.fast == parsed.as_ref().and_then(|values| values.fast);
+        self.validate_fast_request(kind, target_model, request.fast, unchanged_fast)?;
 
         let replacement = match current.as_deref() {
             Some(bytes) => self.edit_source(kind, bytes, request)?,
@@ -296,6 +347,7 @@ impl NativeAgentSettingsStore {
     fn effort_options(&self, kind: AgentKind, model: Option<&str>) -> Vec<String> {
         match kind {
             AgentKind::Codex => self.codex_effort_options(model),
+            AgentKind::Cursor => self.cursor_effort_options(model),
             _ => kind.static_effort_options(),
         }
     }
@@ -304,45 +356,357 @@ impl NativeAgentSettingsStore {
         let Some(model) = model else {
             return Vec::new();
         };
-        let path = self.home.join(".codex/models_cache.json");
-        let Ok(Some(bytes)) = read_source(&path) else {
+        self.codex_model_options(Some(model))
+            .into_iter()
+            .find(|option| option.id == model)
+            .map(|option| option.effort_options)
+            .unwrap_or_default()
+    }
+
+    fn cursor_effort_options(&self, model: Option<&str>) -> Vec<String> {
+        let Some(model) = model else {
             return Vec::new();
         };
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            return Vec::new();
-        };
-        let Some(models) = value.get("models").and_then(serde_json::Value::as_array) else {
-            return Vec::new();
-        };
-        let Some(model_entry) = models
-            .iter()
-            .find(|entry| entry.get("slug").and_then(serde_json::Value::as_str) == Some(model))
-        else {
-            return Vec::new();
-        };
-        let Some(levels) = model_entry
-            .get("supported_reasoning_levels")
-            .and_then(serde_json::Value::as_array)
-        else {
-            return Vec::new();
-        };
-        let mut options = Vec::new();
-        for level in levels {
-            let value = level
-                .as_str()
-                .or_else(|| level.get("effort").and_then(serde_json::Value::as_str));
-            let Some(value) = value else { continue };
-            if value.is_empty()
-                || value.len() > MAX_SETTINGS_EFFORT_BYTES
-                || value
-                    .chars()
-                    .any(|character| character.is_control() || character.is_whitespace())
-                || options.iter().any(|candidate| candidate == value)
-            {
-                continue;
-            }
-            options.push(value.to_owned());
+        self.cursor_model_options(Some(model))
+            .into_iter()
+            .find(|option| option.id == model)
+            .map(|option| option.effort_options)
+            .unwrap_or_default()
+    }
+
+    fn model_options(&self, kind: AgentKind, current_model: Option<&str>) -> Vec<ModelOption> {
+        match kind {
+            AgentKind::Codex => self.codex_model_options(current_model),
+            AgentKind::Cursor => self.cursor_model_options(current_model),
+            AgentKind::Opencode => self.opencode_model_options(current_model),
+            AgentKind::Claude => self.claude_model_options(current_model),
         }
+    }
+
+    fn validate_fast_request(
+        &self,
+        kind: AgentKind,
+        model: Option<&str>,
+        fast: Option<bool>,
+        unchanged: bool,
+    ) -> Result<(), AgentSettingsError> {
+        if fast != Some(true) {
+            return Ok(());
+        }
+        if unchanged {
+            return Ok(());
+        }
+        if matches!(kind, AgentKind::Opencode | AgentKind::Claude) {
+            return Err(AgentSettingsError::invalid(
+                "requested fast mode is not supported by this native agent",
+            ));
+        }
+        let supported = model
+            .and_then(|model| {
+                self.model_options(kind, Some(model))
+                    .into_iter()
+                    .find(|option| option.id == model)
+            })
+            .is_some_and(|option| option.fast_supported);
+        if supported {
+            Ok(())
+        } else {
+            Err(AgentSettingsError::invalid(
+                "requested fast mode is not supported by this model",
+            ))
+        }
+    }
+
+    fn codex_model_options(&self, current_model: Option<&str>) -> Vec<ModelOption> {
+        let path = self.home.join(".codex/models_cache.json");
+        let Some(value) = read_catalog_value(&path, MAX_SETTINGS_SOURCE_BYTES) else {
+            return current_model
+                .filter(|model| validate_catalog_id(model))
+                .map(|model| {
+                    vec![ModelOption {
+                        id: model.to_owned(),
+                        label: model.to_owned(),
+                        effort_options: Vec::new(),
+                        fast_supported: false,
+                    }]
+                })
+                .unwrap_or_default();
+        };
+        let all = catalog_entries_from_value(&value, false, false);
+        let visible = finalize_catalog(catalog_entries_from_value(&value, true, false), true);
+        let mut options = visible;
+        if let Some(model) = current_model
+            && !options.iter().any(|option| option.id == model)
+        {
+            let fallback = all
+                .into_iter()
+                .find(|entry| entry.option.id == model)
+                .map(|entry| entry.option)
+                .unwrap_or_else(|| ModelOption {
+                    id: model.to_owned(),
+                    label: model.to_owned(),
+                    effort_options: Vec::new(),
+                    fast_supported: false,
+                });
+            if options.len() >= MAX_SETTINGS_MODEL_OPTIONS {
+                options.pop();
+            }
+            options.push(fallback);
+        }
+        options
+    }
+
+    fn cursor_model_options(&self, current_model: Option<&str>) -> Vec<ModelOption> {
+        let path = self.home.join(".cursor/cli-config.json");
+        let Some(bytes) = read_source(&path).ok().flatten() else {
+            return current_model
+                .filter(|model| validate_catalog_id(model))
+                .map(|model| {
+                    vec![ModelOption {
+                        id: model.to_owned(),
+                        label: model.to_owned(),
+                        effort_options: Vec::new(),
+                        fast_supported: false,
+                    }]
+                })
+                .unwrap_or_default();
+        };
+        let Ok(value) = parse_unique_json(&bytes) else {
+            return Vec::new();
+        };
+        let root = &value.0;
+        let mut entries = catalog_entries_from_value(root, false, true);
+        let root_object = root.as_object();
+        let selected_capabilities = root_object
+            .and_then(|object| object.get("selectedModel"))
+            .and_then(|selected| selected.get("parameters"))
+            .map(|parameters| {
+                (
+                    model_effort_options(parameters, true),
+                    fast_supported_from_value(parameters),
+                )
+            });
+        if let Some(model) = current_model
+            && let Some(details) =
+                root_object
+                    .and_then(|object| object.get("model"))
+                    .filter(|details| {
+                        details.get("modelId").and_then(serde_json::Value::as_str) == Some(model)
+                    })
+            && let Some(entry) = catalog_entry(details, Some(model), false, true, 0)
+        {
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|existing| existing.option.id == model)
+            {
+                existing.option.label = entry.option.label;
+            } else {
+                entries.push(CatalogEntry {
+                    order: usize::MAX,
+                    ..entry
+                });
+            }
+        }
+        if let Some(model) = current_model
+            && let Some((efforts, fast_supported)) = selected_capabilities
+        {
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|existing| existing.option.id == model)
+            {
+                for effort in efforts {
+                    push_effort(&mut existing.option.effort_options, &effort, true);
+                }
+                existing.option.fast_supported |= fast_supported;
+            } else {
+                entries.push(CatalogEntry {
+                    option: ModelOption {
+                        id: model.to_owned(),
+                        label: model.to_owned(),
+                        effort_options: efforts,
+                        fast_supported,
+                    },
+                    priority: None,
+                    order: usize::MAX,
+                });
+            }
+        }
+        let current_fallback = current_model.and_then(|model| {
+            entries
+                .iter()
+                .find(|entry| entry.option.id == model)
+                .map(|entry| entry.option.clone())
+        });
+        let mut options = finalize_catalog(entries, false);
+        if let Some(model) = current_model
+            && !options.iter().any(|option| option.id == model)
+        {
+            if options.len() >= MAX_SETTINGS_MODEL_OPTIONS {
+                options.pop();
+            }
+            options.push(current_fallback.unwrap_or_else(|| ModelOption {
+                id: model.to_owned(),
+                label: model.to_owned(),
+                effort_options: Vec::new(),
+                fast_supported: false,
+            }));
+        }
+        options.truncate(MAX_SETTINGS_MODEL_OPTIONS);
+        options
+    }
+
+    fn opencode_model_options(&self, current_model: Option<&str>) -> Vec<ModelOption> {
+        let cache = self.home.join(".cache/opencode/models.json");
+        let Some(value) = read_catalog_value(&cache, MAX_OPENCODE_CATALOG_BYTES) else {
+            return current_model
+                .filter(|model| validate_catalog_id(model))
+                .map(|model| {
+                    vec![ModelOption {
+                        id: model.to_owned(),
+                        label: model.to_owned(),
+                        effort_options: Vec::new(),
+                        fast_supported: false,
+                    }]
+                })
+                .unwrap_or_default();
+        };
+        let configured_provider =
+            current_model.and_then(|model| model.split_once('/').map(|(provider, _)| provider));
+        let provider = configured_provider.or_else(|| value.get("opencode").map(|_| "opencode"));
+        let Some(provider) = provider else {
+            return current_model
+                .filter(|model| validate_catalog_id(model))
+                .map(|model| {
+                    vec![ModelOption {
+                        id: model.to_owned(),
+                        label: model.to_owned(),
+                        effort_options: Vec::new(),
+                        fast_supported: false,
+                    }]
+                })
+                .unwrap_or_default();
+        };
+        let Some(models) = value
+            .get(provider)
+            .and_then(|provider| provider.get("models"))
+        else {
+            return current_model
+                .filter(|model| validate_catalog_id(model))
+                .map(|model| {
+                    vec![ModelOption {
+                        id: model.to_owned(),
+                        label: model.to_owned(),
+                        effort_options: Vec::new(),
+                        fast_supported: false,
+                    }]
+                })
+                .unwrap_or_default();
+        };
+        let mut entries = Vec::new();
+        if let Some(models) = models.as_object() {
+            for (id, metadata) in models.iter().take(MAX_SETTINGS_MODEL_OPTIONS * 2) {
+                let mut entry = catalog_entry(metadata, Some(id), false, false, entries.len());
+                if let Some(entry) = entry.as_mut() {
+                    // OpenCode's cache uses provider-local IDs.  Match the
+                    // configured provider/model shape when the caller uses it.
+                    let qualified_id = format!("{provider}/{}", entry.option.id);
+                    if !validate_catalog_id(&qualified_id) {
+                        continue;
+                    }
+                    entry.option.id = qualified_id;
+                    // OpenCode exposes reasoning metadata, but this native
+                    // settings surface has no global effort override to save.
+                    entry.option.effort_options.clear();
+                    entry.option.fast_supported = false;
+                    entries.push(entry.clone());
+                }
+            }
+        }
+        let current_fallback = current_model.and_then(|model| {
+            entries
+                .iter()
+                .find(|entry| entry.option.id == model)
+                .map(|entry| entry.option.clone())
+        });
+        let mut options = finalize_catalog(entries, false);
+        if let Some(model) = current_model
+            && !options.iter().any(|option| option.id == model)
+        {
+            if options.len() >= MAX_SETTINGS_MODEL_OPTIONS {
+                options.pop();
+            }
+            options.push(current_fallback.unwrap_or_else(|| ModelOption {
+                id: model.to_owned(),
+                label: model.to_owned(),
+                effort_options: Vec::new(),
+                fast_supported: false,
+            }));
+        }
+        options.truncate(MAX_SETTINGS_MODEL_OPTIONS);
+        options
+    }
+
+    fn claude_model_options(&self, current_model: Option<&str>) -> Vec<ModelOption> {
+        let mut entries = Vec::new();
+        for (order, (id, label)) in [("fable", "Fable"), ("opus", "Opus"), ("sonnet", "Sonnet")]
+            .into_iter()
+            .enumerate()
+        {
+            entries.push(CatalogEntry {
+                option: ModelOption {
+                    id: id.to_owned(),
+                    label: label.to_owned(),
+                    effort_options: CLAUDE_EFFORT_OPTIONS
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
+                    fast_supported: false,
+                },
+                priority: None,
+                order,
+            });
+        }
+        for candidate in [
+            self.home.join(".claude/models.json"),
+            self.home.join(".claude/model-catalog.json"),
+        ] {
+            if let Some(value) = read_catalog_value(&candidate, MAX_SETTINGS_SOURCE_BYTES) {
+                entries.extend(catalog_entries_from_value(&value, false, false));
+            }
+        }
+        for entry in &mut entries {
+            entry.option.effort_options = CLAUDE_EFFORT_OPTIONS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect();
+            entry.option.fast_supported = false;
+        }
+        let current_fallback = current_model.and_then(|model| {
+            entries
+                .iter()
+                .find(|entry| entry.option.id == model)
+                .map(|entry| entry.option.clone())
+        });
+        let mut options = finalize_catalog(entries, false);
+        if let Some(model) = current_model
+            && !options.iter().any(|option| option.id == model)
+        {
+            if options.len() >= MAX_SETTINGS_MODEL_OPTIONS {
+                options.pop();
+            }
+            options.push(current_fallback.unwrap_or_else(|| {
+                ModelOption {
+                    id: model.to_owned(),
+                    label: model.to_owned(),
+                    effort_options: CLAUDE_EFFORT_OPTIONS
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
+                    fast_supported: false,
+                }
+            }));
+        }
+        options.truncate(MAX_SETTINGS_MODEL_OPTIONS);
         options
     }
 
@@ -358,6 +722,9 @@ impl NativeAgentSettingsStore {
             model: None,
             effort: None,
             effort_options: kind.static_effort_options(),
+            model_options: self.model_options(kind, None),
+            fast: None,
+            fast_supported: false,
             source: kind.source().to_owned(),
             revision,
             writable: false,
@@ -424,9 +791,12 @@ impl NativeAgentSettingsStore {
         };
         Ok(AgentDefaultSettings {
             agent: "opencode".to_owned(),
-            model,
+            model: model.clone(),
             effort: None,
             effort_options: Vec::new(),
+            model_options: self.model_options(AgentKind::Opencode, model.as_deref()),
+            fast: None,
+            fast_supported: false,
             source: AgentKind::Opencode.source().to_owned(),
             revision,
             writable,
@@ -452,6 +822,7 @@ impl NativeAgentSettingsStore {
             && commented.is_none()
             && request.model.is_none()
             && request.effort.is_none()
+            && request.fast != Some(true)
         {
             return self.read_opencode();
         }
@@ -518,7 +889,7 @@ impl NativeAgentSettingsStore {
         kind: AgentKind,
         request: &AgentSettingsSaveRequest,
     ) -> Result<Option<Vec<u8>>, AgentSettingsError> {
-        if request.model.is_none() && request.effort.is_none() {
+        if request.model.is_none() && request.effort.is_none() && request.fast != Some(true) {
             return Ok(None);
         }
         let empty = match kind {
@@ -533,7 +904,368 @@ impl NativeAgentSettingsStore {
 struct ParsedValues {
     model: Option<String>,
     effort: Option<String>,
+    fast: Option<bool>,
     message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CatalogEntry {
+    option: ModelOption,
+    priority: Option<i64>,
+    order: usize,
+}
+
+fn finalize_catalog(mut entries: Vec<CatalogEntry>, priority_order: bool) -> Vec<ModelOption> {
+    if priority_order {
+        entries.sort_by(|left, right| {
+            left.priority
+                .is_none()
+                .cmp(&right.priority.is_none())
+                .then_with(|| left.priority.cmp(&right.priority))
+                .then_with(|| left.order.cmp(&right.order))
+        });
+    } else {
+        entries.sort_by_key(|entry| entry.order);
+    }
+    let mut options = Vec::new();
+    for entry in entries {
+        if options
+            .iter()
+            .any(|option: &ModelOption| option.id == entry.option.id)
+        {
+            continue;
+        }
+        options.push(entry.option);
+        if options.len() >= MAX_SETTINGS_MODEL_OPTIONS {
+            break;
+        }
+    }
+    options
+}
+
+fn catalog_text(value: Option<&serde_json::Value>, max_bytes: usize) -> Option<String> {
+    let value = value?.as_str()?;
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value
+            .chars()
+            .any(|character| character.is_control() || character == '\n' || character == '\r')
+        || value.trim().is_empty()
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn catalog_model_id(entry: &serde_json::Value, fallback: Option<&str>) -> Option<String> {
+    let object = entry.as_object();
+    ["slug", "id", "modelId", "model_id", "model"]
+        .iter()
+        .find_map(|key| {
+            object.and_then(|object| catalog_text(object.get(*key), MAX_SETTINGS_MODEL_BYTES))
+        })
+        .or_else(|| fallback.and_then(|value| validate_catalog_id(value).then(|| value.to_owned())))
+}
+
+fn validate_catalog_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SETTINGS_MODEL_BYTES
+        && value
+            .chars()
+            .all(|character| !character.is_control() && character != '\n' && character != '\r')
+        && !value.trim().is_empty()
+}
+
+fn catalog_label(entry: &serde_json::Value, id: &str, cursor: bool) -> String {
+    let label = entry
+        .as_object()
+        .and_then(|object| {
+            ["display_name", "displayName", "label", "name"]
+                .iter()
+                .find_map(|key| catalog_text(object.get(*key), MAX_SETTINGS_LABEL_BYTES))
+        })
+        .unwrap_or_else(|| id.to_owned());
+    if cursor {
+        cursor_label(id, &label)
+    } else {
+        label
+    }
+}
+
+fn cursor_label(id: &str, label: &str) -> String {
+    // Cursor persists dynamic effort/speed suffixes in displayName.  Keep a
+    // stable, bounded label when one is present, and otherwise use the model
+    // id so a later parameter edit cannot leave stale UI text behind.
+    let mut stable = label.to_owned();
+    for suffix in [" High Fast", " High", " Fast", " Low", " Medium", " Max"] {
+        if let Some(prefix) = stable.strip_suffix(suffix) {
+            stable = prefix.trim_end().to_owned();
+            break;
+        }
+    }
+    if stable.is_empty() || stable == label || stable.len() > MAX_SETTINGS_LABEL_BYTES {
+        if label == id || label.contains(" High") || label.contains(" Fast") {
+            id.to_owned()
+        } else {
+            label.chars().take(MAX_SETTINGS_LABEL_BYTES).collect()
+        }
+    } else {
+        stable
+    }
+}
+
+fn push_effort(options: &mut Vec<String>, value: &str, cursor: bool) {
+    if value.is_empty()
+        || value.len() > MAX_SETTINGS_EFFORT_BYTES
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || (cursor && !cursor_effort_is_verified(value))
+        || options.iter().any(|candidate| candidate == value)
+        || options.len() >= MAX_SETTINGS_EFFORT_OPTIONS
+    {
+        return;
+    }
+    options.push(value.to_owned());
+}
+
+fn cursor_effort_is_verified(value: &str) -> bool {
+    matches!(value, "low" | "medium" | "high" | "xhigh" | "max" | "ultra")
+}
+
+fn effort_options_from_value(value: &serde_json::Value, cursor: bool) -> Vec<String> {
+    let mut options = Vec::new();
+    if let Some(array) = value.as_array() {
+        for item in array {
+            if let Some(item) = item.as_str() {
+                push_effort(&mut options, item, cursor);
+                continue;
+            }
+            let Some(object) = item.as_object() else {
+                continue;
+            };
+            if object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value != "effort")
+            {
+                continue;
+            }
+            for key in ["effort", "value"] {
+                if let Some(item) = object.get(key).and_then(serde_json::Value::as_str) {
+                    push_effort(&mut options, item, cursor);
+                }
+            }
+            for key in ["options", "values", "supported_reasoning_levels"] {
+                if let Some(items) = object.get(key).and_then(serde_json::Value::as_array) {
+                    for item in items {
+                        if let Some(item) = item.as_str() {
+                            push_effort(&mut options, item, cursor);
+                        } else if let Some(item) =
+                            item.get("effort").and_then(serde_json::Value::as_str)
+                        {
+                            push_effort(&mut options, item, cursor);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    options
+}
+
+fn model_effort_options(entry: &serde_json::Value, cursor: bool) -> Vec<String> {
+    let Some(object) = entry.as_object() else {
+        return effort_options_from_value(entry, cursor);
+    };
+    let mut options = Vec::new();
+    for key in [
+        "supported_reasoning_levels",
+        "effort_options",
+        "efforts",
+        "reasoning_levels",
+        "reasoning_options",
+        "parameters",
+    ] {
+        if let Some(value) = object.get(key) {
+            for option in effort_options_from_value(value, cursor) {
+                push_effort(&mut options, &option, cursor);
+            }
+        }
+    }
+    options
+}
+
+fn fast_supported_from_value(value: &serde_json::Value) -> bool {
+    if value.as_array().is_some_and(|parameters| {
+        parameters.iter().any(|parameter| {
+            parameter.get("id").and_then(serde_json::Value::as_str) == Some("fast")
+        })
+    }) {
+        return true;
+    }
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object
+        .get("fast_supported")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    for key in ["additional_speed_tiers", "speed_tiers"] {
+        if object
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| {
+                values.iter().any(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("fast"))
+                })
+            })
+        {
+            return true;
+        }
+    }
+    if object
+        .get("service_tiers")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| {
+            values.iter().any(|value| {
+                value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id.eq_ignore_ascii_case("fast") || id == "priority")
+                    || value
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("fast"))
+            })
+        })
+    {
+        return true;
+    }
+    object
+        .get("parameters")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|parameters| {
+            parameters.iter().any(|parameter| {
+                parameter.get("id").and_then(serde_json::Value::as_str) == Some("fast")
+            })
+        })
+}
+
+fn catalog_entry(
+    entry: &serde_json::Value,
+    fallback_id: Option<&str>,
+    visible_only: bool,
+    cursor: bool,
+    order: usize,
+) -> Option<CatalogEntry> {
+    let object = entry.as_object();
+    if visible_only
+        && object
+            .and_then(|object| object.get("visibility"))
+            .and_then(serde_json::Value::as_str)
+            != Some("list")
+    {
+        return None;
+    }
+    let id = catalog_model_id(entry, fallback_id)?;
+    if !validate_catalog_id(&id) {
+        return None;
+    }
+    let priority = object
+        .and_then(|object| object.get("priority"))
+        .and_then(serde_json::Value::as_i64);
+    Some(CatalogEntry {
+        option: ModelOption {
+            id: id.clone(),
+            label: catalog_label(entry, &id, cursor),
+            effort_options: model_effort_options(entry, cursor),
+            fast_supported: fast_supported_from_value(entry),
+        },
+        priority,
+        order,
+    })
+}
+
+fn catalog_entries_from_value(
+    value: &serde_json::Value,
+    visible_only: bool,
+    cursor: bool,
+) -> Vec<CatalogEntry> {
+    let mut entries = Vec::new();
+    let mut order = 0usize;
+    if let Some(array) = value.as_array() {
+        for entry in array {
+            if let Some(entry) = catalog_entry(entry, None, visible_only, cursor, order) {
+                entries.push(entry);
+            }
+            order = order.saturating_add(1);
+        }
+    }
+    if let Some(object) = value.as_object() {
+        for key in ["models", "catalog", "model_options", "availableModels"] {
+            if let Some(models) = object.get(key) {
+                if let Some(array) = models.as_array() {
+                    for entry in array {
+                        if let Some(entry) = catalog_entry(entry, None, visible_only, cursor, order)
+                        {
+                            entries.push(entry);
+                        }
+                        order = order.saturating_add(1);
+                    }
+                } else if let Some(models) = models.as_object() {
+                    for (id, entry) in models {
+                        if let Some(entry) =
+                            catalog_entry(entry, Some(id), visible_only, cursor, order)
+                        {
+                            entries.push(entry);
+                        }
+                        order = order.saturating_add(1);
+                    }
+                }
+            }
+        }
+        if let Some(parameters) = object
+            .get("modelParameters")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (id, value) in parameters {
+                if let Some(entry) = catalog_entry(value, Some(id), false, true, order) {
+                    entries.push(entry);
+                }
+                order = order.saturating_add(1);
+            }
+        }
+        for key in ["modelParameterKeys", "modelSelectionHistory"] {
+            if let Some(values) = object.get(key).and_then(serde_json::Value::as_array) {
+                for value in values {
+                    if let Some(id) = value.as_str().filter(|id| validate_catalog_id(id))
+                        && let Some(entry) = catalog_entry(
+                            &serde_json::json!({"id": id}),
+                            Some(id),
+                            false,
+                            true,
+                            order,
+                        )
+                    {
+                        entries.push(entry);
+                    }
+                    order = order.saturating_add(1);
+                }
+            }
+        }
+    }
+    entries
+}
+
+fn read_catalog_value(path: &Path, max_bytes: usize) -> Option<serde_json::Value> {
+    let bytes = read_source_limited(path, max_bytes).ok().flatten()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -625,6 +1357,11 @@ pub fn validate_save_request(request: &AgentSettingsSaveRequest) -> Result<(), A
             "requested effort is not supported by this native agent",
         ));
     }
+    if request.fast == Some(true) && matches!(kind, AgentKind::Opencode | AgentKind::Claude) {
+        return Err(AgentSettingsError::invalid(
+            "requested fast mode is not supported by this native agent",
+        ));
+    }
     Ok(())
 }
 
@@ -680,6 +1417,13 @@ fn validate_parsed_values(values: &ParsedValues) -> Result<(), AgentSettingsErro
 }
 
 fn read_source(path: &Path) -> Result<Option<Vec<u8>>, AgentSettingsError> {
+    read_source_limited(path, MAX_SETTINGS_SOURCE_BYTES)
+}
+
+fn read_source_limited(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, AgentSettingsError> {
     if !parent_chain_is_safe(path) {
         return Err(AgentSettingsError::unavailable(
             "native configuration path has an unsafe parent",
@@ -698,17 +1442,17 @@ fn read_source(path: &Path) -> Result<Option<Vec<u8>>, AgentSettingsError> {
                 "native configuration has unsafe ownership or permissions",
             ));
         }
-        if before.size > MAX_SETTINGS_SOURCE_BYTES as u64 {
+        if before.size > max_bytes as u64 {
             return Err(AgentSettingsError::config(
                 "native configuration exceeds the supported size",
             ));
         }
         let mut bytes = Vec::new();
         (&mut file)
-            .take((MAX_SETTINGS_SOURCE_BYTES + 1) as u64)
+            .take((max_bytes + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|_| AgentSettingsError::unavailable("native configuration is unavailable"))?;
-        if bytes.len() > MAX_SETTINGS_SOURCE_BYTES {
+        if bytes.len() > max_bytes {
             return Err(AgentSettingsError::config(
                 "native configuration exceeds the supported size",
             ));
@@ -744,10 +1488,10 @@ fn read_source(path: &Path) -> Result<Option<Vec<u8>>, AgentSettingsError> {
             .map_err(|_| AgentSettingsError::unavailable("native configuration is unavailable"))?;
         let mut bytes = Vec::new();
         (&mut file)
-            .take((MAX_SETTINGS_SOURCE_BYTES + 1) as u64)
+            .take((max_bytes + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|_| AgentSettingsError::unavailable("native configuration is unavailable"))?;
-        if bytes.len() > MAX_SETTINGS_SOURCE_BYTES {
+        if bytes.len() > max_bytes {
             return Err(AgentSettingsError::config(
                 "native configuration exceeds the supported size",
             ));
@@ -1454,9 +2198,11 @@ fn parse_codex(bytes: &[u8]) -> Result<ParsedValues, AgentSettingsError> {
         .ok_or_else(|| AgentSettingsError::config("native configuration is malformed"))?;
     let model = optional_toml_string(table.get("model"))?;
     let effort = optional_toml_string(table.get("model_reasoning_effort"))?;
+    let fast = codex_fast_value(table.get("service_tier"))?;
     Ok(ParsedValues {
         model,
         effort,
+        fast,
         message: None,
     })
 }
@@ -1470,6 +2216,20 @@ fn optional_toml_string(value: Option<&toml::Value>) -> Result<Option<String>, A
                 .ok_or_else(|| AgentSettingsError::config("native setting has an unsupported type"))
         })
         .transpose()
+}
+
+fn codex_fast_value(value: Option<&toml::Value>) -> Result<Option<bool>, AgentSettingsError> {
+    let Some(value) = value else { return Ok(None) };
+    let Some(value) = value.as_str() else {
+        return Err(AgentSettingsError::config(
+            "native setting has an unsupported type",
+        ));
+    };
+    Ok(match value {
+        "fast" | "priority" => Some(true),
+        "standard" | "default" => Some(false),
+        _ => None,
+    })
 }
 
 fn parse_json_agent(bytes: &[u8], _claude: bool) -> Result<ParsedValues, AgentSettingsError> {
@@ -1489,6 +2249,7 @@ fn parse_json_agent(bytes: &[u8], _claude: bool) -> Result<ParsedValues, AgentSe
     Ok(ParsedValues {
         model,
         effort,
+        fast: None,
         message: None,
     })
 }
@@ -1554,9 +2315,31 @@ fn parse_cursor(bytes: &[u8]) -> Result<ParsedValues, AgentSettingsError> {
         (Some(value), _) | (_, Some(value)) => Some(value),
         _ => None,
     };
+    let selected_fast = selected_parameter_bool(object.get("selectedModel"), "fast")?;
+    let model_fast = model
+        .as_deref()
+        .map(|model| {
+            let values = object
+                .get("modelParameters")
+                .and_then(|value| value.as_object())
+                .and_then(|values| values.get(model));
+            cached_parameter_bool(values, "fast")
+        })
+        .transpose()?
+        .flatten();
+    let fast = match (selected_fast, model_fast) {
+        (Some(left), Some(right)) if left != right => {
+            return Err(AgentSettingsError::config(
+                "native fast selection is ambiguous",
+            ));
+        }
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        _ => None,
+    };
     Ok(ParsedValues {
         model,
         effort,
+        fast,
         message: None,
     })
 }
@@ -1590,6 +2373,79 @@ fn cached_parameter(
     value: Option<&serde_json::Value>,
 ) -> Result<Option<String>, AgentSettingsError> {
     parameter_effort(value)
+}
+
+fn selected_parameter_bool(
+    value: Option<&serde_json::Value>,
+    id: &str,
+) -> Result<Option<bool>, AgentSettingsError> {
+    let Some(value) = value else { return Ok(None) };
+    let Some(object) = value.as_object() else {
+        return Err(AgentSettingsError::config(
+            "native model selection has an unsupported type",
+        ));
+    };
+    parameter_bool(object.get("parameters"), id)
+}
+
+fn cached_parameter_bool(
+    value: Option<&serde_json::Value>,
+    id: &str,
+) -> Result<Option<bool>, AgentSettingsError> {
+    parameter_bool(value, id)
+}
+
+fn parameter_bool(
+    value: Option<&serde_json::Value>,
+    id: &str,
+) -> Result<Option<bool>, AgentSettingsError> {
+    let Some(value) = value else { return Ok(None) };
+    let Some(parameters) = value.as_array() else {
+        return Err(AgentSettingsError::config(
+            "native model parameters have an unsupported type",
+        ));
+    };
+    let mut selected = None;
+    for parameter in parameters {
+        let Some(parameter) = parameter.as_object() else {
+            return Err(AgentSettingsError::config(
+                "native model parameters have an unsupported type",
+            ));
+        };
+        if parameter.get("id").and_then(serde_json::Value::as_str) != Some(id) {
+            continue;
+        }
+        if selected.is_some() {
+            return Err(AgentSettingsError::config(
+                "native fast selection is ambiguous",
+            ));
+        }
+        selected = Some(optional_json_bool(parameter.get("value"))?.ok_or_else(|| {
+            AgentSettingsError::config("native model parameters have an unsupported type")
+        })?);
+    }
+    Ok(selected)
+}
+
+fn optional_json_bool(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<bool>, AgentSettingsError> {
+    let Some(value) = value else { return Ok(None) };
+    if let Some(value) = value.as_bool() {
+        return Ok(Some(value));
+    }
+    if let Some(value) = value.as_str() {
+        return match value {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            _ => Err(AgentSettingsError::config(
+                "native model parameters have an unsupported type",
+            )),
+        };
+    }
+    Err(AgentSettingsError::config(
+        "native model parameters have an unsupported type",
+    ))
 }
 
 fn parameter_effort(
@@ -1631,11 +2487,29 @@ fn edit_codex(
 ) -> Result<Vec<u8>, AgentSettingsError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| AgentSettingsError::config("native configuration is not valid UTF-8"))?;
-    let _: toml::Value = toml::from_str(text)
+    let value: toml::Value = toml::from_str(text)
         .map_err(|_| AgentSettingsError::config("native configuration is malformed"))?;
     let text = edit_toml_key(text, "model", request.model.as_deref())?;
     let text = edit_toml_key(&text, "model_reasoning_effort", request.effort.as_deref())?;
+    let current_tier = value
+        .get("service_tier")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    let tier = match request.fast {
+        Some(true) => Some("fast"),
+        Some(false) | None if current_tier.as_deref().is_some_and(codex_known_tier) => None,
+        Some(false) | None => current_tier.as_deref(),
+    };
+    let text = if tier != current_tier.as_deref() {
+        edit_toml_key(&text, "service_tier", tier)?
+    } else {
+        text
+    };
     Ok(text.into_bytes())
+}
+
+fn codex_known_tier(value: &str) -> bool {
+    matches!(value, "fast" | "priority" | "standard" | "default")
 }
 
 fn edit_toml_key(text: &str, key: &str, value: Option<&str>) -> Result<String, AgentSettingsError> {
@@ -1931,12 +2805,14 @@ fn edit_cursor(
         &["selectedModel", "parameters"],
         request.effort.as_deref(),
     )?;
+    text = json_set_fast_parameter(&text, &["selectedModel", "parameters"], request.fast)?;
     if let Some(model) = request.model.as_deref() {
         text = json_set_parameter(
             &text,
             &["modelParameters", model],
             request.effort.as_deref(),
         )?;
+        text = json_set_fast_parameter(&text, &["modelParameters", model], request.fast)?;
     }
     Ok(text.into_bytes())
 }
@@ -1959,6 +2835,7 @@ fn cursor_model_parameters_raw(
     let raw = text[array.span.start..array.span.end].to_owned();
     let parsed = parse_unique_json(raw.as_bytes())?;
     let _ = parameter_effort(Some(&parsed.0))?;
+    let _ = cached_parameter_bool(Some(&parsed.0), "fast")?;
     Ok(Some(raw))
 }
 
@@ -2245,8 +3122,58 @@ fn json_set_parameter(
     path: &[&str],
     value: Option<&str>,
 ) -> Result<String, AgentSettingsError> {
-    let Some(array) = find_array(text, path)? else {
-        return Ok(text.to_owned());
+    let value = value.map(|value| JsonParameterValue::String(value.to_owned()));
+    json_set_parameter_value(text, path, "effort", value, false)
+}
+
+fn json_set_fast_parameter(
+    text: &str,
+    path: &[&str],
+    value: Option<bool>,
+) -> Result<String, AgentSettingsError> {
+    let value = value.map(JsonParameterValue::Bool);
+    // Cursor's persisted toggle uses the strings "true"/"false".  Existing
+    // boolean fixtures remain compatible because updates preserve the current
+    // value type when one is already present.
+    json_set_parameter_value(text, path, "fast", value, true)
+}
+
+enum JsonParameterValue {
+    String(String),
+    Bool(bool),
+}
+
+fn json_set_parameter_value(
+    text: &str,
+    path: &[&str],
+    id: &str,
+    value: Option<JsonParameterValue>,
+    bool_default_string: bool,
+) -> Result<String, AgentSettingsError> {
+    let array = match find_array(text, path)? {
+        Some(array) => array,
+        None => {
+            let parent_path = path
+                .split_last()
+                .map(|(_, parent)| parent)
+                .unwrap_or_default();
+            let key_exists = find_object(text, parent_path)?.is_some_and(|object| {
+                object
+                    .fields
+                    .iter()
+                    .any(|field| field.key == path[path.len() - 1])
+            });
+            if key_exists {
+                return Err(AgentSettingsError::config(
+                    "native model parameters have an unsupported type",
+                ));
+            }
+            if value.is_none() {
+                return Ok(text.to_owned());
+            }
+            let created = json_set_path_raw(text, path, Some("[]"))?;
+            return json_set_parameter_value(&created, path, id, value, bool_default_string);
+        }
     };
     let mut parameter = None;
     for (index, element) in array.elements.iter().enumerate() {
@@ -2259,7 +3186,7 @@ fn json_set_parameter(
             .find(|field| field.key == "id")
             .and_then(|field| json_string_value(text, field.value).ok().flatten())
             .as_deref()
-            == Some("effort")
+            == Some(id)
         {
             parameter = Some((index, object));
             break;
@@ -2268,12 +3195,26 @@ fn json_set_parameter(
     if let Some((index, object)) = parameter {
         if let Some(field) = object.fields.iter().find(|field| field.key == "value") {
             return match value {
-                Some(value) => Ok(json_replace(text, field.value, &json_string(value))),
+                Some(value) => Ok(json_replace(
+                    text,
+                    field.value,
+                    &json_parameter_value(text, field.value, value, bool_default_string),
+                )),
                 None => json_remove_array_element(text, &array, index),
             };
         }
         if let Some(value) = value {
-            return json_insert_field(text, &object, "value", &json_string(value));
+            return json_insert_field(
+                text,
+                &object,
+                "value",
+                &json_parameter_value(
+                    text,
+                    JsonSpan { start: 0, end: 0 },
+                    value,
+                    bool_default_string,
+                ),
+            );
         }
         return json_remove_array_element(text, &array, index);
     }
@@ -2283,8 +3224,46 @@ fn json_set_parameter(
     json_insert_array_element(
         text,
         &array,
-        &format!("{{\"id\":\"effort\",\"value\":{}}}", json_string(value)),
+        &format!(
+            "{{\"id\":{},\"value\":{}}}",
+            json_string(id),
+            json_parameter_value(
+                text,
+                JsonSpan { start: 0, end: 0 },
+                value,
+                bool_default_string
+            )
+        ),
     )
+}
+
+fn json_parameter_value(
+    text: &str,
+    existing: JsonSpan,
+    value: JsonParameterValue,
+    bool_default_string: bool,
+) -> String {
+    match value {
+        JsonParameterValue::String(value) => json_string(&value),
+        JsonParameterValue::Bool(value) => {
+            if existing.end > existing.start
+                && let Ok(existing) =
+                    serde_json::from_str::<serde_json::Value>(&text[existing.start..existing.end])
+            {
+                if existing.is_boolean() {
+                    return value.to_string();
+                }
+                if existing.is_string() {
+                    return json_string(&value.to_string());
+                }
+            }
+            if bool_default_string {
+                json_string(&value.to_string())
+            } else {
+                value.to_string()
+            }
+        }
+    }
 }
 
 fn parse_root_object(text: &str) -> Result<Option<JsonObject>, AgentSettingsError> {

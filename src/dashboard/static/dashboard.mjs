@@ -1062,11 +1062,22 @@ const AGENT_SETTINGS_FIELDS = [
   'model',
   'effort',
   'effort_options',
+  'model_options',
+  'fast',
+  'fast_supported',
   'source',
   'revision',
   'writable',
   'message',
 ];
+
+const MODEL_OPTION_FIELDS = ['id', 'label', 'effort_options', 'fast_supported'];
+const SETTINGS_MODEL_LIMIT = 256;
+const SETTINGS_LABEL_LIMIT = 256;
+const SETTINGS_EFFORT_LIMIT = 32;
+const SETTINGS_MODEL_OPTIONS_LIMIT = 64;
+const SETTINGS_EFFORT_OPTIONS_LIMIT = 32;
+const SETTINGS_REVISION_LIMIT = 128;
 
 const hasExactKeys = (value, keys) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -1074,10 +1085,32 @@ const hasExactKeys = (value, keys) => {
   return actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index]);
 };
 
+const utf8ByteLength = (value) => new TextEncoder().encode(value).length;
 const validSettingsText = (value, maxLength) => typeof value === 'string'
   && value.length > 0
-  && value.length <= maxLength
-  && !/[\r\n]/.test(value);
+  && utf8ByteLength(value) <= maxLength
+  && value.trim().length > 0
+  && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+
+const validEffortOption = (value) => validSettingsText(value, SETTINGS_EFFORT_LIMIT)
+  && !/\s/.test(value);
+
+const validateModelOption = (option) => {
+  if (!hasExactKeys(option, MODEL_OPTION_FIELDS)
+    || !validSettingsText(option.id, SETTINGS_MODEL_LIMIT)
+    || !validSettingsText(option.label, SETTINGS_LABEL_LIMIT)
+    || typeof option.fast_supported !== 'boolean'
+    || !Array.isArray(option.effort_options)
+    || option.effort_options.length > SETTINGS_EFFORT_OPTIONS_LIMIT
+    || option.effort_options.some((value) => !validEffortOption(value))) {
+    throw new Error('The native settings response was invalid.');
+  }
+  const efforts = new Set(option.effort_options);
+  if (efforts.size !== option.effort_options.length) {
+    throw new Error('The native settings response was invalid.');
+  }
+  return option;
+};
 
 const validateAgentSettingsEntry = (entry, expectedAgent = null, { requireRevision = false } = {}) => {
   if (!hasExactKeys(entry, AGENT_SETTINGS_FIELDS)) {
@@ -1087,19 +1120,36 @@ const validateAgentSettingsEntry = (entry, expectedAgent = null, { requireRevisi
   if (!knownAgent || (expectedAgent && entry.agent !== expectedAgent)) {
     throw new Error('The native settings response was invalid.');
   }
-  if (entry.model != null && !validSettingsText(entry.model, 256)) {
+  if (entry.model != null && !validSettingsText(entry.model, SETTINGS_MODEL_LIMIT)) {
     throw new Error('The native settings response was invalid.');
   }
-  if (entry.effort != null && !validSettingsText(entry.effort, 64)) {
+  if (entry.effort != null && !validSettingsText(entry.effort, SETTINGS_EFFORT_LIMIT)) {
     throw new Error('The native settings response was invalid.');
   }
   if (!Array.isArray(entry.effort_options)
-    || entry.effort_options.length > 64
-    || entry.effort_options.some((value) => !validSettingsText(value, 64))) {
+    || entry.effort_options.length > SETTINGS_EFFORT_OPTIONS_LIMIT
+    || entry.effort_options.some((value) => !validEffortOption(value))) {
+    throw new Error('The native settings response was invalid.');
+  }
+  if (new Set(entry.effort_options).size !== entry.effort_options.length
+    || !Array.isArray(entry.model_options)
+    || entry.model_options.length > SETTINGS_MODEL_OPTIONS_LIMIT) {
+    throw new Error('The native settings response was invalid.');
+  }
+  const modelIds = new Set();
+  for (const option of entry.model_options) {
+    validateModelOption(option);
+    if (modelIds.has(option.id)) throw new Error('The native settings response was invalid.');
+    modelIds.add(option.id);
+  }
+  if (entry.fast != null && typeof entry.fast !== 'boolean') {
+    throw new Error('The native settings response was invalid.');
+  }
+  if (typeof entry.fast_supported !== 'boolean') {
     throw new Error('The native settings response was invalid.');
   }
   if (!validSettingsText(entry.source, 128)
-    || (entry.revision != null && !validSettingsText(entry.revision, 256))
+    || (entry.revision != null && !validSettingsText(entry.revision, SETTINGS_REVISION_LIMIT))
     || (requireRevision && entry.revision == null)
     || typeof entry.writable !== 'boolean'
     || (entry.message != null && !validSettingsText(entry.message, 512))) {
@@ -1241,17 +1291,53 @@ function createObservatoryView(document, element, {
       settingsDrafts.set(key, {
         model: entry?.model ?? null,
         effort: entry?.effort ?? null,
+        fast: entry?.fast ?? null,
         dirty: false,
       });
     } else if (!settingsDrafts.get(key).dirty && entry) {
       settingsDrafts.set(key, {
         model: entry.model ?? null,
         effort: entry.effort ?? null,
+        fast: entry.fast ?? null,
         dirty: false,
       });
     }
     return settingsDrafts.get(key);
   };
+  const settingsDraftMatchesEntry = (draft, entry) => (
+    draft.model === (entry?.model ?? null)
+    && draft.effort === (entry?.effort ?? null)
+    && draft.fast === (entry?.fast ?? null)
+  );
+  const settingsMarkDraft = (draft, entry) => {
+    draft.dirty = !settingsDraftMatchesEntry(draft, entry);
+  };
+  const settingsCapability = (entry, model) => {
+    const option = entry?.model_options?.find((candidate) => candidate.id === model) ?? null;
+    if (option) {
+      return {
+        option,
+        effortOptions: [...option.effort_options],
+        fastSupported: option.fast_supported,
+        verified: true,
+      };
+    }
+    if (model === (entry?.model ?? null) && entry) {
+      return {
+        option: null,
+        effortOptions: Array.isArray(entry.effort_options) ? [...entry.effort_options] : [],
+        fastSupported: entry.fast_supported === true,
+        verified: false,
+      };
+    }
+    return {
+      option: null,
+      effortOptions: [],
+      fastSupported: false,
+      verified: false,
+    };
+  };
+  const settingsFastOffValue = (agent) => agent === 'cursor' ? false : null;
   const settingsValueLabel = (value) => value == null ? 'CLI default' : String(value);
   const latestValueLabel = (value) => value == null ? 'Not reported' : String(value);
   const settingsState = (worker) => settingsCache.get(worker) ?? { status: 'idle' };
@@ -1295,7 +1381,19 @@ function createObservatoryView(document, element, {
 
   const updateEditorControls = () => {
     if (!detailRefs?.editorControls) return;
-    const { save, cancel, model, effort, effortReset, entry, draft, worker, agent } = detailRefs.editorControls;
+    const {
+      save,
+      cancel,
+      model,
+      effort,
+      effortReset,
+      fast,
+      fastReset,
+      entry,
+      draft,
+      worker,
+      agent,
+    } = detailRefs.editorControls;
     const mutation = mutationState(worker, agent);
     const canWrite = Boolean(entry?.writable && entry.revision);
     save.disabled = !canWrite || !draft.dirty || mutation.saving;
@@ -1306,6 +1404,9 @@ function createObservatoryView(document, element, {
       effort.value = draft.effort == null ? 'CLI default' : draft.effort;
     }
     if (effortReset) effortReset.disabled = !canWrite || mutation.saving || draft.effort == null;
+    if (fast) fast.disabled = fast.getAttribute('data-supported') !== 'true'
+      || !canWrite || mutation.saving;
+    if (fastReset) fastReset.disabled = !canWrite || mutation.saving || draft.fast == null;
     if (detailRefs.editorMessage) {
       detailRefs.editorMessage.textContent = settingsNotice(worker, agent)
         ?? mutation.error
@@ -1384,85 +1485,197 @@ function createObservatoryView(document, element, {
     const canWrite = Boolean(entry.writable && entry.revision);
     const modelLabel = element('label', 'settings-field');
     modelLabel.append(element('span', '', 'Default model'));
-    const model = element('input');
-    model.setAttribute('type', 'text');
-    model.setAttribute('maxlength', '256');
-    model.setAttribute('autocomplete', 'off');
+    const model = element('select');
     model.setAttribute('data-testid', 'agent-settings-model');
     model.setAttribute('aria-label', 'Native default model');
-    model.setAttribute('placeholder', 'CLI default');
+    const modelOptions = Array.isArray(entry.model_options) ? [...entry.model_options] : [];
+    if (draft.model && !modelOptions.some((option) => option.id === draft.model)) {
+      modelOptions.push({
+        id: draft.model,
+        label: draft.model,
+        effort_options: [],
+        fast_supported: false,
+      });
+    }
+    const defaultModel = element('option', '', 'CLI default');
+    defaultModel.setAttribute('value', '');
+    model.append(defaultModel);
+    for (const optionValue of modelOptions) {
+      const optionLabel = optionValue.label === optionValue.id
+        ? optionValue.label
+        : optionValue.label + ' · ' + optionValue.id;
+      const option = element('option', '', optionLabel);
+      option.setAttribute('value', optionValue.id);
+      model.append(option);
+    }
     model.value = draft.model ?? '';
-    model.addEventListener('input', () => {
-      draft.model = model.value.trim() || null;
-      draft.dirty = draft.model !== (entry.model ?? null) || draft.effort !== (entry.effort ?? null);
-      updateEditorControls();
-    });
     modelLabel.append(model);
-
-    const effortLabel = element('label', 'settings-field');
-    effortLabel.append(element('span', '', 'Default effort'));
-    let effortControl = null;
-    let effortReset = null;
-    const effortOptions = Array.isArray(entry.effort_options)
-      ? entry.effort_options.filter((value) => typeof value === 'string' && value.length > 0)
-      : [];
-    if (effortOptions.length > 0) {
-      const effort = element('select');
-      effort.setAttribute('data-testid', 'agent-settings-effort');
-      effort.setAttribute('aria-label', 'Native default effort');
-      effort.setAttribute('data-editable', 'true');
-      const defaultOption = element('option', '', 'CLI default');
-      defaultOption.setAttribute('value', '');
-      effort.append(defaultOption);
-      const values = [...effortOptions];
-      if (entry.effort && !values.includes(entry.effort)) values.push(entry.effort);
-      for (const value of values) {
-        const option = element('option', '', value);
-        option.setAttribute('value', value);
-        effort.append(option);
-      }
-      effort.value = draft.effort ?? '';
-      effort.addEventListener('change', () => {
-        draft.effort = effort.value || null;
-        draft.dirty = draft.model !== (entry.model ?? null) || draft.effort !== (entry.effort ?? null);
-        updateEditorControls();
-      });
-      effortControl = effort;
-      effortLabel.append(effort);
-    } else if (entry.effort != null) {
-      const effort = element('input');
-      effort.setAttribute('type', 'text');
-      effort.setAttribute('data-testid', 'agent-settings-effort');
-      effort.setAttribute('aria-label', 'Native default effort');
-      effort.value = draft.effort ?? 'CLI default';
-      effort.readOnly = true;
-      effort.setAttribute('data-editable', 'false');
-      const effortHint = element('small', 'settings-field__hint', 'Choices unavailable');
-      effortReset = element('button', 'button button--quiet settings-field__reset', 'Use CLI default');
-      effortReset.setAttribute('type', 'button');
-      effortReset.setAttribute('data-testid', 'agent-settings-effort-reset');
-      effortReset.addEventListener('click', () => {
-        draft.effort = null;
-        draft.dirty = draft.model !== (entry.model ?? null) || draft.effort !== (entry.effort ?? null);
-        updateEditorControls();
-      });
-      effortLabel.append(effort, effortHint, effortReset);
-      effortControl = effort;
-    } else if (agent !== 'opencode') {
-      const defaultEffort = element('span', 'settings-field__value', 'CLI default');
-      defaultEffort.setAttribute('data-testid', 'agent-settings-effort');
-      effortLabel.append(
-        defaultEffort,
-        element('small', 'settings-field__hint', 'Choices unavailable'),
-      );
-    } else {
-      const unsupported = element('span', 'settings-field__value', 'Not supported');
-      unsupported.setAttribute('data-testid', 'agent-settings-effort');
-      effortLabel.append(unsupported, element('small', 'settings-field__hint', 'This agent does not publish a global effort setting.'));
+    if (modelOptions.length <= 1) {
+      modelLabel.append(element('small', 'settings-field__hint', 'Model choices unavailable'));
     }
 
+    const effortLabel = element('label', 'settings-field');
+    const fastLabel = element('label', 'settings-field settings-field--checkbox');
+    let effortControl = null;
+    let effortReset = null;
+    let fastControl = null;
+    let fastReset = null;
+    const renderEffortControl = () => {
+      effortLabel.replaceChildren(element('span', '', 'Default effort'));
+      const capability = settingsCapability(entry, draft.model);
+      const effortOptions = capability.effortOptions;
+      effortControl = null;
+      effortReset = null;
+      if (effortOptions.length > 0) {
+        const effort = element('select');
+        effort.setAttribute('data-testid', 'agent-settings-effort');
+        effort.setAttribute('aria-label', 'Native default effort');
+        effort.setAttribute('data-editable', 'true');
+        const defaultOption = element('option', '', 'CLI default');
+        defaultOption.setAttribute('value', '');
+        effort.append(defaultOption);
+        const values = [...effortOptions];
+        if (entry.effort && !values.includes(entry.effort)) values.push(entry.effort);
+        if (draft.effort && !values.includes(draft.effort)) values.push(draft.effort);
+        for (const value of values) {
+          const option = element('option', '', value);
+          option.setAttribute('value', value);
+          effort.append(option);
+        }
+        effort.value = draft.effort ?? '';
+        effort.addEventListener('change', () => {
+          draft.effort = effort.value || null;
+          settingsMarkDraft(draft, entry);
+          updateEditorControls();
+        });
+        effortControl = effort;
+        effortLabel.append(effort);
+      } else if (draft.effort != null || entry.effort != null) {
+        const effort = element('input');
+        effort.setAttribute('type', 'text');
+        effort.setAttribute('data-testid', 'agent-settings-effort');
+        effort.setAttribute('aria-label', 'Native default effort');
+        effort.value = draft.effort ?? 'CLI default';
+        effort.readOnly = true;
+        effort.setAttribute('data-editable', 'false');
+        const effortHint = element('small', 'settings-field__hint', 'Choices unavailable');
+        effortReset = element('button', 'button button--quiet settings-field__reset', 'Use CLI default');
+        effortReset.setAttribute('type', 'button');
+        effortReset.setAttribute('data-testid', 'agent-settings-effort-reset');
+        effortReset.addEventListener('click', () => {
+          draft.effort = null;
+          settingsMarkDraft(draft, entry);
+          settingsNotices.set(settingsKeyFor(worker, agent), 'Effort reset to CLI default.');
+          updateEditorControls();
+        });
+        effortLabel.append(effort, effortHint, effortReset);
+        effortControl = effort;
+      } else if (agent === 'opencode') {
+        const unsupported = element('span', 'settings-field__value', 'Not supported');
+        unsupported.setAttribute('data-testid', 'agent-settings-effort');
+        effortLabel.append(
+          unsupported,
+          element('small', 'settings-field__hint', 'This agent does not publish a global effort setting.'),
+        );
+      } else {
+        const defaultEffort = element('span', 'settings-field__value', 'CLI default');
+        defaultEffort.setAttribute('data-testid', 'agent-settings-effort');
+        effortLabel.append(
+          defaultEffort,
+          element('small', 'settings-field__hint', 'Choices unavailable'),
+        );
+      }
+    };
+    const renderFastControl = () => {
+      fastLabel.replaceChildren(element('span', '', 'Fast'));
+      const capability = settingsCapability(entry, draft.model);
+      fastControl = element('input');
+      fastControl.setAttribute('type', 'checkbox');
+      fastControl.setAttribute('data-testid', 'agent-settings-fast');
+      fastControl.setAttribute('aria-label', 'Native default Fast');
+      fastControl.setAttribute('data-supported', String(capability.fastSupported));
+      fastControl.checked = draft.fast === true;
+      const controlRow = element('span', 'settings-field__checkbox-row');
+      controlRow.append(fastControl);
+      const fastHint = element('small', 'settings-field__hint');
+      const fastResetSlot = element('span', 'settings-field__reset-slot');
+      fastLabel.append(controlRow, fastHint, fastResetSlot);
+      fastReset = null;
+
+      const syncFastPresentation = () => {
+        fastControl.checked = draft.fast === true;
+        const state = draft.fast === true
+          ? 'Fast enabled'
+          : draft.fast === false ? 'Fast explicitly off' : 'CLI default';
+        fastHint.textContent = capability.fastSupported
+          ? state
+          : draft.fast != null
+            ? 'Fast state saved; availability is unverified for this model.'
+            : agent === 'opencode' || agent === 'claude'
+              ? 'This agent does not support a global Fast setting.'
+              : 'Fast availability is unverified for this model.';
+        if (draft.fast == null) {
+          fastReset = null;
+          fastResetSlot.replaceChildren();
+          return;
+        }
+        if (!fastReset) {
+          fastReset = element('button', 'button button--quiet settings-field__reset', 'Use CLI default');
+          fastReset.setAttribute('type', 'button');
+          fastReset.setAttribute('data-testid', 'agent-settings-fast-reset');
+          fastReset.addEventListener('click', () => {
+            draft.fast = null;
+            settingsMarkDraft(draft, entry);
+            settingsNotices.set(settingsKeyFor(worker, agent), 'Fast reset to CLI default.');
+            syncFastPresentation();
+            detailRefs.editorControls.fast = fastControl;
+            detailRefs.editorControls.fastReset = fastReset;
+            updateEditorControls();
+          });
+        }
+        fastResetSlot.replaceChildren(fastReset);
+      };
+
+      fastControl.addEventListener('change', () => {
+        if (!capability.fastSupported) return;
+        draft.fast = fastControl.checked ? true : settingsFastOffValue(agent);
+        settingsMarkDraft(draft, entry);
+        syncFastPresentation();
+        detailRefs.editorControls.fast = fastControl;
+        detailRefs.editorControls.fastReset = fastReset;
+        updateEditorControls();
+      });
+      syncFastPresentation();
+    };
+
+    model.addEventListener('change', () => {
+      draft.model = model.value || null;
+      const capability = settingsCapability(entry, draft.model);
+      const notices = [];
+      if (draft.effort != null && !capability.effortOptions.includes(draft.effort)) {
+        draft.effort = null;
+        notices.push('Effort reset to CLI default for this model.');
+      }
+      if (draft.fast != null && !capability.fastSupported) {
+        draft.fast = null;
+        notices.push('Fast reset to CLI default for this model.');
+      }
+      settingsMarkDraft(draft, entry);
+      if (notices.length) settingsNotices.set(settingsKeyFor(worker, agent), notices.join(' '));
+      else settingsNotices.delete(settingsKeyFor(worker, agent));
+      renderEffortControl();
+      renderFastControl();
+      detailRefs.editorControls.effort = effortControl;
+      detailRefs.editorControls.effortReset = effortReset;
+      detailRefs.editorControls.fast = fastControl;
+      detailRefs.editorControls.fastReset = fastReset;
+      updateEditorControls();
+    });
+    renderEffortControl();
+    renderFastControl();
+
     const fields = element('div', 'settings-editor__fields');
-    fields.append(modelLabel, effortLabel);
+    fields.append(modelLabel, effortLabel, fastLabel);
     const actions = element('div', 'settings-editor__actions');
     const save = element('button', 'button button--primary', 'Save changes');
     save.setAttribute('type', 'button');
@@ -1474,7 +1687,7 @@ function createObservatoryView(document, element, {
     const effortHelp = element(
       'p',
       'settings-editor__effort-help',
-      'Effort choices describe the loaded model. If you change the model, review the effort or choose CLI default before saving; the worker validates the pair.',
+      'Effort and Fast follow the selected model. Unsupported choices reset to CLI default.',
     );
     body.append(fields, effortHelp, actions);
     editor.replaceChildren(heading, help, ...(sourceMessage ? [sourceMessage] : []), body, message);
@@ -1485,6 +1698,8 @@ function createObservatoryView(document, element, {
       model,
       effort: effortControl,
       effortReset,
+      fast: fastControl,
+      fastReset,
       entry,
       draft,
       worker,
@@ -1611,7 +1826,12 @@ function createObservatoryView(document, element, {
         ? entry
           ? settingsEntryUnavailable(entry)
             ? { value: 'Unavailable', hint: null, missing: true }
-            : { value: settingsValueLabel(entry.model), hint: null, missing: false }
+            : {
+              value: settingsValueLabel(entry.model)
+                + (entry.fast === true ? ' · Fast' : entry.fast === false ? ' · Fast off' : ''),
+              hint: null,
+              missing: false,
+            }
           : { value: 'Unavailable', hint: null, missing: true }
         : cache.status === 'loading' ? loadingValue : cache.status === 'error' ? errorValue : unloadedValue;
       const effortState = settingsEffortState(agent.id, entry);
@@ -1739,6 +1959,7 @@ function createObservatoryView(document, element, {
         agent: targetAgent,
         model: draft.model,
         effort: draft.effort,
+        fast: draft.fast,
         revision: entry.revision,
       }), targetAgent, { requireRevision: true });
       if (settingsSaveTokens.get(key) !== token || saved?.agent !== targetAgent) return;
