@@ -371,6 +371,19 @@ pub(crate) fn queue_blocking_code(reason: Option<&QueueBlockingReason>) -> &'sta
     }
 }
 
+/// Blocking code a task row reports. Busy-but-capable workers stay
+/// `WAITING_FOR_DISPATCH`; a requirement no configured worker offers is named.
+pub fn task_row_blocking_code(reason: Option<&QueueBlockingReason>) -> String {
+    match reason {
+        Some(QueueBlockingReason::CapabilityMissing { missing }) => {
+            format!("NO_WORKER_OFFERS:{}", missing.join(","))
+        }
+        Some(QueueBlockingReason::PinnedWorkerBusy { .. }) => "PINNED_WORKER_BUSY".to_owned(),
+        Some(QueueBlockingReason::RunCap) => "RUN_MAX_PARALLEL".to_owned(),
+        Some(QueueBlockingReason::NoEligibleWorker) | None => "WAITING_FOR_DISPATCH".to_owned(),
+    }
+}
+
 fn project_turn(turn: &TurnSummary, boundary: &RedactionBoundary) -> TaskTurnProjection {
     TaskTurnProjection {
         turn_number: turn.turn_number(),

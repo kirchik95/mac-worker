@@ -14,12 +14,13 @@ use std::{
         Arc, Condvar, LazyLock, Mutex, Weak,
         atomic::{AtomicU8, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use uuid::Uuid;
 
 use crate::{
+    agent_facts::FACTS_TTL,
     config::Config,
     error::WorkerError,
     job::{
@@ -615,6 +616,7 @@ impl ClientStateStore {
         )?;
         let snapshot = read_queue_snapshot(self.inner.queue.as_raw_fd())?.0;
         require_queue_client(&snapshot, self.inner.client_id)?;
+        let now_millis = advisory_now_millis();
         let observations = config
             .workers
             .iter()
@@ -625,7 +627,7 @@ impl ClientStateStore {
                             observation.worker_name().to_owned(),
                             observation.ready(),
                             observation.slot(),
-                            observation.capabilities().to_vec(),
+                            advisory_capabilities(&observation, now_millis),
                             observation.available_memory_bytes(),
                             observation.free_disk_bytes(),
                         )
@@ -674,7 +676,7 @@ impl ClientStateStore {
             };
             codes.insert(
                 task_id,
-                crate::task_view::queue_blocking_code(row.blocking_reason()).to_owned(),
+                crate::task_view::task_row_blocking_code(row.blocking_reason()),
             );
         }
         Ok(codes)
@@ -5124,6 +5126,24 @@ fn cvt_fd(result: libc::c_int) -> io::Result<OwnedFd> {
 
 fn invalid_state(message: &'static str) -> WorkerError {
     WorkerError::Io(io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+fn advisory_now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// Agent capabilities are derived from facts that expire after `FACTS_TTL`.
+/// The admission cache may still list them; the advisory view must not.
+fn advisory_capabilities(observation: &AdmissionObservation, now_millis: u64) -> Vec<String> {
+    let mut capabilities = observation.capabilities().to_vec();
+    if now_millis.saturating_sub(observation.observed_at_millis()) > FACTS_TTL {
+        capabilities.retain(|capability| !capability.starts_with("agent:"));
+    }
+    capabilities
 }
 
 fn injected_failure(point: ClientStateWritePoint) -> WorkerError {

@@ -1,9 +1,15 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy, TurnLimits},
-    job::ProcessIdentity,
+    client_state::ClientStateStore,
+    config::Config,
+    job::{AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
     protocol::PROTOCOL_VERSION,
+    scheduler::{CandidateSlot, WorkerPreference},
     task::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunProgress, RunRecord,
         RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
@@ -440,6 +446,96 @@ fn queued_task_projection_includes_blocking_code_in_cli_and_snapshot() {
         .expect("serialize dashboard projection");
     assert_eq!(cli["tasks"], snapshot["tasks"]);
     assert_eq!(cli["tasks"][0]["blocking_code"], "CAPABILITY_MISSING");
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn blocking_code_for_queued_requirement(
+    worker_capabilities: &[&str],
+    slot: CandidateSlot,
+    requirements: &[&str],
+) -> String {
+    let temp = tempfile::tempdir().unwrap();
+    let state = ClientStateStore::open(&temp.path().canonicalize().unwrap().join("state")).unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let task = queued_record();
+    let task_id = task.meta().task_id();
+    let turn_id = TurnId::generate();
+    state.create_task(task).unwrap();
+    state
+        .write_turn_prompt(task_id, turn_id, "prompt must stay out of blocking codes")
+        .unwrap();
+    let now = now_millis();
+    state
+        .admission_observation("mini-1", now, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                slot,
+                worker_capabilities
+                    .iter()
+                    .map(|capability| (*capability).to_owned())
+                    .collect(),
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+        })
+        .unwrap();
+    state
+        .enqueue(
+            QueueEntry::new(
+                turn_id,
+                state.client_id(),
+                PROJECT_ID.into(),
+                WORKTREE_ID.into(),
+                CommandSummary::argv(1).unwrap(),
+                requirements
+                    .iter()
+                    .map(|requirement| (*requirement).to_owned())
+                    .collect(),
+                WorkerPreference::Automatic,
+                QueueEntryKind::TaskTurn,
+                None,
+                ProcessIdentity::new(42, 1_700_000_000_001).unwrap(),
+                now,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    state
+        .task_blocking_codes(&config)
+        .unwrap()
+        .remove(&task_id)
+        .expect("waiting task turn reports a blocking code")
+}
+
+#[test]
+fn queued_task_whose_requirement_no_worker_offers_names_the_requirement() {
+    let code = blocking_code_for_queued_requirement(
+        &["darwin-arm64"],
+        CandidateSlot::Idle,
+        &["agent:codex"],
+    );
+    assert_eq!(code, "NO_WORKER_OFFERS:agent:codex");
+}
+
+#[test]
+fn queued_task_waiting_only_for_a_busy_worker_stays_waiting_for_dispatch() {
+    let code = blocking_code_for_queued_requirement(
+        &["darwin-arm64", "agent:codex"],
+        CandidateSlot::Busy,
+        &["agent:codex"],
+    );
+    assert_eq!(code, "WAITING_FOR_DISPATCH");
 }
 
 fn assert_absent_keys_and_values(value: &serde_json::Value, forbidden: &[&str]) {

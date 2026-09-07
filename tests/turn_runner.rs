@@ -18,7 +18,7 @@ use std::{
 };
 
 use mac_worker::{
-    agent::AgentKind,
+    agent::{AgentKind, PermissionPolicy},
     agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
     client_state::{
         ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
@@ -39,8 +39,9 @@ use mac_worker::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
     },
     task::{
-        ClosePolicy, RunId, RunRecord, RunnerState, TaskId, TaskLimits, TaskMeta, TaskOutcome,
-        TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunRecord, RunnerState,
+        TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+        TaskStatus, TurnId, TurnSummary, TurnTerminal,
     },
     task_client::{TaskClient, TaskSubmitRequest},
     task_store::{
@@ -2433,4 +2434,158 @@ fn submit_preserves_state_when_detached_child_adopts_before_handoff_failure() {
             .unwrap();
     let transfer = TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
     assert!(transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
+}
+
+struct ProbeFailingRunner;
+
+impl ProcessRunner for ProbeFailingRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let _ = request;
+        Err(WorkerError::Unavailable(
+            "REFRESH_FACTS_FAILED: worker mini-1 is unreachable".into(),
+        ))
+    }
+}
+
+#[test]
+fn runner_that_exits_early_writes_one_diagnostic_line_and_no_secret() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let task_id = TaskId::generate();
+    let turn_id = TurnId::generate();
+    let owner = InlineRunnerExecutor
+        .start(&paths, task_id, turn_id)
+        .unwrap()
+        .process_identity();
+    let secret = "deadbeefdeadbeefdeadbeefdeadbeef";
+    let prompt = format!("do not leak {secret} or /Users/alice/.ssh/id_rsa");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id,
+        run_id: None,
+        project_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        worktree_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        policy: PermissionPolicy::Workspace,
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid: "0123456789abcdef0123456789abcdef01234567".parse().unwrap(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("mac-worker", "mac-worker@example.test").unwrap(),
+        title: None,
+        prompt: prompt.clone(),
+        created_at_millis: now,
+    })
+    .unwrap();
+    let status = TaskStatus::new(
+        TaskState::Queued,
+        None,
+        None,
+        false,
+        Some(meta.base_oid().clone()),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        Vec::new(),
+        now,
+    )
+    .unwrap();
+    state
+        .create_task(
+            LocalTaskRecord::new(
+                meta,
+                status,
+                None,
+                None,
+                None,
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+                None,
+                true,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    state.write_turn_prompt(task_id, turn_id, &prompt).unwrap();
+    state
+        .admission_observation("mini-1", now, || {
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec!["darwin-arm64".into()],
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+        })
+        .unwrap();
+    state
+        .enqueue(
+            QueueEntry::new(
+                turn_id,
+                state.client_id(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                CommandSummary::argv(1).unwrap(),
+                vec!["agent:codex".into()],
+                WorkerPreference::Automatic,
+                QueueEntryKind::TaskTurn,
+                None,
+                owner,
+                now,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let error = TurnRunner::new(
+        &ProbeFailingRunner,
+        &config,
+        &paths,
+        &state,
+        &InlineRunnerExecutor,
+    )
+    .run(task_id, turn_id, Some(&mut Vec::new()))
+    .unwrap_err();
+    assert!(
+        error.public_code() == "UNAVAILABLE" || error.public_code() == "REFRESH_FACTS_FAILED",
+        "early-exit error code: {}",
+        error.public_code()
+    );
+
+    let log = String::from_utf8(
+        fs::read(support::task_harness::runner_log(
+            state_root.path(),
+            &task_id.to_string(),
+            &turn_id.to_string(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let lines: Vec<_> = log.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(
+        lines,
+        ["exited: NO_WORKER_OFFERS:agent:codex workers=mini-1"]
+    );
+    assert!(!log.contains(secret));
+    assert!(!log.contains("/Users/alice"));
+    assert!(!log.contains("id_rsa"));
 }

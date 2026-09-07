@@ -49,6 +49,7 @@ use crate::{
 const LOG_CHUNK_LIMIT: u32 = 64 * 1024;
 const RUNNER_LOG_MODE: u32 = 0o600;
 const RUNNER_DIRECTORY_MODE: u32 = 0o700;
+const EARLY_EXIT_DIAGNOSTIC_LIMIT: usize = 256;
 const WAIT_POLL: Duration = Duration::from_millis(100);
 const MAX_CAPACITY_BACKOFF_SECS: u64 = 30;
 const RUNNER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
@@ -202,24 +203,56 @@ impl<'a> TurnRunner<'a> {
         // and lets future mixed queues repair old rows without touching the
         // task-turn ownership protocol.
         let _ = self.client_state.recover_dead_dispatches()?;
-        let owner = self.claim(task_id, turn_id)?;
-        let result = self.execute(task_id, turn_id, owner, &mut follow);
-        match result {
-            Ok(report) => {
-                self.start_next_parked(owner)?;
-                Ok(report)
-            }
-            Err(error) => {
-                // Before the host accepted a job, the dispatch is safe to
-                // retry.  Once accepted, the queue row remains durable and
-                // reconciliation will hand it to a replacement runner.
-                if matches!(self.can_revert_preacceptance(task_id, turn_id), Ok(true)) {
-                    let _ = self.client_state.revert_dispatch(turn_id, owner);
+        let result = (|| {
+            let owner = self.claim(task_id, turn_id)?;
+            let result = self.execute(task_id, turn_id, owner, &mut follow);
+            match result {
+                Ok(report) => {
+                    self.start_next_parked(owner)?;
+                    Ok(report)
                 }
-                let _ = self.client_state.record_runner(task_id, None);
-                Err(error)
+                Err(error) => {
+                    // Before the host accepted a job, the dispatch is safe to
+                    // retry.  Once accepted, the queue row remains durable and
+                    // reconciliation will hand it to a replacement runner.
+                    if matches!(self.can_revert_preacceptance(task_id, turn_id), Ok(true)) {
+                        let _ = self.client_state.revert_dispatch(turn_id, owner);
+                    }
+                    let _ = self.client_state.record_runner(task_id, None);
+                    Err(error)
+                }
             }
+        })();
+        if let Err(error) = &result {
+            let _ = self.write_early_exit_diagnostic(task_id, turn_id, error);
         }
+        result
+    }
+
+    fn write_early_exit_diagnostic(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        error: &WorkerError,
+    ) -> Result<(), WorkerError> {
+        let mut log = self.client_state.open_runner_log(task_id, turn_id)?;
+        if log.metadata().map_err(WorkerError::Io)?.len() > 0 {
+            return Ok(());
+        }
+        let workers = self
+            .config
+            .workers
+            .iter()
+            .map(|worker| worker.name.as_str())
+            .collect::<Vec<_>>();
+        let code = self
+            .client_state
+            .task_blocking_codes(self.config)
+            .ok()
+            .and_then(|codes| codes.get(&task_id).cloned())
+            .unwrap_or_else(|| error.public_code());
+        log.write_all(early_exit_diagnostic_line(&code, &workers).as_bytes())
+            .map_err(WorkerError::Io)
     }
 
     fn start_next_parked(&self, owner: ProcessIdentity) -> Result<(), WorkerError> {
@@ -1288,6 +1321,19 @@ fn require_project_match(
 
 fn turn_origin_url(meta: &crate::task::TaskMeta) -> Option<String> {
     meta.push_origin_url().map(str::to_owned)
+}
+
+fn early_exit_diagnostic_line(code: &str, workers: &[&str]) -> String {
+    let mut line = if workers.is_empty() {
+        format!("exited: {code}")
+    } else {
+        format!("exited: {code} workers={}", workers.join(","))
+    };
+    if line.len() > EARLY_EXIT_DIAGNOSTIC_LIMIT {
+        line.truncate(EARLY_EXIT_DIAGNOSTIC_LIMIT);
+    }
+    line.push('\n');
+    line
 }
 
 fn capacity_busy() -> WorkerError {
