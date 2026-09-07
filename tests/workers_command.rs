@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsString,
+    fs,
     os::unix::process::ExitStatusExt,
     process::ExitStatus,
     sync::{
@@ -13,7 +14,9 @@ use std::{
 };
 
 use mac_worker::{
+    RuntimeContext,
     agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
+    cli::{Cli, Command},
     config::{Config, WorkerEntry},
     error::{ProcessError, ProcessStream, WorkerError},
     lease::{LeaseSummary, SlotState},
@@ -23,6 +26,7 @@ use mac_worker::{
         CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
         WorkersReport,
     },
+    run_with_io_in_context,
     transport::{ProbeClock, SshTransport, WorkersService},
 };
 
@@ -1362,4 +1366,237 @@ fn workers_output_includes_profile_keyed_facts_without_values() {
     assert!(json.contains("\"facts_age_millis\":1000"));
     assert!(json.contains("\"secure\":true"));
     assert!(!json.contains("/Users/"));
+}
+
+fn refresh_ok() -> Result<ProcessResult, WorkerError> {
+    Ok(ProcessResult {
+        status: exit_status(0),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
+}
+
+fn refresh_unreachable() -> Result<ProcessResult, WorkerError> {
+    Ok(ProcessResult {
+        status: exit_status(255),
+        stdout: Vec::new(),
+        stderr: b"connection refused".to_vec(),
+    })
+}
+
+fn probe_ok() -> Result<ProcessResult, WorkerError> {
+    Ok(ProcessResult {
+        status: exit_status(0),
+        stdout: valid_probe_json(),
+        stderr: Vec::new(),
+    })
+}
+
+fn probe_unreachable() -> Result<ProcessResult, WorkerError> {
+    Ok(ProcessResult {
+        status: exit_status(255),
+        stdout: Vec::new(),
+        stderr: b"connection refused".to_vec(),
+    })
+}
+
+fn run_workers_refresh(
+    runner: &RecordingRunner,
+    worker_count: usize,
+    json: bool,
+) -> (u8, String, String) {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut body = String::from("version = 1\n");
+    for index in 1..=worker_count {
+        body.push_str(&format!(
+            "[[workers]]\nname = \"mini-{index}\"\nssh = \"mac{index}\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n"
+        ));
+    }
+    let config_path = temporary.path().join("config.toml");
+    fs::write(&config_path, body).unwrap();
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::new(),
+        temporary.path().join("home"),
+        temporary.path().to_path_buf(),
+    );
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_io_in_context(
+        Cli {
+            config: Some(config_path),
+            json,
+            command: Command::Workers { refresh: true },
+        },
+        runner,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    (
+        exit,
+        String::from_utf8(stdout).unwrap(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    )
+}
+
+fn ssh_destinations(runner: &RecordingRunner, command_suffix: &str) -> Vec<String> {
+    runner
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request.program == OsString::from("/usr/bin/ssh")
+                && request
+                    .args
+                    .last()
+                    .is_some_and(|argument| argument.to_string_lossy().ends_with(command_suffix))
+        })
+        .map(|request| request_destination(&request))
+        .collect()
+}
+
+fn parse_workers_json(stdout: &str) -> serde_json::Value {
+    serde_json::from_str(stdout.trim()).expect("workers --refresh JSON")
+}
+
+#[test]
+fn refresh_reports_every_worker_when_all_succeed() {
+    let runner = RecordingRunner::returning_results(vec![
+        refresh_ok(),
+        refresh_ok(),
+        probe_ok(),
+        probe_ok(),
+    ]);
+
+    let (exit, stdout, stderr) = run_workers_refresh(&runner, 2, true);
+
+    assert_eq!(exit, 0, "{stderr}");
+    assert_eq!(
+        ssh_destinations(&runner, "host refresh-facts"),
+        ["mac1", "mac2"]
+    );
+    assert_eq!(ssh_destinations(&runner, "host probe"), ["mac1", "mac2"]);
+    let value = parse_workers_json(&stdout);
+    assert_eq!(value["kind"], "workers");
+    assert_eq!(value["workers"][0]["name"], "mini-1");
+    assert_eq!(value["workers"][0]["ssh"], "mac1");
+    assert_eq!(value["workers"][0]["status"], "ready");
+    assert_eq!(value["workers"][0]["refresh"]["ok"], true);
+    assert_eq!(value["workers"][1]["name"], "mini-2");
+    assert_eq!(value["workers"][1]["status"], "ready");
+    assert_eq!(value["workers"][1]["refresh"]["ok"], true);
+
+    let runner = RecordingRunner::returning_results(vec![
+        refresh_ok(),
+        refresh_ok(),
+        probe_ok(),
+        probe_ok(),
+    ]);
+    let (exit, stdout, stderr) = run_workers_refresh(&runner, 2, false);
+    assert_eq!(exit, 0, "{stderr}");
+    assert!(
+        stdout.contains("mini-1") && stdout.contains("mini-2"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("refresh: ok").count(), 2, "{stdout}");
+}
+
+#[test]
+fn refresh_keeps_reporting_when_one_worker_is_unreachable() {
+    let runner = RecordingRunner::returning_results(vec![
+        refresh_ok(),
+        refresh_unreachable(),
+        probe_ok(),
+        probe_unreachable(),
+    ]);
+
+    let (exit, stdout, stderr) = run_workers_refresh(&runner, 2, true);
+
+    assert_eq!(exit, 0, "{stderr}");
+    assert_eq!(
+        ssh_destinations(&runner, "host refresh-facts"),
+        ["mac1", "mac2"]
+    );
+    assert_eq!(ssh_destinations(&runner, "host probe"), ["mac1", "mac2"]);
+    let value = parse_workers_json(&stdout);
+    assert_eq!(value["workers"][0]["name"], "mini-1");
+    assert_eq!(value["workers"][0]["status"], "ready");
+    assert_eq!(value["workers"][0]["refresh"]["ok"], true);
+    assert!(value["workers"][0]["probe"].is_object());
+    assert_eq!(value["workers"][1]["name"], "mini-2");
+    assert_eq!(value["workers"][1]["refresh"]["ok"], false);
+    assert_eq!(
+        value["workers"][1]["refresh"]["error_code"],
+        "REFRESH_FACTS_FAILED"
+    );
+    assert!(
+        value["workers"][1]["refresh"]["error_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("worker fact refresh failed")),
+        "{value}"
+    );
+
+    let runner = RecordingRunner::returning_results(vec![
+        refresh_ok(),
+        refresh_unreachable(),
+        probe_ok(),
+        probe_unreachable(),
+    ]);
+    let (exit, stdout, stderr) = run_workers_refresh(&runner, 2, false);
+    assert_eq!(exit, 0, "{stderr}");
+    assert!(stdout.contains("mini-1: ready"), "{stdout}");
+    assert!(stdout.contains("mini-2: unavailable"), "{stdout}");
+    assert!(stdout.contains("refresh: ok"), "{stdout}");
+    assert!(
+        stdout.contains("refresh: failed [REFRESH_FACTS_FAILED]: worker fact refresh failed"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn refresh_fails_only_when_every_worker_is_unreachable() {
+    let runner = RecordingRunner::returning_results(vec![
+        refresh_unreachable(),
+        refresh_unreachable(),
+        probe_unreachable(),
+        probe_unreachable(),
+    ]);
+
+    let (exit, stdout, stderr) = run_workers_refresh(&runner, 2, true);
+
+    assert_eq!(exit, 69, "{stderr}");
+    assert_eq!(
+        ssh_destinations(&runner, "host refresh-facts"),
+        ["mac1", "mac2"]
+    );
+    let value = parse_workers_json(&stdout);
+    assert_eq!(value["workers"][0]["name"], "mini-1");
+    assert_eq!(value["workers"][1]["name"], "mini-2");
+    assert_eq!(value["workers"][0]["refresh"]["ok"], false);
+    assert_eq!(value["workers"][1]["refresh"]["ok"], false);
+    assert_eq!(
+        value["workers"][0]["refresh"]["error_code"],
+        "REFRESH_FACTS_FAILED"
+    );
+    assert_eq!(
+        value["workers"][1]["refresh"]["error_code"],
+        "REFRESH_FACTS_FAILED"
+    );
+
+    let runner = RecordingRunner::returning_results(vec![
+        refresh_unreachable(),
+        refresh_unreachable(),
+        probe_unreachable(),
+        probe_unreachable(),
+    ]);
+    let (exit, stdout, stderr) = run_workers_refresh(&runner, 2, false);
+    assert_eq!(exit, 69, "{stderr}");
+    assert!(stdout.contains("mini-1"), "{stdout}");
+    assert!(stdout.contains("mini-2"), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("refresh: failed [REFRESH_FACTS_FAILED]")
+            .count(),
+        2,
+        "{stdout}"
+    );
 }

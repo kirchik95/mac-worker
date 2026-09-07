@@ -33,7 +33,7 @@ use output::CommandOutput;
 use paths::PathLayout;
 use probe::ProbeCollector;
 use process::ProcessRunner;
-use protocol::{PROTOCOL_VERSION, SetupReport};
+use protocol::{PROTOCOL_VERSION, SetupReport, WorkersReport};
 use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnapshotResponse};
 use run::{
     CancelService, FleetReconciler, LogsService, RunRequest, RunService, StatusService,
@@ -204,15 +204,8 @@ fn execute_with_context(
             })?))
         }
         Command::Workers { refresh } => {
-            let config = load_config(cli.config, runtime)?;
-            let transport = SshTransport::new(runner);
-            if refresh {
-                for worker in &config.workers {
-                    transport.refresh_facts(worker)?;
-                }
-            }
-            let service = WorkersService::new(transport);
-            Ok(CommandOutput::Workers(service.inspect(&config)))
+            let inspection = inspect_configured_workers(cli.config, runtime, runner, refresh)?;
+            Ok(CommandOutput::Workers(inspection.report))
         }
         Command::Gc { .. } => Err(WorkerError::Protocol(
             "public gc requires the stdio execution boundary".into(),
@@ -1582,6 +1575,9 @@ pub fn run_with_rsync_executor_in_context(
             stderr,
         );
     }
+    if matches!(cli.command, Command::Workers { refresh: true }) {
+        return run_workers_refresh_command(cli, runner, runtime, stdout, stderr);
+    }
     let json = cli.json;
     let public_status = matches!(cli.command, Command::Status { .. } | Command::Cancel { .. });
     let raw_probe = matches!(
@@ -1615,6 +1611,181 @@ fn write_command_diagnostic(public_status: bool, stderr: &mut dyn Write, error: 
     } else {
         write_error(stderr, error);
     }
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerRefreshOutcome {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+}
+
+struct WorkersInspection {
+    report: WorkersReport,
+    refresh: Option<Vec<WorkerRefreshOutcome>>,
+}
+
+fn run_workers_refresh_command(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+    runtime: &RuntimeContext,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    match inspect_configured_workers(cli.config, runtime, runner, true) {
+        Ok(inspection) => match write_workers_refresh_output(stdout, cli.json, &inspection) {
+            Ok(()) => workers_refresh_exit_status(&inspection),
+            Err(error) => {
+                write_error(stderr, &error);
+                error.exit_code()
+            }
+        },
+        Err(error) => {
+            write_error(stderr, &error);
+            error.exit_code()
+        }
+    }
+}
+
+fn inspect_configured_workers(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    refresh: bool,
+) -> Result<WorkersInspection, WorkerError> {
+    let config = load_config(config_override, runtime)?;
+    let transport = SshTransport::new(runner);
+    let refresh = refresh.then(|| {
+        config
+            .workers
+            .iter()
+            .map(|worker| match transport.refresh_facts(worker) {
+                Ok(()) => WorkerRefreshOutcome {
+                    ok: true,
+                    error_code: None,
+                    error_message: None,
+                },
+                Err(error) => refresh_failure(&error),
+            })
+            .collect()
+    });
+    Ok(WorkersInspection {
+        report: WorkersService::new(transport).inspect(&config),
+        refresh,
+    })
+}
+
+fn refresh_failure(error: &WorkerError) -> WorkerRefreshOutcome {
+    match error {
+        WorkerError::Transport { code, message } => WorkerRefreshOutcome {
+            ok: false,
+            error_code: Some((*code).to_owned()),
+            error_message: Some(message.clone()),
+        },
+        _ => WorkerRefreshOutcome {
+            ok: false,
+            error_code: Some(error.public_code()),
+            error_message: Some(error.to_string()),
+        },
+    }
+}
+
+fn workers_refresh_exit_status(inspection: &WorkersInspection) -> u8 {
+    match &inspection.refresh {
+        Some(outcomes) if !outcomes.is_empty() && outcomes.iter().all(|outcome| !outcome.ok) => {
+            crate::error::ExitKind::Unavailable as u8
+        }
+        _ => 0,
+    }
+}
+
+fn write_workers_refresh_output(
+    stdout: &mut dyn Write,
+    json: bool,
+    inspection: &WorkersInspection,
+) -> Result<(), WorkerError> {
+    let rendered = if json {
+        render_workers_refresh_json(inspection)?
+    } else {
+        render_workers_refresh_human(inspection)
+    };
+    stdout.write_all(rendered.as_bytes())?;
+    stdout.write_all(b"\n")?;
+    stdout.flush().map_err(WorkerError::Io)
+}
+
+fn render_workers_refresh_human(inspection: &WorkersInspection) -> String {
+    let refresh = inspection.refresh.as_deref().unwrap_or(&[]);
+    inspection
+        .report
+        .workers
+        .iter()
+        .zip(refresh)
+        .map(|(worker, outcome)| {
+            let mut rendered = CommandOutput::Workers(WorkersReport {
+                protocol_version: inspection.report.protocol_version,
+                workers: vec![worker.clone()],
+            })
+            .render_human();
+            rendered.push('\n');
+            rendered.push_str(&render_refresh_line(outcome));
+            rendered
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_refresh_line(outcome: &WorkerRefreshOutcome) -> String {
+    if outcome.ok {
+        "  refresh: ok".into()
+    } else {
+        let code = outcome
+            .error_code
+            .as_deref()
+            .unwrap_or("REFRESH_FACTS_FAILED");
+        let message = outcome
+            .error_message
+            .as_deref()
+            .unwrap_or("worker fact refresh failed");
+        format!("  refresh: failed [{code}]: {message}")
+    }
+}
+
+fn render_workers_refresh_json(inspection: &WorkersInspection) -> Result<String, WorkerError> {
+    #[derive(Serialize)]
+    struct Report<'a> {
+        kind: &'static str,
+        protocol_version: u32,
+        workers: Vec<Worker<'a>>,
+    }
+    #[derive(Serialize)]
+    struct Worker<'a> {
+        #[serde(flatten)]
+        health: &'a crate::protocol::WorkerHealth,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        refresh: Option<&'a WorkerRefreshOutcome>,
+    }
+
+    let refresh = inspection.refresh.as_deref();
+    let payload = Report {
+        kind: "workers",
+        protocol_version: inspection.report.protocol_version,
+        workers: inspection
+            .report
+            .workers
+            .iter()
+            .enumerate()
+            .map(|(index, health)| Worker {
+                health,
+                refresh: refresh.and_then(|outcomes| outcomes.get(index)),
+            })
+            .collect(),
+    };
+    serde_json::to_string(&payload).map_err(|error| {
+        WorkerError::Protocol(format!("failed to serialize command output: {error}"))
+    })
 }
 
 #[derive(Debug, Serialize)]
