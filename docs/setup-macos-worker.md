@@ -469,6 +469,33 @@ The binary named `agent` on a worker is unrelated; Cursor must be invoked as `cu
 
 Keychain-backed Cursor logins need special handling on a headless worker. With no GUI session, the macOS login keychain is locked and Cursor refuses commands, including its version and status probes. mac-worker unlocks the configured keychain in the same launch session immediately before Cursor probes, prebinds, and turns. Codex's file-based login and OpenCode's file-based or provider login do not need these keychain variables.
 
+### Codex workspace sandbox and the cargo registry
+
+A Codex Rust turn can write the right code, pass `cargo fmt --check`, and still finish `blocked`. The turn summary names a path under `~/.cargo/registry/cache/` and `Operation not permitted`. The default `codex = "workspace"` sandbox denies the shared cargo registry, which lives outside the task worktree. A crate that is not already unpacked on that worker fails this way.
+
+Warm the registry on each worker before those tasks run. On the worker, as the worker account, in a checkout of the project that carries the same `Cargo.lock`, run:
+
+```bash
+cargo fetch --locked
+```
+
+Run it in that account's own shell, not inside an agent turn. The command unpacks crates into `~/.cargo/registry`, which later task worktrees on the same worker reuse.
+
+Raising that agent to `unattended` in `.worker.toml` also lets the turn write the registry. That removes Codex's workspace-write sandbox, a safety boundary against accidental writes outside the worktree. It is an operator decision, not the default:
+
+```toml
+[task.permissions]
+codex = "unattended"
+```
+
+To see whether the registry is already warm for a given project, run this one line in the same checkout on the worker:
+
+```bash
+cargo fetch --locked --offline
+```
+
+Exit `0` means every crate in that lockfile is present. A non-zero exit means at least one crate is still missing.
+
 ## 7. Env profiles
 
 Place one file per profile on each worker:
