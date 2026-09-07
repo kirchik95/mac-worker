@@ -1,581 +1,195 @@
-# Set up a macOS worker
+# Prepare a Mac worker
 
-This guide prepares a trusted Mac mini for the phase-one `worker setup` and `worker workers` commands. It deliberately separates account administration from tool installation: `worker setup` installs the worker helper into the selected account, but does not create accounts, grant privileges, or change Remote Login settings.
+Start with one Apple Silicon Mac and one agent. Commands below say whether they run on the **laptop** (controller) or the **worker**. Replace `yourname@mini.local` with the worker account and hostname or IP address.
 
-## 1. Choose the worker account
+## 1. Prepare the worker
 
-For this deployment, use the existing macOS account on each Mac mini. A dedicated standard account remains an optional hardening step, but is not required. `worker setup` never creates accounts, elevates privileges, or invokes `sudo`.
+On the **worker**, use your existing macOS account or a dedicated standard account. Jobs run with that account's access. Enable **System Settings → General → Sharing → Remote Login** and allow that account.
 
-Remote jobs inherit everything that the selected account can access, including its files, processes, Keychain items available without interaction, development credentials, and Docker state. Only dispatch trusted code, avoid passwordless sudo, and keep production or other high-value credentials off these worker machines where practical.
-
-## 2. Enable SSH for the selected account
-
-In macOS **System Settings**, enable **General → Sharing → Remote Login** and allow access for the selected account. Limit Remote Login to only the accounts that actually need worker access.
-
-Install one worker-specific public key in that account's `~/.ssh/authorized_keys`. Set mode `0700` on `.ssh` and `0600` on `authorized_keys`:
+Open Terminal on the worker and check Git:
 
 ```bash
-chmod 0700 ~/.ssh
-chmod 0600 ~/.ssh/authorized_keys
+git --version
 ```
 
-Use the selected account's own shell for these commands. The key should be dedicated to this worker access path; do not reuse a personal key that has broader access.
+If macOS asks to install Command Line Tools, complete the installation. You can also start it with `xcode-select --install`.
 
-## 3. Configure the local SSH alias
+Keep the Mac powered and awake while jobs run. On a desktop Mac, enable the setting to prevent automatic sleep when the display is off. Check the power settings again after rebooting. The worker needs outbound access to its agent provider; mac-worker needs only SSH inbound.
 
-Configure the alias used by `config.example.toml` (for example, `mac1`) to log in as the selected existing account. Pin the worker host key locally and disable SSH agent forwarding for each worker alias. A representative `~/.ssh/config` entry is:
+## 2. Connect over SSH
+
+If `ssh -o BatchMode=yes yourname@mini.local true` already succeeds without a prompt, skip to [Connect the worker](#3-connect-the-worker).
+
+On the **laptop**, create a dedicated key. Choose a passphrase when prompted. If that filename already exists, reuse the existing key or choose a new filename; do not overwrite it.
+
+```bash
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+ssh-keygen -t ed25519 -f "$HOME/.ssh/mac-worker_ed25519" -C mac-worker
+ssh-add --apple-use-keychain "$HOME/.ssh/mac-worker_ed25519"
+```
+
+For the first connection, verify the server's fingerprint. On the **worker**, display it locally:
+
+```bash
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+On the **laptop**, connect once and compare the displayed ED25519 fingerprint before accepting it:
+
+```bash
+ssh -o HostKeyAlgorithms=ssh-ed25519 -o ForwardAgent=no yourname@mini.local
+```
+
+Enter the worker account's password, then `exit` to return to the laptop. If macOS has a different host-key configuration, verify its corresponding public-key fingerprint instead.
+
+On the **laptop**, append the public key to the worker's authorized keys. This asks for the worker password once more:
+
+```bash
+cat "$HOME/.ssh/mac-worker_ed25519.pub" | \
+  ssh -o ForwardAgent=no yourname@mini.local \
+  'umask 077; mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh" && cat >> "$HOME/.ssh/authorized_keys" && chmod 600 "$HOME/.ssh/authorized_keys"'
+```
+
+Add this block to the laptop's `~/.ssh/config`, replacing the hostname and username. It lets SSH find and unlock the dedicated key; an extra alias is optional:
 
 ```sshconfig
-Host mac1
-    HostName <worker-hostname-or-address>
-    User <existing-macos-account>
-    IdentityFile ~/.ssh/<worker-specific-key>
+Host mini.local
+    User yourname
+    IdentityFile ~/.ssh/mac-worker_ed25519
     IdentitiesOnly yes
-    UserKnownHostsFile ~/.ssh/known_hosts
+    AddKeysToAgent yes
+    UseKeychain yes
     StrictHostKeyChecking yes
     ForwardAgent no
 ```
 
-Add and verify the worker's host key in the local `~/.ssh/known_hosts` through your normal trusted host-key verification process. Do not weaken host-key checking or rely on agent forwarding as a workaround.
+Use the same address in the `Host` line that you pass to `worker init`. Keep existing settings such as `Port` or `ProxyJump` if you need them.
 
-## 4. Verify the prerequisite
-
-Before installing anything, confirm that the exact alias completes a non-interactive connection:
+Check from the **laptop**:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes -- mac1 /usr/bin/true
+ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no \
+  -o ClearAllForwardings=yes yourname@mini.local /usr/bin/true
 ```
 
-This command must exit `0`, print no stdout, and never prompt. If it fails, correct the selected-account, key, or pinned-host-key setup first. Do not run `worker setup` until it succeeds.
+Success means exit code `0` and no prompt. If it fails, check Remote Login, the account name, the loaded key and `~/.ssh/config`. Do not disable host-key checking to make the check pass.
 
-## 5. Install and check the helper
+## 3. Connect the worker
 
-After the SSH prerequisite succeeds, use the local phase-one commands:
+Install the CLI on the laptop using the [README](../README.md#1-install-the-cli-on-your-laptop), then run on the **laptop**:
 
 ```bash
-./target/release/worker setup mini-1
-./target/release/worker workers
-./target/release/worker --json workers | jq .
+worker init yourname@mini.local
 ```
 
-`setup` is safe to run again for the same worker; it replaces the helper installation. Phase one only supports setup and inventory/probe reporting. `worker run`, snapshots, queues, logs, and artifacts are not yet implemented.
+The command checks SSH, architecture and Git; creates `~/.config/mac-worker/config.toml`; installs the helper at `~/.local/bin/worker` on the worker; and checks Codex. A custom `--config PATH` is supported, as are the existing XDG configuration paths.
 
-Before creating or changing setup state, the installer resolves the account home physically, creates missing `.local` directories one level at a time, and rejects symlinks or non-directories at `.local`, `.local/bin`, `.local/share`, `.local/share/mac-worker`, `setup`, the installation lock, and the owner transaction. It repeats those containment and type checks before digest recording, backup preparation, promotion, verification, cleanup, and rollback. A rejected or changed path leaves owner-scoped evidence in place and is reported as a setup failure or cleanup/rollback warning.
+The default worker name is the hostname without `.local`. Use `--name mini-1` to choose another name. A retry preserves a registered destination's existing name. Adding another address appends a worker and preserves existing entries and comments.
 
-## Recovery from retained setup state
+An agent/login failure leaves the configuration available for the next attempt. Complete the reported step and rerun the command. `init` reuses a healthy compatible helper and refreshes agent checks; `worker setup` explicitly reinstalls or updates helpers.
 
-If `setup` reports `INSTALL_LOCKED`, `UNKNOWN_INSTALLATION_STATE`, or a cleanup/rollback warning, connect as the configured worker account and recover only the transaction owned by the retained lock. Do not retry setup until the following checks are complete. Never use `sudo`, `rm -rf`, globs, or broad cleanup under `~/.local/share/mac-worker/setup/`.
+## 4. Install and log in to one agent
 
-Read and validate the exact lock owner before forming a transaction path. The owner file must contain exactly 32 lowercase hexadecimal bytes followed by one newline and no other bytes or lines. Recorded digest files use the same canonical representation with 64 lowercase hexadecimal bytes followed by one newline. Any other representation must retain the lock and stop.
+Do these steps as the same **worker account** used by SSH. Agent credentials stay on that Mac.
+
+### Codex (default)
+
+On the **worker**, if Homebrew is installed:
 
 ```bash
-(
-    set -eu
-    LC_ALL=C
-    export LC_ALL
-
-    fail() {
-        printf '%s\n' "$1" >&2
-        exit 1
-    }
-
-    require_regular_file() {
-        if [ -L "$1" ] || [ ! -f "$1" ]; then
-            fail "$2 is missing, a symlink, or not a regular file; retain the lock and stop"
-        fi
-    }
-
-    read_canonical_hex_file() {
-        hex_file=$1
-        hex_length=$2
-        require_regular_file "$hex_file" "$3"
-        byte_count=$(/usr/bin/wc -c < "$hex_file") \
-            || fail "$3 cannot be sized; retain the lock and stop"
-        if [ "$byte_count" -ne "$((hex_length + 1))" ]; then
-            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
-        fi
-        hex_value=''
-        if ! IFS= read -r hex_value < "$hex_file"; then
-            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
-        fi
-        if [ "${#hex_value}" -ne "$hex_length" ]; then
-            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
-        fi
-        case "$hex_value" in
-            *[!0-9a-f]*)
-                fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
-                ;;
-        esac
-        canonical_hex=$hex_value
-    }
-
-    read_canonical_state_file() {
-        state_file=$1
-        require_regular_file "$state_file" "$2"
-        for state_value in acquired staged prepared promoting promoted rolled_back; do
-            if printf '%s\n' "$state_value" | /usr/bin/cmp -s - "$state_file"; then
-                canonical_state=$state_value
-                return 0
-            fi
-        done
-        fail "$2 is not an exact recognized state plus LF; retain the lock and stop"
-    }
-
-    setup_root="$HOME/.local/share/mac-worker/setup"
-    lock_dir="$setup_root/.install-lock"
-    owner_path="$lock_dir/owner"
-    read_canonical_hex_file "$owner_path" 32 'setup lock owner'
-    owner=$canonical_hex
-
-    transaction="$setup_root/$owner"
-    if [ -L "$transaction" ] || [ ! -d "$transaction" ]; then
-        fail 'owner-scoped setup transaction is missing or a symlink; retain the lock and stop'
-    fi
-
-    /bin/ls -ld "$lock_dir" "$transaction"
-    read_canonical_state_file "$transaction/state" 'setup state marker'
-    printf '%s\n' "$canonical_state"
-    if [ -e "$transaction/candidate.sha256" ] || [ -L "$transaction/candidate.sha256" ]; then
-        read_canonical_hex_file "$transaction/candidate.sha256" 64 'candidate digest'
-        printf '%s\n' "$canonical_hex"
-    fi
-    if [ -e "$transaction/previous.sha256" ] || [ -L "$transaction/previous.sha256" ]; then
-        read_canonical_hex_file "$transaction/previous.sha256" 64 'previous digest'
-        printf '%s\n' "$canonical_hex"
-    fi
-    if [ -L "$HOME/.local/bin/worker" ] \
-        || { [ -e "$HOME/.local/bin/worker" ] && [ ! -f "$HOME/.local/bin/worker" ]; }; then
-        fail 'active helper is a symlink or not a regular file; retain the lock and stop'
-    fi
-    if [ -f "$HOME/.local/bin/worker" ]; then
-        /usr/bin/shasum -a 256 "$HOME/.local/bin/worker"
-    fi
-)
+brew install --cask codex
+codex login --device-auth
+codex login status
 ```
 
-If inspection shows the exact terminal state `promoted` or `rolled_back`, run this complete cleanup block as one command. Nonterminal states require manual diagnosis and must retain the lock. The block deliberately recomputes every value rather than relying on the inspection block, so it is safe to copy independently. It performs no removal until the owner, transaction, state-specific evidence, active helper when required, and probe have all been validated, then reads them again immediately before cleanup.
+Open the device-login URL in a browser and enter the code. Device login may need to be enabled in your ChatGPT account or workspace. If unavailable, run `codex login` in the worker's desktop session and sign in there. See the [official installation guide](https://developers.openai.com/codex/cli/) for other installation methods and [authentication guide](https://developers.openai.com/codex/auth/) for login options. mac-worker checks the login again through SSH.
+
+On the **laptop**:
 
 ```bash
-(
-    set -eu
-    LC_ALL=C
-    export LC_ALL
-
-    fail() {
-        printf '%s\n' "$1" >&2
-        exit 1
-    }
-
-    valid_hex_value() {
-        [ "${#1}" -eq "$2" ] || return 1
-        case "$1" in
-            *[!0-9a-f]*) return 1 ;;
-        esac
-    }
-
-    require_regular_file() {
-        if [ -L "$1" ] || [ ! -f "$1" ]; then
-            fail "$2 is missing, a symlink, or not a regular file; retain the lock and stop"
-        fi
-    }
-
-    read_canonical_hex_file() {
-        hex_file=$1
-        hex_length=$2
-        require_regular_file "$hex_file" "$3"
-        byte_count=$(/usr/bin/wc -c < "$hex_file") \
-            || fail "$3 cannot be sized; retain the lock and stop"
-        if [ "$byte_count" -ne "$((hex_length + 1))" ]; then
-            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
-        fi
-        hex_value=''
-        if ! IFS= read -r hex_value < "$hex_file"; then
-            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
-        fi
-        if ! valid_hex_value "$hex_value" "$hex_length"; then
-            fail "$3 is not a canonical lowercase hexadecimal file; retain the lock and stop"
-        fi
-        canonical_hex=$hex_value
-    }
-
-    read_canonical_state_file() {
-        state_file=$1
-        require_regular_file "$state_file" "$2"
-        for state_value in acquired staged prepared promoting promoted rolled_back; do
-            if printf '%s\n' "$state_value" | /usr/bin/cmp -s - "$state_file"; then
-                canonical_state=$state_value
-                return 0
-            fi
-        done
-        fail "$2 is not an exact recognized state plus LF; retain the lock and stop"
-    }
-
-    require_absent_path() {
-        if [ -e "$1" ] || [ -L "$1" ]; then
-            fail "$2 must be absent; retain the lock and stop"
-        fi
-    }
-
-    require_empty_regular_file() {
-        require_regular_file "$1" "$2"
-        empty_size=$(/usr/bin/wc -c < "$1") \
-            || fail "$2 cannot be sized; retain the lock and stop"
-        if [ "$empty_size" -ne 0 ]; then
-            fail "$2 is not an exact empty regular file; retain the lock and stop"
-        fi
-    }
-
-    read_regular_digest() {
-        require_regular_file "$1" "$2"
-        regular_digest="$(/usr/bin/shasum -a 256 "$1" 2>/dev/null)" \
-            || fail "$2 digest cannot be read; retain the lock and stop"
-        regular_digest="${regular_digest%% *}"
-        if ! valid_hex_value "$regular_digest" 64; then
-            fail "$2 digest is invalid; retain the lock and stop"
-        fi
-        canonical_digest=$regular_digest
-    }
-
-    allow_absent_regular_file() {
-        if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then
-            fail "$2 is a symlink or not a regular file; retain the lock and stop"
-        fi
-    }
-
-    verify_setup_directory() {
-        if [ -L "$setup_root" ] || [ ! -d "$setup_root" ]; then
-            fail 'setup directory is missing or a symlink; retain the lock and stop'
-        fi
-        setup_physical="$(cd -P "$setup_root" 2>/dev/null && /bin/pwd)" \
-            || fail 'setup directory cannot be resolved; retain the lock and stop'
-        if [ "$setup_physical" != "$data_root/setup" ]; then
-            fail 'setup directory is outside the mac-worker data root; retain the lock and stop'
-        fi
-    }
-
-    verify_lock_directory() {
-        if [ -L "$lock_dir" ] || [ ! -d "$lock_dir" ]; then
-            fail 'setup lock directory is missing or a symlink; retain the lock and stop'
-        fi
-        lock_physical="$(cd -P "$lock_dir" 2>/dev/null && /bin/pwd)" \
-            || fail 'setup lock directory cannot be resolved; retain the lock and stop'
-        if [ "$lock_physical" != "$setup_physical/.install-lock" ]; then
-            fail 'setup lock directory is outside the setup directory; retain the lock and stop'
-        fi
-    }
-
-    verify_transaction_directory() {
-        if [ -L "$transaction" ] || [ ! -d "$transaction" ]; then
-            fail 'owner-scoped setup transaction is missing or a symlink; retain the lock and stop'
-        fi
-        transaction_physical="$(cd -P "$transaction" 2>/dev/null && /bin/pwd)" \
-            || fail 'owner-scoped setup transaction cannot be resolved; retain the lock and stop'
-        if [ "$transaction_physical" != "$setup_physical/$owner" ]; then
-            fail 'owner-scoped setup transaction is outside the setup directory; retain the lock and stop'
-        fi
-    }
-
-    verify_cleanup_file_types() {
-        allow_absent_regular_file "$transaction/worker.new" 'staged helper'
-        allow_absent_regular_file "$transaction/worker.previous" 'previous helper'
-        allow_absent_regular_file "$transaction/candidate.sha256" 'candidate digest'
-        allow_absent_regular_file "$transaction/previous.sha256" 'previous digest'
-        allow_absent_regular_file "$transaction/no-previous" 'no-previous marker'
-        require_regular_file "$transaction/state" 'setup state marker'
-    }
-
-    verify_terminal_state() {
-        read_canonical_state_file "$transaction/state" 'setup state marker'
-        verified_state=$canonical_state
-        verified_candidate_digest=''
-        verified_previous_present=0
-        verified_previous_digest=''
-        verified_active_present=0
-        verified_active_digest=''
-
-        read_canonical_hex_file "$transaction/candidate.sha256" 64 'candidate digest'
-        verified_candidate_digest=$canonical_hex
-        require_absent_path "$transaction/worker.new" 'staged helper'
-
-        case "$verified_state" in
-            promoted)
-                read_regular_digest "$worker" 'active helper'
-                verified_active_present=1
-                verified_active_digest=$canonical_digest
-                if [ "$verified_active_digest" != "$verified_candidate_digest" ]; then
-                    fail 'promoted active helper does not match the candidate digest; retain the lock and stop'
-                fi
-                if [ -f "$transaction/worker.previous" ]; then
-                    require_absent_path "$transaction/no-previous" 'no-previous marker'
-                    read_canonical_hex_file "$transaction/previous.sha256" 64 'previous digest'
-                    verified_previous_present=1
-                    verified_previous_digest=$canonical_hex
-                    read_regular_digest "$transaction/worker.previous" 'previous helper'
-                    if [ "$canonical_digest" != "$verified_previous_digest" ]; then
-                        fail 'previous helper does not match the previous digest; retain the lock and stop'
-                    fi
-                else
-                    require_absent_path "$transaction/previous.sha256" 'previous digest'
-                    require_empty_regular_file "$transaction/no-previous" 'no-previous marker'
-                fi
-                if ! "$worker" host probe; then
-                    fail 'active helper probe failed; retain the lock and stop'
-                fi
-                ;;
-            rolled_back)
-                require_absent_path "$transaction/worker.previous" 'previous helper'
-                if [ -f "$transaction/previous.sha256" ]; then
-                    require_absent_path "$transaction/no-previous" 'no-previous marker'
-                    read_canonical_hex_file "$transaction/previous.sha256" 64 'previous digest'
-                    verified_previous_present=1
-                    verified_previous_digest=$canonical_hex
-                    read_regular_digest "$worker" 'active helper'
-                    verified_active_present=1
-                    verified_active_digest=$canonical_digest
-                    if [ "$verified_active_digest" != "$verified_previous_digest" ]; then
-                        fail 'rolled-back active helper does not match the previous digest; retain the lock and stop'
-                    fi
-                    if ! "$worker" host probe; then
-                        fail 'active helper probe failed; retain the lock and stop'
-                    fi
-                else
-                    require_empty_regular_file "$transaction/no-previous" 'no-previous marker'
-                    require_absent_path "$worker" 'active helper'
-                fi
-                ;;
-            *)
-                fail 'setup state is not a provable terminal state; retain the lock and stop'
-                ;;
-        esac
-    }
-
-    verify_transaction_entries() {
-        /usr/bin/find "$transaction" ! -path "$transaction" -prune \
-            -exec /bin/sh -c '
-                transaction=$1
-                shift
-                for entry do
-                    case "$entry" in
-                        "$transaction/worker.new"|"$transaction/worker.previous"|\
-                        "$transaction/candidate.sha256"|"$transaction/previous.sha256"|\
-                        "$transaction/no-previous"|"$transaction/state") ;;
-                        *)
-                            printf "%s\n" "unexpected owner-scoped transaction entry: $entry; retain the lock and stop" >&2
-                            exit 1
-                            ;;
-                    esac
-                done
-            ' sh "$transaction" {} + \
-            || fail 'owner-scoped setup transaction cannot be enumerated or contains unexpected entries; retain the lock and stop'
-    }
-
-    verify_lock_entries() {
-        /usr/bin/find "$lock_dir" ! -path "$lock_dir" -prune \
-            -exec /bin/sh -c '
-                transaction_owner_path=$1
-                shift
-                for entry do
-                    case "$entry" in
-                        "$transaction_owner_path") ;;
-                        *)
-                            printf "%s\n" "unexpected setup lock entry: $entry; retain the lock and stop" >&2
-                            exit 1
-                            ;;
-                    esac
-                done
-            ' sh "$transaction_owner_path" {} + \
-            || fail 'setup lock directory cannot be enumerated or contains unexpected entries; retain the lock and stop'
-    }
-
-    data_root="$(cd -P "$HOME/.local/share/mac-worker" 2>/dev/null && /bin/pwd)" \
-        || fail 'mac-worker data root cannot be resolved; retain the lock and stop'
-    setup_root="$data_root/setup"
-    lock_dir="$setup_root/.install-lock"
-    transaction_owner_path="$lock_dir/owner"
-    worker="$HOME/.local/bin/worker"
-
-    verify_setup_directory
-    verify_lock_directory
-    read_canonical_hex_file "$transaction_owner_path" 32 'setup lock owner'
-    owner=$canonical_hex
-
-    transaction="$setup_root/$owner"
-    verify_transaction_directory
-    verify_cleanup_file_types
-    verify_transaction_entries
-    verify_lock_entries
-
-    verify_terminal_state
-    initial_state=$verified_state
-    initial_candidate_digest=$verified_candidate_digest
-    initial_previous_present=$verified_previous_present
-    initial_previous_digest=$verified_previous_digest
-    initial_active_present=$verified_active_present
-    initial_active_digest=$verified_active_digest
-
-    verify_setup_directory
-    verify_lock_directory
-    read_canonical_hex_file "$transaction_owner_path" 32 'setup lock owner immediately before cleanup'
-    final_owner=$canonical_hex
-    if [ "$final_owner" != "$owner" ]; then
-        fail 'setup lock owner changed or is invalid immediately before cleanup; retain the lock and stop'
-    fi
-    verify_transaction_directory
-    verify_cleanup_file_types
-    verify_transaction_entries
-    verify_lock_entries
-    verify_terminal_state
-
-    if [ "$verified_state" != "$initial_state" ] \
-        || [ "$verified_candidate_digest" != "$initial_candidate_digest" ] \
-        || [ "$verified_previous_present" -ne "$initial_previous_present" ] \
-        || [ "$verified_previous_digest" != "$initial_previous_digest" ] \
-        || [ "$verified_active_present" -ne "$initial_active_present" ] \
-        || [ "$verified_active_digest" != "$initial_active_digest" ]; then
-        fail 'state-specific recovery evidence changed before cleanup; retain the lock and stop'
-    fi
-
-    /bin/rm -f "$transaction/worker.new" "$transaction/worker.previous" \
-        "$transaction/candidate.sha256" "$transaction/previous.sha256" \
-        "$transaction/no-previous" "$transaction/state"
-    /bin/rmdir "$transaction"
-    /bin/rm -f "$transaction_owner_path"
-    /bin/rmdir "$lock_dir"
-)
+worker init yourname@mini.local --agent codex
 ```
 
-If any inspection, identity check, probe, removal, or `rmdir` step fails, stop, retain the lock and transaction as evidence, and do not retry setup. Do not delete unrelated setup directories or release a lock whose owner no longer matches.
+No environment profile is required for a working Codex login.
 
-The sections above remain the account, SSH, and helper-install steps. The rest of this guide provisions the same worker for agent tasks. It does not replace the recovery procedure.
+### Other agents
 
-## Agent-task provisioning
+| Agent | Install on the worker | Login on the worker | Check from the laptop |
+| --- | --- | --- | --- |
+| OpenCode | [Official installer](https://opencode.ai/docs/) | `opencode auth login` | `worker init yourname@mini.local --agent opencode` |
+| Cursor | [Official installer](https://cursor.com/docs/cli/installation); see executable name below | `cursor-agent login` or an API-key profile | `worker init yourname@mini.local --agent cursor --env-profile agents` |
+| Claude Code | [Official installer](https://code.claude.com/docs/en/setup) | Sign in with Claude Code or provision a supported token/API-key profile | `worker init yourname@mini.local --agent claude` (add `--env-profile agents` when needed) |
 
-**Available today:** `worker setup`, `worker workers`, `worker run`, and `worker dashboard`. Also available, and unchanged by this material: `worker doctor`, `worker status`, and `worker logs`.
+This version of mac-worker invokes Cursor as `cursor-agent`. If the official installer provides only `agent`, confirm it is the Cursor executable, then expose that executable under the expected name on the worker's login `PATH`. Do not replace an unrelated `agent` or an existing `cursor-agent`. Probes and turns use the account's login-shell PATH; a tool visible only in an interactive shell may need its PATH setup moved to the login-shell configuration.
 
-**Planned for phase 5, not in the current CLI:** `worker task …` and `worker workers --refresh`. Do not run those forms until they exist in this binary. Prepare the worker now so a later helper can collect agent facts and migrate the host layout through `worker setup`.
+Use only the selected agent to finish your first task. Additional agents can be installed and checked later.
 
-## 6. Agent CLIs on the worker
+## Environment profiles
 
-The pool can run these agents. Install them on the worker account's login-shell `PATH` yourself; `worker setup` never installs or logs into an agent.
+Profiles are optional. They supply agent variables or unlock a headless login keychain. On the **worker**, create a private profile named `agents`:
 
-| Agent | Status on this pool | Headless authentication |
-| --- | --- | --- |
-| Codex | In use now | File-based login on the worker. No env profile is required. |
-| Claude Code | Deferred on the workers by operator decision | Env profile (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`). Not authenticated on the workers today. |
-| Cursor Agent | Adapter exists; not wired into the CLI until a later plan | Env profile (`CURSOR_API_KEY`). A keychain-backed login also needs the host-only keychain variables below. |
-| OpenCode | Adapter exists; not wired into the CLI until a later plan | File-based or provider login, plus any provider variables the agent needs in an env profile. |
+```bash
+umask 077
+mkdir -p "$HOME/.config/mac-worker/env"
+chmod 700 "$HOME/.config/mac-worker/env"
+${EDITOR:-vi} "$HOME/.config/mac-worker/env/agents.env"
+chmod 600 "$HOME/.config/mac-worker/env/agents.env"
+```
 
-The binary named `agent` on a worker is unrelated; Cursor must be invoked as `cursor-agent`.
+Write `KEY=value` lines, without shell commands. The file must be regular, owned by the worker account and mode `0600`. Never put it in the repository or a task prompt.
 
-Keychain-backed Cursor logins need special handling on a headless worker. With no GUI session, the macOS login keychain is locked and Cursor refuses commands, including its version and status probes. mac-worker unlocks the configured keychain in the same launch session immediately before Cursor probes, prebinds, and turns. Codex's file-based login and OpenCode's file-based or provider login do not need these keychain variables.
+| Agent | Supported profile values |
+| --- | --- |
+| Cursor | `CURSOR_API_KEY` |
+| Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` |
+| OpenCode | Provider variables needed by the selected CLI/provider |
 
-### Codex workspace sandbox and the cargo registry
+A Cursor login stored in the macOS keychain can be locked over SSH. For that login, put `MAC_WORKER_KEYCHAIN_PASSWORD` in the profile, with optional `MAC_WORKER_KEYCHAIN_PATH` for a non-default keychain. The helper consumes these reserved values and sends the password to `security unlock-keychain` on stdin; it does not export them to the agent. Provision the values locally on the worker.
 
-A Codex Rust turn can write the right code, pass `cargo fmt --check`, and still finish `blocked`. The turn summary names a path under `~/.cargo/registry/cache/` and `Operation not permitted`. The default `codex = "workspace"` sandbox denies the shared cargo registry, which lives outside the task worktree. A crate that is not already unpacked on that worker fails this way.
+Check the selected profile and use it for tasks:
 
-Warm the registry on each worker before those tasks run. On the worker, as the worker account, in a checkout of the project that carries the same `Cargo.lock`, run:
+```bash
+worker init yourname@mini.local --agent cursor --env-profile agents
+worker task submit --agent cursor --env-profile agents --wait --prompt "Create SETUP_CHECK.md containing: mac-worker works."
+```
+
+`init` reports readiness only when the named profile is secure and the selected agent authenticates with it. It does not save a project-wide agent/profile default; use the printed task command or configure [project defaults](usage.md).
+
+## 5. Run a task, then prepare your project
+
+Follow [Get your first branch](../README.md#3-get-your-first-branch). Builds also need your project's runtime, package manager, dependencies and any required development services.
+
+Configure your Git name and email on the **laptop**. mac-worker passes the submitter's identity to worker commits; absent an identity, it uses a fixed mac-worker fallback.
+
+For a Rust project under Codex's workspace sandbox, populate the worker account's Cargo registry before a build task. In a worker checkout with the same `Cargo.lock`, run:
 
 ```bash
 cargo fetch --locked
-```
-
-Run it in that account's own shell, not inside an agent turn. The command unpacks crates into `~/.cargo/registry`, which later task worktrees on the same worker reuse.
-
-Raising that agent to `unattended` in `.worker.toml` also lets the turn write the registry. That removes Codex's workspace-write sandbox, a safety boundary against accidental writes outside the worktree. It is an operator decision, not the default:
-
-```toml
-[task.permissions]
-codex = "unattended"
-```
-
-To see whether the registry is already warm for a given project, run this one line in the same checkout on the worker:
-
-```bash
 cargo fetch --locked --offline
 ```
 
-Exit `0` means every crate in that lockfile is present. A non-zero exit means at least one crate is still missing.
+The offline check succeeds once the lockfile's crates are cached. This avoids registry writes outside the task worktree during a sandboxed turn. The [usage reference](usage.md) covers other project options.
 
-## 7. Env profiles
+## Updating and installation recovery
 
-Place one file per profile on each worker:
-
-```text
-~/.config/mac-worker/env/<name>.env
-```
-
-The file must be a regular file with mode `0600`, owned by the worker account. On each mini, the operator provisions it and pastes the values themselves:
-
-```sh
-umask 077
-mkdir -p ~/.config/mac-worker/env
-chmod 700 ~/.config/mac-worker/env
-$EDITOR ~/.config/mac-worker/env/<name>.env
-chmod 600 ~/.config/mac-worker/env/<name>.env
-```
-
-Write one `KEY=value` per line. Do not put a profile in the project, and do not ask mac-worker to create, upload, or print one.
-
-Variables each adapter reads from a profile:
-
-| Agent | Variables |
-| --- | --- |
-| Codex | none; file-based login is enough |
-| Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` |
-| Cursor Agent | `CURSOR_API_KEY` |
-| OpenCode | whatever provider variables that CLI needs |
-
-For a keychain-backed Cursor login, the host consumes these reserved names and never exports them to Cursor:
-
-```text
-MAC_WORKER_KEYCHAIN_PASSWORD=<paste the login-keychain password>
-# Optional; defaults to $HOME/Library/Keychains/login.keychain-db
-MAC_WORKER_KEYCHAIN_PATH=<paste an alternate keychain path if needed>
-```
-
-The password is passed to `/usr/bin/security unlock-keychain` on stdin, never on the command line. mac-worker never prints, records, uploads, or forwards either reserved value; the ordinary agent variables are the only profile values injected into the agent environment.
-
-mac-worker reads a profile to inject the ordinary agent variables into the agent's environment and to run a read-only authentication check. It consumes the reserved keychain variables itself. It never copies, forwards, prints, or records values. Records may list variable names.
-
-A profile that is group- or world-readable is reported by the probe as insecure. A turn that names that profile is refused with `ENV_PROFILE_PERMISSIONS` before the agent starts. The probe that reports profiles, and the turn that refuses them, arrive with phase 5; the file and its mode are required now.
-
-## 8. Git identity on the worker
-
-A worker may have no `user.name` or `user.email`. Agent commits and publisher commits must not pick up Git's automatic identity fallback, which can attribute work to the worker host.
-
-The launcher therefore exports the submitting user's Git identity as `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL`. That identity is taken from the submitter's `user.name` and `user.email` (not secret) and recorded with the task. If the submitter has no identity, the launcher uses a fixed `mac-worker` fallback rather than the worker's hostname.
-
-Without an exported identity, a commit on the worker can still succeed through Git's fallback and be attributed incorrectly. Configure `user.name` and `user.email` on the MacBook that submits tasks.
-
-## 9. Rerunning `worker setup`
-
-The v2 helper migrates the host layout only through `worker setup`. Every other entry point, including the read-only probe, fails closed on an outdated layout. A worker whose data root predates the installation anchor reports `HOST_LAYOUT_OUTDATED` or fails setup; it is not eligible until setup has migrated it.
-
-`worker setup` does not rewrite a pre-anchor data root in place. The operator remedy used today is to move the old tree aside to a dated archive name and rerun setup:
+After updating the laptop CLI, run on the **laptop**:
 
 ```bash
-mv ~/.local/share/mac-worker ~/.local/share/mac-worker.pre-anchor-<date>
-./target/release/worker setup mini-1
+worker setup
+worker workers --refresh
 ```
 
-Name the archive `mac-worker.pre-anchor-<date>`, for example `mac-worker.pre-anchor-2026-09-03`. Do not use `sudo`, `rm -rf`, or globs under `~/.local/share/mac-worker`. Keep the archive until the new helper has been probed and a trusted job has completed. After a successful setup, `worker workers` should report the worker ready again.
+Use inventory names to update a subset, for example `worker setup mini`. These commands update mac-worker helpers, not agents or project dependencies. If a helper reports a retained installation lock or an outdated layout, use [installation recovery](setup-recovery.md).
 
-Rerun `worker setup` on every worker after a helper that changes the host layout or that collects agent facts for the first time.
+## Removal and stored data
 
-## 10. What the worker will hold
+Finish or cancel active tasks and fetch results you want to keep before retiring a worker.
 
-Under the mac-worker data root (`~/.local/share/mac-worker`), an agent-capable helper keeps:
+- Remove its `[[workers]]` block from the laptop's configuration to stop scheduling work there. To retire the whole pool, stop submissions and keep or archive that configuration.
+- Delete `~/.local/bin/worker` on the laptop and, if retiring it, on the worker account. If installed with Homebrew later, use `brew uninstall mac-worker` on the laptop instead.
+- Configuration and local task history remain in `~/.config/mac-worker`, `~/.local/state/mac-worker`, `~/.cache/mac-worker` and `~/.local/share/mac-worker` (or your XDG locations).
+- The worker's `~/.local/share/mac-worker` holds installation state, project mirrors, task worktrees and logs. `worker gc` previews reclaimable task data; `worker gc --apply` performs supported cleanup while the worker is still configured and installed. Keep or archive remaining data separately.
+- Agents keep credentials and sessions outside mac-worker's directories. Removing mac-worker does not sign out agents or remove their session history.
 
-- a per-project bare mirror
-- one task workspace per open task (a shared clone of that mirror)
-- turn job directories and their event logs
-
-Agents keep their own session stores outside that data root, for example under the account's Codex or Claude directories. Prompts, file contents, and diffs persist there under the agent's own retention. Closing or discarding a task does not guarantee those stores are empty.
-
-Remote jobs still inherit everything the selected account can access. Agent turns use that same account.
-
-## 11. Sleep and network
-
-Workers must not sleep. Every worker used for agent tasks needs outbound network access to the agent's model provider. Codex, Claude Code, Cursor Agent, and OpenCode all call their providers from the worker, not from the MacBook.
-
-ProxyJump-style SSH aliases are fine. Every mac-worker call is SSH; nothing on the worker listens for the control plane. Do not open inbound ports for mac-worker, and do not forward an SSH agent.
+To revoke SSH access, remove only the dedicated public key's line from the worker's `authorized_keys` and the matching laptop SSH configuration entry. Removing the helper alone does not revoke account access.

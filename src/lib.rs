@@ -78,6 +78,7 @@ pub mod job_service;
 pub mod keychain;
 pub mod lease;
 pub mod manifest;
+pub mod onboarding;
 pub mod output;
 pub mod paths;
 pub mod probe;
@@ -173,6 +174,25 @@ fn execute_with_context(
     runtime: &RuntimeContext,
 ) -> Result<CommandOutput, WorkerError> {
     match cli.command {
+        Command::Init {
+            destination,
+            name,
+            agent,
+            env_profile,
+        } => {
+            let paths = discover_paths(cli.config, runtime)?;
+            onboarding::initialize(
+                runner,
+                &paths.config,
+                onboarding::InitRequest {
+                    destination,
+                    name,
+                    agent,
+                    env_profile,
+                },
+            )
+            .map(CommandOutput::Init)
+        }
         Command::Setup { hosts } => {
             let config = load_config(cli.config, runtime)?;
             let selected = select_workers(&config, &hosts)?;
@@ -3075,7 +3095,7 @@ mod tests {
 
         let config = Config::load(&config_path).unwrap();
 
-        assert_eq!(config.worker("mini-2").unwrap().ssh, "mac2");
+        assert_eq!(config.worker("mini-1").unwrap().ssh, "yourname@mini.local");
         assert!(config.worker("not-configured").is_none());
     }
 

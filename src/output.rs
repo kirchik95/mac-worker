@@ -1,6 +1,7 @@
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandOutput {
+    Init(crate::onboarding::InitReport),
     Setup(crate::protocol::SetupReport),
     Doctor(crate::protocol::DoctorReport),
     Workers(crate::protocol::WorkersReport),
@@ -20,6 +21,7 @@ impl CommandOutput {
 
     pub fn render_human(&self) -> String {
         match self {
+            Self::Init(report) => report.render_human(),
             Self::Setup(report) => report
                 .workers
                 .iter()
@@ -102,6 +104,7 @@ impl CommandOutput {
 
     pub fn aggregate_exit_kind(&self) -> Option<crate::error::ExitKind> {
         match self {
+            Self::Init(report) => report.exit_kind,
             Self::Setup(report) => report
                 .workers
                 .iter()

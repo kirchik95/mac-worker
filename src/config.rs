@@ -28,7 +28,10 @@ pub struct WorkerEntry {
 impl Config {
     pub fn load(path: &Path) -> Result<Self, WorkerError> {
         let contents = fs::read_to_string(path).map_err(|error| {
-            WorkerError::Config(format!("failed to read {}: {error}", path.display()))
+            let hint = if error.kind() == std::io::ErrorKind::NotFound {
+                "; connect your first Mac with `worker init user@mini.local` (keep --config if you use a custom path)"
+            } else { "" };
+            WorkerError::Config(format!("failed to read {}: {error}{hint}", path.display()))
         })?;
         let config = Self::parse(&contents)?;
         config.validate()?;
@@ -116,7 +119,7 @@ fn default_remote_binary() -> String {
     REMOTE_BINARY.into()
 }
 
-fn valid_identifier(value: &str) -> bool {
+pub(crate) fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
         && value
             .bytes()

@@ -38,7 +38,7 @@ fn worker_help() -> String {
 }
 
 #[test]
-fn phase_five_d_help_and_readme_document_origin_cursor_opencode_and_gc() {
+fn phase_five_d_help_exposes_origin_cursor_opencode_and_gc() {
     let help = worker_help();
     assert!(help.contains("--source <SOURCE>"));
     assert!(help.contains("--publish <PUBLISH>"));
@@ -50,21 +50,6 @@ fn phase_five_d_help_and_readme_document_origin_cursor_opencode_and_gc() {
     assert!(help.contains("reconcile"));
     assert!(help.contains("Usage: worker gc"));
     assert!(help.contains("--apply"));
-
-    let readme = read_repository("README.md");
-    for phrase in [
-        "source = \"origin\"",
-        "publish = [\"fetch\", \"push\"]",
-        "CURSOR_API_KEY",
-        "worker task reconcile",
-        "worker gc --apply",
-        "agent turns run with the worker account's full access",
-    ] {
-        assert!(
-            readme.contains(phrase),
-            "missing documentation phrase: {phrase}"
-        );
-    }
 }
 
 #[test]

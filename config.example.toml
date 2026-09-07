@@ -1,19 +1,8 @@
+# Usually created for you by: worker init yourname@mini.local
 version = 1
 
 [[workers]]
 name = "mini-1"
-ssh = "mac1"
-slots = 1
-capabilities = ["darwin-arm64"]
-
-[[workers]]
-name = "mini-2"
-ssh = "mac2"
-slots = 1
-capabilities = ["darwin-arm64"]
-
-[[workers]]
-name = "mini-3"
-ssh = "mac3"
+ssh = "yourname@mini.local"
 slots = 1
 capabilities = ["darwin-arm64"]

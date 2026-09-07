@@ -25,16 +25,39 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
+    #[command(
+        about = "Connect a Mac, create its configuration and check agent readiness",
+        after_help = "Example: worker init alice@mini.local\nEnable Remote Login on the Mac first. SSH aliases also work.\nRerun the same command after completing any setup or login instructions."
+    )]
+    Init {
+        /// SSH destination: user@hostname, an IP address, or an existing SSH alias
+        #[arg(value_name = "SSH", value_parser = crate::onboarding::ssh_destination)]
+        destination: String,
+        /// Inventory name (defaults to the hostname; preserves existing names on retry)
+        #[arg(long, value_parser = crate::onboarding::worker_name)]
+        name: Option<String>,
+        /// Agent to check; the first-task command will use this agent
+        #[arg(long, default_value = "codex", value_parser = ["codex", "cursor", "opencode", "claude"])]
+        agent: String,
+        /// Existing environment profile on the worker, when the agent needs one
+        #[arg(long, value_parser = crate::onboarding::identifier)]
+        env_profile: Option<String>,
+    },
+    #[command(about = "Install or update helpers on configured workers (all by default)")]
     Setup {
+        /// Inventory names, as shown by `worker workers`
         hosts: Vec<String>,
     },
+    #[command(about = "Check a Git project and compatible workers before running a job")]
     Doctor {
         #[arg(long)]
         project: Option<PathBuf>,
         #[arg(long = "include", value_parser = non_empty_pattern)]
         includes: Vec<String>,
     },
+    #[command(about = "Show worker health, capacity and agent logins")]
     Workers {
+        /// Refresh agent and authentication facts before reporting
         #[arg(long)]
         refresh: bool,
     },
@@ -43,6 +66,7 @@ pub enum Command {
         #[arg(long)]
         apply: bool,
     },
+    #[command(about = "Open the local dashboard in your browser")]
     Dashboard {
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
         port: Option<u16>,

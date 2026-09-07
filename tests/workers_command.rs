@@ -1444,7 +1444,7 @@ fn ssh_destinations(runner: &RecordingRunner, command_suffix: &str) -> Vec<Strin
         .requests()
         .into_iter()
         .filter(|request| {
-            request.program == OsString::from("/usr/bin/ssh")
+            request.program == "/usr/bin/ssh"
                 && request
                     .args
                     .last()
