@@ -1,148 +1,152 @@
+<p align="center">
+  <img src="docs/images/hero.png" alt="mac-worker: a pool of headless Mac minis that turn prompts into branches" width="100%">
+</p>
+
 # mac-worker
 
-`mac-worker` is a personal remote-execution tool for dispatching heavy local-development commands from a MacBook to a small pool of trusted Mac mini workers.
+**Hand a coding task to a pool of Mac minis. Get a Git branch back.**
 
-## Phase 3: setup, inventory, and one remote job
+`mac-worker` is a small Rust CLI that turns a few spare Macs into a pool of headless coding agents. From your laptop you submit a prompt; the pool picks an idle worker, runs a coding agent (Codex, Cursor, or OpenCode) inside an isolated copy of your repository, and publishes the result as a branch you can fetch, review, and merge. A read-only dashboard shows what every machine is doing.
 
-First provision each host according to the [macOS worker setup guide](docs/setup-macos-worker.md). In particular, the worker alias must support non-interactive SSH with the existing macOS account selected for worker jobs before running setup. A separate worker-only account is optional hardening, not a prerequisite.
+It is a personal tool, built for one person with a MacBook and three Mac minis on the same network. It is deliberately boring: SSH, Git, plain files, no daemon on the laptop, no database, no cloud.
+
+- **One command per task.** `worker task submit --agent codex --prompt-file task.md`
+- **Results are branches.** Nothing touches your working tree; you `fetch` and decide.
+- **Agents are interchangeable.** Codex, Cursor, and OpenCode run through the same task lifecycle.
+- **Nothing sensitive leaves the worker.** Logins live on the minis; the CLI never copies or prints them.
+- **Everything is observable.** `worker task list`, `worker workers`, and a loopback dashboard.
+
+## How it works
+
+<p align="center">
+  <img src="docs/images/architecture.png" alt="Architecture: the laptop schedules over SSH, each worker runs one agent turn in an isolated worktree and publishes a branch" width="100%">
+</p>
+
+1. **You submit a task** from a Git worktree on your laptop. The CLI records the task locally, snapshots the exact base commit into a small transfer repository, and puts one *turn* on the FIFO queue.
+2. **The scheduler picks a worker.** Each configured Mac mini has one slot. A local detached *turn runner* takes the queue row and talks to the worker's helper over SSH; the remote lease is authoritative, so two runners can never share a slot.
+3. **The worker runs the agent.** The helper materialises the base commit into a per-task worktree (backed by a bare mirror per project), unlocks what the agent needs, and launches it headless with a composed prompt: your text plus the task context and a required structured result.
+4. **The result is published.** When the agent finishes, the helper commits whatever the agent left in the worktree, publishes it as `task/<id>`, and records the structured outcome: `done`, `needs_input`, or `blocked`, with a summary, questions, and changed files.
+5. **You fetch and decide.** `worker task fetch` brings the branch into your repository as a remote-tracking ref. Ask a follow-up with `worker task say`, or close the task.
+
+The laptop is the orchestrator and the only place with a copy of your intent. Workers hold mirrors, worktrees, and agent sessions, all of which `worker gc` can reclaim.
+
+## Quick start
+
+### Requirements
+
+- **Laptop (orchestrator):** macOS or Linux, Rust 1.85 or newer (the crate uses the 2024 edition), Git, and SSH aliases for every worker.
+- **Workers:** Macs on the same network with Remote Login enabled, Git, and the agent CLIs you want to use: [Codex](https://github.com/openai/codex) (`codex`), [Cursor](https://cursor.com) (`cursor-agent`), or [OpenCode](https://opencode.ai) (`opencode`). Each agent is logged in on the worker itself, once.
+
+The [macOS worker setup guide](docs/setup-macos-worker.md) walks through the account, SSH, agent installation, and login on each worker.
+
+### 1. Build and install the CLI
 
 ```bash
-cargo test --all-targets
+git clone https://github.com/kirchik95/mac-worker.git
+cd mac-worker
 cargo build --release
+install -m 755 target/release/worker ~/.local/bin/worker
+```
+
+### 2. Describe your workers
+
+```bash
 mkdir -p ~/.config/mac-worker
 cp config.example.toml ~/.config/mac-worker/config.toml
-./target/release/worker setup mini-1
-./target/release/worker workers
-./target/release/worker --json workers | jq .
 ```
 
-`worker setup mini-1` installs the current helper for that configured worker. `worker workers` lists configured workers and performs bounded read-only SSH health probes; it may report a worker unavailable before setup. Phase 3 required an explicit worker name; Phase 4 adds automatic scheduling when the pin is omitted.
+```toml
+version = 1
 
-Run trusted, non-interactive batch commands from a Git worktree:
+[[workers]]
+name = "mini-1"
+ssh = "mac1"                       # an alias from ~/.ssh/config
+slots = 1
+capabilities = ["darwin-arm64"]
+```
+
+`ssh` is an alias that already works non-interactively (`ssh mac1 true`). Add one `[[workers]]` block per machine.
+
+### 3. Install the helper and check the pool
 
 ```bash
-./target/release/worker run --worker mini-1 -- /usr/bin/printf 'hello\n'
-./target/release/worker status
-./target/release/worker status <job-id>
-./target/release/worker logs -f <job-id>
+worker setup mini-1 mini-2 mini-3   # copies the helper binary to each worker
+worker workers --refresh            # probes hosts, agents, and logins
 ```
 
-Bare `worker status` lists recent jobs and may report `N older jobs omitted`; `worker status <job-id>` reports one exact job.
+`worker workers` shows each machine's slot, load, and which agents are installed and authenticated. Rerun `worker setup` after upgrading the CLI; the protocol version is checked on every call.
 
-The `--` form sends a literal argument vector; use `--shell '...'` only when shell syntax is intentional. Jobs have no interactive PTY or stdin forwarding. Phase 3 is for trusted batch work only: a worker job runs with the access of its configured macOS account.
+### 4. Run your first task
 
-Before submission, the client captures a verified immutable snapshot rather than uploading the live worktree. The host verifies and promotes that upload before running it from an isolated workspace. Once the host durably accepts a job, it continues if the client or log follower disconnects; reconnect with `status` or `logs` using the original job ID. Source changes made in the remote workspace are never returned to the local worktree.
-
-Human log streaming writes raw application bytes to stdout or stderr. With `--json`, `run` and `logs` emit versioned NDJSON events; log chunks are base64-encoded instead of appearing as raw bytes. mac-worker avoids adding secret values to its own diagnostics, but application logs can contain secrets emitted by the application.
-
-Phase 3 deliberately does not provide automatic scheduling or queueing, cancellation, artifact transfer, package caches, Docker profiles, safe garbage collection, or a dashboard. Any configured artifact collection causes `worker run` to reject the job during preflight with `ARTIFACTS_UNSUPPORTED`, rather than running the command and silently discarding requested outputs.
-
-## Phase 4: automatic scheduling, cancellation, and reconciliation
-
-Use the scheduler with a literal command vector:
+From any Git repository on your laptop:
 
 ```bash
-worker run -- npm test
-worker run --no-wait -- npm test
-worker run --worker mini-2 -- npm test
-worker status
-worker cancel <job-id>
+worker task submit --agent codex --wait \
+  --prompt "Add a failing test for the empty-cart checkout bug, then fix it. Run cargo test."
+
+worker task result <task-id>    # summary, questions, changed files
+worker task fetch  <task-id>    # the branch task/<task-id> lands in this repository
+git log --oneline mac-worker/mini-1/task/<task-id>
 ```
 
-An automatic run is admitted to a compatible configured worker and queues in that worker's FIFO order. `--worker NAME` pins the run to that worker; a pinned run waits only for its named worker and does not block compatible work on another worker. `--no-wait` returns `CAPACITY_BUSY` when no eligible slot is immediately available and does not publish a queue row, snapshot, local job record, lease, or other remote mutation. Cancellation is explicit and targeted: it can cancel a waiting row locally or cancel a running job on its recorded worker. Disconnecting a log follower or pressing Ctrl-C does not cancel an accepted job; reconnect with its original job ID. Source changes made in a remote workspace are never returned to the local worktree.
+Drop `--wait` to return immediately and follow with `worker task list`, `worker task wait`, or the dashboard.
 
-Scheduler admission uses the local shared observation cache only as advisory input. The remote lease remains authoritative, so a stale or unavailable cache observation cannot free capacity or prove that a worker is idle. The dashboard is Phase 4.5. Artifact transfer/fetch, package caches, Docker profiles, and general garbage collection are later work and are not public Phase 4 commands.
+## Agents
 
-## Validate a project locally
+| Agent | Flag | Login lives | Notes |
+|---|---|---|---|
+| Codex | `--agent codex` | file-based login on the worker | `--model gpt-5.6-luna --effort max` are passed through; runs in the Codex workspace sandbox |
+| OpenCode | `--agent opencode` | OpenCode auth store on the worker | uses the worker's default model; pick another with `--model opencode-go/<model>` |
+| Cursor | `--agent cursor --env-profile agents` | Cursor login on the worker + an env profile | needs the profile described below because Cursor keeps its login in the macOS keychain |
+| Claude Code | `--agent claude` | env profile | adapter exists; disabled on the workers until you opt in |
 
-Build the release binary, then run Doctor from either human-readable or JSON-oriented tooling:
+Every agent gets the same contract: work only in the task worktree, do not switch branches or push, and end with a JSON result. Agents that cannot ask questions interactively return `needs_input` with the exact question; you answer with `worker task say <id> --message "…" --wait`, which starts the next turn in the same agent session.
 
-```bash
-cargo build --release
-./target/release/worker doctor --project /path/to/worktree
-./target/release/worker --json doctor --project /path/to/worktree | jq .
-./target/release/worker doctor --project /path/to/worktree \
-  --include 'fixtures/generated/**'
+### Env profiles
+
+Some agents need environment variables or a keychain unlock on the worker. Put them in an owner-only file on each worker, never in the repository:
+
+```sh
+umask 077
+mkdir -p ~/.config/mac-worker/env && chmod 700 ~/.config/mac-worker/env
+$EDITOR ~/.config/mac-worker/env/agents.env      # KEY=value per line
+chmod 600 ~/.config/mac-worker/env/agents.env
 ```
 
-Doctor inspects the Git worktree, probes configured workers read-only, creates a unique local snapshot, verifies the selected source a second time, and deletes that exact snapshot before a successful return. It does not upload project data or start a user command. A cleanup failure is an I/O failure, never a ready result.
+Recognised keys include `CURSOR_API_KEY`, and the host-only `MAC_WORKER_KEYCHAIN_PASSWORD` (plus optional `MAC_WORKER_KEYCHAIN_PATH`), which mac-worker feeds to `security unlock-keychain` on stdin right before an agent that needs the login keychain runs. The two keychain values are consumed by the helper and never exported to the agent, logged, or shown anywhere. A profile that is group- or world-readable is refused.
 
-`UNTRACKED_INPUT` means local inputs are not covered by an explicit policy. Commit them, ignore or remove them when appropriate, or include only the exact file or narrow project-owned subtree needed by the command. Do not use a catch-all include. `SENSITIVE_PATH` means a conventional credential path is selected: remove it from the project input and use a documented example file or separately provisioned worker configuration. If the name is intentionally non-secret, review it and add only that exact relative path to `snapshot.allow_sensitive` in `.worker.toml`; Doctor will emit a content-free warning.
+## Task lifecycle
 
-## Local dashboard
-
-`worker dashboard` is a local observer for the configured fleet. It is not a scheduler or a replacement for CLI operations such as `worker run`, `worker status`, `worker logs`, or `worker cancel`.
-
-```bash
-worker dashboard
-worker dashboard --no-open
-worker dashboard --port 9173
-```
-
-The dashboard binds `127.0.0.1` only and validates the request `Host` against that loopback listener. It is ephemeral: it polls rather than pushes updates and keeps no database. The Overview, Tasks, and Run history views observe local state; Settings can explicitly save native agent defaults for future CLI launches. API JSON responses use `Cache-Control: no-store`; the server also sends a restrictive CSP, `nosniff`, and `no-referrer` headers and does not enable CORS.
-
-The light dashboard has four views: **Overview** (workers, queue, progress and task output), **Tasks**, **Run history**, and **Settings**. Settings shows each worker's cached agent authentication, CLI versions, latest recorded launch settings, and native model, effort, and Fast defaults from the worker's user settings. Model dropdowns use bounded native catalogs and saved selections; Cursor's list is not a complete account catalog. Empty model values display as `CLI default`; effort choices and Fast availability follow the selected model, while existing unverified values remain visible and resettable. OpenCode does not publish a global effort or Fast setting. Saving uses an optimistic revision check, preserves the three-field draft on errors or conflicts, and affects subsequent launches; Cancel restores the saved values. Task, environment, project, and model-specific settings may override them. Stale or missing observations show an unknown connection state. Fonts are bundled locally under the SIL Open Font License.
-
-The tasks view is a read-only extension of this observer for durable agent tasks and named runs:
-
-- The tasks table shows title, agent, state, worker, runner state, turn count, last outcome, run position, branch, freshness, and age.
-- Run, state, worker, and agent filters are local browser filters; they do not make network requests.
-- Run cards show top-level and per-run progress. Queue rows retain the scheduler's batch/task-turn kind, pin, run cap, FIFO position, and Phase-4 blocking reason.
-- Task detail shows the safe result summary, questions, changed files, diff stat, base/head IDs, turn timeline, runner liveness, and the exact `worker task fetch <task-id>` command.
-
-The snapshot endpoint is `GET /api/v1/snapshot`. Task detail is `GET /api/v1/tasks/<task-id>`, and a turn log is read with `GET /api/v1/tasks/<task-id>/turns/<turn-id>/logs?stream=stdout|stderr&offset=<byte-offset>&limit=<bytes>`. Task IDs and turn IDs must be canonical typed identifiers; the existing legacy `/api/v1/jobs/...` detail and log routes remain separate. Snapshot polling runs every two seconds. Overview initially selects a current active task when available. A selected task turn polls stdout and stderr independently every one second with byte cursors and decoder state; each log request is bounded to `1..=65,536` bytes. Completed turns drain their recorded output before polling stops, using exact terminal lengths when available or an empty terminal read. A new turn resets both cursors without changing the selected navigation view.
-
-`worker task list --json` and the dashboard snapshot use the same `tasks`, `runs`, and `progress` projection. The CLI adds its protocol-version envelope; the snapshot flattens the projection beside its worker, queue, and legacy-job fields.
-
-The dashboard only observes local records, process liveness, cached worker observations, and bounded remote status/log reads. It never starts or recovers a runner, reconciles, cancels, closes, fetches a result, or sends a task message. Settings read the allowlisted native defaults from each configured worker and save the selected model, effort, Fast state, and revision through the protected settings endpoint. Project defaults continue to come from `.worker.toml` in the directory where `worker dashboard` is launched. Prompts and prompt-file contents, environment profile values, credentials, session references, complete paths, raw host diagnostics, and unbounded output are not exposed in task rows, queue rows, JSON, detail, or timeline data. Selected environment profile names may appear in task and settings projections. Changed files remain repository-relative or become `[path]`; log chunks are bounded base64 bytes and browser content is rendered as text only. Application log content is trusted text for the local operator and may contain application-emitted secrets.
-
-## Phase 5
-
-Phase 5 adds agent tasks: submit a prompt instead of a command, run a headless coding agent on a Mac mini, and collect the result as a Git branch. This release exposes the `worker task` family and `worker workers --refresh`; verify the exact installed grammar with `worker task --help` and the relevant subcommand help before dispatching. The task lifecycle commands are available in this branch, and phase 5e adds the read-only dashboard tasks view described above. The dashboard does not replace the task CLI; its Settings view only edits native agent defaults for future launches.
-
-The orchestrator loop is documented in [`.claude/skills/pool-dispatch/SKILL.md`](.claude/skills/pool-dispatch/SKILL.md). How to write a brief is in [`.claude/skills/pool-task-authoring/SKILL.md`](.claude/skills/pool-task-authoring/SKILL.md). The three-Mac live procedure is [docs/phase-five-acceptance-runbook.md](docs/phase-five-acceptance-runbook.md); the sanitized record template is [docs/phase-five-validation.md](docs/phase-five-validation.md).
-
-Prepare each worker first using the [macOS worker setup guide](docs/setup-macos-worker.md). After a helper that migrates the host layout or collects agent facts for the first time, rerun `worker setup` on every worker. This release moves the protocol to version 5 because the turn material and the task status changed shape, so `worker setup` must be rerun on every worker before it is eligible again.
-
-Task commands:
+<p align="center">
+  <img src="docs/images/task-lifecycle.png" alt="Task lifecycle: submit, queue, turn, publish, fetch, close, with done / needs_input / blocked outcomes" width="100%">
+</p>
 
 ```text
-worker task submit --agent codex --prompt-file tasks/fix-login.md
-worker task submit --agent codex --model gpt-5.6-luna --effort max --prompt-file tasks/fix-login.md
-worker task batch tasks/sprint.toml --max-parallel 3
-worker task list --run <run_id> --json
-worker task list --state open --outcome needs-input --json
-worker task wait --run <run_id>
-worker task say <task_id> --message-file answer.md --wait
-worker task result <task_id> --json
-worker task fetch <task_id>
-worker task close <task_id>
-worker task reconcile
-worker workers --refresh
+worker task submit   --agent <a> (--prompt TEXT | --prompt-file PATH) [--wait] [--model M] [--effort E]
+worker task batch    tasks.toml [--max-parallel N] [--wait]      # several tasks as one named run
+worker task list     [--run ID] [--state open] [--outcome needs-input]
+worker task status   <id>          worker task logs <id> [-f]     worker task diff <id> --stat
+worker task wait     --task-id <id> | --run <run-id> [--timeout 30m]
+worker task say      <id> --message "…" [--wait]                  # answer or steer, next turn
+worker task result   <id>          worker task fetch <id>
+worker task cancel   <id>          worker task close <id> [--discard]
+worker task reconcile              # re-own dead runners, re-queue orphaned turns; submits nothing
+worker gc [--apply]                # preview, then reclaim old tasks, branches, mirrors on the workers
 ```
 
-`worker workers --refresh` recollects agent, profile, and Git-identity facts. `worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks without submitting anything.
+Outcomes are recorded on the task, independent of the process exit code:
 
-`--model` and `--effort` are recorded with the task and reach only the agents that accept them: Codex takes the effort as `-c model_reasoning_effort="<value>"` on the first turn and on resume, while Claude, Cursor, and OpenCode ignore it as they already ignore `--max-turns` and `--max-budget`. An effort value may contain only ASCII letters, digits, `-`, and `_`, and at most 32 bytes.
+- `done`: the agent finished and the branch is published. Tasks close themselves by default (`--close-on done`).
+- `needs_input`: the agent has a bounded question; `say` answers it.
+- `blocked`: the agent could not finish. Read `result` and `logs`, then `say` guidance or `close --discard`.
+- `unknown`: the agent did not return a structured result; the branch is still published.
 
-A task's effort overrides the worker's native default for that turn only: the Settings view edits the agent's own configuration on the worker, and the launcher's config override wins over it without changing it. The Tasks view reports the effort recorded with the task, and reports none when the task did not set one and the worker's own default applies.
-
-`worker task list --outcome <kind>` filters by the recorded last outcome (`done`, `needs_input`, `blocked`, `unknown`, `failed`, `cancelled`, `timed_out`, `lost`; the dashed spelling is accepted) and composes with `--state`. `--state open --outcome needs-input` lists the tasks waiting on an answer.
-
-An agent's questions carry the answers it will accept: `worker task status --json` and `worker task result --json` report each question as `{"text": …, "options": [...]}`, and a question with no options stays a bare string. Answer with `worker task say`.
-
-For an individual task, use `worker task wait --task-id <task_id>`; `worker task wait --run <run_id>` waits for every task in a run.
-
-A batch file looks like this:
+A batch file groups independent tasks into a run with shared defaults:
 
 ```toml
 version = 1
 agent = "codex"
 model = "gpt-5.6-luna"
-effort = "max"
-base = "main"
-source = "local"
-publish = ["fetch"]
 timeout = "45m"
 
 [[tasks]]
@@ -151,73 +155,85 @@ prompt_file = "tasks/fix-flaky-login.md"
 
 [[tasks]]
 title = "Extract billing client"
-prompt = """
-Move the billing HTTP client into packages/billing-client …
-"""
-agent = "codex"
-publish = ["fetch", "push"]
+prompt = "Move the billing HTTP client into packages/billing-client …"
+agent = "opencode"
 ```
 
-Top-level keys are defaults; each task may override them. Project defaults live in `.worker.toml`:
+Project-wide defaults live in `.worker.toml` next to your code:
 
 ```toml
 [task]
-source = "local"
-publish = ["fetch"]
-env_profile = "agents"
 default_agent = "codex"
-model = "gpt-5.6-luna"     # optional; --model wins
-effort = "max"             # optional; --effort wins
+model = "gpt-5.6-luna"
+effort = "max"
+env_profile = "agents"
+source = "local"            # or "origin": start from the exact commit on your Git remote
+publish = ["fetch"]         # add "push" to also push task/<id> to origin
 timeout = "45m"
 max_followups = 10
-
-[task.permissions]
-codex = "workspace"        # workspace | unattended
-claude = "unattended"
-cursor = "unattended"
-opencode = "unattended"
 ```
 
-Claude Code is deferred on the workers by operator decision. When it is enabled, put its token in an owner-only profile on each worker (`~/.config/mac-worker/env/agents.env`, mode `0600`) with `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. Codex uses its file-based login and needs no profile. mac-worker never creates, uploads, or prints a profile.
+Writing good briefs is its own skill. Two Claude Code skills ship with the repository and work from any project: [`pool-task-authoring`](.claude/skills/pool-task-authoring/SKILL.md) turns an objective into one-turn, headless-safe tasks, and [`pool-dispatch`](.claude/skills/pool-dispatch/SKILL.md) is the mechanical submit / wait / answer / fetch loop. Say "send it to the pool" and Claude Code uses them.
 
-Agent turns run with the worker account's full access: its files, processes, caches, agent configuration, and any credentials that account holds. A task workspace is not a security boundary. Only dispatch trusted prompts.
+## Dashboard
 
-## Phase 5d: origin publication, Cursor, and OpenCode
+<p align="center">
+  <img src="docs/images/dashboard.png" alt="The dashboard: three machine cards, queue, active work, and the task ledger" width="100%">
+</p>
 
-Phase 5d extends the task core with origin-backed bases, optional origin publication, Cursor and OpenCode turns, and retention through `worker gc`. Dashboard task views remain phase 5e. Verify the exact installed grammar with the debug-build help before dispatching; the shapes below match `cargo run -q -- task submit --help`, `cargo run -q -- workers --help`, and `cargo run -q -- gc --help`.
+```bash
+worker dashboard                 # opens http://127.0.0.1:<port>
+worker dashboard --port 8765 --no-open
+```
+
+The dashboard is a loopback-only observer: workers with slot state and host load, the FIFO queue with blocking reasons, active turns with live logs, the task ledger with filters, per-task detail with the outcome, changed files, and the exact `worker task fetch` command, and a run history. It polls, keeps no database, never starts or cancels anything, and never shows prompts, credentials, or profile values. Its Settings view can save native model and effort defaults for future launches; that is its only write. The JSON it renders is available at `GET /api/v1/snapshot`, `GET /api/v1/tasks/<id>`, and `GET /api/v1/tasks/<id>/turns/<turn>/logs`.
+
+The interface is a React application in `ui/`, built with Tailwind and shadcn/ui and embedded into the binary at build time, so `cargo build` needs no JavaScript toolchain.
+
+## What the pool will and will not do
+
+- A task worktree is isolation for your repository, not a security boundary: agent turns run with the worker account's full access. Only dispatch prompts you trust, on machines you own.
+- Your working tree is never modified. Results arrive as remote-tracking refs; merging is your decision.
+- Workers hold a bare mirror per project, a worktree per task, agent sessions, and bounded logs. `worker gc` previews and reclaims them: idle open tasks after 7 days, result branches after 30 days or on `close --discard`.
+- The CLI adds no secrets to its own diagnostics, redacts worker paths from agent summaries, and refuses insecure profiles. Application logs can still contain whatever the agent printed.
+- Every command is idempotent or explicitly recoverable: `worker task reconcile` repairs after a laptop reboot, and `worker setup` migrates workers after an upgrade.
+
+## Plain remote commands
+
+The task system is built on a simpler layer that is still available: run any trusted, non-interactive command on a worker from a snapshot of the current worktree.
+
+```bash
+worker run -- cargo test --locked           # scheduler picks a worker
+worker run --worker mini-2 -- npm test      # pin one
+worker status                               # recent jobs
+worker logs -f <job-id>
+worker cancel <job-id>
+worker doctor --project .                   # validate a project before its first job
+```
+
+## Repository layout
 
 ```text
-worker task submit --agent cursor --env-profile agents --prompt-file tasks/fix-login.md
-worker task submit --agent opencode --prompt-file tasks/update-api.md
-worker task submit --source origin --base main --agent codex --prompt "…"
-worker task submit --publish fetch --publish push --publish-branch feature/api --agent claude --prompt "…"
-worker workers --refresh
-worker task reconcile
-worker gc --apply
+src/            the CLI, scheduler, transfer and publication, host helper, agent adapters, dashboard server
+src/agent/      one adapter per agent: codex.rs, cursor.rs, opencode.rs, claude.rs
+ui/             dashboard front end (React + Tailwind), built into src/dashboard/static/app
+tests/          integration suites with recorded agent transcripts under tests/fixtures
+docs/           worker setup guide, acceptance runbook, sanitised validation records
+docs/superpowers/   design specs, implementation plans, and review notes
+.claude/skills/ the two pool skills for Claude Code
 ```
 
-`worker task submit [OPTIONS]` help prints `--agent <AGENT>`, `--source <SOURCE>`, `--publish <PUBLISH>`, `--publish-branch <PUBLISH_BRANCH>`, and `--env-profile <ENV_PROFILE>`. Accepted `--source` values are `local` and `origin` (default from `.worker.toml`, else `local`). `--publish` is repeatable; accepted values are `fetch` and `push` (default from `.worker.toml`, else `fetch`). `--publish-branch` is valid only with `publish = push`. Accepted `--agent` values are `codex`, `claude`, `cursor`, and `opencode`. Claude Code remains deferred on the workers by operator decision.
+## Documentation
 
-A project may set `source = "origin"` and `publish = ["fetch", "push"]` in `.worker.toml` or in a batch file. `source = origin` fails before task creation with `BASE_NOT_ON_ORIGIN` when the exact base is absent from the normalized origin; preparation fails with `BASE_UNAVAILABLE` when the worker cannot fetch or verify it. `publish = push` requires a committed base and the inventory capability `origin:<host>`, reserves a unique run branch, always performs fetch publication, and leaves the task open with `PUBLISH_FAILED` when origin rejects the push. `--wip` with push is `PUBLISH_REQUIRES_COMMITTED_BASE`. A pinned worker that lacks `origin:<host>` is `CAPABILITY_MISSING` and is not rerouted.
+- [Set up a macOS worker](docs/setup-macos-worker.md): account, SSH, agents, profiles, sleep settings.
+- [Phase 5 acceptance runbook](docs/phase-five-acceptance-runbook.md) and its [validation record](docs/phase-five-validation.md): how the pool was proven end to end on three machines.
+- [Dashboard validation](docs/dashboard-validation.md).
+- [Design specs](docs/superpowers/specs/) and [plans](docs/superpowers/plans/): why things are shaped the way they are.
 
-As in the execution core, agent turns run with the worker account's full access. Cursor (`--agent cursor`) and OpenCode (`--agent opencode`) use bound sessions and pointer prompts. Cursor prebinds a chat before the first turn and launches with `--force`; OpenCode binds the session from its first JSON event and launches with `--auto`. Resume uses the recorded session reference and fails with `SESSION_UNBOUND` when it is absent. Profile values stay on the worker: they are never copied, logged, or returned through `worker workers`.
+## Status
 
-Cursor headless turns need `CURSOR_API_KEY` in a secure env profile. If Cursor's login is backed by the macOS login keychain, the keychain must be unlocked in the same headless launch session because Cursor refuses commands while that keychain is locked. On each mini, an operator can add the host-only `MAC_WORKER_KEYCHAIN_PASSWORD` and optional `MAC_WORKER_KEYCHAIN_PATH` to the profile; mac-worker sends the password to `/usr/bin/security` on stdin immediately before Cursor probes, prebinds, and turns. The default path is `$HOME/Library/Keychains/login.keychain-db`.
+Tested daily on one MacBook and three Apple-silicon Mac minis running macOS 26 with Codex, Cursor, and OpenCode. Expect the protocol to change between releases; the CLI refuses to talk to a worker with a different protocol version until you rerun `worker setup`.
 
-Provision the profile on each mini yourself, pasting the values directly into the owner-only file:
+## License
 
-```sh
-umask 077
-mkdir -p ~/.config/mac-worker/env
-chmod 700 ~/.config/mac-worker/env
-$EDITOR ~/.config/mac-worker/env/agents.env
-chmod 600 ~/.config/mac-worker/env/agents.env
-```
-
-The file may contain `CURSOR_API_KEY=…`, `MAC_WORKER_KEYCHAIN_PASSWORD=…`, and, when needed, `MAC_WORKER_KEYCHAIN_PATH=…`. mac-worker never prints, records, uploads, or exports the two host-only values. Codex and OpenCode do not need keychain unlock variables. OpenCode uses file-based or provider login plus any provider variables that CLI needs in the same profile. OpenCode's worker-local server is loopback-only for the lifetime of that process. See [macOS worker setup](docs/setup-macos-worker.md) for the agent and profile caveats.
-
-Profile files are operator-provisioned owner-only files (`~/.config/mac-worker/env/<name>.env`, mode `0600`). mac-worker never creates, uploads, or prints a profile. An insecure (group- or world-readable) profile is reported as insecure and is never applied; naming it on a turn is `ENV_PROFILE_PERMISSIONS`.
-
-`worker workers --refresh` recollects agent, profile, and Git-identity facts. `worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks without submitting anything.
-
-`worker gc [OPTIONS]` help prints `--apply`. Without `--apply`, `worker gc` previews every candidate with a reason. `worker gc --apply` applies the preview: idle open tasks close after task retention (default seven days) while the result branch is preserved; result branches prune after branch retention (default thirty days) or immediately on `worker task close --discard`; empty mirrors and transfer repositories become candidates only when no task or base ref protects them. `gc` never prunes another task's mirror ref. Native session deletion runs on discard only when the installed adapter exposes it.
+[MIT](LICENSE)
