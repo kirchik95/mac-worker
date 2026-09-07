@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::CString,
     fmt,
     fs::File,
     os::{
@@ -40,7 +41,9 @@ pub type StagingNonce = [u8; 16];
 const PREVIOUS_HOST_LAYOUT_VERSION: u32 = 1;
 const HOST_INSTALLATION_VERSION: u32 = 1;
 const INSTALLATION_PREFIX: &str = ".mac-worker-installation-";
+const INSTALLATION_IDENTITY_REFRESH_NAME: &str = ".mac-worker-anchor-refresh-identity.json";
 const HOST_LAYOUT_FILE: &str = "layout.json";
+const HOST_LAYOUT_REFRESH_NAME: &str = "layout.refresh.json";
 const CAPACITY_LOCK_FILE: &str = "capacity.lock";
 const ADMISSION_LOCK_FILE: &str = "admission.lock";
 const SESSION_LOCK_FILE: &str = "session.lock";
@@ -125,6 +128,10 @@ pub enum HostStoreWritePoint {
     AfterResolutionCleanupMarker = 58,
     BeforeResolutionLeaseRelease = 59,
     AfterCleanupIntentCommit = 60,
+    AfterHostLayoutRefreshUnlink = 61,
+    AfterHostLayoutRefreshPublish = 62,
+    AfterInstallationIdentityRefreshUnlink = 63,
+    AfterInstallationIdentityRefreshPublish = 64,
 }
 
 impl LayoutEntry {
@@ -929,8 +936,16 @@ impl HostStore {
         };
         let names = installation_names(&parent, root)?;
         let root_present = parent.entry_exists(&names.root_name)?;
-        let lock_present = parent.entry_exists(&names.lock)?;
-        let identity_present = parent.entry_exists(&names.identity)?;
+        let mut lock_present = parent.entry_exists(&names.lock)?;
+        let mut identity_present = parent.entry_exists(&names.identity)?;
+        let mut reanchored = false;
+        if root_present && !lock_present && !identity_present {
+            reanchored = reanchor_legacy_installation(&parent, &names)?;
+            if reanchored {
+                lock_present = parent.entry_exists(&names.lock)?;
+                identity_present = parent.entry_exists(&names.identity)?;
+            }
+        }
         if !root_present && !lock_present && !identity_present && !create {
             return Ok(None);
         }
@@ -977,10 +992,27 @@ impl HostStore {
                 drop(installation_lock.take());
             }
         }
-        if !initialize && (!root_present || !identity_present) {
+        if !initialize && !root_present {
             return Err(WorkerError::Protocol(
                 "host installation is incomplete after coordination".into(),
             ));
+        }
+        if !initialize && !identity_present {
+            let refresh_residue = parent.entry_exists(INSTALLATION_IDENTITY_REFRESH_NAME)?;
+            let legacy_identity = has_installation_identity_file(&parent)?;
+            if !refresh_residue && !legacy_identity {
+                return Err(WorkerError::Protocol(
+                    "host installation is incomplete after coordination".into(),
+                ));
+            }
+        }
+        if installation_lock.is_none() {
+            let retry = parent.open_existing_private_lock(&names.lock)?;
+            let result = unsafe { libc::flock(retry.as_raw_fd(), libc::LOCK_EX) };
+            if result != 0 {
+                return Err(WorkerError::Io(std::io::Error::last_os_error()));
+            }
+            installation_lock = Some(retry);
         }
         let installation_lock = installation_lock.ok_or_else(|| {
             WorkerError::Protocol("host installation coordination was lost".into())
@@ -1013,11 +1045,18 @@ impl HostStore {
         if initialize {
             inject_open_fault(point, HostStoreWritePoint::AfterHostRootCreate)?;
         }
-        let initialized_layout = rooted.entry_exists(HOST_LAYOUT_FILE)?;
-        let stored_layout = if initialized_layout {
+        let layout_present = rooted.entry_exists(HOST_LAYOUT_FILE)?;
+        let layout_refresh_present = rooted.entry_exists(HOST_LAYOUT_REFRESH_NAME)?;
+        let initialized_layout = layout_present || layout_refresh_present;
+        let stored_layout = if layout_present {
             Some(read_json_strict_at::<HostLayoutIdentity>(
                 &rooted,
                 HOST_LAYOUT_FILE,
+            )?)
+        } else if layout_refresh_present {
+            Some(read_json_strict_at::<HostLayoutIdentity>(
+                &rooted,
+                HOST_LAYOUT_REFRESH_NAME,
             )?)
         } else {
             None
@@ -1053,11 +1092,25 @@ impl HostStore {
             }
             inject_open_fault(point, HostStoreWritePoint::AfterHostCapacityLock)?;
         }
-        let layout = if initialized_layout {
-            let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
-            let current_layout = build_host_layout(&rooted, &namespaces, layout_file_identity)?;
+        if !initialize && !parent.entry_exists(&names.identity)? {
+            complete_legacy_identity_reanchor(&parent, &names, lock_identity)?;
+        }
+        let mut layout_refreshed = layout_refresh_present;
+        let layout = if initialize {
+            let stored = publish_host_layout(&rooted, &namespaces)?;
+            inject_open_fault(point, HostStoreWritePoint::AfterHostLayoutPublish)?;
+            stored
+        } else {
             let stored = stored_layout.expect("initialized layout was read above");
+            let current_layout = if layout_present {
+                let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
+                build_host_layout(&rooted, &namespaces, layout_file_identity)?
+            } else {
+                stored.clone()
+            };
             if needs_migration {
+                let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
+                let current_layout = build_host_layout(&rooted, &namespaces, layout_file_identity)?;
                 let replacement = serde_json::to_vec(&current_layout).map_err(|error| {
                     WorkerError::Protocol(format!(
                         "failed to serialize migrated host layout: {error}"
@@ -1068,26 +1121,14 @@ impl HostStore {
                 })?;
                 rooted.rewrite_private_regular_exact(HOST_LAYOUT_FILE, &expected, &replacement)?;
                 current_layout
+            } else if !layout_present || layout_is_volume_remount(&stored, &current_layout) {
+                layout_refreshed = true;
+                refresh_host_layout(&rooted, &namespaces, point)?
             } else {
                 validate_host_layout(&stored, &current_layout)?;
+                remove_private_if_present(&rooted, HOST_LAYOUT_REFRESH_NAME)?;
                 stored
             }
-        } else {
-            let layout_file_identity = rooted.write_private_atomic_no_replace_with_identity(
-                HOST_LAYOUT_FILE,
-                |layout_file_identity| {
-                    let layout = build_host_layout(&rooted, &namespaces, layout_file_identity)
-                        .map_err(worker_error_as_io)?;
-                    serde_json::to_vec(&layout).map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                    })
-                },
-            )?;
-            let current_layout = build_host_layout(&rooted, &namespaces, layout_file_identity)?;
-            let stored: HostLayoutIdentity = read_json_strict_at(&rooted, HOST_LAYOUT_FILE)?;
-            validate_host_layout(&stored, &current_layout)?;
-            inject_open_fault(point, HostStoreWritePoint::AfterHostLayoutPublish)?;
-            stored
         };
         let layout_file_identity = layout.layout_file.as_private();
         let (installation, installation_file_identity) = if initialize {
@@ -1095,48 +1136,25 @@ impl HostStore {
                 point,
                 HostStoreWritePoint::BeforeInstallationIdentityPublish,
             )?;
-            let installation_file_identity = parent.write_private_atomic_no_replace_with_identity(
-                &names.identity,
-                |installation_file_identity| {
-                    let installation = build_installation_identity(
-                        &parent,
-                        &names,
-                        lock_identity,
-                        &rooted,
-                        layout_file_identity,
-                        installation_file_identity,
-                    )
-                    .map_err(worker_error_as_io)?;
-                    serde_json::to_vec(&installation).map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                    })
-                },
-            )?;
-            let current = build_installation_identity(
+            let published = publish_installation_identity(
                 &parent,
                 &names,
                 lock_identity,
                 &rooted,
                 layout_file_identity,
-                installation_file_identity,
             )?;
-            let stored: HostInstallationIdentity = read_json_strict_at(&parent, &names.identity)?;
-            validate_installation_identity(&stored, &current)?;
             inject_open_fault(point, HostStoreWritePoint::AfterInstallationIdentityPublish)?;
-            (stored, installation_file_identity)
+            published
         } else {
-            let installation_file_identity = parent.private_entry_identity(&names.identity)?;
-            let current = build_installation_identity(
+            restore_or_refresh_installation_identity(
                 &parent,
                 &names,
                 lock_identity,
                 &rooted,
                 layout_file_identity,
-                installation_file_identity,
-            )?;
-            let stored: HostInstallationIdentity = read_json_strict_at(&parent, &names.identity)?;
-            validate_installation_identity(&stored, &current)?;
-            (stored, installation_file_identity)
+                reanchored || layout_refreshed,
+                point,
+            )?
         };
         parent.validate_private_regular_binding(
             &names.lock,
@@ -3311,8 +3329,7 @@ fn installation_names(parent: &RootedDir, root: &Path) -> Result<InstallationNam
         .to_owned();
     let parent_identity = parent.identity()?;
     let mut digest = Sha256::new();
-    digest.update(b"mac-worker-installation-v1\0");
-    digest.update(parent_identity.device.to_be_bytes());
+    digest.update(b"mac-worker-installation-v2\0");
     digest.update(parent_identity.inode.to_be_bytes());
     digest.update((root_component.as_bytes().len() as u64).to_be_bytes());
     digest.update(root_component.as_bytes());
@@ -3325,6 +3342,495 @@ fn installation_names(parent: &RootedDir, root: &Path) -> Result<InstallationNam
         root_name,
         root_name_sha256,
     })
+}
+
+fn is_installation_identity_name(name: &str) -> bool {
+    name.strip_prefix(INSTALLATION_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .is_some_and(|key| is_lower_hex(key, 64))
+}
+
+fn has_installation_identity_file(parent: &RootedDir) -> Result<bool, WorkerError> {
+    for bytes in parent.list_names()? {
+        let Ok(name) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if is_installation_identity_name(name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn recorded_devices_uniform(devices: impl IntoIterator<Item = u64>) -> bool {
+    let mut seen = None;
+    for device in devices {
+        match seen {
+            None => seen = Some(device),
+            Some(existing) if existing != device => return false,
+            Some(_) => {}
+        }
+    }
+    seen.is_some()
+}
+
+fn installation_recorded_devices(identity: &HostInstallationIdentity) -> [u64; 5] {
+    [
+        identity.parent.device,
+        identity.lock.device,
+        identity.root.device,
+        identity.layout.device,
+        identity.identity_file.device,
+    ]
+}
+
+fn layout_recorded_devices(layout: &HostLayoutIdentity) -> impl Iterator<Item = u64> + '_ {
+    std::iter::once(layout.root.device)
+        .chain(std::iter::once(layout.layout_file.device))
+        .chain(layout.entries.iter().map(|entry| entry.device))
+}
+
+fn installation_inodes_match(
+    stored: &HostInstallationIdentity,
+    current: &HostInstallationIdentity,
+) -> bool {
+    stored.parent.inode == current.parent.inode
+        && stored.lock.inode == current.lock.inode
+        && stored.root.inode == current.root.inode
+        && stored.layout.inode == current.layout.inode
+        && stored.identity_file.inode == current.identity_file.inode
+}
+
+fn layout_inodes_match(stored: &HostLayoutIdentity, current: &HostLayoutIdentity) -> bool {
+    stored.root.inode == current.root.inode
+        && stored.layout_file.inode == current.layout_file.inode
+        && stored.entries.len() == current.entries.len()
+        && stored
+            .entries
+            .iter()
+            .zip(current.entries.iter())
+            .all(|(stored, current)| stored.path == current.path && stored.inode == current.inode)
+}
+
+fn layout_is_volume_remount(stored: &HostLayoutIdentity, current: &HostLayoutIdentity) -> bool {
+    stored.version == current.version
+        && layout_inodes_match(stored, current)
+        && recorded_devices_uniform(layout_recorded_devices(stored))
+        && stored.root.device != current.root.device
+}
+
+fn installation_is_volume_remount(
+    stored: &HostInstallationIdentity,
+    current: &HostInstallationIdentity,
+) -> bool {
+    stored.version == current.version
+        && installation_inodes_match(stored, current)
+        && recorded_devices_uniform(installation_recorded_devices(stored))
+        && stored.parent.device != current.parent.device
+}
+
+fn rename_private_no_replace(
+    directory: &RootedDir,
+    from: &str,
+    to: &str,
+) -> Result<(), WorkerError> {
+    if from.contains('/')
+        || to.contains('/')
+        || from.is_empty()
+        || to.is_empty()
+        || from == "."
+        || to == "."
+        || from == ".."
+        || to == ".."
+    {
+        return Err(WorkerError::Protocol(
+            "host installation rename is not a single private entry".into(),
+        ));
+    }
+    directory.verify_bound()?;
+    let from_name = CString::new(from).map_err(|_| {
+        WorkerError::Protocol("host installation rename contains an interior NUL".into())
+    })?;
+    let to_name = CString::new(to).map_err(|_| {
+        WorkerError::Protocol("host installation rename contains an interior NUL".into())
+    })?;
+    let fd = directory.raw_directory_fd();
+    #[cfg(target_vendor = "apple")]
+    let result = unsafe {
+        libc::renameatx_np(
+            fd,
+            from_name.as_ptr(),
+            fd,
+            to_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = unsafe {
+        libc::renameat2(
+            fd,
+            from_name.as_ptr(),
+            fd,
+            to_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    compile_error!("rename_private_no_replace requires renameatx_np or renameat2");
+    if result != 0 {
+        return Err(WorkerError::Io(std::io::Error::last_os_error()));
+    }
+    directory.sync_root()?;
+    Ok(())
+}
+
+fn remove_private_if_present(directory: &RootedDir, name: &str) -> Result<(), WorkerError> {
+    if !directory.entry_exists(name)? {
+        return Ok(());
+    }
+    if name.contains('/') || name.is_empty() || name == "." || name == ".." {
+        return Err(WorkerError::Protocol(
+            "host installation cleanup is not a single private entry".into(),
+        ));
+    }
+    directory.verify_bound()?;
+    let c_name = CString::new(name).map_err(|_| {
+        WorkerError::Protocol("host installation cleanup contains an interior NUL".into())
+    })?;
+    let result = unsafe { libc::unlinkat(directory.raw_directory_fd(), c_name.as_ptr(), 0) };
+    if result != 0 {
+        return Err(WorkerError::Io(std::io::Error::last_os_error()));
+    }
+    directory.sync_root()?;
+    Ok(())
+}
+
+fn scan_legacy_installation_identities(
+    parent: &RootedDir,
+    names: &InstallationNames,
+) -> Result<Vec<(String, HostInstallationIdentity)>, WorkerError> {
+    let mut found = Vec::new();
+    for bytes in parent.list_names()? {
+        let Ok(name) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if !is_installation_identity_name(name) || name == names.identity {
+            continue;
+        }
+        let Ok(identity) = read_json_strict_at::<HostInstallationIdentity>(parent, name) else {
+            continue;
+        };
+        found.push((name.to_owned(), identity));
+    }
+    Ok(found)
+}
+
+fn live_reanchor_inodes(
+    parent: &RootedDir,
+    names: &InstallationNames,
+) -> Result<Option<(u64, u64, u64)>, WorkerError> {
+    if !parent.entry_exists(&names.root_name)? {
+        return Ok(None);
+    }
+    let parent_device = parent.root_metadata()?.st_dev as u64;
+    let rooted = parent.open_private_direct_child_on_device(&names.root_name, parent_device)?;
+    if !rooted.entry_exists(HOST_LAYOUT_FILE)? {
+        return Ok(None);
+    }
+    let root_inode = rooted.identity()?.inode;
+    let layout_inode = rooted.private_entry_identity(HOST_LAYOUT_FILE)?.inode;
+    Ok(Some((parent.identity()?.inode, root_inode, layout_inode)))
+}
+
+fn legacy_identity_matches(
+    stored: &HostInstallationIdentity,
+    names: &InstallationNames,
+    parent_inode: u64,
+    root_inode: u64,
+    lock_inode: u64,
+    layout_inode: u64,
+) -> bool {
+    stored.root_name_sha256 == names.root_name_sha256
+        && stored.parent.inode == parent_inode
+        && stored.root.inode == root_inode
+        && stored.lock.inode == lock_inode
+        && stored.layout.inode == layout_inode
+        && recorded_devices_uniform(installation_recorded_devices(stored))
+}
+
+fn is_installation_lock_name(name: &str) -> bool {
+    name.strip_prefix(INSTALLATION_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".lock"))
+        .is_some_and(|key| is_lower_hex(key, 64))
+}
+
+fn lock_file_with_inode(
+    parent: &RootedDir,
+    names: &InstallationNames,
+    expected_inode: u64,
+    preferred: Option<u64>,
+) -> Result<Option<(String, u64)>, WorkerError> {
+    if let Some(inode) = preferred {
+        if inode == expected_inode {
+            return Ok(Some((names.lock.clone(), inode)));
+        }
+        return Ok(None);
+    }
+    let mut found = None;
+    for bytes in parent.list_names()? {
+        let Ok(name) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if !is_installation_lock_name(name) {
+            continue;
+        }
+        let inode = parent.private_entry_identity(name)?.inode;
+        if inode != expected_inode {
+            continue;
+        }
+        if found.is_some() {
+            return Err(WorkerError::Protocol(
+                "host installation lock is absent".into(),
+            ));
+        }
+        found = Some((name.to_owned(), inode));
+    }
+    Ok(found)
+}
+
+fn unique_matching_legacy_identity(
+    parent: &RootedDir,
+    names: &InstallationNames,
+    lock_inode: Option<u64>,
+) -> Result<Option<(String, String)>, WorkerError> {
+    let Some((parent_inode, root_inode, layout_inode)) = live_reanchor_inodes(parent, names)?
+    else {
+        return Ok(None);
+    };
+    let mut matches = Vec::new();
+    for (identity_name, stored) in scan_legacy_installation_identities(parent, names)? {
+        let Some((lock_name, current_lock_inode)) =
+            lock_file_with_inode(parent, names, stored.lock.inode, lock_inode)?
+        else {
+            continue;
+        };
+        if !legacy_identity_matches(
+            &stored,
+            names,
+            parent_inode,
+            root_inode,
+            current_lock_inode,
+            layout_inode,
+        ) {
+            continue;
+        }
+        matches.push((lock_name, identity_name));
+    }
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(WorkerError::Protocol(
+            "host installation lock is absent".into(),
+        )),
+    }
+}
+
+fn reanchor_legacy_installation(
+    parent: &RootedDir,
+    names: &InstallationNames,
+) -> Result<bool, WorkerError> {
+    let Some((lock_name, identity_name)) = unique_matching_legacy_identity(parent, names, None)?
+    else {
+        return Ok(false);
+    };
+    if lock_name != names.lock {
+        rename_private_no_replace(parent, &lock_name, &names.lock)?;
+    }
+    if identity_name != names.identity {
+        rename_private_no_replace(parent, &identity_name, &names.identity)?;
+    }
+    Ok(true)
+}
+
+fn complete_legacy_identity_reanchor(
+    parent: &RootedDir,
+    names: &InstallationNames,
+    lock_identity: PrivateEntryIdentity,
+) -> Result<(), WorkerError> {
+    if parent.entry_exists(&names.identity)? {
+        return Ok(());
+    }
+    let Some((_, identity_name)) =
+        unique_matching_legacy_identity(parent, names, Some(lock_identity.inode))?
+    else {
+        return Ok(());
+    };
+    if identity_name != names.identity {
+        rename_private_no_replace(parent, &identity_name, &names.identity)?;
+    }
+    Ok(())
+}
+
+fn publish_host_layout(
+    rooted: &RootedDir,
+    namespaces: &BTreeMap<&'static str, RootedDir>,
+) -> Result<HostLayoutIdentity, WorkerError> {
+    let layout_file_identity = rooted.write_private_atomic_no_replace_with_identity(
+        HOST_LAYOUT_FILE,
+        |layout_file_identity| {
+            let layout = build_host_layout(rooted, namespaces, layout_file_identity)
+                .map_err(worker_error_as_io)?;
+            serde_json::to_vec(&layout)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        },
+    )?;
+    let current_layout = build_host_layout(rooted, namespaces, layout_file_identity)?;
+    let stored: HostLayoutIdentity = read_json_strict_at(rooted, HOST_LAYOUT_FILE)?;
+    validate_host_layout(&stored, &current_layout)?;
+    Ok(stored)
+}
+
+fn publish_installation_identity(
+    parent: &RootedDir,
+    names: &InstallationNames,
+    lock_identity: PrivateEntryIdentity,
+    rooted: &RootedDir,
+    layout_file_identity: PrivateEntryIdentity,
+) -> Result<(HostInstallationIdentity, PrivateEntryIdentity), WorkerError> {
+    let installation_file_identity = parent.write_private_atomic_no_replace_with_identity(
+        &names.identity,
+        |installation_file_identity| {
+            let installation = build_installation_identity(
+                parent,
+                names,
+                lock_identity,
+                rooted,
+                layout_file_identity,
+                installation_file_identity,
+            )
+            .map_err(worker_error_as_io)?;
+            serde_json::to_vec(&installation)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        },
+    )?;
+    let current = build_installation_identity(
+        parent,
+        names,
+        lock_identity,
+        rooted,
+        layout_file_identity,
+        installation_file_identity,
+    )?;
+    let stored: HostInstallationIdentity = read_json_strict_at(parent, &names.identity)?;
+    validate_installation_identity(&stored, &current)?;
+    Ok((stored, installation_file_identity))
+}
+
+fn refresh_host_layout(
+    rooted: &RootedDir,
+    namespaces: &BTreeMap<&'static str, RootedDir>,
+    point: Option<HostStoreWritePoint>,
+) -> Result<HostLayoutIdentity, WorkerError> {
+    if rooted.entry_exists(HOST_LAYOUT_FILE)? && !rooted.entry_exists(HOST_LAYOUT_REFRESH_NAME)? {
+        rename_private_no_replace(rooted, HOST_LAYOUT_FILE, HOST_LAYOUT_REFRESH_NAME)?;
+    }
+    inject_open_fault(point, HostStoreWritePoint::AfterHostLayoutRefreshUnlink)?;
+    if !rooted.entry_exists(HOST_LAYOUT_FILE)? {
+        let stored = publish_host_layout(rooted, namespaces)?;
+        inject_open_fault(point, HostStoreWritePoint::AfterHostLayoutRefreshPublish)?;
+        remove_private_if_present(rooted, HOST_LAYOUT_REFRESH_NAME)?;
+        return Ok(stored);
+    }
+    let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
+    let current = build_host_layout(rooted, namespaces, layout_file_identity)?;
+    let stored: HostLayoutIdentity = read_json_strict_at(rooted, HOST_LAYOUT_FILE)?;
+    validate_host_layout(&stored, &current)?;
+    inject_open_fault(point, HostStoreWritePoint::AfterHostLayoutRefreshPublish)?;
+    remove_private_if_present(rooted, HOST_LAYOUT_REFRESH_NAME)?;
+    Ok(stored)
+}
+
+fn restore_or_refresh_installation_identity(
+    parent: &RootedDir,
+    names: &InstallationNames,
+    lock_identity: PrivateEntryIdentity,
+    rooted: &RootedDir,
+    layout_file_identity: PrivateEntryIdentity,
+    reanchored: bool,
+    point: Option<HostStoreWritePoint>,
+) -> Result<(HostInstallationIdentity, PrivateEntryIdentity), WorkerError> {
+    let identity_present = parent.entry_exists(&names.identity)?;
+    let refresh_residue = parent.entry_exists(INSTALLATION_IDENTITY_REFRESH_NAME)?;
+    if !identity_present && !refresh_residue {
+        return Err(WorkerError::Protocol(
+            "host installation is incomplete after coordination".into(),
+        ));
+    }
+    if identity_present {
+        let installation_file_identity = parent.private_entry_identity(&names.identity)?;
+        let current = build_installation_identity(
+            parent,
+            names,
+            lock_identity,
+            rooted,
+            layout_file_identity,
+            installation_file_identity,
+        )?;
+        let stored: HostInstallationIdentity = read_json_strict_at(parent, &names.identity)?;
+        let refresh = reanchored
+            || installation_is_volume_remount(&stored, &current)
+            || (installation_inodes_match(&stored, &current) && stored.key != current.key);
+        if !refresh {
+            validate_installation_identity(&stored, &current)?;
+            remove_private_if_present(parent, INSTALLATION_IDENTITY_REFRESH_NAME)?;
+            return Ok((stored, installation_file_identity));
+        }
+        if !refresh_residue {
+            rename_private_no_replace(parent, &names.identity, INSTALLATION_IDENTITY_REFRESH_NAME)?;
+        } else if identity_present {
+            remove_private_if_present(parent, &names.identity)?;
+        }
+    } else if !refresh_residue {
+        return Err(WorkerError::Protocol(
+            "host installation is incomplete after coordination".into(),
+        ));
+    }
+    inject_open_fault(
+        point,
+        HostStoreWritePoint::AfterInstallationIdentityRefreshUnlink,
+    )?;
+    if !parent.entry_exists(&names.identity)? {
+        let published = publish_installation_identity(
+            parent,
+            names,
+            lock_identity,
+            rooted,
+            layout_file_identity,
+        )?;
+        inject_open_fault(
+            point,
+            HostStoreWritePoint::AfterInstallationIdentityRefreshPublish,
+        )?;
+        remove_private_if_present(parent, INSTALLATION_IDENTITY_REFRESH_NAME)?;
+        return Ok(published);
+    }
+    let installation_file_identity = parent.private_entry_identity(&names.identity)?;
+    let current = build_installation_identity(
+        parent,
+        names,
+        lock_identity,
+        rooted,
+        layout_file_identity,
+        installation_file_identity,
+    )?;
+    let stored: HostInstallationIdentity = read_json_strict_at(parent, &names.identity)?;
+    validate_installation_identity(&stored, &current)?;
+    inject_open_fault(
+        point,
+        HostStoreWritePoint::AfterInstallationIdentityRefreshPublish,
+    )?;
+    remove_private_if_present(parent, INSTALLATION_IDENTITY_REFRESH_NAME)?;
+    Ok((stored, installation_file_identity))
 }
 
 fn build_installation_identity(
@@ -4112,7 +4618,10 @@ mod review_regression_tests {
     };
     use std::{
         fs,
-        os::unix::fs::{MetadataExt, PermissionsExt},
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, PermissionsExt},
+        },
         sync::{Arc, Barrier, mpsc},
         thread,
         time::Duration,
@@ -4131,6 +4640,71 @@ mod review_regression_tests {
             .collect::<Vec<_>>();
         entries.sort();
         entries
+    }
+
+    fn bump_layout_entry_device(entry: &mut LayoutEntry) {
+        entry.device = entry.device.wrapping_add(1);
+    }
+
+    fn stale_anchor_devices(parent: &Path, root: &Path) {
+        let identity = installation_entries(parent)
+            .into_iter()
+            .find(|path| path.extension().is_some_and(|value| value == "json"))
+            .expect("installation identity");
+        let mut stored: HostInstallationIdentity =
+            serde_json::from_slice(&fs::read(&identity).unwrap()).unwrap();
+        bump_layout_entry_device(&mut stored.parent);
+        bump_layout_entry_device(&mut stored.lock);
+        bump_layout_entry_device(&mut stored.root);
+        bump_layout_entry_device(&mut stored.layout);
+        bump_layout_entry_device(&mut stored.identity_file);
+        fs::write(&identity, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let layout_path = root.join(HOST_LAYOUT_FILE);
+        let mut layout: HostLayoutIdentity =
+            serde_json::from_slice(&fs::read(&layout_path).unwrap()).unwrap();
+        bump_layout_entry_device(&mut layout.root);
+        bump_layout_entry_device(&mut layout.layout_file);
+        for entry in &mut layout.entries {
+            bump_layout_entry_device(entry);
+        }
+        fs::write(&layout_path, serde_json::to_vec(&layout).unwrap()).unwrap();
+    }
+
+    fn legacy_v1_installation_names(parent: &Path, root: &Path) -> (String, String) {
+        let metadata = fs::metadata(parent).unwrap();
+        let root_component = root.file_name().unwrap();
+        let mut digest = Sha256::new();
+        digest.update(b"mac-worker-installation-v1\0");
+        digest.update((metadata.dev() as u64).to_be_bytes());
+        digest.update(metadata.ino().to_be_bytes());
+        digest.update((root_component.as_bytes().len() as u64).to_be_bytes());
+        digest.update(root_component.as_bytes());
+        let key = format!("{:x}", digest.finalize());
+        (
+            format!("{INSTALLATION_PREFIX}{key}.lock"),
+            format!("{INSTALLATION_PREFIX}{key}.json"),
+        )
+    }
+
+    fn relocate_installation_to_legacy_names(parent: &Path, root: &Path) -> (PathBuf, PathBuf) {
+        let entries = installation_entries(parent);
+        let lock = entries
+            .iter()
+            .find(|path| path.extension().is_some_and(|value| value == "lock"))
+            .unwrap()
+            .clone();
+        let identity = entries
+            .iter()
+            .find(|path| path.extension().is_some_and(|value| value == "json"))
+            .unwrap()
+            .clone();
+        let (legacy_lock, legacy_identity) = legacy_v1_installation_names(parent, root);
+        let legacy_lock = parent.join(legacy_lock);
+        let legacy_identity = parent.join(legacy_identity);
+        fs::rename(&lock, &legacy_lock).unwrap();
+        fs::rename(&identity, &legacy_identity).unwrap();
+        (legacy_lock, legacy_identity)
     }
 
     fn create_owner_only_job_tree(job_path: &Path) {
@@ -4795,6 +5369,129 @@ mod review_regression_tests {
             .is_err()
         );
         assert!(HostStore::open(&complete_root).is_ok());
+    }
+
+    #[test]
+    fn installation_key_survives_a_parent_device_change() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let _store = HostStore::open(&root).unwrap();
+        let before = installation_entries(temp.path());
+        assert_eq!(before.len(), 2);
+        stale_anchor_devices(temp.path(), &root);
+        if let Err(error) = HostStore::open(&root) {
+            panic!("device-change open failed: {error:?}");
+        }
+        assert_eq!(installation_entries(temp.path()), before);
+        let identity = before
+            .iter()
+            .find(|path| path.extension().is_some_and(|value| value == "json"))
+            .unwrap();
+        let stored: HostInstallationIdentity =
+            serde_json::from_slice(&fs::read(identity).unwrap()).unwrap();
+        let parent_device = fs::metadata(temp.path()).unwrap().dev() as u64;
+        assert_eq!(stored.parent.device, parent_device);
+        assert!(recorded_devices_uniform(installation_recorded_devices(
+            &stored
+        )));
+    }
+
+    #[test]
+    fn reanchors_a_legacy_installation_identity() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let _store = HostStore::open(&root).unwrap();
+        let v2 = installation_entries(temp.path());
+        let (legacy_lock, legacy_identity) =
+            relocate_installation_to_legacy_names(temp.path(), &root);
+        assert!(legacy_lock.is_file());
+        assert!(legacy_identity.is_file());
+        if let Err(error) = HostStore::open(&root) {
+            panic!("legacy re-anchor open failed: {error:?}");
+        }
+        assert_eq!(installation_entries(temp.path()), v2);
+        assert!(!legacy_lock.exists());
+        assert!(!legacy_identity.exists());
+    }
+
+    #[test]
+    fn refuses_legacy_reanchor_when_a_stored_inode_differs() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let _store = HostStore::open(&root).unwrap();
+        let (_legacy_lock, legacy_identity) =
+            relocate_installation_to_legacy_names(temp.path(), &root);
+        let mut stored: HostInstallationIdentity =
+            serde_json::from_slice(&fs::read(&legacy_identity).unwrap()).unwrap();
+        stored.root.inode = stored.root.inode.wrapping_add(1);
+        fs::write(&legacy_identity, serde_json::to_vec(&stored).unwrap()).unwrap();
+        let error = match HostStore::open(&root) {
+            Ok(_) => panic!("re-anchor accepted a mismatched inode"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("host installation lock is absent")
+        );
+    }
+
+    #[test]
+    fn refuses_legacy_reanchor_when_two_legacy_candidates_match() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let _store = HostStore::open(&root).unwrap();
+        let (_legacy_lock, legacy_identity) =
+            relocate_installation_to_legacy_names(temp.path(), &root);
+        let duplicate = temp
+            .path()
+            .join(format!("{INSTALLATION_PREFIX}{}.json", "a".repeat(64)));
+        let bytes = fs::read(&legacy_identity).unwrap();
+        fs::write(&duplicate, &bytes).unwrap();
+        fs::set_permissions(&duplicate, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(is_installation_identity_name(
+            duplicate.file_name().unwrap().to_str().unwrap()
+        ));
+        let error = match HostStore::open(&root) {
+            Ok(_) => panic!("re-anchor accepted two matching candidates"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("host installation lock is absent"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_crashes_are_repaired_on_the_next_open() {
+        for point in [
+            HostStoreWritePoint::AfterHostLayoutRefreshUnlink,
+            HostStoreWritePoint::AfterHostLayoutRefreshPublish,
+            HostStoreWritePoint::AfterInstallationIdentityRefreshUnlink,
+            HostStoreWritePoint::AfterInstallationIdentityRefreshPublish,
+        ] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let _store = HostStore::open(&root).unwrap();
+            stale_anchor_devices(temp.path(), &root);
+            assert!(
+                HostStore::open_with_write_fault(&root, point).is_err(),
+                "fault at {point:?}"
+            );
+            if let Err(error) = HostStore::open(&root) {
+                panic!("repair after {point:?} failed: {error:?}");
+            }
+            assert!(root.join(HOST_LAYOUT_FILE).is_file());
+            assert!(!root.join(HOST_LAYOUT_REFRESH_NAME).exists());
+            assert!(
+                !temp
+                    .path()
+                    .join(INSTALLATION_IDENTITY_REFRESH_NAME)
+                    .exists()
+            );
+        }
     }
 
     #[test]
