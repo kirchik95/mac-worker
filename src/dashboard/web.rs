@@ -31,11 +31,16 @@ use crate::{
 
 const MAX_LOG_LIMIT: u32 = 65_536;
 const MAX_SETTINGS_REQUEST_BYTES: usize = 8_192;
-const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'";
+// `style-src` admits inline styles because the component library the dashboard
+// UI is built from sets them on elements it positions. Scripts stay first-party
+// only, and the page still renders every remote string as text.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'";
 
-const INDEX_HTML: &str = include_str!("static/index.html");
-const DASHBOARD_CSS: &str = include_str!("static/dashboard.css");
-const DASHBOARD_MJS: &str = include_str!("static/dashboard.mjs");
+// The UI is built from `ui/` with `npm run build`, which writes this tree.
+const INDEX_HTML: &str = include_str!("static/app/index.html");
+const DASHBOARD_CSS: &str = include_str!("static/app/assets/index.css");
+const DASHBOARD_JS: &str = include_str!("static/app/assets/index.js");
+const FAVICON_SVG: &str = include_str!("static/app/favicon.svg");
 
 pub trait DashboardLogSource: Send + Sync + 'static {
     fn job_detail(&self, job_id: JobId) -> Result<DashboardJob, ApiError>;
@@ -146,8 +151,9 @@ where
 {
     Router::new()
         .route("/", get(index))
-        .route("/assets/dashboard.css", get(stylesheet))
-        .route("/assets/dashboard.mjs", get(script))
+        .route("/assets/index.css", get(stylesheet))
+        .route("/assets/index.js", get(script))
+        .route("/favicon.svg", get(favicon))
         .route("/assets/{font}", get(font))
         .route("/api/v1/snapshot", get(snapshot::<S, C, M>))
         .route(
@@ -234,14 +240,18 @@ async fn stylesheet() -> Response {
 }
 
 async fn script() -> Response {
-    embedded_asset("application/javascript; charset=utf-8", DASHBOARD_MJS)
+    embedded_asset("application/javascript; charset=utf-8", DASHBOARD_JS)
+}
+
+async fn favicon() -> Response {
+    embedded_asset("image/svg+xml", FAVICON_SVG)
 }
 
 async fn font(Path(name): Path<String>) -> Response {
     let bytes: &'static [u8] = match name.as_str() {
-        "plex-sans-regular.ttf" => include_bytes!("static/fonts/plex-sans-regular.ttf"),
-        "plex-sans-medium.ttf" => include_bytes!("static/fonts/plex-sans-medium.ttf"),
-        "plex-mono-regular.ttf" => include_bytes!("static/fonts/plex-mono-regular.ttf"),
+        "plex-sans-regular.ttf" => include_bytes!("static/app/assets/plex-sans-regular.ttf"),
+        "plex-sans-medium.ttf" => include_bytes!("static/app/assets/plex-sans-medium.ttf"),
+        "plex-mono-regular.ttf" => include_bytes!("static/app/assets/plex-mono-regular.ttf"),
         _ => return not_found().await,
     };
     ([(header::CONTENT_TYPE, "font/ttf")], bytes).into_response()

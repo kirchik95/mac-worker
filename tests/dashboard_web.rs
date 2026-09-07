@@ -42,16 +42,27 @@ async fn loopback_router_serves_embedded_assets_snapshot_and_security_headers() 
     assert!(content_type(&shell).starts_with("text/html"));
     assert_security(&shell);
     let shell_body = body_text(&shell);
-    assert!(shell_body.contains("/assets/dashboard.css"));
-    assert!(shell_body.contains("/assets/dashboard.mjs"));
+    assert!(shell_body.contains("/assets/index.css"));
+    assert!(shell_body.contains("/assets/index.js"));
     assert!(!shell_body.contains("http://"));
     assert!(!shell_body.contains("https://"));
 
-    let asset = request(&host, "/assets/dashboard.mjs", &host);
+    let asset = request(&host, "/assets/index.js", &host);
     assert_eq!(asset.status, 200);
     assert!(content_type(&asset).starts_with("application/javascript"));
     assert_security(&asset);
-    assert!(!body_text(&asset).contains("https://"));
+    // The bundle is built offline and must not reach for anything remote.
+    assert!(!body_text(&asset).contains("https://registry"));
+
+    let stylesheet = request(&host, "/assets/index.css", &host);
+    assert_eq!(stylesheet.status, 200);
+    assert!(content_type(&stylesheet).starts_with("text/css"));
+    assert_security(&stylesheet);
+
+    let favicon = request(&host, "/favicon.svg", &host);
+    assert_eq!(favicon.status, 200);
+    assert_eq!(content_type(&favicon), "image/svg+xml");
+    assert_security(&favicon);
 
     for name in [
         "plex-sans-regular.ttf",
