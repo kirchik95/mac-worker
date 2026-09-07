@@ -8,6 +8,17 @@
 
 `mac-worker` runs coding agents on your spare Macs while you keep working on your laptop. Submit a prompt from a Git repository; a worker runs Codex, Cursor, OpenCode or Claude Code in a separate worktree and returns a branch you can review and merge. Start with one Mac and add more when you need them.
 
+## Contents
+
+- [What you need](#what-you-need)
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+- [Add another Mac](#add-another-mac)
+- [Update or remove](#update-or-remove)
+- [Build from source](#build-from-source)
+- [More documentation](#more-documentation)
+- [License](#license)
+
 <p align="center">
   <img src="docs/images/dashboard.png" alt="Dashboard showing connected Macs, queued tasks and completed work" width="100%">
 </p>
@@ -92,6 +103,37 @@ worker workers --refresh
 
 The dashboard opens locally in your browser. To submit and return immediately, omit `--wait`.
 
+## How it works
+
+Your laptop coordinates the work. The selected Mac runs the agent and keeps its task workspace. This diagram shows the default flow, using a local repository as the source:
+
+```mermaid
+flowchart LR
+    laptop["Your laptop<br/><br/>worker CLI + local queue<br/>Scheduler + task history<br/>Dashboard + Git repository"]
+
+    subgraph pool["Your Mac workers — one task turn per Mac"]
+        selected["Selected Mac<br/><br/>Helper + project mirror<br/>Task worktree + coding agent"]
+        others["Additional Macs<br/>Same worker setup"]
+    end
+
+    provider["Agent provider"]
+
+    laptop -->|SSH: prompt + base commit| selected
+    selected -->|SSH: status, logs + Git branch| laptop
+    laptop -. Other queued tasks over SSH .-> others
+    selected <-->|Agent API| provider
+    others <-->|Agent API| provider
+```
+
+1. **Submit.** The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with the required agent and capabilities.
+2. **Run.** Over SSH, mac-worker transfers the base commit into the worker's project mirror, prepares a separate task worktree and launches the agent under a supervisor. The agent uses the worker's own login and project tools.
+3. **Follow or reply.** The CLI and dashboard read task status and logs. If the agent needs input, `worker task say <id> --message "…"` starts another turn in the same task workspace and agent session.
+4. **Review.** The worker publishes `task/<id>`, and the laptop fetches it as a remote-tracking ref. `worker task fetch <id>` can fetch it again and prints the ref to inspect. Your current working tree stays unchanged; you decide what to merge.
+
+The dashboard is embedded in the CLI, listens only on loopback and does not start or cancel tasks. The queue and task records live on the laptop; project mirrors, task worktrees and agent sessions live on the workers. Use `worker gc` to preview retained worker data that can be reclaimed.
+
+Workers contact agent providers directly. No mac-worker cloud service or database server is required. If you prefer to get code from a Git remote or push result branches there, see the [origin and publication settings](docs/usage.md#task-lifecycle).
+
 ## Add another Mac
 
 ```bash
@@ -112,16 +154,6 @@ worker workers --refresh
 `worker setup` with no names updates every configured worker. It does not install or update the agents themselves. See [installation recovery](docs/setup-recovery.md) if an older installation needs attention.
 
 To remove the CLI installed by the script, delete `~/.local/bin/worker` (or the file in your chosen `--bin-dir`). This keeps configuration and task history. See [removal and stored data](docs/setup-macos-worker.md#removal-and-stored-data) before retiring a worker.
-
-## How it works
-
-<p align="center">
-  <img src="docs/images/architecture.png" alt="The laptop sends a task over SSH; a Mac runs an agent and publishes a branch" width="100%">
-</p>
-
-The laptop queues tasks and sends their base commit to workers over SSH. Each worker runs an agent in a task worktree and publishes the result as `task/<id>`. The laptop fetches that branch for review. Workers keep project mirrors, task worktrees and agent sessions; `worker gc` previews retained data that can be reclaimed.
-
-There is no cloud control plane, database or service to administer on the laptop. Workers contact their agent providers directly. The dashboard is embedded in the CLI and listens only on loopback.
 
 ## Build from source
 
