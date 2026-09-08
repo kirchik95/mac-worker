@@ -1,0 +1,3 @@
+session ses_fixture_missing
+I finished the task, but there is no structured result.
+stop

@@ -1,0 +1,3 @@
+session 0d3c…
+{"status":"needs_input","summary":"Need the target crate name","questions":["Which crate should be renamed?"],"files_changed":[]}
+completed

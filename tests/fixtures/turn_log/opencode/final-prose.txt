@@ -1,0 +1,8 @@
+session ses_fixture_prose
+I finished the task. Progress metadata: {"step":"done"}.
+
+Final result:
+{"status":"needs_input","summary":"review is needed","questions":["Which target?"],"files_changed":["prose.txt"]}
+
+Thanks.
+stop

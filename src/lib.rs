@@ -107,6 +107,7 @@ pub mod transfer;
 pub mod transfer_repo;
 pub mod transport;
 pub mod turn;
+pub mod turn_log;
 pub mod turn_runner;
 
 #[doc(hidden)]

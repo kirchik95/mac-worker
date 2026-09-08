@@ -1,0 +1,7 @@
+session 00000000-0000-4000-8000-0000000000c2
+Need a crate name.
+
+```mac-worker-result
+{"status":"needs_input","summary":"Need the target crate name","questions":["Which crate should be renamed?"],"files_changed":[]}
+```
+success
