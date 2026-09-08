@@ -205,6 +205,14 @@ error non-destructively. If no successful payload exists, retain the existing
 loading/error states. Task-ID change clears both, aborts the old generation, and
 starts the same 2,000 ms cadence.
 
+While an expanded turn has both `started_at_millis == null` and
+`ended_at_millis == null`, render a short waiting-for-start state instead of
+mounting `TurnLogPanel`. Mount the existing unchanged panel as soon as either
+timestamp exists, with the existing `live` derivation. Pre-start failed or ended
+turns remain readable when `ended_at_millis` is populated even if
+`started_at_millis` is null. Do not change the log hook, `ActiveTurn`, poll
+cadence, or log protocol.
+
 ### Questions
 
 `useAttentionQuestions` currently slices the waiting IDs to six. Replace that
@@ -303,6 +311,8 @@ Ruling: Regenerate and verify embedded UI assets once after the source tasks are
 Ruling: Accept current-end log semantics for stage 4 without a wire change — normal supervisor ordering publishes ended turns after logs and terminal status are durable, while the dashboard exposes no final byte target — cost: a prematurely empty or malformed response cannot be distinguished from final EOF, so this UI is not runner-equivalent proof of log finality.
 
 Ruling: Allow a finalized log reader to resume when the same identity becomes live — TaskDetail also passes live=false for a not-yet-started turn, so finalization cannot be permanent for that identity — cost: finalization is now per stopped reading period and the resume path must preserve text/offset while restoring a usable UTF-8 decoder.
+
+Ruling: Defer a pending turn log panel until TaskDetail observes a start or end timestamp — live=false otherwise conflates queued and completed turns, so a fast queued-to-terminal transition can leave an early-empty reader stopped — cost: pre-start output is not shown until the next detail observation, within the existing polling cadence.
 
 The log-finality gate is resolved. Task 2 may implement the bounded available-log
 behavior above without changing the protocol.

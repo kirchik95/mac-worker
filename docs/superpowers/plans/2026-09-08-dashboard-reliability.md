@@ -478,11 +478,12 @@ If `TaskDetail.test.tsx` did not need a wording edit, omit it from `git add`.
 
 **Interfaces:**
 - Consumes: existing `fetchTaskDetail(id, signal)`, `TaskDetail`,
-  `(string | Question)[]`, 2,000 ms detail cadence.
-- Produces: last-good TaskDetail rendering and
+  `(string | Question)[]`, 2,000 ms detail cadence, existing `live` derivation.
+- Produces: last-good TaskDetail rendering,
   `Record<string, (string | Question)[] | undefined>` where only successful
-  reads install a key; six is maximum in flight, not maximum IDs. Task 4 later
-  builds it.
+  reads install a key; six is maximum in flight, not maximum IDs; and a
+  waiting-for-start state for expanded turns with no start or end timestamp.
+  Task 4 later builds it.
 
 - [ ] **Step 1: Confirm handoff and run focused baselines**
 
@@ -505,6 +506,13 @@ Assert A remains visible with a transient error after failure. After the next
 Add a task-ID rerender test: leave task A pending, rerender task B, resolve A,
 and prove A never replaces B. Preserve the existing no-last-good initial error
 case.
+
+With fake/deferred detail responses, expand a queued turn
+(`started_at_millis` and `ended_at_millis` both null) and prove it produces no
+log fetch and is not labelled completed. The next detail that skips directly to
+terminal must mount the existing `TurnLogPanel` and drain its available tail.
+Also verify an observed running transition starts following. Keep pre-start
+failed/ended turns readable when `ended_at_millis` is populated.
 
 - [ ] **Step 3: Add a RED hook test for more than six IDs**
 
@@ -547,9 +555,10 @@ Run:
 (cd ui && npm test -- src/views/TaskDetail.test.tsx src/hooks/useAttentionQuestions.test.ts src/views/Tasks.test.tsx)
 ```
 
-Expected: fail because TaskDetail hides last-good data/retains old error, only
-six IDs are attempted, failures become empty arrays, and missing entries are
-coalesced before the view branch.
+Expected: fail because TaskDetail hides last-good data/retains old error, an
+expanded queued turn mounts a completed log reader, only six IDs are
+attempted, failures become empty arrays, and missing entries are coalesced
+before the view branch.
 
 - [ ] **Step 7: Publish detail and clear error atomically on success**
 
@@ -567,6 +576,12 @@ On failure, keep `detail` unchanged and set the error. Render a full-page error
 only when `detail == null`; when last-good detail exists, render a small
 transient error above the unchanged detail. Keep the interval, abort, and
 task-ID dependency unchanged.
+
+While an expanded turn has both `started_at_millis == null` and
+`ended_at_millis == null`, render a short waiting-for-start state instead of
+mounting `TurnLogPanel`. Mount the existing unchanged panel as soon as either
+timestamp exists, with the existing `live` derivation. Do not change the log
+hook or `ActiveTurn`.
 
 - [ ] **Step 8: Replace total truncation with a six-worker queue**
 
@@ -615,8 +630,9 @@ contained no questions; nonempty means render each mapped question.
 Run the Step 6 command.
 
 Expected: all tests pass, all eight IDs are accessible with at most six active,
-out-of-order/cancelled results remain isolated, and task detail visibly
-recovers without changing cadence.
+out-of-order/cancelled results remain isolated, task detail visibly recovers
+without changing cadence, and a queued expanded turn waits to start until a
+timestamp exists.
 
 - [ ] **Step 11: Review source only and commit**
 
@@ -903,8 +919,9 @@ Write the final report with HEAD SHA and all outcomes. Do not push or deploy.
 - The concrete finality gap and accepted current-end ruling are stated in the
   spec and Task 2; no task invents EOF.
 - Last-good detail, success error clearing, task-ID cancellation, 2,000 ms
-  cadence, all waiting IDs, six concurrency, ordering, empty/not-loaded,
-  cancellation, and stale generation isolation are covered by Task 3.
+  cadence, queued-to-terminal log panel deferral, all waiting IDs, six
+  concurrency, ordering, empty/not-loaded, cancellation, and stale generation
+  isolation are covered by Task 3.
 - Official action verification, PR-only checks, supported Node, macOS Rust,
   fresh directory allocation, full-tree parity, one checked-in build, and
   source-before-bundle review are covered by Task 4.
@@ -942,6 +959,8 @@ Ruling: Regenerate and verify embedded UI assets once after the source tasks are
 Ruling: Accept current-end log semantics for stage 4 without a wire change — normal supervisor ordering publishes ended turns after logs and terminal status are durable, while the dashboard exposes no final byte target — cost: a prematurely empty or malformed response cannot be distinguished from final EOF, so this UI is not runner-equivalent proof of log finality.
 
 Ruling: Allow a finalized log reader to resume when the same identity becomes live — TaskDetail also passes live=false for a not-yet-started turn, so finalization cannot be permanent for that identity — cost: finalization is now per stopped reading period and the resume path must preserve text/offset while restoring a usable UTF-8 decoder.
+
+Ruling: Defer a pending turn log panel until TaskDetail observes a start or end timestamp — live=false otherwise conflates queued and completed turns, so a fast queued-to-terminal transition can leave an early-empty reader stopped — cost: pre-start output is not shown until the next detail observation, within the existing polling cadence.
 
 The log-finality gate is resolved. This planning commit authorizes no
 implementation by itself; the controller dispatches the already specified

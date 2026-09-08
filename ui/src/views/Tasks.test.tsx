@@ -1,6 +1,6 @@
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { MALICIOUS, snapshot, task } from '@/test/fixtures'
 import { Tasks } from './Tasks'
@@ -19,6 +19,16 @@ const titles = () =>
     .getAllByRole('row')
     .slice(1)
     .map((row) => within(row).getAllByRole('cell')[1].textContent ?? '')
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+afterEach(() => vi.unstubAllGlobals())
 
 describe('Tasks', () => {
   it('renders a hostile title as text and never as markup', () => {
@@ -157,5 +167,65 @@ describe('Tasks', () => {
     render(<Tasks snapshot={fixture} onSelect={onSelect} />)
     await user.click(screen.getByText('Repair login'))
     expect(onSelect).toHaveBeenCalledWith('a'.repeat(32))
+  })
+
+  it('distinguishes unread, empty, and failed attention questions', async () => {
+    const pending = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => {
+        const href = String(url)
+        if (href.includes('wait-empty')) {
+          return Promise.resolve({ ok: true, status: 200, json: async () => ({ questions: [] }) })
+        }
+        if (href.includes('wait-fail')) return Promise.reject(new Error('detail missing'))
+        return pending.promise
+      }),
+    )
+    const waiting = snapshot({
+      tasks: [
+        task({
+          task_id: 'wait-pending',
+          title: 'Pending question task',
+          state: 'open',
+          last_outcome: { kind: 'needs_input' },
+        }),
+        task({
+          task_id: 'wait-empty',
+          title: 'Empty question task',
+          state: 'open',
+          last_outcome: { kind: 'needs_input' },
+        }),
+        task({
+          task_id: 'wait-fail',
+          title: 'Failed question task',
+          state: 'open',
+          last_outcome: { kind: 'needs_input' },
+        }),
+      ],
+    })
+    render(<Tasks snapshot={waiting} onSelect={() => {}} />)
+
+    expect(screen.getAllByText('Reading the question…')).toHaveLength(3)
+    const emptyCopy =
+      'The task record carries no question — open the task to read its last turn.'
+    expect(await screen.findByText(emptyCopy)).toBeInTheDocument()
+
+    const articleFor = (title: string) => {
+      const match = screen
+        .getAllByText(title)
+        .map((node) => node.closest('article'))
+        .find((node) => node != null)
+      expect(match).not.toBeNull()
+      return match as HTMLElement
+    }
+    const pendingArticle = articleFor('Pending question task')
+    const emptyArticle = articleFor('Empty question task')
+    const failArticle = articleFor('Failed question task')
+    expect(within(pendingArticle).getByText('Reading the question…')).toBeInTheDocument()
+    expect(within(emptyArticle).getByText(emptyCopy)).toBeInTheDocument()
+    expect(within(failArticle).getByText('Reading the question…')).toBeInTheDocument()
+    expect(within(pendingArticle).queryByText(emptyCopy)).not.toBeInTheDocument()
+    expect(within(failArticle).queryByText(emptyCopy)).not.toBeInTheDocument()
   })
 })

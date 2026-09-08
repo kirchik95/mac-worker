@@ -118,7 +118,7 @@ function Attention({
 
       {tasks.map((task) => {
         const run = snapshot.runs.find((entry) => entry.run_id === task.run_id)
-        const asked = questions[task.task_id] ?? []
+        const asked = questions[task.task_id]
         return (
           <article
             key={task.task_id}

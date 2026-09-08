@@ -57,6 +57,7 @@ function Turn({ taskId, turn, open, onToggle }: {
   onToggle: () => void
 }) {
   const live = turn.ended_at_millis == null && turn.started_at_millis != null
+  const waitingToStart = turn.started_at_millis == null && turn.ended_at_millis == null
 
   return (
     <div className="overflow-hidden rounded-[10px] border bg-card">
@@ -89,13 +90,19 @@ function Turn({ taskId, turn, open, onToggle }: {
       </button>
 
       {open ? (
-        <TurnLogPanel
-          taskId={taskId}
-          turnId={turn.turn_id}
-          turnNumber={turn.turn_number}
-          live={live}
-          truncated={turn.log_truncated}
-        />
+        waitingToStart ? (
+          <p className="px-5 py-3.5 text-sm text-muted-foreground">
+            Waiting for this turn to start…
+          </p>
+        ) : (
+          <TurnLogPanel
+            taskId={taskId}
+            turnId={turn.turn_id}
+            turnNumber={turn.turn_number}
+            live={live}
+            truncated={turn.log_truncated}
+          />
+        )
       ) : null}
     </div>
   )
@@ -115,7 +122,10 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
     const poll = async () => {
       try {
         const payload = await fetchTaskDetail(taskId, controller.signal)
-        if (!cancelled) setDetail(payload)
+        if (!cancelled) {
+          setDetail(payload)
+          setError(null)
+        }
       } catch (cause) {
         if (cancelled || controller.signal.aborted) return
         setError(cause instanceof Error ? cause.message : String(cause))
@@ -131,7 +141,7 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
     }
   }, [taskId])
 
-  if (error) return <p className="text-sm text-destructive">{error}</p>
+  if (error && detail == null) return <p className="text-sm text-destructive">{error}</p>
   if (!detail) return <p className="text-sm text-muted-foreground">Loading task…</p>
 
   const { task } = detail
@@ -139,6 +149,7 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
 
   return (
     <div className="space-y-5">
+      {error ? <p className="text-sm text-destructive">{error}</p> : null}
       <nav className="flex items-center gap-2.5 text-xs">
         <button
           type="button"

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 
 import { fetchTaskDetail, type Question } from '@/lib/api'
 
-/** A guard on the fan-out: the list is one request per task that needs input. */
+/** A guard on the fan-out: at most this many detail reads run at once. */
 export const MAX_ATTENTION_FETCHES = 6
 
 /**
@@ -14,34 +14,42 @@ export const MAX_ATTENTION_FETCHES = 6
 export function useAttentionQuestions(
   taskIds: string[],
 ): Record<string, (string | Question)[] | undefined> {
-  const [questions, setQuestions] = useState<Record<string, (string | Question)[]>>({})
+  const [questions, setQuestions] = useState<Record<string, (string | Question)[] | undefined>>(
+    {},
+  )
   const key = taskIds.join(',')
 
   useEffect(() => {
-    const ids = key ? key.split(',').slice(0, MAX_ATTENTION_FETCHES) : []
-    if (ids.length === 0) {
-      setQuestions({})
-      return
-    }
+    const ids = key ? key.split(',') : []
+    setQuestions({})
+    if (ids.length === 0) return
 
     let cancelled = false
     const controller = new AbortController()
+    let nextIndex = 0
 
-    void (async () => {
-      const entries = await Promise.all(
-        ids.map(async (id) => {
-          try {
-            const detail = await fetchTaskDetail(id, controller.signal)
-            return [id, detail.questions] as const
-          } catch {
-            // A task that cannot be read keeps its row; the caller distinguishes
-            // "not answered yet" from "answered with nothing" by the empty array.
-            return [id, []] as const
+    const worker = async () => {
+      while (!cancelled) {
+        const index = nextIndex
+        nextIndex += 1
+        if (index >= ids.length || cancelled) return
+        const id = ids[index]
+        try {
+          const detail = await fetchTaskDetail(id, controller.signal)
+          if (!cancelled) {
+            setQuestions((current) => ({
+              ...current,
+              [id]: detail.questions,
+            }))
           }
-        }),
-      )
-      if (!cancelled) setQuestions(Object.fromEntries(entries))
-    })()
+        } catch {
+          // Keep this ID undefined. Do not publish [] for failure.
+        }
+      }
+    }
+
+    const workers = Math.min(MAX_ATTENTION_FETCHES, ids.length)
+    for (let started = 0; started < workers; started += 1) void worker()
 
     return () => {
       cancelled = true
