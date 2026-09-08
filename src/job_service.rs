@@ -2736,7 +2736,7 @@ fn consume_job_fault(
     }
 }
 
-fn read_canonical_json<T>(directory: &RootedDir, name: &str) -> Result<T, WorkerError>
+pub(crate) fn read_canonical_json<T>(directory: &RootedDir, name: &str) -> Result<T, WorkerError>
 where
     T: DeserializeOwned + Serialize,
 {

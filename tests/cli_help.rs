@@ -56,6 +56,55 @@ fn gc_supports_preview_by_default_and_explicit_apply() {
 }
 
 #[test]
+fn host_follow_turn_parses_three_identifiers_and_stays_hidden() {
+    // The herdr pane types `worker host follow-turn <project> <worktree> <job>`;
+    // the grammar must accept exactly that and nothing shorter, while the
+    // command stays out of every help page like the other host commands.
+    let project_id = "b".repeat(64);
+    let worktree_id = "c".repeat(64);
+    let job_id = "018f0f4a6b5c7d8e9f00112233445566";
+    let cli = Cli::try_parse_from([
+        "worker",
+        "host",
+        "follow-turn",
+        project_id.as_str(),
+        worktree_id.as_str(),
+        job_id,
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        WorkerCommand::Host {
+            command: HostCommand::FollowTurn { .. }
+        }
+    ));
+    assert!(
+        Cli::try_parse_from([
+            "worker",
+            "host",
+            "follow-turn",
+            project_id.as_str(),
+            worktree_id.as_str()
+        ])
+        .is_err()
+    );
+
+    let mut help = Command::cargo_bin("worker").unwrap();
+    help.arg("--help");
+    help.assert()
+        .success()
+        .stdout(predicate::str::contains("follow-turn").not());
+
+    let mut host_help = Command::cargo_bin("worker").unwrap();
+    host_help.args(["host", "--help"]);
+    host_help
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("task-close"))
+        .stdout(predicate::str::contains("follow-turn").not());
+}
+
+#[test]
 fn task_help_exposes_lifecycle_commands_and_keeps_runner_hidden() {
     let mut command = Command::cargo_bin("worker").unwrap();
     command.args(["task", "--help"]);
