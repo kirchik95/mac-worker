@@ -100,6 +100,16 @@ the damaged record in place during apply.
    `transfer_gc_waits_for_a_live_transfer_repository_handle` and the full
    attached agent lifecycle suite (`agent_cursor_opencode`, 13 tests).
 
+   Amended 2026-09-08: the lock mode was wrong, not the lock. Holding it
+   exclusively for the handle's lifetime made every `submit` and `fetch` for a
+   project wait behind a running turn on any worker. Users of a transfer
+   repository now hold the lock shared, transfer GC takes it exclusively
+   without waiting and reports a repository in use as skipped, and first
+   creation runs under a short exclusive lock on `<repo_id>.init.lock`.
+   Regressions: `transfer_gc_skips_a_live_transfer_repository_handle_with_a_warning`,
+   `two_handles_for_one_repository_open_concurrently`,
+   `concurrent_first_creation_yields_one_initialized_repository`.
+
 5. **Major - fixed** - `src/task_store.rs:791-815` (pre-fix
    `8d232bd:791-818`) - discard precondition and durable terminal ordering
 

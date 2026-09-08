@@ -275,7 +275,7 @@ A runner is started by `submit`, `batch`, and `say` for each new turn, through t
 
 At most one runner per configured worker waits for capacity at any time. Younger waiting rows are parked: they have no process, keep their task `queued`, and are given a runner by a runner that finishes or by the next mutating task command. A waiting runner polls with exponential backoff from one second to thirty seconds and reads fleet health from the shared observation cache, refreshing it single-flight only when its entry is older than its TTL. A runner therefore costs the pool no more SSH traffic than one interactive `worker run` would.
 
-The runner's lifetime is the capacity wait plus the turn: it exits after recording the terminal outcome and importing the result, after the turn is `lost`, after a pre-acceptance failure has been resolved or abandoned, or when the local task record says the task was cancelled before acceptance. It holds no lock while waiting for capacity, during SSH, or during Git transport.
+The runner's lifetime is the capacity wait plus the turn: it exits after recording the terminal outcome and importing the result, after the turn is `lost`, after a pre-acceptance failure has been resolved or abandoned, or when the local task record says the task was cancelled before acceptance. It holds no lock while waiting for capacity, and no exclusive lock during SSH or Git transport; the transfer repository handle it keeps open for the turn holds that repository's lock shared, which blocks nobody but transfer collection of that repository (section 10.2).
 
 The runner never decides task state on its own: it records what the worker reported. A killed runner leaves the remote turn untouched. Recovery is cooperative and lock-protected, and it runs only in mutating commands: `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and the explicit `worker task reconcile`. Each of these first refreshes the tasks it is about to act on from their recorded workers, re-owns dead-owner rows, re-enqueues `queued` tasks whose row is missing, and starts a replacement runner for any waiting row or active turn that has no live runner, within the per-worker cap. `worker task wait` does this on every poll, so a batch that outlived its submitting shell still completes. `list`, `status`, `result`, `diff`, `logs`, and dashboard task views never mutate task state or start a process; they show a dead runner as `dead` and a stale row as stale. The dashboard's authorized native agent-settings save is outside task lifecycle state. No process is ever started for a task that is `open`, `closed`, `abandoned`, or `lost`.
 
@@ -658,7 +658,7 @@ The v2 execution core is complete when acceptance in section 20.2 passes for Cod
 
 Each of these requires its own review before implementation:
 
-- **Interactive mode.** A turn that runs the agent's TUI inside a Herdr pane on the worker, attachable with Herdr's remote session support, so the user can type to the agent and answer its prompts. It trades the exit-code completion signal for Herdr's heuristic agent states and weakens limits; it must be an explicit `--interactive` flag, never a default.
+- **Interactive mode.** A turn that runs the agent's TUI inside a Herdr pane on the worker, attachable with Herdr's remote session support, so the user can type to the agent and answer its prompts. It trades the exit-code completion signal for Herdr's heuristic agent states and weakens limits; it must be an explicit `--interactive` flag, never a default. Its observability half, a read-only pane and reported states for a headless turn, is specified separately in the [herdr reporter design](2026-09-08-herdr-reporter-design.md) and does not require this item.
 - **Long-lived Claude turns.** Claude Code accepts streaming JSON input, so one process could stay alive across follow-ups and accept messages while working. This changes the "no message into a running agent" rule and is deferred until the turn model is proven.
 - **Merge request creation** by mac-worker after `push`.
 - **Dashboard task cancel** and other task-lifecycle mutating controls, under the dashboard design's token and same-origin requirements. The native model, effort, and Fast Settings Save operation is already authorized and is outside this deferral.
@@ -677,7 +677,7 @@ Closest in topology, but the model loop runs in Cursor's cloud, every tool call 
 
 ### Herdr remote sessions alone
 
-Herdr already runs on every worker and can attach to remote sessions. It gives a live view and interactive control but no queue, no limits, no durable task records, and no result publication. It is the basis for the deferred interactive mode, not a replacement for this design.
+Herdr already runs on every worker and can attach to remote sessions. It gives a live view and interactive control but no queue, no limits, no durable task records, and no result publication. It is the basis for the deferred interactive mode, not a replacement for this design. Since herdr 0.9 (2026-09-08) the same server also renders states that an external source reports through its socket, which the [herdr reporter design](2026-09-08-herdr-reporter-design.md) uses to show headless turns without changing this design.
 
 ### Blocking `submit` instead of local runners
 

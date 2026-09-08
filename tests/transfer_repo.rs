@@ -758,3 +758,154 @@ fn transfer_cache_directories_and_alternates_are_owner_only() {
     let mode = fs::metadata(&alternates).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "alternates must be owner-only, got {mode:o}");
 }
+
+#[test]
+fn two_handles_for_one_repository_open_concurrently() {
+    let cache = cache_root();
+    let repo = repo_with_commits();
+    let first = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let cache_path = cache.path().to_path_buf();
+    let common_dir = repo.common_dir();
+    let handle = std::thread::spawn(move || {
+        sender
+            .send(TransferRepo::open_or_create(&cache_path, &common_dir))
+            .unwrap();
+    });
+    let second = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a second handle must not wait for the first")
+        .unwrap();
+    handle.join().unwrap();
+    assert_eq!(second.repo_id(), first.repo_id());
+    assert_eq!(second.path(), first.path());
+}
+
+#[test]
+fn concurrent_handles_build_bases_for_different_tasks() {
+    let cache = cache_root();
+    let repo = repo_with_commits();
+    repo.write("README.md", b"hello, dirty\n");
+    let held = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let tasks = [
+        TaskId::new(Uuid::from_u128(11)),
+        TaskId::new(Uuid::from_u128(12)),
+    ];
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let workers: Vec<_> = tasks
+        .iter()
+        .map(|task| {
+            let sender = sender.clone();
+            let cache_path = cache.path().to_path_buf();
+            let common_dir = repo.common_dir();
+            let context = repo.context();
+            let task = *task;
+            std::thread::spawn(move || {
+                let result =
+                    TransferRepo::open_or_create(&cache_path, &common_dir).and_then(|transfer| {
+                        transfer
+                            .build_wip_base(&runner(), &context, task, &settings(), &identity())
+                            .map(|_| ())
+                    });
+                sender.send(result).unwrap();
+            })
+        })
+        .collect();
+    drop(sender);
+    for _ in &tasks {
+        receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("wip bases must not wait for the held handle")
+            .expect("concurrent wip bases succeed");
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    for task in tasks {
+        let output = git_in(
+            held.path(),
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/mac-worker/bases/{task}"),
+            ],
+        );
+        assert!(output.status.success(), "base ref for {task} exists");
+    }
+}
+
+#[test]
+fn import_result_does_not_wait_for_another_live_handle() {
+    let cache = cache_root();
+    let (repo, transfer) = repo_and_transfer_with_result(&cache, task_id());
+    let other = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let common_dir = repo.common_dir();
+    let handle = std::thread::spawn(move || {
+        sender
+            .send(
+                transfer
+                    .import_result(&runner(), &common_dir, "mini-1", task_id())
+                    .map(|_| ()),
+            )
+            .unwrap();
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("import must not wait for another handle")
+        .unwrap();
+    handle.join().unwrap();
+    drop(other);
+    assert!(repo.has_ref(&format!(
+        "refs/remotes/mac-worker/mini-1/task/{}",
+        task_id()
+    )));
+}
+
+#[test]
+fn concurrent_first_creation_yields_one_initialized_repository() {
+    let cache = cache_root();
+    let repo = repo_with_commits();
+    let barrier = std::sync::Barrier::new(4);
+    let repo_ids: Vec<String> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let barrier = &barrier;
+                let cache_path = cache.path().to_path_buf();
+                let repo = &repo;
+                scope.spawn(move || {
+                    barrier.wait();
+                    TransferRepo::open_or_create(&cache_path, &repo.common_dir())
+                        .map(|transfer| transfer.repo_id().to_owned())
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap()
+                    .expect("every concurrent creator succeeds")
+            })
+            .collect()
+    });
+    assert!(repo_ids.iter().all(|repo_id| repo_id == &repo_ids[0]));
+    let transfer_dir = cache.path().join("transfer");
+    let repos = fs::read_dir(&transfer_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".git"))
+        .count();
+    assert_eq!(repos, 1);
+    assert!(
+        transfer_dir
+            .join(format!("{}.git/HEAD", repo_ids[0]))
+            .exists()
+    );
+    assert!(
+        transfer_dir
+            .join(format!("{}.git/scratch", repo_ids[0]))
+            .is_dir()
+    );
+}

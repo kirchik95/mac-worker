@@ -220,17 +220,19 @@ impl<'a> TransferGc<'a> {
             {
                 continue;
             }
-            let result =
-                self.collect_transfer_record(&parent, &raw_name, now_millis, &mut candidates);
-            if let Err(error) = result {
-                push_transfer_record_warning(&mut warnings, &error);
+            match self.collect_transfer_record(&parent, &raw_name, now_millis, &mut candidates) {
+                Ok(TransferRecordScan::Scanned) => {}
+                Ok(TransferRecordScan::InUse(repo_id)) => {
+                    push_warning(&mut warnings, &in_use_warning(&repo_id))
+                }
+                Err(error) => push_transfer_record_warning(&mut warnings, &error),
             }
         }
         candidates.sort_by(|left, right| left.identifier().cmp(right.identifier()));
         let mut applied = Vec::new();
         if apply {
             for candidate in &candidates {
-                if self.apply_candidate(&parent, candidate, now_millis)? {
+                if self.apply_candidate(&parent, candidate, now_millis, &mut warnings)? {
                     applied.push(candidate.clone());
                 }
             }
@@ -244,7 +246,7 @@ impl<'a> TransferGc<'a> {
         raw_name: &[u8],
         now_millis: u64,
         candidates: &mut Vec<GcCandidate>,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<TransferRecordScan, WorkerError> {
         let name = std::str::from_utf8(raw_name).map_err(|_| {
             WorkerError::Protocol("GC_METADATA_INVALID: transfer repo name is not UTF-8".into())
         })?;
@@ -259,19 +261,21 @@ impl<'a> TransferGc<'a> {
             ));
         }
         if self.protected_repo_ids.contains(repo_id) {
-            return Ok(());
+            return Ok(TransferRecordScan::Scanned);
         }
-        let _repo_lock = lock_transfer_repo(parent, repo_id)?;
+        let Some(_repo_lock) = try_lock_transfer_repo_exclusive(parent, repo_id)? else {
+            return Ok(TransferRecordScan::InUse(repo_id.to_owned()));
+        };
         let repo = parent
             .open_child_directory(&relative_transfer(name)?, false)
             .map_err(WorkerError::Io)?;
         let refs = git_ref_names(self.runner, repo.path())?;
         if !transfer_refs_are_collectable(&refs) {
-            return Ok(());
+            return Ok(TransferRecordScan::Scanned);
         }
         let modified = crate::gc::rooted_modified_millis(&repo)?;
         if now_millis.saturating_sub(modified) < crate::gc::BRANCH_RETENTION_MILLIS {
-            return Ok(());
+            return Ok(TransferRecordScan::Scanned);
         }
         candidates.push(GcCandidate::new(
             "transfer_repo",
@@ -279,7 +283,7 @@ impl<'a> TransferGc<'a> {
             0,
             "transfer repository retention",
         )?);
-        Ok(())
+        Ok(TransferRecordScan::Scanned)
     }
 
     fn apply_candidate(
@@ -287,12 +291,16 @@ impl<'a> TransferGc<'a> {
         parent: &RootedDir,
         candidate: &GcCandidate,
         now_millis: u64,
+        warnings: &mut Vec<String>,
     ) -> Result<bool, WorkerError> {
         let repo_id = candidate.identifier();
         if !is_lower_hex(repo_id, 64) || self.protected_repo_ids.contains(repo_id) {
             return Ok(false);
         }
-        let _repo_lock = lock_transfer_repo(parent, repo_id)?;
+        let Some(_repo_lock) = try_lock_transfer_repo_exclusive(parent, repo_id)? else {
+            push_warning(warnings, &in_use_warning(repo_id));
+            return Ok(false);
+        };
         let name = format!("{repo_id}.git");
         if !parent.entry_exists(&name)? {
             return Ok(false);
@@ -311,6 +319,20 @@ impl<'a> TransferGc<'a> {
     }
 }
 
+/// Reported once per repository and GC run when it has a live handle.
+fn in_use_warning(repo_id: &str) -> String {
+    format!(
+        "transfer repository {} in use by a task; skipped",
+        &repo_id[..12.min(repo_id.len())]
+    )
+}
+
+/// What one directory entry of the transfer namespace yielded to GC.
+enum TransferRecordScan {
+    Scanned,
+    InUse(String),
+}
+
 fn push_transfer_record_warning(warnings: &mut Vec<String>, error: &WorkerError) {
     let warning =
         if error.to_string().contains("name") || error.to_string().contains("ID is invalid") {
@@ -318,14 +340,66 @@ fn push_transfer_record_warning(warnings: &mut Vec<String>, error: &WorkerError)
         } else {
             "unreadable transfer repository record"
         };
+    push_warning(warnings, warning);
+}
+
+fn push_warning(warnings: &mut Vec<String>, warning: &str) {
     if warnings.len() < 64 && !warnings.iter().any(|existing| existing == warning) {
         warnings.push(warning.to_owned());
     }
 }
 
-fn lock_transfer_repo(parent: &RootedDir, repo_id: &str) -> Result<Arc<File>, WorkerError> {
+/// Every user of a transfer repository holds its lock shared for the
+/// lifetime of the handle.  Users never exclude each other: indexes, base
+/// refs, and result refs are per task, objects are content addressed, and
+/// automatic maintenance is off.  The lock exists so that transfer GC, which
+/// takes it exclusively, can never delete a repository with a live handle.
+fn lock_transfer_repo_shared(parent: &RootedDir, repo_id: &str) -> Result<Arc<File>, WorkerError> {
+    flock_transfer_file(parent, &format!("{repo_id}.lock"), libc::LOCK_SH)
+}
+
+/// Transfer GC never waits for a repository: a live handle means the
+/// repository is in use, and GC reports that and moves on.
+fn try_lock_transfer_repo_exclusive(
+    parent: &RootedDir,
+    repo_id: &str,
+) -> Result<Option<Arc<File>>, WorkerError> {
     let file = parent.open_private_lock(&format!("{repo_id}.lock"))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    // A shared holder can be a process in the middle of forking a child, which
+    // references the lock's open file description until it execs.  A few short
+    // retries see through that window without ever waiting for a real holder.
+    for attempt in 0..IN_USE_ATTEMPTS {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(Arc::new(file)));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(WorkerError::Io(error));
+        }
+        if attempt + 1 < IN_USE_ATTEMPTS {
+            std::thread::sleep(IN_USE_RETRY_DELAY);
+        }
+    }
+    Ok(None)
+}
+
+const IN_USE_ATTEMPTS: u32 = 4;
+const IN_USE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// First creation of a repository is the one step that must not run twice.
+/// It runs under a short exclusive lock on a separate file, so a shared
+/// holder never upgrades the lock it already holds.
+fn lock_transfer_repo_init(parent: &RootedDir, repo_id: &str) -> Result<Arc<File>, WorkerError> {
+    flock_transfer_file(parent, &format!("{repo_id}.init.lock"), libc::LOCK_EX)
+}
+
+fn flock_transfer_file(
+    parent: &RootedDir,
+    name: &str,
+    operation: libc::c_int,
+) -> Result<Arc<File>, WorkerError> {
+    let file = parent.open_private_lock(name)?;
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
         return Err(WorkerError::Io(io::Error::last_os_error()));
     }
     Ok(Arc::new(file))
@@ -335,9 +409,10 @@ fn is_transfer_lock_entry(raw_name: &[u8]) -> bool {
     let Ok(name) = std::str::from_utf8(raw_name) else {
         return false;
     };
-    let Some(repo_id) = name.strip_suffix(".lock") else {
+    let Some(stem) = name.strip_suffix(".lock") else {
         return false;
     };
+    let repo_id = stem.strip_suffix(".init").unwrap_or(stem);
     is_lower_hex(repo_id, 64)
 }
 
@@ -375,21 +450,33 @@ impl TransferRepo {
         };
         let transfer_parent = cache_root.join("transfer");
         let transfer_ns = open_or_create_owner_only_dir(&transfer_parent)?;
-        let repo_lock = lock_transfer_repo(&transfer_ns, &repo_id)?;
+        let repo_lock = lock_transfer_repo_shared(&transfer_ns, &repo_id)?;
         let path = transfer_parent.join(format!("{repo_id}.git"));
-        let repo_dir = open_or_create_owner_only_dir(&path)?;
-        if !repo_dir.entry_exists("HEAD")? {
-            run_system_git(
-                None,
-                &[
-                    OsString::from("init"),
-                    OsString::from("--bare"),
-                    path.as_os_str().to_os_string(),
-                ],
-                None,
-                None,
-            )?;
-        }
+        let repo_dir = match open_initialized_transfer_repo(&path)? {
+            Some(repo_dir) => repo_dir,
+            None => {
+                let _init_lock = lock_transfer_repo_init(&transfer_ns, &repo_id)?;
+                match open_initialized_transfer_repo(&path)? {
+                    Some(repo_dir) => repo_dir,
+                    None => {
+                        let repo_dir = open_or_create_owner_only_dir(&path)?;
+                        run_system_git(
+                            None,
+                            &[
+                                OsString::from("init"),
+                                OsString::from("--bare"),
+                                path.as_os_str().to_os_string(),
+                            ],
+                            None,
+                            None,
+                        )?;
+                        let _scratch =
+                            repo_dir.open_child_directory(&relative("scratch")?, true)?;
+                        repo_dir
+                    }
+                }
+            }
+        };
         chmod_owner_only(&repo_dir)?;
         let _scratch = repo_dir.open_child_directory(&relative("scratch")?, true)?;
         let info = open_owner_only_subdir(&path, &["objects", "info"])?;
@@ -1477,13 +1564,38 @@ fn chmod_owner_only(dir: &RootedDir) -> io::Result<()> {
 }
 
 fn open_or_create_owner_only_dir(path: &Path) -> io::Result<RootedDir> {
-    let dir = match RootedDir::open(path) {
-        Ok(dir) => dir,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => RootedDir::create(path)?,
-        Err(error) => return Err(error),
-    };
+    let dir = open_or_create_dir(path)?;
     chmod_owner_only(&dir)?;
     Ok(dir)
+}
+
+/// Open a directory, creating it when absent.  A concurrent creator winning
+/// the race is not an error: the directory is simply opened again.
+fn open_or_create_dir(path: &Path) -> io::Result<RootedDir> {
+    match RootedDir::open(path) {
+        Ok(dir) => Ok(dir),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match RootedDir::create(path) {
+            Ok(dir) => Ok(dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => RootedDir::open(path),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+/// The repository directory when it exists and has been initialized, so a
+/// directory left behind by an interrupted creation is initialized again.
+fn open_initialized_transfer_repo(path: &Path) -> Result<Option<RootedDir>, WorkerError> {
+    let repo_dir = match RootedDir::open(path) {
+        Ok(repo_dir) => repo_dir,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(WorkerError::Io(error)),
+    };
+    if repo_dir.entry_exists("HEAD")? {
+        Ok(Some(repo_dir))
+    } else {
+        Ok(None)
+    }
 }
 
 fn open_owner_only_subdir(root: &Path, components: &[&str]) -> Result<RootedDir, WorkerError> {
@@ -1492,11 +1604,7 @@ fn open_owner_only_subdir(root: &Path, components: &[&str]) -> Result<RootedDir,
     chmod_owner_only(&dir)?;
     for component in components {
         current.push(component);
-        dir = match RootedDir::open(&current) {
-            Ok(opened) => opened,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => RootedDir::create(&current)?,
-            Err(error) => return Err(WorkerError::Io(error)),
-        };
+        dir = open_or_create_dir(&current).map_err(WorkerError::Io)?;
         chmod_owner_only(&dir)?;
     }
     Ok(dir)
@@ -1521,8 +1629,22 @@ fn write_alternates_atomic(info: &RootedDir, target: &Path) -> Result<(), Worker
         info.replace_private_regular_exact("alternates", &current, &bytes)?;
         return Ok(());
     }
-    info.write_private_atomic_no_replace("alternates", &bytes)?;
-    Ok(())
+    match info.write_private_atomic_no_replace("alternates", &bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // A concurrent opener of the same repository wrote the file
+            // first.  Its content is a function of the repository, so it is
+            // expected to match; anything else is corrected like a stale file.
+            let mut inspection = info.inspect(&relative("alternates")?)?;
+            let mut current = Vec::new();
+            inspection.read_to_end(&mut current)?;
+            if current != bytes {
+                info.replace_private_regular_exact("alternates", &current, &bytes)?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn git_error(code: &'static str, message: &str) -> WorkerError {
@@ -1536,5 +1658,79 @@ fn task_config(message: impl Into<String>) -> WorkerError {
     WorkerError::Task {
         code: "TASK_CONFIG_INVALID",
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::SystemProcessRunner;
+
+    fn user_repository(root: &Path) -> PathBuf {
+        let user = root.join("user");
+        fs::create_dir_all(&user).unwrap();
+        run_system_git(
+            None,
+            &[
+                OsString::from("init"),
+                OsString::from("-q"),
+                user.as_os_str().to_os_string(),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        user.join(".git")
+    }
+
+    #[test]
+    fn apply_skips_a_candidate_whose_repository_is_in_use_and_collects_it_later() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let common_dir = user_repository(temp.path());
+        let transfer = TransferRepo::open_or_create(&cache, &common_dir).unwrap();
+        let repo_path = transfer.path().to_path_buf();
+        let parent = RootedDir::open(&cache.join("transfer")).unwrap();
+        let candidate = GcCandidate::new(
+            "transfer_repo",
+            transfer.repo_id(),
+            0,
+            "transfer repository retention",
+        )
+        .unwrap();
+        let gc = TransferGc::new(&cache, &SystemProcessRunner);
+
+        let mut warnings = Vec::new();
+        let applied = gc
+            .apply_candidate(&parent, &candidate, u64::MAX / 2, &mut warnings)
+            .unwrap();
+        assert!(!applied);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("in use"));
+        assert!(repo_path.exists());
+
+        drop(transfer);
+        // Unit tests share this process with tests that fork without exec;
+        // such a child keeps every inherited descriptor, including this lock,
+        // open until it exits.  Collection therefore succeeds eventually rather
+        // than immediately here, which is not a property of the code under test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let mut warnings = Vec::new();
+            let applied = gc
+                .apply_candidate(&parent, &candidate, u64::MAX / 2, &mut warnings)
+                .unwrap();
+            if applied {
+                assert!(warnings.is_empty(), "{warnings:?}");
+                break;
+            }
+            assert!(warnings[0].contains("in use"), "{warnings:?}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released repository was never collected"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!repo_path.exists());
     }
 }
