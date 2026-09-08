@@ -14,15 +14,13 @@ use crate::{
     error::WorkerError,
     git_transport::GitTransport,
     job::{
-        AdmissionObservation, CommandSpec, ProcessIdentity, QueueEntry, QueueEntryKind,
-        QueueRunReference, QueueState,
+        CommandSpec, ProcessIdentity, QueueEntry, QueueEntryKind, QueueRunReference, QueueState,
     },
     paths::PathLayout,
     process::ProcessRunner,
     project_config::TaskSettings,
     project_state::ProjectState,
     scheduler::{CandidateObservation, SchedulerPolicy, Selection, WorkerPreference},
-    scheduler_adapter::SchedulerProbeAdapter,
     supervisor::{ProcessObservation, SystemProcessInspector},
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, PushTarget,
@@ -35,7 +33,6 @@ use crate::{
     },
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
-    transport::{SshTransport, WorkersService},
     turn_runner::{DetachedRunnerExecutor, RunnerExecutor, TurnRunner, adopt_row_with_retry},
 };
 
@@ -2467,6 +2464,10 @@ impl<'a> TaskClient<'a> {
         &self,
         preference: &WorkerPreference,
     ) -> Result<Vec<CandidateObservation>, WorkerError> {
+        use crate::turn_runner::{
+            admission_from_health, candidate_from_admission, probe_with_fresh_facts,
+            single_worker_config,
+        };
         self.config
             .workers
             .iter()
@@ -2475,52 +2476,20 @@ impl<'a> TaskClient<'a> {
                 WorkerPreference::Pinned { worker: pinned } => worker.name == *pinned,
             })
             .map(|worker| {
-                let one = Config {
-                    version: self.config.version,
-                    notifications: crate::config::NotificationsConfig::default(),
-                    workers: vec![worker.clone()],
-                };
-                let cached = self.client_state.admission_observation(
-                    &worker.name,
-                    current_time_millis()?,
-                    || {
-                        let health = WorkersService::new(SshTransport::new(self.runner))
-                            .inspect(&one)
-                            .workers
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| {
-                                WorkerError::Protocol("worker probe was empty".into())
-                            })?;
-                        let candidate = SchedulerProbeAdapter::observations(
-                            &one,
-                            std::slice::from_ref(&health),
-                        )?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| WorkerError::Protocol("worker probe was empty".into()))?;
-                        AdmissionObservation::new(
-                            candidate.worker_name().to_owned(),
-                            candidate.ready(),
-                            candidate.slot(),
-                            candidate.capabilities().to_vec(),
-                            candidate.available_memory_bytes(),
-                            candidate.free_disk_bytes(),
-                            current_time_millis()?,
-                        )
-                    },
-                )?;
-                CandidateObservation::new(
-                    cached.observation().worker_name().to_owned(),
-                    cached.observation().ready(),
-                    cached.observation().slot(),
-                    cached.observation().capabilities().to_vec(),
-                    cached.observation().available_memory_bytes(),
-                    cached.observation().free_disk_bytes(),
-                )
-                .map_err(|_| {
-                    WorkerError::Protocol("cached scheduler observation is invalid".into())
-                })
+                let one = single_worker_config(self.config, worker);
+                let observed_at = current_time_millis()?;
+                // A fresh cached observation stands.  Otherwise probe, and
+                // refresh facts that aged out before judging capabilities,
+                // so a pinned submit is not refused for agents the worker
+                // still has.
+                let cached =
+                    self.client_state
+                        .admission_observation(&worker.name, observed_at, || {
+                            let (health, _) =
+                                probe_with_fresh_facts(self.runner, &one, worker, observed_at)?;
+                            admission_from_health(&one, &health, observed_at)
+                        })?;
+                candidate_from_admission(cached.observation())
             })
             .collect()
     }

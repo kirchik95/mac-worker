@@ -163,6 +163,7 @@ struct AcceptedThenTerminalRunner {
     stdout_log_sent: Mutex<bool>,
     probe_count: Mutex<u32>,
     facts_fresh: Mutex<bool>,
+    first_probe_fresh: bool,
     base_release_failures: Mutex<u8>,
     worker: Mutex<String>,
 }
@@ -376,8 +377,17 @@ impl AcceptedThenTerminalRunner {
             stdout_log_sent: Mutex::new(false),
             probe_count: Mutex::new(0),
             facts_fresh: Mutex::new(false),
+            first_probe_fresh: true,
             base_release_failures: Mutex::new(0),
             worker: Mutex::new("mini-1".into()),
+        }
+    }
+
+    /// A worker whose facts cache has already aged out when submit probes it.
+    fn with_stale_facts() -> Self {
+        Self {
+            first_probe_fresh: false,
+            ..Self::new()
         }
     }
 
@@ -440,7 +450,7 @@ impl AcceptedThenTerminalRunner {
     fn facts_are_fresh_for_probe(&self) -> bool {
         let mut count = self.probe_count.lock().unwrap();
         *count += 1;
-        self.facts_fresh() || *count == 1
+        self.facts_fresh() || (self.first_probe_fresh && *count == 1)
     }
 
     fn submitted_turn_origin(&self) -> Option<String> {
@@ -727,6 +737,34 @@ struct AcceptedThenTerminalFixture {
     reported_runner: Option<RunnerState>,
 }
 
+fn submit_request(
+    project: &Path,
+    origin: Option<&str>,
+    preference: WorkerPreference,
+    wait_for_capacity: bool,
+) -> TaskSubmitRequest {
+    TaskSubmitRequest {
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        prompt: "make the change".into(),
+        project: project.to_path_buf(),
+        base: "main".into(),
+        wip: origin.is_none(),
+        source: None,
+        publish: origin.map(|_| vec!["fetch".into(), "push".into()]),
+        publish_branch: None,
+        cli_includes: Vec::new(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        preference,
+        wait_for_capacity,
+        attached: false,
+        run_id: None,
+    }
+}
+
 impl AcceptedThenTerminalFixture {
     fn new() -> Self {
         Self::new_with_push_origin(None)
@@ -747,6 +785,24 @@ impl AcceptedThenTerminalFixture {
         preference: WorkerPreference,
         wait_for_capacity: bool,
     ) -> Self {
+        Self::build(
+            AcceptedThenTerminalRunner::new(),
+            origin,
+            preference,
+            wait_for_capacity,
+        )
+    }
+
+    fn new_with_runner(runner: AcceptedThenTerminalRunner, preference: WorkerPreference) -> Self {
+        Self::build(runner, None, preference, false)
+    }
+
+    fn build(
+        runner: AcceptedThenTerminalRunner,
+        origin: Option<&str>,
+        preference: WorkerPreference,
+        wait_for_capacity: bool,
+    ) -> Self {
         let repo = support::GitRepo::init();
         repo.write("base.txt", b"base\n");
         repo.commit_all("base");
@@ -761,31 +817,11 @@ impl AcceptedThenTerminalFixture {
             "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\", \"origin:example.test\"]\n",
         )
         .unwrap();
-        let runner = AcceptedThenTerminalRunner::new();
         let executor = InlineRunnerExecutor;
         let current_dir = CurrentDirGuard::enter(repo.root());
         let report = TaskClient::new(&runner, &config, &paths, &state, &executor)
             .submit(
-                TaskSubmitRequest {
-                    agent: AgentKind::Codex,
-                    model: None,
-                    effort: None,
-                    prompt: "make the change".into(),
-                    project: repo.root().to_path_buf(),
-                    base: "main".into(),
-                    wip: origin.is_none(),
-                    source: None,
-                    publish: origin.map(|_| vec!["fetch".into(), "push".into()]),
-                    publish_branch: None,
-                    cli_includes: Vec::new(),
-                    limits: TaskLimits::default(),
-                    close_policy: ClosePolicy::Never,
-                    env_profile: None,
-                    preference,
-                    wait_for_capacity,
-                    attached: false,
-                    run_id: None,
-                },
+                submit_request(repo.root(), origin, preference, wait_for_capacity),
                 &mut Vec::new(),
                 &mut Vec::new(),
             )
@@ -4420,4 +4456,89 @@ fn the_early_exit_line_names_the_error_that_ended_the_runner() {
     assert!(line.starts_with("exited: "), "{log}");
     assert!(line.contains("PROJECT_MISMATCH"), "{log}");
     assert!(line.ends_with("workers=mini-1"), "{log}");
+}
+
+#[test]
+fn a_pinned_submit_refreshes_stale_facts_instead_of_reporting_missing_agents() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    // Facts older than their TTL carry no agent capabilities.  Before the
+    // shared admission observer, a pinned submit read that as the worker
+    // missing agent:codex and failed with CAPABILITY_MISSING; the operator
+    // had to run `worker workers --refresh` by hand.  Now the submit itself
+    // refreshes and probes again before deciding.
+    let fixture = AcceptedThenTerminalFixture::new_with_runner(
+        AcceptedThenTerminalRunner::with_stale_facts(),
+        WorkerPreference::Pinned {
+            worker: "mini-1".into(),
+        },
+    );
+
+    assert!(fixture.runner.facts_fresh());
+    let requests = fixture.runner.requests();
+    let refresh = requests
+        .iter()
+        .position(|request| {
+            request
+                .args
+                .iter()
+                .any(|arg| arg == HostOperation::RefreshFacts.command())
+        })
+        .expect("the submit refreshed the stale facts");
+    let probes = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| {
+            request
+                .args
+                .iter()
+                .any(|arg| arg == "~/.local/bin/worker host probe")
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert!(
+        probes.iter().any(|&index| index < refresh) && probes.iter().any(|&index| index > refresh),
+        "probe, refresh, probe again: probes {probes:?}, refresh {refresh}"
+    );
+
+    let outcome = fixture.run(&mut Vec::new()).unwrap();
+    assert_eq!(outcome.status().state(), TaskState::Closed);
+}
+
+#[test]
+fn a_pinned_submit_whose_refresh_fails_reports_the_worker_not_its_capabilities() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    // Without a fresh cached observation the submit probes; the probe
+    // reports stale facts and the refresh fails.
+    fs::remove_file(fixture.paths.state.join("observations/mini-1.json")).unwrap();
+    let runner = AdmissionFailureRunner {
+        inner: &fixture.runner,
+        ssh: "mac1",
+        failure: AdmissionFailure::Refresh,
+        failed_worker_requests: Mutex::new(Vec::new()),
+    };
+
+    let error = TaskClient::new(
+        &runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .submit(
+        submit_request(
+            fixture._repo.root(),
+            None,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            false,
+        ),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.public_code(), "CAPACITY_BUSY", "{error}");
+    assert_unavailable_observation(&fixture, "mini-1");
 }
