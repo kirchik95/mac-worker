@@ -808,6 +808,92 @@ fn reconcile_replaces_a_dead_runner_for_an_active_task_turn() {
 }
 
 #[test]
+fn reconcile_does_not_replace_a_live_handoff_owner_without_runner_metadata() {
+    // Break caught: a queue handoff has committed before runner metadata is
+    // written, and reconciliation starts a second process for the same turn.
+    struct HandoffInspector {
+        ambiguous: bool,
+    }
+    impl ProcessInspector for HandoffInspector {
+        fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+            LiveOwners.identity_for_pid(pid)
+        }
+
+        fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+            if self.ambiguous {
+                ProcessObservation::Ambiguous
+            } else {
+                LiveOwners.observe(expected)
+            }
+        }
+
+        fn observe_group(&self, group: u32) -> ProcessGroupObservation {
+            LiveOwners.observe_group(group)
+        }
+
+        fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership {
+            LiveOwners.observe_group_members(leader)
+        }
+    }
+
+    for ambiguous in [false, true] {
+        for dispatching in [false, true] {
+            let state_root = tempfile::tempdir().unwrap();
+            let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+            let handoff_owner = owner(907);
+            let task_id = TaskId::new(Uuid::from_u128(907));
+            let turn_id = job(908);
+            let record = task_record(
+                task_id,
+                turn_id,
+                TaskState::Active,
+                PROJECT_ID.into(),
+                WORKTREE_ID.into(),
+                "mini-1",
+                None,
+            );
+            let remote = TaskRemoteRunner::new(record.status().clone());
+            let store = ClientStateStore::open_with_owner_inspector(
+                &paths.state,
+                HandoffInspector { ambiguous },
+            )
+            .unwrap();
+            store.create_task(record).unwrap();
+            store
+                .write_turn_prompt(task_id, turn_id, "fixture prompt")
+                .unwrap();
+            cache_idle(&store, "mini-1", 10);
+            store
+                .enqueue(turn(
+                    &store,
+                    908,
+                    10,
+                    handoff_owner,
+                    WorkerPreference::Pinned {
+                        worker: "mini-1".into(),
+                    },
+                    None,
+                ))
+                .unwrap();
+            if dispatching {
+                store
+                    .claim_next(handoff_owner, &["mini-1".into()], 11)
+                    .unwrap()
+                    .unwrap();
+            }
+            let before = store.queue_entry(turn_id).unwrap().unwrap();
+            let config = task_config();
+            let report = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor)
+                .reconcile_runners()
+                .unwrap();
+            assert_eq!(report.started_runners(), 0);
+            assert!(store.load_task(task_id).unwrap().runner().is_none());
+            assert_eq!(store.queue_entry(turn_id).unwrap().unwrap(), before);
+        }
+    }
+}
+
+#[test]
 fn pinned_head_waiting_for_a_busy_worker_does_not_block_a_younger_first_turn() {
     let fixture = Fixture::open();
     cache_idle(&fixture.store, "mini-1", 10);

@@ -175,6 +175,15 @@ pub struct TurnRunner<'a> {
 }
 
 impl<'a> TurnRunner<'a> {
+    /// Runs a detached queue worker, which may serve another eligible turn.
+    pub fn run_detached(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<TurnOutcomeReport, WorkerError> {
+        self.run_mode(task_id, turn_id, None, true)
+    }
+
     pub fn new(
         runner: &'a dyn ProcessRunner,
         config: &'a Config,
@@ -196,7 +205,17 @@ impl<'a> TurnRunner<'a> {
         &self,
         task_id: TaskId,
         turn_id: TurnId,
+        follow: Option<&mut dyn Write>,
+    ) -> Result<TurnOutcomeReport, WorkerError> {
+        self.run_mode(task_id, turn_id, follow, false)
+    }
+
+    fn run_mode(
+        &self,
+        mut task_id: TaskId,
+        mut turn_id: TurnId,
         mut follow: Option<&mut dyn Write>,
+        allow_reassignment: bool,
     ) -> Result<TurnOutcomeReport, WorkerError> {
         ignore_sigpipe();
         // Legacy batch dispatch recovery deliberately skips task-turn rows,
@@ -205,7 +224,10 @@ impl<'a> TurnRunner<'a> {
         // task-turn ownership protocol.
         let _ = self.client_state.recover_dead_dispatches()?;
         let result = (|| {
-            let owner = self.claim(task_id, turn_id)?;
+            let (claimed_task, claimed_turn, owner) =
+                self.claim(task_id, turn_id, allow_reassignment)?;
+            task_id = claimed_task;
+            turn_id = claimed_turn;
             let result = self.execute(task_id, turn_id, owner, &mut follow);
             match result {
                 Ok(report) => {
@@ -319,7 +341,7 @@ impl<'a> TurnRunner<'a> {
             .client_state
             .remove_task_turn_after_terminal(turn_id, owner)?;
         let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
-        if let Ok(project_path) = std::env::current_dir()
+        if let Ok(project_path) = self.task_project_path(&record)
             && let Ok(project) =
                 ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
             && project.context.project_id == record.meta().project_id()
@@ -331,7 +353,12 @@ impl<'a> TurnRunner<'a> {
         Ok(())
     }
 
-    fn claim(&self, task_id: TaskId, turn_id: TurnId) -> Result<ProcessIdentity, WorkerError> {
+    fn claim(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        allow_reassignment: bool,
+    ) -> Result<(TaskId, TurnId, ProcessIdentity), WorkerError> {
         let mut backoff = 1_u64;
         let runner_owner = current_process_identity()?;
         loop {
@@ -350,7 +377,7 @@ impl<'a> TurnRunner<'a> {
                 QueueState::Dispatching { dispatch_owner, .. }
                     if *dispatch_owner == runner_owner =>
                 {
-                    return Ok(*dispatch_owner);
+                    return Ok((task_id, turn_id, *dispatch_owner));
                 }
                 QueueState::Dispatching { .. } => {
                     return Err(queue_error(
@@ -372,21 +399,36 @@ impl<'a> TurnRunner<'a> {
                         std::thread::sleep(WAIT_POLL);
                         continue;
                     }
-                    let observations = self.observe_admission(entry.preference())?;
+                    let may_yield = allow_reassignment && record.wait_for_capacity();
+                    let observations = self.observe_admission(if may_yield {
+                        &WorkerPreference::Automatic
+                    } else {
+                        entry.preference()
+                    })?;
                     let affinity = self
                         .client_state
                         .affinity_hints(entry.project_id(), entry.worktree_id())?;
                     let ranked =
                         SchedulerPolicy::rank(&observations, entry.requirements(), &affinity)
                             .into_iter()
+                            .filter(|candidate| match entry.preference() {
+                                WorkerPreference::Automatic => true,
+                                WorkerPreference::Pinned { worker } => {
+                                    candidate.worker_name() == worker
+                                }
+                            })
                             .map(|candidate| candidate.worker_name().to_owned())
                             .collect::<Vec<_>>();
-                    if let Some(claim) =
-                        self.client_state
-                            .claim_next(runner_owner, &ranked, now_millis()?)?
-                    {
+                    if let Some(claim) = self.client_state.claim_task_turn(
+                        runner_owner,
+                        turn_id,
+                        &ranked,
+                        now_millis()?,
+                    )? {
                         return match claim.entry().state() {
-                            QueueState::Dispatching { dispatch_owner, .. } => Ok(*dispatch_owner),
+                            QueueState::Dispatching { dispatch_owner, .. } => {
+                                Ok((task_id, turn_id, *dispatch_owner))
+                            }
                             _ => Err(task_error(
                                 "TASK_QUEUE_STATE",
                                 "queue claim did not produce a dispatch",
@@ -396,6 +438,18 @@ impl<'a> TurnRunner<'a> {
                     if !record.wait_for_capacity() {
                         self.abandon_capacity(&record, turn_id, *owner)?;
                         return Err(capacity_busy());
+                    }
+                    if may_yield
+                        && let Some((next_task, claim)) =
+                            self.client_state.claim_parked_for_waiting_runner(
+                                task_id,
+                                turn_id,
+                                runner_owner,
+                                &observations,
+                                now_millis()?,
+                            )?
+                    {
+                        return Ok((next_task, claim.entry().job_id(), runner_owner));
                     }
                 }
             }
@@ -412,7 +466,7 @@ impl<'a> TurnRunner<'a> {
         follow: &mut Option<&mut dyn Write>,
     ) -> Result<TurnOutcomeReport, WorkerError> {
         let initial_record = self.client_state.load_task(task_id)?;
-        let project_path = std::env::current_dir().map_err(WorkerError::Io)?;
+        let project_path = self.task_project_path(&initial_record)?;
         let project =
             ProjectState::load_for_task(self.runner, &project_path, &[], initial_record.meta())?;
         require_project_match(
@@ -1070,7 +1124,7 @@ impl<'a> TurnRunner<'a> {
         let _ = self
             .client_state
             .remove_turn_prompt(record.meta().task_id(), turn_id);
-        if let Ok(project_path) = std::env::current_dir()
+        if let Ok(project_path) = self.task_project_path(record)
             && let Ok(project) =
                 ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
             && project.context.project_id == record.meta().project_id()
@@ -1118,7 +1172,7 @@ impl<'a> TurnRunner<'a> {
             .remove_task_turn_after_terminal(turn_id, owner)?;
         let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
         if abandoned
-            && let Ok(project_path) = std::env::current_dir()
+            && let Ok(project_path) = self.task_project_path(record)
             && let Ok(project) =
                 ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
             && project.context.project_id == record.meta().project_id()
@@ -1128,6 +1182,16 @@ impl<'a> TurnRunner<'a> {
             let _ = transfer.release_base(self.runner, task_id);
         }
         Ok(())
+    }
+
+    fn task_project_path(
+        &self,
+        record: &LocalTaskRecord,
+    ) -> Result<std::path::PathBuf, WorkerError> {
+        match self.client_state.task_project_path(record)? {
+            Some(path) => Ok(path),
+            None => std::env::current_dir().map_err(WorkerError::Io),
+        }
     }
 
     fn observe_admission(

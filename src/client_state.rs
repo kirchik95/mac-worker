@@ -19,6 +19,9 @@ use std::{
 
 use uuid::Uuid;
 
+mod runner_dispatch;
+mod task_context;
+
 use crate::{
     agent_facts::FACTS_TTL,
     config::Config,
@@ -99,6 +102,7 @@ pub enum ClientStateWritePoint {
     AfterSubmissionIntentClearPublicationBeforeFinalSync = 30,
     AfterTaskReplacementExchangeBeforeFirstDirectorySync = 31,
     AfterRunReplacementExchangeBeforeFirstDirectorySync = 32,
+    AfterRunnerYieldQueuePublication = 33,
 }
 
 #[doc(hidden)]
@@ -706,6 +710,28 @@ impl ClientStateStore {
         ranked_workers: &[String],
         claimed_at_millis: u64,
     ) -> Result<Option<QueueClaim>, WorkerError> {
+        self.claim_next_matching(owner, ranked_workers, claimed_at_millis, None)
+    }
+
+    /// Keeps an attached or resumed task runner bound to its requested turn,
+    /// even when another row still contains the same process identity.
+    pub fn claim_task_turn(
+        &self,
+        owner: ProcessIdentity,
+        turn_id: TurnId,
+        ranked_workers: &[String],
+        claimed_at_millis: u64,
+    ) -> Result<Option<QueueClaim>, WorkerError> {
+        self.claim_next_matching(owner, ranked_workers, claimed_at_millis, Some(turn_id))
+    }
+
+    fn claim_next_matching(
+        &self,
+        owner: ProcessIdentity,
+        ranked_workers: &[String],
+        claimed_at_millis: u64,
+        turn_id: Option<TurnId>,
+    ) -> Result<Option<QueueClaim>, WorkerError> {
         owner.validate()?;
         if claimed_at_millis == 0 {
             return Err(queue_error(
@@ -726,6 +752,11 @@ impl ClientStateStore {
 
         self.update_queue(|snapshot| {
             self.reach_concurrency_point(ClientStateConcurrencyPoint::ClaimRunCapEvaluation);
+            let tasks = if snapshot.entries.iter().any(|entry| matches!(entry.state(), QueueState::Parked)) {
+                self.queued_task_records_locked(snapshot)?
+            } else {
+                HashMap::new()
+            };
             let mut selected = None;
             for worker in ranked_workers {
                 if snapshot.entries.iter().any(|entry| {
@@ -744,6 +775,9 @@ impl ClientStateStore {
                 .map(|observation| observation.capabilities().to_vec());
                 for index in 0..snapshot.entries.len() {
                     let candidate = &snapshot.entries[index];
+                    if turn_id.is_some_and(|turn| candidate.job_id() != turn || candidate.kind() != QueueEntryKind::TaskTurn) {
+                        continue;
+                    }
                     if !matches!(candidate.state(), QueueState::Waiting { owner: row_owner } if *row_owner == owner)
                         || candidate.is_cancel_requested()
                         || !candidate.eligible_for(worker, capabilities.as_deref())
@@ -753,12 +787,7 @@ impl ClientStateStore {
                     }
                     let mut blocked = false;
                     for older in &snapshot.entries[..index] {
-                        if matches!(older.state(), QueueState::Waiting { .. })
-                            && !older.is_cancel_requested()
-                            && older.eligible_for(worker, capabilities.as_deref())
-                            && self.run_has_capacity(snapshot, older)?
-                            && self.owner_is_live_or_ambiguous(older.owner(), owner)
-                        {
+                        if self.blocks_queue_claim(snapshot, older, candidate, worker, capabilities.as_deref(), owner, &tasks)? {
                             blocked = true;
                             break;
                         }
@@ -1187,6 +1216,14 @@ impl ClientStateStore {
         validate_affinity_key(project_id, "project ID")?;
         validate_affinity_key(worktree_id, "worktree ID")?;
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        self.affinity_hints_locked(project_id, worktree_id)
+    }
+
+    fn affinity_hints_locked(
+        &self,
+        project_id: &str,
+        worktree_id: &str,
+    ) -> Result<AffinityHints, WorkerError> {
         let project = read_project_affinity_optional(
             self.inner.affinity_projects.as_raw_fd(),
             &project_affinity_name(project_id)?,
@@ -1847,6 +1884,18 @@ impl ClientStateStore {
     where
         F: FnOnce() -> io::Result<()>,
     {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        self.update_task_locked_before_final_sync(replacement, before_final_sync)
+    }
+
+    fn update_task_locked_before_final_sync<F>(
+        &self,
+        replacement: LocalTaskRecord,
+        before_final_sync: F,
+    ) -> Result<(), WorkerError>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
         if self.take_task_rollback_update_failure()
             || self.take_fault(ClientStateWritePoint::BeforeTaskRollbackUpdate)
         {
@@ -1856,7 +1905,6 @@ impl ClientStateStore {
         }
         let task_id = replacement.meta().task_id();
         let bytes = task_record_bytes(&replacement)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let tasks = self.tasks_dir()?;
         let names = tasks.list_names().map_err(WorkerError::Io)?;
         self.recover_task_replacement_residue(&tasks, &names)?;
@@ -5217,6 +5265,9 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         }
         ClientStateWritePoint::AfterRunReplacementExchangeBeforeFirstDirectorySync => {
             "after run replacement exchange before first directory sync"
+        }
+        ClientStateWritePoint::AfterRunnerYieldQueuePublication => {
+            "after runner yield queue publication"
         }
     };
     WorkerError::Io(io::Error::other(format!(

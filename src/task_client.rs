@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     io::{self, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -755,6 +756,8 @@ impl<'a> TaskClient<'a> {
         let (mut report, should_start, queued_turn) =
             match (|| -> Result<(TaskReport, bool, TurnId), WorkerError> {
                 self.client_state
+                    .write_task_project_path(&record_for_rollback, &initial.context.root)?;
+                self.client_state
                     .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
                 let run_reference = match request.run_id {
                     Some(run_id) => {
@@ -969,8 +972,12 @@ impl<'a> TaskClient<'a> {
             ));
         }
         let worker = task_worker(self.config, record.status())?;
-        let project =
-            ProjectState::load_for_task(self.runner, &self.current_project()?, &[], record.meta())?;
+        let project = ProjectState::load_for_task(
+            self.runner,
+            &self.current_project(Some(&record))?,
+            &[],
+            record.meta(),
+        )?;
         require_project_match(&project, record.meta())?;
         let transfer =
             TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
@@ -1277,10 +1284,29 @@ impl<'a> TaskClient<'a> {
                 .client_state
                 .runner_liveness(record.meta().task_id())?
                 .is_none()
-                && self.live_runner_count()? < self.config.workers.len()
             {
-                self.start_runner(record.meta().task_id(), turn_id)?;
-                report.started_runners += 1;
+                // Queue publication precedes runner metadata during a
+                // handoff. Its live owner remains authoritative throughout
+                // that window, including a dispatch already reserved by the
+                // departing runner.
+                let Some(current_entry) = self.client_state.queue_entry(turn_id)? else {
+                    continue;
+                };
+                if matches!(current_entry.state(), QueueState::Parked)
+                    || current_entry.owner_opt().is_some_and(|row_owner| {
+                        *row_owner != owner
+                            && matches!(
+                                self.client_state.process_observation(*row_owner),
+                                ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
+                            )
+                    })
+                {
+                    continue;
+                }
+                if self.live_runner_count()? < self.config.workers.len() {
+                    self.start_runner(record.meta().task_id(), turn_id)?;
+                    report.started_runners += 1;
+                }
             }
         }
 
@@ -1605,7 +1631,7 @@ impl<'a> TaskClient<'a> {
         let run_id = RunId::generate();
         let created = current_time_millis()?;
         let batch_dir = file.parent().unwrap_or_else(|| Path::new("."));
-        let project = self.current_project()?;
+        let project = self.current_project(None)?;
         let mut requests = Vec::with_capacity(batch.tasks.len());
         for task in &batch.tasks {
             requests.push((
@@ -1725,8 +1751,12 @@ impl<'a> TaskClient<'a> {
         turn_id: TurnId,
         worker: String,
     ) -> Result<QueueEntry, WorkerError> {
-        let project =
-            ProjectState::load_for_task(self.runner, &self.current_project()?, &[], record.meta())?;
+        let project = ProjectState::load_for_task(
+            self.runner,
+            &self.current_project(Some(record))?,
+            &[],
+            record.meta(),
+        )?;
         require_project_match(&project, record.meta())?;
         let now = current_time_millis()?;
         let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
@@ -1865,8 +1895,12 @@ impl<'a> TaskClient<'a> {
     }
 
     fn transfer_for_record(&self, record: &LocalTaskRecord) -> Result<TransferRepo, WorkerError> {
-        let project =
-            ProjectState::load_for_task(self.runner, &self.current_project()?, &[], record.meta())?;
+        let project = ProjectState::load_for_task(
+            self.runner,
+            &self.current_project(Some(record))?,
+            &[],
+            record.meta(),
+        )?;
         require_project_match(&project, record.meta())?;
         TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
     }
@@ -1956,8 +1990,12 @@ impl<'a> TaskClient<'a> {
                     .copied()
             })
             .ok_or_else(|| task_error("TASK_INCONSISTENT", "queued task has no turn prompt"))?;
-        let project =
-            ProjectState::load_for_task(self.runner, &self.current_project()?, &[], record.meta())?;
+        let project = ProjectState::load_for_task(
+            self.runner,
+            &self.current_project(Some(record))?,
+            &[],
+            record.meta(),
+        )?;
         require_project_match(&project, record.meta())?;
         let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
         let run = record
@@ -2167,8 +2205,12 @@ impl<'a> TaskClient<'a> {
     }
 
     fn release_task_base(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
-        let project =
-            ProjectState::load_for_task(self.runner, &self.current_project()?, &[], record.meta())?;
+        let project = ProjectState::load_for_task(
+            self.runner,
+            &self.current_project(Some(record))?,
+            &[],
+            record.meta(),
+        )?;
         require_project_match(&project, record.meta())?;
         let transfer =
             TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
@@ -2176,24 +2218,23 @@ impl<'a> TaskClient<'a> {
     }
 
     fn live_runner_count(&self) -> Result<usize, WorkerError> {
-        Ok(self
-            .client_state
-            .list_tasks()?
-            .into_iter()
-            .filter(|task| {
-                !matches!(
-                    task.status().state(),
-                    TaskState::Closed | TaskState::Abandoned | TaskState::Lost
-                )
-            })
-            .filter_map(|task| {
-                self.client_state
-                    .runner_liveness(task.meta().task_id())
-                    .ok()
-            })
-            .flatten()
-            .filter(|state| *state == RunnerState::Live)
-            .count())
+        let mut identities = BTreeSet::new();
+        for task in self.client_state.list_tasks()? {
+            if task.status().state().is_terminal() {
+                continue;
+            }
+            let Some(runner) = task.runner() else {
+                continue;
+            };
+            let identity = runner.process_identity();
+            if matches!(
+                self.client_state.process_observation(identity),
+                ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
+            ) {
+                identities.insert((identity.pid(), identity.start_time_micros()));
+            }
+        }
+        Ok(identities.len())
     }
 
     fn observe_admission(
@@ -2269,7 +2310,12 @@ impl<'a> TaskClient<'a> {
             .map_err(WorkerError::Io)
     }
 
-    fn current_project(&self) -> Result<PathBuf, WorkerError> {
+    fn current_project(&self, record: Option<&LocalTaskRecord>) -> Result<PathBuf, WorkerError> {
+        if let Some(record) = record
+            && let Some(project_path) = self.client_state.task_project_path(record)?
+        {
+            return Ok(project_path);
+        }
         std::env::current_dir().map_err(WorkerError::Io)
     }
 }

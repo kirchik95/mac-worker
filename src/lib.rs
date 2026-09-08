@@ -728,7 +728,7 @@ fn run_task_command(
                     .parse::<crate::task::TurnId>()
                     .map_err(|_| WorkerError::Protocol("invalid runner turn ID".into()))?;
                 let outcome = TurnRunner::new(runner, &config, &paths, &client_state, executor)
-                    .run(task_id, turn_id, Some(stdout))?;
+                    .run_detached(task_id, turn_id)?;
                 Ok(outcome.exit_code())
             }
             Command::Task { command } => {

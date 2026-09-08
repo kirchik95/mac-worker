@@ -163,6 +163,7 @@ struct AcceptedThenTerminalRunner {
     probe_count: Mutex<u32>,
     facts_fresh: Mutex<bool>,
     base_release_failures: Mutex<u8>,
+    worker: Mutex<String>,
 }
 
 #[derive(Clone)]
@@ -278,6 +279,7 @@ impl AcceptedThenTerminalRunner {
             probe_count: Mutex::new(0),
             facts_fresh: Mutex::new(false),
             base_release_failures: Mutex::new(0),
+            worker: Mutex::new("mini-1".into()),
         }
     }
 
@@ -317,7 +319,7 @@ impl AcceptedThenTerminalRunner {
                 TaskState::Active
             },
             outcome,
-            Some("mini-1".into()),
+            Some(self.worker.lock().unwrap().clone()),
             true,
             Some(meta.base_oid().clone()),
             terminal.then_some("finished".into()),
@@ -517,6 +519,12 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                 canonical_process(&LeaseAcquireResponse::Acquired { lease })
             }
             value if value == HostOperation::TaskPrepare.command() => {
+                *self.worker.lock().unwrap() = if request.args.iter().any(|arg| arg == "mac2") {
+                    "mini-2"
+                } else {
+                    "mini-1"
+                }
+                .into();
                 let prepare: TaskPrepareRequest = decode_request(request)?;
                 *self.task.lock().unwrap() = Some((prepare.meta().clone(), prepare.job_id()));
                 canonical_process(&TaskPrepareResponse::new(
@@ -886,6 +894,438 @@ fn add_second_worker(fixture: &mut AcceptedThenTerminalFixture, first: bool) {
     worker.name = "mini-2".into();
     worker.ssh = "mac2".into();
     fixture.config.workers.insert(usize::from(!first), worker);
+}
+
+struct FixedTaskExecutor(ProcessIdentity);
+impl RunnerExecutor for FixedTaskExecutor {
+    fn start(
+        &self,
+        _: &mac_worker::paths::PathLayout,
+        _: TaskId,
+        _: TurnId,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        Ok(mac_worker::task::RunnerIdentity::new(self.0))
+    }
+}
+
+#[derive(Default)]
+struct CountedInlineExecutor(Mutex<Vec<(TaskId, TurnId)>>);
+impl RunnerExecutor for CountedInlineExecutor {
+    fn start(
+        &self,
+        paths: &mac_worker::paths::PathLayout,
+        task: TaskId,
+        turn: TurnId,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        self.0.lock().unwrap().push((task, turn));
+        InlineRunnerExecutor.start(paths, task, turn)
+    }
+}
+
+struct BusyPinnedRunner<'a> {
+    fixture: &'a AcceptedThenTerminalFixture,
+    donor: TurnId,
+    probes: Mutex<u32>,
+}
+
+impl ProcessRunner for BusyPinnedRunner<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let mut result = self.fixture.runner.run(request)?;
+        if request.program == OsStr::new("/usr/bin/ssh")
+            && request.args.iter().any(|arg| arg == "mac1")
+            && request
+                .args
+                .last()
+                .is_some_and(|arg| arg == "~/.local/bin/worker host probe")
+        {
+            let mut count = self.probes.lock().unwrap();
+            *count += 1;
+            if *count > 1 {
+                // Bound the regression: a runner that keeps waiting on its
+                // pin is cancelled on its next polling pass, then exits.
+                self.fixture
+                    .state
+                    .request_queue_cancel(self.donor, u64::MAX / 2)?;
+            }
+            let mut probe: ProbeResponse = serde_json::from_slice(&result.stdout).unwrap();
+            probe.slot_state = SlotState::Busy;
+            result = canonical_process(&probe)?;
+        }
+        Ok(result)
+    }
+}
+
+fn submit_pool_task(
+    fixture: &AcceptedThenTerminalFixture,
+    project: &Path,
+    worker: &str,
+    executor: &dyn RunnerExecutor,
+) -> (TaskId, TurnId) {
+    let report = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        executor,
+    )
+    .submit(
+        TaskSubmitRequest {
+            agent: AgentKind::Codex,
+            model: None,
+            effort: None,
+            prompt: "recipient private prompt".into(),
+            project: project.to_path_buf(),
+            base: "main".into(),
+            wip: true,
+            source: Some("local".into()),
+            publish: Some(vec!["fetch".into()]),
+            publish_branch: None,
+            cli_includes: vec![],
+            limits: TaskLimits::default(),
+            close_policy: ClosePolicy::Never,
+            env_profile: None,
+            preference: WorkerPreference::Pinned {
+                worker: worker.into(),
+            },
+            wait_for_capacity: true,
+            attached: false,
+            run_id: None,
+        },
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    (
+        report.task_id(),
+        fixture
+            .state
+            .queue_entry_for_task_turn(report.task_id())
+            .unwrap()
+            .unwrap()
+            .job_id(),
+    )
+}
+
+fn saturated_pool(
+    fixture: &mut AcceptedThenTerminalFixture,
+    recipient_project: &Path,
+) -> ((TaskId, TurnId), (TaskId, TurnId)) {
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    add_second_worker(fixture, false);
+    let mut third = fixture.config.workers[0].clone();
+    third.name = "mini-3".into();
+    third.ssh = "mac3".into();
+    fixture.config.workers.push(third);
+    fixture.state = ClientStateStore::open_with_owner_inspector(
+        &fixture.paths.state,
+        DeadOwnerInspector {
+            dead_owner: ProcessIdentity::new(999_999, 1).unwrap(),
+        },
+    )
+    .unwrap();
+    // An already reserved mini-1 turn and two separate pinned runners fill
+    // the process budget. The queued mini-2 task must therefore be parked.
+    let active_owner = ProcessIdentity::new(424_241, 1).unwrap();
+    fixture
+        .state
+        .adopt_row(fixture.turn_id, active_owner)
+        .unwrap();
+    fixture
+        .state
+        .record_runner(
+            fixture.task_id,
+            Some(mac_worker::task::RunnerIdentity::new(active_owner)),
+        )
+        .unwrap();
+    fixture
+        .state
+        .claim_next(active_owner, &["mini-1".into()], u64::MAX / 4)
+        .unwrap()
+        .unwrap();
+    let donor = submit_pool_task(
+        fixture,
+        fixture._repo.root(),
+        "mini-1",
+        &InlineRunnerExecutor,
+    );
+    submit_pool_task(
+        fixture,
+        fixture._repo.root(),
+        "mini-1",
+        &FixedTaskExecutor(ProcessIdentity::new(424_242, 2).unwrap()),
+    );
+    let recipient = submit_pool_task(fixture, recipient_project, "mini-2", &InlineRunnerExecutor);
+    assert!(matches!(
+        fixture
+            .state
+            .queue_entry(recipient.1)
+            .unwrap()
+            .unwrap()
+            .state(),
+        mac_worker::job::QueueState::Parked
+    ));
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    (donor, recipient)
+}
+
+#[test]
+fn detached_waiter_executes_parked_turn_in_its_saved_project_without_an_extra_process() {
+    // Break caught: all process slots wait on mini-1 while mini-2 is idle;
+    // task execution/result import also used the donor's inherited cwd.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    for linked_worktree in [false, true] {
+        let mut fixture = AcceptedThenTerminalFixture::new();
+        let other_repo = support::GitRepo::init();
+        other_repo.write("recipient.txt", b"recipient repository\n");
+        other_repo.commit_all("recipient base");
+        let recipient_project = if linked_worktree {
+            let path = fixture.state_root.path().join("linked-recipient");
+            assert!(
+                fixture
+                    ._repo
+                    .git(&[
+                        "worktree",
+                        "add",
+                        "-b",
+                        "recipient",
+                        path.to_str().unwrap(),
+                        "main"
+                    ])
+                    .status
+                    .success()
+            );
+            path
+        } else {
+            other_repo.root().to_path_buf()
+        };
+        let (donor, recipient) = saturated_pool(&mut fixture, &recipient_project);
+        let donor_owner = fixture
+            .state
+            .load_task(donor.0)
+            .unwrap()
+            .runner()
+            .unwrap()
+            .process_identity();
+        let original = fixture.state.queue_entry(donor.1).unwrap().unwrap();
+        let original_prompt = fixture.state.read_turn_prompt(donor.0, donor.1).unwrap();
+        let runner = BusyPinnedRunner {
+            fixture: &fixture,
+            donor: donor.1,
+            probes: Mutex::new(0),
+        };
+        let executor = CountedInlineExecutor::default();
+        let outcome = TurnRunner::new(
+            &runner,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &executor,
+        )
+        .run_detached(donor.0, donor.1)
+        .unwrap();
+        assert_eq!(outcome.status().state(), TaskState::Closed);
+        assert_eq!(outcome.status().worker(), Some("mini-2"));
+        assert_eq!(outcome.status().turns()[0].turn_id(), recipient.1);
+        assert_eq!(
+            fixture
+                .state
+                .load_task(recipient.0)
+                .unwrap()
+                .status()
+                .state(),
+            TaskState::Closed
+        );
+        assert_eq!(
+            fixture.state.load_task(donor.0).unwrap().status().state(),
+            TaskState::Queued
+        );
+        let resumed = fixture.state.queue_entry(donor.1).unwrap().unwrap();
+        assert_eq!(resumed.queue_id(), original.queue_id());
+        assert_eq!(resumed.preference(), original.preference());
+        assert_eq!(
+            fixture.state.read_turn_prompt(donor.0, donor.1).unwrap(),
+            original_prompt
+        );
+        assert_eq!(resumed.owner_opt(), Some(&donor_owner));
+        // The only spawn happens after terminal completion to resume the
+        // displaced donor. Yielding itself never starts another process.
+        assert_eq!(*executor.0.lock().unwrap(), vec![donor]);
+        let requests = fixture.runner.requests();
+        let submissions = requests
+            .iter()
+            .filter(|request| {
+                request
+                    .args
+                    .last()
+                    .is_some_and(|arg| arg == HostOperation::TaskTurn.command())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(
+            decode_request::<TaskTurnRequest>(submissions[0])
+                .unwrap()
+                .turn()
+                .task_id(),
+            recipient.0
+        );
+        let common_dir = if linked_worktree {
+            fixture._repo.root().join(".git")
+        } else {
+            other_repo.root().join(".git")
+        }
+        .canonicalize()
+        .unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.args.iter().any(|arg| arg == "fetch")
+                    && request
+                        .args
+                        .iter()
+                        .any(|arg| arg.to_string_lossy().contains("refs/remotes/mac-worker/"))
+                    && request.args.iter().any(|arg| arg == common_dir.as_os_str())),
+            "result import must target the recipient's Git common directory"
+        );
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            fixture._repo.root().canonicalize().unwrap()
+        );
+    }
+}
+
+#[test]
+fn attached_waiter_keeps_following_the_requested_turn() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture = AcceptedThenTerminalFixture::new();
+    let project = fixture._repo.root().to_path_buf();
+    let (donor, recipient) = saturated_pool(&mut fixture, &project);
+    let runner = BusyPinnedRunner {
+        fixture: &fixture,
+        donor: donor.1,
+        probes: Mutex::new(0),
+    };
+    let error = TurnRunner::new(
+        &runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(donor.0, donor.1, Some(&mut Vec::new()))
+    .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_QUEUE_MISSING");
+    assert!(matches!(
+        fixture
+            .state
+            .queue_entry(recipient.1)
+            .unwrap()
+            .unwrap()
+            .state(),
+        mac_worker::job::QueueState::Parked
+    ));
+    assert!(!fixture.runner.requests().iter().any(|request| {
+        request
+            .args
+            .last()
+            .is_some_and(|arg| arg == HostOperation::TaskTurn.command())
+    }));
+}
+
+#[test]
+fn interrupted_legacy_reassignment_recovers_from_an_unrelated_working_directory() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture = AcceptedThenTerminalFixture::new();
+    let project = fixture._repo.root().to_path_buf();
+    let (donor, recipient) = saturated_pool(&mut fixture, &project);
+    // A pre-upgrade parked task has a prompt but no saved context.
+    fs::remove_file(
+        fixture
+            .paths
+            .state
+            .join("turns")
+            .join(recipient.0.to_string())
+            .join("project.json"),
+    )
+    .unwrap();
+    let crashed_owner = ProcessIdentity::new(424_243, 3).unwrap();
+    fixture.state.adopt_row(donor.1, crashed_owner).unwrap();
+    fixture
+        .state
+        .record_runner(
+            donor.0,
+            Some(mac_worker::task::RunnerIdentity::new(crashed_owner)),
+        )
+        .unwrap();
+    let unrelated = tempfile::tempdir().unwrap();
+    let _cwd = CurrentDirGuard::enter(unrelated.path());
+    let observations = vec![
+        mac_worker::scheduler::CandidateObservation::new(
+            "mini-2".into(),
+            true,
+            mac_worker::scheduler::CandidateSlot::Idle,
+            vec!["agent:codex".into(), "darwin-arm64".into()],
+            Some(16 << 30),
+            64 << 30,
+        )
+        .unwrap(),
+    ];
+    fixture
+        .state
+        .inject_write_failure_once(ClientStateWritePoint::AfterRunnerYieldQueuePublication);
+    assert!(
+        fixture
+            .state
+            .claim_parked_for_waiting_runner(
+                donor.0,
+                donor.1,
+                crashed_owner,
+                &observations,
+                u64::MAX / 4
+            )
+            .is_err()
+    );
+    let resumed_state = ClientStateStore::open_with_owner_inspector(
+        &fixture.paths.state,
+        DeadOwnerInspector {
+            dead_owner: crashed_owner,
+        },
+    )
+    .unwrap();
+    let recovery = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &resumed_state,
+        &fixture.executor,
+    )
+    .reconcile_runners()
+    .unwrap();
+    assert_eq!(recovery.started_runners(), 1);
+    let outcome = TurnRunner::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &resumed_state,
+        &fixture.executor,
+    )
+    .run_detached(recipient.0, recipient.1)
+    .unwrap();
+    assert_eq!(outcome.status().state(), TaskState::Closed);
+    assert_eq!(outcome.status().worker(), Some("mini-2"));
+    assert_eq!(
+        resumed_state
+            .task_project_path(&resumed_state.load_task(recipient.0).unwrap())
+            .unwrap(),
+        Some(project.canonicalize().unwrap())
+    );
+    assert_eq!(
+        resumed_state.load_task(donor.0).unwrap().status().state(),
+        TaskState::Queued
+    );
+    assert_eq!(
+        std::env::current_dir().unwrap(),
+        unrelated.path().canonicalize().unwrap()
+    );
 }
 
 fn assert_unavailable_observation(fixture: &AcceptedThenTerminalFixture, worker: &str) {
