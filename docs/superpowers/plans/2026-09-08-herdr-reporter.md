@@ -23,11 +23,11 @@
 
 Files: create `src/herdr.rs`, `tests/herdr_client.rs`, `tests/support/fake_herdr.rs`; modify `src/lib.rs`.
 
-- [ ] Add `tests/support/fake_herdr.rs`: a `UnixListener` at `<home>/.config/herdr/herdr.sock` in a temporary home, a queue of canned JSON responses keyed by method, an optional per-method stall, and a recording of every request line. Expose `requests()` so later suites can assert payload contents.
-- [ ] Add failing tests in `tests/herdr_client.rs`: request framing `{"id","method","params"}` plus newline; the response with the matching id is returned and a mismatched id is an error; `error` bodies become `HerdrError::Server { code, message }`; an absent socket returns `HerdrError::Absent` within the connect deadline; a stalling server returns `HerdrError::Timeout` within the response deadline; the descriptor is `O_CLOEXEC` while open and closed after the call.
-- [ ] Implement `src/herdr.rs`: `HerdrSocket::default_for_home(home)` and `from_env_or_home(env, home)` (honouring `HERDR_SOCKET_PATH`), `HerdrClient::request(method, params) -> Result<Value, HerdrError>`, typed wrappers for `ping`, `workspace_list`, `workspace_create`, `tab_list`, `tab_create`, `tab_close`, `pane_process_info`, `pane_send_input`, `pane_report_agent`, `pane_report_metadata`, `pane_release_agent`, and `notification_show`, ids `mac-worker:<millis>:<counter>`, `seq` as nanoseconds, a hand-written `Debug` that omits params.
-- [ ] Keep the relevant subset of `herdr api schema --json` (protocol 22) under `tests/fixtures/herdr/schema-subset.json` and add a test that every typed wrapper's params validate against it.
-- [ ] Run `cargo test --locked --offline --test herdr_client` and fix regressions.
+- [x] Add `tests/support/fake_herdr.rs`: a `UnixListener` at `<home>/.config/herdr/herdr.sock` in a temporary home, a queue of canned JSON responses keyed by method, an optional per-method stall, and a recording of every request line. Expose `requests()` so later suites can assert payload contents.
+- [x] Add failing tests in `tests/herdr_client.rs`: request framing `{"id","method","params"}` plus newline; the response with the matching id is returned and a mismatched id is an error; `error` bodies become `HerdrError::Server { code, message }`; an absent socket returns `HerdrError::Absent` within the connect deadline; a stalling server returns `HerdrError::Timeout` within the response deadline; the descriptor is `O_CLOEXEC` while open and closed after the call.
+- [x] Implement `src/herdr.rs`: `HerdrSocket::default_for_home(home)` and `from_env_or_home(env, home)` (honouring `HERDR_SOCKET_PATH`), `HerdrClient::request(method, params) -> Result<Value, HerdrError>`, typed wrappers for `ping`, `workspace_list`, `workspace_create`, `tab_list`, `tab_create`, `tab_close`, `pane_process_info`, `pane_send_input`, `pane_report_agent`, `pane_report_metadata`, `pane_release_agent`, and `notification_show`, ids `mac-worker:<millis>:<counter>`, `seq` as nanoseconds, a hand-written `Debug` that omits params.
+- [x] Keep the relevant subset of `herdr api schema --json` (protocol 22) under `tests/fixtures/herdr/schema-subset.json` and add a test that every typed wrapper's params validate against it.
+- [x] Run `cargo test --locked --offline --test herdr_client` and fix regressions.
 
 ### Task 2: Configuration, wire fields, and the protocol bump
 

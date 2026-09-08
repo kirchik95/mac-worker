@@ -71,6 +71,7 @@ pub mod doctor;
 pub mod error;
 pub mod gc;
 pub mod git_transport;
+pub mod herdr;
 pub mod host_store;
 pub mod inputs;
 pub mod install;

@@ -1,0 +1,341 @@
+{
+ "methods": {
+  "notification.show": {
+   "properties": {
+    "body": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "position": {
+     "anyOf": [
+      {
+       "enum": [
+        "top-left",
+        "top-right",
+        "bottom-left",
+        "bottom-right"
+       ],
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "sound": {
+     "enum": [
+      "none",
+      "done",
+      "request"
+     ],
+     "type": "string"
+    },
+    "title": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "title"
+   ],
+   "type": "object"
+  },
+  "pane.process_info": {
+   "properties": {
+    "pane_id": {
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   },
+   "type": "object"
+  },
+  "pane.release_agent": {
+   "properties": {
+    "agent": {
+     "type": "string"
+    },
+    "pane_id": {
+     "type": "string"
+    },
+    "seq": {
+     "format": "uint64",
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "source": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "pane_id",
+    "source",
+    "agent"
+   ],
+   "type": "object"
+  },
+  "pane.report_agent": {
+   "properties": {
+    "agent": {
+     "type": "string"
+    },
+    "agent_session_id": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "agent_session_path": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "message": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "pane_id": {
+     "type": "string"
+    },
+    "seq": {
+     "format": "uint64",
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "source": {
+     "type": "string"
+    },
+    "state": {
+     "enum": [
+      "idle",
+      "working",
+      "blocked",
+      "unknown"
+     ],
+     "type": "string"
+    }
+   },
+   "required": [
+    "pane_id",
+    "source",
+    "agent",
+    "state"
+   ],
+   "type": "object"
+  },
+  "pane.report_metadata": {
+   "properties": {
+    "agent": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "applies_to_source": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "clear_display_agent": {
+     "default": false,
+     "type": "boolean"
+    },
+    "clear_state_labels": {
+     "default": false,
+     "type": "boolean"
+    },
+    "clear_title": {
+     "default": false,
+     "type": "boolean"
+    },
+    "display_agent": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "pane_id": {
+     "type": "string"
+    },
+    "seq": {
+     "format": "uint64",
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "source": {
+     "type": "string"
+    },
+    "state_labels": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "type": "object"
+    },
+    "title": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "tokens": {
+     "additionalProperties": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "maxProperties": 16,
+     "propertyNames": {
+      "pattern": "^[A-Za-z0-9_-]{1,32}$"
+     },
+     "type": "object"
+    },
+    "ttl_ms": {
+     "format": "uint64",
+     "maximum": 86400000,
+     "minimum": 1,
+     "type": [
+      "integer",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "pane_id",
+    "source"
+   ],
+   "type": "object"
+  },
+  "pane.send_input": {
+   "properties": {
+    "keys": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "pane_id": {
+     "type": "string"
+    },
+    "text": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "pane_id"
+   ],
+   "type": "object"
+  },
+  "ping": {
+   "type": "object"
+  },
+  "tab.close": {
+   "properties": {
+    "tab_id": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "tab_id"
+   ],
+   "type": "object"
+  },
+  "tab.create": {
+   "properties": {
+    "cwd": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "env": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "type": "object"
+    },
+    "focus": {
+     "default": false,
+     "type": "boolean"
+    },
+    "label": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "workspace_id": {
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   },
+   "type": "object"
+  },
+  "tab.list": {
+   "properties": {
+    "workspace_id": {
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   },
+   "type": "object"
+  },
+  "workspace.create": {
+   "properties": {
+    "cwd": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "env": {
+     "additionalProperties": {
+      "type": "string"
+     },
+     "type": "object"
+    },
+    "focus": {
+     "default": false,
+     "type": "boolean"
+    },
+    "label": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "source_workspace_id": {
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   },
+   "type": "object"
+  },
+  "workspace.list": {
+   "type": "object"
+  }
+ },
+ "protocol": 22,
+ "source": "herdr api schema --json, protocol 22, herdr 0.9.0, captured 2026-09-08"
+}
