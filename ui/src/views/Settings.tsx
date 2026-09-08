@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
@@ -74,14 +74,30 @@ function Detail({
   permissions: string | null
   envProfile: string | null
   connectionLabel: string
-  onSaved: (settings: AgentSettings) => void
+  onSaved: (setting: AgentSetting) => void
 }) {
+  const identity = `${worker}\0${setting.agent}`
   const [draft, setDraft] = useState<Draft>(() => draftOf(setting))
-  const [busy, setBusy] = useState(false)
-  const [message, setMessage] = useState<string | null>(null)
+  const [activity, setActivity] = useState<{
+    identity: string
+    busy: boolean
+    message: string | null
+  }>(() => ({ identity, busy: false, message: null }))
+  const saveGeneration = useRef(0)
 
+  if (activity.identity !== identity) {
+    setActivity({ identity, busy: false, message: null })
+  }
   const saved = useMemo(() => draftOf(setting), [setting])
   useEffect(() => setDraft(draftOf(setting)), [setting.agent, setting.revision, setting])
+  useEffect(
+    () => () => {
+      saveGeneration.current += 1
+    },
+    [worker, setting.agent],
+  )
+  const busy = activity.identity === identity ? activity.busy : false
+  const message = activity.identity === identity ? activity.message : null
   const dirty = !sameDraft(draft, saved)
 
   const selectedModel = setting.model_options.find((option) => option.id === draft.model) ?? null
@@ -89,8 +105,8 @@ function Detail({
   const fastSupported = selectedModel?.fast_supported ?? setting.fast_supported
 
   const save = useCallback(async () => {
-    setBusy(true)
-    setMessage(null)
+    const generation = ++saveGeneration.current
+    setActivity({ identity, busy: true, message: null })
     try {
       const next = await saveAgentSettings(worker, {
         agent: setting.agent,
@@ -99,15 +115,25 @@ function Detail({
         fast: fastSupported ? draft.fast : null,
         revision: setting.revision,
       })
+      if (generation !== saveGeneration.current) return
       onSaved(next)
-      setMessage('Saved.')
+      setActivity({ identity, busy: true, message: 'Saved.' })
     } catch (error) {
+      if (generation !== saveGeneration.current) return
       // Keep the draft: a rejected revision must not lose the operator's edit.
-      setMessage(error instanceof Error ? error.message : String(error))
+      setActivity({
+        identity,
+        busy: true,
+        message: error instanceof Error ? error.message : String(error),
+      })
     } finally {
-      setBusy(false)
+      if (generation === saveGeneration.current) {
+        setActivity((current) =>
+          current.identity === identity ? { ...current, busy: false } : current,
+        )
+      }
     }
-  }, [worker, setting.agent, setting.revision, draft, fastSupported, onSaved])
+  }, [identity, worker, setting.agent, setting.revision, draft, fastSupported, onSaved])
 
   return (
     <section className="rounded-[10px] border bg-card p-5">
@@ -222,7 +248,7 @@ function Detail({
           disabled={!dirty || busy}
           onClick={() => {
             setDraft(saved)
-            setMessage(null)
+            setActivity({ identity, busy: false, message: null })
           }}
         >
           Cancel
@@ -314,6 +340,19 @@ export function Settings({ snapshot }: { snapshot: Snapshot }) {
     ?.permissions
   const envProfile = (snapshot.project_defaults as { env_profile?: string | null } | null)
     ?.env_profile
+  const mergeSaved = useCallback(
+    (saved: AgentSetting) =>
+      setSettings((current) =>
+        current == null
+          ? current
+          : {
+              agents: current.agents.map((agent) =>
+                agent.agent === saved.agent ? saved : agent,
+              ),
+            },
+      ),
+    [],
+  )
 
   if (workers.length === 0) {
     return <p className="text-sm text-muted-foreground">No workers are configured.</p>
@@ -413,7 +452,7 @@ export function Settings({ snapshot }: { snapshot: Snapshot }) {
           permissions={permissions?.[setting.agent] ?? null}
           envProfile={envProfile ?? null}
           connectionLabel={connection(worker, setting.agent).label}
-          onSaved={setSettings}
+          onSaved={mergeSaved}
         />
       ) : null}
 

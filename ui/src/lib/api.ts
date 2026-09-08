@@ -199,10 +199,13 @@ export const fetchAgentSettings = (worker: string, signal?: AbortSignal) =>
   getJson<AgentSettings>(`/api/v1/workers/${encodeURIComponent(worker)}/agent-settings`, signal)
 
 /** Saves one agent. The revision is the optimistic check the host enforces. */
-export async function saveAgentSettings(worker: string, body: SaveSettings): Promise<AgentSettings> {
+export async function saveAgentSettings(worker: string, body: SaveSettings): Promise<AgentSetting> {
   const response = await fetch(`/api/v1/workers/${encodeURIComponent(worker)}/agent-settings`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'x-mac-worker-settings': '1',
+    },
     body: JSON.stringify(body),
   })
   const payload: unknown = await response.json().catch(() => null)
@@ -213,7 +216,7 @@ export async function saveAgentSettings(worker: string, body: SaveSettings): Pro
         : `save responded ${response.status}`
     throw new ApiError(response.status, message)
   }
-  return payload as AgentSettings
+  return payload as AgentSetting
 }
 
 export const questionText = (question: string | Question) =>

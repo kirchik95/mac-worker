@@ -32,6 +32,49 @@ describe('getJson', () => {
 })
 
 describe('saveAgentSettings', () => {
+  it('sends the browser-safe guard and returns the saved agent', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        agent: 'codex',
+        model: 'gpt-6-astra',
+        effort: 'xhigh',
+        fast: true,
+        fast_supported: true,
+        effort_options: ['low', 'high', 'xhigh'],
+        model_options: [],
+        source: 'native-codex',
+        revision: 'rev-2',
+        writable: true,
+        message: null,
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const request = {
+      agent: 'codex',
+      model: 'gpt-6-astra',
+      effort: 'xhigh',
+      fast: true,
+      revision: 'rev-1',
+    }
+    const saved = await saveAgentSettings('mini-1', request)
+    const [, init] = fetchMock.mock.calls[0]
+
+    expect(init.headers).toMatchObject({
+      'content-type': 'application/json',
+      'x-mac-worker-settings': '1',
+    })
+    expect(init.headers).not.toHaveProperty('origin')
+    expect(JSON.parse(init.body)).toMatchObject({
+      agent: 'codex',
+      revision: 'rev-1',
+    })
+    expect(saved).toMatchObject({ agent: 'codex', revision: 'rev-2' })
+    vi.unstubAllGlobals()
+  })
+
   it('sends the revision the host checks and reports a rejection', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: false,

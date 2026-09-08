@@ -249,6 +249,9 @@ async fn settings_routes_read_and_protect_save() {
     );
     assert_eq!(accepted.status, 200);
     assert_eq!(settings.saves.load(Ordering::SeqCst), 1);
+    let saved: serde_json::Value = serde_json::from_slice(&accepted.body).unwrap();
+    assert_eq!(saved["agent"], "codex");
+    assert!(saved.get("agents").is_none());
     server.shutdown().await.unwrap();
 }
 
