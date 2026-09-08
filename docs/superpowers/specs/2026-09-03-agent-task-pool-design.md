@@ -658,7 +658,7 @@ The v2 execution core is complete when acceptance in section 20.2 passes for Cod
 
 Each of these requires its own review before implementation:
 
-- **Interactive mode.** A turn that runs the agent's TUI inside a Herdr pane on the worker, attachable with Herdr's remote session support, so the user can type to the agent and answer its prompts. It trades the exit-code completion signal for Herdr's heuristic agent states and weakens limits; it must be an explicit `--interactive` flag, never a default.
+- **Interactive mode.** A turn that runs the agent's TUI inside a Herdr pane on the worker, attachable with Herdr's remote session support, so the user can type to the agent and answer its prompts. It trades the exit-code completion signal for Herdr's heuristic agent states and weakens limits; it must be an explicit `--interactive` flag, never a default. Its observability half, a read-only pane and reported states for a headless turn, is specified separately in the [herdr reporter design](2026-09-08-herdr-reporter-design.md) and does not require this item.
 - **Long-lived Claude turns.** Claude Code accepts streaming JSON input, so one process could stay alive across follow-ups and accept messages while working. This changes the "no message into a running agent" rule and is deferred until the turn model is proven.
 - **Merge request creation** by mac-worker after `push`.
 - **Dashboard task cancel** and other task-lifecycle mutating controls, under the dashboard design's token and same-origin requirements. The native model, effort, and Fast Settings Save operation is already authorized and is outside this deferral.
@@ -677,7 +677,7 @@ Closest in topology, but the model loop runs in Cursor's cloud, every tool call 
 
 ### Herdr remote sessions alone
 
-Herdr already runs on every worker and can attach to remote sessions. It gives a live view and interactive control but no queue, no limits, no durable task records, and no result publication. It is the basis for the deferred interactive mode, not a replacement for this design.
+Herdr already runs on every worker and can attach to remote sessions. It gives a live view and interactive control but no queue, no limits, no durable task records, and no result publication. It is the basis for the deferred interactive mode, not a replacement for this design. Since herdr 0.9 (2026-09-08) the same server also renders states that an external source reports through its socket, which the [herdr reporter design](2026-09-08-herdr-reporter-design.md) uses to show headless turns without changing this design.
 
 ### Blocking `submit` instead of local runners
 
