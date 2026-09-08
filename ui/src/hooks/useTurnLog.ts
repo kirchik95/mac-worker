@@ -61,6 +61,10 @@ export function useTurnLog(
     if (taskId == null || turnId == null) return
 
     const identityGeneration = generation.current
+    if (live && finalized.current) {
+      finalized.current = false
+      decoder.current = new TextDecoder('utf-8')
+    }
 
     const finalizeDecoder = () => {
       if (generation.current !== identityGeneration || finalized.current) return
@@ -118,8 +122,9 @@ export function useTurnLog(
             current.error === null ? current : { ...current, error: null },
           )
           if (chunk.next_offset > offset.current) {
+            if (decoder.current === null) throw new Error('Log decoder is unavailable')
             const bytes = decodeBase64(chunk.data)
-            const text = decoder.current?.decode(bytes, { stream: true }) ?? ''
+            const text = decoder.current.decode(bytes, { stream: true })
             offset.current = chunk.next_offset
             setLog((current) => ({
               text: current.text + text,

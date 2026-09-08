@@ -384,13 +384,15 @@ retry, no-progress error clearing, and stale decoder isolation.
 - [ ] **Step 6: Separate identity reset from read scheduling**
 
 Keep refs for offset, decoder, identity generation, active request, retry timer,
-and whether this identity's decoder has been finalized. One effect keyed only
-by `[taskId, turnId, stream]` resets state and creates the decoder. Its cleanup
-increments generation, aborts work, clears timers, and discards the decoder
-without calling `decode()` or publishing text.
+and whether the decoder has been finalized for the current stopped reading
+period. One effect keyed only by `[taskId, turnId, stream]` resets state and
+creates the decoder. Its cleanup increments generation, aborts work, clears
+timers, and discards the decoder without calling `decode()` or publishing text.
 
-A second effect may react to `live`, but it must not reset text, offset, or
-decoder. Use an async recursive scheduler, not `setInterval`.
+A second effect may react to `live`, but it must not reset text or offset. When
+a finalized same-identity reader becomes live, it clears finalization and
+creates a fresh UTF-8 decoder before resuming from the preserved offset. Use an
+async recursive scheduler, not `setInterval`.
 
 - [ ] **Step 7: Implement one read outcome and serialized scheduling**
 
@@ -415,12 +417,13 @@ if (live) {
 } else if (outcome === 'failed') {
   // Retry after 1000 ms.
 } else {
-  // Flush this identity's decoder once and stop.
+  // Flush this stopped reading period's decoder once and stop.
 }
 ```
 
 Never immediately repeat `idle`; never run two calls concurrently. A failed
-completed read retains text/offset/decoder and remains retryable.
+completed read retains text/offset/decoder and remains retryable. Never advance
+the offset for bytes that were not consumed by a usable decoder.
 
 - [ ] **Step 8: Correct the panel's finality wording**
 
@@ -937,6 +940,8 @@ Ruling: Validate the Settings boundary with paired production-client contract te
 Ruling: Regenerate and verify embedded UI assets once after the source tasks are reviewed — this keeps source review focused and avoids repeated minified bundle churn — cost: intermediate source commits are not release-ready; no integration occurs before the final asset-parity gate passes.
 
 Ruling: Accept current-end log semantics for stage 4 without a wire change — normal supervisor ordering publishes ended turns after logs and terminal status are durable, while the dashboard exposes no final byte target — cost: a prematurely empty or malformed response cannot be distinguished from final EOF, so this UI is not runner-equivalent proof of log finality.
+
+Ruling: Allow a finalized log reader to resume when the same identity becomes live — TaskDetail also passes live=false for a not-yet-started turn, so finalization cannot be permanent for that identity — cost: finalization is now per stopped reading period and the resume path must preserve text/offset while restoring a usable UTF-8 decoder.
 
 The log-finality gate is resolved. This planning commit authorizes no
 implementation by itself; the controller dispatches the already specified

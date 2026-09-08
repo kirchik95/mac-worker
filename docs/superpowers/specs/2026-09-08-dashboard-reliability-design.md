@@ -132,8 +132,10 @@ race with the reset for a new selection.
 ### Required behavior
 
 Log identity is exactly `(taskId, turnId, stream)`. Only identity change resets
-text, offset, decoder, finalization state, and error. A `live` change preserves
-all of them.
+text, offset, and error. A `live` change preserves those values. A completed
+no-progress read finalizes the decoder once for that stopped reading period; if
+the same identity later becomes live, clear finalization and create a fresh
+UTF-8 decoder at the preserved offset before reading again.
 
 Use completion-based scheduling rather than `setInterval`, so each hook has at
 most one request in flight:
@@ -143,7 +145,10 @@ most one request in flight:
 - when completed, consume advancing chunks sequentially without a delay;
 - an advancing completed read immediately requests the next offset;
 - the first successful no-progress response stops the completion drain and
-  flushes that identity's `TextDecoder` exactly once;
+  flushes that identity's `TextDecoder` exactly once for that stopped reading
+  period;
+- a finalized same-identity reader becoming live preserves text and offset,
+  restores a usable decoder, and resumes polling;
 - a completed read error preserves bytes and decoder state, records the error,
   and retries after 1,000 ms without requiring remount;
 - every successful response clears the prior read error, including an empty
@@ -296,6 +301,8 @@ Ruling: Validate the Settings boundary with paired production-client contract te
 Ruling: Regenerate and verify embedded UI assets once after the source tasks are reviewed — this keeps source review focused and avoids repeated minified bundle churn — cost: intermediate source commits are not release-ready; no integration occurs before the final asset-parity gate passes.
 
 Ruling: Accept current-end log semantics for stage 4 without a wire change — normal supervisor ordering publishes ended turns after logs and terminal status are durable, while the dashboard exposes no final byte target — cost: a prematurely empty or malformed response cannot be distinguished from final EOF, so this UI is not runner-equivalent proof of log finality.
+
+Ruling: Allow a finalized log reader to resume when the same identity becomes live — TaskDetail also passes live=false for a not-yet-started turn, so finalization cannot be permanent for that identity — cost: finalization is now per stopped reading period and the resume path must preserve text/offset while restoring a usable UTF-8 decoder.
 
 The log-finality gate is resolved. Task 2 may implement the bounded available-log
 behavior above without changing the protocol.

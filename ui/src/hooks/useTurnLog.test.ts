@@ -111,6 +111,59 @@ describe('useTurnLog', () => {
     expect(requestedOffsets).toEqual([0, byteLength(prefix), byteLength('prefixTAIL')])
   })
 
+  it('resumes a finalized non-live stream with its text, cursor, and split UTF-8 intact', async () => {
+    const prefix = 'prefix'
+    const prefixBytes = byteLength(prefix)
+    const requestedOffsets: number[] = []
+    const fetchMock = vi.fn(async (url: string) => {
+      const offset = requestOffset(url)
+      requestedOffsets.push(offset)
+      switch (requestedOffsets.length) {
+        case 1:
+          return textChunk('stdout', offset, prefix)
+        case 2:
+          return emptyChunk('stdout', offset)
+        case 3:
+          return response({
+            stream: 'stdout',
+            offset,
+            next_offset: offset + 1,
+            data: b64([0xc3]),
+          })
+        default:
+          return response({
+            stream: 'stdout',
+            offset,
+            next_offset: offset + 1,
+            data: b64([0xa9]),
+          })
+      }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    const { result, rerender } = renderHook(
+      ({ live }) => useTurnLog('task', 'turn', 'stdout', live),
+      { initialProps: { live: false } },
+    )
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(result.current.text).toBe(prefix)
+    expect(result.current.offset).toBe(prefixBytes)
+
+    rerender({ live: true })
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(result.current.offset).toBe(prefixBytes + 1))
+    expect(result.current.text).toBe(prefix)
+    expect(result.current.text).not.toContain('\uFFFD')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000)
+    })
+    await waitFor(() => expect(result.current.text).toBe(`${prefix}é`))
+    expect(result.current.offset).toBe(prefixBytes + 2)
+    expect(requestedOffsets).toEqual([0, prefixBytes, prefixBytes, prefixBytes + 1])
+  })
+
   it('joins a UTF-8 scalar split across completed chunks before finalizing once', async () => {
     const fetchMock = vi.fn(async (url: string) => {
       const offset = requestOffset(url)
@@ -180,10 +233,15 @@ describe('useTurnLog', () => {
     vi.stubGlobal('fetch', fetchMock)
     vi.useFakeTimers({ shouldAdvanceTime: true })
 
+    const initialIdentity: { taskId: string; turnId: string; stream: LogStream } = {
+      taskId: 'task-1',
+      turnId: 'turn-1',
+      stream: 'stdout',
+    }
     const { result, rerender } = renderHook(
       (props: { taskId: string; turnId: string; stream: LogStream }) =>
         useTurnLog(props.taskId, props.turnId, props.stream, false),
-      { initialProps: { taskId: 'task-1', turnId: 'turn-1', stream: 'stdout' as const } },
+      { initialProps: initialIdentity },
     )
     await waitFor(() => expect(result.current.offset).toBe(1))
 
@@ -265,7 +323,7 @@ describe('useTurnLog', () => {
   })
 
   it('requests the bounded host window', async () => {
-    const fetchMock = vi.fn(async () => emptyChunk('stdout', 0))
+    const fetchMock = vi.fn(async (_url: string) => emptyChunk('stdout', 0))
     vi.stubGlobal('fetch', fetchMock)
     vi.useFakeTimers({ shouldAdvanceTime: true })
 
