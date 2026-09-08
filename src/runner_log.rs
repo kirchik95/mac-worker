@@ -69,6 +69,46 @@ fn directory(root: &Path, task: TaskId, create: bool) -> Result<RootedDir, Worke
     )?)
 }
 impl RunnerLog {
+    /// A busy journal belongs to an active writer/finalizer. Never wait while
+    /// holding another state lock; reconciliation can retry on its next pass.
+    pub(crate) fn try_open(
+        root: &Path,
+        task: TaskId,
+        turn: TurnId,
+    ) -> Result<Option<Self>, WorkerError> {
+        match Self::open(root, task, turn) {
+            Ok(log) => Ok(Some(log)),
+            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The journal flock is the finalization fence. Validate the current exact
+    /// turn only after acquiring it, and retain this writer through retirement.
+    pub(crate) fn current_entry(
+        &self,
+        store: &crate::client_state::ClientStateStore,
+    ) -> Result<Option<crate::job::QueueEntry>, WorkerError> {
+        Ok(store
+            .queue_entry_for_task_turn(self.journal.task_id)?
+            .filter(|entry| entry.job_id() == self.journal.turn_id))
+    }
+
+    pub(crate) fn require_owner(
+        &self,
+        store: &crate::client_state::ClientStateStore,
+        owner: crate::job::ProcessIdentity,
+    ) -> Result<crate::job::QueueEntry, WorkerError> {
+        self.current_entry(store)?
+            .filter(|entry| entry.owner_opt() == Some(&owner))
+            .ok_or_else(|| WorkerError::Task {
+                code: "TASK_BUSY",
+                message: "task turn ownership changed before finalization".into(),
+            })
+    }
+
     pub(crate) fn open(root: &Path, task_id: TaskId, turn_id: TurnId) -> Result<Self, WorkerError> {
         let dir = directory(root, task_id, true)?;
         let name = format!("{turn_id}.log");
@@ -257,15 +297,7 @@ impl RunnerLog {
         Ok(true)
     }
 }
-pub(crate) fn finish_never_started(
-    root: &Path,
-    task: TaskId,
-    turn: TurnId,
-    outcome: TaskOutcome,
-) -> Result<(), WorkerError> {
-    let mut log = RunnerLog::open(root, task, turn)?;
-    log.finish_local(task, turn, outcome)
-}
+
 impl RunnerLog {
     pub(crate) fn finish_local(
         &mut self,

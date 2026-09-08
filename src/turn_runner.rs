@@ -220,10 +220,14 @@ impl<'a> TurnRunner<'a> {
                     // Before the host accepted a job, the dispatch is safe to
                     // retry.  Once accepted, the queue row remains durable and
                     // reconciliation will hand it to a replacement runner.
-                    if matches!(self.can_revert_preacceptance(task_id, turn_id), Ok(true)) {
-                        let _ = self.client_state.revert_dispatch(turn_id, owner);
+                    if let Ok(Some(log)) = LogWriter::try_open(&self.paths.state, task_id, turn_id)
+                        && log.require_owner(self.client_state, owner).is_ok()
+                    {
+                        if matches!(self.can_revert_preacceptance(task_id, turn_id), Ok(true)) {
+                            let _ = self.client_state.revert_dispatch(turn_id, owner);
+                        }
+                        let _ = self.client_state.record_runner(task_id, None);
                     }
-                    let _ = self.client_state.record_runner(task_id, None);
                     Err(error)
                 }
             }
@@ -279,6 +283,10 @@ impl<'a> TurnRunner<'a> {
                 ));
             }
         };
+        let log = LogWriter::open(&self.paths.state, task_id, entry.job_id())?;
+        if log.current_entry(self.client_state)?.as_ref() != Some(&entry) {
+            return Err(task_error("TASK_BUSY", "task turn changed during handoff"));
+        }
         self.client_state
             .record_runner(task_id, Some(identity.clone()))?;
         if let Err(error) = adopt_row_with_retry(
@@ -287,6 +295,7 @@ impl<'a> TurnRunner<'a> {
             identity.process_identity(),
         ) {
             let _ = self.client_state.record_runner(task_id, None);
+            drop(log);
             self.abandon_handoff_failure(task_id, entry.job_id(), owner)?;
             return Err(error);
         }
@@ -299,6 +308,10 @@ impl<'a> TurnRunner<'a> {
         turn_id: TurnId,
         owner: ProcessIdentity,
     ) -> Result<(), WorkerError> {
+        let Some(mut log) = LogWriter::try_open(&self.paths.state, task_id, turn_id)? else {
+            return Ok(());
+        };
+        log.require_owner(self.client_state, owner)?;
         if self
             .client_state
             .cancel_unstarted_handoff(turn_id, owner, now_millis()?)?
@@ -325,8 +338,7 @@ impl<'a> TurnRunner<'a> {
                 .with_status(status)?
                 .with_abandon_code(Some("RUNNER_HANDOFF_FAILED".to_owned()))?,
         )?;
-        crate::runner_log::finish_never_started(
-            &self.paths.state,
+        log.finish_local(
             task_id,
             turn_id,
             TaskOutcome::failed("RUNNER_HANDOFF_FAILED"),
@@ -505,6 +517,8 @@ impl<'a> TurnRunner<'a> {
         owner: ProcessIdentity,
         follow: &mut Option<&mut dyn Write>,
     ) -> Result<TurnOutcomeReport, WorkerError> {
+        let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
+        log.require_owner(self.client_state, owner)?;
         let initial_record = self.client_state.load_task(task_id)?;
         let project_path = self.task_project_path(&initial_record)?;
         let project =
@@ -517,7 +531,6 @@ impl<'a> TurnRunner<'a> {
         let transfer =
             TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
         {
-            let log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
             if let Some(completion) = log.completion() {
                 let exit_code = turn_exit_code(&completion.outcome);
                 transfer.release_base(self.runner, task_id)?;
@@ -558,6 +571,7 @@ impl<'a> TurnRunner<'a> {
                     &project,
                     transfer,
                     worker,
+                    &mut log,
                     follow,
                 );
             }
@@ -569,13 +583,18 @@ impl<'a> TurnRunner<'a> {
             .is_some_and(|entry| entry.is_cancel_requested())
             && self.can_revert_preacceptance(task_id, turn_id)?
         {
-            self.cancel_before_acceptance(&initial_record, task_id, turn_id, owner, None)?;
+            self.cancel_before_acceptance(
+                &initial_record,
+                task_id,
+                turn_id,
+                owner,
+                Some(&mut log),
+            )?;
             return Err(task_error(
                 "TASK_CANCELLED",
                 "task turn was cancelled before host acceptance",
             ));
         }
-        let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
         let turn_number = initial_record
             .status()
             .turns()
@@ -899,9 +918,9 @@ impl<'a> TurnRunner<'a> {
         project: &ProjectState,
         transfer: TransferRepo,
         worker: &WorkerEntry,
+        log: &mut LogWriter,
         follow: &mut Option<&mut dyn Write>,
     ) -> Result<TurnOutcomeReport, WorkerError> {
-        let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
         let remote = RemoteJobClient::new(self.runner);
         let status = remote
             .task_status(
@@ -912,11 +931,11 @@ impl<'a> TurnRunner<'a> {
             .clone();
         self.persist_status(task_id, status.clone())?;
         append_event(
-            &mut log,
+            log,
             follow,
             serde_json::json!({"type":"turn_accepted","protocol_version":crate::protocol::PROTOCOL_VERSION,"task_id":task_id,"turn_id":turn_id,"worker":worker.name}),
         )?;
-        let terminal = self.follow_remote(worker, task_id, turn_id, status, &mut log, follow)?;
+        let terminal = self.follow_remote(worker, task_id, turn_id, status, log, follow)?;
         self.finish_terminal(
             task_id,
             turn_id,
@@ -926,7 +945,7 @@ impl<'a> TurnRunner<'a> {
             transfer,
             worker,
             terminal,
-            &mut log,
+            log,
             follow,
         )
     }
@@ -1209,6 +1228,17 @@ impl<'a> TurnRunner<'a> {
         owner: ProcessIdentity,
         log: Option<&mut LogWriter>,
     ) -> Result<(), WorkerError> {
+        let task_id = record.meta().task_id();
+        let mut owned_log;
+        let log = match log {
+            Some(log) => log,
+            None => {
+                owned_log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
+                &mut owned_log
+            }
+        };
+        log.require_owner(self.client_state, owner)?;
+        let record = &self.client_state.load_task(task_id)?;
         let status = TaskStatus::new(
             TaskState::Abandoned,
             Some(TaskOutcome::failed("CAPACITY_BUSY")),
@@ -1238,15 +1268,7 @@ impl<'a> TurnRunner<'a> {
             outcome: TaskOutcome::failed("CAPACITY_BUSY"),
             drained: false,
         };
-        match log {
-            Some(log) => {
-                log.finish(completion, line.as_bytes())?;
-            }
-            None => {
-                LogWriter::open(&self.paths.state, record.meta().task_id(), turn_id)?
-                    .finish(completion, line.as_bytes())?;
-            }
-        }
+        log.finish(completion, line.as_bytes())?;
         if let Ok(project_path) = self.task_project_path(record)
             && let Ok(project) =
                 ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
@@ -1269,12 +1291,27 @@ impl<'a> TurnRunner<'a> {
 
     fn cancel_before_acceptance(
         &self,
-        record: &LocalTaskRecord,
+        _record: &LocalTaskRecord,
         task_id: TaskId,
         turn_id: TurnId,
         owner: ProcessIdentity,
         log: Option<&mut LogWriter>,
     ) -> Result<(), WorkerError> {
+        let mut owned_log;
+        let log = match log {
+            Some(log) => log,
+            None => {
+                owned_log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
+                &mut owned_log
+            }
+        };
+        let entry = log
+            .current_entry(self.client_state)?
+            .ok_or_else(|| task_error("TASK_BUSY", "task turn was retired"))?;
+        if entry.owner_opt().is_some_and(|current| *current != owner) {
+            return Err(task_error("TASK_BUSY", "task turn ownership changed"));
+        }
+        let record = &self.client_state.load_task(task_id)?;
         let status = if record.status().state() == TaskState::Active {
             cancelled_followup_status(record.status())?
         } else {
@@ -1298,15 +1335,7 @@ impl<'a> TurnRunner<'a> {
                 .with_status(status)?
                 .with_abandon_code(abandoned.then_some("CANCELLED".to_owned()))?,
         )?;
-        match log {
-            Some(log) => log.finish_local(task_id, turn_id, TaskOutcome::Cancelled)?,
-            None => crate::runner_log::finish_never_started(
-                &self.paths.state,
-                task_id,
-                turn_id,
-                TaskOutcome::Cancelled,
-            )?,
-        }
+        log.finish_local(task_id, turn_id, TaskOutcome::Cancelled)?;
         if let Ok(project_path) = self.task_project_path(record)
             && let Ok(project) =
                 ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())

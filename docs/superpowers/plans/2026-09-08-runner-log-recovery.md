@@ -97,3 +97,10 @@ Controller performs task review (spec and quality), scoped fixes as needed, whol
 ## Implementation verification note
 
 Implementation and local checks are complete; independent controller review/integration remains pending. The full run passed 1,585 tests across 62 top-level sections. Two bounded late reader/journal guards were subsequently covered by the complete final-source library (316) and reader (21) suites plus fmt/Clippy; see the pool reliability roadmap for exact source-delta disclosure and durable commands. Some tests followed implementation; critical journal guarantees additionally received controlled mutation validation.
+
+
+## Review fix 1: finalization ownership
+
+The per-turn journal flock now fences cancellation, completed reconciliation, runner cleanup, handoff publication/failure and queued close. Each path checks the current exact task/turn row and owner after acquiring the fence, reloads task state before mutation, and retains the writer through base release, runner clearing and row retirement. Dead-owner adoption rechecks both the row snapshot and process observation under the same fence. A competing finalizer skips a busy writer; `say` continues to reject the follow-up until old-row retirement.
+
+Three deterministic real-Git/channel regressions reproduced the original cancellation, completed-reconciliation and completed-runner-retry races before the fix. They assert that old cleanup cannot clear a newer runner or delete its task-scoped base pin. Final scoped verification and the subsequent controller-owned frozen full suite are recorded in the roadmap; decoder flag/cursor strengthening remains outside this fix.

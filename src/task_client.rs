@@ -1133,6 +1133,12 @@ impl<'a> TaskClient<'a> {
             if matches!(entry.state(), QueueState::Dispatching { .. }) {
                 return Err(task_error("TASK_BUSY", "task turn is being dispatched"));
             }
+            let mut log =
+                crate::runner_log::RunnerLog::open(&self.paths.state, task_id, entry.job_id())?;
+            if log.current_entry(self.client_state)?.as_ref() != Some(&entry) {
+                return Err(task_error("TASK_BUSY", "task turn changed before close"));
+            }
+            let record = self.client_state.load_task(task_id)?;
             let retained = self
                 .client_state
                 .retain_task_turn_cancel(entry.job_id(), current_time_millis()?)?
@@ -1162,7 +1168,7 @@ impl<'a> TaskClient<'a> {
                     .with_status(status)?
                     .with_abandon_code(discard.then_some("TASK_CLOSED".to_owned()))?,
             )?;
-            self.finish_waiting_cancellation(&self.client_state.load_task(task_id)?, &retained)?;
+            self.finish_waiting_cancellation_locked(task_id, &retained, &mut log)?;
             return self.report_for(task_id);
         }
         if record.status().state() == TaskState::Queued {
@@ -1282,10 +1288,32 @@ impl<'a> TaskClient<'a> {
                     ProcessObservation::Absent | ProcessObservation::Reused
                 )
             {
-                if matches!(entry.state(), QueueState::Dispatching { .. })
-                    && let Some(task_id) = self.terminal_task_for_turn(entry.job_id())?
+                let Some(task_id) = self.client_state.task_id_for_turn(entry.job_id())? else {
+                    continue;
+                };
+                let Some(log) = crate::runner_log::RunnerLog::try_open(
+                    &self.paths.state,
+                    task_id,
+                    entry.job_id(),
+                )?
+                else {
+                    continue;
+                };
+                let Some(current) = log.current_entry(self.client_state)? else {
+                    continue;
+                };
+                if current != *entry
+                    || !matches!(
+                        self.client_state.process_observation(row_owner),
+                        ProcessObservation::Absent | ProcessObservation::Reused
+                    )
                 {
-                    self.client_state.adopt_row(entry.job_id(), owner)?;
+                    continue;
+                }
+                self.client_state.adopt_row(entry.job_id(), owner)?;
+                if matches!(entry.state(), QueueState::Dispatching { .. })
+                    && log.completion().is_some()
+                {
                     self.release_task_base(&self.client_state.load_task(task_id)?)?;
                     self.client_state.record_runner(task_id, None)?;
                     if self
@@ -1298,9 +1326,7 @@ impl<'a> TaskClient<'a> {
                             .remove_turn_prompt(task_id, entry.job_id());
                         report.repaired_rows += 1;
                     }
-                    continue;
                 }
-                self.client_state.adopt_row(entry.job_id(), owner)?;
             }
         }
 
@@ -1319,7 +1345,28 @@ impl<'a> TaskClient<'a> {
             ) {
                 continue;
             }
-            let _ = self.refresh_task_status(&record);
+            // Refreshing a queued task also writes task-scoped metadata. Use
+            // the same fence so a stale refresh cannot resurrect an old runner
+            // after another finalizer retires its row.
+            if let Some(entry) = self
+                .client_state
+                .queue_entry_for_task_turn(record.meta().task_id())?
+            {
+                let Ok(Some(log)) = crate::runner_log::RunnerLog::try_open(
+                    &self.paths.state,
+                    record.meta().task_id(),
+                    entry.job_id(),
+                ) else {
+                    continue;
+                };
+                if log.current_entry(self.client_state)?.as_ref() != Some(&entry) {
+                    continue;
+                }
+                let _ = self
+                    .refresh_task_status(&self.client_state.load_task(record.meta().task_id())?);
+            } else {
+                let _ = self.refresh_task_status(&record);
+            }
         }
 
         // A crash can occur after the task record is durable but before the
@@ -1371,9 +1418,24 @@ impl<'a> TaskClient<'a> {
             }
             let liveness = self.client_state.runner_liveness(record.meta().task_id())?;
             if liveness == Some(RunnerState::Dead) {
-                self.client_state
-                    .record_runner(record.meta().task_id(), None)?;
-                report.replaced_runners += 1;
+                let Some(log) = crate::runner_log::RunnerLog::try_open(
+                    &self.paths.state,
+                    record.meta().task_id(),
+                    turn_id,
+                )?
+                else {
+                    continue;
+                };
+                if log.current_entry(self.client_state)?.as_ref() != Some(&entry) {
+                    continue;
+                }
+                if self.client_state.runner_liveness(record.meta().task_id())?
+                    == Some(RunnerState::Dead)
+                {
+                    self.client_state
+                        .record_runner(record.meta().task_id(), None)?;
+                    report.replaced_runners += 1;
+                }
             }
             if self
                 .client_state
@@ -1881,6 +1943,27 @@ impl<'a> TaskClient<'a> {
     ) -> Result<(), WorkerError> {
         let task = record.meta().task_id();
         let turn = entry.job_id();
+        let Some(mut log) = crate::runner_log::RunnerLog::try_open(&self.paths.state, task, turn)?
+        else {
+            return Ok(());
+        };
+        let Some(current) = log.current_entry(self.client_state)? else {
+            return Ok(());
+        };
+        if current != *entry {
+            return Ok(());
+        }
+        self.finish_waiting_cancellation_locked(task, &current, &mut log)
+    }
+
+    fn finish_waiting_cancellation_locked(
+        &self,
+        task: TaskId,
+        entry: &QueueEntry,
+        log: &mut crate::runner_log::RunnerLog,
+    ) -> Result<(), WorkerError> {
+        let turn = entry.job_id();
+        let record = self.client_state.load_task(task)?;
         if !entry.is_cancel_requested() || matches!(entry.state(), QueueState::Dispatching { .. }) {
             return Err(task_error(
                 "TASK_BUSY",
@@ -1898,8 +1981,8 @@ impl<'a> TaskClient<'a> {
         } else {
             TaskOutcome::Cancelled
         };
-        crate::runner_log::finish_never_started(&self.paths.state, task, turn, outcome)?;
-        self.release_task_base(record)?;
+        log.finish_local(task, turn, outcome)?;
+        self.release_task_base(&record)?;
         self.client_state.record_runner(task, None)?;
         self.client_state.remove_task_turn_after_terminal(
             turn,
@@ -2051,17 +2134,6 @@ impl<'a> TaskClient<'a> {
         )
     }
 
-    fn terminal_task_for_turn(&self, turn_id: TurnId) -> Result<Option<TaskId>, WorkerError> {
-        let Some(task_id) = self.client_state.task_id_for_turn(turn_id)? else {
-            return Ok(None);
-        };
-        Ok(
-            crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)?
-                .is_some_and(|s| s.completion.is_some())
-                .then_some(task_id),
-        )
-    }
-
     fn enqueue_missing_turn(
         &self,
         record: &LocalTaskRecord,
@@ -2137,7 +2209,29 @@ impl<'a> TaskClient<'a> {
                 "task submission recovery is incomplete",
             ));
         }
+        let expected = self
+            .client_state
+            .queue_entry_for_task_turn(task_id)?
+            .filter(|entry| entry.job_id() == turn_id)
+            .ok_or_else(|| task_error("TASK_BUSY", "task turn was retired before handoff"))?;
         let identity = self.executor.start(self.paths, task_id, turn_id)?;
+        let log = crate::runner_log::RunnerLog::open(&self.paths.state, task_id, turn_id)?;
+        if log.current_entry(self.client_state)?.as_ref() != Some(&expected) {
+            return Err(task_error("TASK_BUSY", "task turn changed during handoff"));
+        }
+        let caller = current_process_identity()?;
+        if expected.owner_opt().is_some_and(|owner| {
+            *owner != caller
+                && matches!(
+                    self.client_state.process_observation(*owner),
+                    ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
+                )
+        }) {
+            return Err(task_error(
+                "TASK_BUSY",
+                "task turn has a live handoff owner",
+            ));
+        }
         self.client_state
             .record_runner(task_id, Some(identity.clone()))?;
         if let Err(error) =
@@ -2269,6 +2363,12 @@ impl<'a> TaskClient<'a> {
         error: WorkerError,
     ) -> WorkerError {
         let _cleanup = (|| -> Result<(), WorkerError> {
+            let Some(mut log) =
+                crate::runner_log::RunnerLog::try_open(&self.paths.state, task_id, turn_id)?
+            else {
+                return Ok(());
+            };
+            log.require_owner(self.client_state, current_process_identity()?)?;
             let Some(entry) = self.client_state.cancel_unstarted_handoff(
                 turn_id,
                 current_process_identity()?,
@@ -2283,8 +2383,7 @@ impl<'a> TaskClient<'a> {
                 .with_status(status)?
                 .with_abandon_code(Some("RUNNER_HANDOFF_FAILED".into()))?;
             self.client_state.update_task(record)?;
-            crate::runner_log::finish_never_started(
-                &self.paths.state,
+            log.finish_local(
                 task_id,
                 turn_id,
                 TaskOutcome::failed("RUNNER_HANDOFF_FAILED"),

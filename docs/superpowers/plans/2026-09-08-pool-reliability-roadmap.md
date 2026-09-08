@@ -98,6 +98,20 @@ cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-tar
 
 Coverage includes multi-chunk tails, immediate terminal acceptance, restart at committed offsets, changed terminal lengths/identity, selected historical follow, failed local cancellation recovery, local-only completed retry, native-event spoofing, committed logs over 8 MiB, and substituted detached log paths. Verification uses real private local files/Git and fake remotes; no live fleet or provider agents were used. Some journal/lifecycle tests were added with or after implementation; the critical journal guarantees additionally underwent controlled mutation validation.
 
+
+**Review fix 1 — finalization fence.** Cancellation, completed reconciliation and runner cleanup now share the journal flock through exact current-row/owner validation, task status mutation, base release, runner clearing and final row retirement. Dead-owner adoption and handoff publication respect the same fence. Three deterministic channel/real-Git regressions failed on base `00956237b15bb7634875994ffb84926f7d149afd` with old cleanup clearing a newer runner or deleting its new base, then passed with the fix.
+
+Frozen fix-source verification (exit 0): **544 passed, 0 failed across 9 top-level suites**: library 316, Cursor/OpenCode 21, client state 42, scheduler queue 64, task command 9, conversation 15, logs 21, project context 8, runner 48. Nested filtered library harnesses are excluded from the count. Fmt, all-target Clippy with warnings denied, and `git diff --check` also passed. Exact commands:
+
+```sh
+cargo test --lib --test turn_runner --test task_conversation --test task_command --test task_logs --test task_project_context --test client_state --test scheduler_queue --test agent_cursor_opencode
+cargo fmt --all --check
+cargo clippy --locked --offline --all-targets -- -D warnings
+git diff --check
+```
+
+Outputs: `/private/tmp/fix1-final-scoped.log`, `/private/tmp/fix1-final-fmt.log`, `/private/tmp/fix1-final-clippy.log`. The fix's final scoped run used frozen Rust sources and no parallel builds. A fresh whole-branch all-target run remains controller-owned after scoped re-review; the earlier all-target source-delta caveat above is not claimed resolved by scoped checks.
+
 ## 4. Контракты и восстановление dashboard
 
 Независимые небольшие изменения:

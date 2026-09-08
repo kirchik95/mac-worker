@@ -1261,3 +1261,295 @@ fn failed_local_cancellation_keeps_a_recoverable_row_until_completion() {
         "cancelled"
     );
 }
+
+// Drop releases a blocked peer even if an assertion unwinds the scope. The
+// receiver's deadline is a final bound against a broken fixture, not ordering.
+struct FinalizerRelease(Option<std::sync::mpsc::Sender<()>>);
+impl FinalizerRelease {
+    fn release(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+impl Drop for FinalizerRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[derive(Clone)]
+struct FinalizerInspector {
+    dead: Option<ProcessIdentity>,
+    observed: std::sync::Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    resume: std::sync::Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+impl ProcessInspector for FinalizerInspector {
+    fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+        ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7)
+    }
+    fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+        if self.dead == Some(expected) {
+            if std::thread::current().name() == Some("stale-finalizer")
+                && let Some(sender) = self.observed.lock().unwrap().take()
+            {
+                sender.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("finalizer gate released");
+            }
+            ProcessObservation::Absent
+        } else {
+            ProcessObservation::Matching {
+                process_group: expected.pid(),
+            }
+        }
+    }
+    fn observe_group(&self, _: u32) -> ProcessGroupObservation {
+        ProcessGroupObservation::Ambiguous
+    }
+    fn observe_group_members(&self, _: u32) -> ProcessGroupMembership {
+        ProcessGroupMembership::Ambiguous
+    }
+}
+struct PausedFinalizerRemote {
+    inner: TaskRemoteRunner,
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl ProcessRunner for PausedFinalizerRemote {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if std::thread::current().name() == Some("old-finalizer")
+            && request.program == OsStr::new("/usr/bin/git")
+            && request.args.iter().any(|a| a == "update-ref")
+            && request.args.iter().any(|a| a == "-d")
+            && request
+                .args
+                .iter()
+                .any(|a| a.to_string_lossy().starts_with("refs/mac-worker/bases/"))
+            && let Some(entered) = self.entered.lock().unwrap().take()
+        {
+            entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("finalizer gate released");
+        }
+        self.inner.run(request)
+    }
+}
+fn finalizer_cannot_damage_a_new_turn(mode: &str) {
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
+    let _cwd_lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base");
+    repo.commit_all("base");
+    let _cwd = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
+    let task = TaskId::generate();
+    let turn_id = JobId::generate();
+    let old_owner = owner(9971);
+    let (observed_tx, observed_rx) = mpsc::channel();
+    let (resume_observe_tx, resume_observe_rx) = mpsc::channel();
+    let inspector = FinalizerInspector {
+        dead: (mode != "cancel").then_some(old_owner),
+        observed: Arc::new(Mutex::new(Some(observed_tx))),
+        resume: Arc::new(Mutex::new(resume_observe_rx)),
+    };
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, inspector).unwrap();
+    let record = task_record(
+        task,
+        turn_id,
+        TaskState::Open,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        Some(old_owner),
+    );
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let remote = PausedFinalizerRemote {
+        inner: TaskRemoteRunner::new(record.status().clone()),
+        entered: Mutex::new(Some(entered_tx)),
+        resume: Mutex::new(resume_rx),
+    };
+    store.create_task(record).unwrap();
+    store.write_turn_prompt(task, turn_id, "old turn").unwrap();
+    store
+        .enqueue(
+            QueueEntry::new(
+                turn_id,
+                store.client_id(),
+                project.context.project_id.clone(),
+                project.context.worktree_id.clone(),
+                CommandSummary::argv(1).unwrap(),
+                vec![],
+                WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                QueueEntryKind::TaskTurn,
+                None,
+                old_owner,
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    cache_idle(&store, "mini-1", 10);
+    if mode != "cancel" {
+        store
+            .claim_next(old_owner, &["mini-1".into()], 11)
+            .unwrap()
+            .unwrap();
+        store.open_runner_log(task, turn_id).unwrap();
+        let checkpoint = paths
+            .state
+            .join("runners")
+            .join(task.to_string())
+            .join(format!("{turn_id}.checkpoint.json"));
+        std::fs::write(&checkpoint,serde_json::to_vec(&serde_json::json!({"version":1,"task_id":task,"turn_id":turn_id,"committed":{"offsets":[0,0],"len":0,"accepted":true,"completion":{"outcome":{"kind":"done"},"drained":true}},"pending":null})).unwrap()).unwrap();
+        std::fs::set_permissions(
+            checkpoint,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+    let transfer = mac_worker::transfer_repo::TransferRepo::open_or_create(
+        &paths.cache,
+        &project.context.common_dir,
+    )
+    .unwrap();
+    let transfer_path = transfer.path().to_owned();
+    drop(transfer);
+    let base_ref = format!("refs/mac-worker/bases/{task}");
+    let head = String::from_utf8(repo.git(&["rev-parse", "HEAD"]).stdout).unwrap();
+    let pin = || {
+        assert!(
+            std::process::Command::new("/usr/bin/git")
+                .arg("--git-dir")
+                .arg(&transfer_path)
+                .args(["update-ref", &base_ref, head.trim()])
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    pin();
+    std::thread::scope(|scope| {
+        let mut resume_old = FinalizerRelease(Some(resume_tx));
+        let mut resume_stale = FinalizerRelease(Some(resume_observe_tx));
+        let stale = if mode != "cancel" {
+            let handle = std::thread::Builder::new()
+                .name("stale-finalizer".into())
+                .spawn_scoped(scope, || client.reconcile_runners())
+                .unwrap();
+            observed_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("stale reconciler must observe the old owner");
+            Some(handle)
+        } else {
+            None
+        };
+        if mode == "retry" {
+            let owner = mac_worker::turn_runner::RunnerExecutor::start(
+                &InlineRunnerExecutor,
+                &paths,
+                task,
+                turn_id,
+            )
+            .unwrap()
+            .process_identity();
+            store.adopt_row(turn_id, owner).unwrap();
+        }
+        let old = std::thread::Builder::new()
+            .name("old-finalizer".into())
+            .spawn_scoped(scope, || match mode {
+                "cancel" => client.cancel(task).map(|_| ()),
+                "reconcile" => client.reconcile_runners().map(|_| ()),
+                "retry" => mac_worker::turn_runner::TurnRunner::new(
+                    &remote,
+                    &config,
+                    &paths,
+                    &store,
+                    &InlineRunnerExecutor,
+                )
+                .run(task, turn_id, None)
+                .map(|_| ()),
+                _ => unreachable!(),
+            })
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("old finalizer must pause immediately before base release");
+        if let Some(stale) = stale {
+            resume_stale.release();
+            stale.join().unwrap().unwrap();
+        } else {
+            client.reconcile_runners().unwrap();
+        }
+        let started = match client.say(task, "next turn".into(), false, &mut vec![], &mut vec![]) {
+            Ok(_) => true,
+            Err(error) => {
+                assert_eq!(error.public_code(), "TASK_BUSY");
+                false
+            }
+        };
+        if started {
+            pin();
+        }
+        resume_old.release();
+        old.join().unwrap().unwrap();
+        if !started {
+            client
+                .say(task, "next turn".into(), false, &mut vec![], &mut vec![])
+                .unwrap();
+            pin();
+        }
+        let current = store.load_task(task).unwrap();
+        assert!(
+            current.runner().is_some(),
+            "old {mode} finalizer cleared the new runner"
+        );
+        assert_ne!(
+            store
+                .queue_entry_for_task_turn(task)
+                .unwrap()
+                .unwrap()
+                .job_id(),
+            turn_id
+        );
+        assert!(
+            std::process::Command::new("/usr/bin/git")
+                .arg("--git-dir")
+                .arg(&transfer_path)
+                .args(["show-ref", "--verify", &base_ref])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "old {mode} finalizer released the new base"
+        );
+    });
+}
+#[test]
+fn concurrent_cancel_finalizers_cannot_damage_a_new_turn() {
+    finalizer_cannot_damage_a_new_turn("cancel");
+}
+#[test]
+fn stale_completed_reconciler_cannot_damage_a_new_turn() {
+    finalizer_cannot_damage_a_new_turn("reconcile");
+}
+#[test]
+fn completed_runner_retry_fences_a_stale_reconciler() {
+    finalizer_cannot_damage_a_new_turn("retry");
+}
