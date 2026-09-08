@@ -18,8 +18,8 @@ use crate::{
     protocol::PROTOCOL_VERSION,
     rooted_fs::RootedDir,
     task::{
-        BaseOid, TaskId, TaskMeta, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary,
-        TurnTerminal,
+        BaseOid, HerdrTurnReport, TaskId, TaskMeta, TaskOutcome, TaskSource, TaskState, TaskStatus,
+        TurnSummary, TurnTerminal,
     },
 };
 
@@ -794,6 +794,7 @@ impl<'a> TaskStore<'a> {
         if status.state() == TaskState::Active {
             return Err(task_error("TASK_BUSY", "task has an active turn"));
         }
+        let reported_to_herdr = status.turns().iter().any(|turn| turn.herdr().is_some());
 
         // Prove the discard target before changing the task. Once the
         // terminal state is durable, any later cleanup failure is safe to
@@ -818,6 +819,9 @@ impl<'a> TaskStore<'a> {
             task.validate_private_entry("workspace")?;
             self.store
                 .remove_owned_child_committed(&task, "workspace")?;
+        }
+        if reported_to_herdr {
+            close_herdr_tabs(request.task_id());
         }
 
         let mut warnings = Vec::new();
@@ -853,6 +857,7 @@ impl<'a> TaskStore<'a> {
         let _session_lock = self.store.session_lock()?;
         let task = self.open_existing_task(project_id, task_id)?;
         let status = self.read_status(&task)?;
+        let reported_to_herdr = status.turns().iter().any(|turn| turn.herdr().is_some());
         if status.state() != TaskState::Open {
             return Ok(None);
         }
@@ -879,6 +884,9 @@ impl<'a> TaskStore<'a> {
                 .remove_owned_child_committed(&task, "workspace")?;
         }
         task.sync_root()?;
+        if reported_to_herdr {
+            close_herdr_tabs(task_id);
+        }
         Ok(Some(next))
     }
 
@@ -1119,6 +1127,43 @@ impl<'a> TaskStore<'a> {
             .session(request.project_id(), request.task_id())?
             .ok_or_else(|| task_error("SESSION_UNBOUND", "task has no bound agent session"))?;
         Ok(TaskSessionResponse::new(binding))
+    }
+
+    /// Notes whether the worker's herdr shows a turn.  Purely informational:
+    /// it touches only the turn's `herdr` field and never the task state,
+    /// outcome, or activity timestamp.
+    pub(crate) fn record_turn_herdr(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        turn_id: JobId,
+        report: HerdrTurnReport,
+    ) -> Result<(), WorkerError> {
+        let task = self.open_existing_task(project_id, task_id)?;
+        let current = self.read_status(&task)?;
+        let mut turns = current.turns().to_vec();
+        let Some(position) = turns.iter().position(|turn| turn.turn_id() == turn_id) else {
+            return Err(task_error(
+                "TASK_INCONSISTENT",
+                "herdr report names an unknown turn",
+            ));
+        };
+        turns[position] = turns[position].clone().with_herdr(Some(report));
+        let next = TaskStatus::new(
+            current.state(),
+            current.last_outcome().cloned(),
+            current.worker().map(str::to_owned),
+            current.session_present(),
+            current.head_oid().cloned(),
+            current.summary().map(str::to_owned),
+            current.questions().to_vec(),
+            current.files_changed().to_vec(),
+            current.diff_stat().map(str::to_owned),
+            turns,
+            current.updated_at_millis(),
+        )?;
+        replace_status_bytes(&task, current, next)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2010,6 +2055,17 @@ fn parse_agent(value: &str) -> Result<AgentKind, WorkerError> {
         "opencode" => Ok(AgentKind::Opencode),
         _ => Err(task_error("TASK_SESSION_INVALID", "unknown agent kind")),
     }
+}
+
+/// Best effort: remove the task's tabs from the worker's herdr.  Called only
+/// for tasks whose record shows a turn was reported, so a worker that never
+/// reported, and every test process, never opens the socket.
+fn close_herdr_tabs(task_id: TaskId) {
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return;
+    };
+    let _ =
+        crate::herdr_reporter::HerdrReporter::for_home(std::path::Path::new(&home)).close(task_id);
 }
 
 #[cfg(test)]

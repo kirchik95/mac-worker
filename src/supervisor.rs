@@ -1016,6 +1016,37 @@ impl SupervisorErrorLog {
     }
 }
 
+/// Appends one bounded diagnostic line to the turn's `supervisor.log`,
+/// creating the file when the supervisor has not written to it yet.
+fn append_supervisor_note(job: &RootedDir, note: &str) {
+    let line = format!("{note}\n");
+    if line.len() as u64 > MAX_SUPERVISOR_LOG_BYTES {
+        return;
+    }
+    let mut file = match job.open_private_append(SUPERVISOR_LOG_NAME) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match job.write_new_private_file(SUPERVISOR_LOG_NAME, &[]) {
+                Ok(file) => file,
+                Err(_) => return,
+            }
+        }
+        Err(_) => return,
+    };
+    let Ok(current) = job.validate_private_append_binding(SUPERVISOR_LOG_NAME, &file) else {
+        return;
+    };
+    let Some(end) = current.checked_add(line.len() as u64) else {
+        return;
+    };
+    if end > MAX_SUPERVISOR_LOG_BYTES {
+        return;
+    }
+    if file.write_all(line.as_bytes()).is_ok() && file.sync_all().is_ok() {
+        let _ = job.sync_root();
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorFaultPoint {
@@ -2127,6 +2158,12 @@ impl<'a> Supervisor<'a> {
         // guard and fence this supervisor while it waits for the child.
         drop(guard);
 
+        // The agent is running and the guard is free: the only place a
+        // bounded, best-effort side channel may spend its budget.
+        if section.herdr_reporter() {
+            self.report_turn_start(job, lease, &section, &account_home);
+        }
+
         if self.fault == Some(SupervisorFaultPoint::AfterRunningStatus) {
             let _ = wait_for_child(child_identity, lease.timeout_millis(), self.inspector)?;
             return Err(injected_supervisor_fault("running status"));
@@ -2375,6 +2412,40 @@ impl<'a> Supervisor<'a> {
             Ok(()) => Err(original),
             Err(error) => Err(error),
         }
+    }
+
+    /// Show the running turn in the worker's herdr, keep the result for the
+    /// terminal report, and leave one line in `supervisor.log` when herdr
+    /// could not be reached.  Nothing here can fail the turn, and nothing is
+    /// written to the task status while the output pump owns it.
+    fn report_turn_start(
+        &self,
+        job: &RootedDir,
+        lease: &LeaseRecord,
+        section: &TurnSection,
+        account_home: &Path,
+    ) {
+        let runner = crate::process::SystemProcessRunner;
+        let task_store = crate::task_store::TaskStore::new(self.store, &runner);
+        let title = task_store
+            .load_meta(section.project_id(), section.turn().task_id())
+            .map(|meta| meta.title().as_str().to_owned())
+            .unwrap_or_else(|_| "task".to_owned());
+        let identity = crate::herdr_reporter::TurnIdentity {
+            project_id: section.project_id().to_owned(),
+            worktree_id: lease.worktree_id().to_owned(),
+            job_id: lease.job_id().to_string(),
+            task_id: section.turn().task_id(),
+            turn_number: section.turn().turn_number(),
+            agent: section.turn().agent(),
+            title,
+        };
+        let reported =
+            crate::herdr_reporter::HerdrReporter::for_home(account_home).start(&identity);
+        if let Some(line) = &reported.diagnostic {
+            append_supervisor_note(job, line);
+        }
+        crate::herdr_reporter::remember_start(&lease.job_id().to_string(), reported.report);
     }
 
     #[allow(clippy::too_many_arguments)]

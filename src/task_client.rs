@@ -486,6 +486,7 @@ pub struct TaskClient<'a> {
     pub(crate) paths: &'a PathLayout,
     pub(crate) client_state: &'a ClientStateStore,
     pub(crate) executor: &'a dyn RunnerExecutor,
+    pub(crate) herdr_notifier: Option<crate::herdr::HerdrSocket>,
 }
 
 impl<'a> TaskClient<'a> {
@@ -502,7 +503,15 @@ impl<'a> TaskClient<'a> {
             paths,
             client_state,
             executor,
+            herdr_notifier: None,
         }
+    }
+
+    /// Herdr session the runners this client starts inline notify about
+    /// finished turns.  Detached runners receive theirs from the CLI.
+    pub fn with_herdr_notifier(mut self, socket: Option<crate::herdr::HerdrSocket>) -> Self {
+        self.herdr_notifier = socket;
+        self
     }
 
     pub fn with_detached_executor(
@@ -833,6 +842,7 @@ impl<'a> TaskClient<'a> {
                 self.client_state,
                 self.executor,
             )
+            .with_notifier(self.herdr_notifier.clone())
             .run(task_id, turn_id, Some(&mut follow))?;
             report.status = outcome.status().clone();
             report.events.extend(outcome.events().iter().cloned());
@@ -1603,6 +1613,7 @@ impl<'a> TaskClient<'a> {
                 self.client_state,
                 self.executor,
             )
+            .with_notifier(self.herdr_notifier.clone())
             .run(task_id, entry.job_id(), Some(stdout))?;
             report.status = outcome.status().clone();
             report.events.extend(outcome.events().iter().cloned());

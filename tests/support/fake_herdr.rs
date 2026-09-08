@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! A scripted herdr server for tests: listens on a Unix socket, answers
 //! one JSON line per connection from a queue of canned replies, and records
 //! every request so tests can assert exactly what crossed the socket.

@@ -215,7 +215,7 @@ What the operator then sees in the pane is the same rendered event stream `worke
 ## 11. Protocol and record changes
 
 - `TurnSection` gains `herdr_reporter: bool`, serialized only when true, beside `git_identity` and `origin_url`, which are the existing per-worker values the laptop injects into a turn. It is outside the turn material digest, like those two.
-- The turn summary in the task status gains an optional `herdr` object: `{ "state": "attached" | "unavailable" | "disabled", "pane_id": "<id>" }`, written by the reporter at start and updated at terminal, so `task status --json` and the dashboard can say whether a turn is visible in herdr. `pane_id` is herdr's opaque pane id and carries no path.
+- The turn summary in the task status gains an optional `herdr` object: `{ "state": "attached" | "unavailable" | "disabled", "pane_id": "<id>" }`, written once at the turn's terminal, so `task status --json` and the dashboard can say whether a turn was visible in herdr. The start result stays in the supervisor's memory until then: the task status is being written by the output pump while the agent runs, and a second writer would race it. `pane_id` is herdr's opaque pane id and carries no path.
 - Agent facts gain `herdr: { "state": "available" | "not_installed" | "no_socket" | "no_response", "version": "<string>" | null }`.
 - `Config` gains an optional `[notifications]` table with `herdr: bool` (default true); `WorkerEntry` gains `herdr: bool` (default false). Both structs keep `deny_unknown_fields`.
 - One new hidden host command, `follow-turn`.

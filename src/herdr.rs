@@ -335,12 +335,17 @@ impl HerdrClient {
             .collect()
     }
 
-    /// Create a workspace without moving the operator's focus.
-    pub fn workspace_create(&self, label: &str, cwd: &Path) -> Result<Created, HerdrError> {
-        let result = self.request(
-            "workspace.create",
-            json!({ "label": label, "cwd": cwd, "focus": false }),
-        )?;
+    /// Create a workspace without moving the operator's focus.  Herdr picks
+    /// the working directory when none is given, so no path has to cross
+    /// the socket.
+    pub fn workspace_create(&self, label: &str, cwd: Option<&Path>) -> Result<Created, HerdrError> {
+        let mut params = Map::new();
+        params.insert("label".into(), json!(label));
+        params.insert("focus".into(), json!(false));
+        if let Some(cwd) = cwd {
+            params.insert("cwd".into(), json!(cwd));
+        }
+        let result = self.request("workspace.create", Value::Object(params))?;
         Ok(Created {
             workspace_id: required_string(object_at(&result, "workspace")?, "workspace_id")?,
             tab_id: required_string(object_at(&result, "tab")?, "tab_id")?,
@@ -367,12 +372,16 @@ impl HerdrClient {
         &self,
         workspace_id: &str,
         label: &str,
-        cwd: &Path,
+        cwd: Option<&Path>,
     ) -> Result<Created, HerdrError> {
-        let result = self.request(
-            "tab.create",
-            json!({ "workspace_id": workspace_id, "label": label, "cwd": cwd, "focus": false }),
-        )?;
+        let mut params = Map::new();
+        params.insert("workspace_id".into(), json!(workspace_id));
+        params.insert("label".into(), json!(label));
+        params.insert("focus".into(), json!(false));
+        if let Some(cwd) = cwd {
+            params.insert("cwd".into(), json!(cwd));
+        }
+        let result = self.request("tab.create", Value::Object(params))?;
         let tab = object_at(&result, "tab")?;
         Ok(Created {
             workspace_id: string_at(tab, "workspace_id").unwrap_or_else(|| workspace_id.to_owned()),

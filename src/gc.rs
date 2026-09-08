@@ -333,6 +333,9 @@ impl<'a> HostGc<'a> {
                         applied.push(candidate.clone());
                     }
                 }
+                if inventory.herdr_reported {
+                    sweep_herdr_tabs(&inventory.task_ids);
+                }
             }
             Ok(GcReport::new(
                 request.apply(),
@@ -426,6 +429,7 @@ impl<'a> HostGc<'a> {
                     }
                 };
                 inventory.task_projects.insert(project.clone());
+                inventory.task_ids.insert(task_id.to_string());
                 let result = self.collect_task_record(
                     request,
                     inventory,
@@ -472,6 +476,9 @@ impl<'a> HostGc<'a> {
     ) -> Result<(), WorkerError> {
         let meta: TaskMeta = read_gc_json(task, "meta.json", "task metadata")?;
         let status: TaskStatus = read_gc_json(task, "status.json", "task status")?;
+        if status.turns().iter().any(|turn| turn.herdr().is_some()) {
+            inventory.herdr_reported = true;
+        }
         if meta.project_id() != project || meta.task_id() != task_id {
             return Err(gc_metadata(
                 &format!("tasks/{project}/{task_id}"),
@@ -1140,6 +1147,11 @@ impl<'a> HostGc<'a> {
 
 #[derive(Default)]
 struct GcInventory {
+    /// Every task directory seen, for the herdr tab sweep.
+    task_ids: BTreeSet<String>,
+    /// Whether any task record shows a turn reported to herdr; the sweep
+    /// runs only then, so a worker that never reported never opens the socket.
+    herdr_reported: bool,
     live_lease_job: Option<JobId>,
     lease_uncertain: bool,
     tasks: BTreeMap<String, TaskSnapshot>,
@@ -1554,4 +1566,15 @@ fn gc_git_error(message: &str) -> WorkerError {
 
 fn relative(path: &str) -> Result<RelativePath, WorkerError> {
     RelativePath::parse(path.as_bytes()).map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
+/// Best effort: close herdr tabs whose task directory is gone.  Tabs of
+/// tasks that still exist are left alone; `task close` removes those.
+fn sweep_herdr_tabs(task_ids: &BTreeSet<String>) {
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return;
+    };
+    let live = |short: &str| task_ids.iter().any(|task_id| task_id.starts_with(short));
+    let _ = crate::herdr_reporter::HerdrReporter::for_home(std::path::Path::new(&home))
+        .sweep_orphans(&live);
 }

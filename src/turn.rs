@@ -694,7 +694,6 @@ impl TurnTerminalHook {
         log_truncated: bool,
     ) -> Result<TurnResult, WorkerError> {
         let _ = path;
-        let _ = job_meta;
         let runner = crate::process::SystemProcessRunner;
         let task_store = TaskStore::new(store, &runner);
         let meta = task_store.load_meta(section.project_id(), section.turn().task_id())?;
@@ -708,7 +707,18 @@ impl TurnTerminalHook {
             log_truncated,
             section.origin_url(),
         ) {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                report_turn_to_herdr(
+                    section,
+                    job_meta,
+                    &meta,
+                    result.outcome(),
+                    result.summary(),
+                    result.questions(),
+                    &task_store,
+                );
+                Ok(result)
+            }
             Err(error) => {
                 // Publication failure must not leave the task active. Keep
                 // the workspace for inspection and make the failure visible
@@ -723,7 +733,7 @@ impl TurnTerminalHook {
                         meta.task_id(),
                         turn.turn_id(),
                         terminal,
-                        fallback,
+                        fallback.clone(),
                         false,
                         log_truncated,
                         status.head_oid().cloned(),
@@ -733,11 +743,60 @@ impl TurnTerminalHook {
                         None,
                         false,
                     );
+                    report_turn_to_herdr(
+                        section,
+                        job_meta,
+                        &meta,
+                        &fallback,
+                        None,
+                        &[],
+                        &task_store,
+                    );
                 }
                 Err(error)
             }
         }
     }
+}
+
+/// Tells the worker's herdr how the turn ended, when the worker reports.
+/// Best effort under the reporter's budget; the result is noted on the turn
+/// record and nothing else changes.
+#[allow(clippy::too_many_arguments)]
+fn report_turn_to_herdr(
+    section: &TurnSection,
+    job_meta: &JobMeta,
+    meta: &crate::task::TaskMeta,
+    outcome: &TaskOutcome,
+    summary: Option<&str>,
+    questions: &[Question],
+    task_store: &TaskStore,
+) {
+    if !section.herdr_reporter() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return;
+    };
+    let identity = crate::herdr_reporter::TurnIdentity {
+        project_id: section.project_id().to_owned(),
+        worktree_id: job_meta.worktree_id().to_owned(),
+        job_id: job_meta.job_id().to_string(),
+        task_id: section.turn().task_id(),
+        turn_number: section.turn().turn_number(),
+        agent: section.turn().agent(),
+        title: meta.title().as_str().to_owned(),
+    };
+    let pane_id = crate::herdr_reporter::take_start(&job_meta.job_id().to_string())
+        .and_then(|report| report.pane_id);
+    let reported = crate::herdr_reporter::HerdrReporter::for_home(std::path::Path::new(&home))
+        .terminal(&identity, pane_id.as_deref(), outcome, summary, questions);
+    let _ = task_store.record_turn_herdr(
+        section.project_id(),
+        section.turn().task_id(),
+        job_meta.job_id(),
+        reported.report,
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

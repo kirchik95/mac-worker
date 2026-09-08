@@ -265,9 +265,7 @@ fn typed_results_are_parsed_from_the_shapes_herdr_answers_with() {
     assert_eq!(workspaces[1].workspace_id, "w3");
     assert_eq!(workspaces[1].label.as_deref(), Some("mac-worker"));
 
-    let created = client
-        .workspace_create("mac-worker", Path::new("/Users/someone"))
-        .unwrap();
+    let created = client.workspace_create("mac-worker", None).unwrap();
     assert_eq!(
         (
             created.workspace_id.as_str(),
@@ -278,11 +276,7 @@ fn typed_results_are_parsed_from_the_shapes_herdr_answers_with() {
     );
 
     let tab = client
-        .tab_create(
-            "w4",
-            "task abc123def456 · turn 1",
-            Path::new("/Users/someone"),
-        )
+        .tab_create("w4", "task abc123def456 · turn 1", None)
         .unwrap();
     assert_eq!(
         (
@@ -325,9 +319,9 @@ fn typed_calls_match_the_captured_herdr_schema() {
 
     client.ping().unwrap();
     client.workspace_list().unwrap_or_default();
-    let _ = client.workspace_create("mac-worker", cwd);
+    let _ = client.workspace_create("mac-worker", Some(cwd));
     let _ = client.tab_list("w1");
-    let _ = client.tab_create("w1", "task abc123def456 · turn 1", cwd);
+    let _ = client.tab_create("w1", "task abc123def456 · turn 1", None);
     client.tab_close("w1:t2").unwrap();
     let _ = client.pane_process_info("w1:p2");
     client

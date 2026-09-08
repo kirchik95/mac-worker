@@ -17,6 +17,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use mac_worker::herdr::HerdrSocket;
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy},
     agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
@@ -4288,4 +4289,96 @@ fn delayed_idle_refresh_propagates_local_write_failure() {
 #[test]
 fn delayed_idle_refresh_propagates_current_record_corruption() {
     delayed_task_projection_cannot_overwrite_publication(ProjectionCase::IdleCorruption);
+}
+
+// --- laptop herdr notifications ------------------------------------------
+
+fn runner_with_notifier<'a>(
+    fixture: &'a AcceptedThenTerminalFixture,
+    config: &'a mac_worker::config::Config,
+    socket: Option<HerdrSocket>,
+) -> TurnRunner<'a> {
+    TurnRunner::new(
+        &fixture.runner,
+        config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .with_notifier(socket)
+}
+
+#[test]
+fn a_finished_turn_notifies_the_configured_herdr_session_once() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let home = tempfile::tempdir().unwrap();
+    let server = support::fake_herdr::FakeHerdr::start_in_home(home.path());
+
+    let outcome = runner_with_notifier(
+        &fixture,
+        &fixture.config,
+        Some(HerdrSocket::at(server.path())),
+    )
+    .run(fixture.task_id, fixture.turn_id, Some(&mut Vec::new()))
+    .unwrap();
+
+    assert_eq!(outcome.status().state(), TaskState::Closed);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0]["method"], "notification.show");
+    let params = &requests[0]["params"];
+    let short = &fixture.task_id.to_string()[..12];
+    assert_eq!(params["title"], format!("task {short}: done"));
+    assert_eq!(params["sound"], "done");
+    let body = params["body"].as_str().unwrap_or_default();
+    assert!(body.starts_with("make the change"), "{body}");
+    for forbidden in ["/Users/", "/private/", "/var/", "/tmp/"] {
+        assert!(!body.contains(forbidden), "{body}");
+    }
+}
+
+#[test]
+fn notifications_stay_silent_when_turned_off_in_the_configuration() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let home = tempfile::tempdir().unwrap();
+    let server = support::fake_herdr::FakeHerdr::start_in_home(home.path());
+    let mut config = fixture.config.clone();
+    config.notifications.herdr = false;
+
+    let outcome = runner_with_notifier(&fixture, &config, Some(HerdrSocket::at(server.path())))
+        .run(fixture.task_id, fixture.turn_id, Some(&mut Vec::new()))
+        .unwrap();
+
+    assert_eq!(outcome.status().state(), TaskState::Closed);
+    assert!(server.requests().is_empty(), "{:?}", server.requests());
+}
+
+#[test]
+fn a_missing_herdr_session_changes_nothing_about_the_turn() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let empty_home = tempfile::tempdir().unwrap();
+
+    let started = std::time::Instant::now();
+    let outcome = runner_with_notifier(
+        &fixture,
+        &fixture.config,
+        Some(HerdrSocket::default_for_home(empty_home.path())),
+    )
+    .run(fixture.task_id, fixture.turn_id, Some(&mut Vec::new()))
+    .unwrap();
+
+    assert_eq!(outcome.status().state(), TaskState::Closed);
+    assert_eq!(outcome.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}
+
+#[test]
+fn a_runner_without_an_injected_session_never_opens_a_socket() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let outcome = fixture.run(&mut Vec::new()).unwrap();
+    assert_eq!(outcome.status().state(), TaskState::Closed);
 }

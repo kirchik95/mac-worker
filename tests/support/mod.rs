@@ -1,5 +1,4 @@
 pub mod agent_launch_fixture;
-#[allow(dead_code)]
 pub mod fake_herdr;
 pub mod recording_runner;
 #[allow(dead_code)]
