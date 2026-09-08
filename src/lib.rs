@@ -69,6 +69,7 @@ pub mod config;
 pub mod dashboard;
 pub mod doctor;
 pub mod error;
+pub mod follow_turn;
 pub mod gc;
 pub mod git_transport;
 pub mod herdr;
@@ -409,6 +410,11 @@ fn execute_with_context(
             command: HostCommand::AgentSettingsSet,
         } => Err(WorkerError::Protocol(
             "host agent-settings-set requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::FollowTurn { .. },
+        } => Err(WorkerError::Protocol(
+            "host follow-turn requires the stdio execution boundary".into(),
         )),
     }
 }
@@ -1381,6 +1387,25 @@ pub fn run_with_rsync_executor_in_context(
     } = &cli.command
     {
         return run_host_supervise(cli.config, runtime, job_id.expose());
+    }
+    if let Command::Host {
+        command:
+            HostCommand::FollowTurn {
+                project_id,
+                worktree_id,
+                job_id,
+            },
+    } = &cli.command
+    {
+        return follow_turn::run_host_follow_turn(
+            cli.config,
+            runtime,
+            project_id.expose(),
+            worktree_id.expose(),
+            job_id.expose(),
+            stdout,
+            stderr,
+        );
     }
     if matches!(
         &cli.command,
