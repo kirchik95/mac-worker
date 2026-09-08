@@ -63,7 +63,7 @@ cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-tar
 Порядок внутри этапа:
 
 1. [x] CLI: показывать причину неуспешного turn без обязательного `--raw`.
-2. [ ] Runner: дочитывать финальные stdout/stderr; восстанавливать позиции после restart без дублирования уже записанного префикса. Переиспользовать существующую семантику `TerminalLogDrain`; согласовать завершение `logs -f` с окончанием выбранного turn и его публикации.
+2. [x] Runner: дочитывать финальные stdout/stderr; восстанавливать позиции после restart без дублирования уже записанного префикса. Переиспользовать существующую семантику `TerminalLogDrain`; согласовать завершение `logs -f` с окончанием выбранного turn и его публикации.
 3. [ ] Cursor: сопоставить окружение auth probe и фактического запуска с env profile; воспроизвести расхождение и исправить его причину.
 
 Критерии: причина ошибки видна обычной командой; длинные потоки и restart не теряют bytes; утверждение о готовности Cursor подтверждается запуском в том же профиле. Проверки, требующие реального агента, выполняются отдельно от локальных fixtures.
@@ -80,65 +80,26 @@ cargo fmt --all --check
 cargo clippy --locked --offline --target-dir /private/tmp/mac-worker-admission-target --all-targets -- -D warnings
 ```
 
-### 3.2. Durable runner logs and selected-turn completion
+### 3.2. Восстановление логов и завершение выбранного turn
 
-Implemented in `fix/runner-log-recovery`: private bounded write-ahead journal, committed native offsets, terminal job identity/final-length checks and confirmed EOF for both streams, publication outcome and completion committed together, and recovery ownership retained through cleanup. Follow finishes for its selected turn while the task remains Open; `say` still waits for cleanup. Cancelled Waiting/Parked turns retain a recovery row until their local never-started completion is durable.
+**Результат:** runner дочитывает stdout/stderr до подтверждённого EOF, включая длинные хвосты и ответ submit с уже завершённой задачей. Закрытый журнал сохраняет позиции обоих потоков вместе с записанными байтами; restart продолжает чтение без повторения подтверждённого префикса. `logs --follow` завершается после дочитывания и публикации результата выбранного turn, даже если задача остаётся Open или уже выполняется следующий turn.
 
-Legacy nonempty logs remain readable without follow. Missing checkpoints fail writer recovery with `LOG_CHECKPOINT_MISSING`; follow without provable completion fails with `LOG_COMPLETION_UNKNOWN`. No automatic legacy replay/migration is attempted.
+Завершение, отмена и recovery сохраняют владение до окончания очистки. Старый finalizer не может очистить runner или base pin нового turn. Кратковременная занятость журнала повторно проверяется с контролем владельца. Запоздалые ответы cancel и status refresh записываются только при совпадении исходного task record под существующим `StateLock`, поэтому не затирают историю нового turn или fetched head. Отмена принятого turn не ждёт завершения чтения логов.
 
-Scoped verification: the eight-suite integrated run passed 233 tests; after final self-review changes, runner 48/48, reader 20/20, journal 8/8, and conversation/context 20/20 passed. All-target Clippy, fmt and diff whitespace checks passed. Four controlled journal mutations (append replay, skipped suffix check, missing writer exclusion, dropped completion) were each detected. The first full run found a missing native-status handler in the Cursor/OpenCode fake remote; after its faithful fixture extension that suite passed 21/21 and all-target Clippy passed again. The all-target rerun exited 0: **1,585 passed, 0 failed, 0 ignored across 62 top-level Cargo sections** (nested filtered harness summaries excluded). Two bounded late guards were added while that run was in progress: historical empty legacy follow uses the selected turn’s terminal state, and pending drained completion requires acceptance. Because the shared target directory could replace later test executables during the run, that full result is not claimed for one immutable final binary set. The frozen final source subsequently passed the **complete library suite (316 tests)** and **complete task_logs suite (21 tests)**, fmt, diff whitespace checks, and all-target Clippy, all exit 0. Independent review and main integration are pending.
+Старые логи без checkpoint остаются доступны без follow. Для непустого legacy-лога восстановление writer возвращает `LOG_CHECKPOINT_MISSING`; follow без доказуемого завершения — `LOG_COMPLETION_UNKNOWN`. Байты сохраняются; автоматической миграции нет.
+
+Изменения `0095623`, `2323cb1`, `290f8c6`, `cb75307` включены в локальный main через fast-forward ветки `fix/runner-log-recovery`. Task review, whole-branch review и повторное review последней правки завершены; блокирующих замечаний нет. Финальный полный прогон на неизменном `cb75307`: **1 598 passed, 0 failed, 0 ignored, 62 top-level Cargo suites**, exit 0. Дополнительно прошли 618 профильных тестов, fmt, all-target Clippy с запретом warnings и `git diff --check`.
 
 ```sh
-cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-target --test turn_runner --test task_logs --test task_conversation --test task_project_context --test runner_dispatch --test scheduler_queue --test agent_adapters --test cli_help
-cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-target --lib runner_log::
-cargo fmt --all --check
-cargo clippy --locked --offline --target-dir /private/tmp/mac-worker-admission-target --all-targets -- -D warnings
 cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-target --all-targets
-```
-
-Coverage includes multi-chunk tails, immediate terminal acceptance, restart at committed offsets, changed terminal lengths/identity, selected historical follow, failed local cancellation recovery, local-only completed retry, native-event spoofing, committed logs over 8 MiB, and substituted detached log paths. Verification uses real private local files/Git and fake remotes; no live fleet or provider agents were used. Some journal/lifecycle tests were added with or after implementation; the critical journal guarantees additionally underwent controlled mutation validation.
-
-
-**Review fix 1 — finalization fence.** Cancellation, completed reconciliation and runner cleanup now share the journal flock through exact current-row/owner validation, task status mutation, base release, runner clearing and final row retirement. Dead-owner adoption and handoff publication respect the same fence. Three deterministic channel/real-Git regressions failed on base `00956237b15bb7634875994ffb84926f7d149afd` with old cleanup clearing a newer runner or deleting its new base, then passed with the fix.
-
-Frozen fix-source verification (exit 0): **544 passed, 0 failed across 9 top-level suites**: library 316, Cursor/OpenCode 21, client state 42, scheduler queue 64, task command 9, conversation 15, logs 21, project context 8, runner 48. Nested filtered library harnesses are excluded from the count. Fmt, all-target Clippy with warnings denied, and `git diff --check` also passed. Exact commands:
-
-```sh
-cargo test --lib --test turn_runner --test task_conversation --test task_command --test task_logs --test task_project_context --test client_state --test scheduler_queue --test agent_cursor_opencode
 cargo fmt --all --check
 cargo clippy --locked --offline --all-targets -- -D warnings
 git diff --check
 ```
 
-Outputs: `/private/tmp/fix1-final-scoped.log`, `/private/tmp/fix1-final-fmt.log`, `/private/tmp/fix1-final-clippy.log`. The fix's final scoped run used frozen Rust sources and no parallel builds. A fresh whole-branch all-target run remains controller-owned after scoped re-review; the earlier all-target source-delta caveat above is not claimed resolved by scoped checks.
+Проверки используют настоящие локальные файлы/Git и fake remotes. Они покрывают crash recovery, длинные потоки, подмену log paths, отмену, смену владельца, задержанные ответы, сохранение результата и завершение выбранного follower. Реальные Mac и provider agents не запускались. Часть journal/lifecycle-тестов добавлена вместе с реализацией или после неё; четыре критические гарантии дополнительно проверены контролируемыми мутациями. Финальный неизменный полный прогон заменяет ранний результат 1 585 тестов со смешанным набором binaries.
 
-
-**Review fix 2 — transient fence contention.** A legitimate runner now retries only a busy journal held by queued refresh or parent handoff. Every attempt checks exact task/turn/owner authority, then rechecks under the acquired writer. A changed owner or retired/replaced row returns `TASK_BUSY`; the cleanup fence lifetime is unchanged. Channel-gated regressions reproduce the original WouldBlock abort and verify exactly one successful submission or zero submissions after ownership loss/replacement.
-
-Frozen fix-2 source verification (exit 0): **547 passed, 0 failed across 9 top-level suites**: library 316, Cursor/OpenCode 21, client state 42, scheduler queue 64, task command 9, conversation 15, logs 21, project context 8, runner 51. Counts exclude nested filtered library subprocess summaries. Commands:
-
-```sh
-cargo test --locked --offline --lib --test turn_runner --test task_conversation --test task_command --test task_logs --test task_project_context --test client_state --test scheduler_queue --test agent_cursor_opencode
-cargo fmt --all --check
-cargo clippy --locked --offline --all-targets -- -D warnings
-git diff --check
-```
-
-All commands passed. Outputs: `/private/tmp/fix2-final-scoped.log`, `/private/tmp/fix2-final-fmt.log`, `/private/tmp/fix2-final-clippy.log`. No concurrent rebuilds or Rust source changes occurred during final verification. Controller-owned frozen whole-branch all-target verification remains pending after scoped re-review. The pre-existing idle/no-queue status-refresh versus new-`say` projection race remains recorded for whole-branch review and outside these scoped fixes.
-
-
-**Final review wave — conditional remote projections.** Accepted cancellation and the formerly deferred idle/no-queue refresh race now share an atomic expected-record comparison under the existing state lock/rooted replacement machinery. Delayed responses cannot overwrite successor history, runner/queue authority or completed fetched-head metadata. Cancellation does not wait for the journal owner; local publication failures propagate while remote observation failures remain best effort. Three original channel-gated races failed before implementation and passed after it; additional checks cover response publication during an active drain, local write failure and current-record corruption.
-
-Frozen final-wave scoped verification: **618 passed, 0 failed across 11 top-level suites**, exit 0. Counts: library 316; agent adapters 50; Cursor/OpenCode 21; client state 42; runner dispatch 15; scheduler queue 64; task command 9; conversation 15; logs 21; project context 8; runner 57. Nested filtered library harness summaries are excluded. Exact commands:
-
-```sh
-cargo test --locked --offline --lib --test client_state --test scheduler_queue --test runner_dispatch --test task_conversation --test turn_runner --test task_logs --test task_project_context --test task_command --test agent_adapters --test agent_cursor_opencode
-cargo fmt --all --check
-cargo clippy --locked --offline --all-targets -- -D warnings
-git diff --check
-```
-
-All passed. Output paths: `/private/tmp/final-fix-scoped.log`, `/private/tmp/final-fix-fmt.log`, `/private/tmp/final-fix-clippy.log`. Final verification used frozen Rust sources with no concurrent rebuilds; only task documentation changed afterwards. The controller interrupted the prior all-target run on `290f8c6` with SIGINT/exit 130 before this wave; that interrupted run is not final-source evidence. Controller-owned whole-branch all-target verification remains pending after re-review. The optional decoder flag/cursor strengthening remains outside this fix.
+Подробности, решения и история проверок: [спецификация](../specs/2026-09-08-runner-log-recovery-design.md), [план и результаты](2026-09-08-runner-log-recovery.md).
 
 ## 4. Контракты и восстановление dashboard
 
