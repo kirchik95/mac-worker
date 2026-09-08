@@ -4389,3 +4389,35 @@ fn a_runner_without_an_injected_session_never_opens_a_socket() {
     let outcome = fixture.run(&mut Vec::new()).unwrap();
     assert_eq!(outcome.status().state(), TaskState::Closed);
 }
+
+#[test]
+fn the_early_exit_line_names_the_error_that_ended_the_runner() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    // A task recorded without its project context makes the runner resolve
+    // the project from its working directory.  From another repository it
+    // must refuse with PROJECT_MISMATCH, and the log must name that error
+    // instead of hiding it behind the queue's blocking code.
+    let project_context = fixture
+        .state_root
+        .path()
+        .join("state")
+        .join("turns")
+        .join(fixture.task_id.to_string())
+        .join("project.json");
+    fs::remove_file(&project_context)
+        .unwrap_or_else(|error| panic!("{}: {error}", project_context.display()));
+    let elsewhere = support::GitRepo::init();
+    elsewhere.write("other.txt", b"other\n");
+    elsewhere.commit_all("other");
+    let _elsewhere = CurrentDirGuard::enter(elsewhere.root());
+
+    let error = fixture.run(&mut Vec::new()).unwrap_err();
+
+    assert_eq!(error.public_code(), "PROJECT_MISMATCH", "{error}");
+    let log = String::from_utf8(fixture.runner_log()).unwrap();
+    let line = log.lines().next().unwrap_or_default();
+    assert!(line.starts_with("exited: "), "{log}");
+    assert!(line.contains("PROJECT_MISMATCH"), "{log}");
+    assert!(line.ends_with("workers=mini-1"), "{log}");
+}

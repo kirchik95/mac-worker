@@ -1901,13 +1901,21 @@ fn unavailable_herdr_probes() -> Vec<(Result<ProcessResult, WorkerError>, &'stat
 fn herdr_true_worker_gets_a_warning_for_every_fact_state_but_available_and_stays_ready() {
     // Spec 5.3 and 12: HERDR_UNAVAILABLE is a warning, never a blocker, and
     // it never touches readiness or eligibility.
-    use mac_worker::protocol::HERDR_UNAVAILABLE_MESSAGE;
+    use mac_worker::protocol::{HERDR_FACTS_STALE_MESSAGE, HERDR_UNAVAILABLE_MESSAGE};
 
     let repo = herdr_repo();
     let config = config(vec![herdr_worker("mini-1", "mac1", true)]);
     for (probe, line) in unavailable_herdr_probes() {
         let state = tempfile::tempdir().unwrap();
         let runner = DoctorRunner::new(vec![probe]);
+        // A fact that is missing or stale renders `unknown` and gets the
+        // message that names the refresh; a fresh fact that is not
+        // `available` gets the unreachable message.
+        let expected_message = if line.contains("unknown") {
+            HERDR_FACTS_STALE_MESSAGE
+        } else {
+            HERDR_UNAVAILABLE_MESSAGE
+        };
 
         let report = inspect(&repo, state.path(), &config, &runner).unwrap();
 
@@ -1919,7 +1927,7 @@ fn herdr_true_worker_gets_a_warning_for_every_fact_state_but_available_and_stays
             vec![(
                 IssueSeverity::Warning,
                 "HERDR_UNAVAILABLE",
-                HERDR_UNAVAILABLE_MESSAGE,
+                expected_message,
             )],
             "{line}"
         );
@@ -1929,7 +1937,7 @@ fn herdr_true_worker_gets_a_warning_for_every_fact_state_but_available_and_stays
         assert!(human.contains(line), "{line} missing in {human}");
         assert!(
             human.contains(&format!(
-                "  warning [HERDR_UNAVAILABLE]: {HERDR_UNAVAILABLE_MESSAGE}"
+                "  warning [HERDR_UNAVAILABLE]: {expected_message}"
             )),
             "{human}"
         );
@@ -1941,7 +1949,7 @@ fn herdr_true_worker_gets_a_warning_for_every_fact_state_but_available_and_stays
             serde_json::json!([{
                 "severity": "warning",
                 "code": "HERDR_UNAVAILABLE",
-                "message": HERDR_UNAVAILABLE_MESSAGE,
+                "message": expected_message,
                 "paths": [],
             }]),
             "{line}"
@@ -1996,9 +2004,10 @@ fn herdr_false_worker_never_gets_the_herdr_warning() {
 
 #[test]
 fn herdr_warning_for_an_unreachable_herdr_worker_sorts_with_the_other_warnings() {
-    // An unreachable worker has an unknown fact; asking for herdr on it adds
-    // the warning beside SSH_UNAVAILABLE and leaves the ready pool ready.
-    use mac_worker::protocol::HERDR_UNAVAILABLE_MESSAGE;
+    // An unreachable worker has no fresh fact; asking for herdr on it adds
+    // the facts warning beside SSH_UNAVAILABLE and leaves the ready pool
+    // ready.
+    use mac_worker::protocol::HERDR_FACTS_STALE_MESSAGE;
 
     let repo = herdr_repo();
     let state = tempfile::tempdir().unwrap();
@@ -2019,7 +2028,7 @@ fn herdr_warning_for_an_unreachable_herdr_worker_sorts_with_the_other_warnings()
             (
                 IssueSeverity::Warning,
                 "HERDR_UNAVAILABLE",
-                HERDR_UNAVAILABLE_MESSAGE,
+                HERDR_FACTS_STALE_MESSAGE,
             ),
             (
                 IssueSeverity::Warning,

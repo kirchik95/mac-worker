@@ -182,7 +182,18 @@ fn worker_issues(
             .as_ref()
             .is_some_and(ProbeResponse::herdr_available)
         {
-            let message = safe_worker_message(worker, HERDR_UNAVAILABLE_CODE);
+            // Unknown is not unreachable: without a fresh fact say so and
+            // name the command that produces one.
+            let known = worker
+                .probe
+                .as_ref()
+                .and_then(ProbeResponse::herdr_fact)
+                .is_some();
+            let message = if known {
+                safe_worker_message(worker, HERDR_UNAVAILABLE_CODE)
+            } else {
+                crate::protocol::HERDR_FACTS_STALE_MESSAGE.to_owned()
+            };
             issues.push(issue(
                 IssueSeverity::Warning,
                 HERDR_UNAVAILABLE_CODE,

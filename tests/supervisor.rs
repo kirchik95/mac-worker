@@ -2572,11 +2572,17 @@ fn supervisor_retains_a_sanitized_error_before_terminal_status() {
         error.to_string().contains("injected supervisor fault"),
         "{error}"
     );
-    assert_eq!(
-        fs::read(job.join("supervisor.log")).unwrap(),
-        b"error_code=IO\n"
+    let supervisor_log = String::from_utf8(fs::read(job.join("supervisor.log")).unwrap()).unwrap();
+    assert!(
+        supervisor_log.starts_with("error_code=IO message="),
+        "{supervisor_log}"
     );
-    assert!(fs::read(job.join("supervisor.log")).unwrap().len() <= 1024);
+    assert!(
+        supervisor_log.contains("injected supervisor fault"),
+        "the message survives beside the code: {supervisor_log}"
+    );
+    assert_eq!(supervisor_log.lines().count(), 1, "{supervisor_log}");
+    assert!(supervisor_log.len() <= 1024);
     assert_eq!(
         serde_json::from_slice::<JobStatus>(&fs::read(job.join("status.json")).unwrap())
             .unwrap()
@@ -3149,4 +3155,55 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
         std::thread::yield_now();
     }
     detached_cleanup.disarm();
+}
+
+#[test]
+fn a_diagnostic_left_by_a_failed_earlier_attempt_does_not_block_the_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let failing = FailingLauncher {
+        launches: Arc::clone(&launches),
+    };
+    let first_error = JobService::new(&store, &failing)
+        .submit_at(request.clone(), 3)
+        .unwrap_err();
+    assert!(
+        first_error
+            .to_string()
+            .contains("injected launcher failure"),
+        "{first_error}"
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+
+    // What a supervisor that failed before launching leaves behind: the
+    // submit created the empty log, the supervisor appended its reason.
+    assert_eq!(fs::metadata(job.join("supervisor.log")).unwrap().len(), 0);
+    let mut diagnostic = fs::OpenOptions::new()
+        .append(true)
+        .open(job.join("supervisor.log"))
+        .unwrap();
+    diagnostic
+        .write_all(b"error_code=PROTOCOL message=simulated first attempt\n")
+        .unwrap();
+    drop(diagnostic);
+
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 4)
+        .unwrap_or_else(|error| panic!("the retry must launch: {error}"));
+    assert!(response.status().state().is_terminal());
+    let status: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status.state(), JobState::Succeeded);
+    let supervisor_log = String::from_utf8(fs::read(job.join("supervisor.log")).unwrap()).unwrap();
+    assert_eq!(
+        supervisor_log, "error_code=PROTOCOL message=simulated first attempt\n",
+        "the retry appends nothing on success"
+    );
 }

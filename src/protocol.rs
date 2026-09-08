@@ -8,6 +8,9 @@ pub const SUPERVISION_VERSION: u32 = 3;
 pub const HERDR_UNAVAILABLE_CODE: &str = "HERDR_UNAVAILABLE";
 pub const HERDR_UNAVAILABLE_MESSAGE: &str =
     "herdr = true but the worker's herdr socket is not reachable; turns run without the reporter";
+/// The same warning when the answer is simply not known: the herdr fact is
+/// missing or older than its TTL, which a facts refresh settles.
+pub const HERDR_FACTS_STALE_MESSAGE: &str = "herdr = true but the worker's herdr facts are stale or missing; run `worker workers --refresh`";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

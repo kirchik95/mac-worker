@@ -306,13 +306,18 @@ impl<'a> TurnRunner<'a> {
             .iter()
             .map(|worker| worker.name.as_str())
             .collect::<Vec<_>>();
-        let code = self
+        let blocking = self
             .client_state
             .task_blocking_codes(self.config)
             .ok()
-            .and_then(|codes| codes.get(&task_id).cloned())
-            .unwrap_or_else(|| error.public_code());
-        log.append_bytes(early_exit_diagnostic_line(&code, &workers).as_bytes())
+            .and_then(|codes| codes.get(&task_id).cloned());
+        let public_code = error.public_code();
+        let message = crate::redaction::RedactionBoundary::from_env()
+            .text(&error.to_string(), EARLY_EXIT_MESSAGE_LIMIT);
+        log.append_bytes(
+            early_exit_diagnostic_line(blocking.as_deref(), &public_code, &message, &workers)
+                .as_bytes(),
+        )
     }
 
     fn start_next_parked(&self, owner: ProcessIdentity) -> Result<(), WorkerError> {
@@ -1335,7 +1340,7 @@ impl<'a> TurnRunner<'a> {
             .iter()
             .map(|w| w.name.as_str())
             .collect::<Vec<_>>();
-        let line = early_exit_diagnostic_line("CAPACITY_BUSY", &workers);
+        let line = early_exit_diagnostic_line(Some("CAPACITY_BUSY"), "CAPACITY_BUSY", "", &workers);
         let completion = Completion {
             outcome: TaskOutcome::failed("CAPACITY_BUSY"),
             drained: false,
@@ -1667,12 +1672,59 @@ fn turn_origin_url(meta: &crate::task::TaskMeta) -> Option<String> {
     meta.push_origin_url().map(str::to_owned)
 }
 
-fn early_exit_diagnostic_line(code: &str, workers: &[&str]) -> String {
-    let mut line = if workers.is_empty() {
-        format!("exited: {code}")
-    } else {
-        format!("exited: {code} workers={}", workers.join(","))
-    };
+/// Longest redacted error message kept in the runner's early-exit line.
+const EARLY_EXIT_MESSAGE_LIMIT: usize = 160;
+
+/// Public codes that name only an error class, never the specific failure.
+fn is_generic_public_code(code: &str) -> bool {
+    matches!(
+        code,
+        "PROJECT"
+            | "SNAPSHOT"
+            | "CAPACITY"
+            | "QUEUE"
+            | "TRANSPORT"
+            | "GIT"
+            | "AGENT"
+            | "TASK"
+            | "CONFIG"
+            | "UNAVAILABLE"
+            | "PROTOCOL"
+            | "COMMAND_EXIT"
+            | "IO"
+            | "PROCESS"
+    )
+}
+
+/// The runner's one line about a turn it gave up on before acceptance: the
+/// queue's view of why the task waits, then the error that actually ended
+/// this runner with its redacted message, then the configured workers.  The
+/// two codes are printed once when they agree, so a plain capacity wait
+/// still reads `exited: CAPACITY_BUSY workers=...`.
+fn early_exit_diagnostic_line(
+    blocking: Option<&str>,
+    public_code: &str,
+    message: &str,
+    workers: &[&str],
+) -> String {
+    let mut line = format!("exited: {}", blocking.unwrap_or(public_code));
+    if blocking.is_some_and(|blocking| blocking != public_code) {
+        line.push_str(&format!(" error={public_code}"));
+    }
+    // A specific code says enough; a class name alone (PROTOCOL, IO, ...)
+    // does not, so the redacted message goes with it.
+    if is_generic_public_code(public_code) {
+        let message = message
+            .strip_prefix(public_code)
+            .and_then(|rest| rest.strip_prefix(": "))
+            .unwrap_or(message);
+        if !message.is_empty() {
+            line.push_str(&format!(" message={message}"));
+        }
+    }
+    if !workers.is_empty() {
+        line.push_str(&format!(" workers={}", workers.join(",")));
+    }
     if line.len() > EARLY_EXIT_DIAGNOSTIC_LIMIT {
         line.truncate(EARLY_EXIT_DIAGNOSTIC_LIMIT);
     }
@@ -1822,8 +1874,50 @@ fn fallback_process_identity(pid: u32) -> Result<ProcessIdentity, WorkerError> {
 
 #[cfg(test)]
 mod tests {
-    use super::turn_exit_code;
+    use super::{early_exit_diagnostic_line, turn_exit_code};
     use crate::task::TaskOutcome;
+
+    #[test]
+    fn the_early_exit_line_keeps_the_runner_error_beside_the_blocking_code() {
+        assert_eq!(
+            early_exit_diagnostic_line(
+                Some("WAITING_FOR_DISPATCH"),
+                "PROJECT_MISMATCH",
+                "PROJECT_MISMATCH: current project is not the task's project",
+                &["mini-1"],
+            ),
+            "exited: WAITING_FOR_DISPATCH error=PROJECT_MISMATCH workers=mini-1\n"
+        );
+        assert_eq!(
+            early_exit_diagnostic_line(Some("CAPACITY_BUSY"), "CAPACITY_BUSY", "", &["a", "b"]),
+            "exited: CAPACITY_BUSY workers=a,b\n"
+        );
+        assert_eq!(
+            early_exit_diagnostic_line(None, "PROJECT_MISMATCH", "PROJECT_MISMATCH: x", &[]),
+            "exited: PROJECT_MISMATCH\n"
+        );
+    }
+
+    #[test]
+    fn the_early_exit_line_adds_the_message_only_for_a_generic_code() {
+        assert_eq!(
+            early_exit_diagnostic_line(None, "IO", "IO: permission denied", &["mini-1"]),
+            "exited: IO message=permission denied workers=mini-1\n"
+        );
+        assert_eq!(
+            early_exit_diagnostic_line(
+                Some("WAITING_FOR_DISPATCH"),
+                "PROTOCOL",
+                "worker probe was empty",
+                &["mini-1"],
+            ),
+            "exited: WAITING_FOR_DISPATCH error=PROTOCOL message=worker probe was empty workers=mini-1\n"
+        );
+        assert_eq!(
+            early_exit_diagnostic_line(None, "LEASE_IDENTITY_MISMATCH", "long story", &["m"]),
+            "exited: LEASE_IDENTITY_MISMATCH workers=m\n"
+        );
+    }
 
     #[test]
     fn agent_failure_exit_code_is_preserved_for_attached_turns() {

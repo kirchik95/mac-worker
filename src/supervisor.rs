@@ -50,7 +50,9 @@ const CHILD_TRANSITION_RETRY: Duration = Duration::from_millis(250);
 const SUPERVISOR_IDENTITY_RETRY: Duration = Duration::from_millis(250);
 const TERM_GRACE: Duration = Duration::from_secs(10);
 const SUPERVISOR_LOG_NAME: &str = "supervisor.log";
-const MAX_SUPERVISOR_LOG_BYTES: u64 = 1024;
+pub(crate) const MAX_SUPERVISOR_LOG_BYTES: u64 = 1024;
+/// Longest error message kept beside its code in `supervisor.log`.
+const SUPERVISOR_LOG_MESSAGE_BYTES: usize = 200;
 pub(crate) const SUPERVISOR_LOCK_FD: RawFd = 3;
 
 pub(crate) fn validate_detached_supervisor_context() -> Result<(), WorkerError> {
@@ -991,9 +993,14 @@ impl SupervisorErrorLog {
         Ok(Some(Self { job, file }))
     }
 
+    /// One line per failure: the public code, and the message redacted and
+    /// bounded, so a supervisor that fails before it launches leaves a
+    /// reason behind and not only a class name.
     fn record(&mut self, error: &WorkerError) {
         let code = error.public_code();
-        let line = format!("error_code={code}\n");
+        let message = crate::redaction::RedactionBoundary::from_env()
+            .text(&error.to_string(), SUPERVISOR_LOG_MESSAGE_BYTES);
+        let line = format!("error_code={code} message={message}\n");
         let line = line.as_bytes();
         if line.len() as u64 > MAX_SUPERVISOR_LOG_BYTES {
             return;

@@ -2423,10 +2423,16 @@ impl<'a> JobService<'a> {
                 }
             }
             if job.entry_exists("supervisor.log")? {
+                // A failed earlier attempt leaves its diagnostic here; that
+                // must not stop the retry.  The supervisor lock and the
+                // recorded identities guard against a second execution, so
+                // only the bound is checked.
                 let file = job.open_private_append("supervisor.log")?;
-                if job.validate_private_append_binding("supervisor.log", &file)? != 0 {
+                if job.validate_private_append_binding("supervisor.log", &file)?
+                    > crate::supervisor::MAX_SUPERVISOR_LOG_BYTES
+                {
                     return Err(WorkerError::Protocol(
-                        "unindexed prelaunch supervisor log is not empty".into(),
+                        "unindexed prelaunch supervisor log exceeds its bound".into(),
                     ));
                 }
             }
@@ -2620,14 +2626,18 @@ fn validate_indexed_prelaunch_job(
             ));
         }
     }
+    // A failed earlier attempt leaves its diagnostic in `supervisor.log`;
+    // that must not stop the retry.  The supervisor lock and the recorded
+    // identities guard against a second execution, so only the bound is
+    // checked here.
     if job.entry_exists("supervisor.log")?
         && job.validate_private_append_binding(
             "supervisor.log",
             &job.open_private_append("supervisor.log")?,
-        )? != 0
+        )? > crate::supervisor::MAX_SUPERVISOR_LOG_BYTES
     {
         return Err(WorkerError::Protocol(
-            "indexed prelaunch supervisor log is not empty".into(),
+            "indexed prelaunch supervisor log exceeds its bound".into(),
         ));
     }
     Ok(())
@@ -2695,14 +2705,18 @@ pub(crate) fn validate_indexed_turn_prelaunch_job(
             ));
         }
     }
+    // A failed earlier attempt leaves its diagnostic in `supervisor.log`;
+    // that must not stop the retry.  The supervisor lock and the recorded
+    // identities guard against a second execution, so only the bound is
+    // checked here.
     if job.entry_exists("supervisor.log")?
         && job.validate_private_append_binding(
             "supervisor.log",
             &job.open_private_append("supervisor.log")?,
-        )? != 0
+        )? > crate::supervisor::MAX_SUPERVISOR_LOG_BYTES
     {
         return Err(WorkerError::Protocol(
-            "indexed prelaunch supervisor log is not empty".into(),
+            "indexed prelaunch supervisor log exceeds its bound".into(),
         ));
     }
     Ok(())
