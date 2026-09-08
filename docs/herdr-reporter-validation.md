@@ -35,6 +35,8 @@ Task `a9b9f216fedd`, submitted to `mini-1` right after the first closed, was acc
 
 `worker task cancel` released the lease and left the task `open` with outcome `cancelled`; `worker task close` then removed it. Separately, a pinned `submit` twenty-five minutes after the last facts refresh was refused with `CAPABILITY_MISSING` until `worker workers --refresh`, the stale-facts behaviour already on the backlog.
 
+Follow-up on 2026-09-09: both traps and the stale-facts refusal are fixed on `main`. `supervisor.log` now carries the redacted message beside the code, the prelaunch checks only bound the log so a retry can launch, the runner's early-exit line names the real error, and a pinned `submit` refreshes stale facts before judging capabilities.
+
 ## needs_input, a follow-up, and close (items 3 and 4)
 
 Task `001fa47a42ad`, Codex, pinned to `mini-1`, told to finish `needs_input` with one question.
