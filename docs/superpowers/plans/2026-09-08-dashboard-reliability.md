@@ -10,6 +10,96 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-08-dashboard-reliability-design.md`
 
+## Completion record (2026-09-09)
+
+Implemented and verified on branch `dashboard-reliability` at `7d91125c3d27cdaf05c5e65b3c209db55a933048`. Dashboard `src/` / `ui/` / embedded assets match `6db0679e20cea9f7aa51b59a262d37bb9c5e3269`; later commits are test-only (`37821f0`, `tests/turn_runner.rs`) and CI-only (`7d91125`, `.github/workflows/ci.yml`). The selected full gate was executed **once** on `7d91125` with `-- --test-threads=1`. That is not a default-parallel Cargo pass, not a GitHub Actions run, not a live fleet/provider run, and not a proven production FD-leak or holding-PID fix.
+
+Dashboard behavior now: Settings POST sends `X-Mac-Worker-Settings: 1` and merges one saved agent; completed logs drain available blocks to current-end (not proven EOF) and can resume if the same identity becomes live; TaskDetail keeps last-good data after a transient error and defers the log panel until a start or end timestamp; waiting-task questions load for every ID with at most six in-flight reads, leaving failures undefined.
+
+### Current full gate (`7d91125`)
+
+Local commands (sequential, owned target `/private/tmp/mac-worker-dashboard-stage4-target`):
+
+```sh
+cargo fmt --all --check
+cargo clippy --locked --offline --target-dir /private/tmp/mac-worker-dashboard-stage4-target --all-targets -- -D warnings
+cargo test --locked --offline --target-dir /private/tmp/mac-worker-dashboard-stage4-target --all-targets -- --test-threads=1
+git diff --check
+```
+
+PR workflow: `cargo test --locked --all-targets -- --test-threads=1`.
+
+| Step | Result |
+| --- | --- |
+| UI | **11** files, **87** tests, exit 0 |
+| Lint | exit 0, **15** warnings = **14** baseline identities + `ui/src/hooks/useTurnLog.ts:36` `liveRef.current = live` (`react(refs)`). Not `generation.current` in an effect. |
+| Production build + whole-tree `diff -r` | exit 0, **7** files match |
+| rustfmt, Clippy `-D warnings`, `git diff --check` | exit 0 |
+| Rust `--all-targets -- --test-threads=1` | exit **0**, **63** top-level `Running` suites, **1615** passed, **0** failed, **0** ignored, **738.252 s**. Count is last `test result:` per suite. Doctests are not in the log and are not a selected gate. Includes `turn_runner` **57** and `workers_command` **33**. Threads/processes spawned inside a test still ran. |
+
+CI isolation review of `7d91125`: spec compliant, quality Approved, 0 Critical / 0 Important / 0 Minor. Whole-branch source review of `2d1a6c4..6db0679`: Approved, 0 C/I, 17 deferred minors. Test-clock scoped review: F1 ADDRESSED.
+
+Durable numbers above stand on their own. Historical local verification artifacts used names such as `final-isolated-validation-report.md`; they are not required to read this completion record.
+
+### Commit sequence
+
+| SHA | Message |
+| --- | --- |
+| `3b54652` | `docs: plan dashboard reliability stage` |
+| `f40be0f` | `docs: resolve dashboard log finality decision` |
+| `384ba6f` | `fix: align dashboard settings save contract` |
+| `8be93e1` | `fix: drain completed dashboard turn logs` |
+| `7a5f0c0` | `fix: resume finalized dashboard logs` |
+| `507f321` | `fix: recover dashboard task attention data` |
+| `6db0679` | `ci: verify dashboard source and embedded assets` |
+| `37821f0` | `test: query runner admission cache at a pre-turn clock` |
+| `7d91125` | `ci: serialize PR cargo tests to one libtest thread` |
+
+### Task evidence (focused; not mixed into the 87)
+
+- Task 1 (`f40be0f`..`384ba6f`): GREEN focused UI 15 + Rust Settings 3; lint **14** baseline warnings, exit 0; source review Approved.
+- Task 2 (`384ba6f`..`8be93e1`, fix `7a5f0c0`): focused 16 then 17 after resume/decoder fix; RED of the fix 1 failed / 16 passed; source + scoped rereview Approved.
+- Task 3 (`7a5f0c0`..`507f321`): baseline 16, RED 6 failed / 19 passed, GREEN 25; typecheck exit 0; review Approved.
+- Task 4 (`507f321`..`6db0679`): one checked-in `npm run build`; second fresh `diff -r` exit 0 (7 files); focused `dashboard_web` 9; PR workflow `@v7` / Node 22 / `macos-15`; `release.yml` unchanged. Review Approved. No remote Actions execution.
+
+### Earlier full gates (history; default-parallel `--all-targets`, both **FAILED**)
+
+**First freeze `6db0679`:** npm ci / UI 11/87 / lint 15 / build+parity / rustfmt / Clippy / `git diff --check` exit 0. `cargo test --locked --offline --target-dir /private/tmp/mac-worker-dashboard-stage4-target --all-targets` exit **101** after **517.483 s**. PARTIAL: **62** top-level suites, **1566** passed / **16** failed / **0** ignored. First failure: `runner_refreshes_stale_agent_facts_before_claiming` (`tests/turn_runner.rs:1033`, `Protocol("refreshed facts were not cached")`), then 15 `CURRENT_DIR_LOCK` poisons. Isolated exact of that test later passed in **1.30 s**. Remaining binaries including `workers_command` were not started (fail-fast). Doctests were not started; that is not “doctests skipped as a selected gate.”
+
+**Test-clock fix `37821f0`:** only `tests/turn_runner.rs` (+12/−5). The test now queries admission at a pre-turn clock; it does not change production TTL. Controlled 2100 ms delay RED reproduced the cache error; GREEN with the same delay passed; delay not committed. Focused exact 1 passed; full `turn_runner` **57** passed; three explicit-time TTL tests in `scheduler_queue` passed. Scoped review: F1 ADDRESSED, no new C/I.
+
+**Second freeze `37821f0`:** UI 87 / lint 15 / build+parity / fmt / Clippy / diff still exit 0. Same parallel `--all-targets` command exit **101** after **19.223 s**. Lib **315 passed / 1 failed** at `runner_log::tests::pending_crash_windows_recover_without_replay` (`src/runner_log.rs:461`, Darwin **35 / WouldBlock** after `drop`). Admission-cache test did not run.
+
+**Lock/fork diagnosis:** isolated exact runner_log test passed (**0.71 s**). Serial `--lib -- --test-threads=1` **316 passed** in **50.38 s** (wall **50.728 s**). Standalone fork/flock demo: parent `LOCK_EX` + `FD_CLOEXEC`, child waits on pipe, parent closes lock fd → second `open`+`LOCK_NB` errno 35 until child exits. Holding PID/FD in the original 19 s process was **not** captured. Most long-waiting raw-fork fixtures already `exec` an isolated child; remaining work is to finish descriptor isolation at test-process creation. Serial libtest is harness mitigation, not proof that a runtime FD leak is fixed. Production extra-FD-close-before-exec paths unchanged.
+
+Task 4 originally landed default libtest threads (`6db0679`). `7d91125` added `-- --test-threads=1`. **738.252 s** is not a program-speed comparison with the fail-fast parallel runs.
+
+### Deferred minors (not fixed)
+
+Triage from whole-branch review (17 items). None required for this verified branch record. They remain open follow-ups.
+
+| Group | Items | Disposition |
+| --- | --- | --- |
+| Coverage gaps | T1-1 A→B→A pending-save test; T3-3 no first-paint ended-only test | Generation/panel branches already reviewed; extra tests optional |
+| Lint / refs | T1-2 fourteen baseline warnings; T2-3 `liveRef` render write (also the 15th warning) | oxlint exit 0; no broad cleanup in this stage |
+| Log UX / comment | T2-1 unbounded 1 Hz completed-error retry (spec-mandated); T2-2 error body hides retained text; T2-8 module comment understates per-period resume | Product/UX/comment follow-ups |
+| Test hygiene | T2-4 unasserted serialization settle; T2-5 fixed microtask hops; T2-6 / T3-2 pre-green isolation guards; T3-1 abort mock swallows late resolve | Not product defects |
+| Complexity | T2-7 large scheduling closure | Style; behavior tested |
+| Task 4 evidence | T4-1 empty first `npm_build_exit`; T4-2 YAML RED log timing; T4-3 focused Cargo flags not echoed | Historical capture gaps; do not recreate |
+| Legacy release CI | T4-4 `.github/workflows/release.yml` Node 20 / macos-14 | Separate migration; see remaining work |
+
+Final-fix note (not in the 17): theoretical >2 s backward clock step between pre-turn `query_now` and the admission stamp.
+
+### Remaining work
+
+- Diagnose and finish descriptor isolation when creating test processes that `fork`. Most long-waiting fork fixtures already exec an isolated child; serial `--test-threads=1` is a mitigation until that work lands. Explicit concurrency inside a test still runs.
+- Migrate `.github/workflows/release.yml` still on `actions/checkout@v4` / `macos-14`. Official dates: Node 20 action runtimes scheduled for removal **2026-09-23** ([changelog](https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/)); macos-14 **unsupported by 2026-11-02** ([runner-images#13518](https://github.com/actions/runner-images/issues/13518)). Those dates are published schedules, not a guarantee this workflow fails on that calendar day. PR pins: `actions/checkout@v7` / `actions/setup-node@v7` ([checkout](https://github.com/actions/checkout), [setup-node](https://github.com/actions/setup-node)); hosted `macos-15` arm64 ([hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners), [runner-images README](https://github.com/actions/runner-images/blob/main/README.md)).
+- Stage 5 measured performance (benchmark before changes). No source speedup claims here.
+
+Limitations that stay true: paired Settings tests are not one browser-to-Rust e2e; current-end is not runner-equivalent final EOF; failed question details stay undefined until a later ID-generation change (no retry protocol); no GitHub Actions or live fleet/provider execution.
+
+Historical task steps below are the implementation script; checkboxes mark that those steps ran.
+
 ## Global Constraints
 
 - Base is `2d1a6c441303758434fcb73a86d5f6999f9e5c97`; recheck HEAD/status at every handoff and preserve unrelated work.
@@ -96,7 +186,7 @@ or call that observation “confirmed final EOF.”
   callback that replaces only the matching agent; selection-generation
   invalidation for delayed saves. Task 4 later builds these source changes.
 
-- [ ] **Step 1: Confirm the assigned base and install the locked UI dependencies**
+- [x] **Step 1: Confirm the assigned base and install the locked UI dependencies**
 
 Run:
 
@@ -110,7 +200,7 @@ Expected: HEAD is the controller-provided Task 1 base descended from
 `2d1a6c4`, status contains no unrelated changes, and `npm ci` succeeds from
 `ui/package-lock.json`. Do not update the lockfile.
 
-- [ ] **Step 2: Run clean focused baselines before RED tests**
+- [x] **Step 2: Run clean focused baselines before RED tests**
 
 Run:
 
@@ -124,7 +214,7 @@ Expected: UI tests and focused Rust Settings route tests pass. Lint exits zero;
 record any existing warnings without broad cleanup. If the Cargo cache is
 incomplete, stop and report instead of silently removing `--offline`.
 
-- [ ] **Step 3: Write RED production-client request/response tests**
+- [x] **Step 3: Write RED production-client request/response tests**
 
 In `ui/src/lib/api.test.ts`, make the Fetch mock return one production-shaped
 agent entry, not `{ agents: [...] }`, and assert both request guards without
@@ -148,7 +238,7 @@ expect(saved).toMatchObject({ agent: 'codex', revision: 'rev-2' })
 
 Keep the existing 409 `ApiError` behavior test.
 
-- [ ] **Step 4: Write RED component tests for singular merge and delayed save**
+- [x] **Step 4: Write RED component tests for singular merge and delayed save**
 
 Change the Settings POST mock to return one `AgentSetting`. Add one test proving
 that after save Codex adopts `rev-2`/new values while OpenCode remains in the
@@ -172,7 +262,7 @@ agent, resolve the old save, and prove the new selected agent and its draft
 remain unchanged. Both cases must pass; worker switching exercises unmount,
 while agent switching exercises prop identity on a retained `Detail` instance.
 
-- [ ] **Step 5: Strengthen the real Axum response-shape assertion**
+- [x] **Step 5: Strengthen the real Axum response-shape assertion**
 
 In `settings_routes_read_and_protect_save`, parse the accepted POST body and
 assert it is a singular object:
@@ -187,7 +277,7 @@ Retain all existing missing-header, wrong-Origin, wrong-content-type,
 oversized-body, unknown-worker, source-call-count, and conflict assertions.
 Do not alter the route.
 
-- [ ] **Step 6: Run RED checks**
+- [x] **Step 6: Run RED checks**
 
 Run:
 
@@ -200,7 +290,7 @@ Expected: UI tests fail because the custom header/return type/merge/generation
 guard are absent. The Rust response-shape assertion should already pass; it
 locks the producer side and is not expected to be RED.
 
-- [ ] **Step 7: Implement the minimal API correction**
+- [x] **Step 7: Implement the minimal API correction**
 
 Change only the helper's header and return type:
 
@@ -224,7 +314,7 @@ export async function saveAgentSettings(
 
 Do not add `Origin`, fetch credentials, a token, or a second GET.
 
-- [ ] **Step 8: Merge only the returned agent and invalidate stale saves**
+- [x] **Step 8: Merge only the returned agent and invalidate stale saves**
 
 Change `Detail.onSaved` to accept `AgentSetting`. In `Settings`, merge by ID:
 
@@ -264,14 +354,14 @@ try {
 An unmount/identity cleanup increments the ref. Do not rely on a React `key`
 alone.
 
-- [ ] **Step 9: Run GREEN focused checks**
+- [x] **Step 9: Run GREEN focused checks**
 
 Run the Step 6 commands again.
 
 Expected: all focused UI and Rust tests pass. The stale 409 draft test, peer
 agent test, delayed worker/agent test, and route guards all pass.
 
-- [ ] **Step 10: Perform source-only review and commit**
+- [x] **Step 10: Perform source-only review and commit**
 
 Run:
 
@@ -312,7 +402,7 @@ existing wire shape and report that no-progress is not runner-equivalent proof.
   state, one in-flight read, current-end completion drain, and retry after
   transient completed-read error. Task 4 later builds it.
 
-- [ ] **Step 1: Confirm handoff and run the focused baseline**
+- [x] **Step 1: Confirm handoff and run the focused baseline**
 
 Run:
 
@@ -324,7 +414,7 @@ git status --short --branch
 
 Expected: clean Task 1 descendant and focused tests pass.
 
-- [ ] **Step 2: Add RED multi-block and live-to-completed tests**
+- [x] **Step 2: Add RED multi-block and live-to-completed tests**
 
 Use deferred Fetch responses and fake timers. Add a completed stream with at
 least `2 * MAX_LOG_CHUNK_BYTES + 4` bytes returned as three advancing chunks
@@ -340,7 +430,7 @@ expect(requestedOffsets).toEqual([0, prefixBytes, totalBytes])
 
 This must fail against the current reset-on-`live` effect.
 
-- [ ] **Step 3: Add RED UTF-8, serialization, and selection-isolation tests**
+- [x] **Step 3: Add RED UTF-8, serialization, and selection-isolation tests**
 
 Cover:
 
@@ -354,7 +444,7 @@ Cover:
 
 Use bytes rather than JavaScript string length for offsets.
 
-- [ ] **Step 4: Add RED completed-error retry and success-clear tests**
+- [x] **Step 4: Add RED completed-error retry and success-clear tests**
 
 Return one advancing block, then 503, then on the 1,000 ms retry return an empty
 successful chunk. Assert:
@@ -370,7 +460,7 @@ expect(result.current.error).toBeNull()
 Assert no remount/rerender is needed and no immediate loop occurs while the
 error is pending.
 
-- [ ] **Step 5: Run RED tests**
+- [x] **Step 5: Run RED tests**
 
 Run:
 
@@ -381,7 +471,7 @@ Run:
 Expected: fail on multi-block completion, live-state preservation, completed
 retry, no-progress error clearing, and stale decoder isolation.
 
-- [ ] **Step 6: Separate identity reset from read scheduling**
+- [x] **Step 6: Separate identity reset from read scheduling**
 
 Keep refs for offset, decoder, identity generation, active request, retry timer,
 and whether the decoder has been finalized for the current stopped reading
@@ -394,7 +484,7 @@ a finalized same-identity reader becomes live, it clears finalization and
 creates a fresh UTF-8 decoder before resuming from the preserved offset. Use an
 async recursive scheduler, not `setInterval`.
 
-- [ ] **Step 7: Implement one read outcome and serialized scheduling**
+- [x] **Step 7: Implement one read outcome and serialized scheduling**
 
 Implement one internal read attempt with explicit outcomes:
 
@@ -425,7 +515,7 @@ Never immediately repeat `idle`; never run two calls concurrently. A failed
 completed read retains text/offset/decoder and remains retryable. Never advance
 the offset for bytes that were not consumed by a usable decoder.
 
-- [ ] **Step 8: Correct the panel's finality wording**
+- [x] **Step 8: Correct the panel's finality wording**
 
 Replace “the turn is finished, nothing more will arrive” with wording that does
 not claim a terminal byte target, for example:
@@ -437,14 +527,14 @@ not claim a terminal byte target, for example:
 Keep the live wording, command, byte count, and truncation message unchanged.
 Update only the focused expectation that names the old sentence.
 
-- [ ] **Step 9: Run GREEN focused checks**
+- [x] **Step 9: Run GREEN focused checks**
 
 Run the Step 5 command.
 
 Expected: all lifecycle, offset, retry, UTF-8, cancellation, and panel tests
 pass.
 
-- [ ] **Step 10: Review source only, report the finality limitation, and commit**
+- [x] **Step 10: Review source only, report the finality limitation, and commit**
 
 Run:
 
@@ -485,7 +575,7 @@ If `TaskDetail.test.tsx` did not need a wording edit, omit it from `git add`.
   waiting-for-start state for expanded turns with no start or end timestamp.
   Task 4 later builds it.
 
-- [ ] **Step 1: Confirm handoff and run focused baselines**
+- [x] **Step 1: Confirm handoff and run focused baselines**
 
 Run:
 
@@ -497,7 +587,7 @@ git status --short --branch
 
 Expected: clean Task 2 descendant and focused tests pass.
 
-- [ ] **Step 2: Add RED TaskDetail failure/recovery tests**
+- [x] **Step 2: Add RED TaskDetail failure/recovery tests**
 
 With fake timers, return detail A, then reject one poll, then return detail B.
 Assert A remains visible with a transient error after failure. After the next
@@ -514,7 +604,7 @@ terminal must mount the existing `TurnLogPanel` and drain its available tail.
 Also verify an observed running transition starts following. Keep pre-start
 failed/ended turns readable when `ended_at_millis` is populated.
 
-- [ ] **Step 3: Add a RED hook test for more than six IDs**
+- [x] **Step 3: Add a RED hook test for more than six IDs**
 
 Create `useAttentionQuestions.test.ts`. Supply eight IDs, track active Fetch
 calls, and hold each in a deferred promise. Assert exactly six start initially;
@@ -529,7 +619,7 @@ expect(result.current[id8]?.[0]).toMatchObject({ text: 'question 8' })
 
 This fails against `.slice(0, MAX_ATTENTION_FETCHES)`.
 
-- [ ] **Step 4: Add RED mapping, empty/not-loaded, and cancellation tests**
+- [x] **Step 4: Add RED mapping, empty/not-loaded, and cancellation tests**
 
 Resolve the eight requests out of order and assert every response remains under
 its requested ID. Before an ID resolves, assert its value is `undefined`.
@@ -540,14 +630,14 @@ Rerender with a new ID generation while old deferred requests exist. Assert old
 results never publish, aborted workers stop dequeuing old IDs, and the new
 generation starts within the same six-request bound.
 
-- [ ] **Step 5: Add the view-level undefined/empty regression**
+- [x] **Step 5: Add the view-level undefined/empty regression**
 
 In `Tasks.test.tsx`, prove an unresolved waiting task shows the existing
 “Reading the question…” branch. Then resolve a genuine empty array and prove
 only that task shows the no-question copy. A failed detail must not reach the
 empty copy.
 
-- [ ] **Step 6: Run RED focused checks**
+- [x] **Step 6: Run RED focused checks**
 
 Run:
 
@@ -560,7 +650,7 @@ expanded queued turn mounts a completed log reader, only six IDs are
 attempted, failures become empty arrays, and missing entries are coalesced
 before the view branch.
 
-- [ ] **Step 7: Publish detail and clear error atomically on success**
+- [x] **Step 7: Publish detail and clear error atomically on success**
 
 In `TaskDetail.poll`:
 
@@ -583,7 +673,7 @@ mounting `TurnLogPanel`. Mount the existing unchanged panel as soon as either
 timestamp exists, with the existing `live` derivation. Do not change the log
 hook or `ActiveTurn`.
 
-- [ ] **Step 8: Replace total truncation with a six-worker queue**
+- [x] **Step 8: Replace total truncation with a six-worker queue**
 
 Keep the hook's public return type. Reset to `{}` for each ordered `key`
 generation. Use a shared integer cursor and start
@@ -614,7 +704,7 @@ const worker = async () => {
 Cleanup sets `cancelled`, aborts the shared controller, and therefore prevents
 publication and further dequeues. Do not add retries or more endpoints.
 
-- [ ] **Step 9: Preserve undefined in `Tasks`**
+- [x] **Step 9: Preserve undefined in `Tasks`**
 
 Remove the premature fallback:
 
@@ -625,7 +715,7 @@ const asked = questions[task.task_id]
 Keep the branches: `undefined` means not loaded; `[]` means a successful detail
 contained no questions; nonempty means render each mapped question.
 
-- [ ] **Step 10: Run GREEN focused checks**
+- [x] **Step 10: Run GREEN focused checks**
 
 Run the Step 6 command.
 
@@ -634,7 +724,7 @@ out-of-order/cancelled results remain isolated, task detail visibly recovers
 without changing cadence, and a queued expanded turn waits to start until a
 timestamp exists.
 
-- [ ] **Step 11: Review source only and commit**
+- [x] **Step 11: Review source only and commit**
 
 Run:
 
@@ -674,7 +764,7 @@ dispatching Task 4.
   checked-in production UI tree. The final validation agent consumes this
   frozen commit.
 
-- [ ] **Step 1: Confirm all source tasks are present and the tree is clean**
+- [x] **Step 1: Confirm all source tasks are present and the tree is clean**
 
 Run:
 
@@ -686,7 +776,7 @@ git status --short --branch
 Expected: the three reviewed task commits are present and no uncommitted source
 or asset change exists.
 
-- [ ] **Step 2: Verify external action versions from official sources**
+- [x] **Step 2: Verify external action versions from official sources**
 
 Check the official `actions/checkout` and `actions/setup-node` GitHub
 repositories or Marketplace pages on the implementation date. Reuse
@@ -695,7 +785,7 @@ major officially supporting Node 22. Record URLs, observed supported majors,
 and the chosen versions in the Task 4 report before editing YAML. Do not infer
 versions from third-party posts.
 
-- [ ] **Step 3: Add the PR workflow**
+- [x] **Step 3: Add the PR workflow**
 
 Create `.github/workflows/ci.yml` with:
 
@@ -740,14 +830,17 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --all --check
-      - run: cargo test --locked --all-targets
+      # One libtest thread: same-process raw-fork fixtures can inherit another test's flock FD after the owner drops it.
+      - run: cargo test --locked --all-targets -- --test-threads=1
       - run: cargo clippy --locked --all-targets -- -D warnings
 ```
+
+Task 4 originally landed this workflow with default libtest threads (`6db0679`). The `-- --test-threads=1` line is the later isolation commit (`7d91125`). Historical parallel `--all-targets` failures remain in the completion record above.
 
 Replace only action major versions contradicted by Step 2's official evidence.
 Do not add push, tag, deployment, worker, provider, or release triggers.
 
-- [ ] **Step 4: Run the single checked-in production build**
+- [x] **Step 4: Run the single checked-in production build**
 
 Run:
 
@@ -761,7 +854,7 @@ Expected: Vite writes only `src/dashboard/static/app/**`. Inspect status for
 deleted or newly generated files, including fonts; do not assume the four text
 files are the complete diff.
 
-- [ ] **Step 5: Compare a second fresh build with the entire embedded tree**
+- [x] **Step 5: Compare a second fresh build with the entire embedded tree**
 
 Use a newly allocated directory, never a predictable pre-existing path:
 
@@ -775,7 +868,7 @@ diff -r "$asset_dir" src/dashboard/static/app
 Expected: exit zero. `diff -r` compares all entries and catches missing, extra,
 and changed files.
 
-- [ ] **Step 6: Run Task 4's focused delivery checks**
+- [x] **Step 6: Run Task 4's focused delivery checks**
 
 Run:
 
@@ -788,7 +881,7 @@ Expected: the embedded Axum serving tests and diff check pass. The production
 build/parity checks are already recorded by Steps 4–5. Do not duplicate the
 final agent's full UI, lint, or Rust gates, and do not run provider/fleet smoke.
 
-- [ ] **Step 7: Review workflow and derived artifacts, then commit**
+- [x] **Step 7: Review workflow and derived artifacts, then commit**
 
 Run:
 
@@ -813,18 +906,17 @@ generated files. Do not push.
 
 This is a validation-agent task, not another implementation change.
 
+The selected complete gate ran once on `7d91125` with `-- --test-threads=1` (63 suites / 1615 passed / 0 failed / 738.252 s). Two earlier default-parallel `--all-targets` runs failed; those records stay history. Durable results are in the completion record above. Historical local verification used a named SDD artifact (`final-isolated-validation-report.md`); it is not a live dependency of this plan.
+
 **Files:**
-- Read: all four task diffs and reports
-- Write report only: `/private/tmp/mac-worker-dashboard-stage4/final-report.md`
+- Read: task diffs and reports
+- Write: the frozen-gate record for controller review (historical local artifact name above)
 
 **Interfaces:**
-- Consumes: frozen Task 4 commit with source, tests, workflow, and matched
-  assets.
-- Produces: one complete validation record for controller review. It makes no
-  repository commit unless a failed gate is returned to the owning
-  implementation task for a focused fix.
+- Consumes: frozen `7d91125` with source, tests, workflow, matched assets, test-clock fix, and serial libtest flag.
+- Produces: one complete validation record. It makes no repository commit unless a failed gate is returned to the owning implementation task for a focused fix.
 
-- [ ] **Step 1: Freeze and inspect repository state**
+- [x] **Step 1: Freeze and inspect repository state**
 
 Run:
 
@@ -834,9 +926,9 @@ git status --short --branch
 git log -5 --oneline
 ```
 
-Expected: clean tree with the four implementation commits in order.
+Expected: clean tree. Original Task 4 freeze had the four implementation commits ending at `6db0679`; later authorized commits are the test-clock fix and CI isolation.
 
-- [ ] **Step 2: Run the full frozen UI gate**
+- [x] **Step 2: Run the full frozen UI gate**
 
 Run:
 
@@ -849,7 +941,7 @@ Run:
 Expected: all commands exit zero. Record test-file/test counts and lint
 warnings, if any.
 
-- [ ] **Step 3: Run fresh full-tree asset parity**
+- [x] **Step 3: Run fresh full-tree asset parity**
 
 Run:
 
@@ -862,22 +954,20 @@ diff -r "$asset_dir" src/dashboard/static/app
 
 Expected: exit zero with no missing, extra, or changed file.
 
-- [ ] **Step 4: Run the full frozen Rust gate serially as commands**
+- [x] **Step 4: Run the full frozen Rust gate serially as commands**
 
-Run one command at a time with the shared target directory:
+Run one command at a time with the shared target directory. Local argv on `7d91125`:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --offline --target-dir /private/tmp/mac-worker-dashboard-stage4-target --all-targets -- -D warnings
-cargo test --locked --offline --target-dir /private/tmp/mac-worker-dashboard-stage4-target --all-targets
+cargo test --locked --offline --target-dir /private/tmp/mac-worker-dashboard-stage4-target --all-targets -- --test-threads=1
 git diff --check
 ```
 
-Expected: all exit zero. Do not start Clippy and tests concurrently. If a known
-timing-sensitive test fails, report the exact failure before any isolated
-rerun; do not conceal it with repeated runs.
+Result: all exit 0. Rust tests **63** suites, **1615** passed, **0** failed, **0** ignored, **738.252 s**. The same commands **without** `-- --test-threads=1` failed on `6db0679` (exit 101, 517.483 s, turn_runner 16 failed) and on `37821f0` (exit 101, 19.223 s, lib 1 failed). Those logs are preserved. Do not start Clippy and tests concurrently. If a known timing-sensitive test fails, report the exact failure before any isolated rerun; do not conceal it with repeated runs.
 
-- [ ] **Step 5: Review completion boundaries**
+- [x] **Step 5: Review completion boundaries**
 
 Confirm:
 
@@ -964,6 +1054,8 @@ Ruling: Defer a pending turn log panel until TaskDetail observes a start or end 
 
 Ruling: Use macos-15 for the new PR Rust job — official runner documentation already deprecates macos-14 with retirement on 2026-11-02 — cost: PR CI and the existing release workflow use different macOS versions until the separately tracked release-workflow migration.
 
-The log-finality gate is resolved. This planning commit authorizes no
-implementation by itself; the controller dispatches the already specified
-tasks separately.
+Ruling: Stabilize the runner cache regression exposed by the full dashboard gate using an explicit observation query time — the existing test checks persistence after a whole turn against a two-second wall-clock TTL — cost: this regression proves publication and refreshed capabilities, not post-turn wall-clock freshness; deterministic cache TTL tests remain the separate freshness authority.
+
+Ruling: Run the PR Rust test harness with one test-function thread — same-process raw-fork fixtures can inherit another test’s flock and keep it busy after the owner drops it, while the serial library experiment passes — cost: Rust checks take longer until fork fixtures are isolated; explicit concurrency exercised inside individual tests is retained.
+
+The log-finality gate is resolved. Tasks 1–4, the test-clock fix, and CI isolation are implemented and verified at `7d91125` as recorded above.

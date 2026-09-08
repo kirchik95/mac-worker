@@ -5,6 +5,12 @@ Approved intent: stage 4 of the pool reliability roadmap on base
 React dashboard and its delivery checks. It is not a dashboard redesign and
 does not add a task, settings, question, or log wire format.
 
+Implemented and verified on `dashboard-reliability` at
+`7d91125c3d27cdaf05c5e65b3c209db55a933048` (2026-09-09). Application code and
+embedded assets are unchanged from `6db0679`; full verification at `7d91125`
+includes the later test-only and CI-only commits. Plan filenames remain
+`2026-09-08-*`.
+
 ## Decision
 
 Deliver four separately reviewable changes in this order:
@@ -20,7 +26,11 @@ Deliver four separately reviewable changes in this order:
 The first three changes are source-and-test commits. They do not regenerate the
 checked-in UI bundle. The fourth change consumes the reviewed source, performs
 the single asset regeneration, and adds the parity gate. A final validation
-agent runs the complete frozen gate once.
+agent runs the complete frozen gate once. That gate passed once on `7d91125`
+with `-- --test-threads=1` (63 top-level suites, 1615 passed, 0 failed,
+738.252 s). Two earlier default-parallel `--all-targets` runs failed; they
+remain history. Default-parallel Cargo is not claimed green. Doctests are not a
+selected gate.
 
 ## Existing boundaries and global invariants
 
@@ -60,6 +70,8 @@ agent runs the complete frozen gate once.
 ## Settings client contract
 
 ### Current behavior
+
+Pre-stage-4 (repaired by Task 1; required behavior below is what HEAD implements).
 
 `saveAgentSettings` in `ui/src/lib/api.ts` sends JSON and the revision but omits
 `X-Mac-Worker-Settings: 1`. `request_has_settings_headers` in
@@ -122,6 +134,8 @@ executes a browser helper against the Rust fixture process.
 ## Turn-log lifecycle
 
 ### Current behavior
+
+Pre-stage-4 (repaired by Task 2 and the same-identity live-resume ruling).
 
 `useTurnLog` treats `live` as part of log identity. A `true → false` change
 clears text, offset, and decoder. A completed hook performs one request because
@@ -197,6 +211,8 @@ bound to the selected turn, or equivalent server-side proof.
 
 ### Task detail
 
+Pre-stage-4 recovery and queued-panel holes (repaired by Task 3 and the pending-panel ruling).
+
 `TaskDetail` currently keeps polling after an error, but a later success sets
 only `detail`; render still returns the old error. A successful response must
 set the new detail and clear error together. If a later request fails and a
@@ -214,6 +230,8 @@ turns remain readable when `ended_at_millis` is populated even if
 cadence, or log protocol.
 
 ### Questions
+
+Pre-stage-4 (repaired by Task 3). Failed/unrequested IDs still stay undefined; no retry protocol was added.
 
 `useAttentionQuestions` currently slices the waiting IDs to six. Replace that
 total cap with at most six asynchronous workers sharing one next-index counter.
@@ -256,9 +274,13 @@ The Rust job runs on the official GitHub-hosted `macos-15` arm64 label
 
 ```sh
 cargo fmt --all --check
-cargo test --locked --all-targets
+cargo test --locked --all-targets -- --test-threads=1
 cargo clippy --locked --all-targets -- -D warnings
 ```
+
+Local full tests add `--offline` and `--target-dir /private/tmp/mac-worker-dashboard-stage4-target` before `--all-targets`, then `-- --test-threads=1`. Independent libtest functions do not overlap. Threads or processes spawned inside a test still run. This is harness isolation after a parallel-lib WouldBlock flake; it is not proof of the holding PID/FD in that failed process. Most long-waiting raw-fork fixtures already exec an isolated child; remaining test work is to finish descriptor isolation at process creation. Task 4 originally shipped default libtest threads; `7d91125` added the flag.
+
+`--jobs 1` is not used. Removing targets, skipping tests, retries, or loosening assertions is out of scope.
 
 Before introducing `actions/setup-node` or changing an action major, the
 implementer verifies the selected version against the official action
@@ -266,9 +288,10 @@ repository/Marketplace and records the source in the task report. Existing
 `actions/checkout@v4` in the release workflow is the starting precedent, not
 permission to guess a current setup action version. Official sources on
 2026-09-08 require `actions/checkout@v7` and `actions/setup-node@v7` for the
-new PR workflow (Node 20 action runtimes are removed from runners on
-2026-09-23). The release workflow remains `actions/checkout@v4` on `macos-14`
-until a separately tracked migration.
+new PR workflow (Node 20 action runtimes are scheduled for removal from
+runners on 2026-09-23; that is a published date, not a guarantee this
+repository’s release workflow fails that day). The release workflow remains
+`actions/checkout@v4` on `macos-14` until a separately tracked migration.
 
 After Tasks 1–3 pass source review, Task 4 runs the normal UI production build
 once into `src/dashboard/static/app`, reviews all generated additions,
@@ -300,12 +323,22 @@ duplicating test runs.
 
 The final validation agent runs, on one frozen revision: full UI tests and lint,
 a fresh temp production build against the checked-in complete asset tree, Rust
-formatting, all-target Clippy, all-target tests, and `git diff --check`. It owns
-all full gates and uses `/private/tmp/mac-worker-dashboard-stage4-target`.
+formatting, all-target Clippy, all-target tests with `-- --test-threads=1`, and
+`git diff --check`. It owns all full gates and uses
+`/private/tmp/mac-worker-dashboard-stage4-target`. On `7d91125` that selected
+gate passed: UI 11 files / 87 tests; lint 15 warnings (14 baseline +
+`useTurnLog.ts:36` `liveRef.current = live`); 7-file whole-tree parity; rustfmt
+and Clippy `-D warnings`; Rust **63** suites, **1615** passed, **0** failed,
+**0** ignored, **738.252 s**. Doctests are not a selected gate.
 
-Completion requires all four task commits, source review before generated
-assets, generated-asset review, final parity, no unrelated files, and an
-explicit report of the log-finality limitation.
+Implementation plus this verification is complete at `7d91125` as a branch
+record. It is not a GitHub Actions, live-fleet, or main-line claim. Failed
+question details stay undefined until a later waiting-ID generation changes;
+this stage adds no question retry protocol.
+
+Recorded UI lint: **15** warnings (14 baseline identities plus
+`useTurnLog.ts:36` `liveRef.current = live` render-write). Not
+`generation.current` inside an effect. None resolved in this stage.
 
 ## Completion decisions
 
@@ -321,12 +354,24 @@ Ruling: Defer a pending turn log panel until TaskDetail observes a start or end 
 
 Ruling: Use macos-15 for the new PR Rust job — official runner documentation already deprecates macos-14 with retirement on 2026-11-02 — cost: PR CI and the existing release workflow use different macOS versions until the separately tracked release-workflow migration.
 
-The log-finality gate is resolved. Task 2 may implement the bounded available-log
-behavior above without changing the protocol.
+Ruling: Stabilize the runner cache regression exposed by the full dashboard gate using an explicit observation query time — the existing test checks persistence after a whole turn against a two-second wall-clock TTL — cost: this regression proves publication and refreshed capabilities, not post-turn wall-clock freshness; deterministic cache TTL tests remain the separate freshness authority.
+
+Ruling: Run the PR Rust test harness with one test-function thread — same-process raw-fork fixtures can inherit another test’s flock and keep it busy after the owner drops it, while the serial library experiment passes — cost: Rust checks take longer until fork fixtures are isolated; explicit concurrency exercised inside individual tests is retained.
+
+The log-finality gate is resolved. Task 2 implemented the bounded available-log
+behavior above without changing the protocol. Follow-up test infrastructure:
+diagnose and finish descriptor isolation during test process creation; most
+long-waiting fork fixtures already exec an isolated child. Serial libtest is a
+mitigation, not a proven runtime FD-leak fix. Follow-up delivery: migrate
+`.github/workflows/release.yml` (still `actions/checkout@v4` on `macos-14`)
+using the published dates and primary sources recorded in the stage-4 plan
+remaining-work list, without treating those dates as a guaranteed break day.
 
 ## Non-goals
 
 No visual redesign, new authentication token, manual Origin header, new
 question protocol, task-answer mutation, polling optimization, direct task
 lookup, SSE/WebSocket transport, live fleet smoke, provider execution, release,
-push, deployment, or unrelated cleanup belongs to this stage.
+push, deployment, unrelated cleanup, GitHub Actions execution as proof, or
+source performance claims belongs to this stage. Paired Settings tests are not
+one browser-to-Rust e2e.
