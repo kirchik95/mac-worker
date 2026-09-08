@@ -103,6 +103,8 @@ worker workers --refresh
 
 The dashboard opens locally in your browser. To submit and return immediately, omit `--wait`.
 
+If a turn fails, run `worker task logs <task-id>` to see agent diagnostics and the recorded failure reason. Use `--turn N` to inspect an earlier turn, or `--raw` for the original log bytes.
+
 ## How it works
 
 Your laptop coordinates the work. The selected Mac runs the agent and keeps its task workspace. This diagram shows the default flow, using a local repository as the source:

@@ -911,20 +911,76 @@ impl<'a> TaskClient<'a> {
         _stderr: &mut dyn Write,
     ) -> Result<(), WorkerError> {
         let mut record = self.client_state.load_task(task_id)?;
-        let selected = select_turn(record.status(), turn)?;
-        let turn_id = selected.turn_id();
-        let mut offset = 0_u64;
-        loop {
-            let bytes = self.read_runner_log(task_id, turn_id)?;
-            if raw {
-                stdout.write_all(&bytes[offset as usize..])?;
-            } else {
-                render_agent_log(&bytes[offset as usize..], record.meta().agent(), stdout)?;
+        let turn_id = if record.status().turns().is_empty() && turn.is_none_or(|number| number == 1)
+        {
+            // Before host acceptance the first turn has no summary yet. Its
+            // private turn directory still identifies an early runner log.
+            // UUID order does not establish chronology, so never guess when
+            // more than one directory exists.
+            match self.client_state.turn_ids_for_task(task_id)?.as_slice() {
+                [turn_id] => *turn_id,
+                _ => return Err(task_error("TASK_LOG_NOT_FOUND", "task has no turn logs")),
             }
-            offset = bytes.len() as u64;
-            stdout.flush()?;
+        } else {
+            select_turn(record.status(), turn)?.turn_id()
+        };
+        let mut offset = 0;
+        let mut reported_failure = None;
+        loop {
+            // Observe completion before reading bytes so a final diagnostic
+            // written just before the status update is included in this read.
             record = self.client_state.load_task(task_id)?;
-            if !follow || record.status().state().is_terminal() {
+            let finished = !follow || record.status().state().is_terminal();
+            let failure = if raw {
+                None
+            } else {
+                record
+                    .status()
+                    .turns()
+                    .iter()
+                    .find(|turn| turn.turn_id() == turn_id)
+                    .and_then(turn_failure)
+            };
+            let bytes = match self.read_runner_log(task_id, turn_id) {
+                Ok(bytes) => Some(bytes),
+                // A cancelled parked turn may never have started a runner.
+                // Its recorded failure remains useful without a log file.
+                Err(WorkerError::Io(error))
+                    if error.kind() == io::ErrorKind::NotFound && failure.is_some() =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(bytes) = bytes {
+                let end = if raw || finished {
+                    bytes.len()
+                } else {
+                    // A poll may end inside JSON or a UTF-8 code point. Leave
+                    // the incomplete line for the next poll; the final read
+                    // flushes any remaining tail.
+                    bytes
+                        .iter()
+                        .rposition(|byte| *byte == b'\n')
+                        .map_or(0, |index| index + 1)
+                };
+                if raw {
+                    stdout.write_all(&bytes[offset..end])?;
+                } else {
+                    render_agent_log(&bytes[offset..end], record.meta().agent(), stdout)?;
+                }
+                offset = end;
+            }
+            // Completed turns normally leave the task Open. Report their
+            // failure now while still following later publication updates.
+            if failure != reported_failure {
+                if let Some(line) = &failure {
+                    writeln!(stdout, "{line}")?;
+                }
+                reported_failure = failure;
+            }
+            stdout.flush()?;
+            if finished {
                 break;
             }
             std::thread::sleep(WAIT_POLL);
@@ -2372,9 +2428,25 @@ fn render_agent_log(
                 crate::agent::AgentEvent::TurnEnd { reason } => reason,
             };
             writeln!(stdout, "{rendered}")?;
+        } else if serde_json::from_str::<serde_json::Value>(line).is_err() {
+            // Runner logs also contain plain stderr and pre-launch failures.
+            // Keep unrecognized structured events hidden, but do not discard
+            // the diagnostics needed to explain why an agent did not start.
+            writeln!(stdout, "{line}")?;
         }
     }
     Ok(())
+}
+
+fn turn_failure(turn: &TurnSummary) -> Option<String> {
+    let description = match turn.outcome() {
+        Some(TaskOutcome::Failed { reason }) => format!("failed: {reason}"),
+        Some(outcome @ (TaskOutcome::Cancelled | TaskOutcome::TimedOut | TaskOutcome::Lost)) => {
+            outcome.kind().to_owned()
+        }
+        _ => return None,
+    };
+    Some(format!("turn {} {description}", turn.turn_number()))
 }
 
 fn task_worker<'a>(
