@@ -125,6 +125,37 @@ This version of mac-worker invokes Cursor as `cursor-agent`. If the official ins
 
 Use only the selected agent to finish your first task. Additional agents can be installed and checked later.
 
+## Show turns in herdr (optional)
+
+If [herdr](https://herdr.dev) runs on the worker, the pool can show its turns in that herdr, and through herdr's machine link or the herdr-mirror plugin, in the herdr on your laptop.
+
+1. Start herdr's server on the worker as the worker account and keep it running. Its default session must own the socket `~/.config/herdr/herdr.sock`:
+
+   ```sh
+   herdr status server
+   ```
+
+2. On the laptop, turn the reporter on for that worker in `~/.config/mac-worker/config.toml` and rerun setup so the worker's facts include herdr:
+
+   ```toml
+   [[workers]]
+   name = "mini-1"
+   ssh = "yourname@mini.local"
+   slots = 1
+   herdr = true
+   ```
+
+   ```sh
+   worker setup mini-1
+   worker doctor
+   ```
+
+   `doctor` prints `herdr: available (<version>)` for the worker, or warns with `HERDR_UNAVAILABLE` and says why. Turns run either way; the warning only means nothing will show up in herdr.
+
+3. Add the worker as a machine in your laptop's herdr (`herdr machine add <ssh-target>`) or run the herdr-mirror plugin, so the `mac-worker` workspace and its `task <id> · turn <n>` tabs appear beside your local agents. Custom sidebar rows can name the tokens `task`, `turn`, `mw_title`, `mw_agent`, and `mw_outcome`.
+
+The reporter only reads the worker's task records and writes nothing to disk on its own; `worker task close` and `worker gc --apply` remove the tabs it opened.
+
 ## Environment profiles
 
 Profiles are optional. They supply agent variables or unlock a headless login keychain. On the **worker**, create a private profile named `agents`:

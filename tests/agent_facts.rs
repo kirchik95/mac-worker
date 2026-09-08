@@ -1,5 +1,4 @@
 #[path = "support/fake_herdr.rs"]
-#[allow(dead_code)]
 mod fake_herdr;
 
 use std::{
