@@ -1114,3 +1114,42 @@ proptest! {
 fn hex_id_helper_matches_task_id_display() {
     assert_eq!(task_id().to_string(), hex_id(1));
 }
+
+#[test]
+fn turn_summary_carries_an_optional_herdr_report() {
+    use mac_worker::task::{HerdrTurnReport, HerdrTurnState};
+
+    let plain = TurnSummary::new(1, turn_id(), None, None, None, false, None, None);
+    let plain_json = serde_json::to_string(&plain).unwrap();
+    assert!(!plain_json.contains("herdr"), "{plain_json}");
+
+    let attached = plain.clone().with_herdr(Some(HerdrTurnReport {
+        state: HerdrTurnState::Attached,
+        pane_id: Some("w3:p1".into()),
+    }));
+    let json = serde_json::to_string(&attached).unwrap();
+    assert!(
+        json.contains(r#""herdr":{"state":"attached","pane_id":"w3:p1"}"#),
+        "{json}"
+    );
+    let back: TurnSummary = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, attached);
+
+    let old: TurnSummary = serde_json::from_str(&plain_json).unwrap();
+    assert_eq!(old.herdr(), None);
+    assert_eq!(old, plain);
+
+    let unavailable: TurnSummary = serde_json::from_str(&json.replace(
+        r#"{"state":"attached","pane_id":"w3:p1"}"#,
+        r#"{"state":"unavailable"}"#,
+    ))
+    .unwrap();
+    assert_eq!(
+        unavailable.herdr().map(|report| report.state),
+        Some(HerdrTurnState::Unavailable)
+    );
+    assert!(
+        serde_json::from_str::<TurnSummary>(&json.replace(r#""pane_id""#, r#""pane""#)).is_err(),
+        "the herdr report rejects unknown fields"
+    );
+}

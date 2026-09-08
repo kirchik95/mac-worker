@@ -1,0 +1,3 @@
+session ses_PLACEHOLDER
+ok
+{"type":"step_finish","timestamp":3,"sessionID":"ses_PLACEHOLDER","part":{"id":"prt_3","reason":"stop","tokens":{"input"

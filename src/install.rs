@@ -8,8 +8,8 @@ use crate::{
     error::WorkerError,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
-        HealthStatus, PROTOCOL_VERSION, ProbeResponse, SetupFailureKind, SetupHostResult,
-        SetupWarning, SetupWarningCode,
+        HERDR_UNAVAILABLE_MESSAGE, HealthStatus, PROTOCOL_VERSION, ProbeResponse, SetupFailureKind,
+        SetupHostResult, SetupWarning, SetupWarningCode,
     },
     transport::{SshTransport, ssh_request},
 };
@@ -282,8 +282,22 @@ impl<'a> Installer<'a> {
             );
         }
 
+        // Spec 5.3: the operator asked for the reporter, but the verification
+        // probe's fresh herdr fact is not `available`.  A warning, never a
+        // failure: the host is installed and the pool is complete without
+        // herdr.
+        let herdr_warning = (worker.herdr
+            && !health
+                .probe
+                .as_ref()
+                .is_some_and(ProbeResponse::herdr_available))
+        .then(|| SetupWarning {
+            code: SetupWarningCode::HerdrUnavailable,
+            message: HERDR_UNAVAILABLE_MESSAGE.to_owned(),
+        });
         let protocol_version = health.probe.map(|probe| probe.protocol_version);
-        let warnings = self.success_cleanup_warnings(worker, &id, &digest);
+        let mut warnings = self.success_cleanup_warnings(worker, &id, &digest);
+        warnings.extend(herdr_warning);
         SetupHostResult {
             name: worker.name.clone(),
             ssh: worker.ssh.clone(),

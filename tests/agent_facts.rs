@@ -1,11 +1,19 @@
+#[path = "support/fake_herdr.rs"]
+mod fake_herdr;
+
 use std::{
-    ffi::OsString, os::unix::process::ExitStatusExt, path::Path, sync::Mutex, time::Duration,
+    ffi::OsString,
+    os::unix::process::ExitStatusExt,
+    path::Path,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 
+use fake_herdr::{FakeHerdr, Reply};
 use mac_worker::{
     agent_facts::{
-        AgentAuth, AgentFacts, AgentProbe, EnvProfile, FACTS_TTL, ProfileProbe,
-        collect_agent_facts_at,
+        AgentAuth, AgentFacts, AgentProbe, EnvProfile, FACTS_TTL, HerdrFactState, HerdrFacts,
+        ProfileProbe, collect_agent_facts_at,
     },
     error::WorkerError,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
@@ -14,6 +22,7 @@ use mac_worker::{
 const COLLECTED_AT: u64 = 100_000;
 const SECRET: &str = "PLANTED_PROFILE_SECRET";
 const ACCOUNT_HOME: &str = "/Users/worker";
+const HERDR_VERSION: &str = "0.9.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scenario {
@@ -29,8 +38,17 @@ enum Scenario {
     KeychainOrdering,
 }
 
+/// What the scripted account login shell knows about a `herdr` binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HerdrBinary {
+    Missing,
+    Installed,
+    VersionFails,
+}
+
 struct FakeProcessRunner {
     scenario: Scenario,
+    herdr: HerdrBinary,
     requests: Mutex<Vec<ProcessRequest>>,
     events: Mutex<Vec<String>>,
     keychain_unlocked: Mutex<bool>,
@@ -38,8 +56,13 @@ struct FakeProcessRunner {
 
 impl FakeProcessRunner {
     fn new(scenario: Scenario) -> Self {
+        Self::with_herdr(scenario, HerdrBinary::Missing)
+    }
+
+    fn with_herdr(scenario: Scenario, herdr: HerdrBinary) -> Self {
         Self {
             scenario,
+            herdr,
             requests: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
             keychain_unlocked: Mutex::new(false),
@@ -121,11 +144,29 @@ impl ProcessRunner for FakeProcessRunner {
         if program == "/bin/zsh" && args.first().map(String::as_str) == Some("-lc") {
             assert!(request.isolate_parent_environment);
             let shell = args.last().map(String::as_str).unwrap_or_default();
+            // The herdr lookups extend PATH with `~/.local/bin` before the
+            // command proper, which follows the last `; `.
+            let (prefix, shell) = match shell.rsplit_once("; ") {
+                Some((prefix, command)) => (Some(prefix), command),
+                None => (None, shell),
+            };
             if shell.starts_with("command -v ") {
                 if self.scenario == Scenario::NoBinariesResolve {
                     return Ok(failure(b"command not found\n"));
                 }
                 let binary = shell.strip_prefix("command -v ").unwrap_or_default();
+                if binary == "herdr" {
+                    assert!(
+                        prefix.is_some_and(|prefix| prefix.contains("$HOME/.local/bin")),
+                        "the herdr lookup must search ~/.local/bin: {prefix:?}"
+                    );
+                    return Ok(match self.herdr {
+                        HerdrBinary::Missing => failure(b"herdr: command not found\n"),
+                        HerdrBinary::Installed | HerdrBinary::VersionFails => {
+                            success(b"/Users/worker/.local/bin/herdr\n")
+                        }
+                    });
+                }
                 if self.scenario == Scenario::KeychainOrdering && binary != "claude" {
                     return Ok(failure(b"command not found\n"));
                 }
@@ -133,6 +174,19 @@ impl ProcessRunner for FakeProcessRunner {
                     return Ok(failure(b"opencode: command not found\n"));
                 }
                 return Ok(success(format!("/opt/tools/{binary}\n").as_bytes()));
+            }
+            if shell == "exec 'herdr' '--version'" {
+                assert!(
+                    prefix.is_some_and(|prefix| prefix.contains("$HOME/.local/bin")),
+                    "the herdr version probe must search ~/.local/bin: {prefix:?}"
+                );
+                return Ok(match self.herdr {
+                    HerdrBinary::Installed => {
+                        success(format!("herdr {HERDR_VERSION}\n").as_bytes())
+                    }
+                    HerdrBinary::VersionFails => failure(b"herdr: unrecognized option\n"),
+                    HerdrBinary::Missing => panic!("herdr --version ran without a herdr binary"),
+                });
             }
             if shell.starts_with("exec ") {
                 return self.exec_command(request, shell);
@@ -544,6 +598,7 @@ fn facts_are_stale_only_after_the_ttl_and_age_subtraction_is_saturating() {
         env_profiles: Vec::new(),
         git_identity: false,
         collected_at_millis: COLLECTED_AT,
+        herdr: None,
     };
     assert!(!facts.is_stale(COLLECTED_AT.saturating_sub(1)));
     assert!(!facts.is_stale(COLLECTED_AT + FACTS_TTL));
@@ -565,6 +620,7 @@ fn dto_json_is_canonical_and_rejects_unknown_or_duplicate_fields() {
         }],
         git_identity: true,
         collected_at_millis: COLLECTED_AT,
+        herdr: None,
     };
     let bytes = facts.canonical_bytes().unwrap();
     let parsed: AgentFacts = serde_json::from_slice(&bytes).unwrap();
@@ -677,5 +733,185 @@ fn login_shell_command_resolution_failure_omits_all_agents() {
     assert!(
         facts.agents.is_empty(),
         "when login-shell command -v fails for every adapter, no agent probes should be emitted"
+    );
+}
+
+#[test]
+fn herdr_facts_round_trip_and_stay_absent_for_records_that_predate_them() {
+    let without = AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: false,
+        collected_at_millis: COLLECTED_AT,
+        herdr: None,
+    };
+    let bytes = without.canonical_bytes().unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("herdr"));
+    let back: AgentFacts = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(back, without);
+
+    for (state, tag) in [
+        (HerdrFactState::Available, "available"),
+        (HerdrFactState::NotInstalled, "not_installed"),
+        (HerdrFactState::NoSocket, "no_socket"),
+        (HerdrFactState::NoResponse, "no_response"),
+    ] {
+        let facts = AgentFacts {
+            herdr: Some(HerdrFacts {
+                state,
+                version: Some("0.9.0".into()),
+            }),
+            ..without.clone()
+        };
+        let json = String::from_utf8(facts.canonical_bytes().unwrap()).unwrap();
+        assert!(
+            json.contains(&format!(r#""herdr":{{"state":"{tag}","version":"0.9.0"}}"#)),
+            "{json}"
+        );
+        let back: AgentFacts = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, facts);
+    }
+
+    let bad = AgentFacts {
+        herdr: Some(HerdrFacts {
+            state: HerdrFactState::Available,
+            version: Some("0.9\u{7}".into()),
+        }),
+        ..without
+    };
+    assert!(
+        bad.canonical_bytes().is_err(),
+        "control characters never reach the record"
+    );
+}
+
+fn shell_command(request: &ProcessRequest) -> &str {
+    request
+        .args
+        .last()
+        .and_then(|argument| argument.to_str())
+        .unwrap_or_default()
+}
+
+fn requests_containing(runner: &FakeProcessRunner, needle: &str) -> Vec<ProcessRequest> {
+    runner
+        .requests()
+        .into_iter()
+        .filter(|request| shell_command(request).contains(needle))
+        .collect()
+}
+
+fn herdr_fact(state: HerdrFactState, version: Option<&str>) -> Option<HerdrFacts> {
+    Some(HerdrFacts {
+        state,
+        version: version.map(str::to_owned),
+    })
+}
+
+#[test]
+fn herdr_fact_is_not_installed_when_no_binary_resolves_on_the_login_shell() {
+    let runner = FakeProcessRunner::new(Scenario::AllAgents);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
+
+    assert_eq!(facts.herdr, herdr_fact(HerdrFactState::NotInstalled, None));
+    let lookups = requests_containing(&runner, "command -v herdr");
+    assert_eq!(lookups.len(), 1, "one herdr lookup through the login shell");
+    assert_eq!(lookups[0].program, OsString::from("/bin/zsh"));
+    assert!(lookups[0].isolate_parent_environment);
+    assert!(
+        shell_command(&lookups[0]).contains("$HOME/.local/bin"),
+        "the lookup must reach herdr's install directory: {:?}",
+        shell_command(&lookups[0])
+    );
+    assert!(
+        requests_containing(&runner, "'herdr' '--version'").is_empty(),
+        "no version probe runs without a binary"
+    );
+}
+
+#[test]
+fn herdr_fact_is_no_socket_when_the_binary_answers_without_a_socket() {
+    let home = tempfile::tempdir().unwrap();
+    let runner = FakeProcessRunner::with_herdr(Scenario::AllAgents, HerdrBinary::Installed);
+    let facts = collect_agent_facts_at(&runner, home.path(), &profiles(), COLLECTED_AT);
+
+    assert_eq!(
+        facts.herdr,
+        herdr_fact(HerdrFactState::NoSocket, Some(HERDR_VERSION))
+    );
+    let versions = requests_containing(&runner, "'herdr' '--version'");
+    assert_eq!(versions.len(), 1, "one version probe for one binary");
+    let version = &versions[0];
+    assert_eq!(version.program, OsString::from("/bin/zsh"));
+    assert!(version.isolate_parent_environment);
+    assert!(
+        version
+            .environment
+            .iter()
+            .any(|(name, value)| name == "HOME" && value == home.path().as_os_str())
+    );
+    assert_eq!(
+        version.policy,
+        ProcessPolicy {
+            stdout_limit: 4 * 1024,
+            stderr_limit: 4 * 1024,
+            deadline: Duration::from_secs(2),
+        }
+    );
+}
+
+#[test]
+fn herdr_fact_keeps_the_socket_state_when_the_version_probe_fails() {
+    let home = tempfile::tempdir().unwrap();
+    let runner = FakeProcessRunner::with_herdr(Scenario::AllAgents, HerdrBinary::VersionFails);
+    let facts = collect_agent_facts_at(&runner, home.path(), &profiles(), COLLECTED_AT);
+
+    assert_eq!(facts.herdr, herdr_fact(HerdrFactState::NoSocket, None));
+}
+
+#[test]
+fn herdr_fact_is_available_when_the_socket_answers_ping_and_no_path_crosses_it() {
+    let home = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start_in_home(home.path());
+    let runner = FakeProcessRunner::with_herdr(Scenario::AllAgents, HerdrBinary::Installed);
+    let facts = collect_agent_facts_at(&runner, home.path(), &profiles(), COLLECTED_AT);
+
+    assert_eq!(
+        facts.herdr,
+        herdr_fact(HerdrFactState::Available, Some(HERDR_VERSION))
+    );
+    assert_eq!(herdr.requests_for("ping").len(), 1);
+    assert_eq!(
+        herdr.requests().len(),
+        1,
+        "the fact costs exactly one request"
+    );
+    let wire = serde_json::to_string(&herdr.requests()).unwrap();
+    let home_text = home.path().to_string_lossy().into_owned();
+    for forbidden in [home_text.as_str(), "/Users/", "/home/", "~"] {
+        assert!(
+            !wire.contains(forbidden),
+            "{forbidden:?} crossed the herdr socket: {wire}"
+        );
+    }
+}
+
+#[test]
+fn herdr_fact_is_no_response_when_the_socket_stays_silent() {
+    let home = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start_in_home(home.path());
+    herdr.reply("ping", Reply::Silence);
+    let runner = FakeProcessRunner::with_herdr(Scenario::AllAgents, HerdrBinary::Installed);
+
+    let started = Instant::now();
+    let facts = collect_agent_facts_at(&runner, home.path(), &profiles(), COLLECTED_AT);
+
+    assert_eq!(
+        facts.herdr,
+        herdr_fact(HerdrFactState::NoResponse, Some(HERDR_VERSION))
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "the ping honours the client deadlines"
     );
 }

@@ -184,6 +184,7 @@ Node.js is needed only when changing the dashboard source in `ui/`; its built as
 - [Installation recovery](docs/setup-recovery.md): retained installer state and older host layouts.
 - [Build and publish a release](docs/releasing.md): archives, checksums and Homebrew distribution.
 - [Acceptance runbook](docs/phase-five-acceptance-runbook.md) and [validation record](docs/phase-five-validation.md).
+- [Herdr reporter validation](docs/herdr-reporter-validation.md): turns in the herdr sidebar, notifications, and the herdr facts, proven on the pool.
 - [Design notes](docs/superpowers/specs/) and [implementation plans](docs/superpowers/plans/).
 
 ## License

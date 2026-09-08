@@ -193,12 +193,14 @@ fn origin_worker() -> WorkerEntry {
         slots: 1,
         capabilities: vec!["darwin-arm64".into(), "origin:gitlab.example.com".into()],
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 
 fn origin_config() -> Config {
     Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![origin_worker()],
     }
 }

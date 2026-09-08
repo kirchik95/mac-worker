@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Deserializer};
 
 use crate::{
-    agent::{AgentKind, PermissionPolicy, TurnLimits, adapter_for, result_instruction},
+    agent::{AgentKind, PermissionPolicy, TurnLimits, result_instruction},
     client_state::ClientStateStore,
     config::{Config, WorkerEntry},
     error::WorkerError,
@@ -486,6 +486,7 @@ pub struct TaskClient<'a> {
     pub(crate) paths: &'a PathLayout,
     pub(crate) client_state: &'a ClientStateStore,
     pub(crate) executor: &'a dyn RunnerExecutor,
+    pub(crate) herdr_notifier: Option<crate::herdr::HerdrSocket>,
 }
 
 impl<'a> TaskClient<'a> {
@@ -502,7 +503,15 @@ impl<'a> TaskClient<'a> {
             paths,
             client_state,
             executor,
+            herdr_notifier: None,
         }
+    }
+
+    /// Herdr session the runners this client starts inline notify about
+    /// finished turns.  Detached runners receive theirs from the CLI.
+    pub fn with_herdr_notifier(mut self, socket: Option<crate::herdr::HerdrSocket>) -> Self {
+        self.herdr_notifier = socket;
+        self
     }
 
     pub fn with_detached_executor(
@@ -833,6 +842,7 @@ impl<'a> TaskClient<'a> {
                 self.client_state,
                 self.executor,
             )
+            .with_notifier(self.herdr_notifier.clone())
             .run(task_id, turn_id, Some(&mut follow))?;
             report.status = outcome.status().clone();
             report.events.extend(outcome.events().iter().cloned());
@@ -1031,7 +1041,11 @@ impl<'a> TaskClient<'a> {
                 if raw {
                     stdout.write_all(&bytes[offset..end])?;
                 } else {
-                    render_agent_log(&bytes[offset..end], record.meta().agent(), stdout)?;
+                    crate::turn_log::render_agent_log(
+                        &bytes[offset..end],
+                        record.meta().agent(),
+                        stdout,
+                    )?;
                 }
                 offset = end;
             }
@@ -1599,6 +1613,7 @@ impl<'a> TaskClient<'a> {
                 self.client_state,
                 self.executor,
             )
+            .with_notifier(self.herdr_notifier.clone())
             .run(task_id, entry.job_id(), Some(stdout))?;
             report.status = outcome.status().clone();
             report.events.extend(outcome.events().iter().cloned());
@@ -2462,6 +2477,7 @@ impl<'a> TaskClient<'a> {
             .map(|worker| {
                 let one = Config {
                     version: self.config.version,
+                    notifications: crate::config::NotificationsConfig::default(),
                     workers: vec![worker.clone()],
                 };
                 let cached = self.client_state.admission_observation(
@@ -2556,41 +2572,6 @@ fn select_turn(status: &TaskStatus, turn: Option<u32>) -> Result<&TurnSummary, W
                 .ok_or_else(|| task_error("TASK_LOG_NOT_FOUND", "turn log was not found"))
         },
     )
-}
-
-fn render_agent_log(
-    bytes: &[u8],
-    agent: AgentKind,
-    stdout: &mut dyn Write,
-) -> Result<(), WorkerError> {
-    let text = String::from_utf8_lossy(bytes);
-    let adapter = adapter_for(agent);
-    for line in text.lines() {
-        if let Some(event) = adapter.parse_event(line) {
-            let rendered = match event {
-                crate::agent::AgentEvent::AssistantMessage { text } => text,
-                crate::agent::AgentEvent::ToolCall { name, summary } => {
-                    format!("{name}: {summary}")
-                }
-                crate::agent::AgentEvent::FileChange { paths } => paths.join(", "),
-                crate::agent::AgentEvent::Command { summary, exit_code } => {
-                    format!("{summary} ({exit_code:?})")
-                }
-                crate::agent::AgentEvent::Usage { .. } => "usage".into(),
-                crate::agent::AgentEvent::SessionStarted { session_ref } => {
-                    format!("session {session_ref}")
-                }
-                crate::agent::AgentEvent::TurnEnd { reason } => reason,
-            };
-            writeln!(stdout, "{rendered}")?;
-        } else if serde_json::from_str::<serde_json::Value>(line).is_err() {
-            // Runner logs also contain plain stderr and pre-launch failures.
-            // Keep unrecognized structured events hidden, but do not discard
-            // the diagnostics needed to explain why an agent did not start.
-            writeln!(stdout, "{line}")?;
-        }
-    }
-    Ok(())
 }
 
 fn turn_failure(turn: &TurnSummary) -> Option<String> {

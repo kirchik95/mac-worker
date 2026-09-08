@@ -194,6 +194,7 @@ fn worker() -> WorkerEntry {
         slots: 1,
         capabilities: vec!["darwin-arm64".into()],
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 
@@ -2215,4 +2216,150 @@ fn error_report_fallback_ignores_a_broken_stderr_writer() {
     );
 
     assert_eq!(exit, 64);
+}
+
+fn probe_json_with_herdr(herdr: Option<serde_json::Value>, facts_age_millis: u64) -> Vec<u8> {
+    let mut probe: serde_json::Value = serde_json::from_slice(&valid_probe_json()).unwrap();
+    let mut facts = serde_json::json!({
+        "agents": [],
+        "env_profiles": [],
+        "git_identity": true,
+        "collected_at_millis": 10,
+    });
+    if let Some(herdr) = herdr {
+        facts["herdr"] = herdr;
+    }
+    probe["agent_facts"] = facts;
+    probe["facts_age_millis"] = serde_json::json!(facts_age_millis);
+    serde_json::to_vec(&probe).unwrap()
+}
+
+fn herdr_worker() -> WorkerEntry {
+    WorkerEntry {
+        herdr: true,
+        ..worker()
+    }
+}
+
+/// A byte-matched, verified install whose final verification probe answers
+/// with `probe`.
+fn install_with_verification_probe(probe: Vec<u8>, worker: &WorkerEntry) -> SetupHostResult {
+    let (_directory, current_exe) = executable_fixture();
+    let mut results = success_results();
+    results[7] = Ok(result(0, probe, b""));
+    let runner = RecordingRunner::returning_results(results);
+    let installer =
+        Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+    installer.install(&current_exe, worker)
+}
+
+fn herdr_unavailable_warning() -> SetupWarning {
+    SetupWarning {
+        code: SetupWarningCode::HerdrUnavailable,
+        message: mac_worker::protocol::HERDR_UNAVAILABLE_MESSAGE.into(),
+    }
+}
+
+#[test]
+fn verified_install_with_herdr_requested_but_unavailable_stays_installed_with_typed_warning() {
+    // Spec 5.3: `herdr = true` with any fact but `available` is a setup
+    // warning; the host still reports installed with its protocol version.
+    use mac_worker::agent_facts::FACTS_TTL;
+
+    for (label, probe) in [
+        (
+            "not installed",
+            probe_json_with_herdr(Some(serde_json::json!({ "state": "not_installed" })), 0),
+        ),
+        (
+            "no socket",
+            probe_json_with_herdr(
+                Some(serde_json::json!({ "state": "no_socket", "version": "0.9.0" })),
+                0,
+            ),
+        ),
+        (
+            "no response",
+            probe_json_with_herdr(
+                Some(serde_json::json!({ "state": "no_response", "version": "0.9.0" })),
+                0,
+            ),
+        ),
+        ("facts predating the fact", probe_json_with_herdr(None, 0)),
+        (
+            "stale facts",
+            probe_json_with_herdr(
+                Some(serde_json::json!({ "state": "available", "version": "0.9.0" })),
+                FACTS_TTL + 1,
+            ),
+        ),
+        ("no facts", valid_probe_json()),
+    ] {
+        let installed = install_with_verification_probe(probe, &herdr_worker());
+
+        assert!(installed.installed, "{label}");
+        assert_eq!(
+            installed.protocol_version,
+            Some(PROTOCOL_VERSION),
+            "{label}"
+        );
+        assert_eq!(installed.error_code, None, "{label}");
+        assert_eq!(installed.error_message, None, "{label}");
+        assert_eq!(
+            installed.warnings,
+            vec![herdr_unavailable_warning()],
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn verified_install_carries_no_herdr_warning_when_available_or_not_requested() {
+    let available = probe_json_with_herdr(
+        Some(serde_json::json!({ "state": "available", "version": "0.9.0" })),
+        0,
+    );
+    let installed = install_with_verification_probe(available, &herdr_worker());
+    assert!(installed.installed);
+    assert!(installed.warnings.is_empty(), "{:?}", installed.warnings);
+
+    for probe in [
+        probe_json_with_herdr(Some(serde_json::json!({ "state": "not_installed" })), 0),
+        valid_probe_json(),
+    ] {
+        let installed = install_with_verification_probe(probe, &worker());
+        assert!(installed.installed);
+        assert!(installed.warnings.is_empty(), "{:?}", installed.warnings);
+    }
+}
+
+#[test]
+fn setup_output_surfaces_the_herdr_warning_after_installed_in_text_and_json() {
+    let message = mac_worker::protocol::HERDR_UNAVAILABLE_MESSAGE;
+    let output = CommandOutput::Setup(SetupReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![SetupHostResult {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            installed: true,
+            protocol_version: Some(PROTOCOL_VERSION),
+            error_code: None,
+            error_message: None,
+            failure_kind: None,
+            warnings: vec![herdr_unavailable_warning()],
+        }],
+    });
+
+    assert_eq!(
+        output.render_human(),
+        format!(
+            "mini-1: installed (protocol {PROTOCOL_VERSION})\n  warning [HERDR_UNAVAILABLE]: {message}"
+        )
+    );
+    let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+    assert_eq!(json["workers"][0]["installed"], true);
+    assert_eq!(
+        json["workers"][0]["warnings"],
+        serde_json::json!([{ "code": "HERDR_UNAVAILABLE", "message": message }])
+    );
 }

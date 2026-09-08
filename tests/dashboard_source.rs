@@ -88,6 +88,7 @@ fn source_projects_only_allowlisted_agent_facts_and_profile_auth() {
         env_profiles: vec![ProfileProbe::new("team-ci", true).unwrap()],
         git_identity: true,
         collected_at_millis: u64::MAX - 1,
+        herdr: None,
     });
     probe.facts_age_millis = Some(FACTS_TTL + 99);
 
@@ -118,6 +119,7 @@ fn source_keeps_fresh_facts_current_despite_an_old_remote_timestamp() {
         env_profiles: Vec::new(),
         git_identity: false,
         collected_at_millis: 1,
+        herdr: None,
     });
     probe.facts_age_millis = Some(0);
 
@@ -148,6 +150,7 @@ fn source_keeps_agent_facts_unavailable_when_facts_or_worker_age_is_missing() {
         env_profiles: Vec::new(),
         git_identity: false,
         collected_at_millis: 1,
+        herdr: None,
     });
     let fixture = Fixture::new(report);
     let rows = fixture.source().collect_workers(Duration::from_secs(7));
@@ -426,12 +429,14 @@ impl Fixture {
         let state = Arc::new(ClientStateStore::open(&state_root).unwrap());
         let config = Arc::new(Config {
             version: 1,
+            notifications: mac_worker::config::NotificationsConfig::default(),
             workers: vec![WorkerEntry {
                 name: "mini-1".into(),
                 ssh: REMOTE_SSH.into(),
                 slots: 1,
                 capabilities: vec!["swift".into()],
                 remote_binary: "~/.local/bin/worker".into(),
+                herdr: false,
             }],
         });
         config.validate().unwrap();
@@ -743,4 +748,54 @@ fn cache_busy_observation(fixture: &Fixture, observed_at_millis: u64) {
 
 fn job_id(value: u128) -> JobId {
     JobId::new(uuid::Uuid::from_u128(value))
+}
+
+#[test]
+fn source_passes_the_herdr_fact_through_agent_facts_and_projects_null_without_it() {
+    // The dashboard sees the same fact doctor and workers see, unchanged; a
+    // record that predates the fact projects `null` rather than inventing one.
+    use mac_worker::agent_facts::{HerdrFactState, HerdrFacts};
+
+    let mut report = ready_report(job_id(91));
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: true,
+        collected_at_millis: 1,
+        herdr: Some(HerdrFacts {
+            state: HerdrFactState::NoSocket,
+            version: Some("0.9.0".into()),
+        }),
+    });
+    probe.facts_age_millis = Some(0);
+    let fixture = Fixture::new(report);
+    let rows = fixture.source().collect_workers(Duration::from_secs(7));
+    let WorkerObservationResult::Current(observation) = rows.into_iter().next().unwrap() else {
+        panic!("ready probe must project to a current observation");
+    };
+    let value = serde_json::to_value(observation.worker.agent_facts.unwrap()).unwrap();
+    assert_eq!(
+        value["herdr"],
+        serde_json::json!({ "state": "no_socket", "version": "0.9.0" })
+    );
+
+    let mut report = ready_report(job_id(92));
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: true,
+        collected_at_millis: 1,
+        herdr: None,
+    });
+    probe.facts_age_millis = Some(0);
+    let fixture = Fixture::new(report);
+    let rows = fixture.source().collect_workers(Duration::from_secs(7));
+    let WorkerObservationResult::Current(observation) = rows.into_iter().next().unwrap() else {
+        panic!("ready probe must project to a current observation");
+    };
+    let value = serde_json::to_value(observation.worker.agent_facts.unwrap()).unwrap();
+    assert!(value.get("herdr").is_some(), "the key is present: {value}");
+    assert!(value["herdr"].is_null(), "{value}");
 }

@@ -1,7 +1,7 @@
 # Herdr reporter design: pool turns in the herdr sidebar
 
 - Date: 2026-09-08 (revision 1, written after the live spike of the same evening; see section 18)
-- Status: draft for review
+- Status: approved for implementation on 2026-09-08 (decisions in section 18)
 - Repository: `mac-worker`
 - User-facing surface: `[[workers]] herdr = true` and `[notifications] herdr` in `config.toml`; new `herdr:` lines in `worker doctor`, `worker setup`, and `worker workers`; a hidden `worker host follow-turn` command that only herdr panes invoke
 - Depends on: the [v2 agent task design](2026-09-03-agent-task-pool-design.md) sections 8, 11.3, 12, 15, 18, and 19; herdr 0.9.0 (socket protocol 22) on every worker that opts in and on the MacBook
@@ -215,7 +215,7 @@ What the operator then sees in the pane is the same rendered event stream `worke
 ## 11. Protocol and record changes
 
 - `TurnSection` gains `herdr_reporter: bool`, serialized only when true, beside `git_identity` and `origin_url`, which are the existing per-worker values the laptop injects into a turn. It is outside the turn material digest, like those two.
-- The turn summary in the task status gains an optional `herdr` object: `{ "state": "attached" | "unavailable" | "disabled", "pane_id": "<id>" }`, written by the reporter at start and updated at terminal, so `task status --json` and the dashboard can say whether a turn is visible in herdr. `pane_id` is herdr's opaque pane id and carries no path.
+- The turn summary in the task status gains an optional `herdr` object: `{ "state": "attached" | "unavailable" | "disabled", "pane_id": "<id>" }`, written once at the turn's terminal, so `task status --json` and the dashboard can say whether a turn was visible in herdr. The start result stays in the supervisor's memory until then: the task status is being written by the output pump while the agent runs, and a second writer would race it. `pane_id` is herdr's opaque pane id and carries no path.
 - Agent facts gain `herdr: { "state": "available" | "not_installed" | "no_socket" | "no_response", "version": "<string>" | null }`.
 - `Config` gains an optional `[notifications]` table with `herdr: bool` (default true); `WorkerEntry` gains `herdr: bool` (default false). Both structs keep `deny_unknown_fields`.
 - One new hidden host command, `follow-turn`.
@@ -298,9 +298,11 @@ The worker helper gains its first outbound local client, bounded and best-effort
 
 ## 18. Review record
 
-Revision 1 is written from the live spike of 2026-09-08 on mac1 (section 2.2) and from a reading of the supervisor, terminal hook, task store, turn runner, doctor, installer, facts, and configuration code as of `c8dcbf1`. Open points for the review:
+Revision 1 is written from the live spike of 2026-09-08 on mac1 (section 2.2) and from a reading of the supervisor, terminal hook, task store, turn runner, doctor, installer, facts, and configuration code as of `c8dcbf1`. The four open points were decided with the operator on 2026-09-08 before implementation started:
 
-- Whether `herdr_reporter` should live in `TurnSection` (per turn, per worker, outside the digest, as proposed) or in `TaskMeta` (per task, persisted on the worker, readable at close without discovery).
-- Whether `unknown` is the right herdr state for failed, cancelled, timed-out, and lost turns, or whether releasing the agent and closing the tab is preferable for cancelled turns.
-- Whether `follow-turn` should render both `stdout.log` and `stderr.log` or the event stream only.
-- Whether the notifier should also fire for `worker run` batch jobs, which this design leaves untouched.
+- `herdr_reporter` lives in `TurnSection`: per turn and per worker, beside the other per-worker values the laptop injects, outside the digest. Close and gc discover tabs by label and need no flag.
+- Failed, cancelled, timed-out, and lost turns report `unknown` with the reason as the message. The row stays visible until the next turn or `close`; a vanished row would hide exactly the turns the operator most needs to see.
+- `follow-turn` renders both `stdout.log` and `stderr.log`. The first real pool run showed a failed turn whose only explanation was in stderr, and the parallel log-diagnostics work (`f29cf81`) made the same choice for `task logs`.
+- The notifier fires for task turns only. `worker run` batch jobs keep their v1 behaviour.
+
+Sequencing note: the pool reliability work of 2026-09-08 changes how a turn records its project context and lands ahead of this design; the `TurnSection` field and the protocol bump in Task 2 of the plan are rebased onto it, so the workers see one `worker setup` round, not two.

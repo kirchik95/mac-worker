@@ -610,6 +610,7 @@ impl DashboardWorkerReader for FakeWorkers {
 fn config_with_workers(names: &[&str]) -> Config {
     let config = Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: names
             .iter()
             .map(|name| WorkerEntry {
@@ -618,6 +619,7 @@ fn config_with_workers(names: &[&str]) -> Config {
                 slots: 1,
                 capabilities: vec!["swift".into()],
                 remote_binary: "~/.local/bin/worker".into(),
+                herdr: false,
             })
             .collect(),
     };

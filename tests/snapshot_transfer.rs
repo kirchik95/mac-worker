@@ -118,6 +118,7 @@ fn worker() -> WorkerEntry {
         slots: 1,
         capabilities: vec!["darwin-arm64".into()],
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 
@@ -2082,7 +2083,7 @@ fn hidden_submit_failures_are_versioned() {
     assert_eq!(error.error().message(), "host request was invalid");
     assert_eq!(
         stdout,
-        br#"{"protocol_version":5,"error":{"code":"INVALID_REQUEST","message":"host request was invalid"}}
+        br#"{"protocol_version":6,"error":{"code":"INVALID_REQUEST","message":"host request was invalid"}}
 "#
     );
     let rendered = String::from_utf8(stdout).unwrap();

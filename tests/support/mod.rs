@@ -1,4 +1,5 @@
 pub mod agent_launch_fixture;
+pub mod fake_herdr;
 pub mod recording_runner;
 #[allow(dead_code)]
 pub mod task_harness;

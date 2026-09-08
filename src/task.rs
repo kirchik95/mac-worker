@@ -923,6 +923,29 @@ pub struct TurnSummary {
     log_truncated: bool,
     started_at_millis: Option<u64>,
     ended_at_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    herdr: Option<HerdrTurnReport>,
+}
+
+/// Whether, and where, a turn was shown in the worker's herdr.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HerdrTurnReport {
+    pub state: HerdrTurnState,
+    /// Herdr's opaque pane id on the worker; carries no path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdrTurnState {
+    /// The worker's herdr shows this turn.
+    Attached,
+    /// The worker was asked to report but its herdr could not be reached.
+    Unavailable,
+    /// The worker is not configured to report.
+    Disabled,
 }
 
 impl TurnSummary {
@@ -947,7 +970,17 @@ impl TurnSummary {
             log_truncated,
             started_at_millis,
             ended_at_millis,
+            herdr: None,
         }
+    }
+
+    pub fn with_herdr(mut self, herdr: Option<HerdrTurnReport>) -> Self {
+        self.herdr = herdr;
+        self
+    }
+
+    pub fn herdr(&self) -> Option<&HerdrTurnReport> {
+        self.herdr.as_ref()
     }
 
     pub fn turn_number(&self) -> u32 {

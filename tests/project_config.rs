@@ -424,3 +424,43 @@ fn requirement_detector_ignores_a_symlinked_indicator_file() {
 
     assert_eq!(requirements, Vec::<String>::new());
 }
+
+#[test]
+fn herdr_keys_parse_with_their_defaults_and_reject_unknown_neighbours() {
+    use mac_worker::config::Config;
+
+    let minimal =
+        Config::parse("version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n")
+            .unwrap();
+    assert!(
+        minimal.notifications.herdr,
+        "laptop notifications default on"
+    );
+    assert!(!minimal.workers[0].herdr, "worker reporting defaults off");
+
+    let explicit = Config::parse(
+        "version = 1\n\n[notifications]\nherdr = false\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\nherdr = true\n",
+    )
+    .unwrap();
+    assert!(!explicit.notifications.herdr);
+    assert!(explicit.workers[0].herdr);
+
+    assert!(
+        Config::parse(
+            "version = 1\n\n[notifications]\nherdr = true\nsound = true\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+        )
+        .is_err(),
+        "unknown notification keys are still rejected"
+    );
+    assert!(
+        Config::parse(
+            "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\nherdr = \"yes\"\n",
+        )
+        .is_err(),
+        "the worker flag is a boolean"
+    );
+
+    let example = Config::parse(include_str!("../config.example.toml")).unwrap();
+    assert!(example.notifications.herdr);
+    assert!(!example.workers[0].herdr);
+}

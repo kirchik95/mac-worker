@@ -301,6 +301,12 @@ pub enum HostCommand {
     AgentSettingsGet,
     #[command(name = "agent-settings-set")]
     AgentSettingsSet,
+    #[command(name = "follow-turn", hide = true)]
+    FollowTurn {
+        project_id: HiddenComponent,
+        worktree_id: HiddenComponent,
+        job_id: HiddenComponent,
+    },
     #[command(name = "receive-pack")]
     ReceivePack {
         job_id: HiddenComponent,

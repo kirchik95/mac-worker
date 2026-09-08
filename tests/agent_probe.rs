@@ -53,6 +53,11 @@ impl ProcessRunner for RecordingRunner {
 
         if program == "/bin/zsh" && args.first().map(String::as_str) == Some("-lc") {
             let shell = args.last().map(String::as_str).unwrap_or_default();
+            // The herdr lookups prefix the command with a PATH extension for
+            // `~/.local/bin`; the command proper follows the last `; `.
+            let shell = shell
+                .rsplit_once("; ")
+                .map_or(shell, |(_, command)| command);
             if shell.starts_with("command -v ") {
                 let binary = shell.strip_prefix("command -v ").unwrap_or_default();
                 let stdout = if binary == "codex" {
@@ -146,12 +151,14 @@ fn worker() -> WorkerEntry {
         slots: 1,
         capabilities: vec!["darwin-arm64".into()],
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 
 fn config() -> Config {
     Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![worker()],
     }
 }
@@ -190,6 +197,7 @@ fn facts(collected_at_millis: u64) -> AgentFacts {
         ],
         git_identity: true,
         collected_at_millis,
+        herdr: None,
     }
 }
 
@@ -485,4 +493,52 @@ fn refresh_uses_the_runtime_home_without_loading_inventory() {
             .iter()
             .any(|request| request.program == OsStr::new("/bin/zsh"))
     );
+}
+
+#[test]
+fn refresh_collects_the_herdr_fact_and_cached_reads_never_probe_it() {
+    // Break caught: the herdr fact leaving refresh-facts for the probe hot
+    // path, or the lookup bypassing the account login shell.
+    use mac_worker::agent_facts::{HerdrFactState, HerdrFacts};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let host_root = host_root(temporary.path());
+    let home = temporary.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let runner = RecordingRunner::default();
+    let facts = ProbeCollector::refresh_facts_at(&host_root, &home, &runner).unwrap();
+    assert_eq!(
+        facts.herdr,
+        Some(HerdrFacts {
+            state: HerdrFactState::NotInstalled,
+            version: None,
+        })
+    );
+    let lookup = runner
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request
+                .args
+                .last()
+                .and_then(|argument| argument.to_str())
+                .is_some_and(|shell| shell.contains("command -v herdr"))
+        })
+        .expect("refresh-facts looks herdr up on the account login shell");
+    assert_eq!(lookup.program, OsStr::new("/bin/zsh"));
+    assert!(lookup.isolate_parent_environment);
+    assert!(
+        lookup
+            .environment
+            .iter()
+            .any(|(name, value)| name == "HOME" && value == home.as_os_str())
+    );
+
+    let request_count_after_refresh = runner.requests().len();
+    let cached = ProbeCollector::cached_facts_at(&host_root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cached.herdr, facts.herdr);
+    assert_eq!(runner.requests().len(), request_count_after_refresh);
 }

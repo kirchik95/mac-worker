@@ -341,12 +341,14 @@ fn worker(name: &str, ssh: &str, capabilities: &[&str]) -> WorkerEntry {
         slots: 1,
         capabilities: capabilities.iter().map(|value| (*value).into()).collect(),
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 
 fn config(workers: Vec<WorkerEntry>) -> Config {
     Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers,
     }
 }
@@ -670,6 +672,7 @@ fn doctor_output_human_renders_complete_ready_and_blocked_reports_without_ssh() 
                 "  mini-1: eligible (mini-1.local; arm64; macOS 26.2; protocol {})\n",
                 "    slot: idle\n",
                 "    capabilities: node, docker\n",
+                "    herdr: unknown\n",
                 "    free disk bytes: 536870912\n",
                 "    total disk bytes: 1073741824\n",
                 "    memory pressure: normal\n",
@@ -698,6 +701,7 @@ fn doctor_output_human_renders_complete_ready_and_blocked_reports_without_ssh() 
             "    missing capabilities: docker\n",
             "    slot: idle\n",
             "    capabilities: node\n",
+            "    herdr: unknown\n",
             "    free disk bytes: 268435456\n",
             "    total disk bytes: 1073741824\n",
             "    memory pressure: warn\n",
@@ -1803,4 +1807,225 @@ fn issues_sort_by_severity_then_code_then_first_path() {
         ]
     );
     assert_no_doctor_snapshot(&state.path().join("cache"));
+}
+
+fn ready_probe_with_facts(
+    capabilities: &[&str],
+    herdr: Option<serde_json::Value>,
+    facts_age_millis: u64,
+) -> Result<ProcessResult, WorkerError> {
+    let mut result = ready_probe(capabilities)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let mut facts = serde_json::json!({
+        "agents": [],
+        "env_profiles": [],
+        "git_identity": true,
+        "collected_at_millis": 10,
+    });
+    if let Some(herdr) = herdr {
+        facts["herdr"] = herdr;
+    }
+    value["agent_facts"] = facts;
+    value["facts_age_millis"] = serde_json::json!(facts_age_millis);
+    result.stdout = serde_json::to_vec(&value).unwrap();
+    Ok(result)
+}
+
+fn herdr_worker(name: &str, ssh: &str, herdr: bool) -> WorkerEntry {
+    WorkerEntry {
+        herdr,
+        ..worker(name, ssh, &[])
+    }
+}
+
+fn herdr_repo() -> GitRepo {
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("herdr doctor fixture");
+    repo
+}
+
+fn issue_triples(report: &DoctorReport) -> Vec<(IssueSeverity, &str, &str)> {
+    report
+        .issues
+        .iter()
+        .map(|issue| (issue.severity, issue.code.as_str(), issue.message.as_str()))
+        .collect()
+}
+
+/// Every probe whose herdr fact is not `available`, with the line spec 5.3
+/// renders for it: three collected states, then facts missing, predating
+/// the fact, and stale.
+fn unavailable_herdr_probes() -> Vec<(Result<ProcessResult, WorkerError>, &'static str)> {
+    use mac_worker::agent_facts::FACTS_TTL;
+
+    vec![
+        (
+            ready_probe_with_facts(
+                &[],
+                Some(serde_json::json!({ "state": "not_installed" })),
+                0,
+            ),
+            "    herdr: not installed",
+        ),
+        (
+            ready_probe_with_facts(
+                &[],
+                Some(serde_json::json!({ "state": "no_socket", "version": "0.9.0" })),
+                0,
+            ),
+            "    herdr: installed (0.9.0), no socket",
+        ),
+        (
+            ready_probe_with_facts(
+                &[],
+                Some(serde_json::json!({ "state": "no_response", "version": "0.9.0" })),
+                0,
+            ),
+            "    herdr: installed (0.9.0), no response",
+        ),
+        (ready_probe(&[]), "    herdr: unknown"),
+        (ready_probe_with_facts(&[], None, 0), "    herdr: unknown"),
+        (
+            ready_probe_with_facts(
+                &[],
+                Some(serde_json::json!({ "state": "available", "version": "0.9.0" })),
+                FACTS_TTL + 1,
+            ),
+            "    herdr: unknown",
+        ),
+    ]
+}
+
+#[test]
+fn herdr_true_worker_gets_a_warning_for_every_fact_state_but_available_and_stays_ready() {
+    // Spec 5.3 and 12: HERDR_UNAVAILABLE is a warning, never a blocker, and
+    // it never touches readiness or eligibility.
+    use mac_worker::protocol::HERDR_UNAVAILABLE_MESSAGE;
+
+    let repo = herdr_repo();
+    let config = config(vec![herdr_worker("mini-1", "mac1", true)]);
+    for (probe, line) in unavailable_herdr_probes() {
+        let state = tempfile::tempdir().unwrap();
+        let runner = DoctorRunner::new(vec![probe]);
+
+        let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+        assert!(report.ready, "{line}: the herdr warning never blocks");
+        assert_eq!(report.workers[0].status, HealthStatus::Ready, "{line}");
+        assert_eq!(report.workers[0].error_code, None, "{line}");
+        assert_eq!(
+            issue_triples(&report),
+            vec![(
+                IssueSeverity::Warning,
+                "HERDR_UNAVAILABLE",
+                HERDR_UNAVAILABLE_MESSAGE,
+            )],
+            "{line}"
+        );
+
+        let human = CommandOutput::Doctor(report.clone()).render_human();
+        assert!(human.starts_with("doctor: ready\n"), "{line}: {human}");
+        assert!(human.contains(line), "{line} missing in {human}");
+        assert!(
+            human.contains(&format!(
+                "  warning [HERDR_UNAVAILABLE]: {HERDR_UNAVAILABLE_MESSAGE}"
+            )),
+            "{human}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&CommandOutput::Doctor(report).render_json().unwrap()).unwrap();
+        assert_eq!(json["ready"], true, "{line}");
+        assert_eq!(
+            json["issues"],
+            serde_json::json!([{
+                "severity": "warning",
+                "code": "HERDR_UNAVAILABLE",
+                "message": HERDR_UNAVAILABLE_MESSAGE,
+                "paths": [],
+            }]),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn herdr_true_worker_with_an_available_fact_gets_no_herdr_warning() {
+    use mac_worker::agent_facts::FACTS_TTL;
+
+    let repo = herdr_repo();
+    let state = tempfile::tempdir().unwrap();
+    let config = config(vec![herdr_worker("mini-1", "mac1", true)]);
+    let runner = DoctorRunner::new(vec![ready_probe_with_facts(
+        &[],
+        Some(serde_json::json!({ "state": "available", "version": "0.9.0" })),
+        FACTS_TTL,
+    )]);
+
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+    assert!(report.ready);
+    assert!(report.issues.is_empty(), "{:?}", report.issues);
+    let human = CommandOutput::Doctor(report.clone()).render_human();
+    assert!(human.contains("    herdr: available (0.9.0)"), "{human}");
+    assert!(!human.contains("HERDR_UNAVAILABLE"));
+    let json = CommandOutput::Doctor(report).render_json().unwrap();
+    assert!(json.contains(r#""herdr":{"state":"available","version":"0.9.0"}"#));
+    assert!(!json.contains("HERDR_UNAVAILABLE"));
+}
+
+#[test]
+fn herdr_false_worker_never_gets_the_herdr_warning() {
+    let repo = herdr_repo();
+    let config = config(vec![herdr_worker("mini-1", "mac1", false)]);
+    for (probe, line) in unavailable_herdr_probes() {
+        let state = tempfile::tempdir().unwrap();
+        let runner = DoctorRunner::new(vec![probe]);
+
+        let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+        assert!(report.ready, "{line}");
+        assert!(report.issues.is_empty(), "{line}: {:?}", report.issues);
+        let human = CommandOutput::Doctor(report.clone()).render_human();
+        assert!(human.contains(line), "{line} missing in {human}");
+        assert!(!human.contains("HERDR_UNAVAILABLE"), "{human}");
+        let json = CommandOutput::Doctor(report).render_json().unwrap();
+        assert!(!json.contains("HERDR_UNAVAILABLE"), "{json}");
+    }
+}
+
+#[test]
+fn herdr_warning_for_an_unreachable_herdr_worker_sorts_with_the_other_warnings() {
+    // An unreachable worker has an unknown fact; asking for herdr on it adds
+    // the warning beside SSH_UNAVAILABLE and leaves the ready pool ready.
+    use mac_worker::protocol::HERDR_UNAVAILABLE_MESSAGE;
+
+    let repo = herdr_repo();
+    let state = tempfile::tempdir().unwrap();
+    let config = config(vec![
+        herdr_worker("offline", "mac1", true),
+        herdr_worker("ready", "mac2", false),
+    ]);
+    let runner = DoctorRunner::new(vec![offline_probe(), ready_probe(&[])]);
+
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+    assert!(report.ready);
+    assert_eq!(report.workers[0].status, HealthStatus::Unavailable);
+    assert_eq!(report.workers[1].status, HealthStatus::Ready);
+    assert_eq!(
+        issue_triples(&report),
+        vec![
+            (
+                IssueSeverity::Warning,
+                "HERDR_UNAVAILABLE",
+                HERDR_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                IssueSeverity::Warning,
+                "SSH_UNAVAILABLE",
+                "worker offline could not be reached by the SSH probe",
+            ),
+        ]
+    );
 }

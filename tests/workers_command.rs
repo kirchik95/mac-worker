@@ -15,7 +15,9 @@ use std::{
 
 use mac_worker::{
     RuntimeContext,
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
+    agent_facts::{
+        AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, HerdrFactState, HerdrFacts, ProfileProbe,
+    },
     cli::{Cli, Command},
     config::{Config, WorkerEntry},
     error::{ProcessError, ProcessStream, WorkerError},
@@ -255,6 +257,7 @@ fn request_destination(request: &ProcessRequest) -> String {
 fn config_with_workers(count: usize) -> Config {
     Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: (1..=count)
             .map(|index| {
                 worker(
@@ -350,6 +353,7 @@ fn worker(name: &str, ssh: &str, capabilities: &[&str]) -> WorkerEntry {
             .map(|capability| (*capability).into())
             .collect(),
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 
@@ -621,6 +625,7 @@ fn budgeted_requirement_inspection_keeps_inventory_first_stable_union() {
     ));
     let config = Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![worker(
             "mini-1",
             "mac1",
@@ -1001,6 +1006,7 @@ fn inventory_keeps_ready_and_failed_workers_in_config_order() {
     ]);
     let config = Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![
             worker("ready", "mac1", &["darwin-arm64"]),
             worker("offline", "mac2", &[]),
@@ -1078,6 +1084,7 @@ fn inspect_with_requirements_adds_project_capabilities_without_changing_inventor
     ]);
     let config = Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![worker("mini-1", "mac1", &["darwin-arm64"])],
     };
     let service = WorkersService::new(SshTransport::new(runner));
@@ -1120,6 +1127,7 @@ fn inspect_with_requirements_uses_inventory_first_stable_union_for_multiple_miss
     ));
     let config = Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![worker(
             "mini-1",
             "mac1",
@@ -1340,6 +1348,7 @@ fn workers_output_includes_profile_keyed_facts_without_values() {
                     }],
                     git_identity: true,
                     collected_at_millis: 10,
+                    herdr: None,
                 }),
                 facts_age_millis: Some(1_000),
             }),
@@ -1601,5 +1610,177 @@ fn refresh_fails_only_when_every_worker_is_unreachable() {
             .count(),
         2,
         "{stdout}"
+    );
+}
+
+fn herdr_health(facts: Option<AgentFacts>, facts_age_millis: Option<u64>) -> WorkerHealth {
+    WorkerHealth {
+        name: "mini-1".into(),
+        ssh: "mac1".into(),
+        status: HealthStatus::Ready,
+        probe: Some(ProbeResponse {
+            protocol_version: PROTOCOL_VERSION,
+            supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+            hostname: "mini-1.local".into(),
+            arch: "arm64".into(),
+            os_version: "26.2".into(),
+            free_disk_bytes: 536_870_912,
+            total_disk_bytes: 1_073_741_824,
+            memory_pressure: MemoryPressure::Normal,
+            swap_used_bytes: None,
+            available_memory_bytes: None,
+            cpu_counters: None,
+            slot_state: SlotState::Idle,
+            active_lease: None,
+            capabilities: vec!["darwin-arm64".into()],
+            agent_facts: facts,
+            facts_age_millis,
+        }),
+        missing_capabilities: Vec::new(),
+        error_code: None,
+        error_message: None,
+    }
+}
+
+fn facts_with_herdr(herdr: Option<HerdrFacts>) -> AgentFacts {
+    AgentFacts {
+        agents: vec![AgentProbe {
+            name: "cursor".into(),
+            version: Some("1.0.0".into()),
+            auth: AgentAuth::Authenticated,
+            auth_by_profile: vec![("agents".into(), AgentAuth::Authenticated)],
+        }],
+        env_profiles: vec![ProfileProbe {
+            name: "agents".into(),
+            secure: true,
+        }],
+        git_identity: true,
+        collected_at_millis: 10,
+        herdr,
+    }
+}
+
+fn render_workers(health: WorkerHealth) -> (String, String) {
+    let output = CommandOutput::Workers(WorkersReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![health],
+    });
+    (output.render_human(), output.render_json().unwrap())
+}
+
+#[test]
+fn workers_output_renders_the_herdr_line_for_every_state_after_the_agents_block() {
+    // Spec 5.3: one `herdr:` line per worker; the operator reads availability
+    // without a second command, and JSON carries the fact through the facts.
+    let version = Some("0.9.0".to_owned());
+    for (state, expected) in [
+        (HerdrFactState::Available, "  herdr: available (0.9.0)"),
+        (HerdrFactState::NotInstalled, "  herdr: not installed"),
+        (
+            HerdrFactState::NoSocket,
+            "  herdr: installed (0.9.0), no socket",
+        ),
+        (
+            HerdrFactState::NoResponse,
+            "  herdr: installed (0.9.0), no response",
+        ),
+    ] {
+        let herdr = HerdrFacts {
+            state,
+            version: if state == HerdrFactState::NotInstalled {
+                None
+            } else {
+                version.clone()
+            },
+        };
+        let (rendered, json) = render_workers(herdr_health(
+            Some(facts_with_herdr(Some(herdr.clone()))),
+            Some(1_000),
+        ));
+        let lines = rendered.lines().collect::<Vec<_>>();
+        let herdr_line = lines
+            .iter()
+            .position(|line| *line == expected)
+            .unwrap_or_else(|| panic!("missing {expected:?} in {rendered}"));
+        let agents_line = lines
+            .iter()
+            .position(|line| *line == "  agents:")
+            .expect("agents block");
+        let profiles_line = lines
+            .iter()
+            .position(|line| *line == "  profiles:")
+            .expect("profiles block");
+        assert!(
+            agents_line < herdr_line && herdr_line < profiles_line,
+            "the herdr line follows the agents block: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("herdr:").count(),
+            1,
+            "exactly one herdr line: {rendered}"
+        );
+        let expected_json = serde_json::to_string(&serde_json::json!({ "herdr": herdr }))
+            .unwrap()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .to_owned();
+        assert!(
+            json.contains(&expected_json),
+            "{expected_json} not in {json}"
+        );
+    }
+}
+
+#[test]
+fn workers_output_renders_herdr_unknown_when_facts_are_missing_stale_or_predate_the_fact() {
+    let available = HerdrFacts {
+        state: HerdrFactState::Available,
+        version: Some("0.9.0".into()),
+    };
+    for (label, health) in [
+        ("missing facts", herdr_health(None, None)),
+        (
+            "facts predating the fact",
+            herdr_health(Some(facts_with_herdr(None)), Some(0)),
+        ),
+        (
+            "stale facts",
+            herdr_health(
+                Some(facts_with_herdr(Some(available.clone()))),
+                Some(FACTS_TTL + 1),
+            ),
+        ),
+        (
+            "facts without a reported age",
+            herdr_health(Some(facts_with_herdr(Some(available.clone()))), None),
+        ),
+    ] {
+        let (rendered, _) = render_workers(health);
+        assert!(
+            rendered.lines().any(|line| line == "  herdr: unknown"),
+            "{label}: expected `herdr: unknown` in {rendered}"
+        );
+        assert_eq!(rendered.matches("herdr:").count(), 1, "{label}: {rendered}");
+    }
+
+    let (fresh, _) = render_workers(herdr_health(
+        Some(facts_with_herdr(Some(available))),
+        Some(FACTS_TTL),
+    ));
+    assert!(
+        fresh.contains("  herdr: available (0.9.0)"),
+        "facts at exactly the TTL are still fresh: {fresh}"
+    );
+
+    let (installed_without_version, _) = render_workers(herdr_health(
+        Some(facts_with_herdr(Some(HerdrFacts {
+            state: HerdrFactState::NoSocket,
+            version: None,
+        }))),
+        Some(0),
+    ));
+    assert!(
+        installed_without_version.contains("  herdr: installed, no socket"),
+        "{installed_without_version}"
     );
 }

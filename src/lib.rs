@@ -69,8 +69,12 @@ pub mod config;
 pub mod dashboard;
 pub mod doctor;
 pub mod error;
+pub mod follow_turn;
 pub mod gc;
 pub mod git_transport;
+pub mod herdr;
+pub mod herdr_notify;
+pub mod herdr_reporter;
 pub mod host_store;
 pub mod inputs;
 pub mod install;
@@ -106,6 +110,7 @@ pub mod transfer;
 pub mod transfer_repo;
 pub mod transport;
 pub mod turn;
+pub mod turn_log;
 pub mod turn_runner;
 
 #[doc(hidden)]
@@ -407,6 +412,11 @@ fn execute_with_context(
             command: HostCommand::AgentSettingsSet,
         } => Err(WorkerError::Protocol(
             "host agent-settings-set requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::FollowTurn { .. },
+        } => Err(WorkerError::Protocol(
+            "host follow-turn requires the stdio execution boundary".into(),
         )),
     }
 }
@@ -717,7 +727,9 @@ fn run_task_command(
         } else {
             &DETACHED_TASK_EXECUTOR
         };
-        let client = TaskClient::new(runner, &config, &paths, &client_state, executor);
+        let notifier = herdr_notifier_socket(&config, runtime);
+        let client = TaskClient::new(runner, &config, &paths, &client_state, executor)
+            .with_herdr_notifier(notifier.clone());
 
         match command {
             Command::Runner { task_id, turn_id } => {
@@ -730,6 +742,7 @@ fn run_task_command(
                     .parse::<crate::task::TurnId>()
                     .map_err(|_| WorkerError::Protocol("invalid runner turn ID".into()))?;
                 let outcome = TurnRunner::new(runner, &config, &paths, &client_state, executor)
+                    .with_notifier(notifier)
                     .run_detached(task_id, turn_id)?;
                 Ok(outcome.exit_code())
             }
@@ -1379,6 +1392,25 @@ pub fn run_with_rsync_executor_in_context(
     } = &cli.command
     {
         return run_host_supervise(cli.config, runtime, job_id.expose());
+    }
+    if let Command::Host {
+        command:
+            HostCommand::FollowTurn {
+                project_id,
+                worktree_id,
+                job_id,
+            },
+    } = &cli.command
+    {
+        return follow_turn::run_host_follow_turn(
+            cli.config,
+            runtime,
+            project_id.expose(),
+            worktree_id.expose(),
+            job_id.expose(),
+            stdout,
+            stderr,
+        );
     }
     if matches!(
         &cli.command,
@@ -2810,6 +2842,22 @@ fn load_config(
 ) -> Result<Config, WorkerError> {
     let paths = discover_paths(config_override, runtime)?;
     Config::load(&paths.config)
+}
+
+/// The herdr session the laptop notifies about finished turns: the one that
+/// started this command when it ran inside herdr, else the account's default,
+/// and none at all when the operator turned notifications off.
+fn herdr_notifier_socket(
+    config: &Config,
+    runtime: &RuntimeContext,
+) -> Option<crate::herdr::HerdrSocket> {
+    if !config.notifications.herdr {
+        return None;
+    }
+    Some(crate::herdr::HerdrSocket::from_env_or_home(
+        |key| runtime.environment.get(std::ffi::OsStr::new(key)).cloned(),
+        &runtime.home,
+    ))
 }
 
 fn discover_paths(

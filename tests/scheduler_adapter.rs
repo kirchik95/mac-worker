@@ -13,12 +13,14 @@ const GIB: u64 = 1024 * 1024 * 1024;
 fn config() -> Config {
     Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![WorkerEntry {
             name: "mini-1".into(),
             ssh: "mac1".into(),
             slots: 1,
             capabilities: vec!["node".into()],
             remote_binary: "~/.local/bin/worker".into(),
+            herdr: false,
         }],
     }
 }

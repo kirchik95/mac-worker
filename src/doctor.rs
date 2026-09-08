@@ -9,7 +9,8 @@ use crate::{
     project::ProjectContext,
     project_state::{ProjectPreparationError, ProjectPreparationRequest, ProjectState},
     protocol::{
-        DoctorIssue, DoctorProject, DoctorReport, HealthStatus, IssueSeverity, WorkerHealth,
+        DoctorIssue, DoctorProject, DoctorReport, HERDR_UNAVAILABLE_CODE,
+        HERDR_UNAVAILABLE_MESSAGE, HealthStatus, IssueSeverity, ProbeResponse, WorkerHealth,
     },
     transport::{SshTransport, WorkersService},
 };
@@ -44,7 +45,7 @@ impl DoctorService<'_> {
         let after_probes =
             ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
         let eligible_worker_count = workers.iter().filter(|worker| is_eligible(worker)).count();
-        let mut issues = worker_issues(&mut workers, eligible_worker_count);
+        let mut issues = worker_issues(&mut workers, eligible_worker_count, self.config);
         if before_probes != after_probes {
             issues.push(local_state_changed_issue());
             sort_issues(&mut issues);
@@ -165,8 +166,31 @@ fn doctor_project(context: &ProjectContext) -> DoctorProject {
     }
 }
 
-fn worker_issues(workers: &mut [WorkerHealth], eligible_worker_count: usize) -> Vec<DoctorIssue> {
+fn worker_issues(
+    workers: &mut [WorkerHealth],
+    eligible_worker_count: usize,
+    config: &Config,
+) -> Vec<DoctorIssue> {
     let mut issues = Vec::new();
+    // Spec 5.3 and 12: a worker the operator asked to report to herdr whose
+    // fact is anything but `available` (including unknown) gets a warning.
+    // It never blocks and never touches eligibility: the pool is complete
+    // without herdr.
+    for worker in workers.iter().filter(|worker| wants_herdr(config, worker)) {
+        if !worker
+            .probe
+            .as_ref()
+            .is_some_and(ProbeResponse::herdr_available)
+        {
+            let message = safe_worker_message(worker, HERDR_UNAVAILABLE_CODE);
+            issues.push(issue(
+                IssueSeverity::Warning,
+                HERDR_UNAVAILABLE_CODE,
+                &message,
+                Vec::new(),
+            ));
+        }
+    }
     for worker in workers.iter_mut().filter(|worker| !is_eligible(worker)) {
         let code = if worker.status == HealthStatus::Ready
             && worker
@@ -225,9 +249,18 @@ fn safe_worker_message(worker: &WorkerHealth, code: &str) -> String {
         "INVALID_RESPONSE" => format!("worker {name} returned an invalid probe response"),
         "PROTOCOL_MISMATCH" => format!("worker {name} uses an incompatible protocol version"),
         "CAPACITY_BUSY" => format!("worker {name} is healthy but its heavy slot is busy"),
+        HERDR_UNAVAILABLE_CODE => HERDR_UNAVAILABLE_MESSAGE.to_owned(),
         _ => format!("worker {name} is not eligible"),
     };
     sanitize_bounded(&message, MAX_ISSUE_MESSAGE_CHARACTERS)
+}
+
+/// Whether the inventory asks this worker to report its turns to herdr.
+fn wants_herdr(config: &Config, worker: &WorkerHealth) -> bool {
+    config
+        .workers
+        .iter()
+        .any(|entry| entry.name == worker.name && entry.herdr)
 }
 
 fn selection_warning_issue(warning: &SelectionWarning) -> DoctorIssue {
@@ -422,12 +455,14 @@ mod tests {
     fn ready_config() -> Config {
         Config {
             version: 1,
+            notifications: crate::config::NotificationsConfig::default(),
             workers: vec![WorkerEntry {
                 name: "mini-1".into(),
                 ssh: "mac1".into(),
                 slots: 1,
                 capabilities: Vec::new(),
                 remote_binary: "~/.local/bin/worker".into(),
+                herdr: false,
             }],
         }
     }

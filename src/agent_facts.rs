@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 use crate::{
     account_launch::account_login_shell_request,
     agent::{AgentKind, AuthProbe, AuthProbeResult, adapter_for, render_prebind_shell},
+    herdr::{HerdrClient, HerdrError, HerdrSocket},
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
 };
 
@@ -26,6 +27,13 @@ pub const FACTS_TTL_MILLIS: u64 = FACTS_TTL;
 const PROBE_OUTPUT_LIMIT: usize = 4 * 1024;
 const PROBE_DEADLINE: Duration = Duration::from_secs(2);
 const MAX_TEXT_BYTES: usize = 128;
+const HERDR_BINARY: &str = "herdr";
+/// The herdr version is bounded tighter than agent text (see [`HerdrFacts`]).
+const HERDR_VERSION_MAX_BYTES: usize = 64;
+/// herdr installs itself into `~/.local/bin`, which the account's login shell
+/// does not always put on PATH; the lookup appends it so the operator's own
+/// PATH still wins.
+const HERDR_PATH_EXTENSION: &str = r#"export PATH="$PATH:$HOME/.local/bin"; "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentAuth {
@@ -339,6 +347,42 @@ pub struct AgentFacts {
     pub env_profiles: Vec<ProfileProbe>,
     pub git_identity: bool,
     pub collected_at_millis: u64,
+    /// Whether the worker's herdr can show turns; absent from facts written
+    /// before the herdr reporter existed.
+    pub herdr: Option<HerdrFacts>,
+}
+
+/// What `refresh-facts` learned about herdr on the worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HerdrFacts {
+    pub state: HerdrFactState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdrFactState {
+    /// A herdr binary, a socket, and an answer to `ping`.
+    Available,
+    /// No herdr binary on the controlled host paths.
+    NotInstalled,
+    /// A binary but no socket for the default session.
+    NoSocket,
+    /// A socket that did not answer `ping` in time.
+    NoResponse,
+}
+
+impl HerdrFacts {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(version) = &self.version
+            && (version.is_empty() || version.len() > 64 || version.chars().any(char::is_control))
+        {
+            return Err("herdr version is invalid".into());
+        }
+        Ok(())
+    }
 }
 
 impl AgentFacts {
@@ -374,6 +418,9 @@ impl AgentFacts {
                 return Err(format!("duplicate profile `{}`", profile.name));
             }
         }
+        if let Some(herdr) = &self.herdr {
+            herdr.validate()?;
+        }
         Ok(())
     }
 }
@@ -385,11 +432,15 @@ impl Serialize for AgentFacts {
         agents.sort_by(|left, right| left.name.cmp(&right.name));
         let mut profiles = self.env_profiles.clone();
         profiles.sort_by(|left, right| left.name.cmp(&right.name));
-        let mut record = serializer.serialize_struct("AgentFacts", 4)?;
+        let fields = if self.herdr.is_some() { 5 } else { 4 };
+        let mut record = serializer.serialize_struct("AgentFacts", fields)?;
         record.serialize_field("agents", &agents)?;
         record.serialize_field("env_profiles", &profiles)?;
         record.serialize_field("git_identity", &self.git_identity)?;
         record.serialize_field("collected_at_millis", &self.collected_at_millis)?;
+        if let Some(herdr) = &self.herdr {
+            record.serialize_field("herdr", herdr)?;
+        }
         record.end()
     }
 }
@@ -403,6 +454,8 @@ impl<'de> Deserialize<'de> for AgentFacts {
             env_profiles: Vec<ProfileProbe>,
             git_identity: bool,
             collected_at_millis: u64,
+            #[serde(default)]
+            herdr: Option<HerdrFacts>,
         }
 
         let wire: Wire = deserialize_unique_object(deserializer)?;
@@ -411,6 +464,7 @@ impl<'de> Deserialize<'de> for AgentFacts {
             env_profiles: wire.env_profiles,
             git_identity: wire.git_identity,
             collected_at_millis: wire.collected_at_millis,
+            herdr: wire.herdr,
         };
         facts.validate().map_err(de::Error::custom)?;
         Ok(facts)
@@ -509,7 +563,57 @@ where
         env_profiles,
         git_identity: collect_git_identity(runner),
         collected_at_millis,
+        herdr: Some(collect_herdr_facts(runner, account_home)),
     }
+}
+
+/// Whether the account's herdr can show turns: a `herdr` binary on the login
+/// shell's PATH (plus `~/.local/bin`), its `--version`, the default session
+/// socket, and an answer to `ping` under the client deadlines.  The version is
+/// recorded whenever the binary answered; the ping carries no path.
+fn collect_herdr_facts(runner: &dyn ProcessRunner, account_home: &Path) -> HerdrFacts {
+    if !herdr_binary_available(runner, account_home) {
+        return HerdrFacts {
+            state: HerdrFactState::NotInstalled,
+            version: None,
+        };
+    }
+    let version = herdr_version(runner, account_home);
+    let socket = HerdrSocket::default_for_home(account_home);
+    if !socket.path().exists() {
+        return HerdrFacts {
+            state: HerdrFactState::NoSocket,
+            version,
+        };
+    }
+    let state = match HerdrClient::new(socket).ping() {
+        Ok(()) => HerdrFactState::Available,
+        Err(HerdrError::Absent) => HerdrFactState::NoSocket,
+        Err(_) => HerdrFactState::NoResponse,
+    };
+    HerdrFacts { state, version }
+}
+
+fn herdr_binary_available(runner: &dyn ProcessRunner, account_home: &Path) -> bool {
+    let shell = format!("{HERDR_PATH_EXTENSION}command -v {HERDR_BINARY}");
+    let request = account_login_shell_request(account_home, &[], &shell, probe_policy());
+    runner
+        .run(&request)
+        .ok()
+        .is_some_and(|result| result.status.success())
+}
+
+fn herdr_version(runner: &dyn ProcessRunner, account_home: &Path) -> Option<String> {
+    let exec = render_prebind_shell(&[HERDR_BINARY.to_owned(), "--version".to_owned()]).ok()?;
+    let shell = format!("{HERDR_PATH_EXTENSION}{exec}");
+    let request = account_login_shell_request(account_home, &[], &shell, probe_policy());
+    let result = runner.run(&request).ok()?;
+    if !result.status.success() {
+        return None;
+    }
+    let version = parse_version(&result.stdout)?;
+    let version = truncate_text_to(&version, HERDR_VERSION_MAX_BYTES);
+    (!version.is_empty()).then_some(version)
 }
 
 fn current_time_millis() -> u64 {
@@ -686,10 +790,14 @@ fn parse_version(output: &[u8]) -> Option<String> {
 }
 
 fn truncate_text(value: &str) -> String {
-    if value.len() <= MAX_TEXT_BYTES {
+    truncate_text_to(value, MAX_TEXT_BYTES)
+}
+
+fn truncate_text_to(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
         return value.to_owned();
     }
-    let mut end = MAX_TEXT_BYTES;
+    let mut end = limit;
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }

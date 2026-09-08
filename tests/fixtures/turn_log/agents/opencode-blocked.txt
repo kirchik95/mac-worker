@@ -1,0 +1,5 @@
+session ses_PLACEHOLDER
+```mac-worker-result
+{"status":"blocked","summary":"Missing credentials for the registry","questions":[],"files_changed":[]}
+```
+stop

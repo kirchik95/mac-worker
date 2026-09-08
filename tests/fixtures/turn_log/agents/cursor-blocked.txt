@@ -1,0 +1,5 @@
+session 00000000-0000-4000-8000-0000000000c3
+```mac-worker-result
+{"status":"blocked","summary":"Missing credentials for the registry","questions":[],"files_changed":[]}
+```
+success

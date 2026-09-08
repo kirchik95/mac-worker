@@ -154,6 +154,9 @@ pub struct TurnRunner<'a> {
     pub(crate) paths: &'a PathLayout,
     pub(crate) client_state: &'a ClientStateStore,
     pub(crate) executor: &'a dyn RunnerExecutor,
+    /// The herdr session to tell about finished turns; absent when the
+    /// operator turned notifications off or nobody injected a session.
+    pub(crate) notifier: Option<crate::herdr::HerdrSocket>,
 }
 
 impl<'a> TurnRunner<'a> {
@@ -179,7 +182,16 @@ impl<'a> TurnRunner<'a> {
             paths,
             client_state,
             executor,
+            notifier: None,
         }
+    }
+
+    /// Notify this herdr session when a turn ends.  Nothing reads the
+    /// process environment here: the caller decides which session, so tests
+    /// and other embedders never reach an operator's herdr by accident.
+    pub fn with_notifier(mut self, socket: Option<crate::herdr::HerdrSocket>) -> Self {
+        self.notifier = socket;
+        self
     }
 
     /// Claims and executes exactly one local task-turn queue row.
@@ -211,6 +223,7 @@ impl<'a> TurnRunner<'a> {
             task_id = claimed_task;
             turn_id = claimed_turn;
             let result = self.execute(task_id, turn_id, owner, &mut follow);
+            self.notify_turn_finished(task_id, turn_id, &result);
             match result {
                 Ok(report) => {
                     self.start_next_parked(owner)?;
@@ -236,6 +249,45 @@ impl<'a> TurnRunner<'a> {
             let _ = self.write_early_exit_diagnostic(task_id, turn_id, error);
         }
         result
+    }
+
+    /// One herdr notification per terminal turn, from the durable record,
+    /// after everything that matters has been written.  Best effort.
+    fn notify_turn_finished(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        result: &Result<TurnOutcomeReport, WorkerError>,
+    ) {
+        let Some(socket) = &self.notifier else {
+            return;
+        };
+        if !self.config.notifications.herdr {
+            return;
+        }
+        let Ok(record) = self.client_state.load_task(task_id) else {
+            return;
+        };
+        let status = match result {
+            Ok(report) => report.status(),
+            Err(_) => record.status(),
+        };
+        let Some(turn) = status.turns().iter().find(|turn| turn.turn_id() == turn_id) else {
+            return;
+        };
+        if turn.terminal().is_none() {
+            return;
+        }
+        let Some(outcome) = turn.outcome().or(status.last_outcome()) else {
+            return;
+        };
+        let _ = crate::herdr_notify::HerdrNotifier::new(socket.clone()).turn_finished(
+            task_id,
+            record.meta().title().as_str(),
+            outcome,
+            status.summary(),
+            status.questions(),
+        );
     }
 
     fn write_early_exit_diagnostic(
@@ -839,7 +891,8 @@ impl<'a> TurnRunner<'a> {
                         turn.clone(),
                         prompt.clone(),
                         turn_origin_url(initial_record.meta()),
-                    )?;
+                    )?
+                    .with_herdr_reporter(worker.herdr);
                     let response = match remote.submit_turn(worker, &request) {
                         Ok(response) => response,
                         Err(error) => {
@@ -1396,6 +1449,7 @@ impl<'a> TurnRunner<'a> {
             .map(|worker| {
                 let one = Config {
                     version: self.config.version,
+                    notifications: crate::config::NotificationsConfig::default(),
                     workers: vec![worker.clone()],
                 };
                 let observed_at = now_millis()?;
