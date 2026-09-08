@@ -251,7 +251,8 @@ compares the entire result with `src/dashboard/static/app`. The comparison
 fails for a missing, extra, or byte-changed file. It does not delete a
 predictable pre-existing path.
 
-The Rust job runs on macOS, installs rustfmt and Clippy, and runs:
+The Rust job runs on the official GitHub-hosted `macos-15` arm64 label
+(Sequoia), installs rustfmt and Clippy, and runs:
 
 ```sh
 cargo fmt --all --check
@@ -263,7 +264,11 @@ Before introducing `actions/setup-node` or changing an action major, the
 implementer verifies the selected version against the official action
 repository/Marketplace and records the source in the task report. Existing
 `actions/checkout@v4` in the release workflow is the starting precedent, not
-permission to guess a current setup action version.
+permission to guess a current setup action version. Official sources on
+2026-09-08 require `actions/checkout@v7` and `actions/setup-node@v7` for the
+new PR workflow (Node 20 action runtimes are removed from runners on
+2026-09-23). The release workflow remains `actions/checkout@v4` on `macos-14`
+until a separately tracked migration.
 
 After Tasks 1–3 pass source review, Task 4 runs the normal UI production build
 once into `src/dashboard/static/app`, reviews all generated additions,
@@ -313,6 +318,8 @@ Ruling: Accept current-end log semantics for stage 4 without a wire change — n
 Ruling: Allow a finalized log reader to resume when the same identity becomes live — TaskDetail also passes live=false for a not-yet-started turn, so finalization cannot be permanent for that identity — cost: finalization is now per stopped reading period and the resume path must preserve text/offset while restoring a usable UTF-8 decoder.
 
 Ruling: Defer a pending turn log panel until TaskDetail observes a start or end timestamp — live=false otherwise conflates queued and completed turns, so a fast queued-to-terminal transition can leave an early-empty reader stopped — cost: pre-start output is not shown until the next detail observation, within the existing polling cadence.
+
+Ruling: Use macos-15 for the new PR Rust job — official runner documentation already deprecates macos-14 with retirement on 2026-11-02 — cost: PR CI and the existing release workflow use different macOS versions until the separately tracked release-workflow migration.
 
 The log-finality gate is resolved. Task 2 may implement the bounded available-log
 behavior above without changing the protocol.

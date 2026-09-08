@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+        working-directory: ui
+      - run: npm test
+        working-directory: ui
+      - run: npm run lint
+        working-directory: ui
+      - name: Verify embedded dashboard assets
+        shell: bash
+        run: |
+          asset_dir="$(mktemp -d "${RUNNER_TEMP}/dashboard-ui.XXXXXX")"
+          trap 'rm -rf "$asset_dir"' EXIT
+          (cd ui && npm run build -- --outDir "$asset_dir")
+          diff -r "$asset_dir" src/dashboard/static/app
+
+  rust:
+    runs-on: macos-15
+    env:
+      CARGO_TARGET_DIR: /private/tmp/mac-worker-dashboard-stage4-target
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --all --check
+      - run: cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings

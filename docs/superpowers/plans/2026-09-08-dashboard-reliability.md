@@ -712,8 +712,8 @@ jobs:
   ui:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -733,11 +733,11 @@ jobs:
           diff -r "$asset_dir" src/dashboard/static/app
 
   rust:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       CARGO_TARGET_DIR: /private/tmp/mac-worker-dashboard-stage4-target
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --all --check
       - run: cargo test --locked --all-targets
@@ -961,6 +961,8 @@ Ruling: Accept current-end log semantics for stage 4 without a wire change — n
 Ruling: Allow a finalized log reader to resume when the same identity becomes live — TaskDetail also passes live=false for a not-yet-started turn, so finalization cannot be permanent for that identity — cost: finalization is now per stopped reading period and the resume path must preserve text/offset while restoring a usable UTF-8 decoder.
 
 Ruling: Defer a pending turn log panel until TaskDetail observes a start or end timestamp — live=false otherwise conflates queued and completed turns, so a fast queued-to-terminal transition can leave an early-empty reader stopped — cost: pre-start output is not shown until the next detail observation, within the existing polling cadence.
+
+Ruling: Use macos-15 for the new PR Rust job — official runner documentation already deprecates macos-14 with retirement on 2026-11-02 — cost: PR CI and the existing release workflow use different macOS versions until the separately tracked release-workflow migration.
 
 The log-finality gate is resolved. This planning commit authorizes no
 implementation by itself; the controller dispatches the already specified
