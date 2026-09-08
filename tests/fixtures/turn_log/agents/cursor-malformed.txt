@@ -1,0 +1,7 @@
+session 00000000-0000-4000-8000-0000000000c4
+I finished, but this is not structured JSON.
+
+```mac-worker-result
+{status:done}
+```
+success

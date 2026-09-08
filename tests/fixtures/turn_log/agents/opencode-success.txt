@@ -1,0 +1,9 @@
+session ses_PLACEHOLDER
+cargo test --locked --test agent_adapters (Some(0))
+src/agent/opencode.rs
+ok
+
+```mac-worker-result
+{"status":"done","summary":"ok","questions":[],"files_changed":["src/agent/opencode.rs"]}
+```
+stop

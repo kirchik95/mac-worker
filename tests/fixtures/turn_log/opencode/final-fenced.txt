@@ -1,0 +1,5 @@
+session ses_fixture_fenced
+```json
+{"status":"done","summary":"fenced result","questions":[],"files_changed":["fenced.txt"]}
+```
+stop

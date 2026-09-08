@@ -1,0 +1,10 @@
+session 00000000-0000-4000-8000-0000000000c1
+working
+read: {"path":"src/agent/mod.rs"}
+src/agent/cursor.rs
+ok
+
+```mac-worker-result
+{"status":"done","summary":"ok","questions":[],"files_changed":["src/agent/cursor.rs"]}
+```
+success
