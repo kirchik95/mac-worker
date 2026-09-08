@@ -4542,3 +4542,39 @@ fn a_pinned_submit_whose_refresh_fails_reports_the_worker_not_its_capabilities()
     assert_eq!(error.public_code(), "CAPACITY_BUSY", "{error}");
     assert_unavailable_observation(&fixture, "mini-1");
 }
+
+#[test]
+fn a_runner_for_a_row_held_by_another_identity_stops_after_the_adoption_wait() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    // A runner started by hand for a waiting row that belongs to another
+    // process is not the detached child its parent is about to adopt; it
+    // must stop with the owner mismatch instead of sleeping forever, and
+    // leave the row exactly as it found it.
+    let foreign = ProcessIdentity::new(424_243, 1).unwrap();
+    fixture.state.adopt_row(fixture.turn_id, foreign).unwrap();
+
+    let started = std::time::Instant::now();
+    let error = TurnRunner::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .with_adoption_wait(std::time::Duration::from_millis(300))
+    .run(fixture.task_id, fixture.turn_id, Some(&mut Vec::new()))
+    .unwrap_err();
+
+    assert_eq!(error.public_code(), "QUEUE_OWNER_MISMATCH", "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let entry = fixture.state.queue_entry(fixture.turn_id).unwrap().unwrap();
+    assert_eq!(entry.owner_opt(), Some(&foreign));
+    assert!(matches!(
+        entry.state(),
+        mac_worker::job::QueueState::Waiting { .. }
+    ));
+    let log = String::from_utf8(fixture.runner_log()).unwrap();
+    let line = log.lines().next().unwrap_or_default();
+    assert!(line.contains("QUEUE_OWNER_MISMATCH"), "{log}");
+}

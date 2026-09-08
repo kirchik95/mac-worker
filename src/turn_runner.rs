@@ -49,6 +49,11 @@ const EARLY_EXIT_DIAGNOSTIC_LIMIT: usize = 256;
 const WAIT_POLL: Duration = Duration::from_millis(100);
 const MAX_CAPACITY_BACKOFF_SECS: u64 = 30;
 const RUNNER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a runner waits for a waiting row held by another identity to be
+/// adopted to it.  The detached parent adopts within `RUNNER_HANDOFF_TIMEOUT`
+/// or abandons the handoff; a runner started by hand for a row that belongs
+/// to someone else would otherwise wait forever.
+const ADOPTION_WAIT: Duration = Duration::from_secs(10);
 
 /// Starts the durable process responsible for one queued task turn.
 pub trait RunnerExecutor: Send + Sync {
@@ -157,6 +162,7 @@ pub struct TurnRunner<'a> {
     /// The herdr session to tell about finished turns; absent when the
     /// operator turned notifications off or nobody injected a session.
     pub(crate) notifier: Option<crate::herdr::HerdrSocket>,
+    adoption_wait: Duration,
 }
 
 impl<'a> TurnRunner<'a> {
@@ -183,6 +189,7 @@ impl<'a> TurnRunner<'a> {
             client_state,
             executor,
             notifier: None,
+            adoption_wait: ADOPTION_WAIT,
         }
     }
 
@@ -191,6 +198,13 @@ impl<'a> TurnRunner<'a> {
     /// and other embedders never reach an operator's herdr by accident.
     pub fn with_notifier(mut self, socket: Option<crate::herdr::HerdrSocket>) -> Self {
         self.notifier = socket;
+        self
+    }
+
+    /// Bound the wait for a waiting row held by another identity.  Tests
+    /// shorten it; the default covers the detached handoff twice over.
+    pub fn with_adoption_wait(mut self, wait: Duration) -> Self {
+        self.adoption_wait = wait;
         self
     }
 
@@ -425,6 +439,7 @@ impl<'a> TurnRunner<'a> {
     ) -> Result<(TaskId, TurnId, ProcessIdentity), WorkerError> {
         let mut backoff = 1_u64;
         let runner_owner = current_process_identity()?;
+        let adoption_deadline = Instant::now() + self.adoption_wait;
         loop {
             let record = self.client_state.load_task(task_id)?;
             let entry = self
@@ -486,6 +501,14 @@ impl<'a> TurnRunner<'a> {
                         // transfer ownership of the waiting row. Do not
                         // claim as the submitter during that window: the
                         // child must wait for its own identity to be adopted.
+                        // A row nobody adopts to this runner belongs to
+                        // another one; stop rather than wait forever.
+                        if Instant::now() >= adoption_deadline {
+                            return Err(queue_error(
+                                "QUEUE_OWNER_MISMATCH",
+                                "task turn is waiting under another runner; `worker task reconcile` re-owns a dead one",
+                            ));
+                        }
                         std::thread::sleep(WAIT_POLL);
                         continue;
                     }
