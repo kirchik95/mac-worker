@@ -27,9 +27,9 @@ use mac_worker::{
     config::Config,
     error::WorkerError,
     job::{
-        AdmissionObservation, CommandSummary, JobMeta, JobStatus, LeaseAcquireRequest,
+        AdmissionObservation, CommandSummary, JobMeta, JobState, JobStatus, LeaseAcquireRequest,
         LeaseAcquireResponse, LeaseRecord, LogChunk, LogChunkRequest, LogStream, ProcessIdentity,
-        QueueEntry, QueueEntryKind, SubmitResponse,
+        QueueEntry, QueueEntryKind, StatusRequest, StatusResponse, SubmitResponse,
     },
     lease::SlotState,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
@@ -75,7 +75,7 @@ fn inline_executor_returns_the_current_process_identity() {
 #[test]
 fn detached_executor_creates_private_runner_log_and_directory() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = support::task_harness::paths(temp.path());
+    let paths = support::task_harness::paths(temp.path().canonicalize().unwrap());
     let task_id = TaskId::generate();
     let turn_id = TurnId::generate();
 
@@ -101,7 +101,7 @@ fn detached_executor_creates_private_runner_log_and_directory() {
 #[test]
 fn detached_runner_does_not_mirror_child_stdio_into_owner_log() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = support::task_harness::paths(temp.path());
+    let paths = support::task_harness::paths(temp.path().canonicalize().unwrap());
     let task_id = TaskId::generate();
     let turn_id = TurnId::generate();
 
@@ -164,6 +164,103 @@ struct AcceptedThenTerminalRunner {
     facts_fresh: Mutex<bool>,
     base_release_failures: Mutex<u8>,
     worker: Mutex<String>,
+}
+
+/// A remote with immutable, seekable logs. Unlike a once-only byte supplier,
+/// this exposes duplicate reads after a runner restart and a final tail larger
+/// than one transport chunk.
+struct ReplayableLogsRunner<'a> {
+    inner: &'a AcceptedThenTerminalRunner,
+    logs: [Vec<u8>; 2],
+    meta: Mutex<Option<JobMeta>>,
+    reads: Mutex<Vec<(LogStream, u64)>>,
+    fail_stderr_once: AtomicBool,
+    terminal_on_submit: bool,
+}
+
+impl<'a> ReplayableLogsRunner<'a> {
+    fn new(inner: &'a AcceptedThenTerminalRunner) -> Self {
+        Self {
+            inner,
+            logs: [vec![0xf1; 150_011], vec![0xfe; 91_017]],
+            meta: Mutex::new(None),
+            reads: Mutex::new(Vec::new()),
+            fail_stderr_once: AtomicBool::new(false),
+            terminal_on_submit: false,
+        }
+    }
+}
+
+impl ProcessRunner for ReplayableLogsRunner<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let operation = request.args.last().and_then(|arg| arg.to_str());
+        if operation == Some(HostOperation::TaskTurn.command()) {
+            let turn: TaskTurnRequest = decode_request(request)?;
+            let material = turn.submit().material();
+            *self.meta.lock().unwrap() = Some(JobMeta::new(material, material.fingerprint())?);
+            let response = self.inner.run(request)?;
+            return if self.terminal_on_submit {
+                let accepted: TaskTurnResponse = serde_json::from_slice(&response.stdout).unwrap();
+                canonical_process(&TaskTurnResponse::new(
+                    accepted.submit().clone(),
+                    self.inner.task_status(turn.turn().task_id(), true)?,
+                ))
+            } else {
+                Ok(response)
+            };
+        }
+        if operation == Some(HostOperation::Status.command()) {
+            let query: StatusRequest = decode_request(request)?;
+            let meta = self.meta.lock().unwrap().clone().unwrap();
+            assert_eq!(query.job_id(), meta.job_id());
+            return canonical_process(&StatusResponse::new(
+                meta.clone(),
+                JobStatus::new(
+                    JobState::Succeeded,
+                    meta.created_at_millis() + 2,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    None,
+                    Some(self.logs[0].len() as u64),
+                    Some(self.logs[1].len() as u64),
+                    None,
+                    None,
+                )?,
+            )?);
+        }
+        if operation == Some(HostOperation::LogChunk.command()) {
+            let query: LogChunkRequest = decode_request(request)?;
+            self.reads
+                .lock()
+                .unwrap()
+                .push((query.stream(), query.offset()));
+            if query.stream() == LogStream::Stderr
+                && self.fail_stderr_once.swap(false, Ordering::SeqCst)
+            {
+                return Err(WorkerError::Transport {
+                    code: "SSH_FAILED",
+                    message: "fixture connection interrupted after stdout append".into(),
+                });
+            }
+            let index = if query.stream() == LogStream::Stdout {
+                0
+            } else {
+                1
+            };
+            let bytes = &self.logs[index];
+            let offset = query.offset() as usize;
+            let end = bytes.len().min(offset + query.limit() as usize);
+            return canonical_process(&mac_worker::job::LogChunkResponse::new(LogChunk::new(
+                query.stream(),
+                query.offset(),
+                bytes[offset..end].to_vec(),
+            )?)?);
+        }
+        self.inner.run(request)
+    }
 }
 
 #[derive(Clone)]
@@ -551,6 +648,9 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                 };
                 canonical_process(&TaskTurnResponse::new(submit, active))
             }
+            value if value == HostOperation::Status.command() => {
+                fixture_terminal_job(&self.requests(), request, 13, 0)
+            }
             value if value == HostOperation::LogChunk.command() => {
                 let chunk_request: LogChunkRequest = decode_request(request)?;
                 let bytes = if chunk_request.stream() == LogStream::Stdout
@@ -744,6 +844,105 @@ fn successful_submission_reports_the_handed_off_runner() {
         fixture.state.runner_liveness(fixture.task_id).unwrap()
     );
     assert_eq!(fixture.reported_runner, Some(RunnerState::Live));
+}
+
+#[test]
+fn runner_drains_both_final_streams_beyond_one_chunk() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let remote = ReplayableLogsRunner::new(&fixture.runner);
+    TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap();
+    let log = fixture.runner_log();
+    assert_eq!(log.iter().filter(|byte| **byte == 0xf1).count(), 150_011);
+    assert_eq!(log.iter().filter(|byte| **byte == 0xfe).count(), 91_017);
+    let reads = remote.reads.lock().unwrap();
+    assert!(
+        reads.contains(&(LogStream::Stdout, 150_011)),
+        "stdout EOF was not confirmed"
+    );
+    assert!(
+        reads.contains(&(LogStream::Stderr, 91_017)),
+        "stderr EOF was not confirmed"
+    );
+}
+
+#[test]
+fn runner_reads_logs_when_submit_already_reports_a_terminal_task() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let mut remote = ReplayableLogsRunner::new(&fixture.runner);
+    remote.terminal_on_submit = true;
+    TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap();
+    let log = fixture.runner_log();
+    assert_eq!(log.iter().filter(|byte| **byte == 0xf1).count(), 150_011);
+    assert_eq!(log.iter().filter(|byte| **byte == 0xfe).count(), 91_017);
+}
+
+#[test]
+fn restarted_runner_resumes_both_logs_without_repeating_a_committed_prefix() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let remote = ReplayableLogsRunner::new(&fixture.runner);
+    remote.fail_stderr_once.store(true, Ordering::SeqCst);
+    let error = TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    assert_eq!(error.public_code(), "SSH_LAUNCH_FAILED");
+    let prefix = fixture.runner_log();
+    assert_eq!(prefix.iter().filter(|byte| **byte == 0xf1).count(), 65_536);
+    let reopened = ClientStateStore::open(&fixture.paths.state).unwrap();
+    remote.reads.lock().unwrap().clear();
+    TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &reopened,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap();
+    let log = fixture.runner_log();
+    assert!(
+        log.starts_with(&prefix),
+        "recovery rewrote already visible bytes"
+    );
+    assert_eq!(log.iter().filter(|byte| **byte == 0xf1).count(), 150_011);
+    assert_eq!(log.iter().filter(|byte| **byte == 0xfe).count(), 91_017);
+    let reads = remote.reads.lock().unwrap();
+    assert_eq!(
+        reads
+            .iter()
+            .find(|(stream, _)| *stream == LogStream::Stdout),
+        Some(&(LogStream::Stdout, 65_536))
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .find(|(stream, _)| *stream == LogStream::Stderr),
+        Some(&(LogStream::Stderr, 0))
+    );
 }
 
 fn assert_remote_turn_completed(
@@ -1803,6 +2002,17 @@ impl ProcessRunner for FetchFailingRunner {
                     submit,
                     self.task_status(turn.turn().task_id())?,
                 ))
+            }
+            value if value == HostOperation::Status.command() => {
+                fixture_terminal_job(&self.requests(), request, 0, 0)
+            }
+            value if value == HostOperation::LogChunk.command() => {
+                let query: LogChunkRequest = decode_request(request)?;
+                canonical_process(&mac_worker::job::LogChunkResponse::new(LogChunk::new(
+                    query.stream(),
+                    query.offset(),
+                    vec![],
+                )?)?)
             }
             value if value == HostOperation::TaskClose.command() => {
                 let close: TaskCloseRequest = decode_request(request)?;
@@ -3332,4 +3542,181 @@ fn runner_that_exits_early_writes_one_diagnostic_line_and_no_secret() {
     assert!(!log.contains(secret));
     assert!(!log.contains("/Users/alice"));
     assert!(!log.contains("id_rsa"));
+}
+
+fn fixture_terminal_job(
+    requests: &[ProcessRequest],
+    query: &ProcessRequest,
+    stdout: u64,
+    stderr: u64,
+) -> Result<ProcessResult, WorkerError> {
+    let query: StatusRequest = decode_request(query)?;
+    let material = if let Some(request) = requests.iter().rev().find(|r| {
+        r.args
+            .last()
+            .is_some_and(|a| a == HostOperation::TaskTurn.command())
+    }) {
+        let turn: TaskTurnRequest = decode_request(request)?;
+        turn.submit().material().clone()
+    } else {
+        // This fixture models an already-completed task returned by prepare.
+        let request = requests
+            .iter()
+            .rev()
+            .find(|r| {
+                r.args
+                    .last()
+                    .is_some_and(|a| a == HostOperation::LeaseAcquire.command())
+            })
+            .unwrap();
+        let acquire: LeaseAcquireRequest = decode_request(request)?;
+        acquire.material().clone()
+    };
+    let meta = JobMeta::new(&material, material.fingerprint())?;
+    assert_eq!(query.job_id(), meta.job_id());
+    canonical_process(&StatusResponse::new(
+        meta,
+        JobStatus::new(
+            JobState::Succeeded,
+            material.created_at_millis() + 2,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+            Some(stdout),
+            Some(stderr),
+            None,
+            None,
+        )?,
+    )?)
+}
+
+#[test]
+fn completed_retry_only_retries_local_cleanup() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    *fixture.runner.base_release_failures.lock().unwrap() = 1;
+    assert!(fixture.run(&mut Vec::new()).is_err());
+    assert!(
+        fixture
+            .state
+            .queue_entry(fixture.turn_id)
+            .unwrap()
+            .is_some()
+    );
+    let before = fixture.runner_log();
+    let count = fixture.runner.requests().len();
+    fixture.run(&mut Vec::new()).unwrap();
+    assert_eq!(fixture.runner_log(), before);
+    assert!(
+        fixture
+            .state
+            .queue_entry(fixture.turn_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture.runner.requests()[count..]
+            .iter()
+            .all(|r| r.program != OsStr::new("/usr/bin/ssh")),
+        "completed retry must not contact remote"
+    );
+}
+
+#[test]
+fn detached_executor_rejects_a_substituted_log_without_changing_its_target() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let task = TaskId::generate();
+    let turn = TurnId::generate();
+    store.open_runner_log(task, turn).unwrap();
+    let log = paths
+        .state
+        .join("runners")
+        .join(task.to_string())
+        .join(format!("{turn}.log"));
+    let target = root.path().join("target");
+    fs::write(&target, b"untouched").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::remove_file(&log).unwrap();
+    symlink(&target, &log).unwrap();
+    assert!(DetachedRunnerExecutor.start(&paths, task, turn).is_err());
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert_eq!(fs::read(target).unwrap(), b"untouched");
+}
+
+#[test]
+fn invalid_terminal_identity_or_changed_final_lengths_keep_recovery_ownership() {
+    struct CorruptStatus<'a> {
+        inner: ReplayableLogsRunner<'a>,
+        calls: Mutex<u32>,
+        change_length: bool,
+    }
+    impl ProcessRunner for CorruptStatus<'_> {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            let mut response = self.inner.run(request)?;
+            if request
+                .args
+                .last()
+                .is_some_and(|a| a == HostOperation::Status.command())
+            {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&response.stdout).unwrap();
+                if self.change_length {
+                    if *calls >= 4 {
+                        value["status"]["final_stdout_bytes"] = 150_012.into();
+                    }
+                } else {
+                    value["meta"]["worker_name"] = "other-worker".into();
+                }
+                response.stdout = serde_json::to_vec(&value).unwrap();
+            }
+            Ok(response)
+        }
+    }
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    for change_length in [false, true] {
+        let fixture = AcceptedThenTerminalFixture::new();
+        let remote = CorruptStatus {
+            inner: ReplayableLogsRunner::new(&fixture.runner),
+            calls: Mutex::new(0),
+            change_length,
+        };
+        assert!(
+            TurnRunner::new(
+                &remote,
+                &fixture.config,
+                &fixture.paths,
+                &fixture.state,
+                &fixture.executor
+            )
+            .run(fixture.task_id, fixture.turn_id, None)
+            .is_err()
+        );
+        assert!(
+            fixture
+                .state
+                .queue_entry(fixture.turn_id)
+                .unwrap()
+                .is_some()
+        );
+        let path = fixture
+            .paths
+            .state
+            .join("runners")
+            .join(fixture.task_id.to_string())
+            .join(format!("{}.checkpoint.json", fixture.turn_id));
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(checkpoint["committed"]["completion"].is_null());
+    }
 }

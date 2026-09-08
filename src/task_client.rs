@@ -930,7 +930,23 @@ impl<'a> TaskClient<'a> {
             // Observe completion before reading bytes so a final diagnostic
             // written just before the status update is included in this read.
             record = self.client_state.load_task(task_id)?;
-            let finished = !follow || record.status().state().is_terminal();
+            let checkpoint = match crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)
+            {
+                Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE) => {
+                    continue;
+                }
+                result => result?,
+            };
+            let finished = !follow || checkpoint.as_ref().is_some_and(|s| s.completion.is_some());
+            let may_initialize = matches!(
+                record.status().state(),
+                TaskState::Queued | TaskState::Active
+            ) && record
+                .status()
+                .turns()
+                .iter()
+                .find(|turn| turn.turn_id() == turn_id)
+                .is_none_or(|turn| turn.terminal().is_none());
             let failure = if raw {
                 None
             } else {
@@ -939,16 +955,64 @@ impl<'a> TaskClient<'a> {
                     .turns()
                     .iter()
                     .find(|turn| turn.turn_id() == turn_id)
-                    .and_then(turn_failure)
+                    .and_then(|turn| {
+                        checkpoint
+                            .as_ref()
+                            .and_then(|s| s.completion.as_ref())
+                            .map_or_else(
+                                || turn_failure(turn),
+                                |c| outcome_failure(turn.turn_number(), &c.outcome),
+                            )
+                    })
             };
-            let bytes = match self.read_runner_log(task_id, turn_id) {
-                Ok(bytes) => Some(bytes),
+            let read = match &checkpoint {
+                Some(checkpoint) => crate::runner_log::read_committed(
+                    &self.paths.state,
+                    task_id,
+                    turn_id,
+                    checkpoint,
+                ),
+                None => self.read_runner_log(task_id, turn_id),
+            };
+            let bytes = match read {
+                Ok(mut bytes) => {
+                    if let Some(checkpoint) = &checkpoint {
+                        let len = usize::try_from(checkpoint.len).map_err(|_| {
+                            task_error("LOG_CHECKPOINT_INVALID", "committed length is out of range")
+                        })?;
+                        if bytes.len() < len {
+                            return Err(task_error(
+                                "LOG_CHECKPOINT_INVALID",
+                                "log is shorter than its committed length",
+                            ));
+                        }
+                        bytes.truncate(len);
+                    } else if follow && (!bytes.is_empty() || !may_initialize) {
+                        return Err(task_error(
+                            "LOG_COMPLETION_UNKNOWN",
+                            "legacy log has no provable completion",
+                        ));
+                    }
+                    Some(bytes)
+                }
                 // A cancelled parked turn may never have started a runner.
                 // Its recorded failure remains useful without a log file.
                 Err(WorkerError::Io(error))
-                    if error.kind() == io::ErrorKind::NotFound && failure.is_some() =>
+                    if error.kind() == io::ErrorKind::NotFound && checkpoint.is_none() =>
                 {
+                    if follow && !may_initialize {
+                        return Err(task_error(
+                            "LOG_COMPLETION_UNKNOWN",
+                            "legacy turn has no provable completion",
+                        ));
+                    }
+                    if !follow && failure.is_none() {
+                        return Err(WorkerError::Io(error));
+                    }
                     None
+                }
+                Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE) => {
+                    continue;
                 }
                 Err(error) => return Err(error),
             };
@@ -1069,24 +1133,13 @@ impl<'a> TaskClient<'a> {
             if matches!(entry.state(), QueueState::Dispatching { .. }) {
                 return Err(task_error("TASK_BUSY", "task turn is being dispatched"));
             }
-            match self
+            let retained = self
                 .client_state
-                .request_queue_cancel(entry.job_id(), current_time_millis()?)?
-            {
-                Some(crate::job::QueueCancel::RemovedWaiting { .. }) => {}
-                Some(crate::job::QueueCancel::RequestedDispatch { .. }) => {
-                    return Err(task_error("TASK_BUSY", "task turn is being dispatched"));
-                }
-                None => {
-                    return Err(task_error(
-                        "TASK_INCONSISTENT",
-                        "task queue turn disappeared",
-                    ));
-                }
+                .retain_task_turn_cancel(entry.job_id(), current_time_millis()?)?
+                .ok_or_else(|| task_error("TASK_INCONSISTENT", "task queue turn disappeared"))?;
+            if matches!(retained.state(), QueueState::Dispatching { .. }) {
+                return Err(task_error("TASK_BUSY", "task turn is being dispatched"));
             }
-            let _ = self
-                .client_state
-                .remove_turn_prompt(task_id, entry.job_id());
             let status = TaskStatus::new(
                 if discard {
                     TaskState::Abandoned
@@ -1109,7 +1162,7 @@ impl<'a> TaskClient<'a> {
                     .with_status(status)?
                     .with_abandon_code(discard.then_some("TASK_CLOSED".to_owned()))?,
             )?;
-            self.release_task_base(&record)?;
+            self.finish_waiting_cancellation(&self.client_state.load_task(task_id)?, &retained)?;
             return self.report_for(task_id);
         }
         if record.status().state() == TaskState::Queued {
@@ -1183,12 +1236,26 @@ impl<'a> TaskClient<'a> {
             let _ = self.complete_submission_rollback(turn_id, &current, &transfer);
         }
 
+        for entry in self.client_state.queue_snapshot()?.entries() {
+            if entry.kind() == QueueEntryKind::TaskTurn
+                && entry.is_cancel_requested()
+                && !matches!(entry.state(), QueueState::Dispatching { .. })
+                && let Some(task_id) = self.client_state.task_id_for_turn(entry.job_id())?
+            {
+                let record = self.client_state.load_task(task_id)?;
+                if !submission_recovery_pending(&record) {
+                    self.finish_waiting_cancellation(&record, entry)?;
+                    report.repaired_rows += 1;
+                }
+            }
+        }
+
         // A task-turn row is owned by its runner in both waiting and
         // dispatching states.  A dead owner is normally adopted so the next
         // runner can resume the accepted turn or retry the pre-acceptance
-        // handoff.  A dispatching row whose task is already non-active is the
-        // terminal-cleanup exception: repair it under the queue lock instead
-        // of leaving a stale reservation that blocks close or say.
+        // handoff. A dispatching row whose journal proves completion needs
+        // only local cleanup. Release its base before retiring the row;
+        // task status alone is never evidence that logs were drained.
         for entry in self.client_state.queue_snapshot()?.entries().iter() {
             if entry.kind() != QueueEntryKind::TaskTurn
                 || matches!(entry.state(), QueueState::Parked)
@@ -1219,6 +1286,8 @@ impl<'a> TaskClient<'a> {
                     && let Some(task_id) = self.terminal_task_for_turn(entry.job_id())?
                 {
                     self.client_state.adopt_row(entry.job_id(), owner)?;
+                    self.release_task_base(&self.client_state.load_task(task_id)?)?;
+                    self.client_state.record_runner(task_id, None)?;
                     if self
                         .client_state
                         .remove_task_turn_after_terminal(entry.job_id(), owner)?
@@ -1276,22 +1345,17 @@ impl<'a> TaskClient<'a> {
             if submission_recovery_pending(&record) {
                 continue;
             }
-            if matches!(
-                record.status().state(),
-                TaskState::Closed | TaskState::Abandoned | TaskState::Lost
-            ) {
-                continue;
-            }
-            let Some(turn_id) = pending_turn_id(record.status()).or_else(|| {
-                self.client_state
-                    .turn_ids_for_task(record.meta().task_id())
-                    .ok()?
-                    .last()
-                    .copied()
-            }) else {
+            let queued = self
+                .client_state
+                .queue_entry_for_task_turn(record.meta().task_id())?;
+            let Some(turn_id) = queued
+                .as_ref()
+                .map(QueueEntry::job_id)
+                .or_else(|| pending_turn_id(record.status()))
+            else {
                 continue;
             };
-            let mut entry = self.client_state.queue_entry(turn_id)?;
+            let mut entry = queued;
             if entry.is_none()
                 && matches!(
                     record.status().state(),
@@ -1303,34 +1367,9 @@ impl<'a> TaskClient<'a> {
             }
             let Some(entry) = entry else { continue };
             if matches!(entry.state(), QueueState::Parked) {
-                if record.status().state() == TaskState::Open {
-                    let _ = self
-                        .client_state
-                        .remove_task_turn_after_terminal(turn_id, owner);
-                }
                 continue;
             }
             let liveness = self.client_state.runner_liveness(record.meta().task_id())?;
-            if record.status().state() == TaskState::Open {
-                if liveness != Some(RunnerState::Live)
-                    && !matches!(
-                        entry
-                            .owner_opt()
-                            .copied()
-                            .map(|identity| { self.client_state.process_observation(identity) }),
-                        Some(ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous)
-                    )
-                {
-                    let row_owner = entry.owner_opt().copied().unwrap_or(owner);
-                    let _ = self
-                        .client_state
-                        .remove_task_turn_after_terminal(turn_id, row_owner);
-                    let _ = self
-                        .client_state
-                        .remove_turn_prompt(record.meta().task_id(), turn_id);
-                }
-                continue;
-            }
             if liveness == Some(RunnerState::Dead) {
                 self.client_state
                     .record_runner(record.meta().task_id(), None)?;
@@ -1385,6 +1424,13 @@ impl<'a> TaskClient<'a> {
     ) -> Result<TaskReport, WorkerError> {
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
+        if self
+            .client_state
+            .queue_entry_for_task_turn(task_id)?
+            .is_some()
+        {
+            return Err(task_error("TASK_BUSY", "previous turn is still finalizing"));
+        }
         match record.status().state() {
             TaskState::Active => return Err(task_error("TASK_BUSY", "task has an active turn")),
             TaskState::Closed | TaskState::Abandoned | TaskState::Lost => {
@@ -1555,28 +1601,13 @@ impl<'a> TaskClient<'a> {
         {
             match self
                 .client_state
-                .request_queue_cancel(turn_id, current_time_millis()?)?
+                .retain_task_turn_cancel(turn_id, current_time_millis()?)?
             {
-                Some(crate::job::QueueCancel::RemovedWaiting { .. }) => {
-                    let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
-                    if record.status().state() == TaskState::Queued {
-                        let status = abandoned_status(record.status(), "CANCELLED")?;
-                        self.client_state.update_task(
-                            record
-                                .with_status(status)?
-                                .with_abandon_code(Some("CANCELLED".to_owned()))?,
-                        )?;
-                        let _ = self.release_task_base(&record);
-                    } else if record.status().state() == TaskState::Active {
-                        let status = cancelled_followup_status(record.status())?;
-                        self.client_state
-                            .update_task(record.with_status(status)?.with_runner(None)?)?;
-                    }
+                Some(entry) if !matches!(entry.state(), QueueState::Dispatching { .. }) => {
+                    self.finish_waiting_cancellation(&record, &entry)?;
                     return self.report_for(task_id);
                 }
-                Some(crate::job::QueueCancel::RequestedDispatch { .. }) => {
-                    return Err(task_error("TASK_BUSY", "task turn is being dispatched"));
-                }
+                Some(_) => return Err(task_error("TASK_BUSY", "task turn is being dispatched")),
                 None if entry.is_some() => {
                     return Err(task_error(
                         "TASK_INCONSISTENT",
@@ -1598,11 +1629,7 @@ impl<'a> TaskClient<'a> {
                 ),
             )?;
             let status = response.status().clone();
-            self.client_state
-                .update_task(record.with_status(status)?.with_runner(None)?)?;
-            self.retire_task_turn(task_id, turn_id)?;
-            let updated = self.client_state.load_task(task_id)?;
-            self.release_task_base(&updated)?;
+            self.client_state.update_task(record.with_status(status)?)?;
         }
         self.report_for(task_id)
     }
@@ -1847,17 +1874,41 @@ impl<'a> TaskClient<'a> {
         )?)
     }
 
-    fn retire_task_turn(&self, task_id: TaskId, turn_id: TurnId) -> Result<(), WorkerError> {
-        if let Some(entry) = self.client_state.queue_entry(turn_id)? {
-            let owner = entry
+    fn finish_waiting_cancellation(
+        &self,
+        record: &LocalTaskRecord,
+        entry: &QueueEntry,
+    ) -> Result<(), WorkerError> {
+        let task = record.meta().task_id();
+        let turn = entry.job_id();
+        if !entry.is_cancel_requested() || matches!(entry.state(), QueueState::Dispatching { .. }) {
+            return Err(task_error(
+                "TASK_BUSY",
+                "cancellation is not proven preacceptance",
+            ));
+        }
+        let status = match record.status().state() {
+            TaskState::Queued => abandoned_status(record.status(), "CANCELLED")?,
+            TaskState::Active => cancelled_followup_status(record.status())?,
+            _ => record.status().clone(),
+        };
+        self.client_state.update_task(record.with_status(status)?)?;
+        let outcome = if record.abandon_code() == Some("RUNNER_HANDOFF_FAILED") {
+            TaskOutcome::failed("RUNNER_HANDOFF_FAILED")
+        } else {
+            TaskOutcome::Cancelled
+        };
+        crate::runner_log::finish_never_started(&self.paths.state, task, turn, outcome)?;
+        self.release_task_base(record)?;
+        self.client_state.record_runner(task, None)?;
+        self.client_state.remove_task_turn_after_terminal(
+            turn,
+            entry
                 .owner_opt()
                 .copied()
-                .unwrap_or(current_process_identity()?);
-            let _ = self
-                .client_state
-                .remove_task_turn_after_terminal(turn_id, owner)?;
-        }
-        let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
+                .unwrap_or(current_process_identity()?),
+        )?;
+        self.client_state.remove_turn_prompt(task, turn)?;
         Ok(())
     }
 
@@ -2004,26 +2055,11 @@ impl<'a> TaskClient<'a> {
         let Some(task_id) = self.client_state.task_id_for_turn(turn_id)? else {
             return Ok(None);
         };
-        let record = self.client_state.load_task(task_id)?;
-        let recorded_turn_is_terminal = record
-            .status()
-            .turns()
-            .iter()
-            .find(|turn| turn.turn_id() == turn_id)
-            .is_some_and(|turn| turn.terminal().is_some());
-        let task_state = record.status().state();
-        if task_state == TaskState::Active {
-            return Ok(None);
-        }
-        let task_is_terminal_or_open = matches!(
-            task_state,
-            TaskState::Open | TaskState::Closed | TaskState::Abandoned | TaskState::Lost
-        );
-        if recorded_turn_is_terminal || task_is_terminal_or_open {
-            Ok(Some(task_id))
-        } else {
-            Ok(None)
-        }
+        Ok(
+            crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)?
+                .is_some_and(|s| s.completion.is_some())
+                .then_some(task_id),
+        )
     }
 
     fn enqueue_missing_turn(
@@ -2132,20 +2168,9 @@ impl<'a> TaskClient<'a> {
         }
         if let Err(error) = self.start_runner(task_id, entry.job_id()) {
             if let Ok(record) = self.client_state.load_task(task_id)
-                && let Ok(status) = abandoned_status(record.status(), "RUNNER_HANDOFF_FAILED")
-                && let Ok(replacement) = record.with_status(status).and_then(|record| {
-                    record.with_abandon_code(Some("RUNNER_HANDOFF_FAILED".to_owned()))
-                })
+                && let Ok(transfer) = self.transfer_for_record(&record)
             {
-                let _ = self.client_state.update_task(replacement);
-            }
-            let _ = self.client_state.remove_queued(entry.job_id());
-            let _ = self
-                .client_state
-                .remove_turn_prompt(task_id, entry.job_id());
-            if let Ok(record) = self.client_state.load_task(task_id) {
-                let _ = self.release_task_base(&record);
-                let _ = self.client_state.record_runner(task_id, None);
+                return Err(self.fail_handoff(task_id, entry.job_id(), transfer, error));
             }
             return Err(task_error(
                 "RUNNER_HANDOFF_FAILED",
@@ -2243,17 +2268,36 @@ impl<'a> TaskClient<'a> {
         transfer: TransferRepo,
         error: WorkerError,
     ) -> WorkerError {
-        let _ = self.client_state.remove_queued(turn_id);
-        let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
-        let _ = self.client_state.record_runner(task_id, None);
-        if let Ok(record) = self.client_state.load_task(task_id)
-            && let Ok(status) = abandoned_status(record.status(), "RUNNER_HANDOFF_FAILED")
-            && let Ok(record) = record.with_status(status)
-            && let Ok(record) = record.with_abandon_code(Some("RUNNER_HANDOFF_FAILED".to_owned()))
-        {
-            let _ = self.client_state.update_task(record);
-        }
-        let _ = transfer.release_base(self.runner, task_id);
+        let _cleanup = (|| -> Result<(), WorkerError> {
+            let Some(entry) = self.client_state.cancel_unstarted_handoff(
+                turn_id,
+                current_process_identity()?,
+                current_time_millis()?,
+            )?
+            else {
+                return Ok(());
+            };
+            let record = self.client_state.load_task(task_id)?;
+            let status = abandoned_status(record.status(), "RUNNER_HANDOFF_FAILED")?;
+            let record = record
+                .with_status(status)?
+                .with_abandon_code(Some("RUNNER_HANDOFF_FAILED".into()))?;
+            self.client_state.update_task(record)?;
+            crate::runner_log::finish_never_started(
+                &self.paths.state,
+                task_id,
+                turn_id,
+                TaskOutcome::failed("RUNNER_HANDOFF_FAILED"),
+            )?;
+            transfer.release_base(self.runner, task_id)?;
+            self.client_state.record_runner(task_id, None)?;
+            self.client_state.remove_task_turn_after_terminal(
+                turn_id,
+                *entry.owner_opt().expect("waiting entry has owner"),
+            )?;
+            self.client_state.remove_turn_prompt(task_id, turn_id)?;
+            Ok(())
+        })();
         task_error(
             "RUNNER_HANDOFF_FAILED",
             format!("runner handoff failed: {error}"),
@@ -2276,7 +2320,12 @@ impl<'a> TaskClient<'a> {
     fn live_runner_count(&self) -> Result<usize, WorkerError> {
         let mut identities = BTreeSet::new();
         for task in self.client_state.list_tasks()? {
-            if task.status().state().is_terminal() {
+            if task.status().state().is_terminal()
+                && self
+                    .client_state
+                    .queue_entry_for_task_turn(task.meta().task_id())?
+                    .is_none()
+            {
                 continue;
             }
             let Some(runner) = task.runner() else {
@@ -2439,14 +2488,18 @@ fn render_agent_log(
 }
 
 fn turn_failure(turn: &TurnSummary) -> Option<String> {
-    let description = match turn.outcome() {
-        Some(TaskOutcome::Failed { reason }) => format!("failed: {reason}"),
-        Some(outcome @ (TaskOutcome::Cancelled | TaskOutcome::TimedOut | TaskOutcome::Lost)) => {
+    outcome_failure(turn.turn_number(), turn.outcome()?)
+}
+
+fn outcome_failure(number: u32, outcome: &TaskOutcome) -> Option<String> {
+    let description = match outcome {
+        TaskOutcome::Failed { reason } => format!("failed: {reason}"),
+        outcome @ (TaskOutcome::Cancelled | TaskOutcome::TimedOut | TaskOutcome::Lost) => {
             outcome.kind().to_owned()
         }
         _ => return None,
     };
-    Some(format!("turn {} {description}", turn.turn_number()))
+    Some(format!("turn {number} {description}"))
 }
 
 fn task_worker<'a>(

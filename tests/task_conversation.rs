@@ -678,6 +678,19 @@ fn reconcile_removes_dead_dispatching_terminal_task_turn_before_close() {
         QueueState::Dispatching { .. }
     ));
 
+    // Task status alone is not completion: model the completed runner journal.
+    store.open_runner_log(task_id, turn_id).unwrap();
+    let checkpoint = paths
+        .state
+        .join("runners")
+        .join(task_id.to_string())
+        .join(format!("{turn_id}.checkpoint.json"));
+    std::fs::write(&checkpoint,serde_json::to_vec(&serde_json::json!({"version":1,"task_id":task_id,"turn_id":turn_id,"committed":{"offsets":[0,0],"len":0,"accepted":true,"completion":{"outcome":{"kind":"done"},"drained":true}},"pending":null})).unwrap()).unwrap();
+    std::fs::set_permissions(
+        &checkpoint,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .unwrap();
     let config = task_config();
     let executor = InlineRunnerExecutor;
     let client = TaskClient::new(&remote, &config, &paths, &store, &executor);
@@ -1170,5 +1183,81 @@ fn an_active_task_turn_consumes_one_run_slot_not_two() {
             .entry()
             .job_id(),
         job(2)
+    );
+}
+
+#[test]
+fn failed_local_cancellation_keeps_a_recoverable_row_until_completion() {
+    use std::io::Write;
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _cwd = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+    let task = TaskId::generate();
+    let id = job(9901);
+    let own = owner(9901);
+    let record = task_record(
+        task,
+        id,
+        TaskState::Queued,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        Some(own),
+    );
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    store.create_task(record).unwrap();
+    store.write_turn_prompt(task, id, "cancel me").unwrap();
+    store
+        .enqueue(turn(
+            &store,
+            9901,
+            10,
+            own,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            None,
+        ))
+        .unwrap();
+    store
+        .open_runner_log(task, id)
+        .unwrap()
+        .write_all(b"legacy bytes")
+        .unwrap();
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+    let error = client.cancel(task).unwrap_err();
+    assert_eq!(error.public_code(), "LOG_CHECKPOINT_MISSING");
+    let entry = store
+        .queue_entry(id)
+        .unwrap()
+        .expect("cancellation must retain recovery row");
+    assert!(entry.is_cancel_requested());
+    assert!(
+        store
+            .claim_task_turn(own, id, &["mini-1".into()], 20)
+            .unwrap()
+            .is_none()
+    );
+    let log = paths
+        .state
+        .join("runners")
+        .join(task.to_string())
+        .join(format!("{id}.log"));
+    assert_eq!(std::fs::read(&log).unwrap(), b"legacy bytes");
+    // Explicit fixture repair preserves the legacy bytes separately; the runtime never migrates them.
+    std::fs::rename(&log, log.with_extension("legacy")).unwrap();
+    client.reconcile_runners().unwrap();
+    assert!(store.queue_entry(id).unwrap().is_none());
+    let sidecar = log.with_file_name(format!("{id}.checkpoint.json"));
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
+    assert_eq!(
+        journal["committed"]["completion"]["outcome"]["kind"],
+        "cancelled"
     );
 }

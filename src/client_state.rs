@@ -862,6 +862,49 @@ impl ClientStateStore {
         })
     }
 
+    /// Retain task cancellation intent until local completion and cleanup are durable.
+    /// Cancelled waiting/parked rows are excluded from admission.
+    pub(crate) fn retain_task_turn_cancel(
+        &self,
+        turn_id: TurnId,
+        requested_at_millis: u64,
+    ) -> Result<Option<QueueEntry>, WorkerError> {
+        self.update_queue(|snapshot| {
+            let Some(entry) = snapshot.entries.iter_mut().find(|e| e.job_id() == turn_id) else {
+                return Ok((None, false));
+            };
+            if entry.kind() != QueueEntryKind::TaskTurn {
+                return Err(queue_error(
+                    "QUEUE_KIND_CONFLICT",
+                    "cancellation requires a task turn",
+                ));
+            }
+            entry.request_cancel(requested_at_millis)?;
+            Ok((Some(entry.clone()), true))
+        })
+    }
+
+    /// Fence a failed handoff only while its original waiting owner still owns it.
+    pub(crate) fn cancel_unstarted_handoff(
+        &self,
+        turn_id: TurnId,
+        owner: ProcessIdentity,
+        now: u64,
+    ) -> Result<Option<QueueEntry>, WorkerError> {
+        self.update_queue(|snapshot| {
+            let Some(entry) = snapshot.entries.iter_mut().find(|e| e.job_id() == turn_id) else {
+                return Ok((None, false));
+            };
+            if entry.kind() != QueueEntryKind::TaskTurn
+                || !matches!(entry.state(),QueueState::Waiting{owner:current} if *current==owner)
+            {
+                return Ok((None, false));
+            }
+            entry.request_cancel(now)?;
+            Ok((Some(entry.clone()), true))
+        })
+    }
+
     pub fn request_queue_cancel(
         &self,
         job_id: JobId,

@@ -105,6 +105,10 @@ The dashboard opens locally in your browser. To submit and return immediately, o
 
 If a turn fails, run `worker task logs <task-id>` to see agent diagnostics and the recorded failure reason. Use `--turn N` to inspect an earlier turn, or `--raw` for the original log bytes.
 
+`worker task logs <task-id> --follow` follows the selected turn until both native streams and result publication are complete. It exits even when the task remains Open or a later turn is active. Runners journal committed stdout/stderr offsets and resume interrupted drains without replaying their committed bytes; readers expose only committed log bytes. A new `say` returns `TASK_BUSY` until the previous runner’s remaining cleanup finishes.
+
+Historical logs without a checkpoint remain readable without `--follow`. A nonempty legacy log cannot be resumed safely: writer recovery returns `LOG_CHECKPOINT_MISSING`, and follow without provable completion returns `LOG_COMPLETION_UNKNOWN`. Existing bytes are preserved; automatic replay or migration is not supported.
+
 ## How it works
 
 Your laptop coordinates the work. The selected Mac runs the agent and keeps its task workspace. This diagram shows the default flow, using a local repository as the source:

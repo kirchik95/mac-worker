@@ -80,6 +80,24 @@ cargo fmt --all --check
 cargo clippy --locked --offline --target-dir /private/tmp/mac-worker-admission-target --all-targets -- -D warnings
 ```
 
+### 3.2. Durable runner logs and selected-turn completion
+
+Implemented in `fix/runner-log-recovery`: private bounded write-ahead journal, committed native offsets, terminal job identity/final-length checks and confirmed EOF for both streams, publication outcome and completion committed together, and recovery ownership retained through cleanup. Follow finishes for its selected turn while the task remains Open; `say` still waits for cleanup. Cancelled Waiting/Parked turns retain a recovery row until their local never-started completion is durable.
+
+Legacy nonempty logs remain readable without follow. Missing checkpoints fail writer recovery with `LOG_CHECKPOINT_MISSING`; follow without provable completion fails with `LOG_COMPLETION_UNKNOWN`. No automatic legacy replay/migration is attempted.
+
+Scoped verification: the eight-suite integrated run passed 233 tests; after final self-review changes, runner 48/48, reader 20/20, journal 8/8, and conversation/context 20/20 passed. All-target Clippy, fmt and diff whitespace checks passed. Four controlled journal mutations (append replay, skipped suffix check, missing writer exclusion, dropped completion) were each detected. The first full run found a missing native-status handler in the Cursor/OpenCode fake remote; after its faithful fixture extension that suite passed 21/21 and all-target Clippy passed again. The all-target rerun exited 0: **1,585 passed, 0 failed, 0 ignored across 62 top-level Cargo sections** (nested filtered harness summaries excluded). Two bounded late guards were added while that run was in progress: historical empty legacy follow uses the selected turn’s terminal state, and pending drained completion requires acceptance. Because the shared target directory could replace later test executables during the run, that full result is not claimed for one immutable final binary set. The frozen final source subsequently passed the **complete library suite (316 tests)** and **complete task_logs suite (21 tests)**, fmt, diff whitespace checks, and all-target Clippy, all exit 0. Independent review and main integration are pending.
+
+```sh
+cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-target --test turn_runner --test task_logs --test task_conversation --test task_project_context --test runner_dispatch --test scheduler_queue --test agent_adapters --test cli_help
+cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-target --lib runner_log::
+cargo fmt --all --check
+cargo clippy --locked --offline --target-dir /private/tmp/mac-worker-admission-target --all-targets -- -D warnings
+cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-target --all-targets
+```
+
+Coverage includes multi-chunk tails, immediate terminal acceptance, restart at committed offsets, changed terminal lengths/identity, selected historical follow, failed local cancellation recovery, local-only completed retry, native-event spoofing, committed logs over 8 MiB, and substituted detached log paths. Verification uses real private local files/Git and fake remotes; no live fleet or provider agents were used. Some journal/lifecycle tests were added with or after implementation; the critical journal guarantees additionally underwent controlled mutation validation.
+
 ## 4. Контракты и восстановление dashboard
 
 Независимые небольшие изменения:

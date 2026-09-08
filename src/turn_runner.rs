@@ -5,12 +5,8 @@
 //! the task and turn records and never relies on a public legacy job record.
 
 use std::{
-    fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        process::CommandExt,
-    },
+    os::unix::process::CommandExt,
     process::{Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -23,13 +19,14 @@ use crate::{
     git_transport::GitTransport,
     job::{
         AdmissionObservation, CommandSpec, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
-        LeaseToken, LogStream, ProcessIdentity, QueueEntryKind, QueueState,
-        RequestFingerprintMaterial, ResolveOrAbandonRequest, SubmitRequest,
+        LeaseToken, LogCursor, LogStream, ProcessIdentity, QueueEntryKind, QueueState,
+        RequestFingerprintMaterial, ResolveOrAbandonRequest, SubmitRequest, TerminalLogDrain,
     },
     paths::PathLayout,
     process::ProcessRunner,
     project_state::ProjectState,
     protocol::HealthStatus,
+    runner_log::{Completion, RunnerLog as LogWriter},
     scheduler::{CandidateObservation, SchedulerPolicy, WorkerPreference},
     scheduler_adapter::SchedulerProbeAdapter,
     supervisor::SystemProcessInspector,
@@ -48,8 +45,6 @@ use crate::{
 };
 
 const LOG_CHUNK_LIMIT: u32 = 64 * 1024;
-const RUNNER_LOG_MODE: u32 = 0o600;
-const RUNNER_DIRECTORY_MODE: u32 = 0o700;
 const EARLY_EXIT_DIAGNOSTIC_LIMIT: usize = 256;
 const WAIT_POLL: Duration = Duration::from_millis(100);
 const MAX_CAPACITY_BACKOFF_SECS: u64 = 30;
@@ -94,23 +89,10 @@ impl RunnerExecutor for DetachedRunnerExecutor {
         task_id: TaskId,
         turn_id: TurnId,
     ) -> Result<RunnerIdentity, WorkerError> {
-        let runner_dir = paths.state.join("runners").join(task_id.to_string());
-        fs::create_dir_all(&runner_dir).map_err(WorkerError::Io)?;
-        fs::set_permissions(
-            &runner_dir,
-            fs::Permissions::from_mode(RUNNER_DIRECTORY_MODE),
-        )
-        .map_err(WorkerError::Io)?;
-        let log_path = runner_dir.join(format!("{turn_id}.log"));
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(RUNNER_LOG_MODE)
-            .open(&log_path)
-            .map_err(WorkerError::Io)?;
-        fs::set_permissions(&log_path, fs::Permissions::from_mode(RUNNER_LOG_MODE))
-            .map_err(WorkerError::Io)?;
-        drop(log);
+        // Use the same rooted, locked initialization as the child. Never follow
+        // a substituted log or chmod an existing target through a pathname.
+        let _state = ClientStateStore::open(&paths.state)?;
+        drop(LogWriter::open(&paths.state, task_id, turn_id)?);
         let executable = std::env::current_exe().map_err(WorkerError::Io)?;
         let mut command = Command::new(executable);
         if !paths.config.as_os_str().is_empty() {
@@ -258,8 +240,8 @@ impl<'a> TurnRunner<'a> {
         turn_id: TurnId,
         error: &WorkerError,
     ) -> Result<(), WorkerError> {
-        let mut log = self.client_state.open_runner_log(task_id, turn_id)?;
-        if log.metadata().map_err(WorkerError::Io)?.len() > 0 {
+        let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
+        if log.len() > 0 {
             return Ok(());
         }
         let workers = self
@@ -274,8 +256,7 @@ impl<'a> TurnRunner<'a> {
             .ok()
             .and_then(|codes| codes.get(&task_id).cloned())
             .unwrap_or_else(|| error.public_code());
-        log.write_all(early_exit_diagnostic_line(&code, &workers).as_bytes())
-            .map_err(WorkerError::Io)
+        log.append_bytes(early_exit_diagnostic_line(&code, &workers).as_bytes())
     }
 
     fn start_next_parked(&self, owner: ProcessIdentity) -> Result<(), WorkerError> {
@@ -318,6 +299,13 @@ impl<'a> TurnRunner<'a> {
         turn_id: TurnId,
         owner: ProcessIdentity,
     ) -> Result<(), WorkerError> {
+        if self
+            .client_state
+            .cancel_unstarted_handoff(turn_id, owner, now_millis()?)?
+            .is_none()
+        {
+            return Ok(());
+        }
         let record = self.client_state.load_task(task_id)?;
         let status = TaskStatus::new(
             TaskState::Abandoned,
@@ -337,10 +325,12 @@ impl<'a> TurnRunner<'a> {
                 .with_status(status)?
                 .with_abandon_code(Some("RUNNER_HANDOFF_FAILED".to_owned()))?,
         )?;
-        let _ = self
-            .client_state
-            .remove_task_turn_after_terminal(turn_id, owner)?;
-        let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
+        crate::runner_log::finish_never_started(
+            &self.paths.state,
+            task_id,
+            turn_id,
+            TaskOutcome::failed("RUNNER_HANDOFF_FAILED"),
+        )?;
         if let Ok(project_path) = self.task_project_path(&record)
             && let Ok(project) =
                 ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
@@ -348,7 +338,12 @@ impl<'a> TurnRunner<'a> {
             && let Ok(transfer) =
                 TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
         {
-            let _ = transfer.release_base(self.runner, task_id);
+            transfer.release_base(self.runner, task_id)?;
+            self.client_state.record_runner(task_id, None)?;
+            let _ = self
+                .client_state
+                .remove_task_turn_after_terminal(turn_id, owner)?;
+            let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
         }
         Ok(())
     }
@@ -371,6 +366,32 @@ impl<'a> TurnRunner<'a> {
                 return Err(task_error(
                     "TASK_QUEUE_KIND",
                     "queue row is not a task turn",
+                ));
+            }
+            if crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)?
+                .is_some_and(|s| s.completion.is_some())
+            {
+                if entry.owner_opt() != Some(&runner_owner) {
+                    return Err(queue_error(
+                        "QUEUE_OWNER_MISMATCH",
+                        "completed turn cleanup belongs to another runner",
+                    ));
+                }
+                return Ok((task_id, turn_id, runner_owner));
+            }
+            if entry.is_cancel_requested()
+                && !matches!(entry.state(), QueueState::Dispatching { .. })
+            {
+                self.cancel_before_acceptance(
+                    &record,
+                    task_id,
+                    turn_id,
+                    entry.owner_opt().copied().unwrap_or(runner_owner),
+                    None,
+                )?;
+                return Err(task_error(
+                    "TASK_CANCELLED",
+                    "turn cancelled before admission",
                 ));
             }
             match entry.state() {
@@ -432,7 +453,7 @@ impl<'a> TurnRunner<'a> {
                         };
                     }
                     if !record.wait_for_capacity() {
-                        self.abandon_capacity(&record, turn_id, *owner)?;
+                        self.abandon_capacity(&record, turn_id, *owner, None)?;
                         return Err(capacity_busy());
                     }
                     if may_yield
@@ -493,6 +514,24 @@ impl<'a> TurnRunner<'a> {
             initial_record.meta().project_id(),
             initial_record.meta().worktree_id(),
         )?;
+        let transfer =
+            TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
+        {
+            let log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
+            if let Some(completion) = log.completion() {
+                let exit_code = turn_exit_code(&completion.outcome);
+                transfer.release_base(self.runner, task_id)?;
+                self.client_state.record_runner(task_id, None)?;
+                self.client_state
+                    .remove_task_turn_after_terminal(turn_id, owner)?;
+                self.client_state.remove_turn_prompt(task_id, turn_id)?;
+                return Ok(TurnOutcomeReport {
+                    status: initial_record.status().clone(),
+                    events: vec![],
+                    exit_code,
+                });
+            }
+        }
         let worker_name = self
             .client_state
             .queue_entry(turn_id)?
@@ -508,8 +547,6 @@ impl<'a> TurnRunner<'a> {
             .config
             .worker(&worker_name)
             .ok_or_else(|| task_error("WORKER_NOT_FOUND", "selected worker is not configured"))?;
-        let transfer =
-            TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
         let prompt = match self.client_state.read_turn_prompt(task_id, turn_id) {
             Ok(prompt) => prompt,
             Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -530,15 +567,15 @@ impl<'a> TurnRunner<'a> {
             .client_state
             .queue_entry(turn_id)?
             .is_some_and(|entry| entry.is_cancel_requested())
+            && self.can_revert_preacceptance(task_id, turn_id)?
         {
-            self.cancel_before_acceptance(&initial_record, task_id, turn_id, owner)?;
+            self.cancel_before_acceptance(&initial_record, task_id, turn_id, owner, None)?;
             return Err(task_error(
                 "TASK_CANCELLED",
                 "task turn was cancelled before host acceptance",
             ));
         }
-        let log = self.client_state.open_runner_log(task_id, turn_id)?;
-        let mut log = LogWriter { file: log };
+        let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
         let turn_number = initial_record
             .status()
             .turns()
@@ -651,7 +688,7 @@ impl<'a> TurnRunner<'a> {
                 if !initial_record.wait_for_capacity()
                     && error.public_code() == "CAPACITY_BUSY" =>
             {
-                self.abandon_capacity(&initial_record, turn_id, owner)?;
+                self.abandon_capacity(&initial_record, turn_id, owner, Some(&mut log))?;
                 return Err(capacity_busy());
             }
             Err(error) => return Err(error),
@@ -665,7 +702,13 @@ impl<'a> TurnRunner<'a> {
                         &SubmitRequest::new(material.clone()),
                     )?;
                     let _ = remote.resolve_preacceptance(worker, &resolve);
-                    self.cancel_before_acceptance(&initial_record, task_id, turn_id, owner)?;
+                    self.cancel_before_acceptance(
+                        &initial_record,
+                        task_id,
+                        turn_id,
+                        owner,
+                        Some(&mut log),
+                    )?;
                     return Err(task_error(
                         "TASK_CANCELLED",
                         "task turn was cancelled before host acceptance",
@@ -710,7 +753,7 @@ impl<'a> TurnRunner<'a> {
                         if !initial_record.wait_for_capacity()
                             && error.public_code() == "CAPACITY_BUSY"
                         {
-                            self.abandon_capacity(&initial_record, turn_id, owner)?;
+                            self.abandon_capacity(&initial_record, turn_id, owner, Some(&mut log))?;
                             return Err(capacity_busy());
                         }
                         return Err(error);
@@ -721,7 +764,13 @@ impl<'a> TurnRunner<'a> {
                         &SubmitRequest::new(material.clone()),
                     )?;
                     let _ = remote.resolve_preacceptance(worker, &resolve);
-                    self.cancel_before_acceptance(&initial_record, task_id, turn_id, owner)?;
+                    self.cancel_before_acceptance(
+                        &initial_record,
+                        task_id,
+                        turn_id,
+                        owner,
+                        Some(&mut log),
+                    )?;
                     return Err(task_error(
                         "TASK_CANCELLED",
                         "task turn was cancelled before host acceptance",
@@ -763,7 +812,12 @@ impl<'a> TurnRunner<'a> {
                             if !initial_record.wait_for_capacity()
                                 && error.public_code() == "CAPACITY_BUSY"
                             {
-                                self.abandon_capacity(&initial_record, turn_id, owner)?;
+                                self.abandon_capacity(
+                                    &initial_record,
+                                    turn_id,
+                                    owner,
+                                    Some(&mut log),
+                                )?;
                                 return Err(capacity_busy());
                             }
                             return Err(error);
@@ -814,11 +868,13 @@ impl<'a> TurnRunner<'a> {
             }
         };
 
-        let terminal = if task_status.state().is_terminal() {
-            task_status
-        } else {
-            self.follow_remote(worker, task_id, turn_id, task_status, &mut log, follow)?
-        };
+        append_event(
+            &mut log,
+            follow,
+            serde_json::json!({"type":"turn_accepted","protocol_version":crate::protocol::PROTOCOL_VERSION,"task_id":task_id,"turn_id":turn_id,"worker":worker.name}),
+        )?;
+        let terminal =
+            self.follow_remote(worker, task_id, turn_id, task_status, &mut log, follow)?;
         self.finish_terminal(
             task_id,
             turn_id,
@@ -845,11 +901,9 @@ impl<'a> TurnRunner<'a> {
         worker: &WorkerEntry,
         follow: &mut Option<&mut dyn Write>,
     ) -> Result<TurnOutcomeReport, WorkerError> {
-        let mut log = LogWriter {
-            file: self.client_state.open_runner_log(task_id, turn_id)?,
-        };
+        let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
         let remote = RemoteJobClient::new(self.runner);
-        let mut status = remote
+        let status = remote
             .task_status(
                 worker,
                 &TaskStatusRequest::new(initial_record.meta().project_id(), task_id),
@@ -857,12 +911,12 @@ impl<'a> TurnRunner<'a> {
             .status()
             .clone();
         self.persist_status(task_id, status.clone())?;
-        let terminal = if status.state().is_terminal() || status.state() == TaskState::Open {
-            status
-        } else {
-            status = self.follow_remote(worker, task_id, turn_id, status, &mut log, follow)?;
-            status
-        };
+        append_event(
+            &mut log,
+            follow,
+            serde_json::json!({"type":"turn_accepted","protocol_version":crate::protocol::PROTOCOL_VERSION,"task_id":task_id,"turn_id":turn_id,"worker":worker.name}),
+        )?;
+        let terminal = self.follow_remote(worker, task_id, turn_id, status, &mut log, follow)?;
         self.finish_terminal(
             task_id,
             turn_id,
@@ -940,10 +994,7 @@ impl<'a> TurnRunner<'a> {
         } else {
             record
         };
-        self.client_state.update_task(record.with_runner(None)?)?;
-        transfer.release_base(self.runner, task_id)?;
-        self.client_state
-            .remove_task_turn_after_terminal(turn_id, owner)?;
+        self.client_state.update_task(record)?;
         let outcome = terminal
             .last_outcome()
             .cloned()
@@ -957,6 +1008,11 @@ impl<'a> TurnRunner<'a> {
             "outcome": outcome,
         });
         append_event(log, follow, event.clone())?;
+        transfer.release_base(self.runner, task_id)?;
+        self.client_state.record_runner(task_id, None)?;
+        self.client_state
+            .remove_task_turn_after_terminal(turn_id, owner)?;
+        self.client_state.remove_turn_prompt(task_id, turn_id)?;
         Ok(TurnOutcomeReport {
             status: terminal,
             events: vec![event],
@@ -980,10 +1036,7 @@ impl<'a> TurnRunner<'a> {
         let status = publication_failure_status(&terminal, outcome.clone(), now_millis()?)?;
         let record = self.client_state.load_task(task_id)?;
         self.client_state
-            .update_task(record.with_status(status.clone())?.with_runner(None)?)?;
-        transfer.release_base(self.runner, task_id)?;
-        self.client_state
-            .remove_task_turn_after_terminal(turn_id, owner)?;
+            .update_task(record.with_status(status.clone())?)?;
         let event = serde_json::json!({
             "type": "turn_terminal",
             "protocol_version": crate::protocol::PROTOCOL_VERSION,
@@ -992,6 +1045,11 @@ impl<'a> TurnRunner<'a> {
             "outcome": outcome,
         });
         append_event(log, follow, event.clone())?;
+        transfer.release_base(self.runner, task_id)?;
+        self.client_state.record_runner(task_id, None)?;
+        self.client_state
+            .remove_task_turn_after_terminal(turn_id, owner)?;
+        self.client_state.remove_turn_prompt(task_id, turn_id)?;
         Ok(TurnOutcomeReport {
             status,
             events: vec![event],
@@ -1048,47 +1106,78 @@ impl<'a> TurnRunner<'a> {
         follow: &mut Option<&mut dyn Write>,
     ) -> Result<TaskStatus, WorkerError> {
         let remote = RemoteJobClient::new(self.runner);
-        let mut offsets = [0_u64, 0_u64];
+        let record = self.client_state.load_task(task_id)?;
+        let offsets = log.offsets();
+        let mut drain = TerminalLogDrain::new(
+            LogCursor::new(LogStream::Stdout, offsets[0], LOG_CHUNK_LIMIT)?,
+            LogCursor::new(LogStream::Stderr, offsets[1], LOG_CHUNK_LIMIT)?,
+        )?;
         loop {
-            if status.state().is_terminal() || matches!(status.state(), TaskState::Open) {
-                return Ok(status);
-            }
-            if self.queue_cancel_requested(turn_id)? {
+            if self.queue_cancel_requested(turn_id)? && status.state() == TaskState::Active {
                 status = remote
                     .task_cancel(
                         worker,
-                        &TaskCancelRequest::new(
-                            self.client_state.load_task(task_id)?.meta().project_id(),
-                            task_id,
-                            turn_id,
-                        ),
+                        &TaskCancelRequest::new(record.meta().project_id(), task_id, turn_id),
                     )?
                     .status()
                     .clone();
                 self.persist_status(task_id, status.clone())?;
-                continue;
             }
-            for (index, stream) in [LogStream::Stdout, LogStream::Stderr]
-                .into_iter()
-                .enumerate()
+            let job = remote.status(worker, turn_id)?;
+            if job.meta().job_id() != turn_id
+                || job.meta().worker_name() != worker.name
+                || job.meta().client_id() != self.client_state.client_id()
+                || job.meta().project_id() != record.meta().project_id()
+                || job.meta().worktree_id() != record.meta().worktree_id()
             {
-                let chunk =
-                    remote.log_chunk(worker, turn_id, stream, offsets[index], LOG_CHUNK_LIMIT)?;
-                let bytes = chunk.decoded_bytes()?;
-                if !bytes.is_empty() {
-                    log.file.write_all(&bytes).map_err(WorkerError::Io)?;
-                    write_follower(follow, &bytes);
-                }
-                offsets[index] = chunk.next_offset();
+                return Err(task_error(
+                    "LOG_JOB_IDENTITY_MISMATCH",
+                    "remote job differs from the selected turn",
+                ));
             }
-            std::thread::sleep(WAIT_POLL);
+            if job.status().state().is_terminal() {
+                drain.set_terminal_status(&job)?;
+            }
+            let mut progressed = false;
+            for stream in [LogStream::Stdout, LogStream::Stderr] {
+                let chunk = remote.log_chunk(
+                    worker,
+                    turn_id,
+                    stream,
+                    drain.cursor(stream).next_offset(),
+                    LOG_CHUNK_LIMIT,
+                )?;
+                let mut next = drain.clone();
+                next.observe_chunk(&chunk)?;
+                let bytes = chunk.decoded_bytes()?;
+                log.append_chunk(&chunk)?;
+                drain = next;
+                progressed |= !bytes.is_empty();
+                write_follower(follow, &bytes);
+            }
+            if drain.cursor(LogStream::Stdout).is_drained()
+                && drain.cursor(LogStream::Stderr).is_drained()
+            {
+                drain.revalidate_terminal_status(&remote.status(worker, turn_id)?)?;
+                status = remote
+                    .task_status(
+                        worker,
+                        &TaskStatusRequest::new(record.meta().project_id(), task_id),
+                    )?
+                    .status()
+                    .clone();
+                self.persist_status(task_id, status.clone())?;
+                if status.state().is_terminal() || status.state() == TaskState::Open {
+                    return Ok(status);
+                }
+            }
+            if !progressed {
+                std::thread::sleep(WAIT_POLL);
+            }
             status = remote
                 .task_status(
                     worker,
-                    &TaskStatusRequest::new(
-                        self.client_state.load_task(task_id)?.meta().project_id(),
-                        task_id,
-                    ),
+                    &TaskStatusRequest::new(record.meta().project_id(), task_id),
                 )?
                 .status()
                 .clone();
@@ -1118,6 +1207,7 @@ impl<'a> TurnRunner<'a> {
         record: &LocalTaskRecord,
         turn_id: TurnId,
         owner: ProcessIdentity,
+        log: Option<&mut LogWriter>,
     ) -> Result<(), WorkerError> {
         let status = TaskStatus::new(
             TaskState::Abandoned,
@@ -1137,12 +1227,26 @@ impl<'a> TurnRunner<'a> {
                 .with_status(status)?
                 .with_abandon_code(Some("CAPACITY_BUSY".into()))?,
         )?;
-        let _ = self
-            .client_state
-            .remove_task_turn_after_terminal(turn_id, owner)?;
-        let _ = self
-            .client_state
-            .remove_turn_prompt(record.meta().task_id(), turn_id);
+        let workers = self
+            .config
+            .workers
+            .iter()
+            .map(|w| w.name.as_str())
+            .collect::<Vec<_>>();
+        let line = early_exit_diagnostic_line("CAPACITY_BUSY", &workers);
+        let completion = Completion {
+            outcome: TaskOutcome::failed("CAPACITY_BUSY"),
+            drained: false,
+        };
+        match log {
+            Some(log) => {
+                log.finish(completion, line.as_bytes())?;
+            }
+            None => {
+                LogWriter::open(&self.paths.state, record.meta().task_id(), turn_id)?
+                    .finish(completion, line.as_bytes())?;
+            }
+        }
         if let Ok(project_path) = self.task_project_path(record)
             && let Ok(project) =
                 ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
@@ -1150,7 +1254,15 @@ impl<'a> TurnRunner<'a> {
             && let Ok(transfer) =
                 TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
         {
-            let _ = transfer.release_base(self.runner, record.meta().task_id());
+            transfer.release_base(self.runner, record.meta().task_id())?;
+            self.client_state
+                .record_runner(record.meta().task_id(), None)?;
+            let _ = self
+                .client_state
+                .remove_task_turn_after_terminal(turn_id, owner)?;
+            let _ = self
+                .client_state
+                .remove_turn_prompt(record.meta().task_id(), turn_id);
         }
         Ok(())
     }
@@ -1161,6 +1273,7 @@ impl<'a> TurnRunner<'a> {
         task_id: TaskId,
         turn_id: TurnId,
         owner: ProcessIdentity,
+        log: Option<&mut LogWriter>,
     ) -> Result<(), WorkerError> {
         let status = if record.status().state() == TaskState::Active {
             cancelled_followup_status(record.status())?
@@ -1183,22 +1296,30 @@ impl<'a> TurnRunner<'a> {
         self.client_state.update_task(
             record
                 .with_status(status)?
-                .with_runner(None)?
                 .with_abandon_code(abandoned.then_some("CANCELLED".to_owned()))?,
         )?;
-        let _ = self
-            .client_state
-            .remove_task_turn_after_terminal(turn_id, owner)?;
-        let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
-        if abandoned
-            && let Ok(project_path) = self.task_project_path(record)
+        match log {
+            Some(log) => log.finish_local(task_id, turn_id, TaskOutcome::Cancelled)?,
+            None => crate::runner_log::finish_never_started(
+                &self.paths.state,
+                task_id,
+                turn_id,
+                TaskOutcome::Cancelled,
+            )?,
+        }
+        if let Ok(project_path) = self.task_project_path(record)
             && let Ok(project) =
                 ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
             && project.context.project_id == record.meta().project_id()
             && let Ok(transfer) =
                 TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
         {
-            let _ = transfer.release_base(self.runner, task_id);
+            transfer.release_base(self.runner, task_id)?;
+            self.client_state.record_runner(task_id, None)?;
+            let _ = self
+                .client_state
+                .remove_task_turn_after_terminal(turn_id, owner)?;
+            let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
         }
         Ok(())
     }
@@ -1350,10 +1471,6 @@ pub(crate) fn adopt_row_with_retry(
     }
 }
 
-struct LogWriter {
-    file: File,
-}
-
 fn append_event(
     log: &mut LogWriter,
     follow: &mut Option<&mut dyn Write>,
@@ -1362,8 +1479,27 @@ fn append_event(
     let mut line = serde_json::to_vec(&event)
         .map_err(|error| task_error("TASK_EVENT_INVALID", error.to_string()))?;
     line.push(b'\n');
-    log.file.write_all(&line).map_err(WorkerError::Io)?;
-    write_follower(follow, &line);
+    let wrote = match event.get("type").and_then(|v| v.as_str()) {
+        Some("turn_accepted") => log.accepted(&line)?,
+        Some("turn_terminal") => {
+            let outcome = serde_json::from_value(event["outcome"].clone())
+                .map_err(|_| task_error("TASK_EVENT_INVALID", "terminal outcome is invalid"))?;
+            log.finish(
+                Completion {
+                    outcome,
+                    drained: true,
+                },
+                &line,
+            )?
+        }
+        _ => {
+            log.append_bytes(&line)?;
+            true
+        }
+    };
+    if wrote {
+        write_follower(follow, &line);
+    }
     Ok(())
 }
 

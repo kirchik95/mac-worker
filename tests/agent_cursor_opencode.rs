@@ -73,6 +73,7 @@ struct HostState {
     child_env: BTreeMap<String, String>,
     task: Option<(TaskMeta, TurnId)>,
     turn_submitted: bool,
+    native_job: Option<JobMeta>,
     fail_first_turn: bool,
     stream_session: Option<String>,
     profile_home: Option<PathBuf>,
@@ -95,6 +96,7 @@ impl RecordingHost {
                 child_env: BTreeMap::new(),
                 task: None,
                 turn_submitted: false,
+                native_job: None,
                 fail_first_turn: false,
                 stream_session: None,
                 profile_home: None,
@@ -344,11 +346,27 @@ impl ProcessRunner for RecordingHost {
                 let active = self.task_status(false)?;
                 let material = turn.submit().material();
                 let job_meta = JobMeta::new(material, material.fingerprint())?;
+                self.state.lock().unwrap().native_job = Some(job_meta.clone());
                 let submit = SubmitResponse::Accepted {
                     meta: Box::new(job_meta),
                     status: JobStatus::accepted(material.created_at_millis() + 1)?,
                 };
                 canonical_process(&TaskTurnResponse::new(submit, active))
+            }
+            value if value == HostOperation::Status.command() => {
+                let query: mac_worker::job::StatusRequest = decode_request(request)?;
+                let state = self.state.lock().unwrap();
+                let meta = state
+                    .native_job
+                    .clone()
+                    .expect("native status follows accepted turn");
+                assert_eq!(query.job_id(), meta.job_id());
+                let status = if state.fail_first_turn {
+                    JobStatus::failed(meta.created_at_millis() + 2, 1, 0, 0)?
+                } else {
+                    JobStatus::succeeded(meta.created_at_millis() + 2, 0, 0)?
+                };
+                canonical_process(&mac_worker::job::StatusResponse::new(meta, status)?)
             }
             value if value == HostOperation::LogChunk.command() => {
                 let chunk_request: LogChunkRequest = decode_request(request)?;

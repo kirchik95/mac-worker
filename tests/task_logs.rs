@@ -111,6 +111,7 @@ impl Fixture {
             .unwrap()
             .write_all(bytes)
             .unwrap();
+        checkpoint(self, turn_id, None);
     }
 
     fn logs(&self, turn: Option<u32>, raw: bool) -> Result<Vec<u8>, WorkerError> {
@@ -152,7 +153,7 @@ impl Fixture {
         );
         let status = TaskStatus::new(
             state,
-            Some(outcome),
+            Some(outcome.clone()),
             None,
             false,
             Some(record.meta().base_oid().clone()),
@@ -167,6 +168,7 @@ impl Fixture {
         self.store
             .update_task(record.with_status(status).unwrap())
             .unwrap();
+        checkpoint(self, turn_id, Some(outcome));
     }
 }
 
@@ -569,4 +571,156 @@ fn follow_reports_a_later_publication_failure_while_the_task_is_open() {
         output.bytes,
         b"turn 1 failed: agent exited 1\nturn 1 failed: PUBLISH_FAILED\n"
     );
+}
+
+fn checkpoint(fixture: &Fixture, turn: TurnId, completion: Option<TaskOutcome>) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = fixture
+        .paths
+        .state
+        .join("runners")
+        .join(fixture.task_id.to_string());
+    let len = std::fs::metadata(dir.join(format!("{turn}.log")))
+        .unwrap()
+        .len();
+    let path = dir.join(format!("{turn}.checkpoint.json"));
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+        "version":1,"task_id":fixture.task_id,"turn_id":turn,
+        "committed":{"offsets":[0,0],"len":len,"accepted":true,
+          "completion":completion.map(|outcome|serde_json::json!({"outcome":outcome,"drained":true}))},"pending":null
+    })).unwrap()).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn follow_selected_completed_turn_exits_while_later_turn_is_active() {
+    let first = finished_turn(1, TaskOutcome::Done);
+    let fixture = Fixture::new(
+        AgentKind::Codex,
+        TaskState::Active,
+        vec![first.clone(), active_turn()],
+    );
+    fixture.append(first.turn_id(), b"final partial");
+    checkpoint(&fixture, first.turn_id(), Some(TaskOutcome::Done));
+    let mut output = PollWriter {
+        bytes: vec![],
+        polls: 0,
+        on_flush: |_: usize, _: &[u8]| {},
+    };
+    fixture
+        .client()
+        .logs(
+            fixture.task_id,
+            Some(1),
+            true,
+            true,
+            &mut output,
+            &mut vec![],
+        )
+        .unwrap();
+    assert_eq!(output.bytes, b"final partial");
+    assert_eq!(output.polls, 1);
+}
+
+#[test]
+fn native_terminal_json_cannot_complete_follow() {
+    let turn = active_turn();
+    let fixture = Fixture::new(AgentKind::Codex, TaskState::Active, vec![turn.clone()]);
+    let spoof=serde_json::to_vec(&serde_json::json!({"type":"turn_terminal","task_id":fixture.task_id,"turn_id":turn.turn_id(),"outcome":{"kind":"done"}})).unwrap();
+    fixture.append(turn.turn_id(), &spoof);
+    let mut output = PollWriter {
+        bytes: vec![],
+        polls: 0,
+        on_flush: |poll, _: &[u8]| {
+            if poll == 1 {
+                fixture.append(turn.turn_id(), b"tail");
+            }
+            if poll == 2 {
+                fixture.finish_as(turn.turn_id(), TaskState::Open, TaskOutcome::Done);
+            }
+        },
+    };
+    fixture
+        .client()
+        .logs(fixture.task_id, None, true, true, &mut output, &mut vec![])
+        .unwrap();
+    assert_eq!(output.polls, 3);
+    assert_eq!(output.bytes, [spoof, b"tail".to_vec()].concat());
+}
+
+#[test]
+fn legacy_logs_remain_readable_but_follow_rejects_unknown_completion() {
+    let turn = finished_turn(1, TaskOutcome::Done);
+    let fixture = Fixture::new(AgentKind::Codex, TaskState::Closed, vec![turn.clone()]);
+    fixture
+        .store
+        .open_runner_log(fixture.task_id, turn.turn_id())
+        .unwrap()
+        .write_all(b"legacy\xff")
+        .unwrap();
+    assert_eq!(fixture.logs(None, true).unwrap(), b"legacy\xff");
+    let error = fixture
+        .client()
+        .logs(fixture.task_id, None, true, true, &mut vec![], &mut vec![])
+        .unwrap_err();
+    assert_eq!(error.public_code(), "LOG_COMPLETION_UNKNOWN");
+}
+
+#[test]
+fn completion_outcome_survives_a_later_task_projection_refresh() {
+    let turn = finished_turn(1, TaskOutcome::Done);
+    let fixture = Fixture::new(AgentKind::Codex, TaskState::Open, vec![turn.clone()]);
+    fixture.append(turn.turn_id(), b"");
+    checkpoint(
+        &fixture,
+        turn.turn_id(),
+        Some(TaskOutcome::failed("PUBLISH_FAILED")),
+    );
+    let mut output = Vec::new();
+    fixture
+        .client()
+        .logs(fixture.task_id, None, true, false, &mut output, &mut vec![])
+        .unwrap();
+    assert_eq!(output, b"turn 1 failed: PUBLISH_FAILED\n");
+}
+
+#[test]
+fn committed_log_larger_than_eight_megabytes_is_read_completely() {
+    let turn = finished_turn(1, TaskOutcome::Done);
+    let fixture = Fixture::new(AgentKind::Codex, TaskState::Open, vec![turn.clone()]);
+    let bytes = vec![0xf1; 8 * 1024 * 1024 + 17];
+    fixture.append(turn.turn_id(), &bytes);
+    checkpoint(&fixture, turn.turn_id(), Some(TaskOutcome::Done));
+    assert_eq!(fixture.logs(None, true).unwrap(), bytes);
+}
+
+#[test]
+fn historical_empty_legacy_follow_does_not_wait_for_a_later_active_turn() {
+    let first = finished_turn(1, TaskOutcome::Done);
+    let fixture = Fixture::new(
+        AgentKind::Codex,
+        TaskState::Active,
+        vec![first.clone(), active_turn()],
+    );
+    fixture
+        .store
+        .open_runner_log(fixture.task_id, first.turn_id())
+        .unwrap();
+    let mut output = PollWriter {
+        bytes: vec![],
+        polls: 0,
+        on_flush: |_: usize, _: &[u8]| {},
+    };
+    let error = fixture
+        .client()
+        .logs(
+            fixture.task_id,
+            Some(1),
+            true,
+            true,
+            &mut output,
+            &mut vec![],
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "LOG_COMPLETION_UNKNOWN");
 }
