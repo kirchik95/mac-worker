@@ -64,7 +64,7 @@ cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-tar
 
 1. [x] CLI: показывать причину неуспешного turn без обязательного `--raw`.
 2. [x] Runner: дочитывать финальные stdout/stderr; восстанавливать позиции после restart без дублирования уже записанного префикса. Переиспользовать существующую семантику `TerminalLogDrain`; согласовать завершение `logs -f` с окончанием выбранного turn и его публикации.
-3. [ ] Cursor: сопоставить окружение auth probe и фактического запуска с env profile; воспроизвести расхождение и исправить его причину.
+3. [x] Cursor: сопоставить окружение auth probe и фактического запуска с env profile; воспроизвести расхождение и исправить его причину.
 
 Критерии: причина ошибки видна обычной командой; длинные потоки и restart не теряют bytes; утверждение о готовности Cursor подтверждается запуском в том же профиле. Проверки, требующие реального агента, выполняются отдельно от локальных fixtures.
 
@@ -100,6 +100,16 @@ git diff --check
 Проверки используют настоящие локальные файлы/Git и fake remotes. Они покрывают crash recovery, длинные потоки, подмену log paths, отмену, смену владельца, задержанные ответы, сохранение результата и завершение выбранного follower. Реальные Mac и provider agents не запускались. Часть journal/lifecycle-тестов добавлена вместе с реализацией или после неё; четыре критические гарантии дополнительно проверены контролируемыми мутациями. Финальный неизменный полный прогон заменяет ранний результат 1 585 тестов со смешанным набором binaries.
 
 Подробности, решения и история проверок: [спецификация](../specs/2026-09-08-runner-log-recovery-design.md), [план и результаты](2026-09-08-runner-log-recovery.md).
+
+### 3.3. Авторизация и окружение профиля Cursor
+
+**Результат:** facts, prebind и turn используют общий account scaffold и `/bin/zsh -lc`. Facts получают явно переданный account HOME и проверяют каждый secure profile в его эффективном login-окружении. Profile-only бинарник доступен даже при отсутствии base-бинарника; PATH и credentials после login startup определяют реальный verdict. Непредусмотренное наследование переменных helper устранено для account-bound requests. Native session deletion использует тот же prebind boundary. Login startup может переопределить профиль; его stdout/stderr входят в probe output, поэтому worker login files должны работать без вывода.
+
+Расхождение воспроизведено до реализации: login startup перезаписывал `CURSOR_API_KEY`, а прежний facts ошибочно возвращал Authenticated. Проверки теперь выполняют production facts, prebind и команду из LaunchPlan с настоящим zsh и synthetic executables. Порядок base auth перед разблокировкой keychain профилей сохранён и защищён regression-тестом.
+
+Реализация `4ce0aad`, исправления review `d44912f`, финальные уточнения документации `d9fb584` / `f4c22e9`. Task review, scoped re-review, независимое whole-branch review и проверка финальной документационной правки пройдены; блокирующих замечаний нет. Полный неизменный прогон на `d44912f`: **1 615 passed, 0 failed, 0 ignored, 63 top-level Cargo suites**, exit 0; также 86 профильных тестов, fmt и all-target Clippy с запретом warnings. Проверки локальные; live provider/fleet smoke не выполнялся. Runtime после этого прогона не менялся.
+
+Измерение login startup и refresh-facts остаётся для этапа 5: внешний бюджет refresh/install — 30 секунд, а количество shell launches растёт с числом secure profiles. Git identity пока сохраняет прежний ambient-home probe; его согласование с account boundary требует отдельной правки. Остальные неблокирующие замечания и принятые решения записаны в [плане](2026-09-08-cursor-auth-profile.md); контракт — в [спецификации](../specs/2026-09-08-cursor-auth-profile-design.md).
 
 ## 4. Контракты и восстановление dashboard
 
