@@ -77,8 +77,8 @@ Files: modify `README.md`, `docs/usage.md`, `docs/setup-macos-worker.md`, `docs/
 - [x] `docs/usage.md`: a short **Herdr** subsection under Dashboard describing the sidebar rows, the notifications, the two config keys, and the `doctor` line. README: the "More documentation" list gains the validation record; nothing else in the README changes.
 - [x] Setup guide (`docs/setup-macos-worker.md` as rewritten in `d162379`): an optional section after "4. Install and log in to one agent" on enabling herdr on a worker (`herdr` running as the worker account, `herdr status server`), the `herdr = true` key, rerunning `worker setup`, and an optional note on adding `$mw_title` or `$task` tokens to a custom sidebar row.
 - [x] v2 spec: confirm sections 22 and 23 carry the cross-reference to the herdr reporter design.
-- [ ] Run the live acceptance of spec section 13.2 on mac1 and record sanitized evidence in `docs/herdr-reporter-validation.md`, including the `task status --json` excerpt with the `herdr` object, the `doctor` and `setup` lines, and the privacy check over the fake-server recordings.
-- [ ] Run `cargo fmt --all --check`, `cargo test --locked --offline --all-targets`, and `cargo clippy --locked --offline --all-targets -- -D warnings`.
+- [x] Run the live acceptance of spec section 13.2 on mac1 and record sanitized evidence in `docs/herdr-reporter-validation.md`, including the `task status --json` excerpt with the `herdr` object, the `doctor` and `setup` lines, and the privacy check over the fake-server recordings.
+- [x] Run `cargo fmt --all --check`, `cargo test --locked --offline --all-targets`, and `cargo clippy --locked --offline --all-targets -- -D warnings`.
 
 ## Gate
 
