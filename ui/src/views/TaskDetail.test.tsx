@@ -131,7 +131,7 @@ describe('TaskDetail', () => {
     await userEvent.setup().click(await screen.findByRole('button', { name: /02/ }))
     expect(await screen.findByText('cargo test --locked')).toBeInTheDocument()
     expect(
-      screen.getByText('the turn is finished, nothing more will arrive'),
+      screen.getByText('the turn is finished · read to the current end'),
     ).toBeInTheDocument()
   })
 

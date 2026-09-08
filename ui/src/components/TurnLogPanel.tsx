@@ -46,9 +46,8 @@ function Line({ event }: { event: LogEvent }) {
 }
 
 /**
- * One turn's recorded output. A finished turn is fetched once and never
- * polled — its bytes cannot change — so the panel says plainly that nothing
- * more will arrive.
+ * One turn's recorded output. A finished turn is drained sequentially until a
+ * read makes no progress, which establishes only the host's current end.
  */
 export function TurnLogPanel({
   taskId,
@@ -96,7 +95,7 @@ export function TurnLogPanel({
           <span className="text-[11px] text-observatory-hollow">
             {live
               ? 'following · the turn is still running'
-              : 'the turn is finished, nothing more will arrive'}
+              : 'the turn is finished · read to the current end'}
           </span>
         </span>
       </div>

@@ -10,11 +10,13 @@ export interface TurnLog {
   error: string | null
 }
 
+type ReadOutcome = 'advanced' | 'idle' | 'failed'
+
 /**
  * Follows one stream of one turn with a byte cursor, exactly as the host serves
  * it. The decoder is kept across polls so a multi-byte character split across a
  * chunk boundary is joined rather than rendered as replacement characters, and
- * it is flushed once when following stops.
+ * it is flushed once a completed stream reaches its current end.
  */
 export function useTurnLog(
   taskId: string | null,
@@ -25,50 +27,133 @@ export function useTurnLog(
   const [log, setLog] = useState<TurnLog>({ text: '', offset: 0, error: null })
   const offset = useRef(0)
   const decoder = useRef<TextDecoder | null>(null)
+  const generation = useRef(0)
+  const activeRequest = useRef<Promise<void> | null>(null)
+  const activeController = useRef<AbortController | null>(null)
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const finalized = useRef(false)
+  const liveRef = useRef(live)
+  liveRef.current = live
 
   useEffect(() => {
+    const identityGeneration = generation.current + 1
+    generation.current = identityGeneration
     offset.current = 0
     decoder.current = new TextDecoder('utf-8')
+    finalized.current = false
     setLog({ text: '', offset: 0, error: null })
 
-    if (taskId == null || turnId == null) return
-    let cancelled = false
-    const controller = new AbortController()
+    return () => {
+      if (generation.current === identityGeneration) generation.current += 1
+      activeController.current?.abort()
+      activeController.current = null
+      activeRequest.current = null
+      if (retryTimer.current !== null) {
+        clearTimeout(retryTimer.current)
+        retryTimer.current = null
+      }
+      decoder.current = null
+      finalized.current = false
+    }
+  }, [taskId, turnId, stream])
 
-    const poll = async () => {
-      try {
-        const chunk = await fetchTurnLog(taskId, turnId, stream, offset.current, controller.signal)
-        if (cancelled) return
-        if (chunk.next_offset > offset.current) {
-          const bytes = decodeBase64(chunk.data)
-          const text = decoder.current?.decode(bytes, { stream: true }) ?? ''
-          offset.current = chunk.next_offset
-          setLog((current) => ({
-            text: current.text + text,
-            offset: chunk.next_offset,
-            error: null,
-          }))
-        }
-      } catch (error) {
-        if (cancelled || controller.signal.aborted) return
-        setLog((current) => ({
-          ...current,
-          error: error instanceof Error ? error.message : String(error),
-        }))
+  useEffect(() => {
+    if (taskId == null || turnId == null) return
+
+    const identityGeneration = generation.current
+
+    const finalizeDecoder = () => {
+      if (generation.current !== identityGeneration || finalized.current) return
+      finalized.current = true
+      const tail = decoder.current?.decode() ?? ''
+      decoder.current = null
+      if (tail) setLog((current) => ({ ...current, text: current.text + tail }))
+    }
+
+    const scheduleRead = (delay: number) => {
+      if (generation.current !== identityGeneration || finalized.current) return
+      retryTimer.current = setTimeout(() => {
+        retryTimer.current = null
+        startRead()
+      }, delay)
+    }
+
+    const handleOutcome = (outcome: ReadOutcome) => {
+      if (generation.current !== identityGeneration) return
+      if (liveRef.current) {
+        scheduleRead(POLL_INTERVAL_MS)
+      } else if (outcome === 'advanced') {
+        startRead()
+      } else if (outcome === 'failed') {
+        scheduleRead(POLL_INTERVAL_MS)
+      } else {
+        finalizeDecoder()
       }
     }
 
-    void poll()
-    const timer = live ? setInterval(() => void poll(), POLL_INTERVAL_MS) : null
+    const startRead = () => {
+      if (
+        generation.current !== identityGeneration ||
+        finalized.current ||
+        activeRequest.current !== null
+      ) {
+        return
+      }
 
-    return () => {
-      cancelled = true
-      controller.abort()
-      if (timer) clearInterval(timer)
-      // Flush whatever partial character the stream ended on, exactly once.
-      const tail = decoder.current?.decode() ?? ''
-      if (tail) setLog((current) => ({ ...current, text: current.text + tail }))
+      const controller = new AbortController()
+      activeController.current = controller
+      const request = (async () => {
+        let outcome: ReadOutcome
+        try {
+          const chunk = await fetchTurnLog(
+            taskId,
+            turnId,
+            stream,
+            offset.current,
+            controller.signal,
+          )
+          if (controller.signal.aborted || generation.current !== identityGeneration) return
+
+          setLog((current) =>
+            current.error === null ? current : { ...current, error: null },
+          )
+          if (chunk.next_offset > offset.current) {
+            const bytes = decodeBase64(chunk.data)
+            const text = decoder.current?.decode(bytes, { stream: true }) ?? ''
+            offset.current = chunk.next_offset
+            setLog((current) => ({
+              text: current.text + text,
+              offset: chunk.next_offset,
+              error: null,
+            }))
+            outcome = 'advanced'
+          } else {
+            outcome = 'idle'
+          }
+        } catch (error) {
+          if (controller.signal.aborted || generation.current !== identityGeneration) return
+          setLog((current) => ({
+            ...current,
+            error: error instanceof Error ? error.message : String(error),
+          }))
+          outcome = 'failed'
+        } finally {
+          if (activeController.current === controller) {
+            activeController.current = null
+            activeRequest.current = null
+          }
+        }
+
+        handleOutcome(outcome)
+      })()
+      activeRequest.current = request
     }
+
+    if (retryTimer.current !== null) {
+      clearTimeout(retryTimer.current)
+      retryTimer.current = null
+    }
+    startRead()
   }, [taskId, turnId, stream, live])
 
   return log
