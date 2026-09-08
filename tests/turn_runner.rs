@@ -3720,3 +3720,238 @@ fn invalid_terminal_identity_or_changed_final_lengths_keep_recovery_ownership() 
         assert!(checkpoint["committed"]["completion"].is_null());
     }
 }
+
+struct FenceRelease(Option<mpsc::Sender<()>>);
+impl FenceRelease {
+    fn release(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+impl Drop for FenceRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct ContentionHook {
+    entered: Mutex<Option<mpsc::Sender<()>>>,
+    resume: Mutex<mpsc::Receiver<()>>,
+}
+impl ClientStateConcurrencyHook for ContentionHook {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == ClientStateConcurrencyPoint::RunnerLogContention
+            && let Some(sender) = self.entered.lock().unwrap().take()
+        {
+            sender.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .expect("release contending runner");
+        }
+    }
+}
+
+struct RefreshFenceRemote<'a> {
+    inner: &'a AcceptedThenTerminalRunner,
+    status: TaskStatus,
+    entered: Mutex<Option<mpsc::Sender<()>>>,
+    resume: Mutex<mpsc::Receiver<()>>,
+}
+impl ProcessRunner for RefreshFenceRemote<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if thread::current().name() == Some("fenced-refresh")
+            && request
+                .args
+                .last()
+                .is_some_and(|arg| arg == HostOperation::TaskStatus.command())
+        {
+            if let Some(sender) = self.entered.lock().unwrap().take() {
+                sender.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("release fenced refresh");
+            }
+            return canonical_process(&TaskStatusResponse::new(self.status.clone()));
+        }
+        self.inner.run(request)
+    }
+}
+
+fn runner_refresh_contention(ownership_change: Option<bool>) {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let (refresh_tx, refresh_rx) = mpsc::channel();
+    let (release_refresh_tx, release_refresh_rx) = mpsc::channel();
+    let (contended_tx, contended_rx) = mpsc::channel();
+    let (release_runner_tx, release_runner_rx) = mpsc::channel();
+    let state = ClientStateStore::open_with_concurrency_hook(
+        &fixture.paths.state,
+        Arc::new(ContentionHook {
+            entered: Mutex::new(Some(contended_tx)),
+            resume: Mutex::new(release_runner_rx),
+        }),
+    )
+    .unwrap();
+    let record = state.load_task(fixture.task_id).unwrap();
+    // A waiting task with a known worker is eligible for queued status refresh.
+    let status = TaskStatus::new(
+        TaskState::Queued,
+        None,
+        Some("mini-1".into()),
+        false,
+        record.status().head_oid().cloned(),
+        None,
+        vec![],
+        vec![],
+        None,
+        vec![],
+        record.status().updated_at_millis(),
+    )
+    .unwrap();
+    state
+        .update_task(record.with_status(status.clone()).unwrap())
+        .unwrap();
+    let remote = RefreshFenceRemote {
+        inner: &fixture.runner,
+        status,
+        entered: Mutex::new(Some(refresh_tx)),
+        resume: Mutex::new(release_refresh_rx),
+    };
+    thread::scope(|scope| {
+        let mut release_refresh = FenceRelease(Some(release_refresh_tx));
+        let mut release_runner = FenceRelease(Some(release_runner_tx));
+        let refresh = thread::Builder::new()
+            .name("fenced-refresh".into())
+            .spawn_scoped(scope, || {
+                TaskClient::new(
+                    &remote,
+                    &fixture.config,
+                    &fixture.paths,
+                    &state,
+                    &fixture.executor,
+                )
+                .reconcile_runners()
+            })
+            .unwrap();
+        refresh_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("refresh owns journal");
+        let runner = scope.spawn(|| {
+            TurnRunner::new(
+                &remote,
+                &fixture.config,
+                &fixture.paths,
+                &state,
+                &fixture.executor,
+            )
+            .run(fixture.task_id, fixture.turn_id, None)
+        });
+        contended_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("runner claimed and encountered refresh fence");
+        assert!(matches!(
+            state.queue_entry(fixture.turn_id).unwrap().unwrap().state(),
+            mac_worker::job::QueueState::Dispatching { .. }
+        ));
+        release_refresh.release();
+        refresh.join().unwrap().unwrap();
+        let replacement_owner = ProcessIdentity::new(999_997, 997).unwrap();
+        if let Some(retire) = ownership_change {
+            if retire {
+                let entry = state.queue_entry(fixture.turn_id).unwrap().unwrap();
+                state
+                    .remove_task_turn_after_terminal(fixture.turn_id, *entry.owner_opt().unwrap())
+                    .unwrap();
+                let replacement_turn = TurnId::generate();
+                state
+                    .write_turn_prompt(fixture.task_id, replacement_turn, "new turn")
+                    .unwrap();
+                state
+                    .enqueue(
+                        QueueEntry::new(
+                            replacement_turn,
+                            state.client_id(),
+                            entry.project_id().into(),
+                            entry.worktree_id().into(),
+                            CommandSummary::argv(1).unwrap(),
+                            vec![],
+                            WorkerPreference::Pinned {
+                                worker: "mini-1".into(),
+                            },
+                            QueueEntryKind::TaskTurn,
+                            None,
+                            replacement_owner,
+                            10,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            } else {
+                state.adopt_row(fixture.turn_id, replacement_owner).unwrap();
+            }
+            state
+                .record_runner(
+                    fixture.task_id,
+                    Some(mac_worker::task::RunnerIdentity::new(replacement_owner)),
+                )
+                .unwrap();
+        }
+        release_runner.release();
+        let result = runner.join().unwrap();
+        if ownership_change.is_some() {
+            assert_eq!(result.unwrap_err().public_code(), "TASK_BUSY");
+            assert_eq!(
+                state
+                    .load_task(fixture.task_id)
+                    .unwrap()
+                    .runner()
+                    .unwrap()
+                    .process_identity(),
+                replacement_owner
+            );
+            assert_eq!(
+                state
+                    .queue_entry_for_task_turn(fixture.task_id)
+                    .unwrap()
+                    .unwrap()
+                    .owner_opt(),
+                Some(&replacement_owner)
+            );
+        } else {
+            result.expect("legitimate runner must survive transient fence contention");
+        }
+    });
+    assert_eq!(
+        fixture
+            .runner
+            .requests()
+            .iter()
+            .filter(|request| request
+                .args
+                .last()
+                .is_some_and(|arg| arg == HostOperation::TaskTurn.command()))
+            .count(),
+        usize::from(ownership_change.is_none())
+    );
+    if ownership_change.is_none() {
+        assert!(state.queue_entry(fixture.turn_id).unwrap().is_none());
+    }
+}
+
+#[test]
+fn runner_retries_a_journal_fence_held_by_queued_refresh() {
+    runner_refresh_contention(None);
+}
+#[test]
+fn contending_runner_stops_when_its_owner_changes() {
+    runner_refresh_contention(Some(false));
+}
+#[test]
+fn contending_runner_cannot_mutate_a_replacement_turn() {
+    runner_refresh_contention(Some(true));
+}

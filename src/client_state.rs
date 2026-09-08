@@ -127,6 +127,7 @@ pub enum ClientStateConcurrencyPoint {
     SubmissionIntentReconciliationAfterTransferLock,
     ObservationRefreshPublication,
     TaskReplacementPreExchange,
+    RunnerLogContention,
 }
 
 /// A deterministic test hook for scheduler persistence races. Implementors
@@ -1512,6 +1513,10 @@ impl ClientStateStore {
         self.reach_concurrency_point(
             ClientStateConcurrencyPoint::SubmissionIntentReconciliationBeforeTransferLock,
         );
+    }
+
+    pub(crate) fn runner_log_contention(&self) {
+        self.reach_concurrency_point(ClientStateConcurrencyPoint::RunnerLogContention);
     }
 
     fn owner_is_live_or_ambiguous(

@@ -112,6 +112,20 @@ git diff --check
 
 Outputs: `/private/tmp/fix1-final-scoped.log`, `/private/tmp/fix1-final-fmt.log`, `/private/tmp/fix1-final-clippy.log`. The fix's final scoped run used frozen Rust sources and no parallel builds. A fresh whole-branch all-target run remains controller-owned after scoped re-review; the earlier all-target source-delta caveat above is not claimed resolved by scoped checks.
 
+
+**Review fix 2 — transient fence contention.** A legitimate runner now retries only a busy journal held by queued refresh or parent handoff. Every attempt checks exact task/turn/owner authority, then rechecks under the acquired writer. A changed owner or retired/replaced row returns `TASK_BUSY`; the cleanup fence lifetime is unchanged. Channel-gated regressions reproduce the original WouldBlock abort and verify exactly one successful submission or zero submissions after ownership loss/replacement.
+
+Frozen fix-2 source verification (exit 0): **547 passed, 0 failed across 9 top-level suites**: library 316, Cursor/OpenCode 21, client state 42, scheduler queue 64, task command 9, conversation 15, logs 21, project context 8, runner 51. Counts exclude nested filtered library subprocess summaries. Commands:
+
+```sh
+cargo test --locked --offline --lib --test turn_runner --test task_conversation --test task_command --test task_logs --test task_project_context --test client_state --test scheduler_queue --test agent_cursor_opencode
+cargo fmt --all --check
+cargo clippy --locked --offline --all-targets -- -D warnings
+git diff --check
+```
+
+All commands passed. Outputs: `/private/tmp/fix2-final-scoped.log`, `/private/tmp/fix2-final-fmt.log`, `/private/tmp/fix2-final-clippy.log`. No concurrent rebuilds or Rust source changes occurred during final verification. Controller-owned frozen whole-branch all-target verification remains pending after scoped re-review. The pre-existing idle/no-queue status-refresh versus new-`say` projection race remains recorded for whole-branch review and outside these scoped fixes.
+
 ## 4. Контракты и восстановление dashboard
 
 Независимые небольшие изменения:

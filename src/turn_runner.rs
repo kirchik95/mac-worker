@@ -517,8 +517,27 @@ impl<'a> TurnRunner<'a> {
         owner: ProcessIdentity,
         follow: &mut Option<&mut dyn Write>,
     ) -> Result<TurnOutcomeReport, WorkerError> {
-        let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
-        log.require_owner(self.client_state, owner)?;
+        // Refresh and parent handoff publication briefly hold the same fence.
+        // Wait without holding state locks, but never wait for another turn or
+        // owner: retirement/reassignment revokes this runner's authority.
+        let mut log = loop {
+            if !self
+                .client_state
+                .queue_entry_for_task_turn(task_id)?
+                .is_some_and(|entry| entry.job_id() == turn_id && entry.owner_opt() == Some(&owner))
+            {
+                return Err(task_error(
+                    "TASK_BUSY",
+                    "task turn ownership changed while waiting for its journal",
+                ));
+            }
+            if let Some(log) = LogWriter::try_open(&self.paths.state, task_id, turn_id)? {
+                log.require_owner(self.client_state, owner)?;
+                break log;
+            }
+            self.client_state.runner_log_contention();
+            std::thread::sleep(WAIT_POLL);
+        };
         let initial_record = self.client_state.load_task(task_id)?;
         let project_path = self.task_project_path(&initial_record)?;
         let project =
