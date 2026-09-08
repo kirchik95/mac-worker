@@ -1,14 +1,16 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
+    thread,
     time::Duration,
 };
 
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy, TurnLimits},
-    client_state::ClientStateStore,
+    client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore},
     config::{Config, WorkerEntry},
     dashboard::{
         model::{DashboardError, DashboardQueueEntryKind, DashboardSnapshot},
@@ -16,7 +18,7 @@ use mac_worker::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
         },
         source::{DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource},
-        task::{DashboardTaskSource, MacWorkerTaskSource},
+        task::{DashboardTaskSource, MAX_TASK_LOG_LIMIT, MacWorkerTaskSource},
     },
     error::WorkerError,
     job::{
@@ -246,6 +248,259 @@ fn task_source_uses_typed_ids_and_stale_detail_without_mutation() {
     assert_eq!(harness.mutation_calls(), 0);
 }
 
+#[test]
+fn task_detail_and_log_map_a_missing_record_to_task_not_found() {
+    let harness = DashboardTaskHarness::active_local_task();
+    let source = harness.task_source();
+    let missing = task_id(99);
+
+    let detail = source.task_detail(missing).unwrap_err();
+    assert_eq!(detail.code, "TASK_NOT_FOUND");
+    assert_eq!(detail.message, "task is not present in local state");
+
+    let log = source
+        .read_task_log(missing, turn_id(1), LogStream::Stdout, 0, 4)
+        .unwrap_err();
+    assert_eq!(log.code, "TASK_NOT_FOUND");
+    assert_eq!(log.message, "task is not present in local state");
+}
+
+#[test]
+fn addressed_task_reads_ignore_an_unrelated_corrupt_sibling() {
+    let harness = DashboardTaskHarness::active_local_task();
+    for number in 2..=17 {
+        harness.create_extra_task(number, Some("mini-1"));
+    }
+    let sibling = harness.create_extra_task(18, Some("mini-1"));
+    std::fs::write(harness.task_path(sibling), b"{not-a-task-record").unwrap();
+
+    assert!(harness.state.list_tasks().is_err());
+    let snapshot = harness.snapshot().unwrap();
+    assert!(
+        snapshot
+            .collection
+            .errors
+            .iter()
+            .any(|error| error.code == "IO"),
+        "list/collection still scans every task record"
+    );
+    assert!(snapshot.task_view.tasks.is_empty());
+
+    let source = harness.task_source();
+    let detail = source.task_detail(harness.task_id()).unwrap();
+    assert_eq!(detail.task.task_id, harness.task_id());
+    assert_eq!(detail.task.title, "Repair login");
+
+    let turn_id = harness
+        .state
+        .load_task(harness.task_id())
+        .unwrap()
+        .status()
+        .turns()[0]
+        .turn_id();
+    harness
+        .state
+        .write_turn_prompt(harness.task_id(), turn_id, SECRET)
+        .unwrap();
+    let chunk = source
+        .read_task_log(harness.task_id(), turn_id, LogStream::Stdout, 3, 4)
+        .unwrap();
+    assert_eq!(chunk.offset(), 3);
+    assert_eq!(chunk.next_offset(), 7);
+    assert_eq!(
+        harness.remote.log_requests(),
+        vec![(turn_id, LogStream::Stdout, 3, 4)]
+    );
+}
+
+#[test]
+fn task_detail_fails_when_the_target_record_is_corrupt() {
+    let harness = DashboardTaskHarness::active_local_task();
+    std::fs::write(harness.task_path(harness.task_id()), b"{broken").unwrap();
+
+    let error = harness
+        .task_source()
+        .task_detail(harness.task_id())
+        .unwrap_err();
+    assert_eq!(error.code, "IO");
+    assert_eq!(error.message, "local dashboard task state is unavailable");
+    assert_ne!(error.code, "TASK_NOT_FOUND");
+}
+
+#[test]
+fn task_detail_fails_when_the_target_filename_and_embedded_id_differ() {
+    let harness = DashboardTaskHarness::active_local_task();
+    let sibling = harness.create_extra_task(2, Some("mini-1"));
+    let foreign = std::fs::read(harness.task_path(sibling)).unwrap();
+    std::fs::write(harness.task_path(harness.task_id()), foreign).unwrap();
+
+    let error = harness
+        .task_source()
+        .task_detail(harness.task_id())
+        .unwrap_err();
+    assert_eq!(error.code, "IO");
+    assert_eq!(error.message, "local dashboard task state is unavailable");
+}
+
+#[test]
+fn read_task_log_rejects_a_turn_owned_by_a_different_task() {
+    let harness = DashboardTaskHarness::active_local_task();
+    let other = harness.create_extra_task(2, Some("mini-1"));
+    let foreign_turn = turn_id(2);
+    harness
+        .state
+        .write_turn_prompt(other, foreign_turn, SECRET)
+        .unwrap();
+    harness
+        .state
+        .write_turn_prompt(harness.task_id(), turn_id(1), SECRET)
+        .unwrap();
+
+    let error = harness
+        .task_source()
+        .read_task_log(harness.task_id(), foreign_turn, LogStream::Stdout, 0, 4)
+        .unwrap_err();
+    assert_eq!(error.code, "TURN_NOT_FOUND");
+    assert_eq!(error.message, "turn is not present in the requested task");
+}
+
+#[test]
+fn read_task_log_rejects_out_of_range_limits() {
+    let harness = DashboardTaskHarness::active_local_task();
+    let source = harness.task_source();
+    let turn = turn_id(1);
+
+    let zero = source
+        .read_task_log(harness.task_id(), turn, LogStream::Stdout, 0, 0)
+        .unwrap_err();
+    assert_eq!(zero.code, "INVALID_LOG_LIMIT");
+    assert_eq!(zero.message, "log limit must be between 1 and 65536 bytes");
+
+    let oversized = source
+        .read_task_log(
+            harness.task_id(),
+            turn,
+            LogStream::Stdout,
+            0,
+            MAX_TASK_LOG_LIMIT + 1,
+        )
+        .unwrap_err();
+    assert_eq!(oversized.code, "INVALID_LOG_LIMIT");
+}
+
+#[test]
+fn closed_task_detail_uses_local_status_without_a_remote_call() {
+    let harness = DashboardTaskHarness::closed_local_task();
+    let detail = harness
+        .task_source()
+        .task_detail(harness.task_id())
+        .unwrap();
+
+    assert_eq!(detail.task.state, TaskState::Closed);
+    assert_eq!(
+        detail.task.freshness,
+        mac_worker::task_view::TaskFreshness::Current
+    );
+    assert_eq!(harness.remote.task_status_calls(), 0);
+    assert_eq!(harness.mutation_calls(), 0);
+}
+
+#[test]
+fn read_task_log_rejects_an_unknown_configured_worker() {
+    let harness = DashboardTaskHarness::active_local_task();
+    let ghost = harness.create_extra_task(2, Some("ghost"));
+    let turn = turn_id(2);
+    harness
+        .state
+        .write_turn_prompt(ghost, turn, SECRET)
+        .unwrap();
+
+    let error = harness
+        .task_source()
+        .read_task_log(ghost, turn, LogStream::Stdout, 0, 4)
+        .unwrap_err();
+    assert_eq!(error.code, "TASK_SOURCE_FAILED");
+    assert_eq!(
+        error.message,
+        "task references an unknown configured worker"
+    );
+}
+
+#[test]
+fn missing_tasks_directory_is_not_mapped_to_task_not_found() {
+    let harness = DashboardTaskHarness::active_local_task();
+    std::fs::remove_dir_all(harness.tasks_dir()).unwrap();
+
+    let error = harness
+        .task_source()
+        .task_detail(harness.task_id())
+        .unwrap_err();
+    assert_eq!(error.code, "IO");
+    assert_eq!(error.message, "local dashboard task state is unavailable");
+}
+
+#[test]
+fn task_detail_waits_for_a_pre_exchange_replacement_writer() {
+    let (writer_entered_tx, writer_entered_rx) = mpsc::channel();
+    let (writer_release_tx, writer_release_rx) = mpsc::channel();
+    let harness =
+        DashboardTaskHarness::active_local_task_with_hook(Arc::new(PreExchangeReplacementGate {
+            entered: writer_entered_tx,
+            release: Mutex::new(writer_release_rx),
+            used: AtomicBool::new(false),
+        }));
+    let original = harness.state.load_task(harness.task_id()).unwrap();
+    let replacement = original.with_runner(None).unwrap();
+    let expected = replacement.clone();
+
+    thread::scope(|scope| {
+        let writer_state = Arc::clone(&harness.state);
+        let writer = scope.spawn(move || writer_state.update_task(replacement));
+        writer_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let source = harness.task_source();
+        let task_id = harness.task_id();
+        let contention = harness.state.observe_next_lock_contention();
+        let (detail_tx, detail_rx) = mpsc::channel();
+        scope.spawn(move || {
+            detail_tx.send(source.task_detail(task_id)).unwrap();
+        });
+
+        let reader_contended = contention.confirmed_within(Duration::from_secs(2));
+        writer_release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(
+            reader_contended,
+            "task detail must wait for the pre-exchange writer"
+        );
+        let detail = detail_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.task.task_id, task_id);
+        assert_eq!(harness.state.load_task(task_id).unwrap(), expected);
+    });
+}
+
+struct PreExchangeReplacementGate {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    used: AtomicBool,
+}
+
+impl ClientStateConcurrencyHook for PreExchangeReplacementGate {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == ClientStateConcurrencyPoint::TaskReplacementPreExchange
+            && !self.used.swap(true, Ordering::SeqCst)
+        {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DashboardTaskHarness {
     _temp: Arc<tempfile::TempDir>,
@@ -258,23 +513,62 @@ struct DashboardTaskHarness {
 
 impl DashboardTaskHarness {
     fn active_local_task() -> Self {
+        Self::local_task(
+            TaskState::Active,
+            Some("mini-1"),
+            Some(turn_id(1)),
+            true,
+            None,
+        )
+    }
+
+    fn closed_local_task() -> Self {
+        Self::local_task(
+            TaskState::Closed,
+            Some("mini-1"),
+            Some(turn_id(1)),
+            false,
+            None,
+        )
+    }
+
+    fn active_local_task_with_hook(hook: Arc<dyn ClientStateConcurrencyHook>) -> Self {
+        Self::local_task(
+            TaskState::Active,
+            Some("mini-1"),
+            Some(turn_id(1)),
+            true,
+            Some(hook),
+        )
+    }
+
+    fn local_task(
+        state: TaskState,
+        worker: Option<&str>,
+        turn: Option<TurnId>,
+        with_runner: bool,
+        hook: Option<Arc<dyn ClientStateConcurrencyHook>>,
+    ) -> Self {
         let temp = Arc::new(tempfile::tempdir().unwrap());
         let state_root = temp.path().canonicalize().unwrap().join("state");
-        let state = Arc::new(ClientStateStore::open(&state_root).unwrap());
+        let store = Arc::new(match hook {
+            Some(hook) => ClientStateStore::open_with_concurrency_hook(&state_root, hook).unwrap(),
+            None => ClientStateStore::open(&state_root).unwrap(),
+        });
         let task_id = task_id(1);
-        let turn_id = turn_id(1);
+        let turn_id = turn.unwrap_or_else(|| turn_id(1));
         let run_id = run_id();
-        state
+        store
             .create_task(task_record(
                 task_id,
                 run_id,
-                TaskState::Active,
-                Some("mini-1"),
-                Some(turn_id),
-                true,
+                state,
+                worker,
+                turn,
+                with_runner,
             ))
             .unwrap();
-        state
+        store
             .create_run(
                 RunRecord::new(
                     run_id,
@@ -292,7 +586,7 @@ impl DashboardTaskHarness {
         let remote = Arc::new(FakeRemote::default());
         Self {
             _temp: temp,
-            state,
+            state: store,
             config,
             workers,
             remote,
@@ -336,6 +630,42 @@ impl DashboardTaskHarness {
 
     fn task_id(&self) -> TaskId {
         self.task_id
+    }
+
+    fn task_source(&self) -> MacWorkerTaskSource {
+        MacWorkerTaskSource::new(
+            Arc::clone(&self.config),
+            Arc::clone(&self.state),
+            Arc::clone(&self.remote) as Arc<dyn DashboardRemoteReader>,
+        )
+    }
+
+    fn task_path(&self, task_id: TaskId) -> std::path::PathBuf {
+        self.tasks_dir().join(format!("{task_id}.json"))
+    }
+
+    fn tasks_dir(&self) -> std::path::PathBuf {
+        self._temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("state")
+            .join("tasks")
+    }
+
+    fn create_extra_task(&self, number: u128, worker: Option<&str>) -> TaskId {
+        let id = task_id(number);
+        self.state
+            .create_task(task_record(
+                id,
+                run_id(),
+                TaskState::Closed,
+                worker,
+                None,
+                false,
+            ))
+            .unwrap();
+        id
     }
 
     fn local_state_fingerprint(&self) -> Vec<u8> {
@@ -504,6 +834,10 @@ impl FakeRemote {
 
     fn mutation_calls(&self) -> usize {
         self.mutation_calls.load(Ordering::SeqCst)
+    }
+
+    fn task_status_calls(&self) -> usize {
+        self.task_status_calls.load(Ordering::SeqCst)
     }
 
     fn task_status_response(&self) -> Result<TaskStatusResponse, WorkerError> {

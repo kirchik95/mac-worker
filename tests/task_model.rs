@@ -674,6 +674,36 @@ fn task_enumeration_waits_for_a_pre_exchange_replacement_writer() {
 }
 
 #[test]
+fn load_task_optional_returns_none_only_for_an_absent_task_file() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let record = sample_record();
+    state.create_task(record.clone()).unwrap();
+
+    assert_eq!(
+        state.load_task_optional(record.meta().task_id()).unwrap(),
+        Some(record.clone())
+    );
+    assert_eq!(
+        state
+            .load_task_optional(TaskId::new(Uuid::from_u128(99)))
+            .unwrap(),
+        None
+    );
+
+    fs::remove_dir_all(paths.state.join("tasks")).unwrap();
+    let error = state
+        .load_task_optional(record.meta().task_id())
+        .unwrap_err();
+    assert_eq!(error.public_code(), "IO");
+    assert!(matches!(
+        error,
+        WorkerError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound
+    ));
+}
+
+#[test]
 fn task_enumeration_does_not_recover_replacement_residue() {
     let state_root = tempfile::tempdir().unwrap();
     let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());

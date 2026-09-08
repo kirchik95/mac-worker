@@ -1920,6 +1920,27 @@ impl ClientStateStore {
         read_task_from_dir(&tasks, &name, task_id)
     }
 
+    /// Loads one addressed task record while holding the authoritative state
+    /// lock, so a concurrent `update_task` replacement cannot ESTALE this read.
+    ///
+    /// `Ok(None)` means the requested task file is absent after the tasks
+    /// directory was opened. Failures opening that directory, validating the
+    /// store root, or parsing the addressed file remain errors and must not be
+    /// treated as a missing task.
+    pub fn load_task_optional(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<LocalTaskRecord>, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let tasks = self.tasks_dir()?;
+        let name = task_file_name(task_id)?;
+        match read_task_from_dir(&tasks, &name, task_id) {
+            Ok(record) => Ok(Some(record)),
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn update_task(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
         self.update_task_before_final_sync(replacement, || Ok(()))
     }

@@ -57,10 +57,8 @@ impl MacWorkerTaskSource {
 
     fn owned_record(&self, task_id: TaskId) -> Result<LocalTaskRecord, ApiError> {
         self.local_tasks
-            .list_tasks()
+            .load_task_optional(task_id)
             .map_err(map_local_api_error)?
-            .into_iter()
-            .find(|record| record.meta().task_id() == task_id)
             .ok_or_else(|| ApiError::new("TASK_NOT_FOUND", "task is not present in local state"))
     }
 
