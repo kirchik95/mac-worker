@@ -623,6 +623,20 @@ impl AcceptedThenTerminalFixture {
     }
 
     fn new_with_push_origin(origin: Option<&str>) -> Self {
+        Self::new_with_options(
+            origin,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            true,
+        )
+    }
+
+    fn new_with_options(
+        origin: Option<&str>,
+        preference: WorkerPreference,
+        wait_for_capacity: bool,
+    ) -> Self {
         let repo = support::GitRepo::init();
         repo.write("base.txt", b"base\n");
         repo.commit_all("base");
@@ -657,10 +671,8 @@ impl AcceptedThenTerminalFixture {
                     limits: TaskLimits::default(),
                     close_policy: ClosePolicy::Never,
                     env_profile: None,
-                    preference: WorkerPreference::Pinned {
-                        worker: "mini-1".into(),
-                    },
-                    wait_for_capacity: true,
+                    preference,
+                    wait_for_capacity,
                     attached: false,
                     run_id: None,
                 },
@@ -818,6 +830,278 @@ fn runner_refreshes_stale_agent_facts_before_claiming() {
             .capabilities()
             .iter()
             .any(|capability| capability == "agent:codex@secure")
+    );
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionFailure {
+    Probe,
+    ProbeOnce,
+    Refresh,
+}
+
+struct AdmissionFailureRunner<'a> {
+    inner: &'a AcceptedThenTerminalRunner,
+    ssh: &'static str,
+    failure: AdmissionFailure,
+    failed_worker_requests: Mutex<Vec<ProcessRequest>>,
+}
+
+impl ProcessRunner for AdmissionFailureRunner<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program != OsStr::new("/usr/bin/ssh")
+            || !request.args.iter().any(|arg| arg == self.ssh)
+        {
+            return self.inner.run(request);
+        }
+        let retried = {
+            let mut requests = self.failed_worker_requests.lock().unwrap();
+            let retried = !requests.is_empty();
+            requests.push(request.clone());
+            retried
+        };
+        if matches!(self.failure, AdmissionFailure::ProbeOnce) && retried {
+            return self.inner.run(request);
+        }
+        let operation = request.args.last().unwrap();
+        if matches!(self.failure, AdmissionFailure::Refresh)
+            && operation == "~/.local/bin/worker host probe"
+        {
+            let response = self.inner.run(request)?;
+            let mut probe: ProbeResponse = serde_json::from_slice(&response.stdout).unwrap();
+            probe.agent_facts.as_mut().unwrap().collected_at_millis = 1;
+            probe.facts_age_millis = Some(FACTS_TTL + 1);
+            return canonical_process(&probe);
+        }
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(255 << 8),
+            stdout: Vec::new(),
+            stderr: b"simulated worker connection failure".to_vec(),
+        })
+    }
+}
+
+fn add_second_worker(fixture: &mut AcceptedThenTerminalFixture, first: bool) {
+    let mut worker = fixture.config.workers[0].clone();
+    worker.name = "mini-2".into();
+    worker.ssh = "mac2".into();
+    fixture.config.workers.insert(usize::from(!first), worker);
+}
+
+fn assert_unavailable_observation(fixture: &AcceptedThenTerminalFixture, worker: &str) {
+    let bytes = fs::read(
+        fixture
+            .paths
+            .state
+            .join("observations")
+            .join(format!("{worker}.json")),
+    )
+    .unwrap();
+    let observation: AdmissionObservation = serde_json::from_slice(&bytes).unwrap();
+    assert!(!observation.ready());
+    assert!(observation.capabilities().is_empty());
+}
+
+fn assert_automatic_admission_survives(failure: AdmissionFailure) {
+    for failed_worker_first in [true, false] {
+        let mut fixture =
+            AcceptedThenTerminalFixture::new_with_options(None, WorkerPreference::Automatic, false);
+        add_second_worker(&mut fixture, failed_worker_first);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        fixture
+            .state
+            .publish_admission_observation(
+                AdmissionObservation::new(
+                    "mini-2".into(),
+                    true,
+                    mac_worker::scheduler::CandidateSlot::Idle,
+                    vec!["agent:codex".into(), "darwin-arm64".into()],
+                    Some(12 * 1024 * 1024 * 1024),
+                    100 * 1024 * 1024 * 1024,
+                    now,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let runner = AdmissionFailureRunner {
+            inner: &fixture.runner,
+            ssh: "mac2",
+            failure,
+            failed_worker_requests: Mutex::new(Vec::new()),
+        };
+
+        let outcome = TurnRunner::new(
+            &runner,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &fixture.executor,
+        )
+        .run(fixture.task_id, fixture.turn_id, Some(&mut Vec::new()))
+        .unwrap();
+
+        assert_remote_turn_completed(&fixture, &outcome);
+        assert_eq!(outcome.status().worker(), Some("mini-1"));
+        assert_unavailable_observation(&fixture, "mini-2");
+        let requests = runner.failed_worker_requests.lock().unwrap();
+        assert!(requests.iter().all(|request| {
+            request.args.last().is_some_and(|operation| {
+                operation == "~/.local/bin/worker host probe"
+                    || (matches!(failure, AdmissionFailure::Refresh)
+                        && operation == HostOperation::RefreshFacts.command())
+            })
+        }));
+    }
+}
+
+#[test]
+fn automatic_admission_skips_unreachable_workers_in_either_inventory_order() {
+    // Break caught: one failed SSH probe aborts the healthy worker's turn,
+    // or leaves an earlier positive observation available to the scheduler.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    assert_automatic_admission_survives(AdmissionFailure::Probe);
+}
+
+#[test]
+fn automatic_admission_skips_failed_fact_refresh_in_either_inventory_order() {
+    // Break caught: a failed refresh after a successful but stale probe
+    // escapes the per-worker observation and aborts automatic selection.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    assert_automatic_admission_survives(AdmissionFailure::Refresh);
+}
+
+#[test]
+fn pinned_admission_does_not_fall_back_when_its_worker_is_unreachable() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture = AcceptedThenTerminalFixture::new_with_options(
+        None,
+        WorkerPreference::Pinned {
+            worker: "mini-1".into(),
+        },
+        false,
+    );
+    add_second_worker(&mut fixture, true);
+    let runner = AdmissionFailureRunner {
+        inner: &fixture.runner,
+        ssh: "mac1",
+        failure: AdmissionFailure::Probe,
+        failed_worker_requests: Mutex::new(Vec::new()),
+    };
+
+    let error = TurnRunner::new(
+        &runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, Some(&mut Vec::new()))
+    .unwrap_err();
+
+    assert_eq!(error.public_code(), "CAPACITY_BUSY");
+    assert_eq!(
+        fixture
+            .state
+            .load_task(fixture.task_id)
+            .unwrap()
+            .status()
+            .state(),
+        TaskState::Abandoned
+    );
+    assert_unavailable_observation(&fixture, "mini-1");
+    assert!(fixture.runner.requests().iter().all(|request| {
+        request.program != OsStr::new("/usr/bin/ssh")
+            || !request.args.iter().any(|arg| arg == "mac2")
+    }));
+}
+
+#[test]
+fn pinned_admission_waits_for_its_worker_to_recover() {
+    // Break caught: a temporary probe failure terminates a waiting runner
+    // or an unavailable observation prevents dispatch after recovery.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    fs::remove_file(fixture.paths.state.join("observations/mini-1.json")).unwrap();
+    let runner = AdmissionFailureRunner {
+        inner: &fixture.runner,
+        ssh: "mac1",
+        failure: AdmissionFailure::ProbeOnce,
+        failed_worker_requests: Mutex::new(Vec::new()),
+    };
+
+    let outcome = TurnRunner::new(
+        &runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, Some(&mut Vec::new()))
+    .unwrap();
+
+    assert_remote_turn_completed(&fixture, &outcome);
+    assert_eq!(outcome.status().worker(), Some("mini-1"));
+}
+
+#[test]
+fn admission_preserves_local_state_errors_after_a_failed_peer() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture =
+        AcceptedThenTerminalFixture::new_with_options(None, WorkerPreference::Automatic, false);
+    add_second_worker(&mut fixture, true);
+    fs::write(
+        fixture.paths.state.join("observations/mini-1.json"),
+        b"corrupt local observation\n",
+    )
+    .unwrap();
+    let runner = AdmissionFailureRunner {
+        inner: &fixture.runner,
+        ssh: "mac2",
+        failure: AdmissionFailure::Refresh,
+        failed_worker_requests: Mutex::new(Vec::new()),
+    };
+
+    let error = TurnRunner::new(
+        &runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, Some(&mut Vec::new()))
+    .unwrap_err();
+
+    assert!(
+        matches!(&error, WorkerError::Io(inner) if inner.kind() == io::ErrorKind::InvalidData),
+        "{error}"
+    );
+    assert!(
+        fixture
+            .state
+            .queue_entry(fixture.turn_id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn admission_preserves_invalid_transport_configuration_errors() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture = AcceptedThenTerminalFixture::new();
+    fixture.config.workers[0].remote_binary = "/invalid/worker".into();
+
+    let error = fixture.run(&mut Vec::new()).unwrap_err();
+
+    assert_eq!(error.public_code(), "INVALID_REQUEST");
+    assert!(
+        fixture
+            .state
+            .queue_entry(fixture.turn_id)
+            .unwrap()
+            .is_some()
     );
 }
 
@@ -2517,7 +2801,7 @@ fn runner_that_exits_early_writes_one_diagnostic_line_and_no_secret() {
                 None,
                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
                 None,
-                true,
+                false,
                 None,
             )
             .unwrap(),
@@ -2565,11 +2849,7 @@ fn runner_that_exits_early_writes_one_diagnostic_line_and_no_secret() {
     )
     .run(task_id, turn_id, Some(&mut Vec::new()))
     .unwrap_err();
-    assert!(
-        error.public_code() == "UNAVAILABLE" || error.public_code() == "REFRESH_FACTS_FAILED",
-        "early-exit error code: {}",
-        error.public_code()
-    );
+    assert_eq!(error.public_code(), "CAPACITY_BUSY");
 
     let log = String::from_utf8(
         fs::read(support::task_harness::runner_log(
@@ -2581,10 +2861,7 @@ fn runner_that_exits_early_writes_one_diagnostic_line_and_no_secret() {
     )
     .unwrap();
     let lines: Vec<_> = log.lines().filter(|line| !line.is_empty()).collect();
-    assert_eq!(
-        lines,
-        ["exited: NO_WORKER_OFFERS:agent:codex workers=mini-1"]
-    );
+    assert_eq!(lines, ["exited: CAPACITY_BUSY workers=mini-1"]);
     assert!(!log.contains(secret));
     assert!(!log.contains("/Users/alice"));
     assert!(!log.contains("id_rsa"));

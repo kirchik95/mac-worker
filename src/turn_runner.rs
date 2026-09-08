@@ -29,6 +29,7 @@ use crate::{
     paths::PathLayout,
     process::ProcessRunner,
     project_state::ProjectState,
+    protocol::HealthStatus,
     scheduler::{CandidateObservation, SchedulerPolicy, WorkerPreference},
     scheduler_adapter::SchedulerProbeAdapter,
     supervisor::SystemProcessInspector,
@@ -1152,20 +1153,42 @@ impl<'a> TurnRunner<'a> {
                     .into_iter()
                     .next()
                     .ok_or_else(|| WorkerError::Protocol("worker probe was empty".into()))?;
-                let facts_stale = health.probe.as_ref().is_none_or(|probe| {
-                    probe
-                        .agent_facts
-                        .as_ref()
-                        .is_none_or(|facts| facts.is_stale(observed_at))
-                });
+                let facts_stale = health.status == HealthStatus::Ready
+                    && health.probe.as_ref().is_none_or(|probe| {
+                        probe
+                            .agent_facts
+                            .as_ref()
+                            .is_none_or(|facts| facts.is_stale(observed_at))
+                    });
                 if facts_stale {
-                    SshTransport::new(self.runner).refresh_facts(worker)?;
-                    health = WorkersService::new(SshTransport::new(self.runner))
-                        .inspect(&one)
-                        .workers
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| WorkerError::Protocol("worker probe was empty".into()))?;
+                    match SshTransport::new(self.runner).refresh_facts(worker) {
+                        Ok(()) => {
+                            health = WorkersService::new(SshTransport::new(self.runner))
+                                .inspect(&one)
+                                .workers
+                                .into_iter()
+                                .next()
+                                .ok_or_else(|| {
+                                    WorkerError::Protocol("worker probe was empty".into())
+                                })?;
+                        }
+                        Err(
+                            error @ WorkerError::Transport {
+                                code: "REFRESH_FACTS_FAILED",
+                                ..
+                            },
+                        ) => {
+                            health.status = HealthStatus::Unavailable;
+                            health.error_code = Some(error.public_code());
+                            health.error_message = Some(error.public_message());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if facts_stale || health.status == HealthStatus::Unavailable {
+                    // A failed worker is an unavailable candidate, not a
+                    // failed fleet observation. Publish it so an earlier
+                    // ready cache entry cannot admit work to this worker.
                     let candidate = candidate_from_health(&one, &health)?;
                     self.client_state
                         .publish_admission_observation(admission_from_health(
