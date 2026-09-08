@@ -817,8 +817,8 @@ impl<'a> TaskClient<'a> {
             report.runner = self.client_state.runner_liveness(task_id)?;
         }
         // The submitter no longer needs the repository after the queue row is
-        // handed off.  Release its per-repository lock before an attached
-        // runner reopens the same repository in this process.
+        // handed off.  Its shared lock would not block the attached runner,
+        // but a handle that outlives its use is a handle GC has to wait for.
         drop(transfer);
         report.events.push(event_task_created(&report));
         if request.attached {

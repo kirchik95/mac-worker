@@ -848,30 +848,124 @@ fn transfer_gc_previews_and_removes_only_an_unreferenced_empty_transfer_repo() {
 }
 
 #[test]
-fn transfer_gc_waits_for_a_live_transfer_repository_handle() {
+fn transfer_gc_skips_a_live_transfer_repository_handle_with_a_warning() {
     let temp = tempfile::tempdir().unwrap();
     let source = GitRepo::init();
     source.write("base.txt", b"base\n");
     source.commit_all("base");
-    let transfer =
-        TransferRepo::open_or_create(&temp.path().join("cache"), &source.root().join(".git"))
-            .unwrap();
     let cache = temp.path().join("cache");
+    let transfer = TransferRepo::open_or_create(&cache, &source.root().join(".git")).unwrap();
+    let held_repo_id = transfer.repo_id().to_owned();
+    let held_path = transfer.path().to_path_buf();
+    let other = GitRepo::init();
+    other.write("other.txt", b"other\n");
+    other.commit_all("other");
+    let free = TransferRepo::open_or_create(&cache, &other.root().join(".git")).unwrap();
+    let free_repo_id = free.repo_id().to_owned();
+    let free_path = free.path().to_path_buf();
+    drop(free);
+
     let (sender, receiver) = mpsc::channel();
+    let gc_cache = cache.clone();
     let handle = thread::spawn(move || {
         let runner = SystemProcessRunner;
-        let report = TransferGc::new(&cache, &runner).preview_at(u64::MAX / 2);
-        sender.send(report).unwrap();
+        let preview = TransferGc::new(&gc_cache, &runner).preview_at(u64::MAX / 2);
+        let applied = TransferGc::new(&gc_cache, &runner).apply_at(u64::MAX / 2);
+        sender.send((preview, applied)).unwrap();
     });
-
-    assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
-    drop(transfer);
-    let report = receiver
-        .recv_timeout(Duration::from_secs(1))
-        .expect("transfer GC should continue after the repository handle drops")
-        .unwrap();
-    assert_eq!(report.candidates().len(), 1);
+    let (preview, applied) = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("transfer GC must not wait for a live repository handle");
     handle.join().unwrap();
+    let preview = preview.unwrap();
+    let applied = applied.unwrap();
+    for report in [&preview, &applied] {
+        assert!(
+            report
+                .candidates()
+                .iter()
+                .all(|candidate| candidate.identifier() != held_repo_id)
+        );
+        assert!(
+            report
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.identifier() == free_repo_id)
+        );
+        assert!(
+            report
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("in use")),
+            "{:?}",
+            report.warnings()
+        );
+    }
+    assert!(held_path.exists());
+    assert!(!free_path.exists());
+
+    drop(transfer);
+    let report = TransferGc::new(&cache, &SystemProcessRunner)
+        .apply_at(u64::MAX / 2)
+        .unwrap();
+    assert!(
+        report
+            .applied()
+            .iter()
+            .any(|candidate| candidate.identifier() == held_repo_id)
+    );
+    assert!(report.warnings().is_empty(), "{:?}", report.warnings());
+    assert!(!held_path.exists());
+}
+
+#[test]
+fn transfer_gc_ignores_the_init_lock_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"base\n");
+    source.commit_all("base");
+    let cache = temp.path().join("cache");
+    let transfer = TransferRepo::open_or_create(&cache, &source.root().join(".git")).unwrap();
+    let repo_id = transfer.repo_id().to_owned();
+    drop(transfer);
+    assert!(
+        cache
+            .join("transfer")
+            .join(format!("{repo_id}.init.lock"))
+            .exists()
+    );
+    let report = TransferGc::new(&cache, &SystemProcessRunner)
+        .preview_at(u64::MAX / 2)
+        .unwrap();
+    assert!(report.warnings().is_empty(), "{:?}", report.warnings());
+    assert_eq!(report.candidates().len(), 1);
+}
+
+#[test]
+fn a_child_process_does_not_inherit_the_transfer_repository_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"base\n");
+    source.commit_all("base");
+    let cache = temp.path().join("cache");
+    let transfer = TransferRepo::open_or_create(&cache, &source.root().join(".git")).unwrap();
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("echo ready; exec /bin/sleep 30")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    std::io::BufRead::read_line(&mut stdout, &mut ready).unwrap();
+    assert_eq!(ready.trim(), "ready", "the child has exec'ed");
+    drop(transfer);
+    let report = TransferGc::new(&cache, &SystemProcessRunner).preview_at(u64::MAX / 2);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let report = report.unwrap();
+    assert!(report.warnings().is_empty(), "{:?}", report.warnings());
+    assert_eq!(report.candidates().len(), 1);
 }
 
 #[test]
