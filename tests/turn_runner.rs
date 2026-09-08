@@ -3955,3 +3955,335 @@ fn contending_runner_stops_when_its_owner_changes() {
 fn contending_runner_cannot_mutate_a_replacement_turn() {
     runner_refresh_contention(Some(true));
 }
+
+struct DelayedProjectionRemote<'a> {
+    inner: &'a AcceptedThenTerminalRunner,
+    accepted: Mutex<Option<mpsc::Sender<()>>>,
+    drain: Mutex<mpsc::Receiver<()>>,
+    response: Mutex<Option<mpsc::Sender<()>>>,
+    release_response: Mutex<mpsc::Receiver<()>>,
+    cancelled: AtomicBool,
+    delay_refresh: bool,
+}
+impl DelayedProjectionRemote<'_> {
+    fn terminal(&self) -> TaskStatus {
+        let task = self.inner.task.lock().unwrap();
+        let (meta, turn) = task.as_ref().unwrap();
+        let cancelled = self.cancelled.load(Ordering::SeqCst);
+        let outcome = if cancelled {
+            TaskOutcome::Cancelled
+        } else {
+            TaskOutcome::Done
+        };
+        TaskStatus::new(
+            TaskState::Open,
+            Some(outcome.clone()),
+            Some("mini-1".into()),
+            true,
+            Some(meta.base_oid().clone()),
+            Some("published turn".into()),
+            vec![],
+            vec![],
+            None,
+            vec![TurnSummary::new(
+                1,
+                *turn,
+                Some(if cancelled {
+                    TurnTerminal::Cancelled
+                } else {
+                    TurnTerminal::Succeeded
+                }),
+                Some(outcome),
+                Some(true),
+                false,
+                Some(meta.created_at_millis()),
+                Some(meta.created_at_millis() + 1),
+            )],
+            meta.created_at_millis() + 1,
+        )
+        .unwrap()
+    }
+    fn delay_response(&self) {
+        if let Some(sender) = self.response.lock().unwrap().take() {
+            sender.send(()).unwrap();
+            self.release_response
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .expect("release delayed projection");
+        }
+    }
+}
+impl ProcessRunner for DelayedProjectionRemote<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let operation = request.args.last().and_then(|arg| arg.to_str());
+        if operation == Some(HostOperation::TaskCancel.command()) {
+            self.cancelled.store(true, Ordering::SeqCst);
+            let response = mac_worker::task_store::TaskCancelResponse::new(self.terminal());
+            self.delay_response();
+            return canonical_process(&response);
+        }
+        if operation == Some(HostOperation::TaskStatus.command()) {
+            if !*self.inner.turn_submitted.lock().unwrap() {
+                return self.inner.run(request);
+            }
+            if thread::current().name() == Some("finishing-turn")
+                && let Some(sender) = self.accepted.lock().unwrap().take()
+            {
+                sender.send(()).unwrap();
+                self.drain
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("release accepted turn drain");
+            }
+            let response = TaskStatusResponse::new(self.terminal());
+            if self.delay_refresh && thread::current().name() == Some("delayed-projection") {
+                self.delay_response();
+            }
+            return canonical_process(&response);
+        }
+        self.inner.run(request)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectionCase {
+    CancelSuccessor,
+    CancelCompleted,
+    IdleSuccessor,
+    CancelResponsive,
+    IdleWriteFailure,
+    IdleCorruption,
+}
+
+fn delayed_task_projection_cannot_overwrite_publication(case: ProjectionCase) {
+    let refresh = matches!(
+        case,
+        ProjectionCase::IdleSuccessor
+            | ProjectionCase::IdleWriteFailure
+            | ProjectionCase::IdleCorruption
+    );
+    let successor = matches!(
+        case,
+        ProjectionCase::CancelSuccessor | ProjectionCase::IdleSuccessor
+    );
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let (drain_tx, drain_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let remote = DelayedProjectionRemote {
+        inner: &fixture.runner,
+        accepted: Mutex::new((!refresh).then_some(accepted_tx)),
+        drain: Mutex::new(drain_rx),
+        response: Mutex::new(Some(response_tx)),
+        release_response: Mutex::new(release_rx),
+        cancelled: AtomicBool::new(false),
+        delay_refresh: refresh,
+    };
+    let client = TaskClient::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    );
+    thread::scope(|scope| {
+        let mut release_drain = FenceRelease(Some(drain_tx));
+        let mut release_response = FenceRelease(Some(release_tx));
+        let runner = thread::Builder::new()
+            .name("finishing-turn".into())
+            .spawn_scoped(scope, || {
+                TurnRunner::new(
+                    &remote,
+                    &fixture.config,
+                    &fixture.paths,
+                    &fixture.state,
+                    &fixture.executor,
+                )
+                .run(fixture.task_id, fixture.turn_id, None)
+            })
+            .unwrap();
+        let delayed = if refresh {
+            runner.join().unwrap().unwrap();
+            thread::Builder::new()
+                .name("delayed-projection".into())
+                .spawn_scoped(scope, || client.reconcile_runners().map(|_| ()))
+                .unwrap()
+        } else {
+            accepted_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("A accepted before cancellation");
+            let cancel = thread::Builder::new()
+                .name("delayed-projection".into())
+                .spawn_scoped(scope, || client.cancel(fixture.task_id).map(|_| ()))
+                .unwrap();
+            response_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("remote cancellation applied; response delayed");
+            if case == ProjectionCase::CancelResponsive {
+                release_response.release();
+                cancel.join().unwrap().unwrap();
+                assert_eq!(
+                    fixture
+                        .state
+                        .load_task(fixture.task_id)
+                        .unwrap()
+                        .status()
+                        .last_outcome(),
+                    Some(&TaskOutcome::Cancelled)
+                );
+                assert!(
+                    fixture
+                        .state
+                        .queue_entry(fixture.turn_id)
+                        .unwrap()
+                        .is_some()
+                );
+                release_drain.release();
+                runner.join().unwrap().unwrap();
+                assert!(
+                    fixture
+                        .state
+                        .load_task(fixture.task_id)
+                        .unwrap()
+                        .fetched_head()
+                        .is_some()
+                );
+                return;
+            }
+            release_drain.release();
+            runner.join().unwrap().unwrap();
+            cancel
+        };
+        if refresh {
+            response_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("idle refresh response delayed");
+        }
+        let completed = fixture.state.load_task(fixture.task_id).unwrap();
+        assert!(
+            completed.fetched_head().is_some(),
+            "A published its fetched head"
+        );
+        assert!(completed.runner().is_none());
+        assert!(
+            fixture
+                .state
+                .queue_entry(fixture.turn_id)
+                .unwrap()
+                .is_none()
+        );
+        let old_log = fixture.runner_log();
+        let checkpoint_path = fixture
+            .paths
+            .state
+            .join("runners")
+            .join(fixture.task_id.to_string())
+            .join(format!("{}.checkpoint.json", fixture.turn_id));
+        let checkpoint = fs::read(&checkpoint_path).unwrap();
+        assert!(!serde_json::from_slice::<serde_json::Value>(&checkpoint).unwrap()["committed"]["completion"].is_null());
+        if successor {
+            client
+                .say(
+                    fixture.task_id,
+                    "next turn".into(),
+                    false,
+                    &mut vec![],
+                    &mut vec![],
+                )
+                .unwrap();
+        }
+        let expected = fixture.state.load_task(fixture.task_id).unwrap();
+        let expected_row = fixture
+            .state
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap();
+        if successor {
+            assert_eq!(expected.status().turns().len(), 2);
+            assert!(expected.runner().is_some());
+            assert_ne!(expected_row.as_ref().unwrap().job_id(), fixture.turn_id);
+        }
+        if case == ProjectionCase::IdleWriteFailure {
+            fixture
+                .state
+                .inject_write_failure_once(ClientStateWritePoint::BeforeTaskRollbackUpdate);
+        }
+        let task_path = fixture
+            .paths
+            .state
+            .join("tasks")
+            .join(format!("{}.json", fixture.task_id));
+        if case == ProjectionCase::IdleCorruption {
+            fs::write(&task_path, b"corrupt").unwrap();
+        }
+        release_response.release();
+        let result = delayed.join().unwrap();
+        if case == ProjectionCase::IdleCorruption {
+            assert!(
+                matches!(result, Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData)
+            );
+            assert_eq!(fs::read(task_path).unwrap(), b"corrupt");
+            return;
+        }
+        if case == ProjectionCase::IdleWriteFailure {
+            assert_eq!(result.unwrap_err().public_code(), "IO");
+        } else {
+            result.unwrap();
+        }
+        let actual = fixture.state.load_task(fixture.task_id).unwrap();
+        assert_eq!(
+            actual.status().turns(),
+            expected.status().turns(),
+            "late response overwrote turn history"
+        );
+        assert_eq!(
+            actual.runner(),
+            expected.runner(),
+            "late response overwrote runner identity"
+        );
+        assert_eq!(
+            actual.fetched_head(),
+            expected.fetched_head(),
+            "late response lost fetched head"
+        );
+        assert_eq!(
+            fixture
+                .state
+                .queue_entry_for_task_turn(fixture.task_id)
+                .unwrap(),
+            expected_row,
+            "late response changed queue ownership"
+        );
+        assert_eq!(fixture.runner_log(), old_log);
+        assert_eq!(fs::read(checkpoint_path).unwrap(), checkpoint);
+    });
+}
+
+#[test]
+fn delayed_accepted_cancel_preserves_a_successor_turn() {
+    delayed_task_projection_cannot_overwrite_publication(ProjectionCase::CancelSuccessor);
+}
+#[test]
+fn delayed_accepted_cancel_preserves_completed_publication() {
+    delayed_task_projection_cannot_overwrite_publication(ProjectionCase::CancelCompleted);
+}
+#[test]
+fn delayed_idle_refresh_preserves_a_successor_turn() {
+    delayed_task_projection_cannot_overwrite_publication(ProjectionCase::IdleSuccessor);
+}
+
+#[test]
+fn accepted_cancel_projects_without_waiting_for_the_drain_fence() {
+    delayed_task_projection_cannot_overwrite_publication(ProjectionCase::CancelResponsive);
+}
+#[test]
+fn delayed_idle_refresh_propagates_local_write_failure() {
+    delayed_task_projection_cannot_overwrite_publication(ProjectionCase::IdleWriteFailure);
+}
+#[test]
+fn delayed_idle_refresh_propagates_current_record_corruption() {
+    delayed_task_projection_cannot_overwrite_publication(ProjectionCase::IdleCorruption);
+}

@@ -126,6 +126,20 @@ git diff --check
 
 All commands passed. Outputs: `/private/tmp/fix2-final-scoped.log`, `/private/tmp/fix2-final-fmt.log`, `/private/tmp/fix2-final-clippy.log`. No concurrent rebuilds or Rust source changes occurred during final verification. Controller-owned frozen whole-branch all-target verification remains pending after scoped re-review. The pre-existing idle/no-queue status-refresh versus new-`say` projection race remains recorded for whole-branch review and outside these scoped fixes.
 
+
+**Final review wave — conditional remote projections.** Accepted cancellation and the formerly deferred idle/no-queue refresh race now share an atomic expected-record comparison under the existing state lock/rooted replacement machinery. Delayed responses cannot overwrite successor history, runner/queue authority or completed fetched-head metadata. Cancellation does not wait for the journal owner; local publication failures propagate while remote observation failures remain best effort. Three original channel-gated races failed before implementation and passed after it; additional checks cover response publication during an active drain, local write failure and current-record corruption.
+
+Frozen final-wave scoped verification: **618 passed, 0 failed across 11 top-level suites**, exit 0. Counts: library 316; agent adapters 50; Cursor/OpenCode 21; client state 42; runner dispatch 15; scheduler queue 64; task command 9; conversation 15; logs 21; project context 8; runner 57. Nested filtered library harness summaries are excluded. Exact commands:
+
+```sh
+cargo test --locked --offline --lib --test client_state --test scheduler_queue --test runner_dispatch --test task_conversation --test turn_runner --test task_logs --test task_project_context --test task_command --test agent_adapters --test agent_cursor_opencode
+cargo fmt --all --check
+cargo clippy --locked --offline --all-targets -- -D warnings
+git diff --check
+```
+
+All passed. Output paths: `/private/tmp/final-fix-scoped.log`, `/private/tmp/final-fix-fmt.log`, `/private/tmp/final-fix-clippy.log`. Final verification used frozen Rust sources with no concurrent rebuilds; only task documentation changed afterwards. The controller interrupted the prior all-target run on `290f8c6` with SIGINT/exit 130 before this wave; that interrupted run is not final-source evidence. Controller-owned whole-branch all-target verification remains pending after re-review. The optional decoder flag/cursor strengthening remains outside this fix.
+
 ## 4. Контракты и восстановление dashboard
 
 Независимые небольшие изменения:

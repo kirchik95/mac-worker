@@ -1362,10 +1362,9 @@ impl<'a> TaskClient<'a> {
                 if log.current_entry(self.client_state)?.as_ref() != Some(&entry) {
                     continue;
                 }
-                let _ = self
-                    .refresh_task_status(&self.client_state.load_task(record.meta().task_id())?);
+                self.refresh_task_status(&self.client_state.load_task(record.meta().task_id())?)?;
             } else {
-                let _ = self.refresh_task_status(&record);
+                self.refresh_task_status(&record)?;
             }
         }
 
@@ -1691,7 +1690,10 @@ impl<'a> TaskClient<'a> {
                 ),
             )?;
             let status = response.status().clone();
-            self.client_state.update_task(record.with_status(status)?)?;
+            // The remote cancellation targets this selected turn, but its
+            // response can arrive after publication or a subsequent say.
+            self.client_state
+                .update_task_if_current(&record, record.with_status(status)?)?;
         }
         self.report_for(task_id)
     }
@@ -2102,13 +2104,16 @@ impl<'a> TaskClient<'a> {
         let Some(worker) = self.config.worker(worker_name) else {
             return Ok(());
         };
-        let response = RemoteJobClient::new(self.runner).task_status(
+        let Ok(response) = RemoteJobClient::new(self.runner).task_status(
             worker,
             &crate::task_store::TaskStatusRequest::new(
                 record.meta().project_id(),
                 record.meta().task_id(),
             ),
-        )?;
+        ) else {
+            // A failed remote observation is not evidence of task loss.
+            return Ok(());
+        };
         if let Some(pending) = pending_turn_id(record.status())
             && record.status().state() == TaskState::Active
             && self
@@ -2127,11 +2132,13 @@ impl<'a> TaskClient<'a> {
             return Ok(());
         }
         let observed_at = response.status().updated_at_millis();
-        self.client_state.update_task(
+        self.client_state.update_task_if_current(
+            record,
             record
                 .with_status(response.status().clone())?
                 .with_status_observed_at(Some(observed_at))?,
-        )
+        )?;
+        Ok(())
     }
 
     fn enqueue_missing_turn(

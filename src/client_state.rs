@@ -1936,11 +1936,41 @@ impl ClientStateStore {
         self.update_task_locked_before_final_sync(replacement, before_final_sync)
     }
 
+    /// Publish a remote projection only if the complete task snapshot used by
+    /// that request is still current. Equality includes turn history, runner
+    /// ownership and publication metadata; a stale response cannot restore them.
+    pub(crate) fn update_task_if_current(
+        &self,
+        expected: &LocalTaskRecord,
+        replacement: LocalTaskRecord,
+    ) -> Result<bool, WorkerError> {
+        if expected.meta().task_id() != replacement.meta().task_id() {
+            return Err(invalid_state(
+                "conditional task update changed task identity",
+            ));
+        }
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        self.replace_task_locked_if_current(replacement, || Ok(()), Some(expected))
+    }
+
     fn update_task_locked_before_final_sync<F>(
         &self,
         replacement: LocalTaskRecord,
         before_final_sync: F,
     ) -> Result<(), WorkerError>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        self.replace_task_locked_if_current(replacement, before_final_sync, None)
+            .map(|_| ())
+    }
+
+    fn replace_task_locked_if_current<F>(
+        &self,
+        replacement: LocalTaskRecord,
+        before_final_sync: F,
+        expected: Option<&LocalTaskRecord>,
+    ) -> Result<bool, WorkerError>
     where
         F: FnOnce() -> io::Result<()>,
     {
@@ -1963,6 +1993,9 @@ impl ClientStateStore {
         let existing = parse_task_record(&old)?;
         if existing.meta().task_id() != task_id {
             return Err(invalid_state("task filename and record identity differ"));
+        }
+        if expected.is_some_and(|expected| expected != &existing) {
+            return Ok(false);
         }
         tasks
             .replace_private_regular_exact_with_sync_hooks(
@@ -1988,6 +2021,7 @@ impl ClientStateStore {
                 },
                 before_final_sync,
             )
+            .map(|()| true)
             .map_err(WorkerError::Io)
     }
 
