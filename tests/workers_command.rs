@@ -401,6 +401,7 @@ fn probe_disables_forwarding_and_uses_the_fixed_host_command() {
             environment_remove: Vec::new(),
             stdin: None,
             policy: probe_policy(),
+            isolate_parent_environment: false,
         }]
     );
 }
@@ -1161,6 +1162,7 @@ fn system_runner_passes_arguments_without_shell_interpretation() {
         environment_remove: Vec::new(),
         stdin: None,
         policy: local_test_policy(),
+        isolate_parent_environment: false,
     };
 
     let result = SystemProcessRunner.run(&request).unwrap();
@@ -1179,6 +1181,7 @@ fn system_runner_writes_the_requested_stdin() {
         environment_remove: Vec::new(),
         stdin: Some(b"raw stdin bytes\n".to_vec()),
         policy: local_test_policy(),
+        isolate_parent_environment: false,
     };
 
     let result = SystemProcessRunner.run(&request).unwrap();

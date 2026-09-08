@@ -156,6 +156,18 @@ worker task submit --agent cursor --env-profile agents --wait --prompt "Create S
 
 `init` reports readiness only when the named profile is secure and the selected agent authenticates with it. It does not save a project-wide agent/profile default; use the printed task command or configure [project defaults](usage.md).
 
+### Login startup and profile precedence
+
+mac-worker runs agent probes, prebind checks and turns through the worker account's login shell (`/bin/zsh -lc`), not a direct binary exec with a captured PATH. The effective environment is built in this order:
+
+1. Account scaffold (`HOME`, `USER`, `LOGNAME`, `SHELL`) for the worker account home used by the request.
+2. Secure profile entries selected for the task or probe, when present.
+3. Login startup files such as `~/.zprofile`, which may override earlier values including `PATH` and agent credentials.
+
+Profile variables are applied before login startup runs, but login startup wins on conflicts. If `~/.zprofile` exports a different `CURSOR_API_KEY` or replaces `PATH`, facts, prebind and turns all observe that post-login value. Put durable PATH and credential setup in the login-shell configuration the worker account actually uses over SSH, and treat profile files as explicit overrides only when you intend them to apply before login startup.
+
+Account-bound launches clear the parent process environment before applying the scaffold and profile entries, so credentials present only in the laptop shell or SSH client are not inherited. Ordinary non-isolated process launches still inherit the parent environment.
+
 ## 5. Run a task, then prepare your project
 
 Follow [Get your first branch](../README.md#3-get-your-first-branch). Builds also need your project's runtime, package manager, dependencies and any required development services.

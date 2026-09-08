@@ -996,6 +996,7 @@ impl TransferRepo {
                 stderr_limit: GIT_OUTPUT_LIMIT,
                 deadline: GIT_DEADLINE,
             },
+            isolate_parent_environment: false,
         };
         let result = runner.run(&request)?;
         if result.status.success() {
@@ -1324,6 +1325,7 @@ fn user_git(
             stderr_limit: GIT_OUTPUT_LIMIT,
             deadline: GIT_DEADLINE,
         },
+        isolate_parent_environment: false,
     };
     let result = runner.run(&request)?;
     if allow_failure || result.status.success() {

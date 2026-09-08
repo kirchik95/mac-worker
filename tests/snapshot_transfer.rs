@@ -408,6 +408,7 @@ fn ssh_json_request_uses_exact_fixed_argv_and_compact_stdin() {
             environment_remove: Vec::new(),
             stdin: Some(br#"{"alpha":7,"beta":"fixed"}"#.to_vec()),
             policy: policy(),
+            isolate_parent_environment: false,
         }]
     );
 }
@@ -622,6 +623,7 @@ fn rsync_upload_uses_exact_stock_argv_and_only_the_publication_root() {
             stderr_limit: 256 * 1024,
             deadline: Duration::from_secs(15 * 60),
         },
+        isolate_parent_environment: false,
     };
     assert_eq!(runner.requests(), vec![expected]);
 

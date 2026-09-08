@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +14,8 @@ use serde::{
 use serde_json::{Map, Value};
 
 use crate::{
-    agent::{AgentKind, AuthProbe, AuthProbeResult, adapter_for},
+    account_launch::account_login_shell_request,
+    agent::{AgentKind, AuthProbe, AuthProbeResult, adapter_for, render_prebind_shell},
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
 };
 
@@ -417,16 +418,21 @@ impl<'de> Deserialize<'de> for AgentFacts {
 }
 
 /// Collect facts using the current wall-clock time in milliseconds.
-pub fn collect_agent_facts<P>(runner: &dyn ProcessRunner, profiles: &[P]) -> AgentFacts
+pub fn collect_agent_facts<P>(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    profiles: &[P],
+) -> AgentFacts
 where
     P: ProfileInput,
 {
-    collect_agent_facts_at(runner, profiles, current_time_millis())
+    collect_agent_facts_at(runner, account_home, profiles, current_time_millis())
 }
 
 /// Deterministic-time variant used by local tests and cache callers.
 pub fn collect_agent_facts_at<P>(
     runner: &dyn ProcessRunner,
+    account_home: &Path,
     profiles: &[P],
     collected_at_millis: u64,
 ) -> AgentFacts
@@ -443,16 +449,6 @@ where
         })
         .collect::<Vec<_>>();
 
-    // Agents are resolved and launched the way turns launch them: through the
-    // account's login shell. Launchers such as an npm-installed `codex` need
-    // that `PATH` (for `node`) even when the helper itself runs with a bare
-    // environment, so the login `PATH` is captured once and applied to every
-    // version and authentication probe. Profile entries are appended after it
-    // and therefore win on conflict.
-    let login_environment = login_path(runner)
-        .map(|path| vec![(OsString::from("PATH"), path)])
-        .unwrap_or_default();
-
     let mut agents = Vec::new();
     for kind in [
         AgentKind::Codex,
@@ -461,32 +457,45 @@ where
         AgentKind::Opencode,
     ] {
         let adapter = adapter_for(kind);
-        let Some(binary) = resolve_binary(runner, adapter.binary()) else {
-            continue;
-        };
+        let binary = adapter.binary();
         let auth_probe = adapter.auth_probe();
-        let version = run_version(runner, &binary, login_environment.clone());
-        let auth = run_auth(runner, &binary, &auth_probe, login_environment.clone());
-        let auth_by_profile = profiles
+        let base_available = adapter_available(runner, account_home, binary, &[]);
+        let mut auth_by_profile = Vec::new();
+        let mut any_profile_binary = false;
+        for profile in profiles
             .iter()
             .filter(|profile| profile.profile_is_secure())
-            .map(|profile| {
-                let mut environment = login_environment.clone();
-                environment.extend(profile.profile_entries());
-                let auth = match profile.keychain_config() {
+        {
+            let entries = profile.profile_entries();
+            let available = adapter_available(runner, account_home, binary, &entries);
+            any_profile_binary |= available;
+            let auth = if !available {
+                AgentAuth::Unknown
+            } else {
+                match profile.keychain_config() {
                     Some(config) if unlock_for_probe(runner, &config) => {
-                        // A keychain-backed profile applies to both agent
-                        // probes. The version is not exposed per profile,
-                        // but it still needs to run in the unlocked session.
-                        let _ = run_version(runner, &binary, environment.clone());
-                        run_auth(runner, &binary, &auth_probe, environment)
+                        let _ = run_version_in_shell(runner, account_home, binary, &entries);
+                        run_auth_in_shell(runner, account_home, binary, &auth_probe, &entries)
                     }
                     Some(_) => AgentAuth::UnknownWithReason(crate::keychain::UNLOCK_FAILED_REASON),
-                    None => run_auth(runner, &binary, &auth_probe, environment),
-                };
-                (profile.profile_name().to_owned(), auth)
-            })
-            .collect();
+                    None => run_auth_in_shell(runner, account_home, binary, &auth_probe, &entries),
+                }
+            };
+            auth_by_profile.push((profile.profile_name().to_owned(), auth));
+        }
+        if !base_available && !any_profile_binary {
+            continue;
+        }
+        let version = if base_available {
+            run_version_in_shell(runner, account_home, binary, &[])
+        } else {
+            None
+        };
+        let auth = if base_available {
+            run_auth_in_shell(runner, account_home, binary, &auth_probe, &[])
+        } else {
+            AgentAuth::Unknown
+        };
         agents.push(AgentProbe {
             name: agent_name(kind).to_owned(),
             version,
@@ -519,82 +528,52 @@ fn agent_name(kind: AgentKind) -> &'static str {
     }
 }
 
-fn resolve_binary(runner: &dyn ProcessRunner, binary: &str) -> Option<OsString> {
-    let result = run_process(
-        runner,
-        OsString::from("zsh"),
-        vec![
-            OsString::from("-lc"),
-            OsString::from(format!("command -v {binary}")),
-        ],
-        Vec::new(),
-    )?;
-    if !result.status.success() {
-        return None;
-    }
-    let path = String::from_utf8(result.stdout).ok()?;
-    let path = path.lines().find(|line| !line.trim().is_empty())?.trim();
-    if path.is_empty() || path.chars().any(char::is_control) {
-        return None;
-    }
-    Some(OsString::from(path))
-}
-
-/// The login shell's `PATH`, as the turn launcher would see it. `None` when
-/// the shell fails, times out, or reports something that is not a plain
-/// path list; callers then probe with the helper's own environment.
-fn login_path(runner: &dyn ProcessRunner) -> Option<OsString> {
-    let result = run_process(
-        runner,
-        OsString::from("zsh"),
-        vec![OsString::from("-lc"), OsString::from("printf %s \"$PATH\"")],
-        Vec::new(),
-    )?;
-    if !result.status.success() {
-        return None;
-    }
-    let path = String::from_utf8(result.stdout).ok()?;
-    let path = path.trim_end_matches(['\n', '\r']);
-    if path.is_empty()
-        || path.len() > PROBE_OUTPUT_LIMIT
-        || path
-            .chars()
-            .any(|character| character.is_control() || character == '\0')
-    {
-        return None;
-    }
-    Some(OsString::from(path))
-}
-
-fn run_version(
+fn adapter_available(
     runner: &dyn ProcessRunner,
-    binary: &OsString,
-    environment: Vec<(OsString, OsString)>,
+    account_home: &Path,
+    binary: &str,
+    profile_entries: &[(OsString, OsString)],
+) -> bool {
+    let shell = format!("command -v {binary}");
+    let request =
+        account_login_shell_request(account_home, profile_entries, &shell, probe_policy());
+    runner
+        .run(&request)
+        .ok()
+        .is_some_and(|result| result.status.success())
+}
+
+fn run_version_in_shell(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    binary: &str,
+    profile_entries: &[(OsString, OsString)],
 ) -> Option<String> {
-    let result = run_process(
-        runner,
-        binary.clone(),
-        vec![OsString::from("--version")],
-        environment,
-    )?;
+    let shell = render_prebind_shell(&[binary.to_owned(), "--version".to_owned()]).ok()?;
+    let request =
+        account_login_shell_request(account_home, profile_entries, &shell, probe_policy());
+    let result = runner.run(&request).ok()?;
     if !result.status.success() {
         return None;
     }
     parse_version(&result.stdout)
 }
 
-fn run_auth(
+fn run_auth_in_shell(
     runner: &dyn ProcessRunner,
-    binary: &OsString,
+    account_home: &Path,
+    binary: &str,
     probe: &AuthProbe,
-    environment: Vec<(OsString, OsString)>,
+    profile_entries: &[(OsString, OsString)],
 ) -> AgentAuth {
-    let Some(result) = run_process(
-        runner,
-        binary.clone(),
-        probe.args().iter().map(OsString::from).collect(),
-        environment,
-    ) else {
+    let mut argv = vec![binary.to_owned()];
+    argv.extend(probe.args().iter().map(|arg| (*arg).to_owned()));
+    let Ok(shell) = render_prebind_shell(&argv) else {
+        return AgentAuth::Unknown;
+    };
+    let request =
+        account_login_shell_request(account_home, profile_entries, &shell, probe_policy());
+    let Some(result) = runner.run(&request).ok() else {
         return AgentAuth::Unknown;
     };
     if !is_valid_utf8(&result.stdout) || !is_valid_utf8(&result.stderr) {
@@ -615,6 +594,32 @@ fn run_auth(
     }
 }
 
+fn probe_policy() -> ProcessPolicy {
+    ProcessPolicy {
+        stdout_limit: PROBE_OUTPUT_LIMIT,
+        stderr_limit: PROBE_OUTPUT_LIMIT,
+        deadline: PROBE_DEADLINE,
+    }
+}
+
+fn run_process(
+    runner: &dyn ProcessRunner,
+    program: OsString,
+    args: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+) -> Option<ProcessResult> {
+    let request = ProcessRequest {
+        program,
+        args,
+        environment,
+        environment_remove: Vec::new(),
+        stdin: None,
+        policy: probe_policy(),
+        isolate_parent_environment: false,
+    };
+    runner.run(&request).ok()
+}
+
 fn unlock_for_probe(
     runner: &dyn ProcessRunner,
     config: &crate::keychain::KeychainUnlockConfig,
@@ -633,27 +638,6 @@ fn unlock_for_probe(
         let _ = (runner, config);
         false
     }
-}
-
-fn run_process(
-    runner: &dyn ProcessRunner,
-    program: OsString,
-    args: Vec<OsString>,
-    environment: Vec<(OsString, OsString)>,
-) -> Option<ProcessResult> {
-    let request = ProcessRequest {
-        program,
-        args,
-        environment,
-        environment_remove: Vec::new(),
-        stdin: None,
-        policy: ProcessPolicy {
-            stdout_limit: PROBE_OUTPUT_LIMIT,
-            stderr_limit: PROBE_OUTPUT_LIMIT,
-            deadline: PROBE_DEADLINE,
-        },
-    };
-    runner.run(&request).ok()
 }
 
 fn is_valid_utf8(bytes: &[u8]) -> bool {

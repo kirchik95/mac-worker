@@ -331,6 +331,7 @@ impl<'a> Installer<'a> {
                 environment_remove: Vec::new(),
                 stdin: None,
                 policy: probe_policy(),
+                isolate_parent_environment: false,
             })
             .map_err(|error| PreflightError {
                 failure_kind: if matches!(error, crate::error::WorkerError::Io(_)) {

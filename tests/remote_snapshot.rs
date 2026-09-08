@@ -1483,6 +1483,7 @@ fn snapshot_verify_transport_uses_the_fixed_command_and_strict_response_dto() {
             environment_remove: Vec::new(),
             stdin: Some(verify_request_bytes()),
             policy,
+            isolate_parent_environment: false,
         }
     );
 

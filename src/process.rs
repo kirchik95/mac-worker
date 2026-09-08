@@ -25,6 +25,9 @@ pub struct ProcessRequest {
     pub environment_remove: Vec<OsString>,
     pub stdin: Option<Vec<u8>>,
     pub policy: ProcessPolicy,
+    /// When true, the runner clears inherited environment variables before
+    /// applying `environment`.
+    pub isolate_parent_environment: bool,
 }
 
 impl std::fmt::Debug for ProcessRequest {
@@ -37,6 +40,10 @@ impl std::fmt::Debug for ProcessRequest {
             .field("environment_remove_count", &self.environment_remove.len())
             .field("stdin_bytes", &self.stdin.as_ref().map(Vec::len))
             .field("policy", &self.policy)
+            .field(
+                "isolate_parent_environment",
+                &self.isolate_parent_environment,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -82,6 +89,9 @@ impl SystemProcessRunner {
         new_session: bool,
     ) -> Result<ProcessResult, WorkerError> {
         let mut command = Command::new(&request.program);
+        if request.isolate_parent_environment {
+            command.env_clear();
+        }
         command
             .args(&request.args)
             .envs(request.environment.iter().map(|(key, value)| (key, value)));

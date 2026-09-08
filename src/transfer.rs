@@ -577,6 +577,7 @@ impl<'a> RsyncTransport<'a> {
             environment_remove: vec!["LANGUAGE".into()],
             stdin: None,
             policy: RSYNC_POLICY,
+            isolate_parent_environment: false,
         };
         let result = self.runner.run(&request).map_err(map_rsync_failure)?;
         if result.stdout.len() > RSYNC_POLICY.stdout_limit {
@@ -639,6 +640,7 @@ impl<'a> SshJsonTransport<'a> {
             environment_remove: Vec::new(),
             stdin: Some(stdin),
             policy,
+            isolate_parent_environment: false,
         };
         let result = self.runner.run(&request).map_err(map_control_failure)?;
         if !result.status.success() {

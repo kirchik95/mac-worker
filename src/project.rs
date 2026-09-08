@@ -238,6 +238,7 @@ impl<'a> ProjectInspector<'a> {
                 stderr_limit: GIT_OUTPUT_LIMIT,
                 deadline: GIT_DEADLINE,
             },
+            isolate_parent_environment: false,
         };
         self.runner.run(&request).map_err(|error| {
             project_error(

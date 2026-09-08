@@ -51,25 +51,28 @@ impl ProcessRunner for RecordingRunner {
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        let stdout = match (program.as_ref(), args.as_slice()) {
-            ("zsh", [shell, command]) if shell == "-lc" && command == "command -v codex" => {
-                b"/opt/tools/codex\n".to_vec()
-            }
-            ("zsh", [shell, command]) if shell == "-lc" && command.starts_with("command -v ") => {
-                Vec::new()
-            }
-            (path, [version]) if path.ends_with("/codex") && version == "--version" => {
-                b"codex-cli 0.152.1\n".to_vec()
-            }
-            (path, [login, status])
-                if path.ends_with("/codex") && login == "login" && status == "status" =>
-            {
-                if request.environment.iter().any(|(_, value)| value == SECRET) {
-                    b"Logged in using ChatGPT\n".to_vec()
+        if program == "/bin/zsh" && args.first().map(String::as_str) == Some("-lc") {
+            let shell = args.last().map(String::as_str).unwrap_or_default();
+            if shell.starts_with("command -v ") {
+                let binary = shell.strip_prefix("command -v ").unwrap_or_default();
+                let stdout = if binary == "codex" {
+                    b"/opt/tools/codex\n".to_vec()
                 } else {
-                    b"Not logged in\n".to_vec()
-                }
+                    Vec::new()
+                };
+                let success = binary == "codex";
+                return Ok(ProcessResult {
+                    status: exit_status(if success { 0 } else { 1 }),
+                    stdout,
+                    stderr: Vec::new(),
+                });
             }
+            if shell.starts_with("exec ") {
+                return Ok(self.exec_command(request, shell));
+            }
+        }
+
+        let stdout = match (program.as_ref(), args.as_slice()) {
             ("zsh", [shell, command])
                 if shell == "-lc" && command == "git config --get user.name" =>
             {
@@ -90,16 +93,45 @@ impl ProcessRunner for RecordingRunner {
             ("/usr/bin/ssh", _) => Vec::new(),
             _ => Vec::new(),
         };
-        let success = !(program == "zsh"
-            && args
-                .get(1)
-                .is_some_and(|command| command.starts_with("command -v "))
-            && args.get(1) != Some(&"command -v codex".to_owned()));
         Ok(ProcessResult {
-            status: exit_status(if success { 0 } else { 1 }),
+            status: exit_status(0),
             stdout,
             stderr: Vec::new(),
         })
+    }
+}
+
+impl RecordingRunner {
+    fn exec_command(&self, request: &ProcessRequest, shell: &str) -> ProcessResult {
+        let shell = shell.strip_prefix("exec ").unwrap_or(shell);
+        let mut parts = Vec::new();
+        for token in shell.split_whitespace() {
+            parts.push(token.trim_matches('\''));
+        }
+        match parts.as_slice() {
+            ["codex", "--version"] => ProcessResult {
+                status: exit_status(0),
+                stdout: b"codex-cli 0.152.1\n".to_vec(),
+                stderr: Vec::new(),
+            },
+            ["codex", "login", "status"] => {
+                let authenticated = request.environment.iter().any(|(_, value)| value == SECRET);
+                ProcessResult {
+                    status: exit_status(0),
+                    stdout: if authenticated {
+                        b"Logged in using ChatGPT\n".to_vec()
+                    } else {
+                        b"Not logged in\n".to_vec()
+                    },
+                    stderr: Vec::new(),
+                }
+            }
+            _ => ProcessResult {
+                status: exit_status(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        }
     }
 }
 
@@ -451,6 +483,6 @@ fn refresh_uses_the_runtime_home_without_loading_inventory() {
         runner
             .requests()
             .iter()
-            .any(|request| request.program == OsStr::new("zsh"))
+            .any(|request| request.program == OsStr::new("/bin/zsh"))
     );
 }

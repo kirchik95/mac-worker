@@ -1533,6 +1533,7 @@ fn git_request<const N: usize>(path: &Path, args: [&str; N]) -> ProcessRequest {
             stderr_limit: GC_GIT_OUTPUT_LIMIT,
             deadline: GC_GIT_DEADLINE,
         },
+        isolate_parent_environment: false,
     }
 }
 

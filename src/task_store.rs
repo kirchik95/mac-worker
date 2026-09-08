@@ -1778,6 +1778,7 @@ fn git_request(
             stderr_limit: GIT_STDERR_LIMIT,
             deadline: GIT_DEADLINE,
         },
+        isolate_parent_environment: false,
     }
 }
 

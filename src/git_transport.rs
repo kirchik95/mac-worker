@@ -466,6 +466,7 @@ fn git_request(
             stderr_limit: GIT_OUTPUT_LIMIT,
             deadline: GIT_DEADLINE,
         },
+        isolate_parent_environment: false,
     }
 }
 
@@ -496,6 +497,7 @@ fn origin_request(origin: String) -> ProcessRequest {
             stderr_limit: GIT_OUTPUT_LIMIT,
             deadline: ORIGIN_PREFLIGHT_DEADLINE,
         },
+        isolate_parent_environment: false,
     }
 }
 

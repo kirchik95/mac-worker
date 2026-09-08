@@ -21,6 +21,7 @@ use std::{
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
+    account_launch::account_environment_scaffold,
     error::WorkerError,
     host_store::{HostStore, JobDisposition, SupervisorGuard},
     inputs::RelativePath,
@@ -255,20 +256,8 @@ impl LaunchPlan {
                 "turn launches require a shell command",
             ));
         };
-        let mut env = vec![
-            ("HOME".into(), account_home.as_os_str().to_os_string()),
-            (
-                "USER".into(),
-                account_environment_value("USER", account_user(account_home)),
-            ),
-            (
-                "LOGNAME".into(),
-                account_environment_value("LOGNAME", account_user(account_home)),
-            ),
-            (
-                "SHELL".into(),
-                account_environment_value("SHELL", OsString::from("/bin/zsh")),
-            ),
+        let mut env = account_environment_scaffold(account_home);
+        env.extend([
             ("TMPDIR".into(), turn_dir.join("tmp").into_os_string()),
             (
                 "MAC_WORKER_TURN_DIR".into(),
@@ -296,7 +285,7 @@ impl LaunchPlan {
             ("GIT_AUTHOR_EMAIL".into(), identity.email().into()),
             ("GIT_COMMITTER_NAME".into(), identity.name().into()),
             ("GIT_COMMITTER_EMAIL".into(), identity.email().into()),
-        ];
+        ]);
         env.extend(profile.entries().iter().cloned());
         for (name, value) in &env {
             if name.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
@@ -373,18 +362,6 @@ fn batch_environment(
         ));
     }
     Ok(environment)
-}
-
-fn account_user(home: &Path) -> OsString {
-    home.file_name()
-        .map(OsString::from)
-        .unwrap_or_else(|| OsString::from("worker"))
-}
-
-fn account_environment_value(name: &str, fallback: OsString) -> OsString {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback)
 }
 
 pub trait ProcessInspector: Send + Sync {

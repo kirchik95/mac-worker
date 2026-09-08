@@ -1009,6 +1009,7 @@ impl<'a> TurnPublisher<'a> {
                     stderr_limit: 128 * 1024,
                     deadline: std::time::Duration::from_secs(15 * 60),
                 },
+                isolate_parent_environment: false,
             })
             .map_err(|error| turn_error("PUBLISH_FAILED", error.to_string()))?;
         if !result.status.success() {

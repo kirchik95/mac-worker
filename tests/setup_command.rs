@@ -1129,6 +1129,7 @@ fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv
             environment_remove: Vec::new(),
             stdin: None,
             policy: preflight_policy(),
+            isolate_parent_environment: false,
         }
     );
     assert_ssh_request_shape(&requests[1], control_policy());

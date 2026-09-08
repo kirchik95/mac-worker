@@ -509,6 +509,7 @@ impl<'a> InputSelector<'a> {
                 stderr_limit: GIT_OUTPUT_LIMIT,
                 deadline: GIT_DEADLINE,
             },
+            isolate_parent_environment: false,
         };
         let result = self.runner.run(&request).map_err(map_process_failure)?;
         if result.stdout.len() > GIT_OUTPUT_LIMIT || result.stderr.len() > GIT_OUTPUT_LIMIT {
@@ -557,6 +558,7 @@ impl<'a> InputSelector<'a> {
                 stderr_limit: GIT_OUTPUT_LIMIT,
                 deadline: GIT_DEADLINE,
             },
+            isolate_parent_environment: false,
         };
         let result = self.runner.run(&request).map_err(map_process_failure)?;
         if result.stdout.len() > GIT_OUTPUT_LIMIT || result.stderr.len() > GIT_OUTPUT_LIMIT {

@@ -1,4 +1,6 @@
-use std::{ffi::OsString, os::unix::process::ExitStatusExt, sync::Mutex, time::Duration};
+use std::{
+    ffi::OsString, os::unix::process::ExitStatusExt, path::Path, sync::Mutex, time::Duration,
+};
 
 use mac_worker::{
     agent_facts::{
@@ -11,6 +13,7 @@ use mac_worker::{
 
 const COLLECTED_AT: u64 = 100_000;
 const SECRET: &str = "PLANTED_PROFILE_SECRET";
+const ACCOUNT_HOME: &str = "/Users/worker";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scenario {
@@ -24,8 +27,6 @@ enum Scenario {
     LoginPathUnavailable,
     KeychainUnlockFailure,
 }
-
-const LOGIN_PATH: &str = "/opt/tools:/usr/local/bin:/usr/bin:/bin";
 
 struct FakeProcessRunner {
     scenario: Scenario,
@@ -71,29 +72,6 @@ impl ProcessRunner for FakeProcessRunner {
             ));
         }
 
-        if program == "zsh" && args == ["-lc", "printf %s \"$PATH\""] {
-            assert!(request.environment.is_empty());
-            return match self.scenario {
-                Scenario::LoginPathUnavailable => Ok(failure(b"zsh: login shell failed\n")),
-                _ => Ok(success(LOGIN_PATH.as_bytes())),
-            };
-        }
-        if program == "zsh" && args == ["-lc", "command -v codex"] {
-            return Ok(success(b"/opt/tools/codex\n"));
-        }
-        if program == "zsh" && args == ["-lc", "command -v claude"] {
-            return Ok(success(b"/opt/tools/claude\n"));
-        }
-        if program == "zsh" && args == ["-lc", "command -v cursor-agent"] {
-            return Ok(success(b"/opt/tools/cursor-agent\n"));
-        }
-        if program == "zsh" && args == ["-lc", "command -v opencode"] {
-            return match self.scenario {
-                Scenario::MissingOpenCode => Ok(failure(b"opencode: command not found\n")),
-                _ => Ok(success(b"/opt/tools/opencode\n")),
-            };
-        }
-
         if program == "zsh" && args == ["-lc", "git config --get user.name"] {
             return Ok(success(b"Submitter\n"));
         }
@@ -101,65 +79,92 @@ impl ProcessRunner for FakeProcessRunner {
             return Ok(success(b"submitter@example.test\n"));
         }
 
-        if program.ends_with("/codex") && args == ["--version"] {
-            return Ok(success(b"codex-cli 0.152.1\n"));
-        }
-        if program.ends_with("/codex") && args == ["login", "status"] {
-            if self.scenario == Scenario::NetworkCodex {
-                return Ok(success(b"Logged in\nnetwork error\n"));
+        if program == "/bin/zsh" && args.first().map(String::as_str) == Some("-lc") {
+            assert!(request.isolate_parent_environment);
+            let shell = args.last().map(String::as_str).unwrap_or_default();
+            if shell.starts_with("command -v ") {
+                if self.scenario == Scenario::LoginPathUnavailable {
+                    return Ok(failure(b"command not found\n"));
+                }
+                let binary = shell.strip_prefix("command -v ").unwrap_or_default();
+                if binary == "opencode" && self.scenario == Scenario::MissingOpenCode {
+                    return Ok(failure(b"opencode: command not found\n"));
+                }
+                return Ok(success(format!("/opt/tools/{binary}\n").as_bytes()));
             }
-            return Ok(success(b"Logged in using ChatGPT\n"));
-        }
-
-        if program.ends_with("/claude") && args == ["--version"] {
-            return Ok(success(b"2.1.252 (Claude Code)\n"));
-        }
-        if program.ends_with("/claude") && args == ["auth", "status"] {
-            if self.scenario == Scenario::LockedClaude {
-                return Ok(success(b"Error: Your macOS login keychain is locked.\n"));
+            if shell.starts_with("exec ") {
+                return self.exec_command(request, shell);
             }
-            if self.scenario == Scenario::ProfileError
-                && request.environment.iter().any(|(_, value)| value == SECRET)
-            {
-                return Err(WorkerError::Protocol(format!("provider rejected {SECRET}")));
-            }
-            return if has_environment(request, "CLAUDE_CODE_OAUTH_TOKEN") {
-                Ok(success(br#"{"loggedIn":true}"#))
-            } else {
-                Ok(success(br#"{"loggedIn":false}"#))
-            };
-        }
-
-        if program.ends_with("/cursor-agent") && args == ["--version"] {
-            return Ok(success(b"cursor-agent 1.3.0\n"));
-        }
-        if program.ends_with("/cursor-agent") && args == ["status"] {
-            if self.scenario == Scenario::InvalidUtf8Cursor {
-                return Ok(success(&[0xff, b'\n']));
-            }
-            return if has_environment(request, "CURSOR_API_KEY") {
-                Ok(success(b"Authenticated as test-user\n"))
-            } else {
-                Ok(success(b"Not authenticated\n"))
-            };
-        }
-
-        if program.ends_with("/opencode") && args == ["--version"] {
-            return Ok(success(b"opencode 1.0.0\n"));
-        }
-        if program.ends_with("/opencode") && args == ["auth", "list"] {
-            if self.scenario == Scenario::AmbiguousOpenCode {
-                return Ok(success(b"unexpected output\n"));
-            }
-            return if has_environment(request, "OPENAI_API_KEY") {
-                Ok(success(br#"[{"provider":"openai"}]"#))
-            } else {
-                Ok(success(b"[]"))
-            };
         }
 
         panic!("unexpected process request: {request:?}");
     }
+}
+
+impl FakeProcessRunner {
+    fn exec_command(
+        &self,
+        request: &ProcessRequest,
+        shell: &str,
+    ) -> Result<ProcessResult, WorkerError> {
+        let shell = shell.strip_prefix("exec ").unwrap_or(shell);
+        let mut parts = Vec::new();
+        for token in shell.split_whitespace() {
+            parts.push(token.trim_matches('\''));
+        }
+        match parts.as_slice() {
+            ["codex", "--version"] => Ok(success(b"codex-cli 0.152.1\n")),
+            ["codex", "login", "status"] => {
+                if self.scenario == Scenario::NetworkCodex {
+                    return Ok(success(b"Logged in\nnetwork error\n"));
+                }
+                Ok(success(b"Logged in using ChatGPT\n"))
+            }
+            ["claude", "--version"] => Ok(success(b"2.1.252 (Claude Code)\n")),
+            ["claude", "auth", "status"] => {
+                if self.scenario == Scenario::LockedClaude {
+                    return Ok(success(b"Error: Your macOS login keychain is locked.\n"));
+                }
+                if self.scenario == Scenario::ProfileError
+                    && request.environment.iter().any(|(_, value)| value == SECRET)
+                {
+                    return Err(WorkerError::Protocol(format!("provider rejected {SECRET}")));
+                }
+                if has_environment(request, "CLAUDE_CODE_OAUTH_TOKEN") {
+                    Ok(success(br#"{"loggedIn":true}"#))
+                } else {
+                    Ok(success(br#"{"loggedIn":false}"#))
+                }
+            }
+            ["cursor-agent", "--version"] => Ok(success(b"cursor-agent 1.3.0\n")),
+            ["cursor-agent", "status"] => {
+                if self.scenario == Scenario::InvalidUtf8Cursor {
+                    return Ok(success(&[0xff, b'\n']));
+                }
+                if has_environment(request, "CURSOR_API_KEY") {
+                    Ok(success(b"Authenticated as test-user\n"))
+                } else {
+                    Ok(success(b"Not authenticated\n"))
+                }
+            }
+            ["opencode", "--version"] => Ok(success(b"opencode 1.0.0\n")),
+            ["opencode", "auth", "list"] => {
+                if self.scenario == Scenario::AmbiguousOpenCode {
+                    return Ok(success(b"unexpected output\n"));
+                }
+                if has_environment(request, "OPENAI_API_KEY") {
+                    Ok(success(br#"[{"provider":"openai"}]"#))
+                } else {
+                    Ok(success(b"[]"))
+                }
+            }
+            _ => panic!("unexpected exec command: {shell:?}"),
+        }
+    }
+}
+
+fn account_home() -> &'static Path {
+    Path::new(ACCOUNT_HOME)
 }
 
 fn success(stdout: &[u8]) -> ProcessResult {
@@ -237,7 +242,7 @@ fn keychain_profiles() -> Vec<EnvProfile> {
 #[test]
 fn collects_all_adapters_with_profile_keyed_auth_and_git_identity() {
     let runner = FakeProcessRunner::new(Scenario::AllAgents);
-    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
 
     assert_eq!(facts.collected_at_millis(), COLLECTED_AT);
     assert!(facts.git_identity);
@@ -288,7 +293,7 @@ fn collects_all_adapters_with_profile_keyed_auth_and_git_identity() {
 #[test]
 fn checks_use_two_second_four_kib_bounds_and_never_apply_insecure_profiles() {
     let runner = FakeProcessRunner::new(Scenario::AllAgents);
-    let _ = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    let _ = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
     let requests = runner.requests();
 
     assert!(requests.iter().all(|request| {
@@ -303,52 +308,51 @@ fn checks_use_two_second_four_kib_bounds_and_never_apply_insecure_profiles() {
     let claude_auth = requests
         .iter()
         .filter(|request| {
-            request.program.to_string_lossy().ends_with("/claude")
-                && request.args == [OsString::from("auth"), OsString::from("status")]
+            request.program.to_string_lossy() == "/bin/zsh"
+                && request
+                    .args
+                    .last()
+                    .and_then(|arg| arg.to_str())
+                    .is_some_and(|shell| shell.contains("'claude' 'auth' 'status'"))
+                && !request
+                    .environment
+                    .iter()
+                    .any(|(key, _)| key == "CLAUDE_CODE_OAUTH_TOKEN")
         })
         .collect::<Vec<_>>();
-    assert_eq!(claude_auth.len(), 2);
-    assert_eq!(
-        claude_auth[0].environment,
-        vec![(OsString::from("PATH"), OsString::from(LOGIN_PATH))]
-    );
-    assert_eq!(
-        claude_auth[1]
-            .environment
-            .iter()
-            .find(|(key, _)| key == &OsString::from("CLAUDE_CODE_OAUTH_TOKEN"))
-            .map(|(_, value)| value.to_string_lossy().into_owned()),
-        Some(SECRET.into())
-    );
+    assert_eq!(claude_auth.len(), 1);
+    let claude_profile_auth = requests
+        .iter()
+        .filter(|request| {
+            request.program.to_string_lossy() == "/bin/zsh"
+                && request
+                    .args
+                    .last()
+                    .and_then(|arg| arg.to_str())
+                    .is_some_and(|shell| shell.contains("'claude' 'auth' 'status'"))
+                && request
+                    .environment
+                    .iter()
+                    .any(|(key, value)| key == "CLAUDE_CODE_OAUTH_TOKEN" && value == SECRET)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(claude_profile_auth.len(), 1);
     assert!(!requests.iter().any(|request| {
         request
             .environment
             .iter()
             .any(|(_, value)| value == "unsafe-value")
     }));
-    let codex_auth = requests
-        .iter()
-        .filter(|request| {
-            request.program.to_string_lossy().ends_with("/codex")
-                && request.args == [OsString::from("login"), OsString::from("status")]
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(codex_auth.len(), 2);
-    assert!(
-        codex_auth[1].environment.iter().any(|(key, value)| key
-            == &OsString::from("CLAUDE_CODE_OAUTH_TOKEN")
-            && value == SECRET)
-    );
 }
 
 #[test]
 fn missing_binaries_are_omitted_and_auth_errors_are_unknown_without_leaking_values() {
     let runner = FakeProcessRunner::new(Scenario::MissingOpenCode);
-    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
     assert!(!facts.agents.iter().any(|agent| agent.name == "opencode"));
 
     let runner = FakeProcessRunner::new(Scenario::LockedClaude);
-    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
     let claude = facts
         .agents
         .iter()
@@ -357,7 +361,7 @@ fn missing_binaries_are_omitted_and_auth_errors_are_unknown_without_leaking_valu
     assert_eq!(claude.auth, AgentAuth::Unknown);
 
     let runner = FakeProcessRunner::new(Scenario::ProfileError);
-    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
     let bytes = facts.canonical_bytes().unwrap();
     assert!(!String::from_utf8(bytes).unwrap().contains(SECRET));
     assert!(!format!("{:?}", profiles()[0]).contains(SECRET));
@@ -366,7 +370,7 @@ fn missing_binaries_are_omitted_and_auth_errors_are_unknown_without_leaking_valu
 #[test]
 fn ambiguous_network_and_non_utf8_auth_outputs_are_unknown() {
     let runner = FakeProcessRunner::new(Scenario::NetworkCodex);
-    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
     let codex = facts
         .agents
         .iter()
@@ -376,7 +380,7 @@ fn ambiguous_network_and_non_utf8_auth_outputs_are_unknown() {
     assert_eq!(codex.auth_by_profile[0].1, AgentAuth::Unknown);
 
     let runner = FakeProcessRunner::new(Scenario::AmbiguousOpenCode);
-    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
     let opencode = facts
         .agents
         .iter()
@@ -386,7 +390,7 @@ fn ambiguous_network_and_non_utf8_auth_outputs_are_unknown() {
     assert_eq!(opencode.auth_by_profile[0].1, AgentAuth::Unknown);
 
     let runner = FakeProcessRunner::new(Scenario::InvalidUtf8Cursor);
-    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
     let cursor = facts
         .agents
         .iter()
@@ -399,7 +403,7 @@ fn ambiguous_network_and_non_utf8_auth_outputs_are_unknown() {
 #[test]
 fn keychain_unlock_failures_are_unknown_with_a_safe_reason() {
     let runner = FakeProcessRunner::new(Scenario::KeychainUnlockFailure);
-    let facts = collect_agent_facts_at(&runner, &keychain_profiles(), COLLECTED_AT);
+    let facts = collect_agent_facts_at(&runner, account_home(), &keychain_profiles(), COLLECTED_AT);
 
     for agent in &facts.agents {
         assert_eq!(
@@ -492,7 +496,7 @@ fn profile_values_are_available_to_the_runner_but_not_to_dto_debug_output() {
     assert!(!debug.contains(SECRET));
 
     let runner = FakeProcessRunner::new(Scenario::AllAgents);
-    let _ = collect_agent_facts_at(&runner, &[profile], COLLECTED_AT);
+    let _ = collect_agent_facts_at(&runner, account_home(), &[profile], COLLECTED_AT);
     assert!(
         runner
             .requests()
@@ -502,61 +506,59 @@ fn profile_values_are_available_to_the_runner_but_not_to_dto_debug_output() {
 }
 
 #[test]
-fn version_and_auth_probes_run_with_the_login_shell_path_and_profiles_win() {
+fn account_login_shell_requests_use_isolation_and_profile_entries() {
     let runner = FakeProcessRunner::new(Scenario::AllAgents);
-    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
     assert_eq!(facts.agents.len(), 4);
 
     let requests = runner.requests();
     let launches = requests
         .iter()
-        .filter(|request| request.program.to_string_lossy().starts_with("/opt/tools/"))
+        .filter(|request| request.program.to_string_lossy() == "/bin/zsh")
         .collect::<Vec<_>>();
     assert!(!launches.is_empty());
     for request in &launches {
+        assert!(request.isolate_parent_environment);
         assert_eq!(
-            request.environment.first(),
-            Some(&(OsString::from("PATH"), OsString::from(LOGIN_PATH))),
-            "{request:?}"
+            request.args.first().map(OsString::as_os_str),
+            Some(OsString::from("-lc").as_os_str())
+        );
+        assert!(
+            request
+                .environment
+                .iter()
+                .any(|(name, value)| name == "HOME" && value == ACCOUNT_HOME)
         );
     }
 
-    // A profile that sets PATH is applied after the login PATH, so it wins.
     let path_profile = EnvProfile {
         name: "path-override".into(),
         secure: true,
         entries: vec![(OsString::from("PATH"), OsString::from("/profile/bin"))],
     };
     let runner = FakeProcessRunner::new(Scenario::AllAgents);
-    collect_agent_facts_at(&runner, &[path_profile], COLLECTED_AT);
+    collect_agent_facts_at(&runner, account_home(), &[path_profile], COLLECTED_AT);
     let overridden = runner
         .requests()
         .into_iter()
         .filter(|request| {
-            request.program.to_string_lossy().ends_with("/codex")
-                && request.args == [OsString::from("login"), OsString::from("status")]
+            request
+                .args
+                .last()
+                .and_then(|arg| arg.to_str())
+                .is_some_and(|shell| shell.contains("'codex' 'login' 'status'"))
+                && request
+                    .environment
+                    .iter()
+                    .any(|(key, value)| key == "PATH" && value == "/profile/bin")
         })
         .collect::<Vec<_>>();
-    assert_eq!(overridden.len(), 2);
-    assert_eq!(
-        overridden[1].environment,
-        vec![
-            (OsString::from("PATH"), OsString::from(LOGIN_PATH)),
-            (OsString::from("PATH"), OsString::from("/profile/bin")),
-        ]
-    );
+    assert_eq!(overridden.len(), 1);
 }
 
 #[test]
 fn an_unavailable_login_shell_path_falls_back_to_the_helper_environment() {
     let runner = FakeProcessRunner::new(Scenario::LoginPathUnavailable);
-    let facts = collect_agent_facts_at(&runner, &profiles(), COLLECTED_AT);
-    assert_eq!(facts.agents.len(), 4);
-    assert!(
-        runner
-            .requests()
-            .iter()
-            .filter(|request| request.program.to_string_lossy().starts_with("/opt/tools/"))
-            .all(|request| !has_environment(request, "PATH"))
-    );
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
+    assert!(facts.agents.is_empty());
 }

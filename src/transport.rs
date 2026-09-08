@@ -684,6 +684,7 @@ pub(crate) fn ssh_request(
         environment_remove: Vec::new(),
         stdin: None,
         policy,
+        isolate_parent_environment: false,
     }
 }
 

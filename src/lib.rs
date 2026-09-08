@@ -59,6 +59,7 @@ use transport::{SshTransport, WorkersService};
 use turn::TaskTurnRequest;
 use turn_runner::{DetachedRunnerExecutor, InlineRunnerExecutor, TurnRunner};
 
+pub mod account_launch;
 pub mod agent;
 pub mod agent_facts;
 pub mod agent_settings;

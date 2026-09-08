@@ -85,6 +85,7 @@ pub fn unlock_keychain(
             stderr_limit: UNLOCK_OUTPUT_LIMIT,
             deadline: UNLOCK_TIMEOUT,
         },
+        isolate_parent_environment: false,
     };
     let result = match runner.run_in_new_session(&request) {
         Ok(result) if result.status.success() => return Ok(()),

@@ -6,6 +6,7 @@ mod opencode;
 use std::{ffi::OsString, path::Path, time::Duration};
 
 use crate::{
+    account_launch::account_login_shell_request,
     error::WorkerError,
     process::{ProcessPolicy, ProcessRequest, ProcessResult},
 };
@@ -510,33 +511,16 @@ pub fn prebind_login_request(
         code: "TURN_COMMAND_INVALID",
         message: error.to_string(),
     })?;
-    let user = account_home
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_else(|| OsString::from("worker"));
-    let mut environment = vec![
-        (
-            OsString::from("HOME"),
-            account_home.as_os_str().to_os_string(),
-        ),
-        (OsString::from("USER"), user.clone()),
-        (OsString::from("LOGNAME"), user),
-        (OsString::from("SHELL"), OsString::from("/bin/zsh")),
-    ];
-    environment.extend(extra_environment.iter().cloned());
-    Ok(ProcessRequest {
-        program: OsString::from("/bin/zsh"),
-        // `args` never repeats the program: the runner supplies argv[0].
-        args: vec![OsString::from("-lc"), OsString::from(shell)],
-        environment,
-        environment_remove: Vec::new(),
-        stdin: None,
-        policy: ProcessPolicy {
+    Ok(account_login_shell_request(
+        account_home,
+        extra_environment,
+        &shell,
+        ProcessPolicy {
             stdout_limit: PREBIND_OUTPUT_LIMIT,
             stderr_limit: PREBIND_OUTPUT_LIMIT,
             deadline: PREBIND_DEADLINE,
         },
-    })
+    ))
 }
 
 pub fn parse_prebind_session_ref(stdout: &[u8]) -> Result<String, WorkerError> {

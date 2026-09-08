@@ -68,6 +68,7 @@ impl CommandExecutor for SystemCommandExecutor {
                 environment_remove: Vec::new(),
                 stdin: None,
                 policy: self.policy,
+                isolate_parent_environment: false,
             })
             .map_err(io::Error::other)?;
 
@@ -206,7 +207,7 @@ impl ProbeCollector {
     ) -> Result<AgentFacts, WorkerError> {
         HostStore::open(host_state_root)?;
         let profiles = load_env_profiles(home)?;
-        let facts = collect_agent_facts(runner, &profiles);
+        let facts = collect_agent_facts(runner, home, &profiles);
         write_cached_facts(host_state_root, &facts)?;
         Ok(facts)
     }

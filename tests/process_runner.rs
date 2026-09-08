@@ -1,8 +1,17 @@
-use std::time::{Duration, Instant};
-
 use mac_worker::{
+    agent::prebind_login_request,
+    agent_facts::AgentAuth,
     error::{ProcessError, ProcessStream, WorkerError},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
+};
+use std::time::{Duration, Instant};
+
+#[allow(dead_code)]
+mod support;
+
+use support::agent_launch_fixture::{
+    FixtureLayout, PARENT_ONLY, assert_subprocess_success, classify_cursor_stdout,
+    fixture_home_from_env, fixture_only_path, skip_unless_subtest,
 };
 
 fn policy(stdout_limit: usize, stderr_limit: usize, deadline: Duration) -> ProcessPolicy {
@@ -24,6 +33,7 @@ fn stdout_overflow_terminates_the_child_with_a_typed_error() {
         environment_remove: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_secs(2)),
+        isolate_parent_environment: false,
     };
     let started = Instant::now();
 
@@ -53,6 +63,7 @@ fn stderr_overflow_terminates_the_child_with_a_typed_error() {
         environment_remove: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_secs(2)),
+        isolate_parent_environment: false,
     };
 
     let error = SystemProcessRunner.run(&request).unwrap_err();
@@ -76,6 +87,7 @@ fn deadline_terminates_and_reaps_a_non_exiting_child() {
         environment_remove: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_millis(100)),
+        isolate_parent_environment: false,
     };
     let started = Instant::now();
 
@@ -100,6 +112,7 @@ fn deadline_terminates_descendants_that_hold_inherited_pipes_open() {
         environment_remove: Vec::new(),
         stdin: None,
         policy: policy(32, 32, Duration::from_millis(100)),
+        isolate_parent_environment: false,
     };
     let started = Instant::now();
 
@@ -124,6 +137,7 @@ fn normal_process_preserves_literal_argv() {
         environment_remove: Vec::new(),
         stdin: None,
         policy: policy(1024, 1024, Duration::from_secs(2)),
+        isolate_parent_environment: false,
     };
 
     let result = SystemProcessRunner.run(&request).unwrap();
@@ -145,6 +159,7 @@ fn requested_environment_reaches_the_child_as_literal_os_strings() {
         environment_remove: Vec::new(),
         stdin: None,
         policy: policy(1024, 1024, Duration::from_secs(2)),
+        isolate_parent_environment: false,
     };
 
     let result = SystemProcessRunner.run(&request).unwrap();
@@ -171,6 +186,7 @@ fn requested_environment_removals_do_not_clear_unrelated_xdg_variables() {
         environment_remove: vec!["GIT_DIR".into()],
         stdin: None,
         policy: policy(1024, 1024, Duration::from_secs(2)),
+        isolate_parent_environment: false,
     };
 
     let result = SystemProcessRunner.run(&request).unwrap();
@@ -190,6 +206,7 @@ fn normal_process_receives_the_complete_stdin_payload() {
         environment_remove: Vec::new(),
         stdin: Some(b"raw stdin bytes\n".to_vec()),
         policy: policy(1024, 1024, Duration::from_secs(2)),
+        isolate_parent_environment: false,
     };
 
     let result = SystemProcessRunner.run(&request).unwrap();
@@ -208,6 +225,7 @@ fn new_session_process_runs_without_a_tty() {
         environment_remove: Vec::new(),
         stdin: None,
         policy: policy(1024, 1024, Duration::from_secs(2)),
+        isolate_parent_environment: false,
     };
 
     let result = SystemProcessRunner.run_in_new_session(&request).unwrap();
@@ -233,6 +251,7 @@ fn nonzero_exit_remains_authoritative_after_stdin_broken_pipe() {
         environment_remove: Vec::new(),
         stdin: Some(vec![b'x'; 16 * 1024 * 1024]),
         policy: policy(1024, 1024, Duration::from_secs(2)),
+        isolate_parent_environment: false,
     };
 
     let result = SystemProcessRunner.run(&request).unwrap();
@@ -240,6 +259,42 @@ fn nonzero_exit_remains_authoritative_after_stdin_broken_pipe() {
     assert_eq!(result.status.code(), Some(23));
     assert!(result.stdout.is_empty());
     assert_eq!(result.stderr, b"rejected\n");
+}
+
+#[test]
+fn isolate_parent_environment_rejects_parent_only_credentials_wrapper() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = FixtureLayout::create(temp.path());
+    fixture.write_zprofile(&format!(
+        "export PATH=\"{}\"\n",
+        fixture_only_path(&fixture.home.join("bin"))
+    ));
+    fixture.install_home_cursor(PARENT_ONLY);
+    assert_subprocess_success(
+        "isolate_parent_environment_rejects_parent_only_credentials",
+        &[
+            ("FIXTURE_HOME", fixture.home.to_str().unwrap()),
+            ("CURSOR_API_KEY", PARENT_ONLY),
+            ("PATH", support::agent_launch_fixture::empty_base_path()),
+        ],
+        true,
+    );
+}
+
+#[test]
+fn isolate_parent_environment_rejects_parent_only_credentials() {
+    if skip_unless_subtest() {
+        return;
+    }
+    let home = fixture_home_from_env();
+    let request =
+        prebind_login_request(&["cursor-agent".into(), "status".into()], &home, &[]).unwrap();
+    assert!(request.isolate_parent_environment);
+    let result = SystemProcessRunner.run(&request).unwrap();
+    assert_eq!(
+        classify_cursor_stdout(&result.stdout),
+        AgentAuth::Unauthenticated
+    );
 }
 
 #[test]
@@ -253,6 +308,7 @@ fn successful_exit_does_not_hide_stdin_broken_pipe() {
         environment_remove: Vec::new(),
         stdin: Some(vec![b'x'; 16 * 1024 * 1024]),
         policy: policy(1024, 1024, Duration::from_secs(2)),
+        isolate_parent_environment: false,
     };
 
     let error = SystemProcessRunner.run(&request).unwrap_err();
