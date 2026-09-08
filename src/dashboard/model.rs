@@ -7,7 +7,7 @@ use serde::{
 };
 
 use crate::{
-    agent_facts::FACTS_TTL,
+    agent_facts::{FACTS_TTL, HerdrFacts},
     job::{JobId, LogChunk, LogStream, MAX_LOG_CHUNK_BYTES},
     task::{RunId, RunProgress, RunnerState, TaskId, TurnId},
     task_view::TaskListProjection,
@@ -104,6 +104,9 @@ pub struct DashboardAgentFacts {
     pub collected_at_millis: u64,
     pub freshness: AgentFactsFreshness,
     pub agents: Vec<DashboardAgent>,
+    /// The worker's herdr fact as `{ state, version }`, passed through
+    /// unchanged; `null` for records that predate it.  Never a capability.
+    pub herdr: Option<HerdrFacts>,
     #[serde(skip)]
     freshness_age_at_observation_millis: u64,
     #[serde(skip)]
@@ -116,11 +119,13 @@ impl DashboardAgentFacts {
         facts_age_millis: u64,
         observed_at_millis: u64,
         agents: Vec<DashboardAgent>,
+        herdr: Option<HerdrFacts>,
     ) -> Self {
         let mut facts = Self {
             collected_at_millis,
             freshness: AgentFactsFreshness::Current,
             agents,
+            herdr,
             freshness_age_at_observation_millis: facts_age_millis,
             freshness_observed_at_millis: observed_at_millis,
         };

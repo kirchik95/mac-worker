@@ -1,7 +1,13 @@
-use crate::agent_facts::AgentFacts;
+use crate::agent_facts::{AgentFacts, FACTS_TTL, HerdrFactState, HerdrFacts};
 
 pub const PROTOCOL_VERSION: u32 = 6;
 pub const SUPERVISION_VERSION: u32 = 3;
+
+/// Spec 5.3 and 12: the `doctor` and `setup` warning for a worker whose
+/// operator asked for the reporter while its herdr is not `available`.
+pub const HERDR_UNAVAILABLE_CODE: &str = "HERDR_UNAVAILABLE";
+pub const HERDR_UNAVAILABLE_MESSAGE: &str =
+    "herdr = true but the worker's herdr socket is not reachable; turns run without the reporter";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +41,26 @@ pub struct ProbeResponse {
     pub agent_facts: Option<AgentFacts>,
     #[serde(default)]
     pub facts_age_millis: Option<u64>,
+}
+
+impl ProbeResponse {
+    /// The herdr fact when it can be trusted: facts present, an age reported
+    /// within the TTL, and a record that carries the fact.  Otherwise `None`,
+    /// which every reader renders as `unknown`.
+    pub fn herdr_fact(&self) -> Option<&HerdrFacts> {
+        let facts = self.agent_facts.as_ref()?;
+        let age = self.facts_age_millis?;
+        if age > FACTS_TTL {
+            return None;
+        }
+        facts.herdr.as_ref()
+    }
+
+    /// Whether the worker's herdr answered `ping` at the last fresh refresh.
+    pub fn herdr_available(&self) -> bool {
+        self.herdr_fact()
+            .is_some_and(|herdr| herdr.state == HerdrFactState::Available)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -149,6 +175,9 @@ pub struct SetupWarning {
 pub enum SetupWarningCode {
     CleanupFailed,
     RollbackFailed,
+    /// `herdr = true` but the verification probe's herdr fact is not
+    /// `available`; the host is still installed.
+    HerdrUnavailable,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
