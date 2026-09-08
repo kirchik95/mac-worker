@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 mod support;
 
 use support::agent_launch_fixture::{
-    FixtureLayout, PARENT_ONLY, assert_subprocess_success, classify_cursor_stdout,
-    fixture_home_from_env, fixture_only_path, skip_unless_subtest,
+    DiagnosticProcessRunner, FixtureLayout, PARENT_ONLY, assert_subprocess_success,
+    classify_cursor_process_result, fixture_home_from_env, fixture_only_path, skip_unless_subtest,
 };
 
 fn policy(stdout_limit: usize, stderr_limit: usize, deadline: Duration) -> ProcessPolicy {
@@ -290,9 +290,9 @@ fn isolate_parent_environment_rejects_parent_only_credentials() {
     let request =
         prebind_login_request(&["cursor-agent".into(), "status".into()], &home, &[]).unwrap();
     assert!(request.isolate_parent_environment);
-    let result = SystemProcessRunner.run(&request).unwrap();
+    let result = DiagnosticProcessRunner.run(&request).unwrap();
     assert_eq!(
-        classify_cursor_stdout(&result.stdout),
+        classify_cursor_process_result(&result),
         AgentAuth::Unauthenticated
     );
 }

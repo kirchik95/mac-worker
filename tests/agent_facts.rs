@@ -24,13 +24,16 @@ enum Scenario {
     NetworkCodex,
     AmbiguousOpenCode,
     InvalidUtf8Cursor,
-    LoginPathUnavailable,
+    NoBinariesResolve,
     KeychainUnlockFailure,
+    KeychainOrdering,
 }
 
 struct FakeProcessRunner {
     scenario: Scenario,
     requests: Mutex<Vec<ProcessRequest>>,
+    events: Mutex<Vec<String>>,
+    keychain_unlocked: Mutex<bool>,
 }
 
 impl FakeProcessRunner {
@@ -38,6 +41,8 @@ impl FakeProcessRunner {
         Self {
             scenario,
             requests: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
+            keychain_unlocked: Mutex::new(false),
         }
     }
 
@@ -46,6 +51,31 @@ impl FakeProcessRunner {
             .lock()
             .expect("request mutex poisoned")
             .clone()
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events.lock().expect("events mutex poisoned").clone()
+    }
+
+    fn record_event(&self, event: &str) {
+        self.events
+            .lock()
+            .expect("events mutex poisoned")
+            .push(event.to_owned());
+    }
+
+    fn keychain_unlocked(&self) -> bool {
+        *self
+            .keychain_unlocked
+            .lock()
+            .expect("keychain mutex poisoned")
+    }
+
+    fn set_keychain_unlocked(&self) {
+        *self
+            .keychain_unlocked
+            .lock()
+            .expect("keychain mutex poisoned") = true;
     }
 }
 
@@ -64,12 +94,21 @@ impl ProcessRunner for FakeProcessRunner {
             .collect::<Vec<_>>();
 
         if program == "/usr/bin/security" {
-            assert_eq!(self.scenario, Scenario::KeychainUnlockFailure);
-            assert_eq!(request.environment, Vec::<(OsString, OsString)>::new());
-            assert_eq!(request.stdin, Some(b"profile-password\n".to_vec()));
-            return Ok(failure(
-                b"security: profile-password /tmp/profile.keychain-db\n",
-            ));
+            return match self.scenario {
+                Scenario::KeychainUnlockFailure => {
+                    assert_eq!(request.environment, Vec::<(OsString, OsString)>::new());
+                    assert_eq!(request.stdin, Some(b"profile-password\n".to_vec()));
+                    Ok(failure(
+                        b"security: profile-password /tmp/profile.keychain-db\n",
+                    ))
+                }
+                Scenario::KeychainOrdering => {
+                    self.record_event("keychain_unlock");
+                    self.set_keychain_unlocked();
+                    Ok(success(b""))
+                }
+                _ => panic!("unexpected security probe for scenario {:?}", self.scenario),
+            };
         }
 
         if program == "zsh" && args == ["-lc", "git config --get user.name"] {
@@ -83,10 +122,13 @@ impl ProcessRunner for FakeProcessRunner {
             assert!(request.isolate_parent_environment);
             let shell = args.last().map(String::as_str).unwrap_or_default();
             if shell.starts_with("command -v ") {
-                if self.scenario == Scenario::LoginPathUnavailable {
+                if self.scenario == Scenario::NoBinariesResolve {
                     return Ok(failure(b"command not found\n"));
                 }
                 let binary = shell.strip_prefix("command -v ").unwrap_or_default();
+                if self.scenario == Scenario::KeychainOrdering && binary != "claude" {
+                    return Ok(failure(b"command not found\n"));
+                }
                 if binary == "opencode" && self.scenario == Scenario::MissingOpenCode {
                     return Ok(failure(b"opencode: command not found\n"));
                 }
@@ -122,6 +164,17 @@ impl FakeProcessRunner {
             }
             ["claude", "--version"] => Ok(success(b"2.1.252 (Claude Code)\n")),
             ["claude", "auth", "status"] => {
+                if self.scenario == Scenario::KeychainOrdering {
+                    if has_environment(request, "CLAUDE_CODE_OAUTH_TOKEN") {
+                        self.record_event("claude_profile_auth");
+                        return Ok(success(br#"{"loggedIn":true}"#));
+                    }
+                    self.record_event("claude_base_auth");
+                    if !self.keychain_unlocked() {
+                        return Ok(success(b"Error: Your macOS login keychain is locked.\n"));
+                    }
+                    return Ok(success(br#"{"loggedIn":false}"#));
+                }
                 if self.scenario == Scenario::LockedClaude {
                     return Ok(success(b"Error: Your macOS login keychain is locked.\n"));
                 }
@@ -400,6 +453,67 @@ fn ambiguous_network_and_non_utf8_auth_outputs_are_unknown() {
     assert_eq!(cursor.auth_by_profile[0].1, AgentAuth::Unknown);
 }
 
+fn keychain_unlock_ordering_profiles() -> Vec<EnvProfile> {
+    vec![EnvProfile {
+        name: "keychain".into(),
+        secure: true,
+        entries: vec![
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), SECRET.into()),
+            (
+                "MAC_WORKER_KEYCHAIN_PASSWORD".into(),
+                "profile-password".into(),
+            ),
+            (
+                "MAC_WORKER_KEYCHAIN_PATH".into(),
+                "/tmp/profile.keychain-db".into(),
+            ),
+        ],
+    }]
+}
+
+#[test]
+fn base_auth_probe_runs_before_keychain_unlock_and_profile_auth() {
+    let runner = FakeProcessRunner::new(Scenario::KeychainOrdering);
+    let facts = collect_agent_facts_at(
+        &runner,
+        account_home(),
+        &keychain_unlock_ordering_profiles(),
+        COLLECTED_AT,
+    );
+    let events = runner.events();
+    let base = events
+        .iter()
+        .position(|event| event == "claude_base_auth")
+        .expect("base claude auth probe must be observed");
+    let profile = events
+        .iter()
+        .position(|event| event == "claude_profile_auth")
+        .expect("profile claude auth probe must be observed");
+    let unlock = events[..profile]
+        .iter()
+        .rposition(|event| event == "keychain_unlock")
+        .expect("keychain unlock must be observed before profile auth");
+    assert!(
+        base < unlock,
+        "base auth must precede the profile keychain unlock, saw {events:?}"
+    );
+    assert!(
+        unlock < profile,
+        "profile auth must follow keychain unlock, saw {events:?}"
+    );
+    let claude = facts
+        .agents
+        .iter()
+        .find(|agent| agent.name == "claude")
+        .expect("claude probe must be present");
+    assert_eq!(
+        claude.auth,
+        AgentAuth::Unknown,
+        "base auth must not observe an earlier keychain unlock"
+    );
+    assert_eq!(claude.auth_by_profile[0].1, AgentAuth::Authenticated);
+}
+
 #[test]
 fn keychain_unlock_failures_are_unknown_with_a_safe_reason() {
     let runner = FakeProcessRunner::new(Scenario::KeychainUnlockFailure);
@@ -557,8 +671,11 @@ fn account_login_shell_requests_use_isolation_and_profile_entries() {
 }
 
 #[test]
-fn an_unavailable_login_shell_path_falls_back_to_the_helper_environment() {
-    let runner = FakeProcessRunner::new(Scenario::LoginPathUnavailable);
+fn login_shell_command_resolution_failure_omits_all_agents() {
+    let runner = FakeProcessRunner::new(Scenario::NoBinariesResolve);
     let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
-    assert!(facts.agents.is_empty());
+    assert!(
+        facts.agents.is_empty(),
+        "when login-shell command -v fails for every adapter, no agent probes should be emitted"
+    );
 }

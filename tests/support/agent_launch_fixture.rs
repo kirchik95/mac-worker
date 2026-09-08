@@ -1,18 +1,23 @@
 #![allow(dead_code)]
 
 use std::{
+    cell::Cell,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    sync::{Mutex, MutexGuard, OnceLock},
+    time::Instant,
 };
 
 use mac_worker::{
-    agent::{prebind_login_request, render_prebind_shell},
+    agent::prebind_login_request,
     agent_facts::{AgentAuth, AgentFacts, AgentProbe},
+    error::WorkerError,
     host_store::HostStore,
     probe::ProbeCollector,
-    process::{ProcessRunner, SystemProcessRunner},
+    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    supervisor::LaunchPlan,
 };
 
 pub const PROFILE_GOOD: &str = "profile-good";
@@ -21,14 +26,30 @@ pub const LOGIN_GOOD: &str = "login-good";
 pub const PARENT_ONLY: &str = "parent-only";
 pub const PROFILE_NAME: &str = "fixture";
 
+const PROBE_POLICY: ProcessPolicy = ProcessPolicy {
+    stdout_limit: 4 * 1024,
+    stderr_limit: 4 * 1024,
+    deadline: std::time::Duration::from_secs(2),
+};
+
 /// Restrict login-shell PATH to synthetic fixture directories only.
 pub fn fixture_only_path(dir: &Path) -> String {
     dir.display().to_string()
 }
 
-pub fn empty_base_path() -> &'static str {
+pub fn system_only_path() -> &'static str {
     "/usr/bin:/bin"
 }
+
+pub fn empty_base_path() -> &'static str {
+    system_only_path()
+}
+
+/// Documented synthetic Git identity for the production `collect_git_identity` path.
+/// Production still uses ambient HOME for those probes; the real-shell fixture must not
+/// source the developer account's login files when refresh_facts runs through it.
+const FIXTURE_GIT_IDENTITY_NAME: &str = "Fixture User";
+const FIXTURE_GIT_IDENTITY_EMAIL: &str = "fixture@example.test";
 
 #[derive(Debug, Clone)]
 pub struct FixtureLayout {
@@ -58,8 +79,10 @@ impl FixtureLayout {
         fs::write(self.home.join(".zprofile"), body).unwrap();
     }
 
-    /// Hermetic login startup: keep profile-supplied PATH ahead of login-bin, otherwise
-    /// expose only the synthetic login-bin directory so installed providers stay ineligible.
+    /// Hermetic login startup: when profile supplies `profile_bin` on PATH, keep it ahead of
+    /// `login_bin`; otherwise expose only the synthetic login-bin directory. Appending the
+    /// zsh default PATH would expose installed provider CLIs, so this replaces rather than
+    /// augments system PATH.
     pub fn write_hermetic_login_zprofile(&self) {
         self.write_zprofile(&format!(
             "PROFILE_BIN=\"{}\"\n\
@@ -118,6 +141,87 @@ impl FixtureLayout {
     }
 }
 
+pub struct DiagnosticProcessRunner;
+
+fn is_git_identity_probe(request: &ProcessRequest) -> bool {
+    if request.isolate_parent_environment {
+        return false;
+    }
+    let program = request.program.to_string_lossy();
+    if program != "zsh" && program != "/bin/zsh" {
+        return false;
+    }
+    let Some(shell) = request.args.last().and_then(|arg| arg.to_str()) else {
+        return false;
+    };
+    request.args.first().map(|arg| arg.as_os_str()) == Some("-lc".as_ref())
+        && shell.starts_with("git config --get user.")
+}
+
+fn shell_command(request: &ProcessRequest) -> Option<&str> {
+    request.args.last().and_then(|arg| arg.to_str())
+}
+
+fn is_exec_probe(request: &ProcessRequest) -> bool {
+    request.program.to_string_lossy() == "/bin/zsh"
+        && shell_command(request).is_some_and(|shell| shell.starts_with("exec "))
+}
+
+fn synthetic_git_identity_result(shell: &str) -> ProcessResult {
+    let stdout = if shell.ends_with("user.name") {
+        format!("{FIXTURE_GIT_IDENTITY_NAME}\n")
+    } else if shell.ends_with("user.email") {
+        format!("{FIXTURE_GIT_IDENTITY_EMAIL}\n")
+    } else {
+        panic!("unexpected git identity probe shell command: {shell}");
+    };
+    ProcessResult {
+        status: exit_status(0),
+        stdout: stdout.into_bytes(),
+        stderr: Vec::new(),
+    }
+}
+
+fn assert_exec_probe_succeeded(request: &ProcessRequest, result: &ProcessResult, started: Instant) {
+    if result.status.success() {
+        return;
+    }
+    panic!(
+        "exec probe failed after {:?}: exit={:?} stdout={:?} stderr={:?}\nprogram={:?} args={:?}",
+        started.elapsed(),
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+        request.program,
+        request.args
+    );
+}
+
+impl ProcessRunner for DiagnosticProcessRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if is_git_identity_probe(request) {
+            return Ok(synthetic_git_identity_result(
+                request.args.last().unwrap().to_str().unwrap(),
+            ));
+        }
+        let started = Instant::now();
+        match SystemProcessRunner.run(request) {
+            Ok(result) => {
+                if is_exec_probe(request) {
+                    assert_exec_probe_succeeded(request, &result, started);
+                }
+                Ok(result)
+            }
+            Err(error) => panic!(
+                "shell probe failed after {:?}: {error:?}\nprogram={:?} args={:?}",
+                started.elapsed(),
+                request.program,
+                request.args
+            ),
+        }
+    }
+}
+
 pub fn is_agent_launch_subtest() -> bool {
     std::env::var("AGENT_LAUNCH_SUBTEST").ok().as_deref() == Some("1")
 }
@@ -130,11 +234,11 @@ pub fn fixture_home_from_env() -> PathBuf {
     PathBuf::from(std::env::var("FIXTURE_HOME").expect("FIXTURE_HOME must be set in subtest"))
 }
 
-pub fn refresh_cursor_facts(runner: &dyn ProcessRunner, home: &Path) -> AgentFacts {
+pub fn refresh_cursor_facts(home: &Path) -> AgentFacts {
     let _guard = shell_fixture_lock();
     let host_root = home.join("host-state");
     HostStore::open(&host_root).unwrap();
-    ProbeCollector::refresh_facts_at(&host_root, home, runner).unwrap()
+    ProbeCollector::refresh_facts_at(&host_root, home, &DiagnosticProcessRunner).unwrap()
 }
 
 pub fn cursor_probe(facts: &AgentFacts) -> Option<&AgentProbe> {
@@ -153,20 +257,8 @@ pub fn cursor_profile_auth(facts: &AgentFacts, profile_name: &str) -> AgentAuth 
         .unwrap_or(AgentAuth::Unknown)
 }
 
-pub fn cursor_auth_for_profile(
-    runner: &dyn ProcessRunner,
-    home: &Path,
-    profile_name: &str,
-) -> AgentAuth {
-    cursor_probe(&refresh_cursor_facts(runner, home))
-        .and_then(|agent| {
-            agent
-                .auth_by_profile
-                .iter()
-                .find(|(name, _)| name == profile_name)
-                .map(|(_, auth)| *auth)
-        })
-        .unwrap_or(AgentAuth::Unknown)
+pub fn cursor_auth_for_profile(home: &Path, profile_name: &str) -> AgentAuth {
+    cursor_profile_auth(&refresh_cursor_facts(home), profile_name)
 }
 
 pub fn prebind_status_auth(
@@ -174,26 +266,47 @@ pub fn prebind_status_auth(
     profile_entries: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> AgentAuth {
     let _guard = shell_fixture_lock();
-    let shell = render_prebind_shell(&["cursor-agent".into(), "status".into()]).unwrap();
     let request = prebind_login_request(
         &["cursor-agent".into(), "status".into()],
         home,
         profile_entries,
     )
     .unwrap();
-    assert_eq!(request.args.last().unwrap().to_str().unwrap(), shell);
-    let result = SystemProcessRunner.run(&request).unwrap();
-    classify_cursor_stdout(&result.stdout)
+    let result = DiagnosticProcessRunner.run(&request).unwrap();
+    classify_cursor_process_result(&result)
 }
 
-pub fn classify_cursor_stdout(stdout: &[u8]) -> AgentAuth {
+pub fn run_launch_plan_cursor_auth(plan: &LaunchPlan) -> AgentAuth {
+    let _guard = shell_fixture_lock();
+    let mut args = plan.args().to_vec();
+    if args.first().map(String::as_str) == Some(plan.program()) {
+        args.remove(0);
+    }
+    let request = ProcessRequest {
+        program: plan.program().into(),
+        args: args.into_iter().map(Into::into).collect(),
+        environment: plan.env().to_vec(),
+        environment_remove: Vec::new(),
+        stdin: None,
+        policy: PROBE_POLICY,
+        isolate_parent_environment: true,
+    };
+    let result = DiagnosticProcessRunner.run(&request).unwrap();
+    classify_cursor_process_result(&result)
+}
+
+pub fn classify_cursor_process_result(result: &ProcessResult) -> AgentAuth {
     use mac_worker::agent::{AgentKind, AuthProbeResult, adapter_for};
     let probe = adapter_for(AgentKind::Cursor).auth_probe();
-    match probe.classify(&mac_worker::process::ProcessResult {
-        status: exit_status(0),
-        stdout: stdout.to_vec(),
-        stderr: Vec::new(),
-    }) {
+    if !result.status.success() {
+        panic!(
+            "cursor status exited with {:?}; stdout={:?} stderr={:?}",
+            result.status.code(),
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    match probe.classify(result) {
         AuthProbeResult::Authenticated => AgentAuth::Authenticated,
         AuthProbeResult::Unauthenticated => AgentAuth::Unauthenticated,
         AuthProbeResult::Unknown | AuthProbeResult::UnknownWithReason(_) => AgentAuth::Unknown,
@@ -229,6 +342,7 @@ pub fn run_subprocess_test(
 }
 
 pub fn assert_subprocess_success(test_name: &str, env: &[(&str, &str)], env_clear: bool) {
+    let _guard = shell_fixture_lock();
     let (status, stdout, stderr) = run_subprocess_test(test_name, env, env_clear);
     assert!(
         status.success(),
@@ -236,7 +350,7 @@ pub fn assert_subprocess_success(test_name: &str, env: &[(&str, &str)], env_clea
     );
 }
 
-pub fn write_profile_entries(body: &str) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+pub fn parse_profile_entries(body: &str) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     body.lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -249,15 +363,42 @@ pub fn write_profile_entries(body: &str) -> Vec<(std::ffi::OsString, std::ffi::O
         .collect()
 }
 
+pub fn write_profile_entries(body: &str) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    parse_profile_entries(body)
+}
+
 fn exit_status(code: i32) -> ExitStatus {
     use std::os::unix::process::ExitStatusExt;
     ExitStatus::from_raw(code << 8)
 }
 
-fn shell_fixture_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
+struct ShellFixtureGuard {
+    _inner: Option<MutexGuard<'static, ()>>,
+}
+
+impl Drop for ShellFixtureGuard {
+    fn drop(&mut self) {
+        if self._inner.is_some() {
+            FIXTURE_LOCK_HELD.with(|held| held.set(false));
+        }
+    }
+}
+
+thread_local! {
+    static FIXTURE_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+fn shell_fixture_lock() -> ShellFixtureGuard {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    if FIXTURE_LOCK_HELD.with(|held| held.get()) {
+        return ShellFixtureGuard { _inner: None };
+    }
+    let guard = LOCK
+        .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    FIXTURE_LOCK_HELD.with(|held| held.set(true));
+    ShellFixtureGuard {
+        _inner: Some(guard),
+    }
 }

@@ -460,6 +460,16 @@ where
         let binary = adapter.binary();
         let auth_probe = adapter.auth_probe();
         let base_available = adapter_available(runner, account_home, binary, &[]);
+        let version = if base_available {
+            run_version_in_shell(runner, account_home, binary, &[])
+        } else {
+            None
+        };
+        let auth = if base_available {
+            run_auth_in_shell(runner, account_home, binary, &auth_probe, &[])
+        } else {
+            AgentAuth::Unknown
+        };
         let mut auth_by_profile = Vec::new();
         let mut any_profile_binary = false;
         for profile in profiles
@@ -486,16 +496,6 @@ where
         if !base_available && !any_profile_binary {
             continue;
         }
-        let version = if base_available {
-            run_version_in_shell(runner, account_home, binary, &[])
-        } else {
-            None
-        };
-        let auth = if base_available {
-            run_auth_in_shell(runner, account_home, binary, &auth_probe, &[])
-        } else {
-            AgentAuth::Unknown
-        };
         agents.push(AgentProbe {
             name: agent_name(kind).to_owned(),
             version,
