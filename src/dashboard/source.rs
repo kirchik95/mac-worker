@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    agent_facts::AgentFacts,
+    agent_facts::{AgentFacts, HerdrFacts},
     client_state::ClientStateStore,
     config::{Config, WorkerEntry},
     dashboard::{
@@ -482,11 +482,19 @@ fn project_agent_facts(
                 .collect(),
         })
         .collect();
+    let herdr = facts.herdr.as_ref().map(|herdr| HerdrFacts {
+        state: herdr.state,
+        version: herdr
+            .version
+            .as_deref()
+            .map(|version| boundary.text(version, 64)),
+    });
     DashboardAgentFacts::from_observation(
         facts.collected_at_millis(),
         facts_age_millis,
         observed_at_millis,
         agents,
+        herdr,
     )
 }
 

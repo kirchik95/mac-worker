@@ -251,6 +251,27 @@ fn render_agent_auth(auth: crate::agent_facts::AgentAuth) -> String {
     }
 }
 
+/// Spec 5.3: `available (0.9.0)`, `not installed`, `installed (0.9.0), no
+/// socket`, `installed (0.9.0), no response`, or `unknown` when the facts are
+/// stale, missing, or predate the fact.
+fn render_herdr_fact(probe: &crate::protocol::ProbeResponse) -> String {
+    use crate::agent_facts::HerdrFactState;
+
+    let Some(herdr) = probe.herdr_fact() else {
+        return "unknown".into();
+    };
+    let versioned = |label: &str| match &herdr.version {
+        Some(version) => format!("{label} ({version})"),
+        None => label.to_owned(),
+    };
+    match herdr.state {
+        HerdrFactState::Available => versioned("available"),
+        HerdrFactState::NotInstalled => "not installed".into(),
+        HerdrFactState::NoSocket => format!("{}, no socket", versioned("installed")),
+        HerdrFactState::NoResponse => format!("{}, no response", versioned("installed")),
+    }
+}
+
 fn render_doctor_worker_health(worker: &crate::protocol::WorkerHealth) -> String {
     if worker.status == crate::protocol::HealthStatus::Ready
         && worker
@@ -348,6 +369,7 @@ fn render_worker_health_with_labels(
                     }
                 }
             }
+            lines.push(format!("  herdr: {}", render_herdr_fact(probe)));
             if facts.env_profiles.is_empty() {
                 lines.push("  profiles: none".into());
             } else {
@@ -360,6 +382,8 @@ fn render_worker_health_with_labels(
                     ));
                 }
             }
+        } else {
+            lines.push(format!("  herdr: {}", render_herdr_fact(probe)));
         }
         lines.push(format!("  free disk bytes: {}", probe.free_disk_bytes));
         lines.push(format!("  total disk bytes: {}", probe.total_disk_bytes));
@@ -398,6 +422,9 @@ fn setup_warning_code(code: &crate::protocol::SetupWarningCode) -> &'static str 
     match code {
         crate::protocol::SetupWarningCode::CleanupFailed => "CLEANUP_FAILED",
         crate::protocol::SetupWarningCode::RollbackFailed => "ROLLBACK_FAILED",
+        crate::protocol::SetupWarningCode::HerdrUnavailable => {
+            crate::protocol::HERDR_UNAVAILABLE_CODE
+        }
     }
 }
 
