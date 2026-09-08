@@ -50,7 +50,7 @@ Task `001fa47a42ad`, Codex, pinned to `mini-1`, told to finish `needs_input` wit
 ## Not exercised
 
 - Item 6 (herdr stopped on a worker) was not run against the operator's live herdr server; the automated tests cover the `unavailable` path with an empty HOME, and the `HERDR_UNAVAILABLE` warning with a fake fact.
-- Whether the MacBook's herdr client showed the rows and played the notifications is the operator's observation, not something the worker can prove; the earlier spike had shown the same reported states arriving through the machine link and the mirror plugin.
+- What the MacBook shows is the operator's observation, not something the worker can prove. The operator confirmed both for the done task: the `task ee73c942913f · turn 1` tab appeared under `Mac #1` in the herdr sidebar, and the `task ee73c942913f: done` notification arrived on the laptop.
 
 ## Privacy (item 8)
 
