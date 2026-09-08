@@ -70,18 +70,14 @@ The Rust route continues to consume `AgentSettingsSaveRequest` and
 `DashboardSettingsSource::save` continues to return one
 `AgentDefaultSettings`. No task changes those Rust interfaces.
 
-### Pre-implementation log-finality decision gate
+### Resolved log-finality decision
 
-Before dispatching Task 2, read the spec's “Log-finality contract finding.”
-The dashboard response has no terminal byte target/EOF field, so no-progress
-cannot provide the same proof as `TerminalLogDrain`. The controller must choose:
-
-- accept stage 4's current-end behavior and honest copy, with no wire change; or
-- stop this plan before Task 2 and authorize a separate protocol/design change
-  carrying terminal per-stream byte targets or equivalent server-side proof.
-
-Do not infer approval from the roadmap, invent a field, or call no-progress
-“confirmed final EOF.” Tasks 3–4 must not be used to hide this decision.
+The controller accepts stage 4's current-end behavior with no wire change.
+Normal supervisor ordering publishes an ended turn after logs and terminal
+status are durable, but the dashboard response still has no terminal byte
+target/EOF field. Task 2 therefore reads all advancing available blocks and
+stops on the first successful no-progress response. It must not invent a field
+or call that observation “confirmed final EOF.”
 
 ### Task 1: Settings production-client contract and stale-response isolation
 
@@ -299,8 +295,8 @@ rerun the focused commands.
 
 ### Task 2: Multi-block completed logs and lifecycle-safe UTF-8
 
-**Decision prerequisite:** The controller has explicitly selected current-end
-semantics at the decision gate. Otherwise do not execute this task.
+**Decision:** Current-end semantics are approved for this task. Preserve the
+existing wire shape and report that no-progress is not runner-equivalent proof.
 
 **Files:**
 - Modify: `ui/src/hooks/useTurnLog.ts`
@@ -896,12 +892,13 @@ Write the final report with HEAD SHA and all outcomes. Do not push or deploy.
 - Settings header, singular response, peer preservation, fresh revision,
   browser-owned Origin, route guards, honest paired tests, and delayed
   worker/agent response isolation are covered by Task 1.
-- Log identity, multi-block completed draining, live preservation, independent
-  streams, one in-flight request, no-progress stop, completed retry, empty
+- Log identity, multi-block available-log reads for ended turns, live
+  preservation, independent streams, one in-flight request, no-progress stop,
+  ended-turn retry, empty
   success error clearing, UTF-8 flush, and stale cleanup isolation are covered
   by Task 2.
-- The concrete finality gap is stated in the spec and enforced as a decision
-  gate before Task 2; no task invents EOF.
+- The concrete finality gap and accepted current-end ruling are stated in the
+  spec and Task 2; no task invents EOF.
 - Last-good detail, success error clearing, task-ID cancellation, 2,000 ms
   cadence, all waiting IDs, six concurrency, ordering, empty/not-loaded,
   cancellation, and stale generation isolation are covered by Task 3.
@@ -939,6 +936,8 @@ Ruling: Validate the Settings boundary with paired production-client contract te
 
 Ruling: Regenerate and verify embedded UI assets once after the source tasks are reviewed — this keeps source review focused and avoids repeated minified bundle churn — cost: intermediate source commits are not release-ready; no integration occurs before the final asset-parity gate passes.
 
-The controller must record the log-finality decision from the pre-implementation
-gate before Task 2 is dispatched. No implementation begins from this planning
-commit.
+Ruling: Accept current-end log semantics for stage 4 without a wire change — normal supervisor ordering publishes ended turns after logs and terminal status are durable, while the dashboard exposes no final byte target — cost: a prematurely empty or malformed response cannot be distinguished from final EOF, so this UI is not runner-equivalent proof of log finality.
+
+The log-finality gate is resolved. This planning commit authorizes no
+implementation by itself; the controller dispatches the already specified
+tasks separately.

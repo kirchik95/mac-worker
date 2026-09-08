@@ -180,11 +180,13 @@ the stopping point “read to the current end,” not “confirmed final EOF.”
 existing panel statement “nothing more will arrive” must be replaced with
 honest wording.
 
-This design does not silently add an EOF field. If controller acceptance
-requires the same proven finality as runner logs, implementation must pause and
-authorize a separate wire change exposing terminal per-stream byte targets
-bound to the selected turn (or an equivalent server-side drained response).
-Without that decision, stage 4 proceeds with current-end semantics only.
+This design does not silently add an EOF field. The controller accepts
+current-end semantics for stage 4 based on the normal supervisor ordering
+above. Implementation reads all advancing available blocks and stops at the
+first successful no-progress response; it does not describe that observation
+as runner-equivalent proof. A future requirement for proven finality would need
+a separate authorized wire design exposing terminal per-stream byte targets
+bound to the selected turn, or equivalent server-side proof.
 
 ## Detail recovery and waiting questions
 
@@ -293,9 +295,10 @@ Ruling: Validate the Settings boundary with paired production-client contract te
 
 Ruling: Regenerate and verify embedded UI assets once after the source tasks are reviewed — this keeps source review focused and avoids repeated minified bundle churn — cost: intermediate source commits are not release-ready; no integration occurs before the final asset-parity gate passes.
 
-Log-finality decision still required before Task 2 implementation: accept the
-current-end semantics above for stage 4, or separately authorize a wire contract
-that exposes provable terminal targets. The plan does not assume that approval.
+Ruling: Accept current-end log semantics for stage 4 without a wire change — normal supervisor ordering publishes ended turns after logs and terminal status are durable, while the dashboard exposes no final byte target — cost: a prematurely empty or malformed response cannot be distinguished from final EOF, so this UI is not runner-equivalent proof of log finality.
+
+The log-finality gate is resolved. Task 2 may implement the bounded available-log
+behavior above without changing the protocol.
 
 ## Non-goals
 
