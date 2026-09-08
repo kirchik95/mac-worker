@@ -798,6 +798,7 @@ impl TransferRepo {
                 added: 0,
                 deleted: selection.tracked_deletions.len(),
             };
+            let mut index_info = Vec::new();
             for entry in &selection.entries {
                 if entry.kind == SelectedInputKind::EmptyDirectory {
                     continue;
@@ -808,17 +809,24 @@ impl TransferRepo {
                     | crate::inputs::InputOrigin::IncludedIgnored => dirty.added += 1,
                 }
                 let (mode, oid) = self.hash_worktree_entry(runner, &source, &entry.path)?;
-                let cacheinfo = format!("{mode},{oid},{}", entry.path.as_str());
+                index_info.extend_from_slice(mode.as_bytes());
+                index_info.push(b' ');
+                index_info.extend_from_slice(oid.as_bytes());
+                index_info.push(b'\t');
+                index_info.extend_from_slice(entry.path.as_str().as_bytes());
+                index_info.push(0);
+            }
+            if !index_info.is_empty() {
                 self.transfer_git(
                     runner,
                     &[
                         OsString::from("update-index"),
                         OsString::from("--add"),
-                        OsString::from("--cacheinfo"),
-                        OsString::from(cacheinfo),
+                        OsString::from("-z"),
+                        OsString::from("--index-info"),
                     ],
                     Some(&scratch),
-                    None,
+                    Some(index_info),
                 )?;
             }
             let tree = parse_tree_id(&self.transfer_git(
@@ -829,7 +837,7 @@ impl TransferRepo {
             )?)?;
             Ok(CapturedSelection { tree, dirty })
         })();
-        let _ = scratch_dir.remove_owned_child(&index_name);
+        remove_scratch_index(&scratch_dir, &index_name);
         captured
     }
 
@@ -1486,6 +1494,21 @@ fn collect_names(
         }
     }
     Ok(())
+}
+
+fn remove_scratch_index(scratch_dir: &RootedDir, index_name: &str) {
+    let lock_name = format!("{index_name}.lock");
+    for name in [lock_name.as_str(), index_name] {
+        let _ = restore_and_remove_scratch_regular(scratch_dir, name);
+    }
+}
+
+fn restore_and_remove_scratch_regular(scratch_dir: &RootedDir, name: &str) -> io::Result<()> {
+    if !scratch_dir.entry_exists(name)? {
+        return Ok(());
+    }
+    scratch_dir.set_private_regular_mode(name, 0o600)?;
+    scratch_dir.remove_owned_regular(name)
 }
 
 fn base_ref(task_id: TaskId) -> String {

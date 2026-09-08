@@ -1,15 +1,20 @@
 mod support;
 
 use std::{
+    collections::BTreeMap,
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::{
+        fs::{PermissionsExt, symlink},
+        process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
+    process::ExitStatus,
     time::Duration,
 };
 
 use mac_worker::{
     error::WorkerError,
-    process::SystemProcessRunner,
+    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project::{ProjectContext, ProjectInspector},
     project_config::{
         ArtifactSettings, ProjectSettings, ResourceClass, SnapshotSettings, TaskSettings,
@@ -908,4 +913,326 @@ fn concurrent_first_creation_yields_one_initialized_repository() {
             .join(format!("{}.git/scratch", repo_ids[0]))
             .is_dir()
     );
+}
+
+const SPACE_NAME: &str = "file with space.txt";
+const UNICODE_NAME: &str = "привет.bin";
+const TAB_NAME: &str = "name\twith\ttab.txt";
+const NEWLINE_NAME: &str = "name\nwith\nnewline.txt";
+const COMMA_NAME: &str = "name,with,comma.txt";
+const DASH_NAME: &str = "-leading-dash.txt";
+const BINARY_BYTES: &[u8] = b"\x00\xff\xfe binary \n\x00";
+
+struct FailOnWriteTree;
+
+impl ProcessRunner for FailOnWriteTree {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.args.iter().any(|argument| argument == "write-tree") {
+            return Ok(ProcessResult {
+                status: ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: b"injected write-tree failure\n".to_vec(),
+            });
+        }
+        SystemProcessRunner.run(request)
+    }
+}
+
+fn update_index_requests(runner: &RecordingRunner) -> Vec<ProcessRequest> {
+    runner
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request
+                .args
+                .iter()
+                .any(|argument| argument == "update-index")
+        })
+        .collect()
+}
+
+fn hash_object_count(runner: &RecordingRunner) -> usize {
+    runner
+        .requests()
+        .iter()
+        .filter(|request| {
+            request
+                .args
+                .iter()
+                .any(|argument| argument == "hash-object")
+        })
+        .count()
+}
+
+fn split_tab(record: &[u8]) -> (&[u8], &[u8]) {
+    let index = record
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .expect("records are meta TAB path");
+    (&record[..index], &record[index + 1..])
+}
+
+fn index_info_paths(stdin: &[u8]) -> Vec<String> {
+    stdin
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let (_, path) = split_tab(record);
+            String::from_utf8(path.to_vec()).expect("utf8 index path")
+        })
+        .collect()
+}
+
+fn scratch_index_residue(transfer: &TransferRepo) -> Vec<String> {
+    let scratch = transfer.path().join("scratch");
+    if !scratch.exists() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = fs::read_dir(&scratch)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".mac-worker-rooted-fs")
+        .collect();
+    names.sort();
+    names
+}
+
+fn transfer_tree_nul(git_dir: &Path, oid: &str) -> BTreeMap<String, (String, Vec<u8>)> {
+    let listing = git_in(git_dir, &["ls-tree", "-r", "-z", oid]);
+    assert!(listing.status.success(), "ls-tree -z must succeed");
+    let mut entries = BTreeMap::new();
+    for record in listing.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let (meta, path) = split_tab(record);
+        let meta = std::str::from_utf8(meta).expect("utf8 ls-tree meta");
+        let mut parts = meta.split_whitespace();
+        let mode = parts.next().expect("mode").to_owned();
+        let _kind = parts.next();
+        let object = parts.next().expect("oid");
+        let path = String::from_utf8(path.to_vec()).expect("utf8 ls-tree path");
+        let blob = git_in(git_dir, &["cat-file", "-p", object]);
+        assert!(blob.status.success(), "cat-file {object}");
+        entries.insert(path, (mode, blob.stdout));
+    }
+    entries
+}
+
+fn make_executable(path: &Path) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+fn repo_for_batched_index() -> Fixture {
+    let repo = repo_with_commits();
+    repo.write(SPACE_NAME, b"space-bytes\n");
+    repo.write(UNICODE_NAME, b"unicode-bytes\n");
+    repo.write(TAB_NAME, b"tab-bytes\n");
+    repo.write(NEWLINE_NAME, b"newline-bytes\n");
+    repo.write(COMMA_NAME, b"comma-bytes\n");
+    repo.write(DASH_NAME, b"dash-bytes\n");
+    repo.write("payload.bin", BINARY_BYTES);
+    repo.write("bin/tool.sh", b"#!/bin/sh\necho hi\n");
+    make_executable(&repo.path().join("bin/tool.sh"));
+    symlink("src/app.rs", repo.path().join("link-to-app")).unwrap();
+    repo.write("gone.txt", b"delete-me\n");
+    for index in 0..8 {
+        repo.write(
+            &format!("extra/{index:02}.txt"),
+            format!("extra-{index:02}\n").as_bytes(),
+        );
+    }
+    repo.commit_all("unusual and extra snapshot inputs");
+    fs::remove_file(repo.path().join("gone.txt")).expect("delete tracked file");
+    repo.write("fixtures/generated.txt", b"fixture\n");
+    repo
+}
+
+fn expected_batched_tree(repo: &Fixture) -> BTreeMap<String, (String, Vec<u8>)> {
+    let mut expected = BTreeMap::new();
+    let root = repo.path();
+    let mut insert_file = |path: &str, mode: &str| {
+        expected.insert(
+            path.to_owned(),
+            (mode.to_owned(), fs::read(root.join(path)).unwrap()),
+        );
+    };
+    insert_file("README.md", "100644");
+    insert_file("src/app.rs", "100644");
+    insert_file(SPACE_NAME, "100644");
+    insert_file(UNICODE_NAME, "100644");
+    insert_file(TAB_NAME, "100644");
+    insert_file(NEWLINE_NAME, "100644");
+    insert_file(COMMA_NAME, "100644");
+    insert_file(DASH_NAME, "100644");
+    insert_file("payload.bin", "100644");
+    insert_file("bin/tool.sh", "100755");
+    insert_file("fixtures/generated.txt", "100644");
+    for index in 0..8 {
+        insert_file(&format!("extra/{index:02}.txt"), "100644");
+    }
+    expected.insert(
+        "link-to-app".into(),
+        (
+            "120000".into(),
+            fs::read_link(root.join("link-to-app"))
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+        ),
+    );
+    expected
+}
+
+#[test]
+fn wip_capture_batches_index_updates_and_preserves_tree_bytes() {
+    // Break caught: per-file update-index --cacheinfo (or comma-split cacheinfo)
+    // dropping unusual names or emitting O(H) index processes.
+    let repo = repo_for_batched_index();
+    let expected = expected_batched_tree(&repo);
+    let hashed_entries = expected.len();
+    assert_eq!(hashed_entries, 20, "fixture H is the independent want");
+    let cache = cache_root();
+    let recorder = RecordingRunner::passthrough();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(
+            &recorder,
+            &repo.context(),
+            task_id(),
+            &settings_including(&["fixtures/**"]),
+            &identity(),
+        )
+        .unwrap();
+
+    let updates = update_index_requests(&recorder);
+    assert_eq!(
+        updates.len(),
+        2,
+        "at most one update-index per nonempty capture, not one per file; got {:?}",
+        updates
+            .iter()
+            .map(|request| request.args.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(hash_object_count(&recorder), hashed_entries * 2);
+    for request in &updates {
+        let args: Vec<&str> = request
+            .args
+            .iter()
+            .filter_map(|argument| argument.to_str())
+            .collect();
+        assert!(
+            args.contains(&"--index-info") && args.contains(&"-z") && args.contains(&"--add"),
+            "index batch must be NUL-framed --index-info: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|argument| *argument == "--cacheinfo"
+                || argument.contains("--cacheinfo")
+                || argument.contains("100644,")),
+            "per-file --cacheinfo must not remain: {args:?}"
+        );
+        let stdin = request.stdin.as_deref().expect("index-info stdin");
+        assert!(
+            stdin.ends_with(&[0]) || stdin.is_empty(),
+            "index-info payload must be NUL-framed"
+        );
+        let paths = index_info_paths(stdin);
+        for name in [
+            SPACE_NAME,
+            UNICODE_NAME,
+            TAB_NAME,
+            NEWLINE_NAME,
+            COMMA_NAME,
+            DASH_NAME,
+            "payload.bin",
+            "bin/tool.sh",
+            "link-to-app",
+            "fixtures/generated.txt",
+        ] {
+            assert!(
+                paths.iter().any(|path| path == name),
+                "index-info stdin missing {name:?} in {paths:?}"
+            );
+        }
+        assert!(!paths.iter().any(|path| path == "gone.txt"));
+        assert_eq!(paths.len(), hashed_entries);
+    }
+
+    let tree = transfer_tree_nul(transfer.path(), base.oid().as_str());
+    assert_eq!(tree, expected);
+    assert!(!tree.contains_key("gone.txt"));
+    assert_eq!(scratch_index_residue(&transfer), [] as [String; 0]);
+}
+
+#[test]
+fn wip_empty_selection_does_not_call_update_index() {
+    // Break caught: adding a vacuous update-index batch when read-tree --empty
+    // already produced the empty tree. H=0 must stay at zero index processes.
+    let repo = repo_with_commits();
+    fs::remove_file(repo.path().join("README.md")).unwrap();
+    fs::remove_file(repo.path().join("src/app.rs")).unwrap();
+    let cache = cache_root();
+    let recorder = RecordingRunner::passthrough();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(
+            &recorder,
+            &repo.context(),
+            task_id(),
+            &settings(),
+            &identity(),
+        )
+        .unwrap();
+    assert_eq!(update_index_requests(&recorder).len(), 0);
+    assert_eq!(hash_object_count(&recorder), 0);
+    assert!(transfer_tree_nul(transfer.path(), base.oid().as_str()).is_empty());
+    assert_eq!(scratch_index_residue(&transfer), [] as [String; 0]);
+}
+
+#[test]
+fn wip_capture_failure_removes_owned_scratch_index() {
+    // Break caught: leaving GIT_INDEX_FILE scratch bytes after a transfer Git error.
+    let repo = repo_with_commits();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let error = transfer
+        .build_wip_base(
+            &FailOnWriteTree,
+            &repo.context(),
+            task_id(),
+            &settings(),
+            &identity(),
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "BASE_UNAVAILABLE");
+    assert_eq!(scratch_index_residue(&transfer), [] as [String; 0]);
+    assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{}", task_id())));
+}
+
+#[test]
+fn unusual_name_mutation_between_captures_is_still_snapshot_changed() {
+    // Break caught: batched index-info reuse skipping the second full capture.
+    let repo = repo_for_batched_index();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let error = transfer
+        .build_wip_base_with_hook(
+            &runner(),
+            &repo.context(),
+            task_id(),
+            &settings_including(&["fixtures/**"]),
+            &identity(),
+            &|| {
+                repo.write(COMMA_NAME, b"comma-bytes-mutated\n");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "SNAPSHOT_CHANGED");
+    assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{}", task_id())));
+    assert_eq!(scratch_index_residue(&transfer), [] as [String; 0]);
 }
