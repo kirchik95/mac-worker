@@ -1009,6 +1009,17 @@ fn follower_write_error_detaches_runner_and_completes_remote_turn() {
 fn runner_refreshes_stale_agent_facts_before_claiming() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
     let fixture = AcceptedThenTerminalFixture::new();
+    // Query time is captured before the turn. This test proves the runner
+    // published refreshed capabilities, not that the whole Git turn finished
+    // inside the 2s admission TTL. cached_admission clamps now to observed_at,
+    // so a slightly early query still reads the published record at age 0.
+    // Submit's first probe is TTL-fresh but still Unauthenticated on the
+    // secure profile, so it cannot emit agent:codex@secure; only the
+    // post-refresh probe (facts_fresh) publishes that capability.
+    let query_now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let outcome = fixture.run(&mut Vec::new()).unwrap();
 
     assert_eq!(outcome.status().state(), TaskState::Closed);
@@ -1019,13 +1030,9 @@ fn runner_refreshes_stale_agent_facts_before_claiming() {
             .iter()
             .any(|arg| arg == HostOperation::RefreshFacts.command())
     }));
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
     let cached = fixture
         .state
-        .admission_observation("mini-1", now, || {
+        .admission_observation("mini-1", query_now, || {
             Err(mac_worker::error::WorkerError::Protocol(
                 "refreshed facts were not cached".into(),
             ))
