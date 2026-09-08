@@ -160,11 +160,13 @@ worker task submit --agent cursor --env-profile agents --wait --prompt "Create S
 
 mac-worker runs agent probes, prebind checks and turns through the worker account's login shell (`/bin/zsh -lc`), not a direct binary exec with a captured PATH. The effective environment is built in this order:
 
-1. Account scaffold (`HOME`, `USER`, `LOGNAME`, `SHELL`) for the worker account home used by the request.
+1. Account scaffold for the worker account home used by the request: `HOME` is set to that supplied account home. `USER`, `LOGNAME`, and `SHELL` follow the same turn semantics as task launches—the mac-worker daemon's non-empty ambient values when present, otherwise the account-home directory name for `USER`/`LOGNAME` and `/bin/zsh` for `SHELL`.
 2. Secure profile entries selected for the task or probe, when present.
 3. Login startup files such as `~/.zprofile`, which may override earlier values including `PATH` and agent credentials.
 
 Profile variables are applied before login startup runs, but login startup wins on conflicts. If `~/.zprofile` exports a different `CURSOR_API_KEY` or replaces `PATH`, facts, prebind and turns all observe that post-login value. Put durable PATH and credential setup in the login-shell configuration the worker account actually uses over SSH, and treat profile files as explicit overrides only when you intend them to apply before login startup.
+
+Keep the worker account's login startup silent on stdout and stderr, including in `~/.zprofile` and `~/.zshenv`. Login files run before the agent binary, so anything they print is included in the bounded version and auth probe output that mac-worker classifies. Extra lines can make a valid credential report as `Unknown` during `worker init` or refresh—for example when status output is no longer a single recognised line, when a warning contains a scanned error keyword, or when login output pushes the combined streams past the 4 KiB probe limit. mac-worker does not strip or rewrite that output; fixing chatty login files is an operator configuration change.
 
 Account-bound launches clear the parent process environment before applying the scaffold and profile entries, so credentials present only in the laptop shell or SSH client are not inherited. Ordinary non-isolated process launches still inherit the parent environment.
 
