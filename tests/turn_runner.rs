@@ -896,6 +896,33 @@ fn add_second_worker(fixture: &mut AcceptedThenTerminalFixture, first: bool) {
     fixture.config.workers.insert(usize::from(!first), worker);
 }
 
+#[test]
+fn detached_runner_starts_on_its_ready_pin_without_probing_other_workers() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture = AcceptedThenTerminalFixture::new();
+    add_second_worker(&mut fixture, false);
+    let runner = AdmissionFailureRunner {
+        inner: &fixture.runner,
+        ssh: "mac2",
+        failure: AdmissionFailure::Probe,
+        failed_worker_requests: Mutex::new(Vec::new()),
+    };
+    let outcome = TurnRunner::new(
+        &runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run_detached(fixture.task_id, fixture.turn_id)
+    .unwrap();
+    assert_remote_turn_completed(&fixture, &outcome);
+    assert!(
+        runner.failed_worker_requests.lock().unwrap().is_empty(),
+        "a ready pinned turn must not wait on unrelated SSH probes"
+    );
+}
+
 struct FixedTaskExecutor(ProcessIdentity);
 impl RunnerExecutor for FixedTaskExecutor {
     fn start(

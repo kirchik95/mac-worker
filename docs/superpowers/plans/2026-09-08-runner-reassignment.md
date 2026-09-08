@@ -62,7 +62,7 @@ cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-tar
 - [x] Review the complete diff against the acceptance contracts; address blocking findings.
 - [x] Commit the verified stage separately and update the root roadmap with actual results.
 
-## Verification result — 2026-09-08
+## Main implementation verification — `b68aff9`, 2026-09-08
 
 - Final focused run: 15 queue-reassignment tests, 8 private-context tests and 41 turn-runner tests passed (64 total). Existing conversation and scheduler suites also passed in the complete run.
 - Final `cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-target --all-targets`: exit 0; the harness summaries report 1,551 passed, 0 failed, 0 ignored across 61 test binaries (64 summaries including nested harnesses).
@@ -70,3 +70,9 @@ cargo test --locked --offline --target-dir /private/tmp/mac-worker-admission-tar
 - Independent review against `9a893bd` identified and verified fixes for legacy FIFO/context eligibility, context durability before queue publication, and unvalidated cwd inheritance. No remaining actionable findings in the scoped review.
 - Integration tests use actual local Git repositories and linked worktrees with simulated SSH/agent boundaries. The worker fleet and real coding agents were not run or changed.
 - Existing concurrent count/spawn/adopt startup accounting remains a separate reliability follow-up; the new reassignment transition starts no process.
+
+## Ready-pin fast-path follow-up
+
+A final regression reproduced unnecessary peer SSH probes before a ready pinned turn's own claim. The runner now first attempts its requested worker; after a miss it extends observations to remaining workers only when parked work exists. Existing observations are reused.
+
+The follow-up passed 140 tests across all five affected suites: `turn_runner` (42), `runner_dispatch` (15), `task_project_context` (8), `scheduler_queue` (64) and `task_conversation` (11). Final fmt, Clippy with `-D warnings`, diff checks and independent review passed. The complete all-targets result above belongs to `b68aff9`; after this narrow observation-order change the affected suites were rerun, without another complete all-targets run.

@@ -400,11 +400,7 @@ impl<'a> TurnRunner<'a> {
                         continue;
                     }
                     let may_yield = allow_reassignment && record.wait_for_capacity();
-                    let observations = self.observe_admission(if may_yield {
-                        &WorkerPreference::Automatic
-                    } else {
-                        entry.preference()
-                    })?;
+                    let mut observations = self.observe_admission(entry.preference())?;
                     let affinity = self
                         .client_state
                         .affinity_hints(entry.project_id(), entry.worktree_id())?;
@@ -440,7 +436,29 @@ impl<'a> TurnRunner<'a> {
                         return Err(capacity_busy());
                     }
                     if may_yield
-                        && let Some((next_task, claim)) =
+                        && self
+                            .client_state
+                            .queue_snapshot()?
+                            .entries()
+                            .iter()
+                            .any(|entry| matches!(entry.state(), QueueState::Parked))
+                    {
+                        // A ready pinned turn takes its fast path above. Only
+                        // a blocked donor with parked work needs observations
+                        // for the remaining fleet; keep its existing sample.
+                        for worker in &self.config.workers {
+                            if !observations
+                                .iter()
+                                .any(|observation| observation.worker_name() == worker.name)
+                            {
+                                observations.extend(self.observe_admission(
+                                    &WorkerPreference::Pinned {
+                                        worker: worker.name.clone(),
+                                    },
+                                )?);
+                            }
+                        }
+                        if let Some((next_task, claim)) =
                             self.client_state.claim_parked_for_waiting_runner(
                                 task_id,
                                 turn_id,
@@ -448,8 +466,9 @@ impl<'a> TurnRunner<'a> {
                                 &observations,
                                 now_millis()?,
                             )?
-                    {
-                        return Ok((next_task, claim.entry().job_id(), runner_owner));
+                        {
+                            return Ok((next_task, claim.entry().job_id(), runner_owner));
+                        }
                     }
                 }
             }
