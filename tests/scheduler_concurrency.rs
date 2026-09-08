@@ -361,12 +361,14 @@ fn production_run_paths(temp: &tempfile::TempDir) -> PathLayout {
 fn production_run_config() -> Config {
     Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![WorkerEntry {
             name: "mini-a".into(),
             ssh: "mini-a".into(),
             slots: 1,
             capabilities: Vec::new(),
             remote_binary: "~/.local/bin/worker".into(),
+            herdr: false,
         }],
     }
 }

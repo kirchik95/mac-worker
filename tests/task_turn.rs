@@ -1601,3 +1601,25 @@ fn cancelling_a_running_turn_hands_off_before_deadline_and_publishes_cancelled()
     .unwrap();
     assert_eq!(job_status.state(), JobState::Cancelled);
 }
+
+#[test]
+fn turn_section_carries_the_herdr_flag_only_when_set() {
+    let identity = GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap();
+    let plain = TurnSection::new(material("hello"), "a".repeat(64), identity.clone()).unwrap();
+    let plain_json = serde_json::to_string(&plain).unwrap();
+    assert!(!plain_json.contains("herdr_reporter"), "{plain_json}");
+    assert!(!plain.herdr_reporter());
+
+    let flagged = TurnSection::new(material("hello"), "a".repeat(64), identity)
+        .unwrap()
+        .with_herdr_reporter(true);
+    let json = serde_json::to_string(&flagged).unwrap();
+    assert!(json.ends_with(r#","herdr_reporter":true}"#), "{json}");
+    let back: TurnSection = serde_json::from_str(&json).unwrap();
+    assert!(back.herdr_reporter());
+    assert_eq!(back, flagged);
+
+    let old: TurnSection = serde_json::from_str(&plain_json).unwrap();
+    assert!(!old.herdr_reporter());
+    assert_eq!(old, plain);
+}

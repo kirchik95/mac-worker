@@ -10,7 +10,29 @@ const REMOTE_BINARY: &str = "~/.local/bin/worker";
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
     pub workers: Vec<WorkerEntry>,
+}
+
+/// Laptop-side notifications about finished turns.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationsConfig {
+    /// Tell the MacBook's herdr when a turn ends.  On by default because it
+    /// is a no-op when no herdr socket is reachable.
+    #[serde(default = "default_true")]
+    pub herdr: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self { herdr: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -23,6 +45,10 @@ pub struct WorkerEntry {
     pub capabilities: Vec<String>,
     #[serde(default = "default_remote_binary")]
     pub remote_binary: String,
+    /// Report this worker's turns to the herdr server running on it.  Off by
+    /// default: it creates tabs on the worker and needs herdr there.
+    #[serde(default)]
+    pub herdr: bool,
 }
 
 impl Config {

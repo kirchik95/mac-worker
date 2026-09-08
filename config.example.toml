@@ -1,8 +1,16 @@
 # Usually created for you by: worker init yourname@mini.local
 version = 1
 
+# Tell the herdr running on this laptop when a turn ends. On by default and a
+# no-op when no herdr socket is reachable.
+[notifications]
+herdr = true
+
 [[workers]]
 name = "mini-1"
 ssh = "yourname@mini.local"
 slots = 1
 capabilities = ["darwin-arm64"]
+# Show this worker's turns in its herdr sidebar. Needs a herdr server on the
+# worker; off by default.
+herdr = false

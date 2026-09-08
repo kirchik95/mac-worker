@@ -600,6 +600,7 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                         }],
                         git_identity: true,
                         collected_at_millis: if fresh { u64::MAX / 2 } else { 1 },
+                        herdr: None,
                     }),
                     facts_age_millis: Some(if fresh { 0 } else { FACTS_TTL + 1 }),
                 })
@@ -1962,6 +1963,7 @@ impl ProcessRunner for FetchFailingRunner {
                     env_profiles: Vec::new(),
                     git_identity: true,
                     collected_at_millis: u64::MAX / 2,
+                    herdr: None,
                 }),
                 facts_age_millis: Some(0),
             }),

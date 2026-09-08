@@ -321,6 +321,7 @@ fn queue_worker(name: &str) -> WorkerEntry {
         slots: 1,
         capabilities: Vec::new(),
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 
@@ -392,6 +393,7 @@ fn queue_rows_expose_advisory_blocking_reasons_from_cached_observations_only() {
     let fixture = open_queue();
     let config = Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![
             queue_worker("mini-a"),
             queue_worker("mini-b"),
@@ -520,6 +522,7 @@ fn queue_blocking_reason_without_cached_observations_is_no_eligible_worker() {
     let fixture = open_queue();
     let config = Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![queue_worker("mini-a")],
     };
     let entry = fixture
@@ -557,6 +560,7 @@ fn queue_blocking_reason_uses_pinned_policy_rejections_for_capabilities() {
     let fixture = open_queue();
     let config = Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![queue_worker("mini-a"), queue_worker("mini-b")],
     };
     cache_observation(&fixture.store, "mini-a", &[], 17);

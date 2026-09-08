@@ -910,6 +910,7 @@ fn typed_settings_transport_uses_fixed_remote_argv_and_json_stdin() {
         slots: 1,
         capabilities: Vec::new(),
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     };
     let actual = SshJsonTransport::new(&runner)
         .agent_settings_get(&worker)
@@ -949,6 +950,7 @@ fn typed_settings_transport_keeps_user_values_in_json_stdin() {
         slots: 1,
         capabilities: Vec::new(),
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     };
     let request = AgentSettingsSaveRequest {
         agent: "claude".into(),

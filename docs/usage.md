@@ -111,6 +111,23 @@ The dashboard is a loopback-only observer: workers with slot state and host load
 
 The interface is a React application in `ui/`, built with Tailwind and shadcn/ui and embedded into the binary at build time, so `cargo build` needs no JavaScript toolchain.
 
+## Configuration
+
+`~/.config/mac-worker/config.toml` is written by `worker init` and holds one `[[workers]]` block per Mac. Two optional keys concern herdr, the terminal workspace manager the pool can report into:
+
+```toml
+[notifications]
+herdr = true      # default true: notify this laptop's herdr when a turn ends; silent without a socket
+
+[[workers]]
+name = "mini-1"
+ssh = "yourname@mini.local"
+slots = 1
+herdr = false     # default false: show this worker's turns in its own herdr sidebar
+```
+
+The design behind both keys is in [the herdr reporter design](superpowers/specs/2026-09-08-herdr-reporter-design.md).
+
 ## What the pool will and will not do
 
 - A task worktree is isolation for your repository, not a security boundary: agent turns run with the worker account's full access. Only dispatch prompts you trust, on machines you own.

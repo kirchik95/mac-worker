@@ -5778,6 +5778,7 @@ fn matrix_worker() -> WorkerEntry {
         slots: 1,
         capabilities: vec!["darwin-arm64".into()],
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 

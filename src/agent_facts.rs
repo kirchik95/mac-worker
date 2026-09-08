@@ -339,6 +339,42 @@ pub struct AgentFacts {
     pub env_profiles: Vec<ProfileProbe>,
     pub git_identity: bool,
     pub collected_at_millis: u64,
+    /// Whether the worker's herdr can show turns; absent from facts written
+    /// before the herdr reporter existed.
+    pub herdr: Option<HerdrFacts>,
+}
+
+/// What `refresh-facts` learned about herdr on the worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HerdrFacts {
+    pub state: HerdrFactState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdrFactState {
+    /// A herdr binary, a socket, and an answer to `ping`.
+    Available,
+    /// No herdr binary on the controlled host paths.
+    NotInstalled,
+    /// A binary but no socket for the default session.
+    NoSocket,
+    /// A socket that did not answer `ping` in time.
+    NoResponse,
+}
+
+impl HerdrFacts {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(version) = &self.version
+            && (version.is_empty() || version.len() > 64 || version.chars().any(char::is_control))
+        {
+            return Err("herdr version is invalid".into());
+        }
+        Ok(())
+    }
 }
 
 impl AgentFacts {
@@ -374,6 +410,9 @@ impl AgentFacts {
                 return Err(format!("duplicate profile `{}`", profile.name));
             }
         }
+        if let Some(herdr) = &self.herdr {
+            herdr.validate()?;
+        }
         Ok(())
     }
 }
@@ -385,11 +424,15 @@ impl Serialize for AgentFacts {
         agents.sort_by(|left, right| left.name.cmp(&right.name));
         let mut profiles = self.env_profiles.clone();
         profiles.sort_by(|left, right| left.name.cmp(&right.name));
-        let mut record = serializer.serialize_struct("AgentFacts", 4)?;
+        let fields = if self.herdr.is_some() { 5 } else { 4 };
+        let mut record = serializer.serialize_struct("AgentFacts", fields)?;
         record.serialize_field("agents", &agents)?;
         record.serialize_field("env_profiles", &profiles)?;
         record.serialize_field("git_identity", &self.git_identity)?;
         record.serialize_field("collected_at_millis", &self.collected_at_millis)?;
+        if let Some(herdr) = &self.herdr {
+            record.serialize_field("herdr", herdr)?;
+        }
         record.end()
     }
 }
@@ -403,6 +446,8 @@ impl<'de> Deserialize<'de> for AgentFacts {
             env_profiles: Vec<ProfileProbe>,
             git_identity: bool,
             collected_at_millis: u64,
+            #[serde(default)]
+            herdr: Option<HerdrFacts>,
         }
 
         let wire: Wire = deserialize_unique_object(deserializer)?;
@@ -411,6 +456,7 @@ impl<'de> Deserialize<'de> for AgentFacts {
             env_profiles: wire.env_profiles,
             git_identity: wire.git_identity,
             collected_at_millis: wire.collected_at_millis,
+            herdr: wire.herdr,
         };
         facts.validate().map_err(de::Error::custom)?;
         Ok(facts)
@@ -509,6 +555,7 @@ where
         env_profiles,
         git_identity: collect_git_identity(runner),
         collected_at_millis,
+        herdr: None,
     }
 }
 

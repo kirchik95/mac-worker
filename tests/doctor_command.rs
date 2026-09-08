@@ -341,12 +341,14 @@ fn worker(name: &str, ssh: &str, capabilities: &[&str]) -> WorkerEntry {
         slots: 1,
         capabilities: capabilities.iter().map(|value| (*value).into()).collect(),
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 
 fn config(workers: Vec<WorkerEntry>) -> Config {
     Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers,
     }
 }

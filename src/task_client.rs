@@ -2462,6 +2462,7 @@ impl<'a> TaskClient<'a> {
             .map(|worker| {
                 let one = Config {
                     version: self.config.version,
+                    notifications: crate::config::NotificationsConfig::default(),
                     workers: vec![worker.clone()],
                 };
                 let cached = self.client_state.admission_observation(

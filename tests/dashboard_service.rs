@@ -1075,6 +1075,7 @@ fn worker_with_facts(collected_at_millis: u64, facts_age_millis: u64) -> ProbeWo
                 env_profiles: Vec::new(),
                 git_identity: false,
                 collected_at_millis,
+                herdr: None,
             }),
             facts_age_millis: Some(facts_age_millis),
         }),

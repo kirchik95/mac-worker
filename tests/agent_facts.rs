@@ -544,6 +544,7 @@ fn facts_are_stale_only_after_the_ttl_and_age_subtraction_is_saturating() {
         env_profiles: Vec::new(),
         git_identity: false,
         collected_at_millis: COLLECTED_AT,
+        herdr: None,
     };
     assert!(!facts.is_stale(COLLECTED_AT.saturating_sub(1)));
     assert!(!facts.is_stale(COLLECTED_AT + FACTS_TTL));
@@ -565,6 +566,7 @@ fn dto_json_is_canonical_and_rejects_unknown_or_duplicate_fields() {
         }],
         git_identity: true,
         collected_at_millis: COLLECTED_AT,
+        herdr: None,
     };
     let bytes = facts.canonical_bytes().unwrap();
     let parsed: AgentFacts = serde_json::from_slice(&bytes).unwrap();
@@ -677,5 +679,56 @@ fn login_shell_command_resolution_failure_omits_all_agents() {
     assert!(
         facts.agents.is_empty(),
         "when login-shell command -v fails for every adapter, no agent probes should be emitted"
+    );
+}
+
+#[test]
+fn herdr_facts_round_trip_and_stay_absent_for_records_that_predate_them() {
+    use mac_worker::agent_facts::{HerdrFactState, HerdrFacts};
+
+    let without = AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: false,
+        collected_at_millis: COLLECTED_AT,
+        herdr: None,
+    };
+    let bytes = without.canonical_bytes().unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("herdr"));
+    let back: AgentFacts = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(back, without);
+
+    for (state, tag) in [
+        (HerdrFactState::Available, "available"),
+        (HerdrFactState::NotInstalled, "not_installed"),
+        (HerdrFactState::NoSocket, "no_socket"),
+        (HerdrFactState::NoResponse, "no_response"),
+    ] {
+        let facts = AgentFacts {
+            herdr: Some(HerdrFacts {
+                state,
+                version: Some("0.9.0".into()),
+            }),
+            ..without.clone()
+        };
+        let json = String::from_utf8(facts.canonical_bytes().unwrap()).unwrap();
+        assert!(
+            json.contains(&format!(r#""herdr":{{"state":"{tag}","version":"0.9.0"}}"#)),
+            "{json}"
+        );
+        let back: AgentFacts = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, facts);
+    }
+
+    let bad = AgentFacts {
+        herdr: Some(HerdrFacts {
+            state: HerdrFactState::Available,
+            version: Some("0.9\u{7}".into()),
+        }),
+        ..without
+    };
+    assert!(
+        bad.canonical_bytes().is_err(),
+        "control characters never reach the record"
     );
 }

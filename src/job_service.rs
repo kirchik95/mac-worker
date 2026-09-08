@@ -552,7 +552,8 @@ impl<'a> JobService<'a> {
             meta.project_id(),
             meta.git_identity().clone(),
             request.origin_url().map(str::to_owned),
-        )?;
+        )?
+        .with_herdr_reporter(request.herdr_reporter());
         if let Some((job_meta, initial_status)) =
             self.read_repairable_turn_final(&submit, &lease, &section)?
         {

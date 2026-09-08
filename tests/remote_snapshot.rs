@@ -1446,6 +1446,7 @@ fn snapshot_verify_transport_uses_the_fixed_command_and_strict_response_dto() {
         slots: 1,
         capabilities: vec!["darwin-arm64".into()],
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     };
     let policy = ProcessPolicy {
         stdout_limit: 1024 * 1024,
@@ -1598,7 +1599,7 @@ fn hidden_snapshot_verify_failures_are_versioned() {
     assert_eq!(error.error().message(), "host request was invalid");
     assert_eq!(
         stdout,
-        br#"{"protocol_version":5,"error":{"code":"INVALID_REQUEST","message":"host request was invalid"}}
+        br#"{"protocol_version":6,"error":{"code":"INVALID_REQUEST","message":"host request was invalid"}}
 "#
     );
     let rendered = String::from_utf8(stdout).unwrap();

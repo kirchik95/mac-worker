@@ -95,6 +95,7 @@ fn select(text: Option<&str>, request: &InitRequest) -> Result<(WorkerEntry, boo
             slots: 1,
             capabilities: vec!["darwin-arm64".into()],
             remote_binary: "~/.local/bin/worker".into(),
+            herdr: false,
         },
         true,
     ))

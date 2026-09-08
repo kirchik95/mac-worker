@@ -45,6 +45,7 @@ fn worker() -> WorkerEntry {
         slots: 1,
         capabilities: Vec::new(),
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 

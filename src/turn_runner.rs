@@ -839,7 +839,8 @@ impl<'a> TurnRunner<'a> {
                         turn.clone(),
                         prompt.clone(),
                         turn_origin_url(initial_record.meta()),
-                    )?;
+                    )?
+                    .with_herdr_reporter(worker.herdr);
                     let response = match remote.submit_turn(worker, &request) {
                         Ok(response) => response,
                         Err(error) => {
@@ -1396,6 +1397,7 @@ impl<'a> TurnRunner<'a> {
             .map(|worker| {
                 let one = Config {
                     version: self.config.version,
+                    notifications: crate::config::NotificationsConfig::default(),
                     workers: vec![worker.clone()],
                 };
                 let observed_at = now_millis()?;

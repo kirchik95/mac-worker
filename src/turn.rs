@@ -317,6 +317,7 @@ pub struct TurnSection {
     project_id: String,
     git_identity: GitIdentity,
     origin_url: Option<String>,
+    herdr_reporter: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -398,6 +399,7 @@ impl TurnSection {
             project_id: project_id.into(),
             git_identity,
             origin_url,
+            herdr_reporter: false,
         };
         section.turn.validate()?;
         validate_origin_url(section.origin_url.as_deref())?;
@@ -411,6 +413,18 @@ impl TurnSection {
             return Err(turn_error("TURN_INVALID", "turn project ID is invalid"));
         }
         Ok(section)
+    }
+
+    /// Whether the worker reports this turn to its herdr server.  A
+    /// per-worker choice the laptop makes from its configuration, carried
+    /// beside the other per-worker values and outside the turn digest.
+    pub fn with_herdr_reporter(mut self, enabled: bool) -> Self {
+        self.herdr_reporter = enabled;
+        self
+    }
+
+    pub fn herdr_reporter(&self) -> bool {
+        self.herdr_reporter
     }
 
     pub fn turn(&self) -> &TurnMaterial {
@@ -432,11 +446,17 @@ impl TurnSection {
 
 impl serde::Serialize for TurnSection {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut record = serializer.serialize_struct("TurnSection", 4)?;
+        // The flag is written only when set, so records of turns that
+        // predate it keep their exact bytes.
+        let fields = if self.herdr_reporter { 5 } else { 4 };
+        let mut record = serializer.serialize_struct("TurnSection", fields)?;
         record.serialize_field("turn", &self.turn)?;
         record.serialize_field("project_id", &self.project_id)?;
         record.serialize_field("git_identity", &self.git_identity)?;
         record.serialize_field("origin_url", &self.origin_url)?;
+        if self.herdr_reporter {
+            record.serialize_field("herdr_reporter", &self.herdr_reporter)?;
+        }
         record.end()
     }
 }
@@ -450,6 +470,8 @@ impl<'de> serde::Deserialize<'de> for TurnSection {
             project_id: String,
             git_identity: GitIdentity,
             origin_url: Option<String>,
+            #[serde(default)]
+            herdr_reporter: bool,
         }
         let wire = Wire::deserialize(deserializer)?;
         Self::new_with_origin(
@@ -458,6 +480,7 @@ impl<'de> serde::Deserialize<'de> for TurnSection {
             wire.git_identity,
             wire.origin_url,
         )
+        .map(|section| section.with_herdr_reporter(wire.herdr_reporter))
         .map_err(D::Error::custom)
     }
 }
@@ -468,6 +491,7 @@ pub struct TaskTurnRequest {
     turn: TurnMaterial,
     prompt: String,
     origin_url: Option<String>,
+    herdr_reporter: bool,
 }
 
 impl fmt::Debug for TaskTurnRequest {
@@ -488,6 +512,7 @@ impl TaskTurnRequest {
             turn,
             prompt: prompt.into(),
             origin_url: None,
+            herdr_reporter: false,
         }
     }
 
@@ -502,6 +527,7 @@ impl TaskTurnRequest {
             turn,
             prompt: prompt.into(),
             origin_url,
+            herdr_reporter: false,
         };
         validate_origin_url(request.origin_url.as_deref())?;
         Ok(request)
@@ -550,6 +576,16 @@ impl TaskTurnRequest {
         self.origin_url.as_deref()
     }
 
+    /// Ask the worker to report this turn to its herdr server.
+    pub fn with_herdr_reporter(mut self, enabled: bool) -> Self {
+        self.herdr_reporter = enabled;
+        self
+    }
+
+    pub fn herdr_reporter(&self) -> bool {
+        self.herdr_reporter
+    }
+
     #[doc(hidden)]
     pub fn with_turn(&self, turn: TurnMaterial) -> Self {
         Self {
@@ -557,6 +593,7 @@ impl TaskTurnRequest {
             turn,
             prompt: self.prompt.clone(),
             origin_url: self.origin_url.clone(),
+            herdr_reporter: self.herdr_reporter,
         }
     }
 
@@ -567,6 +604,7 @@ impl TaskTurnRequest {
             turn: self.turn.clone(),
             prompt: prompt.into(),
             origin_url: self.origin_url.clone(),
+            herdr_reporter: self.herdr_reporter,
         }
     }
 }
@@ -574,11 +612,15 @@ impl TaskTurnRequest {
 impl serde::Serialize for TaskTurnRequest {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("TaskTurnRequest", 4)?;
+        let fields = if self.herdr_reporter { 5 } else { 4 };
+        let mut record = serializer.serialize_struct("TaskTurnRequest", fields)?;
         record.serialize_field("submit", &self.submit)?;
         record.serialize_field("turn", &self.turn)?;
         record.serialize_field("prompt", &self.prompt)?;
         record.serialize_field("origin_url", &self.origin_url)?;
+        if self.herdr_reporter {
+            record.serialize_field("herdr_reporter", &self.herdr_reporter)?;
+        }
         record.end()
     }
 }
@@ -592,10 +634,13 @@ impl<'de> serde::Deserialize<'de> for TaskTurnRequest {
             turn: TurnMaterial,
             prompt: String,
             origin_url: Option<String>,
+            #[serde(default)]
+            herdr_reporter: bool,
         }
         let wire = Wire::deserialize(deserializer)?;
         let request = Self::new_with_origin(wire.submit, wire.turn, wire.prompt, wire.origin_url)
             .map_err(D::Error::custom)?;
+        let request = request.with_herdr_reporter(wire.herdr_reporter);
         request.validate().map_err(D::Error::custom)?;
         Ok(request)
     }

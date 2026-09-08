@@ -274,12 +274,14 @@ impl ProcessInspector for LiveOwnerInspector {
 fn config() -> Config {
     Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![WorkerEntry {
             name: "mini-1".into(),
             ssh: "mac1".into(),
             slots: 1,
             capabilities: Vec::new(),
             remote_binary: "~/.local/bin/worker".into(),
+            herdr: false,
         }],
     }
 }
@@ -3685,6 +3687,7 @@ impl JobFollower for ConcurrentTerminalFollower {
 fn run_config() -> Config {
     Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![
             WorkerEntry {
                 name: "mini-1".into(),
@@ -3692,6 +3695,7 @@ fn run_config() -> Config {
                 slots: 1,
                 capabilities: vec!["declared-capability".into()],
                 remote_binary: "~/.local/bin/worker".into(),
+                herdr: false,
             },
             WorkerEntry {
                 name: "poison-worker".into(),
@@ -3699,6 +3703,7 @@ fn run_config() -> Config {
                 slots: 1,
                 capabilities: Vec::new(),
                 remote_binary: "~/.local/bin/worker".into(),
+                herdr: false,
             },
         ],
     }
@@ -3939,6 +3944,7 @@ fn no_wait_busy_pin_never_reconciles_a_recoverable_existing_job() {
     let runner = RunScriptRunner::new(paths.state.clone(), [RunScriptStep::ReconcileOrBusy]);
     let config = Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![
             run_config().workers[0].clone(),
             WorkerEntry {
@@ -3947,6 +3953,7 @@ fn no_wait_busy_pin_never_reconciles_a_recoverable_existing_job() {
                 slots: 1,
                 capabilities: Vec::new(),
                 remote_binary: "~/.local/bin/worker".into(),
+                herdr: false,
             },
         ],
     };
@@ -8852,6 +8859,7 @@ fn logs_requires_the_exact_local_job_and_never_falls_back() {
     let target = persist_log_job(&store, Some(JobStatus::accepted(101).unwrap()));
     let empty_config = Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: Vec::new(),
     };
     let error = logs_service(&empty_config, &store, &remote, &runtime)

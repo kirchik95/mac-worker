@@ -146,12 +146,14 @@ fn worker() -> WorkerEntry {
         slots: 1,
         capabilities: vec!["darwin-arm64".into()],
         remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
     }
 }
 
 fn config() -> Config {
     Config {
         version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![worker()],
     }
 }
@@ -190,6 +192,7 @@ fn facts(collected_at_millis: u64) -> AgentFacts {
         ],
         git_identity: true,
         collected_at_millis,
+        herdr: None,
     }
 }
 
