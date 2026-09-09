@@ -1676,6 +1676,35 @@ fn wip_capture_batches_exactly_one_mib_payload() {
 }
 
 #[test]
+fn wip_capture_batches_one_mib_and_empty_as_one_fast_import() {
+    // Break caught: treating exactly 1 MiB as oversized, or failing to
+    // promote a Single payload when the second unique object is zero bytes.
+    let repo = Fixture::init();
+    repo.write("a.bin", &vec![b'E'; BLOB_BATCH_MAX_BYTES]);
+    repo.write("empty.txt", b"");
+    repo.commit_all("one MiB then empty");
+    let stats = BlobWriteStats::default();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(&stats, &repo.context(), task_id(), &settings(), &identity())
+        .unwrap();
+    assert_eq!(
+        stats.events(),
+        vec![(
+            "fast-import",
+            framed_fast_import_len(&[BLOB_BATCH_MAX_BYTES, 0])
+        )],
+        "exactly 1 MiB plus a distinct empty blob must share one two-object fast-import"
+    );
+    assert_eq!(stats.hash_object_stdin().len(), 0);
+    assert_eq!(stats.fast_import_stdout(), vec![2 * GET_MARK_LINE_BYTES]);
+    let tree = transfer_tree_nul(transfer.path(), base.oid().as_str());
+    assert_eq!(tree["a.bin"].1, vec![b'E'; BLOB_BATCH_MAX_BYTES]);
+    assert_eq!(tree["empty.txt"].1, Vec::<u8>::new());
+}
+
+#[test]
 fn wip_capture_shares_pending_duplicates_and_keeps_modes_independent() {
     let repo = repo_with_commits();
     repo.write("same.txt", b"shared-bytes\n");
