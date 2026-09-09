@@ -918,7 +918,7 @@ impl TransferRepo {
         if pending.would_exceed(bytes.len()) {
             self.flush_pending_blobs(runner, blob_oids, pending)?;
         }
-        pending.push(digest, &bytes);
+        pending.push(digest, bytes, no_filters);
         Ok(digest)
     }
 
@@ -928,24 +928,35 @@ impl TransferRepo {
         blob_oids: &mut BTreeMap<[u8; 32], String>,
         pending: &mut PendingBlobBatch,
     ) -> Result<(), WorkerError> {
-        let Some((stdin, digests)) = pending.take_stream() else {
-            return Ok(());
-        };
-        let output = self.transfer_git(
-            runner,
-            &[
-                OsString::from("fast-import"),
-                OsString::from("--quiet"),
-                OsString::from("--done"),
-            ],
-            None,
-            Some(stdin),
-        )?;
-        let oids = parse_get_mark_oids(&output, digests.len())?;
-        for (digest, oid) in digests.into_iter().zip(oids) {
-            blob_oids.insert(digest, oid);
+        match pending.take() {
+            None => Ok(()),
+            Some(PendingFlush::Singleton {
+                digest,
+                bytes,
+                no_filters,
+            }) => {
+                let oid = self.write_hash_object(runner, bytes, no_filters)?;
+                blob_oids.insert(digest, oid);
+                Ok(())
+            }
+            Some(PendingFlush::Stream { stdin, digests }) => {
+                let output = self.transfer_git(
+                    runner,
+                    &[
+                        OsString::from("fast-import"),
+                        OsString::from("--quiet"),
+                        OsString::from("--done"),
+                    ],
+                    None,
+                    Some(stdin),
+                )?;
+                let oids = parse_get_mark_oids(&output, digests.len())?;
+                for (digest, oid) in digests.into_iter().zip(oids) {
+                    blob_oids.insert(digest, oid);
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     fn write_hash_object(
@@ -1244,53 +1255,141 @@ struct StagedBlob {
     path: String,
 }
 
-struct PendingBlobBatch {
-    stdin: Vec<u8>,
-    digests: Vec<[u8; 32]>,
-    by_digest: BTreeMap<[u8; 32], usize>,
-    payload_bytes: usize,
+enum PendingBlobBatch {
+    Empty,
+    Single {
+        digest: [u8; 32],
+        bytes: Vec<u8>,
+        no_filters: bool,
+    },
+    Multi {
+        stdin: Vec<u8>,
+        digests: Vec<[u8; 32]>,
+        by_digest: BTreeMap<[u8; 32], usize>,
+        payload_bytes: usize,
+    },
+}
+
+enum PendingFlush {
+    Singleton {
+        digest: [u8; 32],
+        bytes: Vec<u8>,
+        no_filters: bool,
+    },
+    Stream {
+        stdin: Vec<u8>,
+        digests: Vec<[u8; 32]>,
+    },
 }
 
 impl PendingBlobBatch {
     fn new() -> Self {
-        Self {
-            stdin: Vec::new(),
-            digests: Vec::new(),
-            by_digest: BTreeMap::new(),
-            payload_bytes: 0,
-        }
+        Self::Empty
     }
 
     fn contains(&self, digest: &[u8; 32]) -> bool {
-        self.by_digest.contains_key(digest)
+        match self {
+            Self::Empty => false,
+            Self::Single {
+                digest: pending, ..
+            } => pending == digest,
+            Self::Multi { by_digest, .. } => by_digest.contains_key(digest),
+        }
+    }
+
+    fn unique_count(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Single { .. } => 1,
+            Self::Multi { digests, .. } => digests.len(),
+        }
+    }
+
+    fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Single { bytes, .. } => bytes.len(),
+            Self::Multi { payload_bytes, .. } => *payload_bytes,
+        }
     }
 
     fn would_exceed(&self, payload_len: usize) -> bool {
-        if self.digests.is_empty() {
+        if self.unique_count() == 0 {
             return false;
         }
-        self.digests.len() >= BLOB_BATCH_MAX_OBJECTS
-            || self.payload_bytes.saturating_add(payload_len) > BLOB_BATCH_MAX_BYTES
+        self.unique_count() >= BLOB_BATCH_MAX_OBJECTS
+            || self.payload_bytes().saturating_add(payload_len) > BLOB_BATCH_MAX_BYTES
     }
 
-    fn push(&mut self, digest: [u8; 32], payload: &[u8]) {
-        let mark = self.digests.len() + 1;
-        write_blob_command(&mut self.stdin, mark, payload);
-        self.by_digest.insert(digest, mark);
-        self.digests.push(digest);
-        self.payload_bytes += payload.len();
-    }
-
-    fn take_stream(&mut self) -> Option<(Vec<u8>, Vec<[u8; 32]>)> {
-        if self.digests.is_empty() {
-            return None;
+    fn push(&mut self, digest: [u8; 32], bytes: Vec<u8>, no_filters: bool) {
+        match std::mem::replace(self, Self::Empty) {
+            Self::Empty => {
+                *self = Self::Single {
+                    digest,
+                    bytes,
+                    no_filters,
+                };
+            }
+            Self::Single {
+                digest: first_digest,
+                bytes: first_bytes,
+                no_filters: _,
+            } => {
+                let mut stdin = Vec::new();
+                write_blob_command(&mut stdin, 1, &first_bytes);
+                write_blob_command(&mut stdin, 2, &bytes);
+                let payload_bytes = first_bytes.len() + bytes.len();
+                drop(first_bytes);
+                let mut by_digest = BTreeMap::new();
+                by_digest.insert(first_digest, 1);
+                by_digest.insert(digest, 2);
+                *self = Self::Multi {
+                    stdin,
+                    digests: vec![first_digest, digest],
+                    by_digest,
+                    payload_bytes,
+                };
+            }
+            Self::Multi {
+                mut stdin,
+                mut digests,
+                mut by_digest,
+                mut payload_bytes,
+            } => {
+                let mark = digests.len() + 1;
+                write_blob_command(&mut stdin, mark, &bytes);
+                by_digest.insert(digest, mark);
+                digests.push(digest);
+                payload_bytes += bytes.len();
+                *self = Self::Multi {
+                    stdin,
+                    digests,
+                    by_digest,
+                    payload_bytes,
+                };
+            }
         }
-        write_get_marks_and_done(&mut self.stdin, self.digests.len());
-        let stdin = std::mem::take(&mut self.stdin);
-        let digests = std::mem::take(&mut self.digests);
-        self.by_digest.clear();
-        self.payload_bytes = 0;
-        Some((stdin, digests))
+    }
+
+    fn take(&mut self) -> Option<PendingFlush> {
+        match std::mem::replace(self, Self::Empty) {
+            Self::Empty => None,
+            Self::Single {
+                digest,
+                bytes,
+                no_filters,
+            } => Some(PendingFlush::Singleton {
+                digest,
+                bytes,
+                no_filters,
+            }),
+            Self::Multi {
+                mut stdin, digests, ..
+            } => {
+                write_get_marks_and_done(&mut stdin, digests.len());
+                Some(PendingFlush::Stream { stdin, digests })
+            }
+        }
     }
 }
 
