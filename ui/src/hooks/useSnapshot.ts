@@ -31,7 +31,16 @@ export function useSnapshot(): SnapshotState {
   useEffect(() => {
     if (example) return
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
     const controller = new AbortController()
+
+    const schedule = () => {
+      if (cancelled) return
+      timer = setTimeout(() => {
+        timer = null
+        void poll()
+      }, POLL_INTERVAL_MS)
+    }
 
     const poll = async () => {
       try {
@@ -48,14 +57,14 @@ export function useSnapshot(): SnapshotState {
           example: false,
         })
       }
+      if (!cancelled) schedule()
     }
 
     void poll()
-    const timer = setInterval(() => void poll(), POLL_INTERVAL_MS)
     return () => {
       cancelled = true
       controller.abort()
-      clearInterval(timer)
+      if (timer !== null) clearTimeout(timer)
     }
   }, [example])
 

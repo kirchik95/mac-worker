@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -327,5 +328,129 @@ describe('TaskDetail', () => {
     expect(await screen.findByText('following · the turn is still running')).toBeInTheDocument()
     expect(screen.queryByText('Waiting for this turn to start…')).not.toBeInTheDocument()
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/logs'))).toBe(true)
+  })
+
+  it('does not start another detail request while the previous poll is pending', async () => {
+    const pending = deferred<ReturnType<typeof jsonResponse>>()
+    let inFlight = 0
+    let peak = 0
+    const fetchMock = vi.fn(() => {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      return pending.promise.finally(() => {
+        inFlight -= 1
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    render(<TaskDetail taskId="aaaa" />)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(peak).toBe(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6000)
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(peak).toBe(1)
+
+    await act(async () => {
+      pending.resolve(jsonResponse(detail({ summary: 'Settled once' })))
+    })
+    expect(await screen.findByText('Settled once')).toBeInTheDocument()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000)
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(peak).toBe(1)
+  })
+
+  it('retries 2s after a rejected poll', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('poll failed'))
+      .mockResolvedValue(jsonResponse(detail({ summary: 'Recovered' })))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    render(<TaskDetail taskId="aaaa" />)
+    expect(await screen.findByText('poll failed')).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000)
+    })
+    expect(await screen.findByText('Recovered')).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not apply or reschedule a pending poll after unmount', async () => {
+    const pending = deferred<ReturnType<typeof jsonResponse>>()
+    const fetchMock = vi.fn(() => pending.promise)
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    const { unmount } = render(<TaskDetail taskId="aaaa" />)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    unmount()
+
+    await act(async () => {
+      pending.resolve(jsonResponse(detail({ summary: 'After unmount' })))
+      await vi.advanceTimersByTimeAsync(6000)
+    })
+    expect(screen.queryByText('After unmount')).not.toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not let a previous task schedule after a task switch while pending', async () => {
+    const pendingA = deferred<ReturnType<typeof jsonResponse>>()
+    const pendingB = deferred<ReturnType<typeof jsonResponse>>()
+    const fetchMock = vi.fn((url: string) =>
+      String(url).includes('task-a') ? pendingA.promise : pendingB.promise,
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    const { rerender } = render(<TaskDetail taskId="task-a" />)
+    rerender(<TaskDetail taskId="task-b" />)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      pendingA.resolve(jsonResponse(detail({ summary: 'From task A' })))
+      await vi.advanceTimersByTimeAsync(6000)
+    })
+    expect(screen.queryByText('From task A')).not.toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      pendingB.resolve(jsonResponse(detail({ summary: 'From task B' })))
+    })
+    expect(await screen.findByText('From task B')).toBeInTheDocument()
+  })
+
+  it('does not let a StrictMode stale generation schedule after remount', async () => {
+    const queue: Array<ReturnType<typeof deferred<ReturnType<typeof jsonResponse>>>> = []
+    const fetchMock = vi.fn(() => {
+      const item = deferred<ReturnType<typeof jsonResponse>>()
+      queue.push(item)
+      return item.promise
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    render(
+      <StrictMode>
+        <TaskDetail taskId="aaaa" />
+      </StrictMode>,
+    )
+    expect(queue.length).toBeGreaterThanOrEqual(1)
+    const started = fetchMock.mock.calls.length
+
+    await act(async () => {
+      queue[0].resolve(jsonResponse(detail({ summary: 'Stale generation' })))
+      await vi.advanceTimersByTimeAsync(6000)
+    })
+    expect(fetchMock.mock.calls.length).toBe(started)
   })
 })

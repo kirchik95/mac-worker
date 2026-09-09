@@ -3,6 +3,8 @@ mod support;
 
 use std::{
     fs,
+    os::unix::fs::MetadataExt,
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -1182,4 +1184,191 @@ fn turn_summary_carries_an_optional_herdr_report() {
         serde_json::from_str::<TurnSummary>(&json.replace(r#""pane_id""#, r#""pane""#)).is_err(),
         "the herdr report rejects unknown fields"
     );
+}
+
+fn task_record_path(state: &Path, record: &LocalTaskRecord) -> std::path::PathBuf {
+    state
+        .join("tasks")
+        .join(format!("{}.json", record.meta().task_id()))
+}
+
+fn regular_file_identity(path: &Path) -> (u64, u64, Vec<u8>) {
+    let meta = fs::metadata(path).unwrap();
+    (meta.dev(), meta.ino(), fs::read(path).unwrap())
+}
+
+fn active_status() -> TaskStatus {
+    TaskStatus::new(
+        TaskState::Active,
+        None,
+        Some("mini-1".into()),
+        false,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        vec![TurnSummary::new(
+            1,
+            turn_id(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )],
+        1_700_000_000_001,
+    )
+    .expect("active status")
+}
+
+#[test]
+fn unchanged_complete_task_record_keeps_the_underlying_file_identity() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let record = sample_record();
+    state.create_task(record.clone()).unwrap();
+    let path = task_record_path(&paths.state, &record);
+    let before = regular_file_identity(&path);
+
+    state.update_task(record.clone()).unwrap();
+
+    assert_eq!(regular_file_identity(&path), before);
+    assert_eq!(state.load_task(record.meta().task_id()).unwrap(), record);
+}
+
+#[test]
+fn changed_task_status_and_ownership_are_persisted() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let original = sample_record();
+    state.create_task(original.clone()).unwrap();
+    let path = task_record_path(&paths.state, &original);
+    let created = regular_file_identity(&path);
+
+    let status_changed = original.clone().with_status(active_status()).unwrap();
+    state.update_task(status_changed.clone()).unwrap();
+    let after_status = regular_file_identity(&path);
+    assert_ne!(after_status.1, created.1);
+    assert_eq!(
+        state.load_task(original.meta().task_id()).unwrap(),
+        status_changed
+    );
+
+    let ownership_changed = status_changed.with_runner(None).unwrap();
+    state.update_task(ownership_changed.clone()).unwrap();
+    let after_owner = regular_file_identity(&path);
+    assert_ne!(after_owner.1, after_status.1);
+    assert_eq!(
+        state.load_task(original.meta().task_id()).unwrap(),
+        ownership_changed
+    );
+}
+
+#[test]
+fn corrupt_and_unsafe_task_records_still_fail_before_a_no_op_skip() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let record = sample_record();
+    state.create_task(record.clone()).unwrap();
+    let path = task_record_path(&paths.state, &record);
+
+    fs::write(&path, b"{not-canonical").unwrap();
+    let corrupt = state.update_task(record.clone()).unwrap_err();
+    assert!(
+        corrupt.to_string().contains("task record is corrupt"),
+        "{corrupt}"
+    );
+
+    fs::write(&path, record.canonical_bytes().unwrap()).unwrap();
+    let mut other_fields = fields_with_prompt("Fix the flaky login spec\n\nDetails…".into());
+    other_fields.task_id = TaskId::new(Uuid::from_u128(99));
+    let foreign = LocalTaskRecord::new(
+        TaskMeta::new(other_fields).unwrap(),
+        sample_status(),
+        None,
+        None,
+        None,
+        REPO_ID.to_owned(),
+        None,
+        true,
+        None,
+    )
+    .unwrap();
+    fs::write(&path, foreign.canonical_bytes().unwrap()).unwrap();
+    let identity = state.update_task(record.clone()).unwrap_err();
+    assert!(
+        identity
+            .to_string()
+            .contains("task filename and record identity differ"),
+        "{identity}"
+    );
+
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("/tmp/mac-worker-task-outside", &path).unwrap();
+    let unsafe_record = state.update_task(record).unwrap_err();
+    assert!(
+        matches!(unsafe_record, WorkerError::Io(_)),
+        "{unsafe_record}"
+    );
+}
+
+#[test]
+fn identical_update_still_recovers_task_replacement_residue() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let original = sample_record();
+    let replacement = original.clone().with_runner(None).unwrap();
+    state.create_task(original).unwrap();
+
+    state.inject_task_replacement_after_exchange_failure_once();
+    assert!(state.update_task(replacement.clone()).is_err());
+    assert_eq!(
+        fs::read_dir(paths.state.join("tasks"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("replace-"))
+            .count(),
+        1
+    );
+
+    let path = task_record_path(&paths.state, &replacement);
+    let before = regular_file_identity(&path);
+    state.update_task(replacement.clone()).unwrap();
+    assert_eq!(
+        state.load_task(replacement.meta().task_id()).unwrap(),
+        replacement
+    );
+    assert!(
+        fs::read_dir(paths.state.join("tasks"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with("replace-"))
+    );
+    assert_eq!(regular_file_identity(&path).2, before.2);
+}
+
+#[test]
+fn explicit_intent_clear_still_replaces_an_identical_complete_record() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let record = sample_record();
+    state.create_task(record.clone()).unwrap();
+    let path = task_record_path(&paths.state, &record);
+    let before = regular_file_identity(&path);
+
+    state
+        .clear_submission_intent(record.clone().without_submission_intent().unwrap())
+        .unwrap();
+
+    let after = regular_file_identity(&path);
+    assert_ne!(after.1, before.1);
+    assert_eq!(after.2, before.2);
+    assert_eq!(state.load_task(record.meta().task_id()).unwrap(), record);
 }

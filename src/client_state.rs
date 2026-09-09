@@ -22,6 +22,9 @@ use uuid::Uuid;
 mod runner_dispatch;
 mod task_context;
 
+#[cfg(test)]
+mod tests;
+
 use crate::{
     agent_facts::FACTS_TTL,
     config::Config,
@@ -128,6 +131,14 @@ pub enum ClientStateConcurrencyPoint {
     ObservationRefreshPublication,
     TaskReplacementPreExchange,
     RunnerLogContention,
+}
+
+/// Ordinary task updates may skip a durable exchange when the complete
+/// parsed record is unchanged. Explicit sync/fault-hook sites still replace.
+#[derive(Clone, Copy)]
+enum IdenticalTaskWrite {
+    Skip,
+    Replace,
 }
 
 /// A deterministic test hook for scheduler persistence races. Implementors
@@ -1536,19 +1547,23 @@ impl ClientStateStore {
     #[doc(hidden)]
     pub fn clear_submission_intent(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
         self.reach_concurrency_point(ClientStateConcurrencyPoint::SubmissionIntentClear);
-        let result = self.update_task_before_final_sync(replacement, || {
-            if self.take_fault(
-                ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync,
-            ) {
-                return Err(io::Error::other(
-                    injected_failure(
-                        ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync,
-                    )
-                    .to_string(),
-                ));
-            }
-            Ok(())
-        });
+        let result = self.update_task_before_final_sync(
+            replacement,
+            || {
+                if self.take_fault(
+                    ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync,
+                ) {
+                    return Err(io::Error::other(
+                        injected_failure(
+                            ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync,
+                        )
+                        .to_string(),
+                    ));
+                }
+                Ok(())
+            },
+            IdenticalTaskWrite::Replace,
+        );
         if result.is_err() {
             self.reach_concurrency_point(
                 ClientStateConcurrencyPoint::SubmissionIntentClearResultUncertain,
@@ -1998,19 +2013,20 @@ impl ClientStateStore {
     }
 
     pub fn update_task(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
-        self.update_task_before_final_sync(replacement, || Ok(()))
+        self.update_task_before_final_sync(replacement, || Ok(()), IdenticalTaskWrite::Skip)
     }
 
     fn update_task_before_final_sync<F>(
         &self,
         replacement: LocalTaskRecord,
         before_final_sync: F,
+        identical: IdenticalTaskWrite,
     ) -> Result<(), WorkerError>
     where
         F: FnOnce() -> io::Result<()>,
     {
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
-        self.update_task_locked_before_final_sync(replacement, before_final_sync)
+        self.update_task_locked_before_final_sync(replacement, before_final_sync, identical)
     }
 
     /// Publish a remote projection only if the complete task snapshot used by
@@ -2027,18 +2043,24 @@ impl ClientStateStore {
             ));
         }
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
-        self.replace_task_locked_if_current(replacement, || Ok(()), Some(expected))
+        self.replace_task_locked_if_current(
+            replacement,
+            || Ok(()),
+            Some(expected),
+            IdenticalTaskWrite::Skip,
+        )
     }
 
     fn update_task_locked_before_final_sync<F>(
         &self,
         replacement: LocalTaskRecord,
         before_final_sync: F,
+        identical: IdenticalTaskWrite,
     ) -> Result<(), WorkerError>
     where
         F: FnOnce() -> io::Result<()>,
     {
-        self.replace_task_locked_if_current(replacement, before_final_sync, None)
+        self.replace_task_locked_if_current(replacement, before_final_sync, None, identical)
             .map(|_| ())
     }
 
@@ -2047,6 +2069,7 @@ impl ClientStateStore {
         replacement: LocalTaskRecord,
         before_final_sync: F,
         expected: Option<&LocalTaskRecord>,
+        identical: IdenticalTaskWrite,
     ) -> Result<bool, WorkerError>
     where
         F: FnOnce() -> io::Result<()>,
@@ -2073,6 +2096,9 @@ impl ClientStateStore {
         }
         if expected.is_some_and(|expected| expected != &existing) {
             return Ok(false);
+        }
+        if matches!(identical, IdenticalTaskWrite::Skip) && replacement == existing {
+            return Ok(true);
         }
         tasks
             .replace_private_regular_exact_with_sync_hooks(

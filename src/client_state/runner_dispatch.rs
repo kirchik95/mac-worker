@@ -110,8 +110,13 @@ impl ClientStateStore {
         self.update_task_locked_before_final_sync(
             recipient.with_runner(Some(RunnerIdentity::new(owner)))?,
             || Ok(()),
+            IdenticalTaskWrite::Replace,
         )?;
-        self.update_task_locked_before_final_sync(source_record.with_runner(None)?, || Ok(()))?;
+        self.update_task_locked_before_final_sync(
+            source_record.with_runner(None)?,
+            || Ok(()),
+            IdenticalTaskWrite::Replace,
+        )?;
         Ok(Some((
             recipient.meta().task_id(),
             QueueClaim::new(snapshot.entries[target_index].clone()),

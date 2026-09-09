@@ -115,9 +115,18 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
 
   useEffect(() => {
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
     const controller = new AbortController()
     setDetail(null)
     setError(null)
+
+    const schedule = () => {
+      if (cancelled) return
+      timer = setTimeout(() => {
+        timer = null
+        void poll()
+      }, POLL_INTERVAL_MS)
+    }
 
     const poll = async () => {
       try {
@@ -130,14 +139,14 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
         if (cancelled || controller.signal.aborted) return
         setError(cause instanceof Error ? cause.message : String(cause))
       }
+      if (!cancelled) schedule()
     }
 
     void poll()
-    const timer = setInterval(() => void poll(), POLL_INTERVAL_MS)
     return () => {
       cancelled = true
       controller.abort()
-      clearInterval(timer)
+      if (timer !== null) clearTimeout(timer)
     }
   }, [taskId])
 
