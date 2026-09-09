@@ -25,7 +25,7 @@ use install::Installer;
 use job::{
     CancelRequest, CommandSpec, FleetReconcileJobResult, FleetReconcileRequest,
     FleetReconcileResponse, HostControlError, JsonEvent, LeaseAcquireRequest, LogChunkRequest,
-    LogChunkResponse, ResolveOrAbandonRequest, StatusRequest, SubmitRequest,
+    LogChunkResponse, ResolveOrAbandonRequest, StatusLogsRequest, StatusRequest, SubmitRequest,
 };
 use job_service::JobService;
 use lease::{AdmissionFacts, LeaseService};
@@ -321,6 +321,11 @@ fn execute_with_context(
             command: HostCommand::LogChunk,
         } => Err(WorkerError::Protocol(
             "host log-chunk requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::StatusLogs,
+        } => Err(WorkerError::Protocol(
+            "host status-logs requires the stdio execution boundary".into(),
         )),
         Command::Host {
             command: HostCommand::ResolveOrAbandon,
@@ -1562,6 +1567,14 @@ pub fn run_with_rsync_executor_in_context(
     if matches!(
         &cli.command,
         Command::Host {
+            command: HostCommand::StatusLogs
+        }
+    ) {
+        return run_host_status_logs(cli.config, runtime, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
             command: HostCommand::ResolveOrAbandon
         }
     ) {
@@ -2143,6 +2156,23 @@ fn run_host_log_chunk(
                 request.limit(),
             )?;
             LogChunkResponse::new(chunk)
+        },
+    )
+}
+
+fn run_host_status_logs(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    run_host_control_endpoint(
+        config_override,
+        runtime,
+        stdin,
+        stdout,
+        |request: StatusLogsRequest, store, launcher| {
+            JobService::new(store, launcher).status_logs(&request)
         },
     )
 }

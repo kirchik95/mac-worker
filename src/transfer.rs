@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fmt, fs,
     os::unix::{
@@ -6,7 +7,7 @@ use std::{
         process::{CommandExt, ExitStatusExt},
     },
     process::{Command, Stdio},
-    sync::LazyLock,
+    sync::{LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -26,8 +27,8 @@ use crate::{
         FleetReconcileResponse, HostControlError, JobId, LeaseAcquireRequest, LeaseRecord,
         LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse, LogStream, MAX_LOG_CHUNK_BYTES,
         PreacceptanceDisposition, RequestFingerprint, ResolveOrAbandonOutcome,
-        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest, StatusResponse,
-        SubmitRequest, SubmitResponse,
+        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusLogsRequest, StatusLogsResponse,
+        StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
@@ -65,6 +66,7 @@ pub enum HostOperation {
     Gc,
     Status,
     LogChunk,
+    StatusLogs,
     ResolveOrAbandon,
     TaskPrepare,
     TaskStatus,
@@ -91,6 +93,7 @@ impl HostOperation {
             Self::Gc => "~/.local/bin/worker host gc",
             Self::Status => "~/.local/bin/worker host status",
             Self::LogChunk => "~/.local/bin/worker host log-chunk",
+            Self::StatusLogs => "~/.local/bin/worker host status-logs",
             Self::ResolveOrAbandon => "~/.local/bin/worker host resolve-or-abandon",
             Self::TaskPrepare => "~/.local/bin/worker host task-prepare",
             Self::TaskStatus => "~/.local/bin/worker host task-status",
@@ -137,9 +140,20 @@ impl ResolutionRuntime for SystemResolutionRuntime {
     }
 }
 
+const STATUS_LOGS_UNKNOWN: u8 = 0;
+const STATUS_LOGS_SUPPORTED: u8 = 1;
+const STATUS_LOGS_UNSUPPORTED: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptionalHostResponse<T> {
+    Supported(T),
+    Unsupported,
+}
+
 pub struct RemoteJobClient<'a> {
     transport: SshJsonTransport<'a>,
     retry: &'a dyn ResolutionRuntime,
+    status_logs: Mutex<HashMap<(String, String), u8>>,
 }
 
 /// Process-local authority proving that one exact remote resolution returned
@@ -626,6 +640,59 @@ impl<'a> SshJsonTransport<'a> {
         request: &Req,
         policy: ProcessPolicy,
     ) -> Result<Res, WorkerError> {
+        let result = self.run_control(worker, operation, request, policy)?;
+        if !result.status.success() {
+            return Err(control_request_failure(&result, policy));
+        }
+        parse_control_response(&result, policy)
+    }
+
+    pub fn request_optional<Req: Serialize, Res: DeserializeOwned + Serialize>(
+        &self,
+        worker: &WorkerEntry,
+        operation: HostOperation,
+        request: &Req,
+        policy: ProcessPolicy,
+    ) -> Result<OptionalHostResponse<Res>, WorkerError> {
+        let result = self.run_control(worker, operation, request, policy)?;
+        if !result.status.success() {
+            if result.status.code() == Some(255) {
+                return Err(transport_error(
+                    "SSH_UNAVAILABLE",
+                    "SSH control request failed",
+                ));
+            }
+            if result.stdout.len() > policy.stdout_limit
+                || result.stderr.len() > policy.stderr_limit
+            {
+                return Err(transport_error(
+                    "HOST_REQUEST_FAILED",
+                    "SSH control request failed",
+                ));
+            }
+            if let Some(error) = decode_host_control_error(&result.stdout) {
+                return Err(error);
+            }
+            if is_unrecognized_optional_command(operation, &result) {
+                return Ok(OptionalHostResponse::Unsupported);
+            }
+            return Err(transport_error(
+                "HOST_REQUEST_FAILED",
+                "SSH control request failed",
+            ));
+        }
+        Ok(OptionalHostResponse::Supported(parse_control_response(
+            &result, policy,
+        )?))
+    }
+
+    fn run_control<Req: Serialize>(
+        &self,
+        worker: &WorkerEntry,
+        operation: HostOperation,
+        request: &Req,
+        policy: ProcessPolicy,
+    ) -> Result<crate::process::ProcessResult, WorkerError> {
         validate_worker(worker)?;
         validate_control_policy(policy)?;
         let stdin = serde_json::to_vec(request)
@@ -651,56 +718,7 @@ impl<'a> SshJsonTransport<'a> {
             policy,
             isolate_parent_environment: false,
         };
-        let result = self.runner.run(&request).map_err(map_control_failure)?;
-        if !result.status.success() {
-            if result.status.code() == Some(255) {
-                return Err(transport_error(
-                    "SSH_UNAVAILABLE",
-                    "SSH control request failed",
-                ));
-            }
-            if result.stdout.len() > policy.stdout_limit
-                || result.stderr.len() > policy.stderr_limit
-            {
-                return Err(transport_error(
-                    "HOST_REQUEST_FAILED",
-                    "SSH control request failed",
-                ));
-            }
-            return Err(
-                decode_host_control_error(&result.stdout).unwrap_or_else(|| {
-                    transport_error("HOST_REQUEST_FAILED", "SSH control request failed")
-                }),
-            );
-        }
-        if result.stdout.len() > policy.stdout_limit {
-            return Err(transport_error(
-                "SSH_RESPONSE_TOO_LARGE",
-                "SSH control response exceeded its limit",
-            ));
-        }
-        if result.stderr.len() > policy.stderr_limit {
-            return Err(transport_error(
-                "SSH_DIAGNOSTIC_TOO_LARGE",
-                "SSH control diagnostic exceeded its limit",
-            ));
-        }
-
-        let mut deserializer = serde_json::Deserializer::from_slice(&result.stdout);
-        let response = Res::deserialize(&mut deserializer)
-            .map_err(|_| transport_error("INVALID_RESPONSE", "host response was invalid"))?;
-        deserializer
-            .end()
-            .map_err(|_| transport_error("INVALID_RESPONSE", "host response was invalid"))?;
-        let canonical = serde_json::to_vec(&response)
-            .map_err(|_| transport_error("INVALID_RESPONSE", "host response was invalid"))?;
-        if result.stdout != canonical && result.stdout != [canonical.as_slice(), b"\n"].concat() {
-            return Err(transport_error(
-                "INVALID_RESPONSE",
-                "host response was invalid",
-            ));
-        }
-        Ok(response)
+        self.runner.run(&request).map_err(map_control_failure)
     }
 
     pub fn agent_settings_get(
@@ -742,6 +760,7 @@ impl<'a> RemoteJobClient<'a> {
         Self {
             transport: SshJsonTransport::new(runner),
             retry,
+            status_logs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -993,17 +1012,146 @@ impl<'a> RemoteJobClient<'a> {
             control_policy(MAX_CONTROL_DEADLINE),
         )?;
         let chunk = response.into_chunk();
-        let response_len = chunk
-            .decoded_bytes()
-            .map_err(|_| invalid_remote_response())?
-            .len();
-        let effective_limit = usize::try_from(limit)
-            .expect("u32 fits in usize on supported hosts")
-            .min(MAX_LOG_CHUNK_BYTES);
-        if chunk.stream() != stream || chunk.offset() != offset || response_len > effective_limit {
-            return Err(invalid_remote_response());
-        }
+        validate_remote_log_chunk(&chunk, stream, offset, limit)?;
         Ok(chunk)
+    }
+
+    pub fn try_combined_status_and_logs(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+        stdout_offset: u64,
+        stdout_limit: u32,
+        stderr_offset: u64,
+        stderr_limit: u32,
+    ) -> Result<Option<(StatusResponse, LogChunk, LogChunk)>, WorkerError> {
+        if self.status_logs_mode(worker) != STATUS_LOGS_UNSUPPORTED {
+            match self.try_status_logs(
+                worker,
+                job_id,
+                stdout_offset,
+                stdout_limit,
+                stderr_offset,
+                stderr_limit,
+            ) {
+                Ok(Some(parts)) => {
+                    self.set_status_logs_mode(worker, STATUS_LOGS_SUPPORTED);
+                    return Ok(Some(parts));
+                }
+                Ok(None) => {
+                    self.set_status_logs_mode(worker, STATUS_LOGS_UNSUPPORTED);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn status_and_logs(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+        stdout_offset: u64,
+        stdout_limit: u32,
+        stderr_offset: u64,
+        stderr_limit: u32,
+    ) -> Result<(StatusResponse, LogChunk, LogChunk), WorkerError> {
+        if let Some(parts) = self.try_combined_status_and_logs(
+            worker,
+            job_id,
+            stdout_offset,
+            stdout_limit,
+            stderr_offset,
+            stderr_limit,
+        )? {
+            return Ok(parts);
+        }
+        self.status_and_logs_sequential(
+            worker,
+            job_id,
+            stdout_offset,
+            stdout_limit,
+            stderr_offset,
+            stderr_limit,
+        )
+    }
+
+    fn try_status_logs(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+        stdout_offset: u64,
+        stdout_limit: u32,
+        stderr_offset: u64,
+        stderr_limit: u32,
+    ) -> Result<Option<(StatusResponse, LogChunk, LogChunk)>, WorkerError> {
+        match self.transport.request_optional::<_, StatusLogsResponse>(
+            worker,
+            HostOperation::StatusLogs,
+            &StatusLogsRequest::new(
+                job_id,
+                stdout_offset,
+                stdout_limit,
+                stderr_offset,
+                stderr_limit,
+            ),
+            control_policy(MAX_CONTROL_DEADLINE),
+        )? {
+            OptionalHostResponse::Unsupported => Ok(None),
+            OptionalHostResponse::Supported(response) => {
+                let (status, stdout, stderr) = response.into_parts();
+                if status.meta().job_id() != job_id || status.meta().worker_name() != worker.name {
+                    return Err(invalid_remote_response());
+                }
+                validate_remote_log_chunk(&stdout, LogStream::Stdout, stdout_offset, stdout_limit)?;
+                validate_remote_log_chunk(&stderr, LogStream::Stderr, stderr_offset, stderr_limit)?;
+                Ok(Some((status, stdout, stderr)))
+            }
+        }
+    }
+
+    fn status_and_logs_sequential(
+        &self,
+        worker: &WorkerEntry,
+        job_id: JobId,
+        stdout_offset: u64,
+        stdout_limit: u32,
+        stderr_offset: u64,
+        stderr_limit: u32,
+    ) -> Result<(StatusResponse, LogChunk, LogChunk), WorkerError> {
+        let status = self.status(worker, job_id)?;
+        let stdout = self.log_chunk(
+            worker,
+            job_id,
+            LogStream::Stdout,
+            stdout_offset,
+            stdout_limit,
+        )?;
+        let stderr = self.log_chunk(
+            worker,
+            job_id,
+            LogStream::Stderr,
+            stderr_offset,
+            stderr_limit,
+        )?;
+        Ok((status, stdout, stderr))
+    }
+
+    fn status_logs_mode(&self, worker: &WorkerEntry) -> u8 {
+        self.status_logs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(worker.name.clone(), worker.ssh.clone()))
+            .copied()
+            .unwrap_or(STATUS_LOGS_UNKNOWN)
+    }
+
+    fn set_status_logs_mode(&self, worker: &WorkerEntry, mode: u8) {
+        self.status_logs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((worker.name.clone(), worker.ssh.clone()), mode);
     }
 
     pub fn resolve_preacceptance(
@@ -1177,6 +1325,89 @@ fn validate_resolution_response(
         || meta.resource_class() != request.resource_class()
         || meta.command_summary() != request.command_summary()
     {
+        return Err(invalid_remote_response());
+    }
+    Ok(())
+}
+
+fn control_request_failure(
+    result: &crate::process::ProcessResult,
+    policy: ProcessPolicy,
+) -> WorkerError {
+    if result.status.code() == Some(255) {
+        return transport_error("SSH_UNAVAILABLE", "SSH control request failed");
+    }
+    if result.stdout.len() > policy.stdout_limit || result.stderr.len() > policy.stderr_limit {
+        return transport_error("HOST_REQUEST_FAILED", "SSH control request failed");
+    }
+    decode_host_control_error(&result.stdout)
+        .unwrap_or_else(|| transport_error("HOST_REQUEST_FAILED", "SSH control request failed"))
+}
+
+fn parse_control_response<Res: DeserializeOwned + Serialize>(
+    result: &crate::process::ProcessResult,
+    policy: ProcessPolicy,
+) -> Result<Res, WorkerError> {
+    if result.stdout.len() > policy.stdout_limit {
+        return Err(transport_error(
+            "SSH_RESPONSE_TOO_LARGE",
+            "SSH control response exceeded its limit",
+        ));
+    }
+    if result.stderr.len() > policy.stderr_limit {
+        return Err(transport_error(
+            "SSH_DIAGNOSTIC_TOO_LARGE",
+            "SSH control diagnostic exceeded its limit",
+        ));
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(&result.stdout);
+    let response = Res::deserialize(&mut deserializer)
+        .map_err(|_| transport_error("INVALID_RESPONSE", "host response was invalid"))?;
+    deserializer
+        .end()
+        .map_err(|_| transport_error("INVALID_RESPONSE", "host response was invalid"))?;
+    let canonical = serde_json::to_vec(&response)
+        .map_err(|_| transport_error("INVALID_RESPONSE", "host response was invalid"))?;
+    if result.stdout != canonical && result.stdout != [canonical.as_slice(), b"\n"].concat() {
+        return Err(transport_error(
+            "INVALID_RESPONSE",
+            "host response was invalid",
+        ));
+    }
+    Ok(response)
+}
+
+fn is_unrecognized_optional_command(
+    operation: HostOperation,
+    result: &crate::process::ProcessResult,
+) -> bool {
+    if operation != HostOperation::StatusLogs
+        || result.status.success()
+        || result.status.code() == Some(255)
+        || !result.stdout.is_empty()
+    {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&result.stderr).to_ascii_lowercase();
+    (stderr.contains("unrecognized subcommand") || stderr.contains("unrecognised subcommand"))
+        && stderr.contains("status-logs")
+}
+
+fn validate_remote_log_chunk(
+    chunk: &LogChunk,
+    stream: LogStream,
+    offset: u64,
+    limit: u32,
+) -> Result<(), WorkerError> {
+    let response_len = chunk
+        .decoded_bytes()
+        .map_err(|_| invalid_remote_response())?
+        .len();
+    let effective_limit = usize::try_from(limit)
+        .expect("u32 fits in usize on supported hosts")
+        .min(MAX_LOG_CHUNK_BYTES);
+    if chunk.stream() != stream || chunk.offset() != offset || response_len > effective_limit {
         return Err(invalid_remote_response());
     }
     Ok(())

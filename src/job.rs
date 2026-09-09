@@ -4407,6 +4407,195 @@ impl<'de> Deserialize<'de> for LogChunkResponse {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusLogsRequest {
+    protocol_version: u32,
+    job_id: JobId,
+    stdout_offset: u64,
+    stdout_limit: u32,
+    stderr_offset: u64,
+    stderr_limit: u32,
+}
+
+impl StatusLogsRequest {
+    pub fn new(
+        job_id: JobId,
+        stdout_offset: u64,
+        stdout_limit: u32,
+        stderr_offset: u64,
+        stderr_limit: u32,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            job_id,
+            stdout_offset,
+            stdout_limit,
+            stderr_offset,
+            stderr_limit,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "status-logs request has an incompatible protocol version",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn protocol_version(self) -> u32 {
+        self.protocol_version
+    }
+    pub fn job_id(self) -> JobId {
+        self.job_id
+    }
+    pub fn stdout_offset(self) -> u64 {
+        self.stdout_offset
+    }
+    pub fn stdout_limit(self) -> u32 {
+        self.stdout_limit
+    }
+    pub fn stderr_offset(self) -> u64 {
+        self.stderr_offset
+    }
+    pub fn stderr_limit(self) -> u32 {
+        self.stderr_limit
+    }
+}
+
+impl Serialize for StatusLogsRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("StatusLogsRequest", 6)?;
+        record.serialize_field("protocol_version", &self.protocol_version)?;
+        record.serialize_field("job_id", &self.job_id)?;
+        record.serialize_field("stdout_offset", &self.stdout_offset)?;
+        record.serialize_field("stdout_limit", &self.stdout_limit)?;
+        record.serialize_field("stderr_offset", &self.stderr_offset)?;
+        record.serialize_field("stderr_limit", &self.stderr_limit)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusLogsRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            protocol_version: u32,
+            job_id: JobId,
+            stdout_offset: u64,
+            stdout_limit: u32,
+            stderr_offset: u64,
+            stderr_limit: u32,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let request = Self {
+            protocol_version: wire.protocol_version,
+            job_id: wire.job_id,
+            stdout_offset: wire.stdout_offset,
+            stdout_limit: wire.stdout_limit,
+            stderr_offset: wire.stderr_offset,
+            stderr_limit: wire.stderr_limit,
+        };
+        request.validate().map_err(de::Error::custom)?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusLogsResponse {
+    protocol_version: u32,
+    status: StatusResponse,
+    stdout: LogChunk,
+    stderr: LogChunk,
+}
+
+impl StatusLogsResponse {
+    pub fn new(
+        status: StatusResponse,
+        stdout: LogChunk,
+        stderr: LogChunk,
+    ) -> Result<Self, WorkerError> {
+        let response = Self {
+            protocol_version: PROTOCOL_VERSION,
+            status,
+            stdout,
+            stderr,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "status-logs response has an incompatible protocol version",
+            ));
+        }
+        self.status.validate()?;
+        self.stdout.validate()?;
+        self.stderr.validate()?;
+        if self.stdout.stream() != LogStream::Stdout || self.stderr.stream() != LogStream::Stderr {
+            return Err(protocol_error(
+                "status-logs chunks do not match stdout and stderr",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+    pub fn status(&self) -> &StatusResponse {
+        &self.status
+    }
+    pub fn stdout(&self) -> &LogChunk {
+        &self.stdout
+    }
+    pub fn stderr(&self) -> &LogChunk {
+        &self.stderr
+    }
+    pub fn into_parts(self) -> (StatusResponse, LogChunk, LogChunk) {
+        (self.status, self.stdout, self.stderr)
+    }
+}
+
+impl Serialize for StatusLogsResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("StatusLogsResponse", 4)?;
+        record.serialize_field("protocol_version", &self.protocol_version)?;
+        record.serialize_field("status", &self.status)?;
+        record.serialize_field("stdout", &self.stdout)?;
+        record.serialize_field("stderr", &self.stderr)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusLogsResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            protocol_version: u32,
+            status: StatusResponse,
+            stdout: LogChunk,
+            stderr: LogChunk,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let response = Self {
+            protocol_version: wire.protocol_version,
+            status: wire.status,
+            stdout: wire.stdout,
+            stderr: wire.stderr,
+        };
+        response.validate().map_err(de::Error::custom)?;
+        Ok(response)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 // The control-plane contract owns the complete accepted response so callers
 // can pattern-match it without a second allocation or lifetime wrapper.

@@ -1181,6 +1181,9 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                 )?)?;
                 canonical_process(&response)
             }
+            value if value == HostOperation::StatusLogs.command() => {
+                Ok(clap_unrecognized_subcommand("status-logs"))
+            }
             other => panic!("unexpected worker operation: {other}"),
         }
     }
@@ -3202,6 +3205,9 @@ impl ProcessRunner for FetchFailingRunner {
                     vec![],
                 )?)?)
             }
+            value if value == HostOperation::StatusLogs.command() => {
+                Ok(clap_unrecognized_subcommand("status-logs"))
+            }
             value if value == HostOperation::TaskClose.command() => {
                 let close: TaskCloseRequest = decode_request(request)?;
                 let status = self.task_status(close.task_id())?;
@@ -3249,6 +3255,14 @@ fn canonical_process<T: serde::Serialize>(
         stdout,
         stderr: Vec::new(),
     })
+}
+
+fn clap_unrecognized_subcommand(subcommand: &str) -> ProcessResult {
+    ProcessResult {
+        status: ExitStatus::from_raw(2 << 8),
+        stdout: Vec::new(),
+        stderr: format!("error: unrecognized subcommand '{subcommand}'\n").into_bytes(),
+    }
 }
 
 #[test]

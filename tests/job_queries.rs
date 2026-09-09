@@ -32,8 +32,8 @@ use mac_worker::{
         JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk,
         LogChunkRequest, LogChunkResponse, LogCursor, LogStream, ProcessIdentity,
         RequestFingerprintMaterial, ResolveOrAbandonOutcome, ResolveOrAbandonRequest,
-        ResolveOrAbandonResponse, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
-        TerminalLogDrain,
+        ResolveOrAbandonResponse, StatusLogsRequest, StatusLogsResponse, StatusRequest,
+        StatusResponse, SubmitRequest, SubmitResponse, TerminalLogDrain,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
@@ -5246,6 +5246,12 @@ fn hidden_query_endpoints_are_argument_free_and_return_one_canonical_typed_line(
         LogChunk::new(LogStream::Stdout, 0, b"endpoint-log".to_vec()).unwrap(),
     )
     .unwrap();
+    let expected_status_logs = StatusLogsResponse::new(
+        expected_status.clone(),
+        LogChunk::new(LogStream::Stdout, 0, b"endpoint-log".to_vec()).unwrap(),
+        LogChunk::new(LogStream::Stderr, 0, Vec::new()).unwrap(),
+    )
+    .unwrap();
     let expected_resolve =
         mac_worker::job::ResolveOrAbandonResponse::accepted(expected_status.clone()).unwrap();
     let reconcile = FleetReconcileRequest::new(vec![job_id]).unwrap();
@@ -5263,6 +5269,11 @@ fn hidden_query_endpoints_are_argument_free_and_return_one_canonical_typed_line(
             "log-chunk",
             serde_json::to_vec(&LogChunkRequest::new(job_id, LogStream::Stdout, 0, 64)).unwrap(),
             serde_json::to_vec(&expected_log).unwrap(),
+        ),
+        (
+            "status-logs",
+            serde_json::to_vec(&StatusLogsRequest::new(job_id, 0, 64, 0, 64)).unwrap(),
+            serde_json::to_vec(&expected_status_logs).unwrap(),
         ),
         (
             "resolve-or-abandon",

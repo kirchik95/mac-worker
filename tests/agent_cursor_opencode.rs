@@ -377,6 +377,9 @@ impl ProcessRunner for RecordingHost {
                 )?)?;
                 canonical_process(&response)
             }
+            value if value == HostOperation::StatusLogs.command() => {
+                Ok(clap_unrecognized_subcommand("status-logs"))
+            }
             value if value == HostOperation::ResolveOrAbandon.command() => {
                 Ok(success(b"{\"protocol_version\":1}\n".to_vec()))
             }
@@ -665,6 +668,14 @@ fn success(stdout: Vec<u8>) -> ProcessResult {
         status: ExitStatus::from_raw(0),
         stdout,
         stderr: Vec::new(),
+    }
+}
+
+fn clap_unrecognized_subcommand(subcommand: &str) -> ProcessResult {
+    ProcessResult {
+        status: ExitStatus::from_raw(2 << 8),
+        stdout: Vec::new(),
+        stderr: format!("error: unrecognized subcommand '{subcommand}'\n").into_bytes(),
     }
 }
 

@@ -180,6 +180,11 @@ impl ProcessRunner for TaskRemoteRunner {
                 *self.status.lock().unwrap() = next.clone();
                 canonical_process(&TaskCloseResponse::new(next))
             }
+            value if value == HostOperation::StatusLogs.command() => Ok(ProcessResult {
+                status: ExitStatus::from_raw(2 << 8),
+                stdout: Vec::new(),
+                stderr: b"error: unrecognized subcommand 'status-logs'\n".to_vec(),
+            }),
             other => Err(WorkerError::Protocol(format!(
                 "unexpected fixture worker operation: {other}"
             ))),

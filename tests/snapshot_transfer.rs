@@ -33,8 +33,8 @@ use mac_worker::{
         ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
         LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk, LogChunkResponse, LogStream,
         PreacceptanceDisposition, RequestFingerprint, RequestFingerprintMaterial,
-        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusResponse,
-        SubmitRequest, SubmitResponse,
+        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
+        StatusLogsRequest, StatusLogsResponse, StatusResponse, SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
@@ -47,10 +47,10 @@ use mac_worker::{
     run_with_rsync_executor_in_context, run_with_stdio_in_context,
     snapshot::{Snapshot, SnapshotBuilder},
     transfer::{
-        AbandonTransferResult, HostOperation, HostTransferService, RemoteJobClient,
-        ResolutionRuntime, RsyncServerExecutor, RsyncServerInvocation, RsyncTransport,
-        SshJsonTransport, TransferFailureDisposition, TransferIdentity, TransferReceipt,
-        transfer_failure_disposition,
+        AbandonTransferResult, HostOperation, HostTransferService, OptionalHostResponse,
+        RemoteJobClient, ResolutionRuntime, RsyncServerExecutor, RsyncServerInvocation,
+        RsyncTransport, SshJsonTransport, TransferFailureDisposition, TransferIdentity,
+        TransferReceipt, transfer_failure_disposition,
     },
 };
 use sha2::Digest;
@@ -112,9 +112,13 @@ impl ProcessRunner for RecordingRunner {
 }
 
 fn worker() -> WorkerEntry {
+    worker_named("mini-1", "mac1")
+}
+
+fn worker_named(name: &str, ssh: &str) -> WorkerEntry {
     WorkerEntry {
-        name: "mini-1".into(),
-        ssh: "mac1".into(),
+        name: name.into(),
+        ssh: ssh.into(),
         slots: 1,
         capabilities: vec!["darwin-arm64".into()],
         remote_binary: "~/.local/bin/worker".into(),
@@ -153,13 +157,17 @@ fn canonical_line(value: &impl serde::Serialize) -> Vec<u8> {
 }
 
 fn remote_submit(seed: u128, created_at_millis: u64) -> SubmitRequest {
+    remote_submit_on(seed, created_at_millis, "mini-1")
+}
+
+fn remote_submit_on(seed: u128, created_at_millis: u64, worker_name: &str) -> SubmitRequest {
     SubmitRequest::new(
         RequestFingerprintMaterial::new(
             JobId::new(uuid::Uuid::from_u128(seed)),
             ClientId::new(uuid::Uuid::from_u128(seed + 1)),
             LeaseToken::new(uuid::Uuid::from_u128(seed + 2)),
             created_at_millis,
-            "mini-1".into(),
+            worker_name.into(),
             "a".repeat(64),
             "b".repeat(64),
             "c".repeat(64),
@@ -1963,6 +1971,12 @@ fn query_operations_use_only_the_three_fixed_commands_and_compact_requests() {
     let status_response = accepted_status(&submit, 10);
     let log_response =
         LogChunkResponse::new(LogChunk::new(LogStream::Stdout, 7, b"x".to_vec()).unwrap()).unwrap();
+    let status_logs_response = StatusLogsResponse::new(
+        status_response.clone(),
+        LogChunk::new(LogStream::Stdout, 7, b"x".to_vec()).unwrap(),
+        LogChunk::new(LogStream::Stderr, 0, Vec::new()).unwrap(),
+    )
+    .unwrap();
     let resolve_response = ResolveOrAbandonResponse::abandoned();
     let cases = [
         (
@@ -1982,6 +1996,12 @@ fn query_operations_use_only_the_three_fixed_commands_and_compact_requests() {
             .unwrap(),
             canonical_line(&log_response),
             "~/.local/bin/worker host log-chunk",
+        ),
+        (
+            HostOperation::StatusLogs,
+            serde_json::to_vec(&StatusLogsRequest::new(resolve.job_id(), 7, 99, 0, 32)).unwrap(),
+            canonical_line(&status_logs_response),
+            "~/.local/bin/worker host status-logs",
         ),
         (
             HostOperation::ResolveOrAbandon,
@@ -2020,6 +2040,16 @@ fn query_operations_use_only_the_three_fixed_commands_and_compact_requests() {
                             7,
                             99,
                         ),
+                        request_policy,
+                    )
+                    .unwrap();
+            }
+            HostOperation::StatusLogs => {
+                SshJsonTransport::new(&runner)
+                    .request::<_, StatusLogsResponse>(
+                        &worker(),
+                        operation,
+                        &StatusLogsRequest::new(resolve.job_id(), 7, 99, 0, 32),
                         request_policy,
                     )
                     .unwrap();
@@ -3478,4 +3508,302 @@ fn publish_receipt_estale_cleanup_is_unsafe_remote_snapshot() {
     );
     assert_file_identity_unchanged(&sibling, sibling_identity);
     assert_canonical_regular_delete_journal(&namespace);
+}
+
+fn poll_status_and_logs(
+    client: &RemoteJobClient<'_>,
+    worker: &WorkerEntry,
+    job_id: JobId,
+) -> Result<(StatusResponse, LogChunk, LogChunk), WorkerError> {
+    client.status_and_logs(worker, job_id, 0, 64, 0, 64)
+}
+
+fn clap_missing_status_logs() -> ProcessResult {
+    result(
+        status(2),
+        b"",
+        b"error: unrecognized subcommand 'status-logs'\n",
+    )
+}
+
+fn host_command(request: &ProcessRequest) -> &str {
+    request
+        .args
+        .last()
+        .and_then(|argument| argument.to_str())
+        .unwrap_or_default()
+}
+
+fn ssh_destination(request: &ProcessRequest) -> &str {
+    request
+        .args
+        .iter()
+        .rev()
+        .nth(1)
+        .and_then(|argument| argument.to_str())
+        .unwrap_or_default()
+}
+
+#[test]
+fn status_and_logs_uses_one_combined_rpc_when_the_helper_supports_it() {
+    let submit = remote_submit(80_000, 10);
+    let job_id = submit.material().job_id();
+    let combined = StatusLogsResponse::new(
+        accepted_status(&submit, 10),
+        LogChunk::new(LogStream::Stdout, 0, b"out".to_vec()).unwrap(),
+        LogChunk::new(LogStream::Stderr, 0, Vec::new()).unwrap(),
+    )
+    .unwrap();
+    let payload = canonical_line(&combined);
+    let runner = RecordingRunner::returning(vec![
+        Ok(result(status(0), &payload, b"")),
+        Ok(result(status(0), &payload, b"")),
+    ]);
+    let client = RemoteJobClient::new(&runner);
+
+    let first = poll_status_and_logs(&client, &worker(), job_id).unwrap();
+    let second = poll_status_and_logs(&client, &worker(), job_id).unwrap();
+    assert_eq!(first.1.decoded_bytes().unwrap(), b"out");
+    assert_eq!(second.1.decoded_bytes().unwrap(), b"out");
+
+    let requests = runner.requests();
+    let commands: Vec<&str> = requests.iter().map(host_command).collect();
+    assert_eq!(
+        commands,
+        vec![
+            HostOperation::StatusLogs.command(),
+            HostOperation::StatusLogs.command(),
+        ]
+    );
+}
+
+#[test]
+fn status_and_logs_falls_back_once_for_matching_protocol_missing_command() {
+    let submit = remote_submit(80_001, 10);
+    let job_id = submit.material().job_id();
+    let status_payload = canonical_line(&accepted_status(&submit, 10));
+    let stdout = canonical_line(
+        &LogChunkResponse::new(LogChunk::new(LogStream::Stdout, 0, b"out".to_vec()).unwrap())
+            .unwrap(),
+    );
+    let stderr = canonical_line(
+        &LogChunkResponse::new(LogChunk::new(LogStream::Stderr, 0, Vec::new()).unwrap()).unwrap(),
+    );
+    let runner = RecordingRunner::returning(vec![
+        Ok(clap_missing_status_logs()),
+        Ok(result(status(0), &status_payload, b"")),
+        Ok(result(status(0), &stdout, b"")),
+        Ok(result(status(0), &stderr, b"")),
+        Ok(result(status(0), &status_payload, b"")),
+        Ok(result(status(0), &stdout, b"")),
+        Ok(result(status(0), &stderr, b"")),
+    ]);
+    let client = RemoteJobClient::new(&runner);
+
+    poll_status_and_logs(&client, &worker(), job_id).unwrap();
+    poll_status_and_logs(&client, &worker(), job_id).unwrap();
+
+    let requests = runner.requests();
+    let commands: Vec<&str> = requests.iter().map(host_command).collect();
+    assert_eq!(
+        commands,
+        vec![
+            HostOperation::StatusLogs.command(),
+            HostOperation::Status.command(),
+            HostOperation::LogChunk.command(),
+            HostOperation::LogChunk.command(),
+            HostOperation::Status.command(),
+            HostOperation::LogChunk.command(),
+            HostOperation::LogChunk.command(),
+        ]
+    );
+}
+
+#[test]
+fn truncated_json_status_logs_does_not_fallback() {
+    let submit = remote_submit(80_002, 10);
+    let job_id = submit.material().job_id();
+    let runner =
+        RecordingRunner::returning(vec![Ok(result(status(1), b"{\"protocol_version\":", b""))]);
+    let client = RemoteJobClient::new(&runner);
+
+    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Transport {
+            code: "HOST_REQUEST_FAILED",
+            ..
+        }
+    ));
+    assert_eq!(runner.requests().len(), 1);
+    assert_eq!(
+        host_command(&runner.requests()[0]),
+        HostOperation::StatusLogs.command()
+    );
+}
+
+#[test]
+fn host_json_error_status_logs_does_not_fallback() {
+    let submit = remote_submit(80_003, 10);
+    let job_id = submit.material().job_id();
+    let stdout = canonical_line(
+        &HostControlError::new("JOB_NOT_FOUND", "exact job has no queryable status").unwrap(),
+    );
+    let runner = RecordingRunner::returning(vec![Ok(result(status(1), &stdout, b""))]);
+    let client = RemoteJobClient::new(&runner);
+
+    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
+    assert!(
+        matches!(error, WorkerError::Protocol(ref message) if message.starts_with("JOB_NOT_FOUND:"))
+    );
+    assert_eq!(runner.requests().len(), 1);
+}
+
+#[test]
+fn request_optional_reports_unsupported_only_for_clap_missing_status_logs() {
+    let submit = remote_submit(80_004, 10);
+    let runner = RecordingRunner::returning(vec![Ok(clap_missing_status_logs())]);
+
+    let response = SshJsonTransport::new(&runner)
+        .request_optional::<_, StatusLogsResponse>(
+            &worker(),
+            HostOperation::StatusLogs,
+            &StatusLogsRequest::new(submit.material().job_id(), 0, 64, 0, 64),
+            policy(),
+        )
+        .unwrap();
+    assert_eq!(response, OptionalHostResponse::Unsupported);
+}
+
+#[test]
+fn nonempty_malformed_status_logs_stdout_does_not_fallback() {
+    let submit = remote_submit(80_005, 10);
+    let job_id = submit.material().job_id();
+    let runner = RecordingRunner::returning(vec![Ok(result(
+        status(2),
+        b"not-a-json-object",
+        b"error: unrecognized subcommand 'status-logs'\n",
+    ))]);
+    let client = RemoteJobClient::new(&runner);
+
+    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Transport {
+            code: "HOST_REQUEST_FAILED",
+            ..
+        }
+    ));
+    assert_eq!(runner.requests().len(), 1);
+}
+
+#[test]
+fn protocol_mismatch_status_logs_does_not_fallback() {
+    let submit = remote_submit(80_006, 10);
+    let job_id = submit.material().job_id();
+    let stdout = canonical_line(
+        &HostControlError::new("PROTOCOL_MISMATCH", "helper protocol version differs").unwrap(),
+    );
+    let runner = RecordingRunner::returning(vec![Ok(result(
+        status(1),
+        &stdout,
+        b"error: unrecognized subcommand 'status-logs'\n",
+    ))]);
+    let client = RemoteJobClient::new(&runner);
+
+    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
+    assert!(
+        matches!(error, WorkerError::Protocol(ref message) if message.starts_with("PROTOCOL_MISMATCH:"))
+    );
+    assert_eq!(runner.requests().len(), 1);
+}
+
+#[test]
+fn ssh_255_status_logs_does_not_fallback() {
+    let submit = remote_submit(80_007, 10);
+    let job_id = submit.material().job_id();
+    let runner = RecordingRunner::returning(vec![Ok(result(
+        status(255),
+        b"",
+        b"error: unrecognized subcommand 'status-logs'\n",
+    ))]);
+    let client = RemoteJobClient::new(&runner);
+
+    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Transport {
+            code: "SSH_UNAVAILABLE",
+            ..
+        }
+    ));
+    assert_eq!(runner.requests().len(), 1);
+}
+
+#[test]
+fn successful_invalid_json_status_logs_does_not_fallback() {
+    let submit = remote_submit(80_008, 10);
+    let job_id = submit.material().job_id();
+    let runner = RecordingRunner::returning(vec![Ok(result(status(0), b"{not-json", b""))]);
+    let client = RemoteJobClient::new(&runner);
+
+    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Transport {
+            code: "INVALID_RESPONSE",
+            ..
+        }
+    ));
+    assert_eq!(runner.requests().len(), 1);
+}
+
+#[test]
+fn unsupported_status_logs_on_one_worker_does_not_suppress_a_supported_peer() {
+    let old = remote_submit_on(80_009, 10, "mini-1");
+    let new = remote_submit_on(80_010, 11, "mini-2");
+    let old_worker = worker_named("mini-1", "mac1");
+    let new_worker = worker_named("mini-2", "mac2");
+    let sequential_status = canonical_line(&accepted_status(&old, 10));
+    let sequential_stdout = canonical_line(
+        &LogChunkResponse::new(LogChunk::new(LogStream::Stdout, 0, b"old".to_vec()).unwrap())
+            .unwrap(),
+    );
+    let sequential_stderr = canonical_line(
+        &LogChunkResponse::new(LogChunk::new(LogStream::Stderr, 0, Vec::new()).unwrap()).unwrap(),
+    );
+    let combined = canonical_line(
+        &StatusLogsResponse::new(
+            accepted_status(&new, 11),
+            LogChunk::new(LogStream::Stdout, 0, b"new".to_vec()).unwrap(),
+            LogChunk::new(LogStream::Stderr, 0, Vec::new()).unwrap(),
+        )
+        .unwrap(),
+    );
+    let runner = RecordingRunner::returning(vec![
+        Ok(clap_missing_status_logs()),
+        Ok(result(status(0), &sequential_status, b"")),
+        Ok(result(status(0), &sequential_stdout, b"")),
+        Ok(result(status(0), &sequential_stderr, b"")),
+        Ok(result(status(0), &combined, b"")),
+    ]);
+    let client = RemoteJobClient::new(&runner);
+
+    let old_logs = poll_status_and_logs(&client, &old_worker, old.material().job_id()).unwrap();
+    let new_logs = poll_status_and_logs(&client, &new_worker, new.material().job_id()).unwrap();
+    assert_eq!(old_logs.1.decoded_bytes().unwrap(), b"old");
+    assert_eq!(new_logs.1.decoded_bytes().unwrap(), b"new");
+
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(ssh_destination(&requests[0]), "mac1");
+    assert_eq!(
+        host_command(&requests[0]),
+        HostOperation::StatusLogs.command()
+    );
+    assert_eq!(ssh_destination(&requests[4]), "mac2");
+    assert_eq!(
+        host_command(&requests[4]),
+        HostOperation::StatusLogs.command()
+    );
 }

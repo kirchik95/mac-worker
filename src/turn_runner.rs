@@ -1283,37 +1283,38 @@ impl<'a> TurnRunner<'a> {
                     .clone();
                 self.persist_status(task_id, status.clone())?;
             }
-            let job = remote.status(worker, turn_id)?;
-            if job.meta().job_id() != turn_id
-                || job.meta().worker_name() != worker.name
-                || job.meta().client_id() != self.client_state.client_id()
-                || job.meta().project_id() != record.meta().project_id()
-                || job.meta().worktree_id() != record.meta().worktree_id()
-            {
-                return Err(task_error(
-                    "LOG_JOB_IDENTITY_MISMATCH",
-                    "remote job differs from the selected turn",
-                ));
-            }
-            if job.status().state().is_terminal() {
-                drain.set_terminal_status(&job)?;
-            }
+            let combined = remote.try_combined_status_and_logs(
+                worker,
+                turn_id,
+                drain.cursor(LogStream::Stdout).next_offset(),
+                LOG_CHUNK_LIMIT,
+                drain.cursor(LogStream::Stderr).next_offset(),
+                LOG_CHUNK_LIMIT,
+            )?;
             let mut progressed = false;
-            for stream in [LogStream::Stdout, LogStream::Stderr] {
-                let chunk = remote.log_chunk(
-                    worker,
-                    turn_id,
-                    stream,
-                    drain.cursor(stream).next_offset(),
-                    LOG_CHUNK_LIMIT,
-                )?;
-                let mut next = drain.clone();
-                next.observe_chunk(&chunk)?;
-                let bytes = chunk.decoded_bytes()?;
-                log.append_chunk(&chunk)?;
-                drain = next;
-                progressed |= !bytes.is_empty();
-                write_follower(follow, &bytes);
+            if let Some((job, stdout_chunk, stderr_chunk)) = combined {
+                self.validate_follow_job(&record, worker, turn_id, &job)?;
+                if job.status().state().is_terminal() {
+                    drain.set_terminal_status(&job)?;
+                }
+                progressed |= Self::apply_log_chunk(&mut drain, log, follow, stdout_chunk)?;
+                progressed |= Self::apply_log_chunk(&mut drain, log, follow, stderr_chunk)?;
+            } else {
+                let job = remote.status(worker, turn_id)?;
+                self.validate_follow_job(&record, worker, turn_id, &job)?;
+                if job.status().state().is_terminal() {
+                    drain.set_terminal_status(&job)?;
+                }
+                for stream in [LogStream::Stdout, LogStream::Stderr] {
+                    let chunk = remote.log_chunk(
+                        worker,
+                        turn_id,
+                        stream,
+                        drain.cursor(stream).next_offset(),
+                        LOG_CHUNK_LIMIT,
+                    )?;
+                    progressed |= Self::apply_log_chunk(&mut drain, log, follow, chunk)?;
+                }
             }
             if drain.cursor(LogStream::Stdout).is_drained()
                 && drain.cursor(LogStream::Stderr).is_drained()
@@ -1343,6 +1344,42 @@ impl<'a> TurnRunner<'a> {
                 .clone();
             self.persist_status(task_id, status.clone())?;
         }
+    }
+
+    fn validate_follow_job(
+        &self,
+        record: &LocalTaskRecord,
+        worker: &WorkerEntry,
+        turn_id: TurnId,
+        job: &crate::job::StatusResponse,
+    ) -> Result<(), WorkerError> {
+        if job.meta().job_id() != turn_id
+            || job.meta().worker_name() != worker.name
+            || job.meta().client_id() != self.client_state.client_id()
+            || job.meta().project_id() != record.meta().project_id()
+            || job.meta().worktree_id() != record.meta().worktree_id()
+        {
+            return Err(task_error(
+                "LOG_JOB_IDENTITY_MISMATCH",
+                "remote job differs from the selected turn",
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_log_chunk(
+        drain: &mut crate::job::TerminalLogDrain,
+        log: &mut LogWriter,
+        follow: &mut Option<&mut dyn Write>,
+        chunk: crate::job::LogChunk,
+    ) -> Result<bool, WorkerError> {
+        let mut next = drain.clone();
+        next.observe_chunk(&chunk)?;
+        let bytes = chunk.decoded_bytes()?;
+        log.append_chunk(&chunk)?;
+        *drain = next;
+        write_follower(follow, &bytes);
+        Ok(!bytes.is_empty())
     }
 
     fn persist_status(&self, task_id: TaskId, status: TaskStatus) -> Result<(), WorkerError> {

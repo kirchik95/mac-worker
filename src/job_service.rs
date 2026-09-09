@@ -18,7 +18,7 @@ use crate::{
         CancelRequest, CancelResponse, ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus,
         LeaseRecord, LeaseToken, LogChunk, LogStream, ProcessIdentity, RequestFingerprint,
         RequestFingerprintMaterial, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
-        StatusResponse, SubmitRequest, SubmitResponse,
+        StatusLogsRequest, StatusLogsResponse, StatusResponse, SubmitRequest, SubmitResponse,
     },
     lease::LeaseService,
     process::SystemProcessRunner,
@@ -709,6 +709,27 @@ impl<'a> JobService<'a> {
                 }
             })?;
         LogChunk::new(stream, offset, bytes)
+    }
+
+    pub fn status_logs(
+        &self,
+        request: &StatusLogsRequest,
+    ) -> Result<StatusLogsResponse, WorkerError> {
+        request.validate()?;
+        let status = self.status(request.job_id())?;
+        let stdout = self.read_log(
+            request.job_id(),
+            LogStream::Stdout,
+            request.stdout_offset(),
+            request.stdout_limit(),
+        )?;
+        let stderr = self.read_log(
+            request.job_id(),
+            LogStream::Stderr,
+            request.stderr_offset(),
+            request.stderr_limit(),
+        )?;
+        StatusLogsResponse::new(status, stdout, stderr)
     }
 
     pub fn reconcile_job(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {

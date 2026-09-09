@@ -268,6 +268,8 @@ pub enum HostCommand {
     Status,
     #[command(name = "log-chunk")]
     LogChunk,
+    #[command(name = "status-logs")]
+    StatusLogs,
     #[command(name = "resolve-or-abandon")]
     ResolveOrAbandon,
     Cancel,
