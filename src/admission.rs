@@ -632,7 +632,10 @@ mod tests {
         probe_entered: Mutex<Option<mpsc::Sender<()>>>,
         probe_release: Mutex<Option<mpsc::Receiver<()>>>,
         wait_before: Mutex<HashMap<String, mpsc::Receiver<()>>>,
+        wait_before_timeout: Mutex<HashMap<String, Duration>>,
+        notify_entered: Mutex<HashMap<String, mpsc::Sender<()>>>,
         notify_after: Mutex<HashMap<String, mpsc::Sender<()>>>,
+        observation_gate: Mutex<HashMap<String, ObservationGate>>,
         refresh_delay: Mutex<HashMap<String, Duration>>,
         herdr_interactive: Mutex<HashMap<String, u32>>,
     }
@@ -653,7 +656,10 @@ mod tests {
                 probe_entered: Mutex::new(None),
                 probe_release: Mutex::new(None),
                 wait_before: Mutex::new(HashMap::new()),
+                wait_before_timeout: Mutex::new(HashMap::new()),
+                notify_entered: Mutex::new(HashMap::new()),
                 notify_after: Mutex::new(HashMap::new()),
+                observation_gate: Mutex::new(HashMap::new()),
                 refresh_delay: Mutex::new(HashMap::new()),
                 herdr_interactive: Mutex::new(HashMap::new()),
             }
@@ -695,17 +701,50 @@ mod tests {
         }
 
         fn wait_before(&self, ssh: &str, release: mpsc::Receiver<()>) {
+            self.wait_before_for(ssh, release, Duration::from_secs(2));
+        }
+
+        fn wait_before_for(&self, ssh: &str, release: mpsc::Receiver<()>, timeout: Duration) {
             self.wait_before
                 .lock()
                 .unwrap()
                 .insert(ssh.to_owned(), release);
+            self.wait_before_timeout
+                .lock()
+                .unwrap()
+                .insert(ssh.to_owned(), timeout);
         }
 
+        fn notify_entered(&self, ssh: &str, entered: mpsc::Sender<()>) {
+            self.notify_entered
+                .lock()
+                .unwrap()
+                .insert(ssh.to_owned(), entered);
+        }
+
+        #[allow(dead_code)]
         fn notify_after(&self, ssh: &str, entered: mpsc::Sender<()>) {
             self.notify_after
                 .lock()
                 .unwrap()
                 .insert(ssh.to_owned(), entered);
+        }
+
+        fn wait_for_published_observation(
+            &self,
+            ssh: &str,
+            store: ClientStateStore,
+            worker_name: &str,
+            timeout: Duration,
+        ) {
+            self.observation_gate.lock().unwrap().insert(
+                ssh.to_owned(),
+                ObservationGate {
+                    store,
+                    worker_name: worker_name.to_owned(),
+                    timeout,
+                },
+            );
         }
     }
 
@@ -721,7 +760,8 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(request.policy.deadline);
-                if let Some(delay) = self.refresh_delay.lock().unwrap().get(&ssh).copied() {
+                let refresh_delay = self.refresh_delay.lock().unwrap().get(&ssh).copied();
+                if let Some(delay) = refresh_delay {
                     thread::sleep(delay);
                 }
                 return Ok(success(Vec::new()));
@@ -731,19 +771,38 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.policy.deadline);
-            if let Some(entered) = self.probe_entered.lock().unwrap().take() {
+            let entered = self.notify_entered.lock().unwrap().remove(&ssh);
+            if let Some(entered) = entered {
                 let _ = entered.send(());
             }
-            if let Some(release) = self.probe_release.lock().unwrap().as_ref() {
+            let entered = self.probe_entered.lock().unwrap().take();
+            if let Some(entered) = entered {
+                let _ = entered.send(());
+            }
+            let release = self.probe_release.lock().unwrap().take();
+            if let Some(release) = release {
                 let _ = release.recv();
             }
-            if let Some(wait) = self.wait_before.lock().unwrap().remove(&ssh) {
-                let _ = wait.recv_timeout(Duration::from_secs(2));
+            let wait_timeout = self
+                .wait_before_timeout
+                .lock()
+                .unwrap()
+                .remove(&ssh)
+                .unwrap_or(Duration::from_secs(2));
+            let observation_gate = self.observation_gate.lock().unwrap().remove(&ssh);
+            if let Some(gate) = observation_gate {
+                wait_until_published(&gate);
             }
-            if let Some(delay) = self.delay.lock().unwrap().get(&ssh).copied() {
+            let wait = self.wait_before.lock().unwrap().remove(&ssh);
+            if let Some(wait) = wait {
+                let _ = wait.recv_timeout(wait_timeout);
+            }
+            let delay = self.delay.lock().unwrap().get(&ssh).copied();
+            if let Some(delay) = delay {
                 thread::sleep(delay);
             }
-            if let Some(notify) = self.notify_after.lock().unwrap().remove(&ssh) {
+            let notify = self.notify_after.lock().unwrap().remove(&ssh);
+            if let Some(notify) = notify {
                 let _ = notify.send(());
             }
             if self
@@ -770,6 +829,32 @@ mod tests {
                 .unwrap_or(FactsKind::Authenticated);
             let interactive = self.herdr_interactive.lock().unwrap().get(&ssh).copied();
             Ok(success(probe_bytes(age, kind, interactive)))
+        }
+    }
+
+    struct ObservationGate {
+        store: ClientStateStore,
+        worker_name: String,
+        timeout: Duration,
+    }
+
+    fn wait_until_published(gate: &ObservationGate) {
+        let deadline = Instant::now() + gate.timeout;
+        loop {
+            if gate
+                .store
+                .peek_admission_observation(&gate.worker_name)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            thread::sleep(remaining.min(Duration::from_millis(5)));
         }
     }
 
@@ -981,20 +1066,22 @@ mod tests {
         runner.facts_age("mac1", FACTS_TTL.saturating_sub(100));
         runner.delay("mac1", Duration::from_millis(80));
         runner.delay("mac2", Duration::from_millis(60));
-        let (mac1_done_tx, mac1_done_rx) = mpsc::channel();
-        runner.notify_after("mac1", mac1_done_tx);
-        runner.wait_before("mac2", mac1_done_rx);
+        runner.wait_for_published_observation(
+            "mac2",
+            store.clone(),
+            "mini-1",
+            Duration::from_secs(2),
+        );
         runner.fail("mac2");
         let ranked =
             observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
+        let capabilities = ranked[0].capabilities().to_vec();
         assert!(ranked[0].ready());
         assert!(
-            ranked[0]
-                .capabilities()
+            capabilities
                 .iter()
                 .all(|capability| !capability.starts_with("agent:")),
-            "facts remaining life was 100ms; 80ms probe transit plus 60ms peer wait must strip agent caps, got {:?}",
-            ranked[0].capabilities()
+            "facts remaining life was 100ms; 80ms probe transit plus 60ms peer wait after final publish must strip agent caps, got {capabilities:?}"
         );
     }
 
@@ -1346,34 +1433,90 @@ mod tests {
         let mini2 = worker("mini-2", "mac2");
         let mini3 = worker("mini-3", "mac3");
         let config = config(vec![mini1.clone(), mini2.clone(), mini3.clone()]);
-        let now = now();
+        let planted_millis = now();
         store
-            .publish_admission_observation(bound_ready(&mini1, now.saturating_sub(1_500), Some(0)))
+            .publish_admission_observation(bound_ready(&mini1, planted_millis, Some(0)))
             .unwrap();
         store
-            .publish_admission_observation(bound_ready(&mini2, now.saturating_sub(1_900), Some(0)))
+            .publish_admission_observation(bound_ready(&mini2, planted_millis, Some(0)))
             .unwrap();
         let runner = ScriptedRunner::new();
-        runner.delay("mac2", Duration::from_millis(400));
-        runner.delay("mac3", Duration::from_millis(150));
         runner.fail("mac3");
         runner.facts_age("mac2", 0);
+        let (mac3_entered_tx, mac3_entered_rx) = mpsc::channel();
+        let (mac3_release_tx, mac3_release_rx) = mpsc::channel();
+        let (mac2_entered_tx, mac2_entered_rx) = mpsc::channel();
+        let (mac2_release_tx, mac2_release_rx) = mpsc::channel();
+        runner.notify_entered("mac3", mac3_entered_tx);
+        runner.wait_before("mac3", mac3_release_rx);
+        runner.notify_entered("mac2", mac2_entered_tx);
+        runner.wait_before_for(
+            "mac2",
+            mac2_release_rx,
+            Duration::from_millis(OBSERVATION_TTL_MILLIS + 500),
+        );
+        let store_for_stale = store.clone();
+        let mini2_for_stale = mini2.clone();
+        let coordinator = thread::spawn(move || {
+            mac3_entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("mini-3 miss wave must start before sibling timestamps are forced stale");
+            let current = store_for_stale
+                .peek_admission_observation("mini-2")
+                .unwrap()
+                .expect("mini-2 must still be the initial warm hit");
+            store_for_stale
+                .commit_admission_observation(
+                    "mini-2",
+                    Some(&current),
+                    bound_ready(
+                        &mini2_for_stale,
+                        now().saturating_sub(OBSERVATION_TTL_MILLIS + 1),
+                        Some(0),
+                    ),
+                )
+                .expect("CAS must force mini-2 stale; publish would drop an older timestamp");
+            mac3_release_tx
+                .send(())
+                .expect("release mini-3 after mini-2 is stale");
+            mac2_entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("expired mini-2 must re-enter the original round pool");
+            let expire_at = planted_millis + OBSERVATION_TTL_MILLIS;
+            if let Some(remaining) = expire_at.saturating_add(1).checked_sub(now()) {
+                thread::sleep(Duration::from_millis(remaining));
+            }
+            mac2_release_tx
+                .send(())
+                .expect("release mini-2 after mini-1's real outer TTL");
+        });
         let ranked =
             observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
+        coordinator
+            .join()
+            .expect("revisit fixture coordinator must finish");
+        let probes = runner.probes.lock().unwrap().clone();
+        let ranked_ready: Vec<_> = ranked
+            .iter()
+            .map(|candidate| (candidate.worker_name().to_owned(), candidate.ready()))
+            .collect();
+        assert_eq!(
+            probes,
+            ["mac3".to_owned(), "mac2".to_owned()],
+            "first wave is the forced miss; revisit probes only the staled sibling; probes={probes:?} ranked={ranked_ready:?}"
+        );
         assert!(
             !ranked[0].ready(),
-            "a cached hit that aged past the outer TTL during the revisit wave must not be reused"
+            "a cached hit that aged past the outer TTL during the revisit wave must not be reused; probes={probes:?} ranked={ranked_ready:?}"
         );
         assert!(
-            runner
-                .probes
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|ssh| ssh == "mac2"),
-            "the expired sibling hit must re-enter the original round pool"
+            ranked[1].ready(),
+            "the revisited sibling must publish a fresh ready observation; probes={probes:?} ranked={ranked_ready:?}"
         );
-        assert!(!ranked[2].ready());
+        assert!(
+            !ranked[2].ready(),
+            "offline miss must stay not ready; ranked={ranked_ready:?}"
+        );
     }
 
     #[test]
