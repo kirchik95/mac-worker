@@ -1,16 +1,18 @@
-# Isolated snapshot and dashboard lookup performance (2026-09-09)
+# Snapshot and dashboard lookup performance (2026-09-09)
 
-This records a **completed subset** of roadmap Stage 5, not the whole stage. Source was integrated only on `performance-validation-20260909`. Main was not mutated.
+This records a **completed subset** of roadmap Stage 5, not the whole stage. Implementation was validated on `performance-validation-20260909` at measured source `1c0bb51703c65587d25c658c046f236f671c6fab`. Later commits on that branch updated documentation only.
 
 ## What landed
 
-Cherry-picked onto starting base `69aa8a652633c9b1b708a180ca8e9b3a5e3730ab` (relevant implementation vs original baseline `7ea2bf355e840798623ff89c7fd995747464aa59` was empty). Trees of the three immutable commits match the cherry-picks.
+Cherry-picked onto starting base `69aa8a652633c9b1b708a180ca8e9b3a5e3730ab` (relevant implementation vs original baseline `7ea2bf355e840798623ff89c7fd995747464aa59` was empty). Reviewed changes are preserved in the cherry-picks. Root verified snapshot tree equality at `b4184a1` vs `41b02be` and lookup-scoped file equality at `1c0bb51` vs `45f02013`.
 
 | Immutable commit | Cherry-pick on this branch | Behavior |
 |---|---|---|
 | `1a11257a9befa5d3d834d00491cbebd157d4bdf1` | `3177fc66ec2835036f3836843e17b99b663561cb` | One NUL-framed `update-index --add -z --index-info` per nonempty `capture_tree`; H=0 skips `update-index` (`read-tree --empty` + `write-tree`). Scratch index cleanup restores owner-regular mode then `remove_owned_regular` for `{index}.lock` and `{index}`. |
 | `41b02be70527021f25af7baade4ac9d51a2d99e5` | `b4184a19d6ddfbf941364efd78446165f0b1ecec` | Per-`build_wip_base` memo: SHA-256 of freshly read bytes → Git blob OID. Both captures still inspect and read every selected non-directory. Mode comes from the current inspection and is not memoized. The map dies with the build. |
 | `45f02013da71ff809d8ad95777ba781c79bd573a` | `1c0bb51703c65587d25c658c046f236f671c6fab` | `MacWorkerTaskSource::owned_record` uses locked `ClientStateStore::load_task_optional`. Missing addressed JSON is `TASK_NOT_FOUND`. Missing/damaged `tasks/` and corrupt targets stay `IO`. Collection still uses `list_tasks()`. |
+
+**H** is all selected non-directory entries in one capture, including unchanged tracked files. **D** is the number of distinct fresh byte payloads across both captures of one `build_wip_base`. The A fixtures here have unique per-file payloads, so D=H.
 
 **Measured source HEAD** for CI and timings: `1c0bb51703c65587d25c658c046f236f671c6fab`.
 
@@ -22,7 +24,7 @@ Memory of the memo is digest keys, OID strings, and map/string overhead for dist
 
 This increment does **not** complete Stage 5 item 1 as written (first capture still runs `hash-object` per distinct content; there is no batched hash-object protocol), does not change admission/probes, and does not add no-op-write skipping, background observations, SSH multiplexing, or origin-delivery changes.
 
-Historical findings in [2026-09-08-architecture-and-flow-review.md](2026-09-08-architecture-and-flow-review.md) stay dated observations, not a rewrite of today’s source. An earlier `transfer_repo` green run that failed until `GIT_DIR` was unset was a contaminated fixture environment, not a current product regression. Unusual-name coverage uses `ls-tree -r -z`; it does not demonstrate that old `--cacheinfo` dropped comma filenames.
+Dated findings in [2026-09-08-architecture-and-flow-review.md](2026-09-08-architecture-and-flow-review.md) remain historical. Unusual-name coverage uses NUL-safe `ls-tree -r -z` + `cat-file`.
 
 ## Commands and evidence
 
@@ -36,11 +38,11 @@ Artifact root: `/private/tmp/mac-worker-performance-implementation-hq98vgb7`. Th
 | A: `STAGE5_COUNT_CONTRACT=optimized` `--exact stage5_validation_a --test-threads=1` (release) | `logs/measure-a-optimized.log` | 0 |
 | B: same pin, `--exact stage5_baseline_b` | `logs/measure-b-optimized.log` | 0 |
 
-Full Rust on `1c0bb51`: **67** `Running` target headers and **67** unfiltered `test result: ok` rows; **1710** passed, **0** failed, **0** ignored. Three filtered helper-subprocess result rows are excluded from that total. Command wall ~797.8 s (`logs/ci-test-all-targets.*`). Do not copy the older Stage 4 figure of 1615 / 738.252 s. No UI rebuild. GitHub Actions and the live pool were not run.
+Full Rust on `1c0bb51`: **67** `Running` target headers and **67** unfiltered `test result: ok` rows; **1710** passed, **0** failed, **0** ignored. Three filtered helper-subprocess result rows are excluded from that total. Command wall ~797.8 s (`logs/ci-test-all-targets.*`). No UI rebuild. GitHub Actions and the live pool were not run.
 
 Harness and JSON: `validation-optimized/stage5_performance_probe.rs` SHA256 `58d8be876096caf53ceb050c15cc860b8c3d18bd09956cf501558aac16565ed6`; `validation-a-results.json` `46b109cb303026733a0ad7759aa93551cfc608bd210b7172b0d792beaacab7af`; `validation-b-results.json` `524f5731a74ea5a6159f4909e4e24566358b614234b207170ff3201231d12f7d`; combined `validation-results.json` `f866e030dfd46ae3fb98bf5891aa5ee86c6ec390d3a8372ca95a9b853d43a4d8`. Before-values are the immutable accepted baseline at `7ea2bf3` (`/private/tmp/mac-worker-performance-baseline-e6vwxdie`), not a rerun of old A/B/C.
 
-**Metadata erratum (do not treat as a timing defect):** top-level `original_baseline_commit` / `starting_base_commit` / `measured_commit` in the executed JSON are `7ea2bf3` / `69aa8a6` / `1c0bb51`. Nested `count_contract.baseline.measured_starting_base` was filled from `MEASURED_COMMIT` (`1c0bb51`); the intended starting-base label is `69aa8a6`. Raw capture is preserved; this document uses the correct top-level IDs. No timing rerun for the label.
+**Metadata erratum (label only, not a timing defect):** in executed `validation-a-results.json`, each `series[*].counts_separate_pass.count_contract.baseline.measured_starting_base` is `1c0bb51`; the same nested field appears under `a.series` in `validation-results.json`. The intended starting-base value is `69aa8a6`. Correct IDs are in combined top-level fields and `commits.*`. All executed/raw files are preserved unchanged. No timing rerun.
 
 Host during combined B metadata: Darwin 25.2.0 arm64, ncpu 16, rustc 1.98.0, git 2.50.1 (Apple Git-155), loadavg `{ 7.24 9.03 12.43 }`. Load was uncontrolled.
 
@@ -48,7 +50,7 @@ Host during combined B metadata: Darwin 25.2.0 arm64, ncpu 16, rustc 1.98.0, git
 
 Wall samples are 1 discarded warmup + `repeats_for(pilot)` measured; median is the even-sample arithmetic mean of the two central values when `n` is even. A times only `build_wip_base`. B does not include setup in request timers. Count pass is separate (`CountingRunner`); wall uses `SystemProcessRunner`. `STAGE5_COUNT_CONTRACT=optimized` asserted labelled D / 2-or-0, not counts inferred after the fact.
 
-Unique-payload fixtures: D=H. Observed counts matched that labelled contract: H=0 → 0 hash-object, 0 update-index (17 other git); H=100 → 100 / 2 (121 git); H=1000 → 1000 / 2 (1021 git). Correctness (NUL-safe `ls-tree -z` + `cat-file`) passed.
+Observed counts matched that labelled contract: H=0 → 0 hash-object, 0 update-index (17 other git); H=100 → 100 / 2 (121 git); H=1000 → 1000 / 2 (1021 git). Correctness (NUL-safe `ls-tree -z` + `cat-file`) passed.
 
 ### A — reused clean / empty WIP (`build_wip_base`)
 
@@ -62,7 +64,7 @@ H=0 got slower on this host. Extra scratch cleanup and different load were **not
 
 ### B — Closed tasks, fake remote, durable turn dirs
 
-Byte equality held on the 1 MiB drain (16 chunks / 16 log requests). Closed `task_detail` asserted 0 remote `task_status` calls.
+Every B cell is n=5 (one discarded warmup plus five measured samples). Byte equality held on the 1 MiB drain (16 chunks / 16 log requests). Closed `task_detail` asserted 0 remote `task_status` calls. The one-chunk timer excludes consumer base64 decode (decode is after `Instant`). The 1 MiB drain timer includes decode while assembling bytes.
 
 | N | Call | Before `7ea2bf3` median | After `1c0bb51` median |
 |---|---|---|---|
@@ -82,6 +84,5 @@ Detail/log no longer scale with history size in this fixture; collection/`list_t
 
 ## Caveats
 
-- Isolated branch only; await root for main integration.
 - Do not quote a raw sample as a median; do not include fixture setup in request time.
-- No claim that all Stage 5 work is done.
+- Stage 5 as a whole is not done: remaining items are still the hashed-object protocol, admission/probes, no-op-write skipping, background observations, SSH multiplexing, and origin delivery.
