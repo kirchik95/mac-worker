@@ -760,15 +760,15 @@ fn collector_stop_and_restart_does_not_overlap_collectors() {
         .with_collection_interval(Duration::from_secs(60)),
     );
     let first = service.start_background_collection().unwrap();
-    wait_for_worker_calls(&source, 1, Duration::from_secs(2));
+    let first_snapshot = wait_for_read(&service, Duration::from_secs(2));
     let after_first = source.worker_call_count();
-    let first_revision = service.read_snapshot().unwrap().revision;
+    assert!(after_first >= 1);
+    let first_revision = first_snapshot.revision;
     first.join();
     thread::sleep(Duration::from_millis(50));
     assert_eq!(source.worker_call_count(), after_first);
     let second = service.start_background_collection().unwrap();
-    wait_for_worker_calls(&source, after_first + 1, Duration::from_secs(2));
-    let restarted = service.read_snapshot().unwrap();
+    let restarted = wait_for_revision(&service, first_revision, Duration::from_secs(2));
     assert!(
         restarted.revision > first_revision,
         "restarted collector reused revision {} after {first_revision}",
@@ -802,6 +802,7 @@ fn collector_stop_without_join_does_not_leave_a_recurring_orphan() {
     thread::sleep(Duration::from_millis(40));
     assert_eq!(source.worker_call_count(), 1);
     gate.release();
+    let published = wait_for_read(&service, Duration::from_secs(2));
     thread::sleep(Duration::from_millis(120));
     assert_eq!(
         source.worker_call_count(),
@@ -810,7 +811,8 @@ fn collector_stop_without_join_does_not_leave_a_recurring_orphan() {
     );
 
     let second = service.start_background_collection().unwrap();
-    wait_for_worker_calls(&source, 2, Duration::from_secs(2));
+    let restarted = wait_for_revision(&service, published.revision, Duration::from_secs(2));
+    assert!(restarted.revision > published.revision);
     assert!(source.worker_call_count() >= 2);
     second.join();
     assert_read_only(&source);
@@ -828,7 +830,7 @@ fn collector_drop_stops_future_collection() {
         .with_collection_interval(Duration::from_millis(20)),
     );
     let collector = service.start_background_collection().unwrap();
-    wait_for_worker_calls(&source, 1, Duration::from_secs(2));
+    let _ = wait_for_read(&service, Duration::from_secs(2));
     let after_start = source.worker_call_count();
     drop(collector);
     thread::sleep(Duration::from_millis(120));
@@ -894,19 +896,30 @@ where
     }
 }
 
-fn wait_for_worker_calls(source: &FakeSource, target: usize, timeout: Duration) {
+fn wait_for_revision<S, C, M>(
+    service: &DashboardService<S, C, M>,
+    min_revision: u64,
+    timeout: Duration,
+) -> DashboardSnapshot
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
     let deadline = Instant::now() + timeout;
     loop {
-        if source.worker_call_count() >= target {
-            return;
+        match service.read_snapshot() {
+            Ok(snapshot) if snapshot.revision > min_revision => return snapshot,
+            Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) if error.code == SNAPSHOT_PENDING && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(snapshot) => panic!(
+                "collector snapshot stayed at revision {} (wanted > {min_revision})",
+                snapshot.revision
+            ),
+            Err(error) => panic!("read_snapshot failed: {} {}", error.code, error.message),
         }
-        if Instant::now() >= deadline {
-            panic!(
-                "collector calls stayed at {} (wanted {target})",
-                source.worker_call_count()
-            );
-        }
-        thread::sleep(Duration::from_millis(10));
     }
 }
 
