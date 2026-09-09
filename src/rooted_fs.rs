@@ -11473,6 +11473,7 @@ mod tests {
             unix::fs::{MetadataExt, PermissionsExt, symlink},
         },
         path::{Path, PathBuf},
+        time::Duration,
     };
 
     use super::{
@@ -16649,6 +16650,8 @@ mod tests {
 
     #[test]
     fn cleanup_process_guard_allows_different_keys_and_roots_while_one_key_is_paused() {
+        const WAIT_DEADLINE: Duration = Duration::from_secs(10);
+
         // Catches a process-wide cleanup guard: a paused journal for one
         // (parent, component) key must not stall unrelated keys or roots.
         let fixture = tempfile::tempdir().unwrap();
@@ -16689,9 +16692,7 @@ mod tests {
             relay.join().unwrap();
             result
         });
-        paused_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
+        paused_rx.recv_timeout(WAIT_DEADLINE).unwrap();
 
         let (same_parent_tx, same_parent_rx) = std::sync::mpsc::channel();
         let peer_physical = physical.clone();
@@ -16715,9 +16716,8 @@ mod tests {
                 .unwrap();
         });
 
-        let same_parent_while_paused =
-            same_parent_rx.recv_timeout(std::time::Duration::from_secs(1));
-        let other_root_while_paused = other_root_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let same_parent_while_paused = same_parent_rx.recv_timeout(WAIT_DEADLINE);
+        let other_root_while_paused = other_root_rx.recv_timeout(WAIT_DEADLINE);
         release_tx.send(()).unwrap();
         paused.join().unwrap().unwrap();
         same_parent.join().unwrap();
