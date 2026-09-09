@@ -352,7 +352,7 @@ warning: invalid byte "#
     let rendered = fixture.logs(None, false).unwrap();
     assert_eq!(
         rendered,
-        "working\nevent: turn_accepted\nwarning: invalid byte \u{fffd}\n".as_bytes()
+        "working\naccepted\nwarning: invalid byte \u{fffd}\n".as_bytes()
     );
     assert!(
         !String::from_utf8_lossy(&rendered).contains("do not render"),

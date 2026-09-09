@@ -230,3 +230,61 @@ fn json_without_a_type_uses_the_unrecognised_key() {
         "event: unrecognised\n"
     );
 }
+
+#[test]
+fn turn_accepted_names_the_inventory_worker() {
+    let log = concat!(
+        "{\"type\":\"turn_accepted\",\"protocol_version\":6,",
+        "\"task_id\":\"secret-task\",\"turn_id\":\"secret-turn\",",
+        "\"worker\":\"mini-2\",\"prompt\":\"do the private thing\"}\n",
+    );
+    for agent in [
+        AgentKind::Codex,
+        AgentKind::Claude,
+        AgentKind::Cursor,
+        AgentKind::Opencode,
+    ] {
+        let rendered = render(agent, log);
+        assert_eq!(rendered, "accepted by mini-2\n");
+        assert!(
+            !rendered.contains("secret-task")
+                && !rendered.contains("secret-turn")
+                && !rendered.contains("do the private thing"),
+            "framing payloads leaked: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn turn_accepted_without_a_worker_renders_accepted() {
+    let log = "{\"type\":\"turn_accepted\",\"private_metadata\":\"do not render\"}\n";
+    let rendered = render(AgentKind::Codex, log);
+    assert_eq!(rendered, "accepted\n");
+    assert!(
+        !rendered.contains("do not render"),
+        "framing payloads leaked: {rendered}"
+    );
+}
+
+#[test]
+fn turn_terminal_is_omitted_and_flushes_the_unrecognised_fold() {
+    let log = concat!(
+        "{\"type\":\"rate_limit\"}\n",
+        "{\"type\":\"turn_accepted\",\"worker\":\"mini-2\"}\n",
+        "{\"type\":\"rate_limit\"}\n",
+        "{\"type\":\"turn_terminal\",\"task_id\":\"secret-task\",",
+        "\"outcome\":{\"kind\":\"failed\",\"reason\":\"agent exited 1\"}}\n",
+        "{\"type\":\"rate_limit\"}\n",
+    );
+    let rendered = render(AgentKind::Codex, log);
+    assert_eq!(
+        rendered,
+        "event: rate_limit\naccepted by mini-2\nevent: rate_limit\nevent: rate_limit\n"
+    );
+    assert!(
+        !rendered.contains("secret-task")
+            && !rendered.contains("agent exited 1")
+            && !rendered.contains("turn_terminal"),
+        "turn_terminal must not print its payload: {rendered}"
+    );
+}

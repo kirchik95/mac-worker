@@ -22,6 +22,9 @@ use crate::{
 /// be able to spill a prompt, path, or a multi-line payload into the log.
 const MAX_EVENT_IDENT_CHARS: usize = 40;
 
+/// Longest inventory worker name printed from a `turn_accepted` line.
+const MAX_WORKER_NAME_CHARS: usize = 128;
+
 /// Renders `bytes` of a turn's runner log as human-readable lines.
 ///
 /// Every line the agent's adapter recognises is printed as a one-line summary
@@ -34,11 +37,12 @@ const MAX_EVENT_IDENT_CHARS: usize = 40;
 /// Only those two short identifiers are printed, never any payload.
 ///
 /// Consecutive unrecognised lines with the same key fold into one rendered
-/// line. The fold is flushed when the key changes, when a recognised event or
-/// a plain-text line is rendered, and at the end of `bytes`. Each call is
-/// independent: `task logs -f` and `follow-turn` render in chunks, so a run
-/// that straddles two polls may print twice. That is acceptable; keeping fold
-/// state across polls would hide the latest key until a later event arrived.
+/// line. The fold is flushed when the key changes, when a recognised event,
+/// a mac-worker framing event, or a plain-text line is rendered, and at the
+/// end of `bytes`. Each call is independent: `task logs -f` and `follow-turn`
+/// render in chunks, so a run that straddles two polls may print twice. That
+/// is acceptable; keeping fold state across polls would hide the latest key
+/// until a later event arrived.
 pub fn render_agent_log(
     bytes: &[u8],
     agent: AgentKind,
@@ -48,6 +52,13 @@ pub fn render_agent_log(
     let adapter = adapter_for(agent);
     let mut fold = None;
     for line in text.lines() {
+        if let Some(framing) = mac_worker_framing_line(line) {
+            flush_unrecognised(&mut fold, stdout)?;
+            if let FramingLine::Print(text) = framing {
+                writeln!(stdout, "{text}")?;
+            }
+            continue;
+        }
         if let Some(event) = adapter.parse_event(line) {
             flush_unrecognised(&mut fold, stdout)?;
             writeln!(stdout, "{}", render_event(event))?;
@@ -73,6 +84,52 @@ pub fn render_agent_log(
         fold = Some(UnrecognisedFold { key, count: 1 });
     }
     flush_unrecognised(&mut fold, stdout)
+}
+
+/// A rendered mac-worker framing line, or silence for `turn_terminal`.
+enum FramingLine {
+    Print(String),
+    Silent,
+}
+
+/// mac-worker's own protocol events, written by `src/turn_runner.rs`
+/// `append_event` (do not change the writer). They are not agent events and
+/// are recognised here before adapter parsing, independent of the agent kind.
+///
+/// `turn_accepted` prints `accepted by <worker>` from the inventory `worker`
+/// field only, or `accepted` when that field is missing. `turn_terminal` is
+/// omitted: the caller already prints the outcome line (`completed` /
+/// `turn N failed`). Only the worker name may reach the pane — never task
+/// ids, turn ids, paths, prompts, or payloads.
+fn mac_worker_framing_line(line: &str) -> Option<FramingLine> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    match value.get("type").and_then(Value::as_str) {
+        Some("turn_accepted") => Some(FramingLine::Print(render_turn_accepted(&value))),
+        Some("turn_terminal") => Some(FramingLine::Silent),
+        _ => None,
+    }
+}
+
+fn render_turn_accepted(value: &Value) -> String {
+    match value
+        .get("worker")
+        .and_then(Value::as_str)
+        .and_then(inventory_worker_name)
+    {
+        Some(worker) => format!("accepted by {worker}"),
+        None => "accepted".into(),
+    }
+}
+
+/// Accepts only an inventory worker name. Anything else on the field is
+/// payload and must not be printed.
+fn inventory_worker_name(raw: &str) -> Option<&str> {
+    if raw.is_empty() || raw.len() > MAX_WORKER_NAME_CHARS {
+        return None;
+    }
+    raw.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'))
+        .then_some(raw)
 }
 
 fn render_event(event: AgentEvent) -> String {
