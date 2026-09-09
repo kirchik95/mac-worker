@@ -447,6 +447,7 @@ fn candidate_at_return(
         observation.available_memory_bytes(),
         observation.free_disk_bytes(),
     )
+    .map(|candidate| candidate.with_interactive_agents(observation.interactive_agents()))
     .map_err(|_| WorkerError::Protocol("cached scheduler observation is invalid".into()))
 }
 
@@ -506,7 +507,7 @@ fn admission_from_health(
         .into_iter()
         .next()
         .ok_or_else(|| WorkerError::Protocol("worker probe was empty".into()))?;
-    AdmissionObservation::new(
+    Ok(AdmissionObservation::new(
         candidate.worker_name().to_owned(),
         candidate.ready(),
         candidate.slot(),
@@ -514,7 +515,8 @@ fn admission_from_health(
         candidate.available_memory_bytes(),
         candidate.free_disk_bytes(),
         observed_at,
-    )
+    )?
+    .with_interactive_agents(candidate.interactive_agents()))
 }
 
 fn negative_bound_observation(worker: &WorkerEntry) -> Result<AdmissionObservation, WorkerError> {
@@ -597,7 +599,9 @@ mod tests {
     };
 
     use crate::{
-        agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
+        agent_facts::{
+            AgentAuth, AgentFacts, AgentProbe, HerdrFactState, HerdrFacts, ProfileProbe,
+        },
         client_state::ClientStateStore,
         job::AdmissionObservation,
         lease::SlotState,
@@ -630,6 +634,7 @@ mod tests {
         wait_before: Mutex<HashMap<String, mpsc::Receiver<()>>>,
         notify_after: Mutex<HashMap<String, mpsc::Sender<()>>>,
         refresh_delay: Mutex<HashMap<String, Duration>>,
+        herdr_interactive: Mutex<HashMap<String, u32>>,
     }
 
     impl ScriptedRunner {
@@ -650,6 +655,7 @@ mod tests {
                 wait_before: Mutex::new(HashMap::new()),
                 notify_after: Mutex::new(HashMap::new()),
                 refresh_delay: Mutex::new(HashMap::new()),
+                herdr_interactive: Mutex::new(HashMap::new()),
             }
         }
 
@@ -662,6 +668,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(ssh.to_owned(), delay);
+        }
+
+        fn herdr_interactive(&self, ssh: &str, count: u32) {
+            self.herdr_interactive
+                .lock()
+                .unwrap()
+                .insert(ssh.to_owned(), count);
         }
 
         fn fail(&self, ssh: &str) {
@@ -755,7 +768,8 @@ mod tests {
                 .get(&ssh)
                 .copied()
                 .unwrap_or(FactsKind::Authenticated);
-            Ok(success(probe_bytes(age, kind)))
+            let interactive = self.herdr_interactive.lock().unwrap().get(&ssh).copied();
+            Ok(success(probe_bytes(age, kind, interactive)))
         }
     }
 
@@ -791,7 +805,16 @@ mod tests {
         }
     }
 
-    fn probe_bytes(facts_age: Option<u64>, kind: FactsKind) -> Vec<u8> {
+    fn probe_bytes(
+        facts_age: Option<u64>,
+        kind: FactsKind,
+        interactive_agents: Option<u32>,
+    ) -> Vec<u8> {
+        let herdr = interactive_agents.map(|count| HerdrFacts {
+            state: HerdrFactState::Available,
+            version: Some("1.0.0".into()),
+            interactive_agents: Some(count),
+        });
         let agent_facts = match kind {
             FactsKind::Missing => None,
             FactsKind::Authenticated => Some(AgentFacts {
@@ -807,7 +830,7 @@ mod tests {
                 }],
                 git_identity: true,
                 collected_at_millis: 1,
-                herdr: None,
+                herdr: herdr.clone(),
             }),
             FactsKind::Unauthenticated => Some(AgentFacts {
                 agents: vec![AgentProbe {
@@ -822,7 +845,7 @@ mod tests {
                 }],
                 git_identity: true,
                 collected_at_millis: 1,
-                herdr: None,
+                herdr,
             }),
         };
         let probe = ProbeResponse {
@@ -1256,6 +1279,36 @@ mod tests {
             "ready row without facts must miss and refresh, not skip SSH"
         );
         assert!(!runner.refreshes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn herdr_interactive_count_survives_probe_disk_and_warm_reuse() {
+        let (_dir, store) = temp_store();
+        let mini1 = worker("mini-1", "mac1");
+        let config = config(vec![mini1.clone()]);
+        let runner = ScriptedRunner::new();
+        runner.facts_age("mac1", 0);
+        runner.herdr_interactive("mac1", 3);
+        let first =
+            observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
+        assert_eq!(first[0].interactive_agents(), Some(3));
+        let stored = store.peek_admission_observation("mini-1").unwrap().unwrap();
+        assert_eq!(stored.interactive_agents(), Some(3));
+        let text = serde_json::to_string(&stored).unwrap();
+        assert!(text.contains(r#""interactive_agents":3"#), "{text}");
+        assert!(text.contains(r#""ssh":"mac1""#), "{text}");
+        let back: AdmissionObservation = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, stored);
+        let probes = runner.probes.lock().unwrap().len();
+        assert_eq!(probes, 1);
+        let second =
+            observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
+        assert_eq!(second[0].interactive_agents(), Some(3));
+        assert_eq!(
+            runner.probes.lock().unwrap().len(),
+            probes,
+            "bound Herdr count must skip SSH inside the outer TTL"
+        );
     }
 
     #[test]
