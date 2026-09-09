@@ -1733,7 +1733,7 @@ fn workers_output_renders_the_herdr_line_for_every_state_after_the_agents_block(
 }
 
 #[test]
-fn workers_output_renders_herdr_unknown_when_facts_are_missing_stale_or_predate_the_fact() {
+fn workers_output_renders_herdr_unknown_when_facts_are_missing_or_predate_the_fact() {
     let available = HerdrFacts {
         state: HerdrFactState::Available,
         version: Some("0.9.0".into()),
@@ -1744,13 +1744,6 @@ fn workers_output_renders_herdr_unknown_when_facts_are_missing_stale_or_predate_
         (
             "facts predating the fact",
             herdr_health(Some(facts_with_herdr(None)), Some(0)),
-        ),
-        (
-            "stale facts",
-            herdr_health(
-                Some(facts_with_herdr(Some(available.clone()))),
-                Some(FACTS_TTL + 1),
-            ),
         ),
         (
             "facts without a reported age",
@@ -1764,6 +1757,17 @@ fn workers_output_renders_herdr_unknown_when_facts_are_missing_stale_or_predate_
         );
         assert_eq!(rendered.matches("herdr:").count(), 1, "{label}: {rendered}");
     }
+
+    let (stale, _) = render_workers(herdr_health(
+        Some(facts_with_herdr(Some(available.clone()))),
+        Some(4_120_000),
+    ));
+    assert!(
+        stale
+            .lines()
+            .any(|line| line == "  herdr: available (0.9.0), stale 69m"),
+        "stale facts keep the last collected fact: {stale}"
+    );
 
     let (fresh, _) = render_workers(herdr_health(
         Some(facts_with_herdr(Some(available))),

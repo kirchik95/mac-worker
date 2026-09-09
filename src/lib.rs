@@ -637,8 +637,21 @@ pub fn run_with_stdio_in_context(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
-    if let Command::Dashboard { port, no_open } = cli.command {
-        return run_dashboard_command(cli.config, runtime, port, no_open, stdout, stderr);
+    if let Command::Dashboard {
+        port,
+        no_open,
+        no_facts_refresh,
+    } = cli.command
+    {
+        return run_dashboard_command(
+            cli.config,
+            runtime,
+            port,
+            no_open,
+            !no_facts_refresh,
+            stdout,
+            stderr,
+        );
     }
     if matches!(cli.command, Command::Run { .. } | Command::Logs { .. }) {
         return run_public_streaming_command(cli, runner, runtime, stdout, stderr);
@@ -662,6 +675,7 @@ fn run_dashboard_command(
     runtime: &RuntimeContext,
     port: Option<u16>,
     no_open: bool,
+    refresh_stale_facts: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
@@ -670,10 +684,13 @@ fn run_dashboard_command(
         let config = std::sync::Arc::new(Config::load(&paths.config)?);
         let client_state = std::sync::Arc::new(ClientStateStore::open(&paths.state)?);
         let launch_directory = runtime.current_dir().ok();
-        let launcher = SystemDashboardLauncher::from_system_for_directory(
+        let launcher = SystemDashboardLauncher::from_system_with_config(
             config,
             client_state,
             launch_directory.as_deref(),
+            crate::dashboard::service::DashboardConfig {
+                refresh_stale_facts,
+            },
         );
         let opener = SystemBrowserOpener;
         let async_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -681,7 +698,11 @@ fn run_dashboard_command(
             .build()
             .map_err(WorkerError::Io)?;
         async_runtime.block_on(run_dashboard(
-            DashboardCommandRequest::new(port, no_open),
+            DashboardCommandRequest {
+                port,
+                no_open,
+                refresh_stale_facts,
+            },
             &launcher,
             &opener,
             Box::pin(async {

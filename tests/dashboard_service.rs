@@ -27,6 +27,7 @@ use mac_worker::{
         },
         source::project_worker,
     },
+    error::WorkerError,
     job::JobId,
     lease::SlotState,
     protocol::{
@@ -695,6 +696,108 @@ fn a_panicking_completion_clock_does_not_consume_a_revision() {
     assert_eq!(recovered.generated_at_millis, 900);
 }
 
+#[test]
+fn stale_worker_triggers_exactly_one_refresh_per_ttl_across_repeated_collections() {
+    let source = FakeSource::new();
+    source.set_workers(vec![WorkerObservationResult::Current(
+        stale_facts_observation(),
+    )]);
+    let wall = ManualClock::new(10_000);
+    let service = DashboardService::new(source.clone(), wall.clone(), ManualMonotonic::new(0));
+
+    let snapshot = service.snapshot(Default::default()).unwrap();
+    assert_eq!(snapshot.workers[0].name, "mini-1");
+    source.wait_for_refresh_calls(1);
+
+    let _ = service.snapshot(Default::default()).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(source.refresh_calls(), vec!["mini-1"]);
+
+    wall.set(10_000 + FACTS_TTL + 1);
+    let _ = service.snapshot(Default::default()).unwrap();
+    source.wait_for_refresh_calls(2);
+    assert_eq!(source.refresh_calls(), vec!["mini-1", "mini-1"]);
+}
+
+#[test]
+fn a_failed_stale_facts_refresh_is_not_retried_before_the_ttl() {
+    let source = FakeSource::new();
+    source.set_workers(vec![WorkerObservationResult::Current(
+        stale_facts_observation(),
+    )]);
+    source.set_refresh_fail(true);
+    let service = service(source.clone());
+
+    let _ = service.snapshot(Default::default()).unwrap();
+    source.wait_for_refresh_calls(1);
+    let _ = service.snapshot(Default::default()).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(source.refresh_calls(), vec!["mini-1"]);
+}
+
+#[test]
+fn stale_facts_refresh_does_not_block_or_shrink_the_snapshot() {
+    let source = FakeSource::new();
+    source.set_workers(vec![WorkerObservationResult::Current(
+        stale_facts_observation(),
+    )]);
+    let gate = Arc::new(Gate::default());
+    source.set_refresh_gate(Some(Arc::clone(&gate)));
+    let service = Arc::new(service(source.clone()));
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let snapshot_service = Arc::clone(&service);
+    thread::spawn(move || {
+        done_tx
+            .send(snapshot_service.snapshot(Default::default()))
+            .ok();
+    });
+    gate.wait_until_entered();
+    let snapshot = done_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("snapshot must not wait for the facts refresh")
+        .unwrap();
+    assert_eq!(snapshot.workers[0].name, "mini-1");
+    assert_eq!(source.refresh_calls(), vec!["mini-1"]);
+    gate.release();
+}
+
+#[test]
+fn no_facts_refresh_flag_disables_stale_facts_refresh() {
+    let source = FakeSource::new();
+    source.set_workers(vec![WorkerObservationResult::Current(
+        stale_facts_observation(),
+    )]);
+    let service = DashboardService::new(
+        source.clone(),
+        ManualClock::new(10_000),
+        ManualMonotonic::new(0),
+    )
+    .with_refresh_stale_facts(false);
+
+    let _ = service.snapshot(Default::default()).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert!(source.refresh_calls().is_empty());
+}
+
+#[test]
+fn unreachable_workers_are_not_refreshed() {
+    let source = FakeSource::new();
+    source.set_workers(vec![WorkerObservationResult::Failed {
+        worker_name: "mini-1".into(),
+        error: error("SSH_UNAVAILABLE", "worker is unreachable"),
+    }]);
+    let service = service(source.clone());
+
+    let _ = service.snapshot(Default::default()).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert!(source.refresh_calls().is_empty());
+}
+
+fn stale_facts_observation() -> Observation {
+    project_worker(&worker_with_facts(1, FACTS_TTL + 1), 10_000).unwrap()
+}
+
 fn service(source: FakeSource) -> DashboardService<FakeSource, ManualClock, ManualMonotonic> {
     DashboardService::new(source, ManualClock::new(10_000), ManualMonotonic::new(0))
 }
@@ -894,6 +997,10 @@ struct FakeSourceState {
     monotonic: Mutex<Option<ManualMonotonic>>,
     worker_advance: AtomicU64,
     finish_wall: Mutex<Option<(ManualClock, u64)>>,
+    refresh_calls: Mutex<Vec<String>>,
+    refresh_calls_changed: Condvar,
+    refresh_fail: AtomicBool,
+    refresh_gate: Mutex<Option<Arc<Gate>>>,
 }
 
 impl FakeSource {
@@ -919,6 +1026,10 @@ impl FakeSource {
             monotonic: Mutex::new(None),
             worker_advance: AtomicU64::new(0),
             finish_wall: Mutex::new(None),
+            refresh_calls: Mutex::new(Vec::new()),
+            refresh_calls_changed: Condvar::new(),
+            refresh_fail: AtomicBool::new(false),
+            refresh_gate: Mutex::new(None),
         }))
     }
 
@@ -978,6 +1089,25 @@ impl FakeSource {
     fn worker_call_count(&self) -> usize {
         self.0.worker_calls.load(Ordering::SeqCst)
     }
+
+    fn set_refresh_fail(&self, fail: bool) {
+        self.0.refresh_fail.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_refresh_gate(&self, gate: Option<Arc<Gate>>) {
+        *lock(&self.0.refresh_gate) = gate;
+    }
+
+    fn refresh_calls(&self) -> Vec<String> {
+        lock(&self.0.refresh_calls).clone()
+    }
+
+    fn wait_for_refresh_calls(&self, target: usize) {
+        let mut calls = lock(&self.0.refresh_calls);
+        while calls.len() < target {
+            calls = wait(&self.0.refresh_calls_changed, calls);
+        }
+    }
 }
 
 impl DashboardDataSource for FakeSource {
@@ -1020,6 +1150,23 @@ impl DashboardDataSource for FakeSource {
             clock.set(now);
         }
         lock(&self.0.queue).clone()
+    }
+
+    fn refresh_worker_facts(&self, worker_name: &str) -> Result<(), WorkerError> {
+        {
+            let mut calls = lock(&self.0.refresh_calls);
+            calls.push(worker_name.to_owned());
+            self.0.refresh_calls_changed.notify_all();
+        }
+        if let Some(gate) = lock(&self.0.refresh_gate).clone() {
+            gate.enter_and_wait();
+        }
+        if self.0.refresh_fail.load(Ordering::SeqCst) {
+            return Err(WorkerError::Unavailable(
+                "REFRESH_FACTS_FAILED: worker fact refresh failed".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

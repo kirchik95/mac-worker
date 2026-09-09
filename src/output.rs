@@ -253,12 +253,22 @@ fn render_agent_auth(auth: crate::agent_facts::AgentAuth) -> String {
 
 /// Spec 5.3: `available (0.9.0)`, `not installed`, `installed (0.9.0), no
 /// socket`, `installed (0.9.0), no response`, or `unknown` when the facts are
-/// stale, missing, or predate the fact. A known non-zero interactive-agent
-/// count is appended so the operator can see load that is not a pool turn.
+/// missing or predate the fact. A known fact older than the TTL is still
+/// printed, with a `stale` age suffix, so the operator can see what last
+/// collected rather than a hole. Capability derivation still uses
+/// [`crate::protocol::ProbeResponse::herdr_fact`], which ignores stale facts.
+/// A known non-zero interactive-agent count is appended so the operator can
+/// see load that is not a pool turn.
 fn render_herdr_fact(probe: &crate::protocol::ProbeResponse) -> String {
-    use crate::agent_facts::HerdrFactState;
+    use crate::agent_facts::{FACTS_TTL, HerdrFactState};
 
-    let Some(herdr) = probe.herdr_fact() else {
+    let Some(facts) = &probe.agent_facts else {
+        return "unknown".into();
+    };
+    let Some(herdr) = &facts.herdr else {
+        return "unknown".into();
+    };
+    let Some(age_millis) = probe.facts_age_millis else {
         return "unknown".into();
     };
     let versioned = |label: &str| match &herdr.version {
@@ -277,7 +287,29 @@ fn render_herdr_fact(probe: &crate::protocol::ProbeResponse) -> String {
             if count == 1 { "" } else { "s" }
         ));
     }
+    if age_millis > FACTS_TTL {
+        rendered.push_str(&format!(", stale {}", render_compact_age(age_millis)));
+    }
     rendered
+}
+
+/// Compact age for the `stale` suffix: `15m`, `69m`, `2h`. Minutes stay
+/// minutes through the first two hours so a 69-minute fact is `69m`, not
+/// a rounded `1h`, matching the dashboard chip.
+fn render_compact_age(age_millis: u64) -> String {
+    let seconds = age_millis.saturating_add(500) / 1000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds.saturating_add(30) / 60;
+    if minutes < 120 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes.saturating_add(30) / 60;
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    format!("{}d", hours.saturating_add(12) / 24)
 }
 
 fn render_doctor_worker_health(worker: &crate::protocol::WorkerHealth) -> String {

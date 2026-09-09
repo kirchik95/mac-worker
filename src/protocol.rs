@@ -51,9 +51,10 @@ pub struct ProbeResponse {
 }
 
 impl ProbeResponse {
-    /// The herdr fact when it can be trusted: facts present, an age reported
-    /// within the TTL, and a record that carries the fact.  Otherwise `None`,
-    /// which every reader renders as `unknown`.
+    /// The herdr fact when it can be trusted for capabilities: facts present,
+    /// an age reported within the TTL, and a record that carries the fact.
+    /// Otherwise `None`. Display (`worker workers`, the dashboard chip) may
+    /// still show a stale fact with its age; scheduling must not.
     pub fn herdr_fact(&self) -> Option<&HerdrFacts> {
         let facts = self.agent_facts.as_ref()?;
         let age = self.facts_age_millis?;

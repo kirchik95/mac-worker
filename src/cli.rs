@@ -72,6 +72,9 @@ pub enum Command {
         port: Option<u16>,
         #[arg(long)]
         no_open: bool,
+        /// Keep the dashboard read-only: do not refresh stale agent facts
+        #[arg(long)]
+        no_facts_refresh: bool,
     },
     #[command(
         override_usage = "worker run [--worker NAME] [--no-wait] -- COMMAND",

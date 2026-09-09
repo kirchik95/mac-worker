@@ -28,28 +28,46 @@ use tokio::sync::oneshot;
 
 #[test]
 fn dashboard_parses_only_the_documented_public_forms() {
-    let cases = [
-        (vec!["worker", "dashboard"], None, false),
+    for (arguments, expected_port, expected_no_open, expected_no_facts_refresh) in [
+        (vec!["worker", "dashboard"], None, false, false),
         (
             vec!["worker", "dashboard", "--port", "9173"],
             Some(9173),
             false,
+            false,
         ),
-        (vec!["worker", "dashboard", "--no-open"], None, true),
+        (vec!["worker", "dashboard", "--no-open"], None, true, false),
         (
             vec!["worker", "dashboard", "--port", "9173", "--no-open"],
             Some(9173),
             true,
+            false,
         ),
-    ];
-
-    for (arguments, expected_port, expected_no_open) in cases {
+        (
+            vec!["worker", "dashboard", "--no-facts-refresh"],
+            None,
+            false,
+            true,
+        ),
+        (
+            vec!["worker", "dashboard", "--no-open", "--no-facts-refresh"],
+            None,
+            true,
+            true,
+        ),
+    ] {
         let cli = Cli::try_parse_from(arguments).expect("dashboard form must parse");
-        let WorkerCommand::Dashboard { port, no_open } = cli.command else {
+        let WorkerCommand::Dashboard {
+            port,
+            no_open,
+            no_facts_refresh,
+        } = cli.command
+        else {
             panic!("dashboard arguments must select the dashboard command");
         };
         assert_eq!(port, expected_port);
         assert_eq!(no_open, expected_no_open);
+        assert_eq!(no_facts_refresh, expected_no_facts_refresh);
     }
 
     for arguments in [
@@ -70,10 +88,7 @@ async fn no_open_prints_loopback_url_without_invoking_browser() {
     let mut warnings = Vec::new();
 
     let result = run_dashboard(
-        DashboardCommandRequest {
-            port: None,
-            no_open: true,
-        },
+        DashboardCommandRequest::new(None, true),
         &launcher,
         &opener,
         Box::pin(async {}),

@@ -10,7 +10,10 @@ use mac_worker::{
     config::{Config, WorkerEntry},
     dashboard::{
         model::{DashboardJobState, DashboardMemoryPressure, DashboardSlotState, WorkerHealth},
-        service::{DashboardDataSource, WorkerObservationResult},
+        service::{
+            DashboardDataSource, DashboardService, SystemClock, SystemMonotonicClock,
+            WorkerObservationResult,
+        },
         source::{
             DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource,
             MacWorkerLogSource,
@@ -505,6 +508,7 @@ struct RecordingWorkers {
     deadlines: Mutex<Vec<Duration>>,
     inspect_delay: Mutex<Duration>,
     finished_at_millis: Mutex<Option<u64>>,
+    refresh_calls: Mutex<Vec<String>>,
 }
 
 impl RecordingWorkers {
@@ -514,6 +518,7 @@ impl RecordingWorkers {
             deadlines: Mutex::new(Vec::new()),
             inspect_delay: Mutex::new(Duration::ZERO),
             finished_at_millis: Mutex::new(None),
+            refresh_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -531,6 +536,24 @@ impl RecordingWorkers {
             .unwrap()
             .expect("inspection must have completed")
     }
+
+    fn refresh_calls(&self) -> Vec<String> {
+        self.refresh_calls.lock().unwrap().clone()
+    }
+
+    fn wait_for_refresh_calls(&self, target: usize) {
+        let started = std::time::Instant::now();
+        loop {
+            if self.refresh_calls().len() >= target {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "timed out waiting for {target} facts refreshes"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl DashboardWorkerReader for RecordingWorkers {
@@ -546,6 +569,11 @@ impl DashboardWorkerReader for RecordingWorkers {
                 .unwrap(),
         );
         self.report.clone()
+    }
+
+    fn refresh_facts(&self, worker: &WorkerEntry) -> Result<(), WorkerError> {
+        self.refresh_calls.lock().unwrap().push(worker.name.clone());
+        Ok(())
     }
 }
 
@@ -802,7 +830,7 @@ fn source_passes_the_herdr_fact_through_agent_facts_and_projects_null_without_it
 }
 
 #[test]
-fn source_projects_a_fresh_herdr_chip_and_omits_it_when_facts_are_stale() {
+fn source_projects_a_fresh_herdr_chip_and_passes_a_stale_fact_through_with_its_age() {
     use mac_worker::agent_facts::{HerdrFactState, HerdrFacts};
 
     let mut report = ready_report(job_id(93));
@@ -830,7 +858,9 @@ fn source_projects_a_fresh_herdr_chip_and_omits_it_when_facts_are_stale() {
         serde_json::json!({
             "state": "available",
             "version": "0.9.0",
-            "interactive_agents": 2
+            "interactive_agents": 2,
+            "stale": false,
+            "age_millis": 0
         })
     );
     let json = value.to_string();
@@ -857,5 +887,75 @@ fn source_projects_a_fresh_herdr_chip_and_omits_it_when_facts_are_stale() {
     let WorkerObservationResult::Current(observation) = rows.into_iter().next().unwrap() else {
         panic!("stale facts still project a worker");
     };
-    assert_eq!(observation.worker.herdr, None);
+    let herdr = observation.worker.herdr.as_ref().expect("stale herdr");
+    assert_eq!(herdr.state, "available");
+    assert_eq!(herdr.version.as_deref(), Some("0.9.0"));
+    assert_eq!(herdr.interactive_agents, Some(2));
+    assert!(herdr.stale);
+    assert_eq!(herdr.age_millis, FACTS_TTL + 1);
+}
+
+fn stale_herdr_report() -> WorkersReport {
+    use mac_worker::agent_facts::{HerdrFactState, HerdrFacts};
+
+    let mut report = ready_report(job_id(95));
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: true,
+        collected_at_millis: 1,
+        herdr: Some(HerdrFacts {
+            state: HerdrFactState::Available,
+            version: Some("0.9.0".into()),
+            interactive_agents: None,
+        }),
+    });
+    probe.facts_age_millis = Some(FACTS_TTL + 1);
+    report
+}
+
+#[test]
+fn source_refresh_worker_facts_invokes_the_reader_for_a_configured_worker() {
+    let fixture = Fixture::new(ready_report(job_id(96)));
+    DashboardDataSource::refresh_worker_facts(&fixture.source(), "mini-1").unwrap();
+    assert_eq!(fixture.workers.refresh_calls(), vec!["mini-1"]);
+    assert!(DashboardDataSource::refresh_worker_facts(&fixture.source(), "missing").is_err());
+}
+
+#[test]
+fn source_collect_workers_does_not_start_a_facts_refresh() {
+    let fixture = Fixture::new(stale_herdr_report());
+    let rows = fixture.source().collect_workers(Duration::from_secs(7));
+    assert!(matches!(
+        rows.into_iter().next(),
+        Some(WorkerObservationResult::Current(_))
+    ));
+    assert!(
+        fixture.workers.refresh_calls().is_empty(),
+        "inspect stays on the collection deadline; the service starts the refresh"
+    );
+}
+
+#[test]
+fn the_same_service_refreshes_a_stale_worker_once_across_repeated_collections() {
+    let fixture = Fixture::new(stale_herdr_report());
+    let service = DashboardService::new(fixture.source(), SystemClock, SystemMonotonicClock::new());
+
+    let _ = service.snapshot(Default::default()).unwrap();
+    fixture.workers.wait_for_refresh_calls(1);
+    let _ = service.snapshot(Default::default()).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(fixture.workers.refresh_calls(), vec!["mini-1"]);
+}
+
+#[test]
+fn no_facts_refresh_flag_skips_the_reader() {
+    let fixture = Fixture::new(stale_herdr_report());
+    let service = DashboardService::new(fixture.source(), SystemClock, SystemMonotonicClock::new())
+        .with_refresh_stale_facts(false);
+
+    let _ = service.snapshot(Default::default()).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(fixture.workers.refresh_calls().is_empty());
 }

@@ -19,6 +19,8 @@ export interface DashboardHerdr {
   state: string
   version?: string | null
   interactive_agents?: number | null
+  stale?: boolean
+  age_millis?: number
 }
 
 export interface Worker {

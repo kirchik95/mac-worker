@@ -44,6 +44,14 @@ const ACTIVE_JOB_COLLECTION_DEADLINE_EXCEEDED: &str = "ACTIVE_JOB_COLLECTION_DEA
 
 pub trait DashboardWorkerReader: Send + Sync + 'static {
     fn inspect(&self, config: &Config, deadline: Duration) -> WorkersReport;
+
+    /// Refresh cached agent facts on `worker`. The ordinary probe never
+    /// starts agent processes; this is the path that does. A default no-op
+    /// lets tests that only inspect skip the SSH round-trip.
+    fn refresh_facts(&self, worker: &WorkerEntry) -> Result<(), WorkerError> {
+        let _ = worker;
+        Ok(())
+    }
 }
 
 pub trait DashboardRemoteReader: Send + Sync + 'static {
@@ -103,6 +111,10 @@ impl DashboardWorkerReader for SystemDashboardWorkerReader {
     fn inspect(&self, config: &Config, deadline: Duration) -> WorkersReport {
         WorkersService::new(SshTransport::new(self.runner.as_ref()))
             .inspect_with_budget(config, deadline)
+    }
+
+    fn refresh_facts(&self, worker: &WorkerEntry) -> Result<(), WorkerError> {
+        SshTransport::new(self.runner.as_ref()).refresh_facts(worker)
     }
 }
 
@@ -319,6 +331,15 @@ impl DashboardDataSource for MacWorkerDashboardSource {
             deadline,
         )
     }
+
+    fn refresh_worker_facts(&self, worker_name: &str) -> Result<(), WorkerError> {
+        let worker = self.config.worker(worker_name).ok_or_else(|| {
+            WorkerError::Unavailable(format!(
+                "DASHBOARD_WORKER_NOT_FOUND: configured worker {worker_name} is not in inventory"
+            ))
+        })?;
+        self.workers.refresh_facts(worker)
+    }
 }
 
 pub struct MacWorkerLogSource {
@@ -426,7 +447,7 @@ pub fn project_worker(
                 )),
                 _ => None,
             },
-            herdr: project_dashboard_herdr(probe),
+            herdr: project_dashboard_herdr(probe, observed_at_millis),
             slot: SlotSummary {
                 state: match probe.slot_state {
                     SlotState::Idle => DashboardSlotState::Idle,
@@ -500,17 +521,27 @@ fn project_agent_facts(
     )
 }
 
-fn project_dashboard_herdr(probe: &ProbeResponse) -> Option<DashboardHerdr> {
-    let herdr = probe.herdr_fact()?;
+fn project_dashboard_herdr(
+    probe: &ProbeResponse,
+    observed_at_millis: u64,
+) -> Option<DashboardHerdr> {
+    // Pass a known fact through even after the TTL so the chip can show
+    // `herdr 0.9.0 · 69m ago` instead of `unknown`. Capability derivation still
+    // uses `ProbeResponse::herdr_fact()`, which returns nothing for stale facts.
+    let facts = probe.agent_facts.as_ref()?;
+    let herdr = facts.herdr.as_ref()?;
+    let facts_age_millis = probe.facts_age_millis?;
     let boundary = RedactionBoundary::from_env();
-    Some(DashboardHerdr {
-        state: herdr.state.as_str().to_owned(),
-        version: herdr
+    Some(DashboardHerdr::from_observation(
+        herdr.state.as_str().to_owned(),
+        herdr
             .version
             .as_deref()
             .map(|version| boundary.text(version, 64)),
-        interactive_agents: herdr.interactive_agents,
-    })
+        herdr.interactive_agents,
+        facts_age_millis,
+        observed_at_millis,
+    ))
 }
 
 fn project_defaults(settings: &ProjectSettings) -> DashboardProjectDefaults {

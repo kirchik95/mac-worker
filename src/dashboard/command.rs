@@ -6,7 +6,10 @@ use crate::{
     client_state::ClientStateStore,
     config::Config,
     dashboard::{
-        service::{DashboardService, SystemClock, SystemMonotonicClock},
+        service::{
+            DashboardConfig, DashboardDeadlines, DashboardService, SystemClock,
+            SystemMonotonicClock,
+        },
         settings::{DashboardSettingsSource, SystemDashboardSettingsSource},
         source::{
             DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource,
@@ -24,11 +27,16 @@ use crate::{
 pub struct DashboardCommandRequest {
     pub port: Option<u16>,
     pub no_open: bool,
+    pub refresh_stale_facts: bool,
 }
 
 impl DashboardCommandRequest {
     pub fn new(port: Option<u16>, no_open: bool) -> Self {
-        Self { port, no_open }
+        Self {
+            port,
+            no_open,
+            refresh_stale_facts: true,
+        }
     }
 }
 
@@ -62,6 +70,20 @@ impl SystemDashboardLauncher {
         local_jobs: Arc<ClientStateStore>,
         launch_directory: Option<&Path>,
     ) -> Self {
+        Self::from_system_with_config(
+            config,
+            local_jobs,
+            launch_directory,
+            DashboardConfig::default(),
+        )
+    }
+
+    pub fn from_system_with_config(
+        config: Arc<Config>,
+        local_jobs: Arc<ClientStateStore>,
+        launch_directory: Option<&Path>,
+        dashboard_config: DashboardConfig,
+    ) -> Self {
         let runner: Arc<dyn ProcessRunner> = Arc::new(SystemProcessRunner);
         let workers: Arc<dyn DashboardWorkerReader> =
             Arc::new(SystemDashboardWorkerReader::new(Arc::clone(&runner)));
@@ -89,10 +111,12 @@ impl SystemDashboardLauncher {
         let log_source = Arc::new(MacWorkerLogSource::new(config, local_jobs, remote));
         Self {
             state: Arc::new(DashboardHttpState {
-                service: Arc::new(DashboardService::new(
+                service: Arc::new(DashboardService::with_options(
                     source,
                     SystemClock,
                     SystemMonotonicClock::new(),
+                    DashboardDeadlines::default(),
+                    dashboard_config,
                 )),
                 log_source,
                 task_source,

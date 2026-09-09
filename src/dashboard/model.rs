@@ -167,6 +167,42 @@ pub struct DashboardHerdr {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interactive_agents: Option<u32>,
+    /// Whether [`age_millis`] has passed [`FACTS_TTL`]. Never a capability:
+    /// scheduling still ignores a stale fact.
+    pub stale: bool,
+    pub age_millis: u64,
+    #[serde(skip)]
+    age_at_observation_millis: u64,
+    #[serde(skip)]
+    observed_at_millis: u64,
+}
+
+impl DashboardHerdr {
+    pub(crate) fn from_observation(
+        state: String,
+        version: Option<String>,
+        interactive_agents: Option<u32>,
+        facts_age_millis: u64,
+        observed_at_millis: u64,
+    ) -> Self {
+        let mut herdr = Self {
+            state,
+            version,
+            interactive_agents,
+            stale: false,
+            age_millis: facts_age_millis,
+            age_at_observation_millis: facts_age_millis,
+            observed_at_millis,
+        };
+        herdr.refresh_age(observed_at_millis);
+        herdr
+    }
+
+    pub(crate) fn refresh_age(&mut self, now_millis: u64) {
+        let elapsed = now_millis.saturating_sub(self.observed_at_millis);
+        self.age_millis = self.age_at_observation_millis.saturating_add(elapsed);
+        self.stale = self.age_millis > FACTS_TTL;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -177,8 +213,8 @@ pub struct DashboardWorker {
     pub observed_at_millis: Option<u64>,
     pub hostname: Option<String>,
     pub agent_facts: Option<DashboardAgentFacts>,
-    /// Fresh herdr fact for the worker card chip; `null` when facts are
-    /// missing, stale, or predate the fact. Never a capability.
+    /// Herdr fact for the worker card chip, including a stale fact and its
+    /// age; `null` only when there is no fact at all. Never a capability.
     pub herdr: Option<DashboardHerdr>,
     pub slot: SlotSummary,
     pub capabilities: Vec<String>,

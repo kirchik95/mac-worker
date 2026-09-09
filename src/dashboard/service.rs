@@ -5,19 +5,22 @@ use std::{
         Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
+    agent_facts::FACTS_TTL,
     dashboard::{
         cache::{Observation, ObservationCache},
         model::{
-            CollectionSummary, DASHBOARD_API_VERSION, DashboardActiveTask, DashboardError,
-            DashboardJob, DashboardJobState, DashboardProjectDefaults, DashboardQueueEntry,
-            DashboardSlotState, DashboardSnapshot, DashboardWorker, Freshness, SlotSummary,
-            SystemSummary, WorkerHealth,
+            AgentFactsFreshness, CollectionSummary, DASHBOARD_API_VERSION, DashboardActiveTask,
+            DashboardError, DashboardJob, DashboardJobState, DashboardProjectDefaults,
+            DashboardQueueEntry, DashboardSlotState, DashboardSnapshot, DashboardWorker, Freshness,
+            SlotSummary, SystemSummary, WorkerHealth,
         },
     },
+    error::WorkerError,
     job::JobId,
     task::TaskState,
     task_view::{TaskFreshness, TaskListProjection},
@@ -160,6 +163,14 @@ pub trait DashboardDataSource: Send + Sync + 'static {
     ) -> Result<DashboardTaskCollection, DashboardError> {
         Ok(DashboardTaskCollection::empty())
     }
+
+    /// Refresh cached agent facts on a reachable worker. The dashboard
+    /// collector calls this off the snapshot path so a slow refresh cannot
+    /// shrink the collection deadline. Default is a no-op so read-only
+    /// fakes stay read-only until a test injects a recorder.
+    fn refresh_worker_facts(&self, _worker_name: &str) -> Result<(), WorkerError> {
+        Ok(())
+    }
 }
 
 pub trait DashboardQueueReader: Send + Sync + 'static {
@@ -174,20 +185,82 @@ impl DashboardQueueReader for EmptyDashboardQueueReader {
     }
 }
 
+/// Collector options that are not deadlines. `refresh_stale_facts` is on
+/// by default so an idle pool does not degrade to `unknown` after the TTL;
+/// `--no-facts-refresh` turns it off for a read-only dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DashboardConfig {
+    pub refresh_stale_facts: bool,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            refresh_stale_facts: true,
+        }
+    }
+}
+
 pub struct DashboardService<S, C, M> {
-    source: S,
+    source: Arc<S>,
     cache: Mutex<ObservationCache>,
     completed: Mutex<Option<Arc<DashboardSnapshot>>>,
     revision: AtomicU64,
     refresh: Mutex<RefreshState>,
+    facts_refresh: Arc<Mutex<FactsRefreshTracker>>,
     clock: C,
     monotonic: M,
     deadlines: DashboardDeadlines,
+    refresh_stale_facts: bool,
 }
 
 struct RefreshState {
     next_generation: u64,
     in_flight: Option<Arc<RefreshFlight>>,
+}
+
+/// Last attempt is stamped when a refresh is *started*, including a failed
+/// one, so a broken worker is retried at most once per TTL. `in_flight`
+/// is the single-flight latch: a still-running refresh is not started again
+/// even if the wall clock has already passed the TTL.
+#[derive(Default)]
+struct FactsRefreshTracker {
+    last_attempt_millis: HashMap<String, u64>,
+    in_flight: HashSet<String>,
+}
+
+impl FactsRefreshTracker {
+    fn try_begin(&mut self, worker_name: &str, now_millis: u64) -> bool {
+        if self.in_flight.contains(worker_name) {
+            return false;
+        }
+        if self
+            .last_attempt_millis
+            .get(worker_name)
+            .is_some_and(|last| now_millis.saturating_sub(*last) < FACTS_TTL)
+        {
+            return false;
+        }
+        self.in_flight.insert(worker_name.to_owned());
+        self.last_attempt_millis
+            .insert(worker_name.to_owned(), now_millis);
+        true
+    }
+
+    fn finish(&mut self, worker_name: &str) {
+        self.in_flight.remove(worker_name);
+    }
+}
+
+struct FactsRefreshGuard {
+    tracker: Arc<Mutex<FactsRefreshTracker>>,
+    worker_name: String,
+}
+
+impl Drop for FactsRefreshGuard {
+    fn drop(&mut self) {
+        lock_recover(&self.tracker).finish(&self.worker_name);
+    }
 }
 
 struct RefreshFlight {
@@ -212,8 +285,24 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         monotonic: M,
         deadlines: DashboardDeadlines,
     ) -> Self {
-        Self {
+        Self::with_options(
             source,
+            clock,
+            monotonic,
+            deadlines,
+            DashboardConfig::default(),
+        )
+    }
+
+    pub fn with_options(
+        source: S,
+        clock: C,
+        monotonic: M,
+        deadlines: DashboardDeadlines,
+        config: DashboardConfig,
+    ) -> Self {
+        Self {
+            source: Arc::new(source),
             cache: Mutex::new(ObservationCache::new()),
             completed: Mutex::new(None),
             revision: AtomicU64::new(0),
@@ -221,10 +310,17 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                 next_generation: 1,
                 in_flight: None,
             }),
+            facts_refresh: Arc::new(Mutex::new(FactsRefreshTracker::default())),
             clock,
             monotonic,
             deadlines,
+            refresh_stale_facts: config.refresh_stale_facts,
         }
+    }
+
+    pub fn with_refresh_stale_facts(mut self, enabled: bool) -> Self {
+        self.refresh_stale_facts = enabled;
+        self
     }
 
     pub fn snapshot(
@@ -450,6 +546,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                 }
                 1 => match rows.into_iter().next().expect("one row exists") {
                     WorkerObservationResult::Current(observation) => {
+                        self.maybe_start_stale_facts_refresh(&observation);
                         let cached = lock_recover(&self.cache).record(observation);
                         if let Some(cached) = cached {
                             let mut worker = cached.worker;
@@ -501,6 +598,41 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             return worker;
         }
         offline_worker(worker_name, error)
+    }
+
+    /// Start a facts refresh outside the collection deadline. Unreachable
+    /// workers are skipped; a busy slot is not. The snapshot is not held
+    /// until the SSH round-trip returns.
+    fn maybe_start_stale_facts_refresh(&self, observation: &Observation) {
+        if !self.refresh_stale_facts {
+            return;
+        }
+        let worker = &observation.worker;
+        if worker.health != WorkerHealth::Ready {
+            return;
+        }
+        let Some(facts) = &worker.agent_facts else {
+            return;
+        };
+        if facts.freshness != AgentFactsFreshness::Stale {
+            return;
+        }
+        let now_millis = self.clock.now_millis();
+        if !lock_recover(&self.facts_refresh).try_begin(&worker.name, now_millis) {
+            return;
+        }
+        let source = Arc::clone(&self.source);
+        let tracker = Arc::clone(&self.facts_refresh);
+        let worker_name = worker.name.clone();
+        let _ = thread::Builder::new()
+            .name(format!("facts-refresh-{worker_name}"))
+            .spawn(move || {
+                let _guard = FactsRefreshGuard {
+                    tracker,
+                    worker_name: worker_name.clone(),
+                };
+                let _ = source.refresh_worker_facts(&worker_name);
+            });
     }
 
     fn collect_local_jobs(&self, errors: &mut Vec<DashboardError>) -> Vec<DashboardJob> {
@@ -624,6 +756,9 @@ fn refresh_agent_facts_freshness(workers: &mut [DashboardWorker], now_millis: u6
     for worker in workers {
         if let Some(facts) = &mut worker.agent_facts {
             facts.refresh_freshness(now_millis);
+        }
+        if let Some(herdr) = &mut worker.herdr {
+            herdr.refresh_age(now_millis);
         }
     }
 }

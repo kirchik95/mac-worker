@@ -233,6 +233,26 @@ describe('Overview', () => {
     render(<Overview snapshot={snapshot()} />)
     expect(screen.getAllByText('herdr: unknown').length).toBeGreaterThan(0)
   })
+
+  it('keeps a stale herdr version and names its age instead of unknown', () => {
+    const stale = snapshot({
+      workers: [
+        worker({
+          herdr: {
+            state: 'available',
+            version: '0.9.0',
+            interactive_agents: 2,
+            stale: true,
+            age_millis: 4_120_000,
+          },
+        }),
+      ],
+    })
+    render(<Overview snapshot={stale} />)
+    expect(screen.getAllByText('herdr 0.9.0 · 69m ago').length).toBe(2)
+    expect(within(card('mini-1')).getByText('herdr 0.9.0 · 69m ago')).toBeInTheDocument()
+    expect(screen.queryByText('herdr: unknown')).toBeNull()
+  })
 })
 
 describe('Overview attention strip', () => {

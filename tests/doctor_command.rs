@@ -1857,8 +1857,6 @@ fn issue_triples(report: &DoctorReport) -> Vec<(IssueSeverity, &str, &str)> {
 /// renders for it: three collected states, then facts missing, predating
 /// the fact, and stale.
 fn unavailable_herdr_probes() -> Vec<(Result<ProcessResult, WorkerError>, &'static str)> {
-    use mac_worker::agent_facts::FACTS_TTL;
-
     vec![
         (
             ready_probe_with_facts(
@@ -1890,9 +1888,9 @@ fn unavailable_herdr_probes() -> Vec<(Result<ProcessResult, WorkerError>, &'stat
             ready_probe_with_facts(
                 &[],
                 Some(serde_json::json!({ "state": "available", "version": "0.9.0" })),
-                FACTS_TTL + 1,
+                4_120_000,
             ),
-            "    herdr: unknown",
+            "    herdr: available (0.9.0), stale 69m",
         ),
     ]
 }
@@ -1908,10 +1906,11 @@ fn herdr_true_worker_gets_a_warning_for_every_fact_state_but_available_and_stays
     for (probe, line) in unavailable_herdr_probes() {
         let state = tempfile::tempdir().unwrap();
         let runner = DoctorRunner::new(vec![probe]);
-        // A fact that is missing or stale renders `unknown` and gets the
-        // message that names the refresh; a fresh fact that is not
-        // `available` gets the unreachable message.
-        let expected_message = if line.contains("unknown") {
+        // A fact that is missing renders `unknown` and a stale fact keeps the
+        // last collected value with a `stale` suffix; both get the message
+        // that names the refresh. A fresh fact that is not `available` gets
+        // the unreachable message.
+        let expected_message = if line.contains("unknown") || line.contains("stale") {
             HERDR_FACTS_STALE_MESSAGE
         } else {
             HERDR_UNAVAILABLE_MESSAGE
