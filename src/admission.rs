@@ -736,15 +736,23 @@ mod tests {
             store: ClientStateStore,
             worker_name: &str,
             timeout: Duration,
-        ) {
+        ) -> ObservationPublishReceipt {
+            let observed = Arc::new(AtomicBool::new(false));
+            let diagnostic = Arc::new(Mutex::new(None));
             self.observation_gate.lock().unwrap().insert(
                 ssh.to_owned(),
                 ObservationGate {
                     store,
                     worker_name: worker_name.to_owned(),
                     timeout,
+                    observed: observed.clone(),
+                    diagnostic: diagnostic.clone(),
                 },
             );
+            ObservationPublishReceipt {
+                observed,
+                diagnostic,
+            }
         }
     }
 
@@ -832,26 +840,42 @@ mod tests {
         }
     }
 
+    struct ObservationPublishReceipt {
+        observed: Arc<AtomicBool>,
+        diagnostic: Arc<Mutex<Option<String>>>,
+    }
+
     struct ObservationGate {
         store: ClientStateStore,
         worker_name: String,
         timeout: Duration,
+        observed: Arc<AtomicBool>,
+        diagnostic: Arc<Mutex<Option<String>>>,
     }
 
     fn wait_until_published(gate: &ObservationGate) {
         let deadline = Instant::now() + gate.timeout;
         loop {
-            if gate
-                .store
-                .peek_admission_observation(&gate.worker_name)
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                return;
+            match gate.store.peek_admission_observation(&gate.worker_name) {
+                Ok(Some(_)) => {
+                    gate.observed.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    *gate.diagnostic.lock().unwrap() = Some(format!(
+                        "peek {} failed before publication: {error}",
+                        gate.worker_name
+                    ));
+                    return;
+                }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                *gate.diagnostic.lock().unwrap() = Some(format!(
+                    "timed out after {:?} waiting for {} publication",
+                    gate.timeout, gate.worker_name
+                ));
                 return;
             }
             thread::sleep(remaining.min(Duration::from_millis(5)));
@@ -1066,7 +1090,7 @@ mod tests {
         runner.facts_age("mac1", FACTS_TTL.saturating_sub(100));
         runner.delay("mac1", Duration::from_millis(80));
         runner.delay("mac2", Duration::from_millis(60));
-        runner.wait_for_published_observation(
+        let published = runner.wait_for_published_observation(
             "mac2",
             store.clone(),
             "mini-1",
@@ -1075,6 +1099,11 @@ mod tests {
         runner.fail("mac2");
         let ranked =
             observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
+        let diagnostic = published.diagnostic.lock().unwrap().clone();
+        assert!(
+            published.observed.load(Ordering::SeqCst),
+            "mac2 60ms wait must follow mini-1's published observation; {diagnostic:?}"
+        );
         let capabilities = ranked[0].capabilities().to_vec();
         assert!(ranked[0].ready());
         assert!(
