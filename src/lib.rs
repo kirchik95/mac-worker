@@ -352,7 +352,7 @@ fn execute_with_context(
             "host migrate-layout requires the stdio execution boundary".into(),
         )),
         Command::Host {
-            command: HostCommand::RefreshFacts,
+            command: HostCommand::RefreshFacts { .. },
         } => Err(WorkerError::Protocol(
             "host refresh-facts requires the stdio execution boundary".into(),
         )),
@@ -1540,13 +1540,11 @@ pub fn run_with_rsync_executor_in_context(
     ) {
         return run_host_migrate_layout(cli.config, runtime, stderr);
     }
-    if matches!(
-        &cli.command,
-        Command::Host {
-            command: HostCommand::RefreshFacts
-        }
-    ) {
-        return run_host_refresh_facts(cli.config, runtime, runner, stderr);
+    if let Command::Host {
+        command: HostCommand::RefreshFacts { timing },
+    } = cli.command
+    {
+        return run_host_refresh_facts(cli.config, runtime, runner, stderr, timing);
     }
     if let Command::Host {
         command:
@@ -2563,10 +2561,18 @@ fn run_host_refresh_facts(
     runtime: &RuntimeContext,
     runner: &dyn ProcessRunner,
     stderr: &mut dyn Write,
+    timing: bool,
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
-        ProbeCollector::refresh_facts_at(&paths.host_state_root(), &runtime.home, runner)?;
+        let (_, collected) = ProbeCollector::refresh_facts_at_with_timing(
+            &paths.host_state_root(),
+            &runtime.home,
+            runner,
+        )?;
+        if timing {
+            collected.write_to(stderr);
+        }
         Ok(())
     })();
     match result {

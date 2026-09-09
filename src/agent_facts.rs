@@ -2,8 +2,9 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     fmt,
+    io::Write,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{
@@ -16,7 +17,8 @@ use serde_json::{Map, Value};
 use crate::{
     account_launch::account_login_shell_request,
     agent::{AgentKind, AuthProbe, AuthProbeResult, adapter_for, render_prebind_shell},
-    herdr::{HerdrClient, HerdrError, HerdrSocket},
+    error::{ProcessError, WorkerError},
+    herdr::{HerdrClient, HerdrError, HerdrSocket, RESPONSE_DEADLINE},
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
 };
 
@@ -25,7 +27,8 @@ pub const FACTS_TTL: u64 = 15 * 60 * 1000;
 pub const FACTS_TTL_MILLIS: u64 = FACTS_TTL;
 
 const PROBE_OUTPUT_LIMIT: usize = 4 * 1024;
-const PROBE_DEADLINE: Duration = Duration::from_secs(2);
+/// Bound on each locate, version, and auth probe during facts collection.
+pub const PROBE_DEADLINE: Duration = Duration::from_secs(2);
 const MAX_TEXT_BYTES: usize = 128;
 const HERDR_BINARY: &str = "herdr";
 /// The herdr version is bounded tighter than agent text (see [`HerdrFacts`]).
@@ -472,6 +475,168 @@ impl<'de> Deserialize<'de> for AgentFacts {
     }
 }
 
+/// Durations recorded while collecting agent facts. Printed only when the
+/// operator asks (`worker host refresh-facts --timing`); each line names
+/// public fact fields and millisecond counts, never command lines, paths,
+/// or profile values.
+#[derive(Debug, Clone)]
+pub struct FactsTiming {
+    steps: Vec<TimingStep>,
+    started: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct TimingStep {
+    agent: Option<String>,
+    profile: Option<String>,
+    step: String,
+    ms: u128,
+    result: Option<String>,
+    deadline_ms: Option<u128>,
+    hit_deadline: bool,
+}
+
+impl FactsTiming {
+    fn new() -> Self {
+        Self {
+            steps: Vec::new(),
+            started: Instant::now(),
+        }
+    }
+
+    /// One stderr line per recorded step, in collection order, with `total` last.
+    pub fn lines(&self) -> Vec<String> {
+        self.steps.iter().map(TimingStep::render).collect()
+    }
+
+    pub fn write_to(&self, writer: &mut dyn Write) {
+        for line in self.lines() {
+            let _ = writeln!(writer, "{line}");
+        }
+    }
+
+    fn probe<T>(
+        &mut self,
+        agent: Option<&str>,
+        profile: Option<&str>,
+        step: &str,
+        deadline: Duration,
+        run: impl FnOnce() -> ProbeRun<T>,
+    ) -> T {
+        self.probe_with_result(agent, profile, step, deadline, |_| None, run)
+    }
+
+    fn probe_with_result<T>(
+        &mut self,
+        agent: Option<&str>,
+        profile: Option<&str>,
+        step: &str,
+        deadline: Duration,
+        result_of: impl FnOnce(&T) -> Option<&'static str>,
+        run: impl FnOnce() -> ProbeRun<T>,
+    ) -> T {
+        let started = Instant::now();
+        let ProbeRun {
+            value,
+            hit_deadline,
+        } = run();
+        let elapsed = started.elapsed();
+        self.steps.push(TimingStep::new(
+            agent,
+            profile,
+            step,
+            elapsed,
+            result_of(&value),
+            Some(deadline),
+            hit_deadline || elapsed >= deadline,
+        ));
+        value
+    }
+
+    fn finish_total(&mut self) {
+        self.steps.push(TimingStep::new(
+            None,
+            None,
+            "total",
+            self.started.elapsed(),
+            None,
+            None,
+            false,
+        ));
+    }
+}
+
+impl TimingStep {
+    fn new(
+        agent: Option<&str>,
+        profile: Option<&str>,
+        step: &str,
+        elapsed: Duration,
+        result: Option<&str>,
+        deadline: Option<Duration>,
+        hit_deadline: bool,
+    ) -> Self {
+        Self {
+            agent: agent.map(str::to_owned),
+            profile: profile.map(str::to_owned),
+            step: step.to_owned(),
+            ms: elapsed.as_millis(),
+            result: result.map(str::to_owned),
+            deadline_ms: deadline.map(|deadline| deadline.as_millis()),
+            hit_deadline,
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut line = String::from("timing");
+        if let Some(agent) = &self.agent {
+            line.push_str(" agent=");
+            line.push_str(agent);
+        }
+        if let Some(profile) = &self.profile {
+            line.push_str(" profile=");
+            line.push_str(profile);
+        }
+        line.push_str(" step=");
+        line.push_str(&self.step);
+        line.push_str(" ms=");
+        line.push_str(&self.ms.to_string());
+        if let Some(result) = &self.result {
+            line.push_str(" result=");
+            line.push_str(result);
+        }
+        if let Some(deadline_ms) = self.deadline_ms {
+            line.push_str(" deadline_ms=");
+            line.push_str(&deadline_ms.to_string());
+        }
+        if self.hit_deadline {
+            line.push_str(" hit_deadline=true");
+        }
+        line
+    }
+}
+
+struct ProbeRun<T> {
+    value: T,
+    hit_deadline: bool,
+}
+
+impl<T> ProbeRun<T> {
+    fn ok(value: T) -> Self {
+        Self {
+            value,
+            hit_deadline: false,
+        }
+    }
+}
+
+fn is_deadline_error(error: &WorkerError) -> bool {
+    matches!(
+        error,
+        WorkerError::Process(ProcessError::DeadlineExceeded { .. })
+    )
+}
+
 /// Collect facts using the current wall-clock time in milliseconds.
 pub fn collect_agent_facts<P>(
     runner: &dyn ProcessRunner,
@@ -481,7 +646,19 @@ pub fn collect_agent_facts<P>(
 where
     P: ProfileInput,
 {
-    collect_agent_facts_at(runner, account_home, profiles, current_time_millis())
+    collect_agent_facts_with_timing(runner, account_home, profiles).0
+}
+
+/// Collect facts and the per-step durations that produced them.
+pub fn collect_agent_facts_with_timing<P>(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    profiles: &[P],
+) -> (AgentFacts, FactsTiming)
+where
+    P: ProfileInput,
+{
+    collect_agent_facts_at_with_timing(runner, account_home, profiles, current_time_millis())
 }
 
 /// Deterministic-time variant used by local tests and cache callers.
@@ -490,6 +667,41 @@ pub fn collect_agent_facts_at<P>(
     account_home: &Path,
     profiles: &[P],
     collected_at_millis: u64,
+) -> AgentFacts
+where
+    P: ProfileInput,
+{
+    collect_agent_facts_at_with_timing(runner, account_home, profiles, collected_at_millis).0
+}
+
+/// Deterministic-time collection that also returns per-step durations.
+pub fn collect_agent_facts_at_with_timing<P>(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    profiles: &[P],
+    collected_at_millis: u64,
+) -> (AgentFacts, FactsTiming)
+where
+    P: ProfileInput,
+{
+    let mut timing = FactsTiming::new();
+    let facts = collect_agent_facts_into(
+        runner,
+        account_home,
+        profiles,
+        collected_at_millis,
+        &mut timing,
+    );
+    timing.finish_total();
+    (facts, timing)
+}
+
+fn collect_agent_facts_into<P>(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    profiles: &[P],
+    collected_at_millis: u64,
+    timing: &mut FactsTiming,
 ) -> AgentFacts
 where
     P: ProfileInput,
@@ -511,17 +723,29 @@ where
         AgentKind::Cursor,
         AgentKind::Opencode,
     ] {
+        let name = agent_name(kind);
         let adapter = adapter_for(kind);
         let binary = adapter.binary();
         let auth_probe = adapter.auth_probe();
-        let base_available = adapter_available(runner, account_home, binary, &[]);
+        let base_available = timing.probe(Some(name), Some("-"), "locate", PROBE_DEADLINE, || {
+            adapter_available(runner, account_home, binary, &[])
+        });
         let version = if base_available {
-            run_version_in_shell(runner, account_home, binary, &[])
+            timing.probe(Some(name), Some("-"), "version", PROBE_DEADLINE, || {
+                run_version_in_shell(runner, account_home, binary, &[])
+            })
         } else {
             None
         };
         let auth = if base_available {
-            run_auth_in_shell(runner, account_home, binary, &auth_probe, &[])
+            timing.probe_with_result(
+                Some(name),
+                Some("-"),
+                "auth",
+                PROBE_DEADLINE,
+                |auth: &AgentAuth| Some(auth.as_str()),
+                || run_auth_in_shell(runner, account_home, binary, &auth_probe, &[]),
+            )
         } else {
             AgentAuth::Unknown
         };
@@ -531,28 +755,73 @@ where
             .iter()
             .filter(|profile| profile.profile_is_secure())
         {
+            let profile_name = profile.profile_name();
             let entries = profile.profile_entries();
-            let available = adapter_available(runner, account_home, binary, &entries);
+            let available = timing.probe(
+                Some(name),
+                Some(profile_name),
+                "locate",
+                PROBE_DEADLINE,
+                || adapter_available(runner, account_home, binary, &entries),
+            );
             any_profile_binary |= available;
             let auth = if !available {
                 AgentAuth::Unknown
             } else {
                 match profile.keychain_config() {
-                    Some(config) if unlock_for_probe(runner, &config) => {
-                        let _ = run_version_in_shell(runner, account_home, binary, &entries);
-                        run_auth_in_shell(runner, account_home, binary, &auth_probe, &entries)
+                    Some(config) => {
+                        let unlocked = timing.probe(
+                            Some(name),
+                            Some(profile_name),
+                            "keychain-unlock",
+                            crate::keychain::UNLOCK_TIMEOUT,
+                            || unlock_for_probe(runner, &config),
+                        );
+                        if unlocked {
+                            let _ = timing.probe(
+                                Some(name),
+                                Some(profile_name),
+                                "version",
+                                PROBE_DEADLINE,
+                                || run_version_in_shell(runner, account_home, binary, &entries),
+                            );
+                            timing.probe_with_result(
+                                Some(name),
+                                Some(profile_name),
+                                "auth",
+                                PROBE_DEADLINE,
+                                |auth: &AgentAuth| Some(auth.as_str()),
+                                || {
+                                    run_auth_in_shell(
+                                        runner,
+                                        account_home,
+                                        binary,
+                                        &auth_probe,
+                                        &entries,
+                                    )
+                                },
+                            )
+                        } else {
+                            AgentAuth::UnknownWithReason(crate::keychain::UNLOCK_FAILED_REASON)
+                        }
                     }
-                    Some(_) => AgentAuth::UnknownWithReason(crate::keychain::UNLOCK_FAILED_REASON),
-                    None => run_auth_in_shell(runner, account_home, binary, &auth_probe, &entries),
+                    None => timing.probe_with_result(
+                        Some(name),
+                        Some(profile_name),
+                        "auth",
+                        PROBE_DEADLINE,
+                        |auth: &AgentAuth| Some(auth.as_str()),
+                        || run_auth_in_shell(runner, account_home, binary, &auth_probe, &entries),
+                    ),
                 }
             };
-            auth_by_profile.push((profile.profile_name().to_owned(), auth));
+            auth_by_profile.push((profile_name.to_owned(), auth));
         }
         if !base_available && !any_profile_binary {
             continue;
         }
         agents.push(AgentProbe {
-            name: agent_name(kind).to_owned(),
+            name: name.to_owned(),
             version,
             auth,
             auth_by_profile,
@@ -564,7 +833,7 @@ where
         env_profiles,
         git_identity: collect_git_identity(runner),
         collected_at_millis,
-        herdr: Some(collect_herdr_facts(runner, account_home)),
+        herdr: Some(collect_herdr_facts(runner, account_home, timing)),
     }
 }
 
@@ -572,14 +841,23 @@ where
 /// shell's PATH (plus `~/.local/bin`), its `--version`, the default session
 /// socket, and an answer to `ping` under the client deadlines.  The version is
 /// recorded whenever the binary answered; the ping carries no path.
-fn collect_herdr_facts(runner: &dyn ProcessRunner, account_home: &Path) -> HerdrFacts {
-    if !herdr_binary_available(runner, account_home) {
+fn collect_herdr_facts(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    timing: &mut FactsTiming,
+) -> HerdrFacts {
+    let available = timing.probe(Some("herdr"), Some("-"), "locate", PROBE_DEADLINE, || {
+        herdr_binary_available(runner, account_home)
+    });
+    if !available {
         return HerdrFacts {
             state: HerdrFactState::NotInstalled,
             version: None,
         };
     }
-    let version = herdr_version(runner, account_home);
+    let version = timing.probe(Some("herdr"), Some("-"), "version", PROBE_DEADLINE, || {
+        herdr_version(runner, account_home)
+    });
     let socket = HerdrSocket::default_for_home(account_home);
     if !socket.path().exists() {
         return HerdrFacts {
@@ -587,34 +865,49 @@ fn collect_herdr_facts(runner: &dyn ProcessRunner, account_home: &Path) -> Herdr
             version,
         };
     }
-    let state = match HerdrClient::new(socket).ping() {
-        Ok(()) => HerdrFactState::Available,
-        Err(HerdrError::Absent) => HerdrFactState::NoSocket,
-        Err(_) => HerdrFactState::NoResponse,
-    };
+    let state = timing.probe(
+        None,
+        None,
+        "herdr-ping",
+        RESPONSE_DEADLINE,
+        || match HerdrClient::new(socket).ping() {
+            Ok(()) => ProbeRun::ok(HerdrFactState::Available),
+            Err(HerdrError::Absent) => ProbeRun::ok(HerdrFactState::NoSocket),
+            Err(HerdrError::Timeout) => ProbeRun {
+                value: HerdrFactState::NoResponse,
+                hit_deadline: true,
+            },
+            Err(_) => ProbeRun::ok(HerdrFactState::NoResponse),
+        },
+    );
     HerdrFacts { state, version }
 }
 
-fn herdr_binary_available(runner: &dyn ProcessRunner, account_home: &Path) -> bool {
+fn herdr_binary_available(runner: &dyn ProcessRunner, account_home: &Path) -> ProbeRun<bool> {
     let shell = format!("{HERDR_PATH_EXTENSION}command -v {HERDR_BINARY}");
     let request = account_login_shell_request(account_home, &[], &shell, probe_policy());
-    runner
-        .run(&request)
-        .ok()
-        .is_some_and(|result| result.status.success())
+    run_availability(runner, &request)
 }
 
-fn herdr_version(runner: &dyn ProcessRunner, account_home: &Path) -> Option<String> {
-    let exec = render_prebind_shell(&[HERDR_BINARY.to_owned(), "--version".to_owned()]).ok()?;
+fn herdr_version(runner: &dyn ProcessRunner, account_home: &Path) -> ProbeRun<Option<String>> {
+    let Ok(exec) = render_prebind_shell(&[HERDR_BINARY.to_owned(), "--version".to_owned()]) else {
+        return ProbeRun::ok(None);
+    };
     let shell = format!("{HERDR_PATH_EXTENSION}{exec}");
     let request = account_login_shell_request(account_home, &[], &shell, probe_policy());
-    let result = runner.run(&request).ok()?;
-    if !result.status.success() {
-        return None;
+    match runner.run(&request) {
+        Ok(result) if result.status.success() => {
+            let version = parse_version(&result.stdout)
+                .map(|version| truncate_text_to(&version, HERDR_VERSION_MAX_BYTES))
+                .filter(|version| !version.is_empty());
+            ProbeRun::ok(version)
+        }
+        Ok(_) => ProbeRun::ok(None),
+        Err(error) => ProbeRun {
+            value: None,
+            hit_deadline: is_deadline_error(&error),
+        },
     }
-    let version = parse_version(&result.stdout)?;
-    let version = truncate_text_to(&version, HERDR_VERSION_MAX_BYTES);
-    (!version.is_empty()).then_some(version)
 }
 
 fn current_time_millis() -> u64 {
@@ -638,14 +931,21 @@ fn adapter_available(
     account_home: &Path,
     binary: &str,
     profile_entries: &[(OsString, OsString)],
-) -> bool {
+) -> ProbeRun<bool> {
     let shell = format!("command -v {binary}");
     let request =
         account_login_shell_request(account_home, profile_entries, &shell, probe_policy());
-    runner
-        .run(&request)
-        .ok()
-        .is_some_and(|result| result.status.success())
+    run_availability(runner, &request)
+}
+
+fn run_availability(runner: &dyn ProcessRunner, request: &ProcessRequest) -> ProbeRun<bool> {
+    match runner.run(request) {
+        Ok(result) => ProbeRun::ok(result.status.success()),
+        Err(error) => ProbeRun {
+            value: false,
+            hit_deadline: is_deadline_error(&error),
+        },
+    }
 }
 
 fn run_version_in_shell(
@@ -653,15 +953,20 @@ fn run_version_in_shell(
     account_home: &Path,
     binary: &str,
     profile_entries: &[(OsString, OsString)],
-) -> Option<String> {
-    let shell = render_prebind_shell(&[binary.to_owned(), "--version".to_owned()]).ok()?;
+) -> ProbeRun<Option<String>> {
+    let Ok(shell) = render_prebind_shell(&[binary.to_owned(), "--version".to_owned()]) else {
+        return ProbeRun::ok(None);
+    };
     let request =
         account_login_shell_request(account_home, profile_entries, &shell, probe_policy());
-    let result = runner.run(&request).ok()?;
-    if !result.status.success() {
-        return None;
+    match runner.run(&request) {
+        Ok(result) if result.status.success() => ProbeRun::ok(parse_version(&result.stdout)),
+        Ok(_) => ProbeRun::ok(None),
+        Err(error) => ProbeRun {
+            value: None,
+            hit_deadline: is_deadline_error(&error),
+        },
     }
-    parse_version(&result.stdout)
 }
 
 fn run_auth_in_shell(
@@ -670,26 +975,33 @@ fn run_auth_in_shell(
     binary: &str,
     probe: &AuthProbe,
     profile_entries: &[(OsString, OsString)],
-) -> AgentAuth {
+) -> ProbeRun<AgentAuth> {
     let mut argv = vec![binary.to_owned()];
     argv.extend(probe.args().iter().map(|arg| (*arg).to_owned()));
     let Ok(shell) = render_prebind_shell(&argv) else {
-        return AgentAuth::Unknown;
+        return ProbeRun::ok(AgentAuth::Unknown);
     };
     let request =
         account_login_shell_request(account_home, profile_entries, &shell, probe_policy());
-    let Some(result) = runner.run(&request).ok() else {
-        return AgentAuth::Unknown;
-    };
+    match runner.run(&request) {
+        Ok(result) => ProbeRun::ok(classify_auth_result(probe, &result)),
+        Err(error) => ProbeRun {
+            value: AgentAuth::Unknown,
+            hit_deadline: is_deadline_error(&error),
+        },
+    }
+}
+
+fn classify_auth_result(probe: &AuthProbe, result: &ProcessResult) -> AgentAuth {
     if !is_valid_utf8(&result.stdout) || !is_valid_utf8(&result.stderr) {
         return AgentAuth::Unknown;
     }
 
-    let classification = probe.classify(&result);
+    let classification = probe.classify(result);
     if let AuthProbeResult::UnknownWithReason(reason) = classification {
         return AgentAuth::UnknownWithReason(reason);
     }
-    if !result.status.success() || contains_auth_probe_error(&result) {
+    if !result.status.success() || contains_auth_probe_error(result) {
         return AgentAuth::Unknown;
     }
     match classification {
@@ -728,20 +1040,25 @@ fn run_process(
 fn unlock_for_probe(
     runner: &dyn ProcessRunner,
     config: &crate::keychain::KeychainUnlockConfig,
-) -> bool {
+) -> ProbeRun<bool> {
     #[cfg(target_os = "macos")]
     {
-        crate::keychain::unlock_keychain(
+        match crate::keychain::unlock_keychain(
             runner,
             config,
             &crate::redaction::RedactionBoundary::from_env(),
-        )
-        .is_ok()
+        ) {
+            Ok(()) => ProbeRun::ok(true),
+            Err(error) => ProbeRun {
+                value: false,
+                hit_deadline: is_deadline_error(&error),
+            },
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (runner, config);
-        false
+        ProbeRun::ok(false)
     }
 }
 

@@ -9,7 +9,9 @@ use std::{
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::{
-    agent_facts::{AgentFacts, EnvProfile as AgentEnvProfile, collect_agent_facts},
+    agent_facts::{
+        AgentFacts, EnvProfile as AgentEnvProfile, FactsTiming, collect_agent_facts_with_timing,
+    },
     error::WorkerError,
     host_store::HostStore,
     lease::{LeaseService, SlotState},
@@ -205,11 +207,22 @@ impl ProbeCollector {
         home: &Path,
         runner: &dyn ProcessRunner,
     ) -> Result<AgentFacts, WorkerError> {
+        Self::refresh_facts_at_with_timing(host_state_root, home, runner).map(|(facts, _)| facts)
+    }
+
+    /// Refreshes cached facts and records how long each collection step took.
+    /// Timing is measured during the same probes that produce the facts; the
+    /// facts file is unchanged.
+    pub fn refresh_facts_at_with_timing(
+        host_state_root: &Path,
+        home: &Path,
+        runner: &dyn ProcessRunner,
+    ) -> Result<(AgentFacts, FactsTiming), WorkerError> {
         HostStore::open(host_state_root)?;
         let profiles = load_env_profiles(home)?;
-        let facts = collect_agent_facts(runner, home, &profiles);
+        let (facts, timing) = collect_agent_facts_with_timing(runner, home, &profiles);
         write_cached_facts(host_state_root, &facts)?;
-        Ok(facts)
+        Ok((facts, timing))
     }
 
     /// Reads the facts cache without launching any agent binary.

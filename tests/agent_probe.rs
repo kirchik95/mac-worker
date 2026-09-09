@@ -371,7 +371,14 @@ fn refresh_command_is_hidden_and_workers_refreshes_before_its_probe() {
     assert!(matches!(
         host.command,
         Command::Host {
-            command: HostCommand::RefreshFacts
+            command: HostCommand::RefreshFacts { timing: false }
+        }
+    ));
+    let timed = Cli::try_parse_from(["worker", "host", "refresh-facts", "--timing"]).unwrap();
+    assert!(matches!(
+        timed.command,
+        Command::Host {
+            command: HostCommand::RefreshFacts { timing: true }
         }
     ));
 
@@ -477,7 +484,7 @@ fn refresh_uses_the_runtime_home_without_loading_inventory() {
             config: Some("/missing/client-inventory.toml".into()),
             json: false,
             command: Command::Host {
-                command: HostCommand::RefreshFacts,
+                command: HostCommand::RefreshFacts { timing: false },
             },
         },
         &runner,
@@ -487,6 +494,11 @@ fn refresh_uses_the_runtime_home_without_loading_inventory() {
     );
     assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&stderr));
     assert!(stdout.is_empty());
+    assert!(
+        !String::from_utf8_lossy(&stderr).contains("timing "),
+        "without --timing stderr stays empty of diagnostics: {}",
+        String::from_utf8_lossy(&stderr)
+    );
     assert!(
         runner
             .requests()
@@ -541,4 +553,121 @@ fn refresh_collects_the_herdr_fact_and_cached_reads_never_probe_it() {
         .unwrap();
     assert_eq!(cached.herdr, facts.herdr);
     assert_eq!(runner.requests().len(), request_count_after_refresh);
+}
+
+#[test]
+fn refresh_facts_without_timing_prints_nothing_extra() {
+    let (exit, stdout, stderr) = run_host_refresh_facts(false);
+    assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert!(stdout.is_empty(), "{}", String::from_utf8_lossy(&stdout));
+    assert!(
+        stderr.is_empty(),
+        "without --timing the command stays silent: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
+fn refresh_facts_timing_prints_named_steps_on_stderr_after_writing_facts() {
+    let (exit, stdout, stderr) = run_host_refresh_facts(true);
+    assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert!(stdout.is_empty(), "{}", String::from_utf8_lossy(&stdout));
+    let text = String::from_utf8(stderr).unwrap();
+    let lines = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        !lines.is_empty(),
+        "timing prints one line per recorded step"
+    );
+    let names = lines
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .filter(|field| {
+                    *field == "timing"
+                        || field.starts_with("agent=")
+                        || field.starts_with("profile=")
+                        || field.starts_with("step=")
+                        || field.starts_with("result=")
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "timing agent=codex profile=- step=locate",
+            "timing agent=codex profile=- step=version",
+            "timing agent=codex profile=- step=auth result=unauthenticated",
+            "timing agent=codex profile=agents step=locate",
+            "timing agent=codex profile=agents step=auth result=authenticated",
+            "timing agent=claude profile=- step=locate",
+            "timing agent=claude profile=agents step=locate",
+            "timing agent=cursor profile=- step=locate",
+            "timing agent=cursor profile=agents step=locate",
+            "timing agent=opencode profile=- step=locate",
+            "timing agent=opencode profile=agents step=locate",
+            "timing agent=herdr profile=- step=locate",
+            "timing step=total",
+        ]
+    );
+    for line in &lines {
+        assert!(line.starts_with("timing "), "{line}");
+        assert!(!line.contains('/'), "timing leaked a path: {line}");
+        assert!(!line.contains(SECRET), "{line}");
+        assert!(!line.contains(INSECURE_SECRET), "{line}");
+        assert!(!line.contains("AGENT_TOKEN="), "{line}");
+        assert!(!line.contains("command -v"), "{line}");
+        assert!(!line.contains("--version"), "{line}");
+        assert!(!line.contains("login status"), "{line}");
+    }
+    assert!(
+        names.last() == Some(&"timing step=total".to_owned()),
+        "total is last"
+    );
+}
+
+fn run_host_refresh_facts(timing: bool) -> (u8, Vec<u8>, Vec<u8>) {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let profiles = home.join(".config/mac-worker/env");
+    fs::create_dir_all(&profiles).unwrap();
+    fs::write(
+        profiles.join("agents.env"),
+        format!("AGENT_TOKEN={SECRET}\n"),
+    )
+    .unwrap();
+    fs::set_permissions(
+        profiles.join("agents.env"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::from([(
+            OsString::from("XDG_DATA_HOME"),
+            temporary.path().join("data").into_os_string(),
+        )]),
+        home,
+        temporary.path().to_path_buf(),
+    );
+    let runner = RecordingRunner::default();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = mac_worker::run_with_io_in_context(
+        Cli {
+            config: Some("/missing/client-inventory.toml".into()),
+            json: false,
+            command: Command::Host {
+                command: HostCommand::RefreshFacts { timing },
+            },
+        },
+        &runner,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    (exit, stdout, stderr)
 }

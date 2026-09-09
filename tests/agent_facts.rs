@@ -13,10 +13,10 @@ use fake_herdr::{FakeHerdr, Reply};
 use mac_worker::{
     agent_facts::{
         AgentAuth, AgentFacts, AgentProbe, EnvProfile, FACTS_TTL, HerdrFactState, HerdrFacts,
-        ProfileProbe, collect_agent_facts_at,
+        PROBE_DEADLINE, ProfileProbe, collect_agent_facts_at, collect_agent_facts_at_with_timing,
     },
     config::{Config, WorkerEntry},
-    error::WorkerError,
+    error::{ProcessError, WorkerError},
     lease::SlotState,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
@@ -44,6 +44,7 @@ enum Scenario {
     NoBinariesResolve,
     KeychainUnlockFailure,
     KeychainOrdering,
+    StallingCodexAuth,
 }
 
 /// What the scripted account login shell knows about a `herdr` binary.
@@ -219,6 +220,11 @@ impl FakeProcessRunner {
         match parts.as_slice() {
             ["codex", "--version"] => Ok(success(b"codex-cli 0.152.1\n")),
             ["codex", "login", "status"] => {
+                if self.scenario == Scenario::StallingCodexAuth {
+                    return Err(WorkerError::Process(ProcessError::DeadlineExceeded {
+                        deadline: request.policy.deadline,
+                    }));
+                }
                 if self.scenario == Scenario::NetworkCodex {
                     return Ok(success(b"Logged in\nnetwork error\n"));
                 }
@@ -1010,4 +1016,168 @@ fn herdr_fact_is_no_response_when_the_socket_stays_silent() {
         started.elapsed() < Duration::from_secs(6),
         "the ping honours the client deadlines"
     );
+}
+
+#[test]
+fn timing_lines_name_each_step_in_collection_order_without_leaking_probe_details() {
+    let runner = FakeProcessRunner::new(Scenario::AllAgents);
+    let (_, timing) =
+        collect_agent_facts_at_with_timing(&runner, account_home(), &profiles(), COLLECTED_AT);
+    let lines = timing.lines();
+    assert_eq!(timing_names(&lines), expected_all_agents_timing_names());
+    assert!(
+        lines
+            .last()
+            .is_some_and(|line| line.starts_with("timing step=total ms=")),
+        "total is last: {lines:?}"
+    );
+    for line in &lines {
+        if line.contains("step=total") {
+            assert!(
+                !line.contains("deadline_ms="),
+                "total has no probe deadline: {line}"
+            );
+        } else {
+            assert!(
+                line.contains("deadline_ms="),
+                "probe steps record their deadline: {line}"
+            );
+        }
+        assert!(!line.contains("hit_deadline="), "{line}");
+    }
+    assert_timing_privacy(&lines);
+}
+
+#[test]
+fn a_probe_that_stalls_to_its_deadline_is_marked_on_the_auth_step() {
+    let runner = FakeProcessRunner::new(Scenario::StallingCodexAuth);
+    let (facts, timing) =
+        collect_agent_facts_at_with_timing(&runner, account_home(), &profiles(), COLLECTED_AT);
+    let lines = timing.lines();
+    let stalled = lines
+        .iter()
+        .filter(|line| line.contains("agent=codex") && line.contains("step=auth"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stalled.len(),
+        2,
+        "base and profile auth both ran: {lines:?}"
+    );
+    for line in stalled {
+        assert!(
+            line.contains("result=unknown"),
+            "deadline auth is unknown: {line}"
+        );
+        assert!(
+            line.contains(&format!("deadline_ms={}", PROBE_DEADLINE.as_millis())),
+            "{line}"
+        );
+        assert!(line.contains("hit_deadline=true"), "{line}");
+    }
+    assert_eq!(facts.agents[0].name, "codex");
+    assert_eq!(facts.agents[0].auth, AgentAuth::Unknown);
+    assert_eq!(facts.agents[0].auth_by_profile[0].1, AgentAuth::Unknown);
+    assert_timing_privacy(&lines);
+}
+
+#[test]
+fn timing_lines_never_contain_paths_profile_values_or_command_text() {
+    let runner = FakeProcessRunner::new(Scenario::KeychainUnlockFailure);
+    let (_, timing) = collect_agent_facts_at_with_timing(
+        &runner,
+        account_home(),
+        &keychain_profiles(),
+        COLLECTED_AT,
+    );
+    let lines = timing.lines();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("step=keychain-unlock")),
+        "keychain unlock is a recorded step: {lines:?}"
+    );
+    assert_timing_privacy(&lines);
+}
+
+fn expected_all_agents_timing_names() -> Vec<String> {
+    let mut names = Vec::new();
+    for agent in ["codex", "claude", "cursor", "opencode"] {
+        let auth = if agent == "codex" {
+            "authenticated"
+        } else {
+            "unauthenticated"
+        };
+        names.push(format!("timing agent={agent} profile=- step=locate"));
+        names.push(format!("timing agent={agent} profile=- step=version"));
+        names.push(format!(
+            "timing agent={agent} profile=- step=auth result={auth}"
+        ));
+        names.push(format!("timing agent={agent} profile=agents step=locate"));
+        names.push(format!(
+            "timing agent={agent} profile=agents step=auth result=authenticated"
+        ));
+    }
+    names.push("timing agent=herdr profile=- step=locate".into());
+    names.push("timing step=total".into());
+    names
+}
+
+fn timing_names(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .filter(|field| {
+                    *field == "timing"
+                        || field.starts_with("agent=")
+                        || field.starts_with("profile=")
+                        || field.starts_with("step=")
+                        || field.starts_with("result=")
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+fn assert_timing_privacy(lines: &[String]) {
+    for line in lines {
+        assert!(line.starts_with("timing "), "{line}");
+        assert!(!line.contains('/'), "timing must not leak a path: {line}");
+        assert!(
+            !line.contains(SECRET),
+            "timing leaked a profile secret: {line}"
+        );
+        for leaked in [
+            "CLAUDE_CODE_OAUTH_TOKEN=",
+            "CURSOR_API_KEY=",
+            "OPENAI_API_KEY=",
+            "MAC_WORKER_KEYCHAIN_PASSWORD=",
+            "MAC_WORKER_KEYCHAIN_PATH=",
+            "cursor-profile-key",
+            "openai-profile-key",
+            "profile-password",
+            "command -v",
+            "--version",
+            "login status",
+            "auth status",
+            "git config",
+            "unlock-keychain",
+        ] {
+            assert!(!line.contains(leaked), "timing leaked {leaked:?}: {line}");
+        }
+        for field in line.split_whitespace().skip(1) {
+            let Some((key, value)) = field.split_once('=') else {
+                panic!("timing field is not key=value: {field} in {line}");
+            };
+            assert!(
+                matches!(
+                    key,
+                    "agent" | "profile" | "step" | "ms" | "result" | "deadline_ms" | "hit_deadline"
+                ),
+                "unexpected timing key {key} in {line}"
+            );
+            assert!(!value.is_empty(), "{line}");
+        }
+    }
 }

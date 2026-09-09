@@ -18,7 +18,8 @@ pub const DEFAULT_KEYCHAIN_RELATIVE_PATH: &str = "Library/Keychains/login.keycha
 pub const UNLOCK_FAILED_REASON: &str = "keychain unlock failed";
 pub const KEYCHAIN_LOCKED_REASON: &str = "keychain locked";
 const SECURITY_PROGRAM: &str = "/usr/bin/security";
-const UNLOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on `security unlock-keychain` during a facts probe.
+pub const UNLOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const UNLOCK_OUTPUT_LIMIT: usize = 4 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
