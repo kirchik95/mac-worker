@@ -2111,6 +2111,9 @@ impl<'a> TaskClient<'a> {
     }
 
     fn refresh_task_status(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
+        if record.retains_log_drain_unavailable() {
+            return Ok(());
+        }
         let Some(worker_name) = record.status().worker() else {
             return Ok(());
         };

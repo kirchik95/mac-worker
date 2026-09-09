@@ -308,9 +308,7 @@ impl<'a> TurnRunner<'a> {
         error: &WorkerError,
     ) -> Result<(), WorkerError> {
         let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
-        if log.len() > 0 {
-            return Ok(());
-        }
+        let after_acceptance = log.len() > 0;
         let workers = self
             .config
             .workers
@@ -326,8 +324,14 @@ impl<'a> TurnRunner<'a> {
         let message = crate::redaction::RedactionBoundary::from_env()
             .text(&error.to_string(), EARLY_EXIT_MESSAGE_LIMIT);
         log.append_bytes(
-            early_exit_diagnostic_line(blocking.as_deref(), &public_code, &message, &workers)
-                .as_bytes(),
+            early_exit_diagnostic_line(
+                after_acceptance,
+                blocking.as_deref(),
+                &public_code,
+                &message,
+                &workers,
+            )
+            .as_bytes(),
         )
     }
 
@@ -662,6 +666,23 @@ impl<'a> TurnRunner<'a> {
             .config
             .worker(&worker_name)
             .ok_or_else(|| task_error("WORKER_NOT_FOUND", "selected worker is not configured"))?;
+        // Acceptance is the durable signal that the host already took the
+        // turn. A replacement runner must drain and import from the committed
+        // offsets rather than submit again, even if the prompt file is still
+        // on disk. TaskStatus alone is never treated as drain evidence.
+        if log.is_accepted() {
+            return self.execute_accepted_without_prompt(
+                task_id,
+                turn_id,
+                owner,
+                &initial_record,
+                &project,
+                transfer,
+                worker,
+                &mut log,
+                follow,
+            );
+        }
         let prompt = match self.client_state.read_turn_prompt(task_id, turn_id) {
             Ok(prompt) => prompt,
             Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -996,7 +1017,22 @@ impl<'a> TurnRunner<'a> {
             serde_json::json!({"type":"turn_accepted","protocol_version":crate::protocol::PROTOCOL_VERSION,"task_id":task_id,"turn_id":turn_id,"worker":worker.name}),
         )?;
         let terminal =
-            self.follow_remote(worker, task_id, turn_id, task_status, &mut log, follow)?;
+            match self.follow_remote(worker, task_id, turn_id, task_status, &mut log, follow) {
+                Ok(status) => status,
+                Err(error) => {
+                    return Err(self.recover_undrainable(
+                        task_id,
+                        turn_id,
+                        owner,
+                        &initial_record,
+                        &project,
+                        &transfer,
+                        worker,
+                        &mut log,
+                        error,
+                    ));
+                }
+            };
         self.finish_terminal(
             task_id,
             turn_id,
@@ -1025,20 +1061,47 @@ impl<'a> TurnRunner<'a> {
         follow: &mut Option<&mut dyn Write>,
     ) -> Result<TurnOutcomeReport, WorkerError> {
         let remote = RemoteJobClient::new(self.runner);
-        let status = remote
-            .task_status(
-                worker,
-                &TaskStatusRequest::new(initial_record.meta().project_id(), task_id),
-            )?
-            .status()
-            .clone();
+        let status = match remote.task_status(
+            worker,
+            &TaskStatusRequest::new(initial_record.meta().project_id(), task_id),
+        ) {
+            Ok(response) => response.status().clone(),
+            Err(error) => {
+                return Err(self.recover_undrainable(
+                    task_id,
+                    turn_id,
+                    owner,
+                    initial_record,
+                    project,
+                    &transfer,
+                    worker,
+                    log,
+                    error,
+                ));
+            }
+        };
         self.persist_status(task_id, status.clone())?;
         append_event(
             log,
             follow,
             serde_json::json!({"type":"turn_accepted","protocol_version":crate::protocol::PROTOCOL_VERSION,"task_id":task_id,"turn_id":turn_id,"worker":worker.name}),
         )?;
-        let terminal = self.follow_remote(worker, task_id, turn_id, status, log, follow)?;
+        let terminal = match self.follow_remote(worker, task_id, turn_id, status, log, follow) {
+            Ok(status) => status,
+            Err(error) => {
+                return Err(self.recover_undrainable(
+                    task_id,
+                    turn_id,
+                    owner,
+                    initial_record,
+                    project,
+                    &transfer,
+                    worker,
+                    log,
+                    error,
+                ));
+            }
+        };
         self.finish_terminal(
             task_id,
             turn_id,
@@ -1317,6 +1380,127 @@ impl<'a> TurnRunner<'a> {
         )
     }
 
+    /// JOB_NOT_FOUND / TASK_NOT_FOUND after acceptance means remaining
+    /// stdout/stderr cannot be proven. Finish the journal as an explicit
+    /// undrainable failure (`drained=false`) so `task logs -f` stops, keep
+    /// the local Failed outcome through later refresh, try to import a
+    /// still-reachable result, and only then release the base pin.
+    #[allow(clippy::too_many_arguments)]
+    fn recover_undrainable(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        owner: ProcessIdentity,
+        initial_record: &LocalTaskRecord,
+        project: &ProjectState,
+        transfer: &TransferRepo,
+        worker: &WorkerEntry,
+        log: &mut LogWriter,
+        error: WorkerError,
+    ) -> WorkerError {
+        let mapped = map_log_drain_unavailable(error);
+        if mapped.public_code() == "LOG_DRAIN_UNAVAILABLE"
+            && let Err(persist_error) = self.persist_log_drain_unavailable(
+                task_id,
+                turn_id,
+                owner,
+                initial_record,
+                project,
+                transfer,
+                worker,
+                log,
+            )
+        {
+            return persist_error;
+        }
+        mapped
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_log_drain_unavailable(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        owner: ProcessIdentity,
+        initial_record: &LocalTaskRecord,
+        project: &ProjectState,
+        transfer: &TransferRepo,
+        worker: &WorkerEntry,
+        log: &mut LogWriter,
+    ) -> Result<(), WorkerError> {
+        let imported = GitTransport::new(self.runner)
+            .fetch_result(
+                worker,
+                self.client_state.client_id(),
+                initial_record.meta().project_id(),
+                task_id,
+                transfer.path(),
+            )
+            .ok()
+            .and_then(|_| {
+                transfer
+                    .import_result(
+                        self.runner,
+                        &project.context.common_dir,
+                        worker.name.as_str(),
+                        task_id,
+                    )
+                    .ok()
+                    .map(|receipt| receipt.head().clone())
+            });
+        if imported.is_some() {
+            transfer.release_base(self.runner, task_id)?;
+        }
+        let workers = self
+            .config
+            .workers
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        let blocking = self
+            .client_state
+            .task_blocking_codes(self.config)
+            .ok()
+            .and_then(|codes| codes.get(&task_id).cloned());
+        let diagnostic = task_error(
+            "LOG_DRAIN_UNAVAILABLE",
+            "worker job or logs are gone; remaining stdout/stderr cannot be drained",
+        );
+        let message = crate::redaction::RedactionBoundary::from_env()
+            .text(&diagnostic.to_string(), EARLY_EXIT_MESSAGE_LIMIT);
+        let line = early_exit_diagnostic_line(
+            log.len() > 0,
+            blocking.as_deref(),
+            "LOG_DRAIN_UNAVAILABLE",
+            &message,
+            &workers,
+        );
+        let outcome = TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE");
+        log.finish(
+            Completion {
+                outcome: outcome.clone(),
+                drained: false,
+            },
+            line.as_bytes(),
+        )?;
+        let record = self.client_state.load_task(task_id)?;
+        let status = publication_failure_status(record.status(), outcome, now_millis()?)?;
+        let record = record
+            .with_status(status)?
+            .with_abandon_code(Some("LOG_DRAIN_UNAVAILABLE".into()))?;
+        let record = if let Some(head) = imported {
+            record.with_fetched_head(Some(head))?
+        } else {
+            record
+        };
+        self.client_state.update_task(record)?;
+        self.client_state.record_runner(task_id, None)?;
+        self.client_state
+            .remove_task_turn_after_terminal(turn_id, owner)?;
+        self.client_state.remove_turn_prompt(task_id, turn_id)?;
+        Ok(())
+    }
+
     fn queue_cancel_requested(&self, turn_id: TurnId) -> Result<bool, WorkerError> {
         Ok(self
             .client_state
@@ -1366,7 +1550,8 @@ impl<'a> TurnRunner<'a> {
             .iter()
             .map(|w| w.name.as_str())
             .collect::<Vec<_>>();
-        let line = early_exit_diagnostic_line(Some("CAPACITY_BUSY"), "CAPACITY_BUSY", "", &workers);
+        let line =
+            early_exit_diagnostic_line(false, Some("CAPACITY_BUSY"), "CAPACITY_BUSY", "", &workers);
         let completion = Completion {
             outcome: TaskOutcome::failed("CAPACITY_BUSY"),
             drained: false,
@@ -1608,18 +1793,27 @@ fn early_exit_message_body<'a>(public_code: &str, message: &'a str) -> Option<&'
     }
 }
 
-/// The runner's one line about a turn it gave up on before acceptance: the
-/// queue's view of why the task waits, then the error that actually ended
-/// this runner with its redacted message, then the configured workers.  The
-/// two codes are printed once when they agree, so a plain capacity wait
-/// still reads `exited: CAPACITY_BUSY workers=...`.
+/// The runner's one line about a turn it gave up on: the queue's view of
+/// why the task waits, then the error that actually ended this runner with
+/// its redacted message, then the configured workers.  The two codes are
+/// printed once when they agree, so a plain capacity wait still reads
+/// `exited: CAPACITY_BUSY workers=...`. After the journal already has content
+/// (the host accepted the turn), the line is prefixed `exited after
+/// acceptance:` so a reader can tell it from the pre-acceptance form; both
+/// are plain text and pass through `task logs` verbatim.
 fn early_exit_diagnostic_line(
+    after_acceptance: bool,
     blocking: Option<&str>,
     public_code: &str,
     message: &str,
     workers: &[&str],
 ) -> String {
-    let mut line = format!("exited: {}", blocking.unwrap_or(public_code));
+    let prefix = if after_acceptance {
+        "exited after acceptance: "
+    } else {
+        "exited: "
+    };
+    let mut line = format!("{prefix}{}", blocking.unwrap_or(public_code));
     if blocking.is_some_and(|blocking| blocking != public_code) {
         line.push_str(&format!(" error={public_code}"));
     }
@@ -1753,6 +1947,16 @@ fn task_error(
     WorkerError::task(code, message)
 }
 
+fn map_log_drain_unavailable(error: WorkerError) -> WorkerError {
+    match error.public_code().as_str() {
+        "JOB_NOT_FOUND" | "TASK_NOT_FOUND" => task_error(
+            "LOG_DRAIN_UNAVAILABLE",
+            "worker job or logs are gone; remaining stdout/stderr cannot be drained",
+        ),
+        _ => error,
+    }
+}
+
 fn now_millis() -> Result<u64, WorkerError> {
     let value = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1782,6 +1986,7 @@ mod tests {
     fn the_early_exit_line_keeps_the_runner_error_beside_the_blocking_code() {
         assert_eq!(
             early_exit_diagnostic_line(
+                false,
                 Some("WAITING_FOR_DISPATCH"),
                 "PROJECT_MISMATCH",
                 "PROJECT_MISMATCH: current project is not the task's project",
@@ -1790,11 +1995,17 @@ mod tests {
             "exited: WAITING_FOR_DISPATCH error=PROJECT_MISMATCH message=current project is not the task's project workers=mini-1\n"
         );
         assert_eq!(
-            early_exit_diagnostic_line(Some("CAPACITY_BUSY"), "CAPACITY_BUSY", "", &["a", "b"]),
+            early_exit_diagnostic_line(
+                false,
+                Some("CAPACITY_BUSY"),
+                "CAPACITY_BUSY",
+                "",
+                &["a", "b"]
+            ),
             "exited: CAPACITY_BUSY workers=a,b\n"
         );
         assert_eq!(
-            early_exit_diagnostic_line(None, "PROJECT_MISMATCH", "PROJECT_MISMATCH: x", &[]),
+            early_exit_diagnostic_line(false, None, "PROJECT_MISMATCH", "PROJECT_MISMATCH: x", &[]),
             "exited: PROJECT_MISMATCH message=x\n"
         );
     }
@@ -1802,11 +2013,12 @@ mod tests {
     #[test]
     fn the_early_exit_line_adds_the_message_when_it_says_more_than_the_code() {
         assert_eq!(
-            early_exit_diagnostic_line(None, "IO", "IO: permission denied", &["mini-1"]),
+            early_exit_diagnostic_line(false, None, "IO", "IO: permission denied", &["mini-1"]),
             "exited: IO message=permission denied workers=mini-1\n"
         );
         assert_eq!(
             early_exit_diagnostic_line(
+                false,
                 Some("WAITING_FOR_DISPATCH"),
                 "PROTOCOL",
                 "worker probe was empty",
@@ -1816,6 +2028,7 @@ mod tests {
         );
         assert_eq!(
             early_exit_diagnostic_line(
+                false,
                 Some("WAITING_FOR_DISPATCH"),
                 "AGENT_EXITED",
                 "AGENT_EXITED: session prebind failed: agent exited 1",
@@ -1824,12 +2037,32 @@ mod tests {
             "exited: WAITING_FOR_DISPATCH error=AGENT_EXITED message=session prebind failed: agent exited 1 workers=mini-1\n"
         );
         assert_eq!(
-            early_exit_diagnostic_line(None, "LEASE_IDENTITY_MISMATCH", "long story", &["m"]),
+            early_exit_diagnostic_line(
+                false,
+                None,
+                "LEASE_IDENTITY_MISMATCH",
+                "long story",
+                &["m"]
+            ),
             "exited: LEASE_IDENTITY_MISMATCH message=long story workers=m\n"
         );
         assert_eq!(
-            early_exit_diagnostic_line(None, "CAPACITY_BUSY", "CAPACITY_BUSY", &["a"]),
+            early_exit_diagnostic_line(false, None, "CAPACITY_BUSY", "CAPACITY_BUSY", &["a"]),
             "exited: CAPACITY_BUSY workers=a\n"
+        );
+    }
+
+    #[test]
+    fn the_post_acceptance_early_exit_line_uses_a_distinct_prefix() {
+        assert_eq!(
+            early_exit_diagnostic_line(
+                true,
+                None,
+                "PROJECT_MISMATCH",
+                "PROJECT_MISMATCH: current project is not the task's project",
+                &["mini-1"],
+            ),
+            "exited after acceptance: PROJECT_MISMATCH message=current project is not the task's project workers=mini-1\n"
         );
     }
 

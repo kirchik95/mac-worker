@@ -84,6 +84,9 @@ impl MacWorkerTaskSource {
         if !matches!(record.status().state(), TaskState::Active | TaskState::Open) {
             return Ok((record.status().clone(), TaskFreshness::Current));
         }
+        if record.retains_log_drain_unavailable() {
+            return Ok((record.status().clone(), TaskFreshness::Current));
+        }
         let Some(worker_name) = record.status().worker() else {
             return Ok((record.status().clone(), TaskFreshness::Current));
         };
@@ -127,6 +130,12 @@ impl DashboardTaskSource for MacWorkerTaskSource {
             ));
         }
         let record = self.owned_record(task_id)?;
+        if record.retains_log_drain_unavailable() {
+            return Err(ApiError::new(
+                "LOG_DRAIN_UNAVAILABLE",
+                "worker job or logs are gone; remaining stdout/stderr cannot be drained",
+            ));
+        }
         let turn_ids = self
             .local_tasks
             .turn_ids_for_task(task_id)
@@ -168,6 +177,12 @@ pub(crate) fn collect_task_projection(
 
         let mut status = record.status().clone();
         let mut task_freshness = TaskFreshness::Current;
+        if record.retains_log_drain_unavailable() {
+            let effective = record.with_status(status).map_err(map_local_error)?;
+            effective_records.push(effective);
+            freshness.insert(task_id, task_freshness);
+            continue;
+        }
         if matches!(status.state(), TaskState::Active | TaskState::Open)
             && status.worker().is_some()
         {

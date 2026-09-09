@@ -8,6 +8,7 @@ use std::{
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{self, ExitStatus},
+    str::FromStr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -25,24 +26,34 @@ use mac_worker::{
         ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
         ClientStateWritePoint,
     },
-    config::Config,
+    config::{Config, WorkerEntry},
+    dashboard::{
+        service::{DashboardService, SystemClock, SystemMonotonicClock},
+        source::{DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource},
+        task::{DashboardTaskSource, MacWorkerTaskSource},
+    },
     error::WorkerError,
     job::{
-        AdmissionObservation, CommandSummary, JobMeta, JobState, JobStatus, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseRecord, LogChunk, LogChunkRequest, LogStream, ProcessIdentity,
-        QueueEntry, QueueEntryKind, StatusRequest, StatusResponse, SubmitResponse,
+        AdmissionObservation, CommandSummary, HostControlError, JobId, JobMeta, JobState,
+        JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LogChunk,
+        LogChunkRequest, LogStream, ProcessIdentity, QueueEntry, QueueEntryKind, StatusRequest,
+        StatusResponse, SubmitResponse,
     },
     lease::SlotState,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
+    project_state::ProjectState,
+    protocol::{
+        CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+        WorkersReport,
+    },
     scheduler::WorkerPreference,
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
     },
     task::{
-        ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunRecord, RunnerState,
-        TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
-        TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunRecord,
+        RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
+        TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
     },
     task_client::{TaskClient, TaskSubmitRequest, WaitSelector},
     task_store::{
@@ -263,6 +274,234 @@ impl ProcessRunner for ReplayableLogsRunner<'_> {
         }
         self.inner.run(request)
     }
+}
+
+struct MissingJobLogsRunner<'a> {
+    inner: ReplayableLogsRunner<'a>,
+}
+
+impl ProcessRunner for MissingJobLogsRunner<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let operation = request.args.last().and_then(|arg| arg.to_str());
+        if operation == Some(HostOperation::Status.command())
+            || operation == Some(HostOperation::LogChunk.command())
+        {
+            let mut result = canonical_process(&HostControlError::new(
+                "JOB_NOT_FOUND",
+                "job ID is not indexed",
+            )?)?;
+            result.status = ExitStatus::from_raw(23 << 8);
+            return Ok(result);
+        }
+        self.inner.run(request)
+    }
+}
+
+#[derive(Default)]
+struct BoundedFollowWriter {
+    bytes: Vec<u8>,
+    polls: usize,
+}
+
+impl Write for BoundedFollowWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.polls += 1;
+        if self.polls > 5 {
+            panic!("task logs -f kept polling after undrainable completion");
+        }
+        Ok(())
+    }
+}
+
+struct HostReportsSuccessReader {
+    status: TaskStatus,
+}
+
+impl DashboardRemoteReader for HostReportsSuccessReader {
+    fn status(&self, _worker: &WorkerEntry, _job_id: JobId) -> Result<StatusResponse, WorkerError> {
+        Err(WorkerError::Protocol("JOB_NOT_FOUND".into()))
+    }
+
+    fn log_chunk(
+        &self,
+        _worker: &WorkerEntry,
+        _job_id: JobId,
+        stream: LogStream,
+        offset: u64,
+        _limit: u32,
+    ) -> Result<LogChunk, WorkerError> {
+        LogChunk::new(stream, offset, Vec::new())
+    }
+
+    fn task_status(
+        &self,
+        _worker: &WorkerEntry,
+        _request: &TaskStatusRequest,
+    ) -> Result<TaskStatusResponse, WorkerError> {
+        Ok(TaskStatusResponse::new(self.status.clone()))
+    }
+}
+
+struct IdleDashboardWorkers;
+
+impl DashboardWorkerReader for IdleDashboardWorkers {
+    fn inspect(&self, _config: &Config, _deadline: Duration) -> WorkersReport {
+        WorkersReport {
+            protocol_version: PROTOCOL_VERSION,
+            workers: Vec::new(),
+        }
+    }
+}
+
+fn persist_independent_terminal_status(fixture: &AcceptedThenTerminalFixture) {
+    let terminal = fixture.runner.task_status(fixture.task_id, true).unwrap();
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    fixture
+        .state
+        .update_task(
+            record
+                .with_status(terminal)
+                .unwrap()
+                .with_runner(None)
+                .unwrap(),
+        )
+        .unwrap();
+}
+
+/// TaskPrepare never ran for a planted journal, so the fake host has no
+/// prepared task. Synthesize Open/Done locally so reconcile will not
+/// recreate a row after retiring a completed dispatch.
+fn persist_local_open_success(fixture: &AcceptedThenTerminalFixture) {
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    let now = record.status().updated_at_millis().saturating_add(1);
+    let turn = record.status().turns().last().map_or_else(
+        || {
+            TurnSummary::new(
+                1,
+                fixture.turn_id,
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+                Some(true),
+                false,
+                Some(1),
+                Some(2),
+            )
+        },
+        |last| {
+            TurnSummary::new(
+                last.turn_number(),
+                last.turn_id(),
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+                last.agent_committed().or(Some(true)),
+                last.log_truncated(),
+                last.started_at_millis(),
+                Some(last.ended_at_millis().unwrap_or(now)),
+            )
+        },
+    );
+    let turns = if record.status().turns().is_empty() {
+        vec![turn]
+    } else {
+        let mut turns = record.status().turns().to_vec();
+        *turns.last_mut().unwrap() = turn;
+        turns
+    };
+    let status = TaskStatus::new(
+        TaskState::Open,
+        Some(TaskOutcome::Done),
+        record.status().worker().map(str::to_owned),
+        record.status().session_present(),
+        record.status().head_oid().cloned(),
+        Some("finished".into()),
+        record.status().questions().to_vec(),
+        record.status().files_changed().to_vec(),
+        record.status().diff_stat().map(str::to_owned),
+        turns,
+        now,
+    )
+    .unwrap();
+    fixture
+        .state
+        .update_task(record.with_status(status).unwrap())
+        .unwrap();
+}
+
+fn fixture_checkpoint(fixture: &AcceptedThenTerminalFixture) -> serde_json::Value {
+    let path = fixture
+        .paths
+        .state
+        .join("runners")
+        .join(fixture.task_id.to_string())
+        .join(format!("{}.checkpoint.json", fixture.turn_id));
+    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap()
+}
+
+fn write_fixture_checkpoint(fixture: &AcceptedThenTerminalFixture, checkpoint: &serde_json::Value) {
+    let path = fixture
+        .paths
+        .state
+        .join("runners")
+        .join(fixture.task_id.to_string())
+        .join(format!("{}.checkpoint.json", fixture.turn_id));
+    fs::write(&path, serde_json::to_vec(checkpoint).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn adopt_dead_owner_and_reconcile<R: ProcessRunner>(
+    fixture: &AcceptedThenTerminalFixture,
+    remote: &R,
+    dead_owner: ProcessIdentity,
+) -> (ClientStateStore, mac_worker::task_client::ReconcileReport) {
+    fixture
+        .state
+        .adopt_row(fixture.turn_id, dead_owner)
+        .unwrap();
+    let store = ClientStateStore::open_with_owner_inspector(
+        &fixture.paths.state,
+        DeadOwnerInspector { dead_owner },
+    )
+    .unwrap();
+    let report = TaskClient::new(
+        remote,
+        &fixture.config,
+        &fixture.paths,
+        &store,
+        &fixture.executor,
+    )
+    .reconcile_runners()
+    .unwrap();
+    (store, report)
+}
+
+fn transfer_for_fixture(fixture: &AcceptedThenTerminalFixture) -> TransferRepo {
+    let project =
+        ProjectState::load(&SystemProcessRunner, &std::env::current_dir().unwrap(), &[]).unwrap();
+    TransferRepo::open_or_create(&fixture.paths.cache, &project.context.common_dir).unwrap()
+}
+
+fn base_pin_name(fixture: &AcceptedThenTerminalFixture) -> String {
+    format!("refs/mac-worker/bases/{}", fixture.task_id)
+}
+
+fn result_fetch_count(runner: &AcceptedThenTerminalRunner) -> usize {
+    runner
+        .requests()
+        .iter()
+        .filter(|request| {
+            request.program == OsStr::new("/usr/bin/git")
+                && request.args.iter().any(|arg| arg == "fetch")
+                && request.args.iter().any(|arg| {
+                    arg.to_string_lossy().contains("refs/mac-worker/results/")
+                        || arg.to_string_lossy().starts_with("--upload-pack=")
+                })
+        })
+        .count()
 }
 
 #[derive(Clone)]
@@ -980,6 +1219,416 @@ fn restarted_runner_resumes_both_logs_without_repeating_a_committed_prefix() {
             .iter()
             .find(|(stream, _)| *stream == LogStream::Stderr),
         Some(&(LogStream::Stderr, 0))
+    );
+}
+
+#[test]
+fn recovery_drains_the_log_tail_when_a_dead_owner_has_terminal_status_and_offsets_behind_available_streams()
+ {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let remote = ReplayableLogsRunner::new(&fixture.runner);
+    remote.fail_stderr_once.store(true, Ordering::SeqCst);
+    let error = TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    assert_eq!(error.public_code(), "SSH_LAUNCH_FAILED");
+    let prefix = fixture.runner_log();
+    assert_eq!(prefix.iter().filter(|byte| **byte == 0xf1).count(), 65_536);
+    persist_independent_terminal_status(&fixture);
+    assert!(fixture_checkpoint(&fixture)["committed"]["completion"].is_null());
+
+    let dead_owner = ProcessIdentity::new(424_242, 4_242_427).unwrap();
+    remote.reads.lock().unwrap().clear();
+    let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
+    assert_eq!(report.repaired_rows(), 0);
+    assert!(store.queue_entry(fixture.turn_id).unwrap().is_some());
+    assert!(fixture_checkpoint(&fixture)["committed"]["completion"].is_null());
+    assert_eq!(
+        fixture
+            .runner_log()
+            .iter()
+            .filter(|byte| **byte == 0xf1)
+            .count(),
+        65_536
+    );
+
+    TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &store,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap();
+
+    let log = fixture.runner_log();
+    assert!(
+        log.starts_with(&prefix),
+        "recovery rewrote already visible bytes"
+    );
+    assert_eq!(log.iter().filter(|byte| **byte == 0xf1).count(), 150_011);
+    assert_eq!(log.iter().filter(|byte| **byte == 0xfe).count(), 91_017);
+    let reads = remote.reads.lock().unwrap();
+    assert_eq!(
+        reads
+            .iter()
+            .find(|(stream, _)| *stream == LogStream::Stdout),
+        Some(&(LogStream::Stdout, 65_536))
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .find(|(stream, _)| *stream == LogStream::Stderr),
+        Some(&(LogStream::Stderr, 0))
+    );
+    let checkpoint = fixture_checkpoint(&fixture);
+    assert_eq!(checkpoint["committed"]["completion"]["drained"], true);
+    assert!(
+        store
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn recovery_imports_the_result_after_a_crash_between_terminal_persist_and_fetch() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let remote = ReplayableLogsRunner::new(&fixture.runner);
+    remote.fail_stderr_once.store(true, Ordering::SeqCst);
+    TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    assert_eq!(result_fetch_count(&fixture.runner), 0);
+    persist_independent_terminal_status(&fixture);
+
+    let prefix = fixture.runner_log();
+    let stdout_have = prefix.iter().filter(|byte| **byte == 0xf1).count();
+    assert_eq!(stdout_have, 65_536);
+    let mut extra = vec![0xf1; 150_011 - stdout_have];
+    extra.extend(vec![0xfe; 91_017]);
+    let log_path = support::task_harness::runner_log(
+        fixture.state_root.path(),
+        &fixture.task_id.to_string(),
+        &fixture.turn_id.to_string(),
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .unwrap()
+        .write_all(&extra)
+        .unwrap();
+    let mut checkpoint = fixture_checkpoint(&fixture);
+    checkpoint["committed"]["offsets"] = serde_json::json!([150_011, 91_017]);
+    checkpoint["committed"]["len"] = serde_json::json!(prefix.len() + extra.len());
+    checkpoint["committed"]["accepted"] = serde_json::json!(true);
+    checkpoint["committed"]["completion"] = serde_json::Value::Null;
+    write_fixture_checkpoint(&fixture, &checkpoint);
+
+    let earlier = BaseOid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let imported = fixture
+        .state
+        .load_task(fixture.task_id)
+        .unwrap()
+        .meta()
+        .base_oid()
+        .clone();
+    assert_ne!(earlier, imported);
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    fixture
+        .state
+        .update_task(record.with_fetched_head(Some(earlier.clone())).unwrap())
+        .unwrap();
+    let transfer = transfer_for_fixture(&fixture);
+    assert!(transfer.has_ref(&base_pin_name(&fixture)));
+    assert_eq!(
+        fixture
+            .state
+            .load_task(fixture.task_id)
+            .unwrap()
+            .fetched_head(),
+        Some(&earlier)
+    );
+
+    let dead_owner = ProcessIdentity::new(424_243, 4_242_437).unwrap();
+    let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
+    assert_eq!(report.repaired_rows(), 0);
+    assert!(store.queue_entry(fixture.turn_id).unwrap().is_some());
+    assert!(fixture_checkpoint(&fixture)["committed"]["completion"].is_null());
+    assert!(transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
+
+    TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &store,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap();
+
+    assert!(result_fetch_count(&fixture.runner) >= 1);
+    let recovered = store.load_task(fixture.task_id).unwrap();
+    assert_eq!(recovered.fetched_head(), Some(&imported));
+    assert_ne!(recovered.fetched_head(), Some(&earlier));
+    assert!(
+        store
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
+    let checkpoint = fixture_checkpoint(&fixture);
+    assert_eq!(checkpoint["committed"]["completion"]["drained"], true);
+    assert_eq!(
+        checkpoint["committed"]["completion"]["outcome"]["kind"],
+        "done"
+    );
+}
+
+#[test]
+fn reconcile_retires_a_dead_dispatching_row_whose_journal_already_proves_completion() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    fixture
+        .state
+        .open_runner_log(fixture.task_id, fixture.turn_id)
+        .unwrap();
+    write_fixture_checkpoint(
+        &fixture,
+        &serde_json::json!({
+            "version": 1,
+            "task_id": fixture.task_id,
+            "turn_id": fixture.turn_id,
+            "committed": {
+                "offsets": [0, 0],
+                "len": 0,
+                "accepted": true,
+                "completion": {"outcome": {"kind": "done"}, "drained": true}
+            },
+            "pending": null
+        }),
+    );
+    persist_local_open_success(&fixture);
+    assert!(transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
+
+    let dead_owner = ProcessIdentity::new(424_244, 4_242_447).unwrap();
+    fixture.state.record_runner(fixture.task_id, None).unwrap();
+    let live_owner = fixture
+        .state
+        .queue_entry(fixture.turn_id)
+        .unwrap()
+        .unwrap()
+        .owner_opt()
+        .copied()
+        .expect("submitted turn has an owner");
+    fixture
+        .state
+        .claim_next(live_owner, &["mini-1".into()], u64::MAX / 4)
+        .unwrap()
+        .expect("waiting turn must become dispatching before orphan repair");
+    let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &fixture.runner, dead_owner);
+    assert_eq!(report.repaired_rows(), 1);
+    assert_eq!(report.started_runners(), 0);
+    assert!(
+        store
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
+}
+
+#[test]
+fn recovery_records_log_drain_unavailable_when_the_worker_job_is_gone() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let inner = ReplayableLogsRunner::new(&fixture.runner);
+    inner.fail_stderr_once.store(true, Ordering::SeqCst);
+    TurnRunner::new(
+        &inner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    persist_independent_terminal_status(&fixture);
+    assert_eq!(
+        fixture
+            .state
+            .load_task(fixture.task_id)
+            .unwrap()
+            .status()
+            .last_outcome(),
+        Some(&TaskOutcome::Done)
+    );
+
+    let remote = MissingJobLogsRunner { inner };
+    let dead_owner = ProcessIdentity::new(424_245, 4_242_457).unwrap();
+    let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
+    assert_eq!(report.repaired_rows(), 0);
+    assert!(fixture_checkpoint(&fixture)["committed"]["completion"].is_null());
+
+    let error = TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &store,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    assert_eq!(error.public_code(), "LOG_DRAIN_UNAVAILABLE", "{error}");
+
+    let checkpoint = fixture_checkpoint(&fixture);
+    assert_eq!(checkpoint["committed"]["accepted"], true);
+    assert_eq!(checkpoint["committed"]["completion"]["drained"], false);
+    assert_eq!(
+        checkpoint["committed"]["completion"]["outcome"]["kind"],
+        "failed"
+    );
+    assert_eq!(
+        checkpoint["committed"]["completion"]["outcome"]["reason"],
+        "LOG_DRAIN_UNAVAILABLE"
+    );
+    let log_bytes = fixture.runner_log();
+    let log = String::from_utf8_lossy(&log_bytes);
+    assert!(
+        !log.contains("\"type\":\"turn_terminal\""),
+        "undrainable journal claimed turn_terminal"
+    );
+    assert!(
+        log.contains("exited after acceptance: LOG_DRAIN_UNAVAILABLE"),
+        "undrainable journal missing drain diagnostic"
+    );
+    let record = store.load_task(fixture.task_id).unwrap();
+    assert_eq!(
+        record.status().last_outcome(),
+        Some(&TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
+    );
+    assert_eq!(record.status().state(), TaskState::Open);
+    assert_eq!(record.abandon_code(), Some("LOG_DRAIN_UNAVAILABLE"));
+    assert!(record.fetched_head().is_some());
+    assert!(
+        store
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.runner_liveness(fixture.task_id).unwrap(), None);
+    assert!(!transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
+
+    let client = TaskClient::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &store,
+        &fixture.executor,
+    );
+    let waited = client
+        .wait(
+            WaitSelector::Task(fixture.task_id),
+            Some(Duration::from_secs(2)),
+        )
+        .unwrap();
+    assert_eq!(waited.exit_code(), 1);
+
+    let mut follow = BoundedFollowWriter::default();
+    client
+        .logs(
+            fixture.task_id,
+            None,
+            true,
+            true,
+            &mut follow,
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert!(follow.polls <= 5);
+    let followed = String::from_utf8_lossy(&follow.bytes);
+    assert!(
+        followed.contains("exited after acceptance: LOG_DRAIN_UNAVAILABLE"),
+        "followed log missing drain diagnostic"
+    );
+    assert!(
+        !followed.contains("\"type\":\"turn_terminal\""),
+        "followed log claimed turn_terminal"
+    );
+
+    let after = client.reconcile_runners().unwrap();
+    assert_eq!(after.started_runners(), 0);
+    let record = store.load_task(fixture.task_id).unwrap();
+    assert_eq!(
+        record.status().last_outcome(),
+        Some(&TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
+    );
+    assert_eq!(record.status().state(), TaskState::Open);
+    assert_eq!(record.abandon_code(), Some("LOG_DRAIN_UNAVAILABLE"));
+    drop(client);
+
+    let host_success = fixture.runner.task_status(fixture.task_id, true).unwrap();
+    let store = std::sync::Arc::new(store);
+    let config = std::sync::Arc::new(fixture.config.clone());
+    let dashboard_remote = std::sync::Arc::new(HostReportsSuccessReader {
+        status: host_success,
+    });
+    let tasks = MacWorkerTaskSource::new(
+        std::sync::Arc::clone(&config),
+        std::sync::Arc::clone(&store),
+        std::sync::Arc::clone(&dashboard_remote)
+            as std::sync::Arc<dyn mac_worker::dashboard::source::DashboardRemoteReader>,
+    );
+    let detail = tasks.task_detail(fixture.task_id).unwrap();
+    assert_eq!(detail.task.state, TaskState::Open);
+    assert_eq!(
+        detail.task.last_outcome,
+        Some(TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
+    );
+    let log_error = tasks
+        .read_task_log(fixture.task_id, fixture.turn_id, LogStream::Stdout, 0, 64)
+        .unwrap_err();
+    assert_eq!(log_error.code, "LOG_DRAIN_UNAVAILABLE");
+
+    let snapshot = DashboardService::new(
+        MacWorkerDashboardSource::new(
+            std::sync::Arc::clone(&config),
+            std::sync::Arc::new(IdleDashboardWorkers),
+            std::sync::Arc::clone(&store),
+            dashboard_remote
+                as std::sync::Arc<dyn mac_worker::dashboard::source::DashboardRemoteReader>,
+        ),
+        SystemClock,
+        SystemMonotonicClock::new(),
+    )
+    .snapshot(Default::default())
+    .unwrap();
+    let row = snapshot
+        .task_view
+        .tasks
+        .iter()
+        .find(|row| row.task_id == fixture.task_id)
+        .expect("undrainable task is present in the dashboard snapshot");
+    assert_eq!(row.state, TaskState::Open);
+    assert_eq!(
+        row.last_outcome,
+        Some(TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
     );
 }
 
@@ -4453,6 +5102,89 @@ fn the_early_exit_line_names_the_error_that_ended_the_runner() {
     assert!(line.starts_with("exited: "), "{log}");
     assert!(line.contains("PROJECT_MISMATCH"), "{log}");
     assert!(line.ends_with("workers=mini-1"), "{log}");
+}
+
+#[test]
+fn a_runner_that_fails_after_acceptance_appends_a_distinct_diagnostic_that_task_logs_renders() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let body = b"{\"type\":\"turn.completed\"}\n";
+    {
+        let mut log = fixture
+            .state
+            .open_runner_log(fixture.task_id, fixture.turn_id)
+            .unwrap();
+        log.write_all(body).unwrap();
+        log.sync_all().unwrap();
+    }
+    let checkpoint = fixture
+        .paths
+        .state
+        .join("runners")
+        .join(fixture.task_id.to_string())
+        .join(format!("{}.checkpoint.json", fixture.turn_id));
+    fs::write(
+        &checkpoint,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "task_id": fixture.task_id,
+            "turn_id": fixture.turn_id,
+            "committed": {
+                "offsets": [0, 0],
+                "len": body.len() as u64,
+                "accepted": true,
+                "completion": null
+            },
+            "pending": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&checkpoint, fs::Permissions::from_mode(0o600)).unwrap();
+    let project_context = fixture
+        .state_root
+        .path()
+        .join("state")
+        .join("turns")
+        .join(fixture.task_id.to_string())
+        .join("project.json");
+    fs::remove_file(&project_context)
+        .unwrap_or_else(|error| panic!("{}: {error}", project_context.display()));
+    let elsewhere = support::GitRepo::init();
+    elsewhere.write("other.txt", b"other\n");
+    elsewhere.commit_all("other");
+    let _elsewhere = CurrentDirGuard::enter(elsewhere.root());
+
+    let error = fixture.run(&mut Vec::new()).unwrap_err();
+    assert_eq!(error.public_code(), "PROJECT_MISMATCH", "{error}");
+    let log = String::from_utf8(fixture.runner_log()).unwrap();
+    assert!(
+        log.contains("exited after acceptance: PROJECT_MISMATCH"),
+        "runner log: {log}"
+    );
+
+    let mut stdout = Vec::new();
+    TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .logs(
+        fixture.task_id,
+        None,
+        false,
+        false,
+        &mut stdout,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let rendered = String::from_utf8(stdout).unwrap();
+    assert!(
+        rendered.contains("exited after acceptance: PROJECT_MISMATCH"),
+        "task logs: {rendered}"
+    );
 }
 
 #[test]

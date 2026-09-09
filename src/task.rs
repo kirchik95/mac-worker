@@ -1295,6 +1295,12 @@ impl LocalTaskRecord {
         self.abandon_code.as_deref()
     }
 
+    /// Local drain failure is durable evidence. Remote Closed/Done must not
+    /// replace it: the remaining stdout/stderr were never proven.
+    pub fn retains_log_drain_unavailable(&self) -> bool {
+        self.abandon_code() == Some("LOG_DRAIN_UNAVAILABLE")
+    }
+
     pub fn submission_rollback_turn_id(&self) -> Option<TurnId> {
         self.submission_rollback_turn_id
     }

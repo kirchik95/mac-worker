@@ -58,6 +58,39 @@ fn invalid() -> WorkerError {
         "runner log checkpoint is inconsistent",
     )
 }
+
+fn is_undrainable_outcome(outcome: &TaskOutcome) -> bool {
+    matches!(outcome, TaskOutcome::Failed { reason } if reason == "LOG_DRAIN_UNAVAILABLE")
+}
+
+/// `drained=true` still requires acceptance. `drained=false` is the empty
+/// pre-acceptance finish, or the explicit undrainable degraded state: the
+/// host accepted the turn but remaining stdout/stderr cannot be proven.
+fn completion_is_valid(accepted: bool, offsets: [u64; 2], completion: &Completion) -> bool {
+    if completion.drained {
+        accepted
+    } else if is_undrainable_outcome(&completion.outcome) {
+        true
+    } else {
+        !accepted && offsets == [0, 0]
+    }
+}
+fn turn_terminal_bytes(
+    task: TaskId,
+    turn: TurnId,
+    outcome: &TaskOutcome,
+) -> Result<Vec<u8>, WorkerError> {
+    let mut bytes = serde_json::to_vec(&serde_json::json!({
+        "type": "turn_terminal",
+        "protocol_version": crate::protocol::PROTOCOL_VERSION,
+        "task_id": task,
+        "turn_id": turn,
+        "outcome": outcome,
+    }))
+    .map_err(|_| invalid())?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
 fn directory(root: &Path, task: TaskId, create: bool) -> Result<RootedDir, WorkerError> {
     let mut root = RootedDir::open(root)?;
     let device = root.root_metadata()?.st_dev as u64;
@@ -171,6 +204,9 @@ impl RunnerLog {
     }
     pub(crate) fn completion(&self) -> Option<&Completion> {
         self.journal.committed.completion.as_ref()
+    }
+    pub(crate) fn is_accepted(&self) -> bool {
+        self.journal.committed.accepted
     }
     pub(crate) fn len(&self) -> u64 {
         self.journal.committed.len
@@ -295,9 +331,7 @@ impl RunnerLog {
                 Err(invalid())
             };
         }
-        if (!completion.drained && (self.journal.committed.accepted || self.offsets() != [0, 0]))
-            || (completion.drained && !self.journal.committed.accepted)
-        {
+        if !completion_is_valid(self.journal.committed.accepted, self.offsets(), &completion) {
             return Err(invalid());
         }
         let mut next = self.journal.committed.clone();
@@ -314,8 +348,7 @@ impl RunnerLog {
         turn: TurnId,
         outcome: TaskOutcome,
     ) -> Result<(), WorkerError> {
-        let mut bytes=serde_json::to_vec(&serde_json::json!({"type":"turn_terminal","protocol_version":crate::protocol::PROTOCOL_VERSION,"task_id":task,"turn_id":turn,"outcome":outcome})).map_err(|_|invalid())?;
-        bytes.push(b'\n');
+        let bytes = turn_terminal_bytes(task, turn, &outcome)?;
         self.finish(
             Completion {
                 outcome,
@@ -340,10 +373,11 @@ fn decode(bytes: &[u8], task_id: TaskId, turn_id: TurnId) -> Result<Journal, Wor
     {
         return Err(invalid());
     }
-    if j.committed.completion.as_ref().is_some_and(|c| {
-        (!c.drained && (j.committed.accepted || j.committed.offsets != [0, 0]))
-            || (c.drained && !j.committed.accepted)
-    }) {
+    if j.committed
+        .completion
+        .as_ref()
+        .is_some_and(|c| !completion_is_valid(j.committed.accepted, j.committed.offsets, c))
+    {
         return Err(invalid());
     }
     if let Some(p) = &j.pending {
@@ -374,10 +408,11 @@ fn decode(bytes: &[u8], task_id: TaskId, turn_id: TurnId) -> Result<Journal, Wor
         {
             return Err(invalid());
         }
-        if p.next.completion.as_ref().is_some_and(|c| {
-            (!c.drained && (p.next.accepted || p.next.offsets != [0, 0]))
-                || (c.drained && !p.next.accepted)
-        }) {
+        if p.next
+            .completion
+            .as_ref()
+            .is_some_and(|c| !completion_is_valid(p.next.accepted, p.next.offsets, c))
+        {
             return Err(invalid());
         }
     }
@@ -510,6 +545,49 @@ mod tests {
             Some(c)
         );
         assert!(w.append_bytes(b"late").is_err());
+    }
+
+    #[test]
+    fn accepted_undrainable_completion_is_valid_without_claiming_drained() {
+        let (d, t, u) = setup();
+        let mut w = RunnerLog::open(d.path(), t, u).unwrap();
+        assert!(w.accepted(b"accepted\n").unwrap());
+        let c = Completion {
+            outcome: TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"),
+            drained: false,
+        };
+        assert!(w.finish(c.clone(), b"undrainable\n").unwrap());
+        assert_eq!(
+            snapshot(d.path(), t, u).unwrap().unwrap().completion,
+            Some(c)
+        );
+        assert!(
+            w.finish(
+                Completion {
+                    outcome: TaskOutcome::Done,
+                    drained: false,
+                },
+                b"nope\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn accepted_success_cannot_complete_as_not_drained() {
+        let (d, t, u) = setup();
+        let mut w = RunnerLog::open(d.path(), t, u).unwrap();
+        assert!(w.accepted(b"accepted\n").unwrap());
+        assert!(
+            w.finish(
+                Completion {
+                    outcome: TaskOutcome::Done,
+                    drained: false,
+                },
+                b"nope\n"
+            )
+            .is_err()
+        );
     }
 }
 #[cfg(test)]

@@ -2,7 +2,12 @@
 mod support;
 
 use std::{
-    ffi::OsStr, os::unix::process::ExitStatusExt, path::PathBuf, process::ExitStatus, sync::Mutex,
+    ffi::OsStr,
+    io::Write,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    path::PathBuf,
+    process::ExitStatus,
+    sync::Mutex,
     time::Duration,
 };
 
@@ -384,6 +389,59 @@ fn owner(pid: u32) -> ProcessIdentity {
 
 fn job(number: u128) -> JobId {
     JobId::new(Uuid::from_u128(number))
+}
+
+fn plant_incomplete_accepted_journal(
+    paths: &mac_worker::paths::PathLayout,
+    store: &ClientStateStore,
+    task_id: TaskId,
+    turn_id: JobId,
+) {
+    let accepted = format!(
+        "{{\"type\":\"turn_accepted\",\"task_id\":\"{task_id}\",\"turn_id\":\"{turn_id}\",\"worker\":\"mini-2\"}}\n"
+    );
+    let agent = "{\"type\":\"turn.completed\"}\n";
+    let body = format!("{accepted}{agent}");
+    let mut log = store.open_runner_log(task_id, turn_id).unwrap();
+    log.write_all(body.as_bytes()).unwrap();
+    log.sync_all().unwrap();
+    drop(log);
+    let checkpoint = paths
+        .state
+        .join("runners")
+        .join(task_id.to_string())
+        .join(format!("{turn_id}.checkpoint.json"));
+    std::fs::write(
+        &checkpoint,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "committed": {
+                "offsets": [0, 0],
+                "len": body.len() as u64,
+                "accepted": true,
+                "completion": null
+            },
+            "pending": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&checkpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn runner_checkpoint(
+    paths: &mac_worker::paths::PathLayout,
+    task_id: TaskId,
+    turn_id: JobId,
+) -> serde_json::Value {
+    let path = paths
+        .state
+        .join("runners")
+        .join(task_id.to_string())
+        .join(format!("{turn_id}.checkpoint.json"));
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
 fn cache_idle(store: &ClientStateStore, worker: &str, now: u64) {
@@ -790,6 +848,76 @@ fn reconcile_removes_dead_dispatching_terminal_task_turn_before_close() {
     assert!(store.queue_entry_for_task_turn(task_id).unwrap().is_none());
     let closed = client.close(task_id, true).unwrap();
     assert_eq!(closed.status().state(), TaskState::Abandoned);
+}
+
+#[test]
+fn reconcile_still_starts_a_runner_for_a_dead_dispatching_turn_that_is_not_terminal() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let dead_owner = owner(913);
+    let task_id = TaskId::new(Uuid::from_u128(913));
+    let turn_id = job(914);
+    let record = task_record(
+        task_id,
+        turn_id,
+        TaskState::Active,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        Some(dead_owner),
+    );
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    let store = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        DeadOwnerInspector { dead_owner },
+    )
+    .unwrap();
+    store.create_task(record).unwrap();
+    store
+        .write_turn_prompt(task_id, turn_id, "fixture prompt")
+        .unwrap();
+    cache_idle(&store, "mini-1", 10);
+    store
+        .enqueue(turn(
+            &store,
+            914,
+            10,
+            dead_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            None,
+        ))
+        .unwrap();
+    store
+        .claim_next(dead_owner, &["mini-1".into()], 11)
+        .unwrap()
+        .unwrap();
+    plant_incomplete_accepted_journal(&paths, &store, task_id, turn_id);
+
+    let config = task_config();
+    let executor = InlineRunnerExecutor;
+    let client = TaskClient::new(&remote, &config, &paths, &store, &executor);
+    let report = client.reconcile_runners().unwrap();
+
+    assert_eq!(report.repaired_rows(), 0);
+    assert_eq!(report.replaced_runners(), 1);
+    assert_eq!(report.started_runners(), 1);
+    let entry = store.queue_entry(turn_id).unwrap().unwrap();
+    assert!(matches!(entry.state(), QueueState::Dispatching { .. }));
+    assert!(matches!(
+        store.process_observation(*entry.owner()),
+        ProcessObservation::Matching { .. }
+    ));
+    let checkpoint = runner_checkpoint(&paths, task_id, turn_id);
+    assert!(
+        checkpoint["committed"]["completion"].is_null(),
+        "{checkpoint}"
+    );
 }
 
 #[test]
