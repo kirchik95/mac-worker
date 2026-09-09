@@ -324,7 +324,8 @@ fn init_installs_a_missing_helper_through_the_transactional_installer() {
         reply(0, ""),
         reply(0, "promoted\n"),
         reply(0, "worker 0.1.0\n"), // Gatekeeper warm-up (--version) before verification.
-        reply(0, &ready),
+        reply(0, ""), // Standalone host refresh-facts (migrate-layout + refresh-facts) before verification.
+        reply(0, &ready), // Verification probe.
         reply(0, ""), // Verified install, scoped cleanup.
         reply(0, ""),
         reply(0, &ready), // Refresh and readiness.
@@ -333,6 +334,42 @@ fn init_installs_a_missing_helper_through_the_transactional_installer() {
     assert_eq!(code, 0, "{out}{err}");
     let requests = host.requests.lock().unwrap();
     assert_eq!(requests.iter().filter(|r| r.stdin.is_some()).count(), 1);
+    let remote_commands: Vec<String> = requests
+        .iter()
+        .filter_map(|request| {
+            request
+                .args
+                .last()
+                .map(|argument| argument.to_string_lossy().into_owned())
+        })
+        .collect();
+    let warmup = remote_commands
+        .iter()
+        .position(|command| command.contains("\"$worker_path\" --version"))
+        .expect("installer must warm the promoted helper");
+    let facts_refresh = remote_commands
+        .iter()
+        .enumerate()
+        .find(|(index, command)| {
+            *index > warmup && command.contains("\"$worker_path\" host refresh-facts")
+        })
+        .map(|(index, _)| index)
+        .expect("installer must refresh facts separately from verification");
+    let verification = remote_commands
+        .iter()
+        .enumerate()
+        .find(|(index, command)| *index > facts_refresh && command.contains("host probe"))
+        .map(|(index, _)| index)
+        .expect("installer must verify with a host probe");
+    assert!(warmup < facts_refresh, "warmup then facts-refresh");
+    assert!(
+        facts_refresh < verification,
+        "facts-refresh then verification"
+    );
+    assert!(
+        !remote_commands[facts_refresh].contains("host probe"),
+        "facts-refresh must not run the verification probe"
+    );
     assert!(host.replies.lock().unwrap().is_empty());
     assert_eq!(Config::load(&fixture.config).unwrap().workers.len(), 1);
 }
