@@ -73,7 +73,8 @@ impl RecordingRunner {
                     matches!(
                         argument.to_str(),
                         Some(
-                            "hash-object"
+                            "fast-import"
+                                | "hash-object"
                                 | "update-index"
                                 | "write-tree"
                                 | "commit-tree"

@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     fmt,
     fs::{self, File},
-    io::{self, Read},
+    io::{self, Read, Write},
     os::fd::AsRawFd,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
@@ -29,6 +29,9 @@ use crate::{
 const GIT_PROGRAM: &str = "/usr/bin/git";
 const GIT_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 const GIT_DEADLINE: Duration = Duration::from_secs(30);
+const BLOB_BATCH_MAX_BYTES: usize = 1024 * 1024;
+const BLOB_BATCH_MAX_OBJECTS: usize = 64;
+const GET_MARK_LINE_BYTES: usize = 41;
 const BASE_COMMIT_MESSAGE: &str = "mac-worker: task base";
 const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
     "GIT_DIR",
@@ -800,7 +803,8 @@ impl TransferRepo {
                 added: 0,
                 deleted: selection.tracked_deletions.len(),
             };
-            let mut index_info = Vec::new();
+            let mut pending = PendingBlobBatch::new();
+            let mut staged = Vec::new();
             for entry in &selection.entries {
                 if entry.kind == SelectedInputKind::EmptyDirectory {
                     continue;
@@ -810,13 +814,33 @@ impl TransferRepo {
                     crate::inputs::InputOrigin::IncludedUntracked
                     | crate::inputs::InputOrigin::IncludedIgnored => dirty.added += 1,
                 }
-                let (mode, oid) =
-                    self.hash_worktree_entry(runner, &source, &entry.path, blob_oids)?;
-                index_info.extend_from_slice(mode.as_bytes());
+                let (mode, digest) = self.stage_worktree_blob(
+                    runner,
+                    &source,
+                    &entry.path,
+                    blob_oids,
+                    &mut pending,
+                )?;
+                staged.push(StagedBlob {
+                    mode,
+                    digest,
+                    path: entry.path.as_str().to_owned(),
+                });
+            }
+            self.flush_pending_blobs(runner, blob_oids, &mut pending)?;
+            let mut index_info = Vec::new();
+            for staged in staged {
+                let oid = blob_oids.get(&staged.digest).ok_or_else(|| {
+                    git_error(
+                        "BASE_UNAVAILABLE",
+                        "a transfer blob was missing after the batch write",
+                    )
+                })?;
+                index_info.extend_from_slice(staged.mode.as_bytes());
                 index_info.push(b' ');
                 index_info.extend_from_slice(oid.as_bytes());
                 index_info.push(b'\t');
-                index_info.extend_from_slice(entry.path.as_str().as_bytes());
+                index_info.extend_from_slice(staged.path.as_bytes());
                 index_info.push(0);
             }
             if !index_info.is_empty() {
@@ -844,19 +868,20 @@ impl TransferRepo {
         captured
     }
 
-    fn hash_worktree_entry(
+    fn stage_worktree_blob(
         &self,
         runner: &dyn ProcessRunner,
         source: &RootedDir,
         path: &RelativePath,
         blob_oids: &mut BTreeMap<[u8; 32], String>,
-    ) -> Result<(&'static str, String), WorkerError> {
+        pending: &mut PendingBlobBatch,
+    ) -> Result<(&'static str, [u8; 32]), WorkerError> {
         let mut inspection = source.inspect(path)?;
         match inspection.kind {
             EntryKind::Symlink => {
-                let target = source.read_symlink(path)?;
-                let oid = self.hash_blob_bytes(runner, target.into_bytes(), false, blob_oids)?;
-                Ok(("120000", oid))
+                let bytes = source.read_symlink(path)?.into_bytes();
+                let digest = self.queue_blob_bytes(runner, bytes, false, blob_oids, pending)?;
+                Ok(("120000", digest))
             }
             EntryKind::RegularFile => {
                 let mut bytes = Vec::new();
@@ -866,32 +891,76 @@ impl TransferRepo {
                 } else {
                     "100644"
                 };
-                let oid = self.hash_blob_bytes(runner, bytes, true, blob_oids)?;
-                Ok((mode, oid))
+                let digest = self.queue_blob_bytes(runner, bytes, true, blob_oids, pending)?;
+                Ok((mode, digest))
             }
         }
     }
 
-    fn hash_blob_bytes(
+    fn queue_blob_bytes(
         &self,
         runner: &dyn ProcessRunner,
         bytes: Vec<u8>,
         no_filters: bool,
         blob_oids: &mut BTreeMap<[u8; 32], String>,
-    ) -> Result<String, WorkerError> {
+        pending: &mut PendingBlobBatch,
+    ) -> Result<[u8; 32], WorkerError> {
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        if let Some(oid) = blob_oids.get(&digest) {
-            return Ok(oid.clone());
+        if blob_oids.contains_key(&digest) || pending.contains(&digest) {
+            return Ok(digest);
         }
+        if bytes.len() > BLOB_BATCH_MAX_BYTES {
+            self.flush_pending_blobs(runner, blob_oids, pending)?;
+            let oid = self.write_hash_object(runner, bytes, no_filters)?;
+            blob_oids.insert(digest, oid);
+            return Ok(digest);
+        }
+        if pending.would_exceed(bytes.len()) {
+            self.flush_pending_blobs(runner, blob_oids, pending)?;
+        }
+        pending.push(digest, &bytes);
+        Ok(digest)
+    }
+
+    fn flush_pending_blobs(
+        &self,
+        runner: &dyn ProcessRunner,
+        blob_oids: &mut BTreeMap<[u8; 32], String>,
+        pending: &mut PendingBlobBatch,
+    ) -> Result<(), WorkerError> {
+        let Some((stdin, digests)) = pending.take_stream() else {
+            return Ok(());
+        };
+        let output = self.transfer_git(
+            runner,
+            &[
+                OsString::from("fast-import"),
+                OsString::from("--quiet"),
+                OsString::from("--done"),
+            ],
+            None,
+            Some(stdin),
+        )?;
+        let oids = parse_get_mark_oids(&output, digests.len())?;
+        for (digest, oid) in digests.into_iter().zip(oids) {
+            blob_oids.insert(digest, oid);
+        }
+        Ok(())
+    }
+
+    fn write_hash_object(
+        &self,
+        runner: &dyn ProcessRunner,
+        bytes: Vec<u8>,
+        no_filters: bool,
+    ) -> Result<String, WorkerError> {
         let mut args = vec![OsString::from("hash-object"), OsString::from("-w")];
         if no_filters {
             args.push(OsString::from("--no-filters"));
         }
         args.push(OsString::from("--stdin"));
         let output = self.transfer_git(runner, &args, None, Some(bytes))?;
-        let oid = parse_hex_oid(&output)?;
-        blob_oids.insert(digest, oid.clone());
-        Ok(oid)
+        parse_hex_oid(&output)
     }
 
     fn commit_tree(
@@ -1169,6 +1238,75 @@ struct CapturedSelection {
     dirty: DirtyReport,
 }
 
+struct StagedBlob {
+    mode: &'static str,
+    digest: [u8; 32],
+    path: String,
+}
+
+struct PendingBlobBatch {
+    stdin: Vec<u8>,
+    digests: Vec<[u8; 32]>,
+    by_digest: BTreeMap<[u8; 32], usize>,
+    payload_bytes: usize,
+}
+
+impl PendingBlobBatch {
+    fn new() -> Self {
+        Self {
+            stdin: Vec::new(),
+            digests: Vec::new(),
+            by_digest: BTreeMap::new(),
+            payload_bytes: 0,
+        }
+    }
+
+    fn contains(&self, digest: &[u8; 32]) -> bool {
+        self.by_digest.contains_key(digest)
+    }
+
+    fn would_exceed(&self, payload_len: usize) -> bool {
+        if self.digests.is_empty() {
+            return false;
+        }
+        self.digests.len() >= BLOB_BATCH_MAX_OBJECTS
+            || self.payload_bytes.saturating_add(payload_len) > BLOB_BATCH_MAX_BYTES
+    }
+
+    fn push(&mut self, digest: [u8; 32], payload: &[u8]) {
+        let mark = self.digests.len() + 1;
+        write_blob_command(&mut self.stdin, mark, payload);
+        self.by_digest.insert(digest, mark);
+        self.digests.push(digest);
+        self.payload_bytes += payload.len();
+    }
+
+    fn take_stream(&mut self) -> Option<(Vec<u8>, Vec<[u8; 32]>)> {
+        if self.digests.is_empty() {
+            return None;
+        }
+        write_get_marks_and_done(&mut self.stdin, self.digests.len());
+        let stdin = std::mem::take(&mut self.stdin);
+        let digests = std::mem::take(&mut self.digests);
+        self.by_digest.clear();
+        self.payload_bytes = 0;
+        Some((stdin, digests))
+    }
+}
+
+fn write_blob_command(stdin: &mut Vec<u8>, mark: usize, payload: &[u8]) {
+    let _ = write!(stdin, "blob\nmark :{mark}\ndata {}\n", payload.len());
+    stdin.extend_from_slice(payload);
+    stdin.push(b'\n');
+}
+
+fn write_get_marks_and_done(stdin: &mut Vec<u8>, count: usize) {
+    for mark in 1..=count {
+        let _ = writeln!(stdin, "get-mark :{mark}");
+    }
+    stdin.extend_from_slice(b"done\n");
+}
+
 pub fn repo_id_for(user_common_dir: &Path) -> Result<String, WorkerError> {
     let canonical = fs::canonicalize(user_common_dir).map_err(|_| {
         git_error(
@@ -1422,6 +1560,45 @@ fn parse_hex_oid(result: &ProcessResult) -> Result<String, WorkerError> {
             "Git returned a non-canonical object ID",
         ))
     }
+}
+
+fn parse_get_mark_oids(
+    result: &ProcessResult,
+    expected: usize,
+) -> Result<Vec<String>, WorkerError> {
+    let Some(want_len) = expected.checked_mul(GET_MARK_LINE_BYTES) else {
+        return Err(git_error(
+            "BASE_UNAVAILABLE",
+            "Git returned a non-canonical object ID",
+        ));
+    };
+    if result.stdout.len() != want_len {
+        return Err(git_error(
+            "BASE_UNAVAILABLE",
+            "Git returned a non-canonical object ID",
+        ));
+    }
+    let mut oids = Vec::with_capacity(expected);
+    for index in 0..expected {
+        let start = index * GET_MARK_LINE_BYTES;
+        let line = &result.stdout[start..start + GET_MARK_LINE_BYTES];
+        if line[GET_MARK_LINE_BYTES - 1] != b'\n' {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "Git returned a non-canonical object ID",
+            ));
+        }
+        let hex = std::str::from_utf8(&line[..40])
+            .map_err(|_| git_error("BASE_UNAVAILABLE", "Git returned a non-canonical object ID"))?;
+        if !is_lower_hex(hex, 40) {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "Git returned a non-canonical object ID",
+            ));
+        }
+        oids.push(hex.to_owned());
+    }
+    Ok(oids)
 }
 
 fn parse_tree_id(result: &ProcessResult) -> Result<String, WorkerError> {

@@ -9,11 +9,12 @@ use std::{
     },
     path::{Path, PathBuf},
     process::ExitStatus,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use mac_worker::{
-    error::WorkerError,
+    error::{ProcessError, ProcessStream, WorkerError},
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project::{ProjectContext, ProjectInspector},
     project_config::{
@@ -147,6 +148,13 @@ fn repo_with_commits() -> Fixture {
     repo.write("src/app.rs", b"fn main() {}\n");
     repo.write("README.md", b"hello\n");
     repo.commit_all("initial");
+    repo
+}
+
+fn repo_with_one_blob() -> Fixture {
+    let repo = Fixture::init();
+    repo.write("only.txt", b"one\n");
+    repo.commit_all("one blob");
     repo
 }
 
@@ -964,6 +972,19 @@ fn hash_object_count(runner: &RecordingRunner) -> usize {
         .count()
 }
 
+fn fast_import_count(runner: &RecordingRunner) -> usize {
+    runner
+        .requests()
+        .iter()
+        .filter(|request| {
+            request
+                .args
+                .iter()
+                .any(|argument| argument == "fast-import")
+        })
+        .count()
+}
+
 fn split_tab(record: &[u8]) -> (&[u8], &[u8]) {
     let index = record
         .iter()
@@ -1088,6 +1109,49 @@ fn expected_batched_tree(repo: &Fixture) -> BTreeMap<String, (String, Vec<u8>)> 
 }
 
 #[test]
+fn wip_capture_writes_distinct_blobs_in_one_fast_import() {
+    // Break caught: one hash-object per distinct content (baseline D=H=20).
+    // Approved contract: one blob-only fast-import for D<=64 small payloads,
+    // zero leftover hash-object, second capture is memo-only.
+    let repo = repo_for_batched_index();
+    let distinct = expected_batched_tree(&repo).len();
+    assert_eq!(distinct, 20, "fixture D is the independent want");
+    let cache = cache_root();
+    let recorder = RecordingRunner::passthrough();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    transfer
+        .build_wip_base(
+            &recorder,
+            &repo.context(),
+            task_id(),
+            &settings_including(&["fixtures/**"]),
+            &identity(),
+        )
+        .unwrap();
+    assert_eq!(fast_import_count(&recorder), 1);
+    assert_eq!(hash_object_count(&recorder), 0);
+    let imports: Vec<_> = recorder
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request
+                .args
+                .iter()
+                .any(|argument| argument == "fast-import")
+        })
+        .collect();
+    let args: Vec<&str> = imports[0]
+        .args
+        .iter()
+        .filter_map(|argument| argument.to_str())
+        .collect();
+    assert!(
+        args.contains(&"--quiet") && args.contains(&"--done"),
+        "blob batch must be quiet done fast-import: {args:?}"
+    );
+}
+
+#[test]
 fn wip_capture_batches_index_updates_and_preserves_tree_bytes() {
     // Break caught: per-file update-index --cacheinfo, or 2H hash-object on a
     // stable worktree after the digest memo, or a later build reusing that memo.
@@ -1118,7 +1182,8 @@ fn wip_capture_batches_index_updates_and_preserves_tree_bytes() {
             .map(|request| request.args.clone())
             .collect::<Vec<_>>()
     );
-    assert_eq!(hash_object_count(&recorder), hashed_entries);
+    assert_eq!(fast_import_count(&recorder), 1);
+    assert_eq!(hash_object_count(&recorder), 0);
     let second_task = TaskId::new(Uuid::from_u128(2));
     let second_recorder = RecordingRunner::passthrough();
     transfer
@@ -1131,10 +1196,11 @@ fn wip_capture_batches_index_updates_and_preserves_tree_bytes() {
         )
         .unwrap();
     assert_eq!(
-        hash_object_count(&second_recorder),
-        hashed_entries,
+        fast_import_count(&second_recorder),
+        1,
         "a later build_wip_base must not reuse the previous memo"
     );
+    assert_eq!(hash_object_count(&second_recorder), 0);
     for request in &updates {
         let args: Vec<&str> = request
             .args
@@ -1205,6 +1271,7 @@ fn wip_empty_selection_does_not_call_update_index() {
         .unwrap();
     assert_eq!(update_index_requests(&recorder).len(), 0);
     assert_eq!(hash_object_count(&recorder), 0);
+    assert_eq!(fast_import_count(&recorder), 0);
     assert!(transfer_tree_nul(transfer.path(), base.oid().as_str()).is_empty());
     assert_eq!(scratch_index_residue(&transfer), [] as [String; 0]);
 }
@@ -1276,7 +1343,8 @@ fn wip_capture_hashes_identical_blob_bytes_once_per_build() {
         .unwrap();
     // README, src/app.rs, twin.txt, twin-link, other.txt → H=5, D=4
     // (twin.txt bytes equal the symlink target "src/app.rs").
-    assert_eq!(hash_object_count(&recorder), 4);
+    assert_eq!(fast_import_count(&recorder), 1);
+    assert_eq!(hash_object_count(&recorder), 0);
     assert_eq!(update_index_requests(&recorder).len(), 2);
     let tree = transfer_tree_nul(transfer.path(), base.oid().as_str());
     assert_eq!(
@@ -1338,4 +1406,501 @@ fn symlink_target_change_between_captures_is_snapshot_changed() {
         )
         .unwrap_err();
     assert_eq!(error.public_code(), "SNAPSHOT_CHANGED");
+}
+
+const BLOB_BATCH_MAX_BYTES: usize = 1024 * 1024;
+const BLOB_BATCH_MAX_OBJECTS: usize = 64;
+const GET_MARK_LINE_BYTES: usize = 41;
+const PROTOCOL_BYTES: &[u8] = b"blob\nmark :99\ndata 3\nNO\nget-mark :1\ndone\n";
+const NO_FINAL_LF: &[u8] = b"no-final-lf";
+const NUL_PAYLOAD: &[u8] = b"x\x00y\xffz";
+
+#[derive(Clone, Default)]
+struct BlobWriteStats {
+    events: Arc<Mutex<Vec<(&'static str, usize)>>>,
+    fast_import_stdout: Arc<Mutex<Vec<usize>>>,
+}
+
+impl BlobWriteStats {
+    fn events(&self) -> Vec<(&'static str, usize)> {
+        self.events.lock().expect("stats").clone()
+    }
+
+    fn fast_import_stdin(&self) -> Vec<usize> {
+        self.events()
+            .into_iter()
+            .filter_map(|(verb, len)| (verb == "fast-import").then_some(len))
+            .collect()
+    }
+
+    fn fast_import_stdout(&self) -> Vec<usize> {
+        self.fast_import_stdout.lock().expect("stats").clone()
+    }
+
+    fn hash_object_stdin(&self) -> Vec<usize> {
+        self.events()
+            .into_iter()
+            .filter_map(|(verb, len)| (verb == "hash-object").then_some(len))
+            .collect()
+    }
+}
+
+impl ProcessRunner for BlobWriteStats {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let stdin_len = request.stdin.as_ref().map(Vec::len).unwrap_or(0);
+        let fast_import = request
+            .args
+            .iter()
+            .any(|argument| argument == "fast-import");
+        let hash_object = request
+            .args
+            .iter()
+            .any(|argument| argument == "hash-object");
+        let result = SystemProcessRunner.run(request)?;
+        if fast_import {
+            self.events
+                .lock()
+                .expect("stats")
+                .push(("fast-import", stdin_len));
+            self.fast_import_stdout
+                .lock()
+                .expect("stats")
+                .push(result.stdout.len());
+        }
+        if hash_object {
+            self.events
+                .lock()
+                .expect("stats")
+                .push(("hash-object", stdin_len));
+        }
+        Ok(result)
+    }
+}
+
+struct InjectFastImport {
+    response: Mutex<Option<Result<ProcessResult, WorkerError>>>,
+    downstream_writes: Mutex<Vec<String>>,
+}
+
+impl InjectFastImport {
+    fn once(result: Result<ProcessResult, WorkerError>) -> Self {
+        Self {
+            response: Mutex::new(Some(result)),
+            downstream_writes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn downstream_writes(&self) -> Vec<String> {
+        self.downstream_writes.lock().expect("inject").clone()
+    }
+}
+
+impl ProcessRunner for InjectFastImport {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let is_import = request
+            .args
+            .iter()
+            .any(|argument| argument == "fast-import");
+        if is_import && let Some(injected) = self.response.lock().expect("inject").take() {
+            return injected;
+        }
+        if self.response.lock().expect("inject").is_none() {
+            for verb in ["update-index", "write-tree", "commit-tree", "update-ref"] {
+                if request.args.iter().any(|argument| argument == verb) {
+                    self.downstream_writes
+                        .lock()
+                        .expect("inject")
+                        .push(verb.to_owned());
+                }
+            }
+        }
+        SystemProcessRunner.run(request)
+    }
+}
+
+fn framed_fast_import_len(payload_lens: &[usize]) -> usize {
+    let mut total = 0;
+    for (index, len) in payload_lens.iter().enumerate() {
+        let mark = index + 1;
+        total += format!("blob\nmark :{mark}\ndata {len}\n").len() + len + 1;
+    }
+    for mark in 1..=payload_lens.len() {
+        total += format!("get-mark :{mark}\n").len();
+    }
+    total + b"done\n".len()
+}
+
+/// Conservative recorded stdin-length bound for one flushed batch: unique
+/// payload bytes stay <= 1 MiB, plus framing for at most 64 blob/mark/data/
+/// get-mark commands and `done`. This is stdin length, not Vec capacity or RSS.
+fn max_framed_batch_stdin_len() -> usize {
+    const PER_OBJECT: usize = b"blob\nmark :64\ndata 1048576\n\nget-mark :64\n".len();
+    BLOB_BATCH_MAX_BYTES + BLOB_BATCH_MAX_OBJECTS * PER_OBJECT + b"done\n".len()
+}
+
+fn fake_oid_hex() -> &'static [u8] {
+    b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+}
+
+fn fake_oid_lines(count: usize) -> Vec<u8> {
+    let mut stdout = Vec::with_capacity(count * GET_MARK_LINE_BYTES);
+    for _ in 0..count {
+        stdout.extend_from_slice(fake_oid_hex());
+        stdout.push(b'\n');
+    }
+    stdout
+}
+
+fn framed_fast_import_stream(payloads: &[&[u8]]) -> Vec<u8> {
+    let mut stdin = Vec::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        let mark = index + 1;
+        stdin.extend_from_slice(format!("blob\nmark :{mark}\ndata {}\n", payload.len()).as_bytes());
+        stdin.extend_from_slice(payload);
+        stdin.push(b'\n');
+    }
+    for mark in 1..=payloads.len() {
+        stdin.extend_from_slice(format!("get-mark :{mark}\n").as_bytes());
+    }
+    stdin.extend_from_slice(b"done\n");
+    stdin
+}
+
+fn assert_no_published_base(transfer: &TransferRepo, error: &WorkerError, code: &str) {
+    assert_eq!(error.public_code(), code);
+    assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{}", task_id())));
+    assert_eq!(scratch_index_residue(transfer), [] as [String; 0]);
+}
+
+#[test]
+fn wip_capture_flushes_after_sixty_four_unique_blobs() {
+    let repo = repo_with_commits();
+    for index in 0..63 {
+        repo.write(
+            &format!("batch/{index:03}.txt"),
+            format!("payload-{index:03}\n").as_bytes(),
+        );
+    }
+    repo.commit_all("sixty-five unique blobs");
+    let stats = BlobWriteStats::default();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(&stats, &repo.context(), task_id(), &settings(), &identity())
+        .unwrap();
+    let stdin = stats.fast_import_stdin();
+    let stdout = stats.fast_import_stdout();
+    assert_eq!(stdin.len(), 2, "D=65 must flush at 64 then remainder");
+    assert_eq!(stats.hash_object_stdin().len(), 0);
+    assert_eq!(
+        stdout,
+        vec![
+            BLOB_BATCH_MAX_OBJECTS * GET_MARK_LINE_BYTES,
+            GET_MARK_LINE_BYTES
+        ]
+    );
+    assert!(
+        stdin.iter().all(|len| *len <= max_framed_batch_stdin_len()),
+        "recorded stdin length exceeded 1MiB+64-object framing: {stdin:?}"
+    );
+    assert_eq!(scratch_index_residue(&transfer), [] as [String; 0]);
+    assert_eq!(
+        transfer_tree_nul(transfer.path(), base.oid().as_str()).len(),
+        65
+    );
+}
+
+#[test]
+fn wip_capture_flushes_when_unique_payload_bytes_would_exceed_one_mib() {
+    let repo = Fixture::init();
+    repo.write("a.bin", &vec![b'A'; 600_000]);
+    repo.write("b.bin", &vec![b'B'; 600_000]);
+    repo.commit_all("two payloads over one MiB together");
+    let stats = BlobWriteStats::default();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(&stats, &repo.context(), task_id(), &settings(), &identity())
+        .unwrap();
+    let stdin = stats.fast_import_stdin();
+    assert_eq!(stdin.len(), 2, "600KiB+600KiB must not share one batch");
+    assert_eq!(stats.hash_object_stdin().len(), 0);
+    assert_eq!(
+        stats.fast_import_stdout(),
+        vec![GET_MARK_LINE_BYTES, GET_MARK_LINE_BYTES]
+    );
+    for (len, payload) in stdin.iter().zip([600_000_usize, 600_000]) {
+        assert_eq!(*len, framed_fast_import_len(&[payload]));
+        assert!(*len <= max_framed_batch_stdin_len());
+    }
+    let tree = transfer_tree_nul(transfer.path(), base.oid().as_str());
+    assert_eq!(tree["a.bin"].1, vec![b'A'; 600_000]);
+    assert_eq!(tree["b.bin"].1, vec![b'B'; 600_000]);
+}
+
+#[test]
+fn wip_capture_falls_back_to_hash_object_for_payloads_over_one_mib() {
+    let repo = Fixture::init();
+    repo.write("a.txt", b"small\n");
+    repo.write("b.bin", &vec![b'C'; BLOB_BATCH_MAX_BYTES + 1]);
+    repo.commit_all("oversized sibling");
+    let stats = BlobWriteStats::default();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(&stats, &repo.context(), task_id(), &settings(), &identity())
+        .unwrap();
+    assert_eq!(
+        stats.events(),
+        vec![
+            ("fast-import", framed_fast_import_len(&[b"small\n".len()])),
+            ("hash-object", BLOB_BATCH_MAX_BYTES + 1),
+        ],
+        "pending small blob must flush before oversized hash-object"
+    );
+    assert!(
+        stats
+            .fast_import_stdin()
+            .iter()
+            .all(|len| *len <= max_framed_batch_stdin_len())
+    );
+    let tree = transfer_tree_nul(transfer.path(), base.oid().as_str());
+    assert_eq!(tree["a.txt"].1, b"small\n");
+    assert_eq!(tree["b.bin"].1, vec![b'C'; BLOB_BATCH_MAX_BYTES + 1]);
+}
+
+#[test]
+fn wip_capture_batches_exactly_one_mib_payload() {
+    let repo = Fixture::init();
+    repo.write("exact.bin", &vec![b'E'; BLOB_BATCH_MAX_BYTES]);
+    repo.commit_all("exactly one MiB");
+    let stats = BlobWriteStats::default();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(&stats, &repo.context(), task_id(), &settings(), &identity())
+        .unwrap();
+    assert_eq!(
+        stats.events(),
+        vec![(
+            "fast-import",
+            framed_fast_import_len(&[BLOB_BATCH_MAX_BYTES])
+        )]
+    );
+    assert_eq!(stats.hash_object_stdin().len(), 0);
+    assert_eq!(stats.fast_import_stdout(), vec![GET_MARK_LINE_BYTES]);
+    let tree = transfer_tree_nul(transfer.path(), base.oid().as_str());
+    assert_eq!(tree["exact.bin"].1, vec![b'E'; BLOB_BATCH_MAX_BYTES]);
+}
+
+#[test]
+fn wip_capture_shares_pending_duplicates_and_keeps_modes_independent() {
+    let repo = repo_with_commits();
+    repo.write("same.txt", b"shared-bytes\n");
+    repo.write("same-exec.sh", b"shared-bytes\n");
+    make_executable(&repo.path().join("same-exec.sh"));
+    repo.commit_all("duplicate pending bytes");
+    let stats = BlobWriteStats::default();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(&stats, &repo.context(), task_id(), &settings(), &identity())
+        .unwrap();
+    assert_eq!(stats.fast_import_stdin().len(), 1);
+    assert_eq!(stats.hash_object_stdin().len(), 0);
+    assert_eq!(
+        stats.fast_import_stdout(),
+        vec![3 * GET_MARK_LINE_BYTES],
+        "README + app.rs + one shared digest must occupy three marks, not one per path"
+    );
+    let tree = transfer_tree_nul(transfer.path(), base.oid().as_str());
+    assert_eq!(tree["same.txt"].0, "100644");
+    assert_eq!(tree["same-exec.sh"].0, "100755");
+    assert_eq!(tree["same.txt"].1, tree["same-exec.sh"].1);
+    assert_eq!(tree["same.txt"].1, b"shared-bytes\n");
+}
+
+#[test]
+fn wip_empty_files_use_one_fast_import_batch() {
+    let repo = repo_with_commits();
+    fs::remove_file(repo.path().join("README.md")).unwrap();
+    fs::remove_file(repo.path().join("src/app.rs")).unwrap();
+    repo.write("empty.txt", b"");
+    repo.write("empty-too.txt", b"");
+    repo.write("empty-exec.sh", b"");
+    make_executable(&repo.path().join("empty-exec.sh"));
+    repo.commit_all("empty-only");
+    let recorder = RecordingRunner::passthrough();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(
+            &recorder,
+            &repo.context(),
+            task_id(),
+            &settings(),
+            &identity(),
+        )
+        .unwrap();
+    assert_eq!(fast_import_count(&recorder), 1);
+    assert_eq!(hash_object_count(&recorder), 0);
+    let imports = recorder
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request
+                .args
+                .iter()
+                .any(|argument| argument == "fast-import")
+        })
+        .expect("empty batch");
+    let stdin = imports.stdin.as_deref().expect("fast-import stdin");
+    assert_eq!(*stdin, framed_fast_import_stream(&[b""]));
+    let tree = transfer_tree_nul(transfer.path(), base.oid().as_str());
+    assert_eq!(tree["empty.txt"], ("100644".into(), Vec::new()));
+    assert_eq!(tree["empty-too.txt"], ("100644".into(), Vec::new()));
+    assert_eq!(tree["empty-exec.sh"], ("100755".into(), Vec::new()));
+}
+
+#[test]
+fn wip_capture_preserves_binary_and_protocol_like_blob_bytes() {
+    let repo = repo_with_commits();
+    repo.write("proto.txt", PROTOCOL_BYTES);
+    repo.write("nul.bin", NUL_PAYLOAD);
+    repo.write("no-lf", NO_FINAL_LF);
+    repo.commit_all("protocol payloads");
+    let recorder = RecordingRunner::passthrough();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(
+            &recorder,
+            &repo.context(),
+            task_id(),
+            &settings(),
+            &identity(),
+        )
+        .unwrap();
+    assert_eq!(fast_import_count(&recorder), 1);
+    let tree = transfer_tree_nul(transfer.path(), base.oid().as_str());
+    assert_eq!(tree["proto.txt"].1, PROTOCOL_BYTES);
+    assert_eq!(tree["nul.bin"].1, NUL_PAYLOAD);
+    assert_eq!(tree["no-lf"].1, NO_FINAL_LF);
+}
+
+fn failed_build_retries(inject: Result<ProcessResult, WorkerError>, code: &str) {
+    let repo = repo_with_one_blob();
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let injector = InjectFastImport::once(inject);
+    let error = transfer
+        .build_wip_base(
+            &injector,
+            &repo.context(),
+            task_id(),
+            &settings(),
+            &identity(),
+        )
+        .unwrap_err();
+    assert_no_published_base(&transfer, &error, code);
+    assert_eq!(
+        injector.downstream_writes(),
+        [] as [String; 0],
+        "rejected importer output must not reach update-index/write-tree"
+    );
+    let base = transfer
+        .build_wip_base(
+            &runner(),
+            &repo.context(),
+            task_id(),
+            &settings(),
+            &identity(),
+        )
+        .unwrap();
+    assert!(!transfer_tree_nul(transfer.path(), base.oid().as_str()).is_empty());
+}
+
+#[test]
+fn wip_fast_import_nonzero_does_not_publish_and_retries() {
+    failed_build_retries(
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: fake_oid_lines(1),
+            stderr: b"injected fast-import failure\n".to_vec(),
+        }),
+        "BASE_UNAVAILABLE",
+    );
+}
+
+#[test]
+fn wip_fast_import_truncated_stdout_does_not_publish_and_retries() {
+    let mut stdout = fake_oid_hex().to_vec();
+    stdout.push(b'\r');
+    failed_build_retries(
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout,
+            stderr: Vec::new(),
+        }),
+        "BASE_UNAVAILABLE",
+    );
+}
+
+#[test]
+fn wip_fast_import_too_few_oids_does_not_publish_and_retries() {
+    failed_build_retries(
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }),
+        "BASE_UNAVAILABLE",
+    );
+}
+
+#[test]
+fn wip_fast_import_too_many_oids_does_not_publish_and_retries() {
+    failed_build_retries(
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout: fake_oid_lines(2),
+            stderr: Vec::new(),
+        }),
+        "BASE_UNAVAILABLE",
+    );
+}
+
+#[test]
+fn wip_fast_import_noncanonical_stdout_does_not_publish_and_retries() {
+    failed_build_retries(
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout: b"E69DE29BB2D1D6434B8B29AE775AD8C2E48C5391\n".to_vec(),
+            stderr: Vec::new(),
+        }),
+        "BASE_UNAVAILABLE",
+    );
+}
+
+#[test]
+fn wip_fast_import_timeout_keeps_process_error_and_retries() {
+    failed_build_retries(
+        Err(ProcessError::DeadlineExceeded {
+            deadline: Duration::from_secs(30),
+        }
+        .into()),
+        "PROCESS",
+    );
+}
+
+#[test]
+fn wip_fast_import_output_limit_keeps_process_error_and_retries() {
+    failed_build_retries(
+        Err(ProcessError::OutputLimitExceeded {
+            stream: ProcessStream::Stdout,
+            limit: 64 * 1024 * 1024,
+        }
+        .into()),
+        "PROCESS",
+    );
 }
