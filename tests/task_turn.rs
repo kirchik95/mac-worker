@@ -1785,6 +1785,14 @@ fn herdr_reporter_attaches_the_turn_and_close_removes_its_tab_wrapper() {
             ]
         })),
     );
+    // after the close only the workspace's own first tab is left
+    server.reply(
+        "tab.list",
+        Reply::Result(serde_json::json!({
+            "type": "tab_list",
+            "tabs": [{ "tab_id": "w9:t1", "label": "1", "workspace_id": "w9" }]
+        })),
+    );
 
     support::agent_launch_fixture::assert_subprocess_success(
         "herdr_reporter_attaches_the_turn_and_close_removes_its_tab",
@@ -1814,6 +1822,8 @@ fn herdr_reporter_attaches_the_turn_and_close_removes_its_tab_wrapper() {
             "workspace.list",
             "tab.list",
             "tab.close",
+            "tab.list",
+            "workspace.close",
         ],
         "{requests:?}"
     );

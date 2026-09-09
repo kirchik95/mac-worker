@@ -11,7 +11,9 @@
 //! The reporter keeps no state of its own.  The workspace is found by its
 //! label and a task's tabs by their label prefix, so a crashed supervisor,
 //! a restarted herdr, or a tab the operator closed leave nothing to
-//! reconcile.  Every entry point is best effort under a budget: it returns
+//! reconcile.  The workspace itself goes when the last task tab goes, so an
+//! idle worker leaves no `mac-worker` row in anyone's sidebar; the next
+//! turn creates it again.  Every entry point is best effort under a budget: it returns
 //! what it managed to do and a short, path-free diagnostic, and it can never
 //! change a turn's outcome, exit code, lease, or records.
 
@@ -310,13 +312,16 @@ impl HerdrReporter {
         Ok(pane_id)
     }
 
-    /// Remove every tab of a task; the agent goes with its pane.
+    /// Remove every tab of a task; the agent goes with its pane.  When that
+    /// leaves the workspace with nothing but its own first tab, the
+    /// workspace goes too.
     pub fn close(&self, task_id: TaskId) -> Result<(), HerdrError> {
         let _budget = Budget::new(CLOSE_BUDGET);
         let Some(workspace_id) = self.find_workspace()? else {
             return Ok(());
         };
-        self.sweep_task(&workspace_id, task_id)
+        self.sweep_task(&workspace_id, task_id)?;
+        self.close_workspace_when_spare(&workspace_id)
     }
 
     /// Remove tabs whose task no longer exists or is no longer open; `live`
@@ -344,7 +349,25 @@ impl HerdrReporter {
                 closed += 1;
             }
         }
+        self.close_workspace_when_spare(&workspace_id)?;
         Ok(closed)
+    }
+
+    /// Close the workspace once no task tab is left in it and nothing else
+    /// is either: a single remaining tab is the one herdr opened with the
+    /// workspace.  A second tab means the operator is using the workspace;
+    /// it stays.
+    fn close_workspace_when_spare(&self, workspace_id: &str) -> Result<(), HerdrError> {
+        let tabs = self.client.tab_list(workspace_id)?;
+        let has_task_tab = tabs.iter().any(|tab| {
+            tab.label
+                .as_deref()
+                .is_some_and(|label| label.starts_with("task "))
+        });
+        if !has_task_tab && tabs.len() <= 1 {
+            self.client.workspace_close(workspace_id)?;
+        }
+        Ok(())
     }
 
     fn find_workspace(&self) -> Result<Option<String>, HerdrError> {

@@ -395,6 +395,12 @@ impl HerdrClient {
             .map(|_| ())
     }
 
+    /// Close a whole workspace with every tab in it.
+    pub fn workspace_close(&self, workspace_id: &str) -> Result<(), HerdrError> {
+        self.request("workspace.close", json!({ "workspace_id": workspace_id }))
+            .map(|_| ())
+    }
+
     pub fn pane_process_info(&self, pane_id: &str) -> Result<ProcessInfo, HerdrError> {
         let result = self.request("pane.process_info", json!({ "pane_id": pane_id }))?;
         let info = object_at(&result, "process_info")?;

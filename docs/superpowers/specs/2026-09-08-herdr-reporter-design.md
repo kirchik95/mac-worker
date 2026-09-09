@@ -85,7 +85,7 @@ The reporter always targets the worker's default herdr session, whose socket is 
 
 On the worker's herdr, and therefore on the MacBook through the machine link or the mirror plugin:
 
-- one workspace labelled `mac-worker`, created on first use and never removed by mac-worker;
+- one workspace labelled `mac-worker`, created on first use and removed again when the last task tab goes and nothing but the workspace's own first tab is left (a tab the operator opened there keeps it);
 - inside it, one tab per running or finished turn, labelled `task <id12> · turn <n>`, with a single pane;
 - the pane's terminal title, and so the sidebar row, reads `task <id12> · <task title>`;
 - the agent icon and state follow the turn: `working`, then `blocked`, `done`, or `unknown`, with the outcome's summary or first question as herdr's state message;
@@ -131,7 +131,7 @@ The reporter runs inside whichever helper process owns the turn event, always on
 It keeps no state of its own. The workspace is found by its `mac-worker` label, and a task's tabs by their `task <id12>` label prefix, so a crashed supervisor, a restarted herdr server, or a tab the operator closed leave nothing to reconcile: the next event re-discovers or re-creates what it needs. Concretely:
 
 1. `ensure_workspace`: `workspace.list`; use the first workspace labelled `mac-worker`, else `workspace.create` with that label, `focus: false`, and the account home as `cwd`.
-2. `sweep_task`: `tab.list` for that workspace; `tab.close` every tab whose label starts with `task <id12>`. This runs before a new turn's tab is created and at task close, and it is what removes a previous turn's tab.
+2. `sweep_task`: `tab.list` for that workspace; `tab.close` every tab whose label starts with `task <id12>`. This runs before a new turn's tab is created and at task close, and it is what removes a previous turn's tab. At task close and after an orphan sweep the reporter lists the tabs once more and, when no `task ` tab is left and at most one tab remains, closes the workspace with `workspace.close`, so an idle worker leaves no row in the sidebar.
 3. `open_turn_tab`: `tab.create` with the label, `focus: false`, and the account home as `cwd`; the response names the root pane.
 4. `arm_pane`: poll `pane.process_info` until the pane's foreground is exactly the login shell, for at most 5 s; then `pane.send_input` with the text `exec ~/.local/bin/worker host follow-turn <project_id> <worktree_id> <job_id>` and an Enter key. If the shell never settles the pane stays a shell and the states are still reported.
 5. `report`: `pane.report_agent` with `source = "mac-worker"`, `agent` set to the herdr kind for the adapter (`codex`, `claude`, `cursor`, `opencode`), the mapped state, and the message; then `pane.report_metadata` with the title, `display_agent = "mac-worker"`, state labels, and the tokens from section 5.2.

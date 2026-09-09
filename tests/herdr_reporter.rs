@@ -384,6 +384,12 @@ fn close_removes_only_the_tabs_of_the_task() {
         ]),
     );
 
+    // Another task still lives in the workspace afterwards.
+    server.reply(
+        "tab.list",
+        tab_list(&[("w3:t1", "1"), ("w3:t4", "task 0000deadbeef · turn 1")]),
+    );
+
     reporter(&server).close(task_id()).unwrap();
 
     let closed: Vec<Value> = server
@@ -392,6 +398,54 @@ fn close_removes_only_the_tabs_of_the_task() {
         .map(|request| request["params"]["tab_id"].clone())
         .collect();
     assert_eq!(closed, vec![json!("w3:t2"), json!("w3:t3")]);
+    assert!(server.requests_for("workspace.close").is_empty());
+}
+
+#[test]
+fn close_removes_the_workspace_when_only_its_first_tab_remains() {
+    let home = tempfile::tempdir().unwrap();
+    let server = FakeHerdr::start_in_home(home.path());
+    server.reply("workspace.list", workspace_list(true));
+    server.reply(
+        "tab.list",
+        tab_list(&[("w3:t1", "1"), ("w3:t2", "task 3714ccefb795 · turn 1")]),
+    );
+    server.reply("tab.list", tab_list(&[("w3:t1", "1")]));
+
+    reporter(&server).close(task_id()).unwrap();
+
+    assert_eq!(
+        methods(&server),
+        vec![
+            "workspace.list",
+            "tab.list",
+            "tab.close",
+            "tab.list",
+            "workspace.close"
+        ]
+    );
+    assert_eq!(params(&server, "workspace.close", 0)["workspace_id"], "w3");
+}
+
+#[test]
+fn close_keeps_the_workspace_while_the_operator_has_a_tab_in_it() {
+    let home = tempfile::tempdir().unwrap();
+    let server = FakeHerdr::start_in_home(home.path());
+    server.reply("workspace.list", workspace_list(true));
+    server.reply(
+        "tab.list",
+        tab_list(&[
+            ("w3:t1", "1"),
+            ("w3:t2", "task 3714ccefb795 · turn 1"),
+            ("w3:t9", "2"),
+        ]),
+    );
+    server.reply("tab.list", tab_list(&[("w3:t1", "1"), ("w3:t9", "2")]));
+
+    reporter(&server).close(task_id()).unwrap();
+
+    assert_eq!(params(&server, "tab.close", 0)["tab_id"], "w3:t2");
+    assert!(server.requests_for("workspace.close").is_empty());
 }
 
 #[test]
@@ -420,12 +474,39 @@ fn sweep_orphans_closes_tabs_of_tasks_that_are_no_longer_live() {
         ]),
     );
 
+    server.reply(
+        "tab.list",
+        tab_list(&[
+            ("w3:t1", "1"),
+            ("w3:t2", "task 3714ccefb795 · turn 1"),
+            ("w3:t4", "task not-a-task-id · turn 1"),
+        ]),
+    );
+
     let closed = reporter(&server)
         .sweep_orphans(&|short| short == "3714ccefb795")
         .unwrap();
 
     assert_eq!(closed, 1);
     assert_eq!(params(&server, "tab.close", 0)["tab_id"], "w3:t3");
+    assert!(server.requests_for("workspace.close").is_empty());
+}
+
+#[test]
+fn sweep_orphans_removes_the_workspace_it_emptied() {
+    let home = tempfile::tempdir().unwrap();
+    let server = FakeHerdr::start_in_home(home.path());
+    server.reply("workspace.list", workspace_list(true));
+    server.reply(
+        "tab.list",
+        tab_list(&[("w3:t1", "1"), ("w3:t3", "task 0000deadbeef · turn 3")]),
+    );
+    server.reply("tab.list", tab_list(&[("w3:t1", "1")]));
+
+    let closed = reporter(&server).sweep_orphans(&|_| false).unwrap();
+
+    assert_eq!(closed, 1);
+    assert_eq!(params(&server, "workspace.close", 0)["workspace_id"], "w3");
 }
 
 #[test]
