@@ -258,6 +258,32 @@ pub fn project_task_list_with_blocking_codes(
     })
 }
 
+/// Narrows already-projected list rows by `--state` / `--outcome`.
+///
+/// Projection must see every task the run still names, otherwise
+/// `run_position` and per-run progress would be rebuilt as if the survivors
+/// were a new run. Filtering the rows afterwards keeps those positions and
+/// blocking codes, and only the list-wide progress follows the visible set.
+pub fn filter_task_list(
+    mut projection: TaskListProjection,
+    state: Option<TaskState>,
+    outcome: Option<&str>,
+) -> TaskListProjection {
+    if state.is_none() && outcome.is_none() {
+        return projection;
+    }
+    projection.tasks.retain(|task| {
+        state.is_none_or(|expected| task.state == expected)
+            && outcome.is_none_or(|kind| {
+                task.last_outcome
+                    .as_ref()
+                    .is_some_and(|value| value.kind() == kind)
+            })
+    });
+    projection.progress = RunProgress::from_states(projection.tasks.iter().map(|task| task.state));
+    projection
+}
+
 pub fn project_task_detail(
     record: &LocalTaskRecord,
     status: &TaskStatus,

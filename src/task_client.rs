@@ -30,7 +30,7 @@ use crate::{
     },
     task_view::{
         TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
-        project_task_list_with_blocking_codes,
+        filter_task_list, project_task_list_with_blocking_codes,
     },
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
@@ -854,6 +854,15 @@ impl<'a> TaskClient<'a> {
         self.report_for_readonly(&record)
     }
 
+    /// Resolves `--run` as a canonical UUID first, then as an exact stored name.
+    ///
+    /// `task batch --name` prints a human name next to the UUID. List and wait
+    /// have to accept that name without treating a stored UUID-shaped name as
+    /// a second way to spell a different run.
+    pub fn resolve_run(&self, identifier: &str) -> Result<RunId, WorkerError> {
+        self.client_state.resolve_run(identifier)
+    }
+
     pub fn list(&self, filter: TaskListFilter) -> Result<TaskListReport, WorkerError> {
         let records = self
             .client_state
@@ -863,18 +872,6 @@ impl<'a> TaskClient<'a> {
                 filter
                     .run_id
                     .is_none_or(|run| task.meta().run_id() == Some(run))
-            })
-            .filter(|task| {
-                filter
-                    .state
-                    .is_none_or(|state| task.status().state() == state)
-            })
-            .filter(|task| {
-                filter.outcome.as_deref().is_none_or(|kind| {
-                    task.status()
-                        .last_outcome()
-                        .is_some_and(|outcome| outcome.kind() == kind)
-                })
             })
             .collect::<Vec<_>>();
 
@@ -906,7 +903,9 @@ impl<'a> TaskClient<'a> {
             &blocking_codes,
         )
         .map_err(task_view_error)?;
-        Ok(TaskListReport { projection })
+        Ok(TaskListReport {
+            projection: filter_task_list(projection, filter.state, filter.outcome.as_deref()),
+        })
     }
 
     pub fn logs(

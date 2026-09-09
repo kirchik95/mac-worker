@@ -141,7 +141,39 @@ fn task_help_keeps_the_released_option_names_discoverable() {
     wait.assert()
         .success()
         .stdout(predicate::str::contains("--task-id <TASK_ID>"))
-        .stdout(predicate::str::contains("--run <RUN>"));
+        .stdout(predicate::str::contains("--run <ID|NAME>"));
+
+    let mut list = Command::cargo_bin("worker").unwrap();
+    list.args(["task", "list", "--help"]);
+    list.assert()
+        .success()
+        .stdout(predicate::str::contains("--run <ID|NAME>"));
+}
+
+#[test]
+fn task_list_and_wait_parse_a_run_name_or_a_run_id() {
+    let name = "polish-2026-09-10";
+    let list = Cli::try_parse_from(["worker", "task", "list", "--run", name]).unwrap();
+    let WorkerCommand::Task {
+        command: mac_worker::cli::TaskCommand::List { run, .. },
+    } = list.command
+    else {
+        panic!("expected a task list command");
+    };
+    assert_eq!(run.as_deref(), Some(name));
+
+    let wait = Cli::try_parse_from(["worker", "task", "wait", "--run", name]).unwrap();
+    let WorkerCommand::Task {
+        command: mac_worker::cli::TaskCommand::Wait { run, .. },
+    } = wait.command
+    else {
+        panic!("expected a task wait command");
+    };
+    assert_eq!(run.as_deref(), Some(name));
+
+    let id = "018f0f4a6b5c7d8e9f00112233445566";
+    Cli::try_parse_from(["worker", "task", "list", "--run", id]).expect("run id must still parse");
+    Cli::try_parse_from(["worker", "task", "wait", "--run", id]).expect("run id must still parse");
 }
 
 #[test]

@@ -904,7 +904,10 @@ fn run_task_subcommand(
             full,
         } => {
             let filter = TaskListFilter {
-                run_id: run,
+                run_id: run
+                    .as_deref()
+                    .map(|value| client.resolve_run(value))
+                    .transpose()?,
                 state: state.as_deref().map(parse_task_state).transpose()?,
                 outcome: outcome
                     .as_deref()
@@ -977,7 +980,7 @@ fn run_task_subcommand(
         } => {
             let selector = match (task_id, run) {
                 (Some(task_id), None) => WaitSelector::Task(task_id),
-                (None, Some(run)) => WaitSelector::Run(run),
+                (None, Some(run)) => WaitSelector::Run(client.resolve_run(&run)?),
                 _ => {
                     return Err(WorkerError::Task {
                         code: "TASK_CONFIG_INVALID",

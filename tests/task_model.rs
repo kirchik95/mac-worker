@@ -1019,6 +1019,80 @@ fn new_worker_error_variants_map_to_documented_exit_kinds() {
 }
 
 #[test]
+fn a_run_identifier_resolves_as_an_id_or_an_exact_stored_name() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let named = RunId::new(Uuid::from_u128(10));
+    let other = RunId::new(Uuid::from_u128(11));
+    let duplicate_left = RunId::new(Uuid::from_u128(12));
+    let duplicate_right = RunId::new(Uuid::from_u128(13));
+
+    state
+        .create_run(
+            RunRecord::new(
+                named,
+                Some("polish-2026-09-10".into()),
+                vec![task_id()],
+                1,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    state
+        .create_run(
+            RunRecord::new(
+                other,
+                Some("other-batch".into()),
+                vec![TaskId::new(Uuid::from_u128(3))],
+                1,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    state
+        .create_run(
+            RunRecord::new(
+                duplicate_left,
+                Some("shared".into()),
+                vec![TaskId::new(Uuid::from_u128(4))],
+                1,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    state
+        .create_run(
+            RunRecord::new(
+                duplicate_right,
+                Some("shared".into()),
+                vec![TaskId::new(Uuid::from_u128(5))],
+                1,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(state.resolve_run(&named.to_string()).unwrap(), named);
+    assert_eq!(state.resolve_run("polish-2026-09-10").unwrap(), named);
+
+    let missing = state.resolve_run("missing-batch").unwrap_err();
+    assert_eq!(missing.public_code(), "RUN_NOT_FOUND");
+    assert_eq!(missing.public_message(), "no stored run has that name");
+
+    let ambiguous = state.resolve_run("shared").unwrap_err();
+    assert_eq!(ambiguous.public_code(), "RUN_NAME_AMBIGUOUS");
+    assert_eq!(
+        ambiguous.public_message(),
+        "more than one stored run has that name"
+    );
+}
+
+#[test]
 fn run_record_round_trips_and_rejects_unknown_fields() {
     let record = RunRecord::new(run_id(), Some("batch-1".into()), vec![task_id()], 2, 99).unwrap();
     let bytes = record.canonical_bytes().unwrap();

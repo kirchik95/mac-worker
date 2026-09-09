@@ -2331,6 +2331,34 @@ impl ClientStateStore {
         read_run_from_dir(&runs, &name, run_id)
     }
 
+    /// Resolves a `task list` / `task wait` `--run` value.
+    ///
+    /// Canonical UUIDs stay identifiers even when no run file exists, matching
+    /// `load_run`. Anything else is an exact `RunRecord` name from this
+    /// listing. Duplicate names are an operator error rather than a silent pick.
+    pub fn resolve_run(&self, identifier: &str) -> Result<RunId, WorkerError> {
+        if let Ok(run_id) = identifier.parse() {
+            return Ok(run_id);
+        }
+        let matches: Vec<RunId> = self
+            .list_runs()?
+            .into_iter()
+            .filter(|run| run.name() == Some(identifier))
+            .map(|run| run.run_id())
+            .collect();
+        match matches.as_slice() {
+            [] => Err(WorkerError::task(
+                "RUN_NOT_FOUND",
+                "no stored run has that name",
+            )),
+            [run_id] => Ok(*run_id),
+            _ => Err(WorkerError::task(
+                "RUN_NAME_AMBIGUOUS",
+                "more than one stored run has that name",
+            )),
+        }
+    }
+
     pub fn list_runs(&self) -> Result<Vec<RunRecord>, WorkerError> {
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let runs = self.runs_dir()?;

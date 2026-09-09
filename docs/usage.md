@@ -35,9 +35,9 @@ Recognised keys include `CURSOR_API_KEY`, and the host-only `MAC_WORKER_KEYCHAIN
 ```text
 worker task submit   --agent <a> (--prompt TEXT | --prompt-file PATH) [--wait] [--model M] [--effort E]
 worker task batch    tasks.toml [--max-parallel N] [--wait]      # several tasks as one named run
-worker task list     [--run ID] [--state open] [--outcome needs-input]
+worker task list     [--run ID|NAME] [--state open] [--outcome needs-input]
 worker task status   <id>          worker task logs <id> [-f]     worker task diff <id> --stat
-worker task wait     --task-id <id> | --run <run-id> [--timeout 30m]
+worker task wait     --task-id <id> | --run <ID|NAME> [--timeout 30m]
 worker task say      <id> --message "…" [--wait]                  # answer or steer, next turn
 worker task result   <id>          worker task fetch <id>
 worker task cancel   <id>          worker task close <id> [--discard]

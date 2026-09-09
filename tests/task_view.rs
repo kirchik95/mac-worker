@@ -16,8 +16,8 @@ use mac_worker::{
         TaskSource, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
     },
     task_view::{
-        TaskDetailProjection, TaskFreshness, TaskListJson, TaskListProjection, project_task_detail,
-        project_task_list, project_task_list_with_blocking_codes,
+        TaskDetailProjection, TaskFreshness, TaskListJson, TaskListProjection, filter_task_list,
+        project_task_detail, project_task_list, project_task_list_with_blocking_codes,
     },
 };
 use serde::Serialize;
@@ -303,6 +303,31 @@ fn fixture_detail() -> TaskDetailProjection {
         TaskFreshness::Stale,
     )
     .expect("valid task detail projection")
+}
+
+#[test]
+fn a_state_filter_keeps_run_positions_instead_of_dropping_sibling_tasks() {
+    // Filtering records before projection is the live failure: the closed
+    // sibling is gone, so the run looks like it references a missing task.
+    let runner_states = HashMap::from([(task_id(1), None)]);
+    let freshness = HashMap::from([(task_id(1), TaskFreshness::Current)]);
+    let error = project_task_list(
+        &[active_record()],
+        &fixture_runs(),
+        &runner_states,
+        &freshness,
+    )
+    .expect_err("filtered-out run members must not be treated as missing");
+    assert_eq!(error.code(), "TASK_VIEW_MISSING_TASK");
+
+    let projection = filter_task_list(fixture_projection(), Some(TaskState::Active), None);
+    assert_eq!(projection.tasks.len(), 1);
+    assert_eq!(projection.tasks[0].task_id, task_id(1));
+    assert_eq!(projection.tasks[0].state, TaskState::Active);
+    assert_eq!(projection.tasks[0].run_position, Some(1));
+    assert_eq!(projection.runs[0].progress.total, 2);
+    assert_eq!(projection.progress.total, 1);
+    assert_eq!(projection.progress.active, 1);
 }
 
 fn queued_record() -> LocalTaskRecord {

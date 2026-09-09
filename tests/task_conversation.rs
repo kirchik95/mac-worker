@@ -26,8 +26,8 @@ use mac_worker::{
     },
     task::{
         BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId as TaskRunId,
-        RunnerIdentity, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
-        TaskState, TaskStatus, TurnSummary, TurnTerminal,
+        RunRecord, RunnerIdentity, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
+        TaskSource, TaskState, TaskStatus, TurnSummary, TurnTerminal,
     },
     task_client::{TaskClient, TaskListFilter, WaitSelector},
     task_store::{TaskCloseRequest, TaskCloseResponse, TaskStatusResponse},
@@ -219,10 +219,33 @@ fn task_record(
     worker: &str,
     runner: Option<ProcessIdentity>,
 ) -> LocalTaskRecord {
+    task_record_in_run(
+        task_id,
+        turn_id,
+        state,
+        project_id,
+        worktree_id,
+        worker,
+        runner,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn task_record_in_run(
+    task_id: TaskId,
+    turn_id: JobId,
+    state: TaskState,
+    project_id: String,
+    worktree_id: String,
+    worker: &str,
+    runner: Option<ProcessIdentity>,
+    run_id: Option<TaskRunId>,
+) -> LocalTaskRecord {
     let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
         task_id,
-        run_id: None,
+        run_id,
         project_id,
         worktree_id,
         agent: AgentKind::Codex,
@@ -555,6 +578,72 @@ fn task_list_filters_by_last_outcome_for_the_orchestrator_loop() {
         })
         .unwrap();
     assert!(none.tasks().is_empty());
+}
+
+#[test]
+fn task_list_state_filter_keeps_the_active_row_of_a_mixed_run() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+
+    let run_id = TaskRunId::new(Uuid::from_u128(99));
+    let active_id = TaskId::new(Uuid::from_u128(960));
+    let closed_id = TaskId::new(Uuid::from_u128(961));
+    store
+        .create_run(
+            RunRecord::new(
+                run_id,
+                Some("polish-2026-09-10".into()),
+                vec![active_id, closed_id],
+                1,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    store
+        .create_task(task_record_in_run(
+            active_id,
+            job(962),
+            TaskState::Active,
+            project.context.project_id.clone(),
+            project.context.worktree_id.clone(),
+            "mini-1",
+            None,
+            Some(run_id),
+        ))
+        .unwrap();
+    store
+        .create_task(task_record_in_run(
+            closed_id,
+            job(963),
+            TaskState::Closed,
+            project.context.project_id.clone(),
+            project.context.worktree_id.clone(),
+            "mini-1",
+            None,
+            Some(run_id),
+        ))
+        .unwrap();
+
+    let remote = TaskRemoteRunner::new(store.load_task(active_id).unwrap().status().clone());
+    let config = task_config();
+    let executor = InlineRunnerExecutor;
+    let client = TaskClient::new(&remote, &config, &paths, &store, &executor);
+
+    let filtered = client
+        .list(TaskListFilter {
+            state: Some(TaskState::Active),
+            ..TaskListFilter::default()
+        })
+        .unwrap();
+    assert_eq!(filtered.tasks().len(), 1);
+    assert_eq!(filtered.tasks()[0].task_id, active_id);
+    assert_eq!(filtered.tasks()[0].run_position, Some(1));
 }
 
 #[test]

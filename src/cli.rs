@@ -2,10 +2,7 @@ use std::{convert::Infallible, ffi::OsString, fmt, path::PathBuf, str::FromStr, 
 
 use clap::{Parser, Subcommand};
 
-use crate::{
-    job::JobId,
-    task::{RunId, TaskId},
-};
+use crate::{job::JobId, task::TaskId};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -194,8 +191,8 @@ pub enum TaskCommand {
         wait: bool,
     },
     List {
-        #[arg(long)]
-        run: Option<RunId>,
+        #[arg(long, value_name = "ID|NAME", value_parser = non_empty_text)]
+        run: Option<String>,
         #[arg(long, value_parser = non_empty_text)]
         state: Option<String>,
         #[arg(long, value_parser = non_empty_text)]
@@ -252,8 +249,8 @@ pub enum TaskCommand {
     Wait {
         #[arg(long)]
         task_id: Option<TaskId>,
-        #[arg(long)]
-        run: Option<RunId>,
+        #[arg(long, value_name = "ID|NAME", value_parser = non_empty_text)]
+        run: Option<String>,
         #[arg(long, value_parser = supported_duration)]
         timeout: Option<Duration>,
     },
