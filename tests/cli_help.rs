@@ -240,7 +240,8 @@ fn workers_help_exposes_refresh() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Usage: worker workers"))
-        .stdout(predicate::str::contains("--refresh"));
+        .stdout(predicate::str::contains("--refresh"))
+        .stdout(predicate::str::contains("--clear-auth-incidents"));
 }
 
 #[test]

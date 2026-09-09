@@ -57,6 +57,9 @@ pub enum Command {
         /// Refresh agent and authentication facts before reporting
         #[arg(long)]
         refresh: bool,
+        /// Clear turn-observed authentication incidents before refreshing
+        #[arg(long, requires = "refresh")]
+        clear_auth_incidents: bool,
     },
     #[command(about = "Preview or apply retention garbage collection on workers")]
     Gc {
@@ -284,6 +287,9 @@ pub enum HostCommand {
         /// Print per-step collection durations on stderr after writing facts
         #[arg(long)]
         timing: bool,
+        /// Clear turn-observed authentication incidents before collecting facts
+        #[arg(long)]
+        clear_auth_incidents: bool,
     },
     #[command(name = "task-prepare")]
     TaskPrepare,

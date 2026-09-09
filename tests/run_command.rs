@@ -9293,7 +9293,10 @@ fn dispatcher_keeps_status_as_one_document_and_other_commands_unchanged() {
         public_cli(
             runtime.config.clone(),
             true,
-            WorkerCommand::Workers { refresh: false },
+            WorkerCommand::Workers {
+                refresh: false,
+                clear_auth_incidents: false,
+            },
         ),
         &RecordingRunner::returning(vec![canonical_process(&ready_probe())]),
         &runtime.context,

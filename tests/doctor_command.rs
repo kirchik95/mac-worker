@@ -17,6 +17,7 @@ use std::{
 
 use mac_worker::{
     RuntimeContext,
+    agent_facts::{AgentAuth, AgentFacts, AgentProbe, turn_auth_failure_reason},
     cli::{Cli, Command},
     config::{Config, WorkerEntry},
     doctor::{DoctorRequest, DoctorService},
@@ -774,6 +775,31 @@ fn doctor_aggregate_exit_uses_ready_usage_and_snapshot_integrity_categories() {
     assert_eq!(
         CommandOutput::Doctor(blocked_output_report("SNAPSHOT_CHANGED")).aggregate_exit_kind(),
         Some(ExitKind::Infrastructure)
+    );
+}
+
+#[test]
+fn doctor_renders_a_turn_auth_failure_reason() {
+    let reason = turn_auth_failure_reason(1_704_067_200_000).unwrap();
+    let mut report = ready_output_report();
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: vec![AgentProbe {
+            name: "codex".into(),
+            version: Some("0.152.1".into()),
+            auth: AgentAuth::UnknownWithReason(reason),
+            auth_by_profile: Vec::new(),
+        }],
+        env_profiles: Vec::new(),
+        git_identity: true,
+        collected_at_millis: 1,
+        herdr: None,
+    });
+    probe.facts_age_millis = Some(0);
+    let human = CommandOutput::Doctor(report).render_human();
+    assert!(
+        human.contains("codex 0.152.1: unknown (auth failed in a turn at 2024-01-01T00:00Z)"),
+        "{human}"
     );
 }
 

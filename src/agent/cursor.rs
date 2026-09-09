@@ -4,11 +4,15 @@ use crate::keychain::KEYCHAIN_LOCKED_REASON;
 use crate::process::ProcessResult;
 
 use super::{
-    AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthProbe, AuthProbeResult,
-    StructuredResult, TurnLaunch, TurnParams, argv_pointer_launch, bound_summary, combined_output,
-    parse_json_line, require_session_ref, resolve_last_structured_result, strip_ansi,
-    validate_params,
+    AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthFailureSignature, AuthProbe,
+    AuthProbeResult, StructuredResult, TurnLaunch, TurnParams, argv_pointer_launch, bound_summary,
+    combined_output, parse_json_line, require_session_ref, resolve_last_structured_result,
+    strip_ansi, validate_params,
 };
+
+const AUTH_FAILURE_SIGNATURES: &[AuthFailureSignature] = &[AuthFailureSignature::Contains(
+    "Authentication required. Please run 'agent login'",
+)];
 
 const ENV_NAMES: [&str; 1] = ["CURSOR_API_KEY"];
 /// `cursor-agent status` can print `Logged in (...)` when a credential exists
@@ -28,6 +32,10 @@ impl AgentAdapter for CursorAdapter {
 
     fn auth_probe(&self) -> AuthProbe {
         AuthProbe::new(&["status"], classify_cursor_auth)
+    }
+
+    fn auth_failure_signatures(&self) -> &'static [AuthFailureSignature] {
+        AUTH_FAILURE_SIGNATURES
     }
 
     fn first_turn(&self, params: &TurnParams) -> Result<TurnLaunch, AdapterError> {

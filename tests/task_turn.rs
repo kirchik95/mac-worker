@@ -477,6 +477,62 @@ fn keychain_unlock_failure_is_a_durable_turn_error_code() {
 }
 
 #[test]
+fn authentication_failure_in_a_turn_records_an_incident_and_names_the_outcome() {
+    let script = concat!(
+        "printf '%s\\n' ",
+        "'ERROR codex_login::auth::manager: Failed to refresh token: ",
+        "Your access token could not be refreshed because your refresh token was already used. ",
+        "Please log out and sign in again.'; ",
+        "exit 1",
+    );
+    let (temp, store, request, _cancel) = prepared_task_turn(script);
+    let launcher = InlineTurnLauncher {
+        store: store.clone(),
+        fault: None,
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    assert_eq!(
+        response.task().last_outcome(),
+        Some(&TaskOutcome::failed("agent authentication failed"))
+    );
+    let incidents =
+        fs::read_to_string(temp.path().join("host").join("auth-incidents.json")).unwrap();
+    assert!(incidents.contains(r#""agent":"codex""#), "{incidents}");
+    assert!(
+        incidents.contains(r#""reason":"auth failed in a turn""#),
+        "{incidents}"
+    );
+    assert!(!incidents.contains("refresh token"), "{incidents}");
+    assert!(!incidents.contains("Please log out"), "{incidents}");
+}
+
+#[test]
+fn a_non_auth_agent_exit_does_not_record_an_incident() {
+    let (temp, store, request, _cancel) = prepared_task_turn("printf 'boom\\n'; exit 1");
+    let launcher = InlineTurnLauncher {
+        store: store.clone(),
+        fault: None,
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    assert_eq!(
+        response.task().last_outcome(),
+        Some(&TaskOutcome::failed("agent exited 1"))
+    );
+    assert!(
+        !temp
+            .path()
+            .join("host")
+            .join("auth-incidents.json")
+            .exists(),
+        "non-auth failures must not write auth-incidents.json"
+    );
+}
+
+#[test]
 fn turn_material_round_trips_canonically() {
     let original = material("prompt");
     let bytes = serde_json::to_vec(&original).unwrap();

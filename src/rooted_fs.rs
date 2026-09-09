@@ -1355,6 +1355,56 @@ impl RootedDir {
         self.read_private_regular_with_hook(name, maximum, || {})
     }
 
+    /// Reads the last `tail` bytes of a private regular file without loading the rest.
+    pub(crate) fn read_private_regular_tail(&self, name: &str, tail: usize) -> io::Result<Vec<u8>> {
+        self.verify_root_name()?;
+        let name = CString::new(name).map_err(interior_nul_error)?;
+        let path_stat = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular(&path_stat)?;
+        let descriptor = open_regular_at(self.root.as_raw_fd(), &name)?;
+        let opened = stat_fd(descriptor.as_raw_fd())?;
+        if let Err(error) = require_private_regular_opened(&opened) {
+            if error.raw_os_error() == Some(libc::ESTALE) {
+                let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+                require_private_regular(&rebound)?;
+            }
+            return Err(error);
+        }
+        if !same_file(&path_stat, &opened) {
+            let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+            require_private_regular(&rebound)?;
+            return Err(os_error(libc::ESTALE));
+        }
+        if opened.st_size < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "host file length is invalid",
+            ));
+        }
+        let length = opened.st_size as u64;
+        let take = u64::try_from(tail).unwrap_or(u64::MAX).min(length);
+        let offset = length - take;
+        let mut bytes = vec![0; usize::try_from(take).unwrap_or(0)];
+        let file = File::from(descriptor);
+        if take > 0 {
+            let read = file.read_at(&mut bytes, offset)?;
+            bytes.truncate(read);
+        }
+        let after = stat_fd(file.as_raw_fd())?;
+        let rebound = stat_at(self.root.as_raw_fd(), &name)?;
+        require_private_regular(&rebound)?;
+        require_private_regular_opened(&after)?;
+        if after.st_size < 0
+            || (after.st_size as u64) < length
+            || !snapshot_metadata_stable(&path_stat, &after)
+            || !snapshot_metadata_stable(&path_stat, &rebound)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        self.verify_root_name()?;
+        Ok(bytes)
+    }
+
     pub(crate) fn read_private_regular_chunk(
         &self,
         name: &str,

@@ -11,7 +11,11 @@ use std::{
 use clap::Parser;
 use mac_worker::{
     RuntimeContext,
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
+    agent::{AgentKind, adapter_for},
+    agent_facts::{
+        AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe, turn_auth_failure_reason,
+    },
+    auth_incidents,
     cli::{Cli, Command, HostCommand},
     config::{Config, WorkerEntry},
     host_store::HostStore,
@@ -378,20 +382,29 @@ fn refresh_command_is_hidden_and_workers_refreshes_before_its_probe() {
     let workers = Cli::try_parse_from(["worker", "workers", "--refresh"]).unwrap();
     assert!(matches!(
         workers.command,
-        Command::Workers { refresh: true }
+        Command::Workers {
+            refresh: true,
+            clear_auth_incidents: false
+        }
     ));
     let host = Cli::try_parse_from(["worker", "host", "refresh-facts"]).unwrap();
     assert!(matches!(
         host.command,
         Command::Host {
-            command: HostCommand::RefreshFacts { timing: false }
+            command: HostCommand::RefreshFacts {
+                timing: false,
+                clear_auth_incidents: false
+            }
         }
     ));
     let timed = Cli::try_parse_from(["worker", "host", "refresh-facts", "--timing"]).unwrap();
     assert!(matches!(
         timed.command,
         Command::Host {
-            command: HostCommand::RefreshFacts { timing: true }
+            command: HostCommand::RefreshFacts {
+                timing: true,
+                clear_auth_incidents: false
+            }
         }
     ));
 
@@ -414,7 +427,10 @@ fn refresh_command_is_hidden_and_workers_refreshes_before_its_probe() {
         Cli {
             config: Some(config_path),
             json: false,
-            command: Command::Workers { refresh: true },
+            command: Command::Workers {
+                refresh: true,
+                clear_auth_incidents: false,
+            },
         },
         &runner,
         &runtime,
@@ -497,7 +513,10 @@ fn refresh_uses_the_runtime_home_without_loading_inventory() {
             config: Some("/missing/client-inventory.toml".into()),
             json: false,
             command: Command::Host {
-                command: HostCommand::RefreshFacts { timing: false },
+                command: HostCommand::RefreshFacts {
+                    timing: false,
+                    clear_auth_incidents: false,
+                },
             },
         },
         &runner,
@@ -670,7 +689,10 @@ fn run_host_refresh_facts(timing: bool) -> (u8, Vec<u8>, Vec<u8>) {
             config: Some("/missing/client-inventory.toml".into()),
             json: false,
             command: Command::Host {
-                command: HostCommand::RefreshFacts { timing },
+                command: HostCommand::RefreshFacts {
+                    timing,
+                    clear_auth_incidents: false,
+                },
             },
         },
         &runner,
@@ -679,4 +701,106 @@ fn run_host_refresh_facts(timing: bool) -> (u8, Vec<u8>, Vec<u8>) {
         &mut stderr,
     );
     (exit, stdout, stderr)
+}
+
+const TURN_AUTH_AT: u64 = 1_704_067_200_000;
+
+#[test]
+fn refresh_facts_overlays_a_codex_turn_auth_incident_and_drops_the_capability() {
+    let temporary = tempfile::tempdir().unwrap();
+    let host = host_root(temporary.path());
+    let home = temporary.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let stdout = concat!(
+        "ERROR codex_login::auth::manager: Failed to refresh token: ",
+        "Your access token could not be refreshed because your refresh token was already used. ",
+        "Please log out and sign in again.\n",
+    );
+    assert!(adapter_for(AgentKind::Codex).output_shows_auth_failure(stdout, ""));
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    auth_incidents::record_incident(&host, AgentKind::Codex, None, at).unwrap();
+
+    let runner = RecordingRunner::default();
+    let facts = ProbeCollector::refresh_facts_at(&host, &home, &runner).unwrap();
+    let reason = turn_auth_failure_reason(at).unwrap();
+    assert_eq!(facts.agents[0].name, "codex");
+    assert_eq!(facts.agents[0].auth, AgentAuth::UnknownWithReason(reason));
+
+    let observations =
+        SchedulerProbeAdapter::observations_at(&config(), &[health_with_facts(facts.clone())], 1)
+            .unwrap();
+    assert!(
+        !observations[0]
+            .capabilities()
+            .iter()
+            .any(|capability| capability == "agent:codex"),
+        "{:?}",
+        observations[0].capabilities()
+    );
+
+    let cleared = ProbeCollector::refresh_facts_at_with_options(&host, &home, &runner, true)
+        .unwrap()
+        .0;
+    assert_eq!(cleared.agents[0].auth, AgentAuth::Unauthenticated);
+}
+
+#[test]
+fn refresh_facts_fails_closed_when_incidents_are_unreadable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let host = host_root(temporary.path());
+    let home = temporary.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let incidents = host.join(auth_incidents::AUTH_INCIDENTS_FILE);
+    fs::write(&incidents, b"{not-canonical").unwrap();
+    fs::set_permissions(&incidents, fs::Permissions::from_mode(0o600)).unwrap();
+    let runner = RecordingRunner::default();
+    assert!(ProbeCollector::refresh_facts_at(&host, &home, &runner).is_err());
+    let cached = ProbeCollector::cached_facts_at(&host)
+        .unwrap()
+        .expect("conservative facts must be written");
+    assert_eq!(
+        cached.agents[0].auth,
+        AgentAuth::UnknownWithReason(auth_incidents::AUTH_INCIDENTS_UNREADABLE_REASON)
+    );
+}
+
+#[test]
+fn workers_and_host_parse_clear_auth_incidents() {
+    let workers =
+        Cli::try_parse_from(["worker", "workers", "--refresh", "--clear-auth-incidents"]).unwrap();
+    assert!(matches!(
+        workers.command,
+        Command::Workers {
+            refresh: true,
+            clear_auth_incidents: true
+        }
+    ));
+    assert!(Cli::try_parse_from(["worker", "workers", "--clear-auth-incidents"]).is_err());
+    let host =
+        Cli::try_parse_from(["worker", "host", "refresh-facts", "--clear-auth-incidents"]).unwrap();
+    assert!(matches!(
+        host.command,
+        Command::Host {
+            command: HostCommand::RefreshFacts {
+                timing: false,
+                clear_auth_incidents: true
+            }
+        }
+    ));
+}
+
+#[test]
+fn workers_output_includes_turn_auth_failure_reason() {
+    let mut facts = facts(1);
+    let reason = turn_auth_failure_reason(TURN_AUTH_AT).unwrap();
+    facts.agents[0].auth = AgentAuth::UnknownWithReason(reason);
+    let report = mac_worker::protocol::WorkersReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![health_with_facts(facts)],
+    };
+    let output = CommandOutput::Workers(report).render_human();
+    assert!(output.contains("codex 0.152.1: unknown (auth failed in a turn at 2024-01-01T00:00Z)"));
 }

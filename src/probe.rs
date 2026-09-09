@@ -10,8 +10,10 @@ use std::ffi::{c_char, c_int, c_void};
 
 use crate::{
     agent_facts::{
-        AgentFacts, EnvProfile as AgentEnvProfile, FactsTiming, collect_agent_facts_with_timing,
+        AgentFacts, EnvProfile as AgentEnvProfile, FactsTiming,
+        collect_agent_facts_at_host_with_overlay,
     },
+    auth_incidents,
     error::WorkerError,
     host_store::HostStore,
     lease::{LeaseService, SlotState},
@@ -218,10 +220,27 @@ impl ProbeCollector {
         home: &Path,
         runner: &dyn ProcessRunner,
     ) -> Result<(AgentFacts, FactsTiming), WorkerError> {
+        Self::refresh_facts_at_with_options(host_state_root, home, runner, false)
+    }
+
+    /// Like [`Self::refresh_facts_at_with_timing`], optionally wiping auth
+    /// incidents first so a later collect advertises the agent again.
+    pub fn refresh_facts_at_with_options(
+        host_state_root: &Path,
+        home: &Path,
+        runner: &dyn ProcessRunner,
+        clear_auth_incidents: bool,
+    ) -> Result<(AgentFacts, FactsTiming), WorkerError> {
         HostStore::open(host_state_root)?;
+        if clear_auth_incidents {
+            auth_incidents::clear_all(host_state_root)?;
+        }
         let profiles = load_env_profiles(home)?;
-        let (facts, timing) = collect_agent_facts_with_timing(runner, home, &profiles);
+        let now = current_time_millis();
+        let (facts, timing, overlay) =
+            collect_agent_facts_at_host_with_overlay(runner, home, &profiles, now, host_state_root);
         write_cached_facts(host_state_root, &facts)?;
+        overlay?;
         Ok((facts, timing))
     }
 

@@ -49,6 +49,27 @@ pub enum AgentKind {
     Opencode,
 }
 
+impl AgentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Cursor => "cursor",
+            Self::Opencode => "opencode",
+        }
+    }
+
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            "cursor" => Some(Self::Cursor),
+            "opencode" => Some(Self::Opencode),
+            _ => None,
+        }
+    }
+}
+
 pub fn result_instruction(agent: AgentKind) -> Option<&'static str> {
     match agent {
         AgentKind::Opencode => Some(OPENCODE_RESULT_INSTRUCTION),
@@ -375,6 +396,164 @@ pub struct AuthProbe {
     classifier: fn(&ProcessResult) -> AuthProbeResult,
 }
 
+/// Last bytes of each stream scanned for authentication-failure phrases.
+/// PERF owns bounded streaming result/log parse; this matcher is a
+/// rolling window over those tails so a 256 MiB stderr.log is never loaded.
+pub const AUTH_SCAN_TAIL_BYTES: usize = 64 * 1024;
+
+/// Fixed phrases that mean an agent turn died because of authentication.
+///
+/// Matching is a rolling substring search on bounded stream tails. Nothing
+/// from those streams is stored; a hit only records the agent, profile name,
+/// a fixed reason, and a timestamp. `ContainsAll` requires every phrase to
+/// appear (they may be split across the two streams) so a generic
+/// `401 Unauthorized` from a tool is not treated as a Codex login failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailureSignature {
+    Contains(&'static str),
+    ContainsAll(&'static [&'static str]),
+}
+
+impl AuthFailureSignature {
+    pub fn matches(self, stdout: &str, stderr: &str) -> bool {
+        streams_show_auth_failure(
+            std::slice::from_ref(&self),
+            stdout.as_bytes(),
+            stderr.as_bytes(),
+        )
+    }
+}
+
+/// Rolling scanner for [`AuthFailureSignature`] over bounded chunks.
+///
+/// Feed stream tails (or any chunk sequence). Call [`Self::reset_window`]
+/// between independent streams so a phrase is not matched across the join.
+pub struct AuthFailureScan {
+    kinds: Vec<ScanKind>,
+    phrases: Vec<&'static str>,
+    found: Vec<bool>,
+    window: Vec<u8>,
+    max_overlap: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ScanKind {
+    Contains,
+    All(usize),
+}
+
+impl AuthFailureScan {
+    pub fn new(signatures: &[AuthFailureSignature]) -> Self {
+        let mut kinds = Vec::new();
+        let mut phrases = Vec::new();
+        for signature in signatures {
+            match signature {
+                AuthFailureSignature::Contains(phrase) => {
+                    kinds.push(ScanKind::Contains);
+                    phrases.push(*phrase);
+                }
+                AuthFailureSignature::ContainsAll(group) => {
+                    kinds.push(ScanKind::All(group.len()));
+                    phrases.extend(group.iter().copied());
+                }
+            }
+        }
+        let max_overlap = phrases
+            .iter()
+            .map(|phrase| phrase.len().saturating_sub(1))
+            .max()
+            .unwrap_or(0);
+        let found = vec![false; phrases.len()];
+        Self {
+            kinds,
+            phrases,
+            found,
+            window: Vec::new(),
+            max_overlap,
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) {
+        if self.phrases.is_empty() || (chunk.is_empty() && self.window.is_empty()) {
+            return;
+        }
+        let mut search = Vec::with_capacity(self.window.len() + chunk.len());
+        search.extend_from_slice(&self.window);
+        search.extend_from_slice(chunk);
+        for (index, phrase) in self.phrases.iter().enumerate() {
+            if !self.found[index] && find_bytes(&search, phrase.as_bytes()) {
+                self.found[index] = true;
+            }
+        }
+        let keep = self.max_overlap.min(search.len());
+        self.window = search[search.len() - keep..].to_vec();
+    }
+
+    pub fn reset_window(&mut self) {
+        self.window.clear();
+    }
+
+    pub fn matched(&self) -> bool {
+        let mut index = 0;
+        for kind in &self.kinds {
+            match kind {
+                ScanKind::Contains => {
+                    if self.found[index] {
+                        return true;
+                    }
+                    index += 1;
+                }
+                ScanKind::All(count) => {
+                    if self.found[index..index + count].iter().all(|found| *found) {
+                        return true;
+                    }
+                    index += count;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn streams_show_auth_failure(
+    signatures: &[AuthFailureSignature],
+    stdout: &[u8],
+    stderr: &[u8],
+) -> bool {
+    let mut scan = AuthFailureScan::new(signatures);
+    scan.push(tail_bytes(stdout, AUTH_SCAN_TAIL_BYTES));
+    scan.reset_window();
+    scan.push(tail_bytes(stderr, AUTH_SCAN_TAIL_BYTES));
+    scan.matched()
+}
+
+fn tail_bytes(bytes: &[u8], tail: usize) -> &[u8] {
+    if bytes.len() <= tail {
+        bytes
+    } else {
+        &bytes[bytes.len() - tail..]
+    }
+}
+
+/// Last `tail` bytes of `value`, snapped to a UTF-8 boundary.
+pub fn tail_utf8(value: &str, tail: usize) -> &str {
+    if value.len() <= tail {
+        return value;
+    }
+    let start = value.len() - tail;
+    let start = (start..=value.len())
+        .find(|index| value.is_char_boundary(*index))
+        .unwrap_or(value.len());
+    &value[start..]
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+        || needle.is_empty()
+}
+
 impl AuthProbe {
     pub const fn new(
         args: &'static [&'static str],
@@ -397,6 +576,19 @@ pub trait AgentAdapter: Send + Sync {
     fn binary(&self) -> &'static str;
     fn auth_probe(&self) -> AuthProbe {
         default_auth_probe(self.kind())
+    }
+    /// Phrases that mean a finished turn failed because the agent could not
+    /// authenticate. Status probes cannot see these; they only ask the
+    /// agent's status command, which may still print "logged in".
+    fn auth_failure_signatures(&self) -> &'static [AuthFailureSignature] {
+        &[]
+    }
+    fn output_shows_auth_failure(&self, stdout: &str, stderr: &str) -> bool {
+        streams_show_auth_failure(
+            self.auth_failure_signatures(),
+            stdout.as_bytes(),
+            stderr.as_bytes(),
+        )
     }
     fn first_turn(&self, params: &TurnParams) -> Result<TurnLaunch, AdapterError>;
     fn resume_turn(

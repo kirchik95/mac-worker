@@ -915,7 +915,30 @@ impl<'a> TurnPublisher<'a> {
         };
 
         let agent_outcome = adapter.classify(exit_code, structured.status());
-        let outcome = TaskOutcome::from_turn(terminal, Some(agent_outcome));
+        let stdout_auth = crate::agent::tail_utf8(&stream, crate::agent::AUTH_SCAN_TAIL_BYTES);
+        let stderr_auth = read_auth_scan_tail(turn_dir, "stderr.log")?;
+        let auth_failed = matches!(agent_outcome, crate::agent::AgentOutcome::Failed { .. })
+            && adapter.output_shows_auth_failure(stdout_auth, &stderr_auth);
+        let outcome = if auth_failed {
+            crate::auth_incidents::record_incident(
+                self.store.host_state_root(),
+                meta.agent(),
+                meta.env_profile(),
+                now_millis()?,
+            )?;
+            TaskOutcome::failed(crate::auth_incidents::AGENT_AUTHENTICATION_FAILED)
+        } else {
+            let outcome = TaskOutcome::from_turn(terminal, Some(agent_outcome));
+            if terminal == TurnTerminal::Succeeded {
+                crate::auth_incidents::record_success(
+                    self.store.host_state_root(),
+                    meta.agent(),
+                    meta.env_profile(),
+                    now_millis()?,
+                )?;
+            }
+            outcome
+        };
         let close = meta.close_policy() == ClosePolicy::Done && outcome == TaskOutcome::Done;
         if meta.publish().contains(&PublishMode::Push) {
             let expected_origin = meta.push_origin_url().ok_or_else(|| {
@@ -1245,6 +1268,16 @@ fn read_optional_text(
         return Ok(None);
     }
     read_text(dir, name, max).map(Some)
+}
+
+fn read_auth_scan_tail(dir: &RootedDir, name: &str) -> Result<String, WorkerError> {
+    if !dir.entry_exists(name)? {
+        return Ok(String::new());
+    }
+    let bytes = dir
+        .read_private_regular_tail(name, crate::agent::AUTH_SCAN_TAIL_BYTES)
+        .map_err(|error| turn_error("PUBLISH_FAILED", format!("cannot read {name}: {error}")))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn bound_string(value: &str) -> String {

@@ -17,6 +17,7 @@ use mac_worker::{
     RuntimeContext,
     agent_facts::{
         AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, HerdrFactState, HerdrFacts, ProfileProbe,
+        turn_auth_failure_reason,
     },
     cli::{Cli, Command},
     config::{Config, WorkerEntry},
@@ -1380,6 +1381,94 @@ fn workers_output_includes_profile_keyed_facts_without_values() {
     assert!(!json.contains("/Users/"));
 }
 
+#[test]
+fn workers_render_a_turn_auth_failure_reason() {
+    let reason = turn_auth_failure_reason(1_704_067_200_000).unwrap();
+    let output = CommandOutput::Workers(WorkersReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![WorkerHealth {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            status: HealthStatus::Ready,
+            probe: Some(ProbeResponse {
+                protocol_version: PROTOCOL_VERSION,
+                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+                hostname: "mini-1.local".into(),
+                arch: "arm64".into(),
+                os_version: "26.2".into(),
+                free_disk_bytes: 500,
+                total_disk_bytes: 1_000,
+                memory_pressure: MemoryPressure::Normal,
+                swap_used_bytes: None,
+                available_memory_bytes: None,
+                cpu_counters: None,
+                slot_state: SlotState::Idle,
+                active_lease: None,
+                capabilities: vec!["darwin-arm64".into()],
+                agent_facts: Some(AgentFacts {
+                    agents: vec![AgentProbe {
+                        name: "codex".into(),
+                        version: Some("0.152.1".into()),
+                        auth: AgentAuth::UnknownWithReason(reason),
+                        auth_by_profile: Vec::new(),
+                    }],
+                    env_profiles: Vec::new(),
+                    git_identity: true,
+                    collected_at_millis: 1,
+                    herdr: None,
+                }),
+                facts_age_millis: Some(0),
+            }),
+            missing_capabilities: Vec::new(),
+            error_code: None,
+            error_message: None,
+        }],
+    })
+    .render_human();
+    assert!(
+        output.contains("codex 0.152.1: unknown (auth failed in a turn at 2024-01-01T00:00Z)"),
+        "{output}"
+    );
+}
+
+#[test]
+fn workers_refresh_clear_auth_incidents_uses_the_clearing_host_command() {
+    let runner = RecordingRunner::returning_results(vec![refresh_ok(), probe_ok()]);
+    let temporary = tempfile::tempdir().unwrap();
+    let config_path = temporary.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::new(),
+        temporary.path().join("home"),
+        temporary.path().to_path_buf(),
+    );
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_io_in_context(
+        Cli {
+            config: Some(config_path),
+            json: false,
+            command: Command::Workers {
+                refresh: true,
+                clear_auth_incidents: true,
+            },
+        },
+        &runner,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        ssh_destinations(&runner, "host refresh-facts --clear-auth-incidents"),
+        ["mac1"]
+    );
+}
+
 fn refresh_ok() -> Result<ProcessResult, WorkerError> {
     Ok(ProcessResult {
         status: exit_status(0),
@@ -1437,7 +1526,10 @@ fn run_workers_refresh(
         Cli {
             config: Some(config_path),
             json,
-            command: Command::Workers { refresh: true },
+            command: Command::Workers {
+                refresh: true,
+                clear_auth_incidents: false,
+            },
         },
         runner,
         &runtime,

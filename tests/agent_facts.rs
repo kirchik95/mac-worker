@@ -3,20 +3,32 @@ mod fake_herdr;
 
 use std::{
     ffi::OsString,
-    os::unix::process::ExitStatusExt,
+    fs,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::Path,
-    sync::Mutex,
+    process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
 use fake_herdr::{FakeHerdr, Reply};
 use mac_worker::{
+    agent::{AgentKind, adapter_for},
     agent_facts::{
         AgentAuth, AgentFacts, AgentProbe, EnvProfile, FACTS_TTL, HerdrFactState, HerdrFacts,
-        PROBE_DEADLINE, ProfileProbe, collect_agent_facts_at, collect_agent_facts_at_with_timing,
+        PROBE_DEADLINE, ProfileProbe, collect_agent_facts_at,
+        collect_agent_facts_at_host_with_timing, collect_agent_facts_at_with_timing,
+        turn_auth_failure_reason,
     },
+    auth_incidents::{self, AUTH_INCIDENT_TTL_MILLIS, AUTH_INCIDENTS_UNREADABLE_REASON},
     config::{Config, WorkerEntry},
     error::{ProcessError, WorkerError},
+    host_store::HostStore,
     lease::SlotState,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
@@ -1441,4 +1453,601 @@ fn assert_timing_privacy(lines: &[String]) {
             assert!(!value.is_empty(), "{line}");
         }
     }
+}
+
+const CODEX_AUTH_FAILURE: &str = concat!(
+    "ERROR codex_login::auth::manager: Failed to refresh token: ",
+    "Your access token could not be refreshed because your refresh token was already used. ",
+    "Please log out and sign in again.\n",
+    r#"{"type":"error","message":"Your access token could not be refreshed because your refresh token was already used."}"#,
+    "\n",
+);
+
+const CURSOR_AUTH_FAILURE: &str = "Error: Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY environment variable.\n";
+
+const TURN_AUTH_AT: u64 = 1_704_067_200_000;
+
+fn host_state() -> (tempfile::TempDir, std::path::PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("host");
+    HostStore::open(&root).unwrap();
+    (temp, root)
+}
+
+fn facts_with_incidents(host_state_root: &Path) -> AgentFacts {
+    let runner = FakeProcessRunner::new(Scenario::AllAgents);
+    collect_agent_facts_at_host_with_timing(
+        &runner,
+        account_home(),
+        &profiles(),
+        COLLECTED_AT,
+        host_state_root,
+    )
+    .0
+}
+
+fn agent_named<'a>(facts: &'a AgentFacts, name: &str) -> &'a AgentProbe {
+    facts
+        .agents
+        .iter()
+        .find(|agent| agent.name == name)
+        .unwrap_or_else(|| panic!("{name} probe must be present"))
+}
+
+fn advertised_agent_capabilities(facts: AgentFacts) -> Vec<String> {
+    let observations = SchedulerProbeAdapter::observations(
+        &Config {
+            version: 1,
+            notifications: mac_worker::config::NotificationsConfig::default(),
+            workers: vec![WorkerEntry {
+                name: "mini-1".into(),
+                ssh: "mac1".into(),
+                slots: 1,
+                capabilities: vec!["darwin-arm64".into()],
+                remote_binary: "~/.local/bin/worker".into(),
+                herdr: false,
+            }],
+        },
+        &[WorkerHealth {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            status: HealthStatus::Ready,
+            probe: Some(ProbeResponse {
+                protocol_version: PROTOCOL_VERSION,
+                supervision_version: SUPERVISION_VERSION,
+                hostname: "mini-1.local".into(),
+                arch: "arm64".into(),
+                os_version: "26.2".into(),
+                free_disk_bytes: 500,
+                total_disk_bytes: 1_000,
+                memory_pressure: MemoryPressure::Normal,
+                swap_used_bytes: None,
+                available_memory_bytes: None,
+                cpu_counters: None,
+                slot_state: SlotState::Idle,
+                active_lease: None,
+                capabilities: vec!["darwin-arm64".into()],
+                agent_facts: Some(facts),
+                facts_age_millis: Some(0),
+            }),
+            missing_capabilities: Vec::new(),
+            error_code: None,
+            error_message: None,
+        }],
+    )
+    .unwrap();
+    observations[0]
+        .capabilities()
+        .iter()
+        .filter(|capability| capability.starts_with("agent:"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn turn_auth_failure_reason_is_utc_minute_and_round_trips() {
+    let reason = turn_auth_failure_reason(TURN_AUTH_AT).expect("bounded interned reason");
+    assert_eq!(reason, "auth failed in a turn at 2024-01-01T00:00Z");
+    let encoded = serde_json::to_vec(&AgentAuth::UnknownWithReason(reason)).unwrap();
+    let parsed: AgentAuth = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(parsed, AgentAuth::UnknownWithReason(reason));
+    assert!(
+        serde_json::from_str::<AgentAuth>(r#""authenticated""#).unwrap()
+            == AgentAuth::Authenticated
+    );
+}
+
+#[test]
+fn scripted_codex_and_cursor_turn_output_records_an_incident_and_drops_the_capability() {
+    let codex = adapter_for(AgentKind::Codex);
+    assert!(codex.output_shows_auth_failure(CODEX_AUTH_FAILURE, ""));
+    assert!(codex.output_shows_auth_failure(
+        "",
+        "ERROR codex_login::auth::manager: HTTP error: 401 Unauthorized\n"
+    ));
+    assert!(!codex.output_shows_auth_failure("HTTP error: 401 Unauthorized\n", ""));
+    assert!(!codex.output_shows_auth_failure("command failed\n", ""));
+
+    let cursor = adapter_for(AgentKind::Cursor);
+    assert!(cursor.output_shows_auth_failure(CURSOR_AUTH_FAILURE, ""));
+    assert!(!cursor.output_shows_auth_failure("command failed\n", ""));
+    assert!(
+        adapter_for(AgentKind::Claude)
+            .auth_failure_signatures()
+            .is_empty()
+    );
+    assert!(
+        adapter_for(AgentKind::Opencode)
+            .auth_failure_signatures()
+            .is_empty()
+    );
+
+    let (_temp, host) = host_state();
+    auth_incidents::record_incident(&host, AgentKind::Codex, None, TURN_AUTH_AT).unwrap();
+    auth_incidents::record_incident(&host, AgentKind::Cursor, Some("agents"), TURN_AUTH_AT)
+        .unwrap();
+    let stored = fs::read_to_string(host.join(auth_incidents::AUTH_INCIDENTS_FILE)).unwrap();
+    assert!(stored.contains(r#""reason":"auth failed in a turn""#));
+    assert!(!stored.contains("refresh token"));
+    assert!(!stored.contains("CURSOR_API_KEY"));
+    assert!(!stored.contains("/Users/"));
+
+    let facts = facts_with_incidents(&host);
+    let reason = turn_auth_failure_reason(TURN_AUTH_AT).unwrap();
+    assert_eq!(
+        agent_named(&facts, "codex").auth,
+        AgentAuth::UnknownWithReason(reason)
+    );
+    assert_eq!(
+        agent_named(&facts, "cursor").auth_by_profile,
+        vec![("agents".into(), AgentAuth::UnknownWithReason(reason))]
+    );
+    assert_eq!(
+        agent_named(&facts, "cursor").auth,
+        AgentAuth::Unauthenticated
+    );
+    let capabilities = advertised_agent_capabilities(facts);
+    assert!(
+        !capabilities
+            .iter()
+            .any(|capability| capability == "agent:codex"),
+        "{capabilities:?}"
+    );
+    assert!(
+        !capabilities
+            .iter()
+            .any(|capability| capability == "agent:cursor@agents"),
+        "{capabilities:?}"
+    );
+}
+
+#[test]
+fn later_success_clears_the_matching_auth_incident() {
+    let (_temp, host) = host_state();
+    auth_incidents::record_incident(&host, AgentKind::Codex, None, TURN_AUTH_AT).unwrap();
+    auth_incidents::record_success(&host, AgentKind::Codex, None, TURN_AUTH_AT + 60_000).unwrap();
+    let facts = facts_with_incidents(&host);
+    assert_eq!(agent_named(&facts, "codex").auth, AgentAuth::Authenticated);
+    assert!(
+        advertised_agent_capabilities(facts)
+            .iter()
+            .any(|capability| capability == "agent:codex")
+    );
+}
+
+#[test]
+fn clear_auth_incidents_flag_restores_the_status_probe() {
+    let (_temp, host) = host_state();
+    auth_incidents::record_incident(&host, AgentKind::Codex, None, TURN_AUTH_AT).unwrap();
+    auth_incidents::clear_all(&host).unwrap();
+    let facts = facts_with_incidents(&host);
+    assert_eq!(agent_named(&facts, "codex").auth, AgentAuth::Authenticated);
+}
+
+#[test]
+fn newer_codex_auth_json_clears_the_incident() {
+    let home = tempfile::tempdir().unwrap();
+    let (_host_temp, host) = host_state();
+    auth_incidents::record_incident(&host, AgentKind::Codex, None, 1).unwrap();
+    std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+    std::fs::write(home.path().join(".codex/auth.json"), b"{}").unwrap();
+    let runner = FakeProcessRunner::new(Scenario::AllAgents);
+    let facts = collect_agent_facts_at_host_with_timing(
+        &runner,
+        home.path(),
+        &profiles(),
+        COLLECTED_AT,
+        &host,
+    )
+    .0;
+    assert_eq!(agent_named(&facts, "codex").auth, AgentAuth::Authenticated);
+}
+
+#[test]
+fn expired_auth_incident_is_not_overlaid() {
+    let (_temp, host) = host_state();
+    auth_incidents::record_incident(&host, AgentKind::Codex, None, 1).unwrap();
+    let runner = FakeProcessRunner::new(Scenario::AllAgents);
+    let facts = collect_agent_facts_at_host_with_timing(
+        &runner,
+        account_home(),
+        &profiles(),
+        1 + AUTH_INCIDENT_TTL_MILLIS,
+        &host,
+    )
+    .0;
+    assert_eq!(agent_named(&facts, "codex").auth, AgentAuth::Authenticated);
+}
+
+static AUTH_HOOK_TESTS: Mutex<()> = Mutex::new(());
+const HOOK_WAIT: Duration = Duration::from_secs(10);
+
+fn recv_bounded<T>(rx: &mpsc::Receiver<T>, what: &str) -> T {
+    rx.recv_timeout(HOOK_WAIT)
+        .unwrap_or_else(|error| panic!("{what} timed out: {error}"))
+}
+
+struct MutateInterleave {
+    go_lock: Option<mpsc::Sender<()>>,
+    go_publish: Option<mpsc::Sender<()>>,
+}
+
+impl Drop for MutateInterleave {
+    fn drop(&mut self) {
+        if let Some(go) = self.go_lock.take() {
+            let _ = go.send(());
+        }
+        if let Some(go) = self.go_publish.take() {
+            let _ = go.send(());
+        }
+        auth_incidents::set_before_lock_hook(None);
+        auth_incidents::set_after_load_hook(None);
+        auth_incidents::set_before_publish_hook(None);
+    }
+}
+
+fn install_paused_writer_hooks() -> (mpsc::Receiver<()>, mpsc::Receiver<()>, MutateInterleave) {
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (go_lock_tx, go_lock_rx) = mpsc::channel();
+    let (go_publish_tx, go_publish_rx) = mpsc::channel();
+    let go_lock_rx = Mutex::new(go_lock_rx);
+    let go_publish_rx = Mutex::new(go_publish_rx);
+    let first_lock = Arc::new(AtomicBool::new(true));
+    let first_publish = Arc::new(AtomicBool::new(true));
+    auth_incidents::set_before_lock_hook(Some(Arc::new({
+        let first_lock = Arc::clone(&first_lock);
+        move || {
+            if first_lock.swap(false, Ordering::SeqCst) {
+                let _ = arrived_tx.send(());
+                let _ = go_lock_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+            }
+        }
+    })));
+    auth_incidents::set_before_publish_hook(Some(Arc::new({
+        let first_publish = Arc::clone(&first_publish);
+        move || {
+            if first_publish.swap(false, Ordering::SeqCst) {
+                let _ = paused_tx.send(());
+                let _ = go_publish_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+            }
+        }
+    })));
+    (
+        arrived_rx,
+        paused_rx,
+        MutateInterleave {
+            go_lock: Some(go_lock_tx),
+            go_publish: Some(go_publish_tx),
+        },
+    )
+}
+
+fn peer_must_stay_blocked(
+    done: &mpsc::Receiver<Result<(), WorkerError>>,
+    store: &Path,
+    forbidden: &str,
+) {
+    let hold = Instant::now();
+    while hold.elapsed() < Duration::from_millis(400) {
+        match done.try_recv() {
+            Ok(result) => panic!("peer finished while the writer still held the lock: {result:?}"),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(error) => panic!("peer thread dropped: {error}"),
+        }
+        if store.exists() {
+            let stored = fs::read_to_string(store).unwrap();
+            assert!(
+                !stored.contains(forbidden),
+                "peer published under the held lock: {stored}"
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn write_corrupt_incidents(host: &Path) {
+    let path = host.join(auth_incidents::AUTH_INCIDENTS_FILE);
+    fs::write(&path, b"{not-canonical").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn invalid_turn_auth_dates_do_not_round_trip_through_facts() {
+    assert!(
+        serde_json::from_str::<AgentAuth>(
+            r#"{"state":"unknown","reason":"auth failed in a turn at 2024-13-01T00:00Z"}"#
+        )
+        .is_err()
+    );
+    let parsed: AgentAuth =
+        serde_json::from_str(r#"{"state":"unknown","reason":"auth failed in a turn"}"#).unwrap();
+    assert_eq!(
+        parsed,
+        AgentAuth::UnknownWithReason(auth_incidents::AUTH_INCIDENT_REASON)
+    );
+}
+
+#[test]
+fn unreadable_incident_store_is_conservative_and_observable() {
+    let (_temp, host) = host_state();
+    write_corrupt_incidents(&host);
+    let facts = facts_with_incidents(&host);
+    assert_eq!(
+        agent_named(&facts, "codex").auth,
+        AgentAuth::UnknownWithReason(AUTH_INCIDENTS_UNREADABLE_REASON)
+    );
+    assert_eq!(
+        agent_named(&facts, "cursor")
+            .auth_by_profile
+            .iter()
+            .find(|(name, _)| name == "agents")
+            .map(|(_, auth)| *auth),
+        Some(AgentAuth::UnknownWithReason(
+            AUTH_INCIDENTS_UNREADABLE_REASON
+        ))
+    );
+    let capabilities = advertised_agent_capabilities(facts);
+    assert!(
+        !capabilities
+            .iter()
+            .any(|capability| capability.starts_with("agent:codex")
+                || capability.starts_with("agent:cursor")),
+        "{capabilities:?}"
+    );
+}
+
+#[test]
+fn refresh_does_not_erase_an_incident_recorded_after_it_loaded() {
+    let _guard = AUTH_HOOK_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_temp, host) = host_state();
+    let (arrived_rx, paused_rx, mut interleave) = install_paused_writer_hooks();
+    let host_writer = host.clone();
+    let writer = thread::spawn(move || {
+        auth_incidents::enable_after_load_hook_on_this_thread();
+        collect_agent_facts_at_host_with_timing(
+            &FakeProcessRunner::new(Scenario::AllAgents),
+            account_home(),
+            &profiles(),
+            COLLECTED_AT,
+            &host_writer,
+        )
+    });
+    recv_bounded(&arrived_rx, "refresh reached mutate before the lock");
+    let _ = interleave.go_lock.take().expect("go_lock").send(());
+    recv_bounded(&paused_rx, "refresh paused before publish");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let host_peer = host.clone();
+    thread::spawn(move || {
+        let _ = done_tx.send(auth_incidents::record_incident(
+            &host_peer,
+            AgentKind::Codex,
+            None,
+            TURN_AUTH_AT,
+        ));
+    });
+    peer_must_stay_blocked(
+        &done_rx,
+        &host.join(auth_incidents::AUTH_INCIDENTS_FILE),
+        r#""agent":"codex""#,
+    );
+
+    drop(interleave);
+    recv_bounded(&done_rx, "peer record_incident").unwrap();
+    writer.join().expect("refresh thread");
+    let facts = facts_with_incidents(&host);
+    let reason = turn_auth_failure_reason(TURN_AUTH_AT).unwrap();
+    assert_eq!(
+        agent_named(&facts, "codex").auth,
+        AgentAuth::UnknownWithReason(reason)
+    );
+    let stored = fs::read_to_string(host.join(auth_incidents::AUTH_INCIDENTS_FILE)).unwrap();
+    assert!(stored.contains(r#""agent":"codex""#), "{stored}");
+}
+
+#[test]
+fn concurrent_records_for_distinct_profiles_both_survive() {
+    let _guard = AUTH_HOOK_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_temp, host) = host_state();
+    let (arrived_rx, paused_rx, mut interleave) = install_paused_writer_hooks();
+    let host_writer = host.clone();
+    let writer = thread::spawn(move || {
+        auth_incidents::enable_after_load_hook_on_this_thread();
+        auth_incidents::record_incident(&host_writer, AgentKind::Codex, None, TURN_AUTH_AT)
+    });
+    recv_bounded(&arrived_rx, "writer reached mutate before the lock");
+    let _ = interleave.go_lock.take().expect("go_lock").send(());
+    recv_bounded(&paused_rx, "writer paused before publish");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let host_peer = host.clone();
+    thread::spawn(move || {
+        let _ = done_tx.send(auth_incidents::record_incident(
+            &host_peer,
+            AgentKind::Cursor,
+            Some("agents"),
+            TURN_AUTH_AT,
+        ));
+    });
+    peer_must_stay_blocked(
+        &done_rx,
+        &host.join(auth_incidents::AUTH_INCIDENTS_FILE),
+        r#""agent":"cursor""#,
+    );
+
+    drop(interleave);
+    recv_bounded(&done_rx, "peer record_incident").unwrap();
+    writer.join().expect("codex record").unwrap();
+    let facts = facts_with_incidents(&host);
+    let reason = turn_auth_failure_reason(TURN_AUTH_AT).unwrap();
+    assert_eq!(
+        agent_named(&facts, "codex").auth,
+        AgentAuth::UnknownWithReason(reason)
+    );
+    assert_eq!(
+        agent_named(&facts, "cursor").auth_by_profile,
+        vec![("agents".into(), AgentAuth::UnknownWithReason(reason))]
+    );
+}
+
+const AUTH_INCIDENT_PEER_HOST: &str = "MAC_WORKER_AUTH_INCIDENT_PEER_HOST";
+
+#[test]
+fn before_publish_lock_keeps_a_peer_process_from_erasing_an_incident() {
+    if let Ok(host) = std::env::var(AUTH_INCIDENT_PEER_HOST) {
+        let host = Path::new(&host);
+        let parent = host.parent().expect("host has a parent");
+        fs::write(parent.join("peer-started"), b"1").unwrap();
+        auth_incidents::record_incident(host, AgentKind::Cursor, Some("agents"), TURN_AUTH_AT)
+            .unwrap();
+        fs::write(parent.join("peer-done"), b"1").unwrap();
+        return;
+    }
+
+    let _guard = AUTH_HOOK_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_temp, host) = host_state();
+    auth_incidents::record_incident(&host, AgentKind::Claude, None, TURN_AUTH_AT).unwrap();
+
+    let (at_publish_tx, at_publish_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    let go_rx = Mutex::new(go_rx);
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    auth_incidents::set_before_publish_hook(Some(Arc::new({
+        let first = Arc::clone(&first);
+        move || {
+            if first.swap(false, Ordering::SeqCst) {
+                let _ = at_publish_tx.send(());
+                let _ = go_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+            }
+        }
+    })));
+    let host_for_thread = host.clone();
+    let writer = thread::spawn(move || {
+        auth_incidents::enable_after_load_hook_on_this_thread();
+        auth_incidents::record_incident(&host_for_thread, AgentKind::Codex, None, TURN_AUTH_AT)
+    });
+    at_publish_rx
+        .recv()
+        .expect("writer reached the publish window while holding the lock");
+
+    struct Unlock {
+        go: Option<mpsc::Sender<()>>,
+    }
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            if let Some(go) = self.go.take() {
+                let _ = go.send(());
+            }
+            auth_incidents::set_before_publish_hook(None);
+        }
+    }
+    let unlock = Unlock {
+        go: Some(go_tx.clone()),
+    };
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .env(AUTH_INCIDENT_PEER_HOST, &host)
+        .args([
+            "--exact",
+            "before_publish_lock_keeps_a_peer_process_from_erasing_an_incident",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let marker_dir = host.parent().expect("host has a parent");
+    let started = marker_dir.join("peer-started");
+    let done = marker_dir.join("peer-done");
+    let wait_started = Instant::now();
+    while !started.exists() {
+        assert!(
+            wait_started.elapsed() < Duration::from_secs(10),
+            "peer process did not start"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "peer process exited before taking the lock"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let hold = Instant::now();
+    while hold.elapsed() < Duration::from_millis(400) {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "peer process must wait on the incident lock through the exchange window"
+        );
+        assert!(
+            !done.exists(),
+            "peer process published while the lock was still held"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let stored = fs::read_to_string(host.join(auth_incidents::AUTH_INCIDENTS_FILE)).unwrap();
+    assert!(stored.contains("claude"), "{stored}");
+    assert!(!stored.contains("cursor"), "{stored}");
+
+    go_tx.send(()).unwrap();
+    drop(unlock);
+    writer.join().expect("parent record").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "peer stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        done.exists(),
+        "peer process must finish after the lock is released"
+    );
+
+    let facts = facts_with_incidents(&host);
+    let reason = turn_auth_failure_reason(TURN_AUTH_AT).unwrap();
+    assert_eq!(
+        agent_named(&facts, "codex").auth,
+        AgentAuth::UnknownWithReason(reason)
+    );
+    assert_eq!(
+        agent_named(&facts, "cursor").auth_by_profile,
+        vec![("agents".into(), AgentAuth::UnknownWithReason(reason))]
+    );
 }

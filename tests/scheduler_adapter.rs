@@ -1,4 +1,5 @@
 use mac_worker::{
+    agent_facts::{AgentAuth, AgentFacts, AgentProbe},
     config::{Config, WorkerEntry},
     error::WorkerError,
     lease::SlotState,
@@ -170,4 +171,33 @@ fn adapter_threads_interactive_agents_from_a_fresh_herdr_fact() {
     probe.facts_age_millis = Some(mac_worker::agent_facts::FACTS_TTL + 1);
     let stale_facts = SchedulerProbeAdapter::observations(&config(), &[stale]).unwrap();
     assert_eq!(stale_facts[0].interactive_agents(), None);
+}
+
+#[test]
+fn a_turn_auth_failure_reason_is_not_an_agent_capability() {
+    let reason = mac_worker::agent_facts::turn_auth_failure_reason(1_704_067_200_000).unwrap();
+    let mut health = ready_health();
+    let probe = health.probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: vec![AgentProbe {
+            name: "codex".into(),
+            version: Some("0.152.1".into()),
+            auth: AgentAuth::UnknownWithReason(reason),
+            auth_by_profile: Vec::new(),
+        }],
+        env_profiles: Vec::new(),
+        git_identity: true,
+        collected_at_millis: 1,
+        herdr: None,
+    });
+    probe.facts_age_millis = Some(0);
+    let observations = SchedulerProbeAdapter::observations(&config(), &[health]).unwrap();
+    assert!(
+        !observations[0]
+            .capabilities()
+            .iter()
+            .any(|capability| capability.starts_with("agent:")),
+        "{:?}",
+        observations[0].capabilities()
+    );
 }

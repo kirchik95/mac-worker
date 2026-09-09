@@ -1,10 +1,16 @@
 use serde_json::Value;
 
 use super::{
-    AdapterError, AgentAdapter, AgentEvent, AgentKind, PermissionPolicy, PromptDelivery,
-    StructuredResult, TurnLaunch, TurnParams, bound_summary, json_i32, parse_json_line,
-    require_session_ref, resolve_structured_result, validate_params,
+    AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthFailureSignature, PermissionPolicy,
+    PromptDelivery, StructuredResult, TurnLaunch, TurnParams, bound_summary, json_i32,
+    parse_json_line, require_session_ref, resolve_structured_result, validate_params,
 };
+
+const AUTH_FAILURE_SIGNATURES: &[AuthFailureSignature] = &[
+    AuthFailureSignature::Contains("refresh token was already used"),
+    AuthFailureSignature::Contains("Please log out and sign in again"),
+    AuthFailureSignature::ContainsAll(&["401 Unauthorized", "codex_login"]),
+];
 
 const SCHEMA_PLACEHOLDER: &str = "{schema}";
 const LAST_MESSAGE_PLACEHOLDER: &str = "{last_message}";
@@ -18,6 +24,10 @@ impl AgentAdapter for CodexAdapter {
 
     fn binary(&self) -> &'static str {
         "codex"
+    }
+
+    fn auth_failure_signatures(&self) -> &'static [AuthFailureSignature] {
+        AUTH_FAILURE_SIGNATURES
     }
 
     fn first_turn(&self, params: &TurnParams) -> Result<TurnLaunch, AdapterError> {

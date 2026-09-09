@@ -303,7 +303,7 @@ fn probe_bound_observation(
         if refresh_budget.is_zero() {
             return Ok(None);
         }
-        match transport.refresh_facts_with_deadline(worker, refresh_budget) {
+        match transport.refresh_facts_with_deadline(worker, refresh_budget, false) {
             Ok(()) => {
                 let reprobe_budget = request_budget(deadline, PROBE_CAP);
                 if reprobe_budget.is_zero() {

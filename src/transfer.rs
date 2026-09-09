@@ -75,6 +75,7 @@ pub enum HostOperation {
     TaskCancel,
     TaskTurn,
     RefreshFacts,
+    RefreshFactsClear,
     Cancel,
     Reconcile,
     AgentSettingsGet,
@@ -100,6 +101,9 @@ impl HostOperation {
             Self::TaskCancel => "~/.local/bin/worker host task-cancel",
             Self::TaskTurn => "~/.local/bin/worker host task-turn",
             Self::RefreshFacts => "~/.local/bin/worker host refresh-facts",
+            Self::RefreshFactsClear => {
+                "~/.local/bin/worker host refresh-facts --clear-auth-incidents"
+            }
             Self::Cancel => "~/.local/bin/worker host cancel",
             Self::Reconcile => "~/.local/bin/worker host reconcile",
             Self::AgentSettingsGet => "~/.local/bin/worker host agent-settings-get",

@@ -125,6 +125,8 @@ No environment profile is required for a working Codex login.
 
 This version of mac-worker invokes Cursor as `cursor-agent`. If the official installer provides only `agent`, confirm it is the Cursor executable, then expose that executable under the expected name on the worker's login `PATH`. Do not replace an unrelated `agent` or an existing `cursor-agent`. Probes and turns use the account's login-shell PATH; a tool visible only in an interactive shell may need its PATH setup moved to the login-shell configuration. `worker workers` reports `unknown (login unverified: user details unavailable)` when `cursor-agent status` cannot fetch user details; fix that with `cursor-agent login` on the worker, or put `CURSOR_API_KEY` in the env profile.
 
+A turn can still fail authentication while those status checks print logged-in: Codex when a ChatGPT refresh token was already used on another machine, Cursor when it prints `Authentication required. Please run 'agent login'`. mac-worker then records a private incident on the worker (agent, profile name, a fixed reason, and the time — never the log) and `worker workers` shows `unknown (auth failed in a turn at <UTC minute>)` until a later turn of that agent succeeds, 24 hours pass, Codex's `~/.codex/auth.json` is newer than the incident, or you run `worker workers --refresh --clear-auth-incidents`. The failed turn's outcome is `agent authentication failed` instead of a bare `agent exited 1`.
+
 Use only the selected agent to finish your first task. Additional agents can be installed and checked later.
 
 ## Show turns in herdr (optional)

@@ -222,13 +222,26 @@ impl<R: ProcessRunner> SshTransport<R> {
     }
 
     pub fn refresh_facts(&self, worker: &WorkerEntry) -> Result<(), WorkerError> {
-        self.refresh_facts_with_deadline(worker, REFRESH_FACTS_POLICY.deadline)
+        self.refresh_facts_cleared(worker, false)
+    }
+
+    pub(crate) fn refresh_facts_cleared(
+        &self,
+        worker: &WorkerEntry,
+        clear_auth_incidents: bool,
+    ) -> Result<(), WorkerError> {
+        self.refresh_facts_with_deadline(
+            worker,
+            REFRESH_FACTS_POLICY.deadline,
+            clear_auth_incidents,
+        )
     }
 
     pub(crate) fn refresh_facts_with_deadline(
         &self,
         worker: &WorkerEntry,
         deadline: Duration,
+        clear_auth_incidents: bool,
     ) -> Result<(), WorkerError> {
         if !valid_ssh_destination(&worker.ssh) || worker.remote_binary != "~/.local/bin/worker" {
             return Err(WorkerError::Transport {
@@ -244,7 +257,12 @@ impl<R: ProcessRunner> SshTransport<R> {
                 message: "worker fact refresh failed".into(),
             });
         }
-        let request = ssh_request(worker, HostOperation::RefreshFacts.command().into(), policy);
+        let command = if clear_auth_incidents {
+            HostOperation::RefreshFactsClear.command()
+        } else {
+            HostOperation::RefreshFacts.command()
+        };
+        let request = ssh_request(worker, command.into(), policy);
         let result = self
             .runner
             .run(&request)

@@ -876,6 +876,10 @@ impl HostStore {
             .ok_or_else(|| WorkerError::Protocol("host installation was not initialized".into()))
     }
 
+    pub(crate) fn host_state_root(&self) -> &Path {
+        &self.inner.display_root
+    }
+
     pub(crate) fn open_if_present(root: &Path) -> Result<Option<Self>, WorkerError> {
         Self::open_inner(root, None, false, false)
     }

@@ -339,3 +339,65 @@ fn unverified_cursor_login_is_not_advertised_as_an_agent_capability() {
             .any(|capability| capability == "agent:cursor@agents")
     );
 }
+
+#[test]
+fn adapters_own_turn_auth_failure_signatures() {
+    use mac_worker::agent::AuthFailureSignature;
+
+    assert_eq!(
+        adapter_for(AgentKind::Codex).auth_failure_signatures(),
+        &[
+            AuthFailureSignature::Contains("refresh token was already used"),
+            AuthFailureSignature::Contains("Please log out and sign in again"),
+            AuthFailureSignature::ContainsAll(&["401 Unauthorized", "codex_login"]),
+        ]
+    );
+    assert_eq!(
+        adapter_for(AgentKind::Cursor).auth_failure_signatures(),
+        &[AuthFailureSignature::Contains(
+            "Authentication required. Please run 'agent login'"
+        )]
+    );
+    assert!(
+        adapter_for(AgentKind::Claude)
+            .auth_failure_signatures()
+            .is_empty()
+    );
+    assert!(
+        adapter_for(AgentKind::Opencode)
+            .auth_failure_signatures()
+            .is_empty()
+    );
+}
+
+#[test]
+fn auth_failure_scan_matches_phrases_split_across_chunks_and_bounded_tails() {
+    use mac_worker::agent::{AUTH_SCAN_TAIL_BYTES, AuthFailureScan, AuthFailureSignature};
+
+    let signatures = [AuthFailureSignature::Contains(
+        "refresh token was already used",
+    )];
+    let mut scan = AuthFailureScan::new(&signatures);
+    scan.push(b"refresh token was al");
+    assert!(!scan.matched());
+    scan.push(b"ready used");
+    assert!(scan.matched());
+
+    let mut tail = "x".repeat(AUTH_SCAN_TAIL_BYTES + 32);
+    tail.push_str("refresh token was already used");
+    assert!(adapter_for(AgentKind::Codex).output_shows_auth_failure(&tail, ""));
+
+    let mut prefix = String::from("refresh token was already used");
+    prefix.push_str(&"x".repeat(AUTH_SCAN_TAIL_BYTES + 32));
+    assert!(!adapter_for(AgentKind::Codex).output_shows_auth_failure(&prefix, ""));
+
+    let split = [AuthFailureSignature::ContainsAll(&[
+        "401 Unauthorized",
+        "codex_login",
+    ])];
+    let mut across = AuthFailureScan::new(&split);
+    across.push(b"codex_login::auth");
+    across.reset_window();
+    across.push(b"HTTP error: 401 Unauthorized");
+    assert!(across.matched());
+}

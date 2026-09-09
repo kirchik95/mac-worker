@@ -4,6 +4,7 @@ use std::{
     fmt,
     io::Write,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,6 +27,9 @@ use crate::{
 /// Agent facts remain usable for fifteen minutes before a runner must refresh them.
 pub const FACTS_TTL: u64 = 15 * 60 * 1000;
 pub const FACTS_TTL_MILLIS: u64 = FACTS_TTL;
+/// Prefix of the interned reason written when a turn died of an authentication
+/// failure. The rest is an ISO-8601 UTC minute so the string stays bounded.
+pub const TURN_AUTH_FAILURE_REASON_PREFIX: &str = "auth failed in a turn at ";
 
 const PROBE_OUTPUT_LIMIT: usize = 4 * 1024;
 /// Bound on each locate, version, and auth probe during facts collection.
@@ -125,8 +129,153 @@ fn known_auth_reason(value: &str) -> Option<&'static str> {
         crate::keychain::UNLOCK_FAILED_REASON => Some(crate::keychain::UNLOCK_FAILED_REASON),
         crate::keychain::KEYCHAIN_LOCKED_REASON => Some(crate::keychain::KEYCHAIN_LOCKED_REASON),
         crate::agent::LOGIN_UNVERIFIED_REASON => Some(crate::agent::LOGIN_UNVERIFIED_REASON),
-        _ => None,
+        crate::auth_incidents::AUTH_INCIDENTS_UNREADABLE_REASON => {
+            Some(crate::auth_incidents::AUTH_INCIDENTS_UNREADABLE_REASON)
+        }
+        crate::auth_incidents::AUTH_INCIDENT_REASON => {
+            Some(crate::auth_incidents::AUTH_INCIDENT_REASON)
+        }
+        other => intern_turn_auth_failure_reason(other),
     }
+}
+
+/// Interned `unknown` reason for an authentication failure observed in a turn.
+///
+/// The timestamp is UTC at minute precision so the string is bounded and can
+/// round-trip through facts.json. Callers must not put paths, prompts, or
+/// log payloads into this reason.
+pub fn turn_auth_failure_reason(at_millis: u64) -> Option<&'static str> {
+    intern_turn_auth_failure_reason(&format_turn_auth_failure_reason(at_millis)?)
+}
+
+const MAX_INTERNED_TURN_REASONS: usize = 32;
+
+fn intern_turn_auth_failure_reason(value: &str) -> Option<&'static str> {
+    if !is_turn_auth_failure_reason(value) {
+        return None;
+    }
+    Some(intern_or_fallback(
+        value,
+        MAX_INTERNED_TURN_REASONS,
+        crate::auth_incidents::AUTH_INCIDENT_REASON,
+    ))
+}
+
+fn intern_or_fallback(value: &str, cap: usize, fallback: &'static str) -> &'static str {
+    static POOL: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut pool = POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    intern_or_fallback_in(&mut pool, value, cap, fallback)
+}
+
+fn intern_or_fallback_in(
+    pool: &mut Vec<&'static str>,
+    value: &str,
+    cap: usize,
+    fallback: &'static str,
+) -> &'static str {
+    if let Some(existing) = pool.iter().copied().find(|stored| *stored == value) {
+        return existing;
+    }
+    if pool.len() >= cap {
+        return fallback;
+    }
+    let leaked: &'static str = Box::leak(value.to_owned().into_boxed_str());
+    pool.push(leaked);
+    leaked
+}
+
+fn format_turn_auth_failure_reason(at_millis: u64) -> Option<String> {
+    let (year, month, day, hour, minute) = utc_minute_from_millis(at_millis)?;
+    Some(format!(
+        "{TURN_AUTH_FAILURE_REASON_PREFIX}{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}Z"
+    ))
+}
+
+fn is_turn_auth_failure_reason(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(TURN_AUTH_FAILURE_REASON_PREFIX) else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    if bytes.len() != 17
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b'Z'
+        || !bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 | 10 | 13 | 16 => true,
+            _ => byte.is_ascii_digit(),
+        })
+    {
+        return false;
+    }
+    let Ok(year) = rest[0..4].parse::<i32>() else {
+        return false;
+    };
+    let Ok(month) = rest[5..7].parse::<u8>() else {
+        return false;
+    };
+    let Ok(day) = rest[8..10].parse::<u8>() else {
+        return false;
+    };
+    let Ok(hour) = rest[11..13].parse::<u8>() else {
+        return false;
+    };
+    let Ok(minute) = rest[14..16].parse::<u8>() else {
+        return false;
+    };
+    (1970..=9999).contains(&year)
+        && (1..=12).contains(&month)
+        && hour <= 23
+        && minute <= 59
+        && day >= 1
+        && day <= days_in_month(year, month)
+}
+
+fn days_in_month(year: i32, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn utc_minute_from_millis(at_millis: u64) -> Option<(i32, u8, u8, u8, u8)> {
+    let seconds = at_millis / 1000;
+    let minute_of_day = ((seconds / 60) % (24 * 60)) as u32;
+    let hour = (minute_of_day / 60) as u8;
+    let minute = (minute_of_day % 60) as u8;
+    let days = i64::try_from(seconds / 86_400).ok()?;
+    let (year, month, day) = civil_date_from_unix_days(days)?;
+    Some((year, month, day, hour, minute))
+}
+
+/// Civil date from days since Unix epoch. Years outside 1970–9999 are
+/// rejected so the interned reason stays a fixed width.
+fn civil_date_from_unix_days(days: i64) -> Option<(i32, u8, u8)> {
+    let z = days.checked_add(719_468)?;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = i32::try_from(era)
+        .ok()?
+        .checked_mul(400)?
+        .checked_add(i32::try_from(yoe).ok()?)?;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+    let year = if month <= 2 { y + 1 } else { y };
+    if !(1970..=9999).contains(&year) {
+        return None;
+    }
+    Some((year, month, day))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,16 +859,108 @@ pub fn collect_agent_facts_at_with_timing<P>(
 where
     P: ProfileInput,
 {
+    let (facts, timing, _) = collect_agent_facts_with_optional_host(
+        runner,
+        account_home,
+        profiles,
+        collected_at_millis,
+        None,
+    );
+    (facts, timing)
+}
+
+/// Like [`collect_agent_facts_at_with_timing`], then overlays current auth
+/// incidents from the host state root.
+///
+/// A current incident for an agent (newer than the last successful
+/// auth-carrying turn of the same agent and profile, younger than 24 h, and
+/// not cleared by a Codex re-login) overlays that agent's facts as
+/// [`AgentAuth::UnknownWithReason`] with [`turn_auth_failure_reason`].
+/// Status probes cannot see a burned refresh token or a Cursor login that
+/// still prints authenticated; the overlay is what stops the scheduler
+/// advertising `agent:<kind>` until the operator re-logs in, a later turn
+/// succeeds, or they pass `--clear-auth-incidents`.
+///
+/// If the incident store is corrupt or unreadable, advertised authentication
+/// is replaced with [`crate::auth_incidents::AUTH_INCIDENTS_UNREADABLE_REASON`]
+/// so the scheduler never treats the overlay miss as a successful login.
+pub fn collect_agent_facts_at_host_with_timing<P>(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    profiles: &[P],
+    collected_at_millis: u64,
+    host_state_root: &Path,
+) -> (AgentFacts, FactsTiming)
+where
+    P: ProfileInput,
+{
+    let (facts, timing, _) = collect_agent_facts_with_optional_host(
+        runner,
+        account_home,
+        profiles,
+        collected_at_millis,
+        Some(host_state_root),
+    );
+    (facts, timing)
+}
+
+/// Collects facts and overlays incidents. The `Result` is `Err` when the
+/// overlay could not be applied; facts in the tuple are still conservative.
+pub(crate) fn collect_agent_facts_at_host_with_overlay<P>(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    profiles: &[P],
+    collected_at_millis: u64,
+    host_state_root: &Path,
+) -> (AgentFacts, FactsTiming, Result<(), WorkerError>)
+where
+    P: ProfileInput,
+{
+    collect_agent_facts_with_optional_host(
+        runner,
+        account_home,
+        profiles,
+        collected_at_millis,
+        Some(host_state_root),
+    )
+}
+
+fn collect_agent_facts_with_optional_host<P>(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    profiles: &[P],
+    collected_at_millis: u64,
+    host_state_root: Option<&Path>,
+) -> (AgentFacts, FactsTiming, Result<(), WorkerError>)
+where
+    P: ProfileInput,
+{
     let mut timing = FactsTiming::new();
-    let facts = collect_agent_facts_into(
+    let mut facts = collect_agent_facts_into(
         runner,
         account_home,
         profiles,
         collected_at_millis,
         &mut timing,
     );
+    let overlay = if let Some(host_state_root) = host_state_root {
+        match crate::auth_incidents::merge_into_facts(
+            &mut facts,
+            host_state_root,
+            account_home,
+            collected_at_millis,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                crate::auth_incidents::apply_unreadable_overlay(&mut facts);
+                Err(error)
+            }
+        }
+    } else {
+        Ok(())
+    };
     timing.finish_total();
-    (facts, timing)
+    (facts, timing, overlay)
 }
 
 fn collect_agent_facts_into<P>(
@@ -1416,4 +1657,49 @@ where
 {
     let UniqueObject(object) = UniqueObject::deserialize(deserializer)?;
     T::deserialize(Value::Object(object)).map_err(de::Error::custom)
+}
+
+#[cfg(test)]
+mod intern_tests {
+    use super::*;
+
+    #[test]
+    fn intern_pool_falls_back_when_full() {
+        let mut pool = Vec::new();
+        let first = intern_or_fallback_in(
+            &mut pool,
+            "auth failed in a turn at 2024-01-01T00:00Z",
+            1,
+            crate::auth_incidents::AUTH_INCIDENT_REASON,
+        );
+        assert_eq!(first, "auth failed in a turn at 2024-01-01T00:00Z");
+        let second = intern_or_fallback_in(
+            &mut pool,
+            "auth failed in a turn at 2024-01-01T00:01Z",
+            1,
+            crate::auth_incidents::AUTH_INCIDENT_REASON,
+        );
+        assert_eq!(second, crate::auth_incidents::AUTH_INCIDENT_REASON);
+        assert_eq!(
+            intern_or_fallback_in(
+                &mut pool,
+                "auth failed in a turn at 2024-01-01T00:00Z",
+                1,
+                crate::auth_incidents::AUTH_INCIDENT_REASON,
+            ),
+            first
+        );
+    }
+
+    #[test]
+    fn invalid_calendar_dates_are_not_auth_reasons() {
+        assert!(known_auth_reason("auth failed in a turn at 2024-13-01T00:00Z").is_none());
+        assert!(known_auth_reason("auth failed in a turn at 2024-01-32T00:00Z").is_none());
+        assert!(known_auth_reason("auth failed in a turn at 2024-01-01T24:00Z").is_none());
+        assert!(known_auth_reason("auth failed in a turn at 2024-02-30T00:00Z").is_none());
+        assert!(known_auth_reason(crate::auth_incidents::AUTH_INCIDENT_REASON).is_some());
+        assert!(
+            known_auth_reason(crate::auth_incidents::AUTH_INCIDENTS_UNREADABLE_REASON).is_some()
+        );
+    }
 }

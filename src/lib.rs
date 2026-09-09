@@ -64,6 +64,7 @@ pub(crate) mod admission;
 pub mod agent;
 pub mod agent_facts;
 pub mod agent_settings;
+pub mod auth_incidents;
 pub mod cli;
 pub mod client_state;
 pub mod config;
@@ -234,8 +235,17 @@ fn execute_with_context(
                 cli_includes: includes,
             })?))
         }
-        Command::Workers { refresh } => {
-            let inspection = inspect_configured_workers(cli.config, runtime, runner, refresh)?;
+        Command::Workers {
+            refresh,
+            clear_auth_incidents,
+        } => {
+            let inspection = inspect_configured_workers(
+                cli.config,
+                runtime,
+                runner,
+                refresh,
+                clear_auth_incidents,
+            )?;
             Ok(CommandOutput::Workers(inspection.report))
         }
         Command::Gc { .. } => Err(WorkerError::Protocol(
@@ -1566,10 +1576,21 @@ pub fn run_with_rsync_executor_in_context(
         return run_host_migrate_layout(cli.config, runtime, stderr);
     }
     if let Command::Host {
-        command: HostCommand::RefreshFacts { timing },
+        command:
+            HostCommand::RefreshFacts {
+                timing,
+                clear_auth_incidents,
+            },
     } = cli.command
     {
-        return run_host_refresh_facts(cli.config, runtime, runner, stderr, timing);
+        return run_host_refresh_facts(
+            cli.config,
+            runtime,
+            runner,
+            stderr,
+            timing,
+            clear_auth_incidents,
+        );
     }
     if let Command::Host {
         command:
@@ -1652,7 +1673,13 @@ pub fn run_with_rsync_executor_in_context(
             stderr,
         );
     }
-    if matches!(cli.command, Command::Workers { refresh: true }) {
+    if matches!(
+        cli.command,
+        Command::Workers {
+            refresh: true,
+            clear_auth_incidents: _
+        }
+    ) {
         return run_workers_refresh_command(cli, runner, runtime, stdout, stderr);
     }
     let json = cli.json;
@@ -1711,7 +1738,14 @@ fn run_workers_refresh_command(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
-    match inspect_configured_workers(cli.config, runtime, runner, true) {
+    let clear_auth_incidents = matches!(
+        cli.command,
+        Command::Workers {
+            clear_auth_incidents: true,
+            ..
+        }
+    );
+    match inspect_configured_workers(cli.config, runtime, runner, true, clear_auth_incidents) {
         Ok(inspection) => match write_workers_refresh_output(stdout, cli.json, &inspection) {
             Ok(()) => workers_refresh_exit_status(&inspection),
             Err(error) => {
@@ -1731,6 +1765,7 @@ fn inspect_configured_workers(
     runtime: &RuntimeContext,
     runner: &dyn ProcessRunner,
     refresh: bool,
+    clear_auth_incidents: bool,
 ) -> Result<WorkersInspection, WorkerError> {
     let config = load_config(config_override, runtime)?;
     let transport = SshTransport::new(runner);
@@ -1738,14 +1773,16 @@ fn inspect_configured_workers(
         config
             .workers
             .iter()
-            .map(|worker| match transport.refresh_facts(worker) {
-                Ok(()) => WorkerRefreshOutcome {
-                    ok: true,
-                    error_code: None,
-                    error_message: None,
+            .map(
+                |worker| match transport.refresh_facts_cleared(worker, clear_auth_incidents) {
+                    Ok(()) => WorkerRefreshOutcome {
+                        ok: true,
+                        error_code: None,
+                        error_message: None,
+                    },
+                    Err(error) => refresh_failure(&error),
                 },
-                Err(error) => refresh_failure(&error),
-            })
+            )
             .collect()
     });
     Ok(WorkersInspection {
@@ -2587,13 +2624,15 @@ fn run_host_refresh_facts(
     runner: &dyn ProcessRunner,
     stderr: &mut dyn Write,
     timing: bool,
+    clear_auth_incidents: bool,
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
-        let (_, collected) = ProbeCollector::refresh_facts_at_with_timing(
+        let (_, collected) = ProbeCollector::refresh_facts_at_with_options(
             &paths.host_state_root(),
             &runtime.home,
             runner,
+            clear_auth_incidents,
         )?;
         if timing {
             collected.write_to(stderr);

@@ -2575,7 +2575,10 @@ fn error_report_fallback_ignores_a_broken_stderr_writer() {
         Cli {
             config: Some("/definitely/missing/mac-worker.toml".into()),
             json: false,
-            command: Command::Workers { refresh: false },
+            command: Command::Workers {
+                refresh: false,
+                clear_auth_incidents: false,
+            },
         },
         &runner,
         &mut Vec::new(),
