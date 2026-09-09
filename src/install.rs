@@ -258,12 +258,24 @@ impl<'a> Installer<'a> {
             }
         }
 
+        // Gatekeeper's first-launch assessment of a freshly copied helper can
+        // exceed the 15 s verification probe. Warm the promoted binary under a
+        // dedicated deadline so that later probe stays short; a failed warm-up
+        // never decides the install on its own.
+        let warmup = ssh_request(worker, warmup_command(&id, &digest), warmup_policy());
+        let warmup_failure = run_success(self.runner, &warmup, SetupFailureKind::Infrastructure)
+            .err()
+            .map(|failure| failure.message);
+
         let (health, probe_failure_kind) = SshTransport::new(self.runner)
             .probe_with_command_and_failure_kind(worker, verification_command(&id, &digest));
         if health.status != HealthStatus::Ready {
-            let message = health
+            let mut message = health
                 .error_message
                 .unwrap_or_else(|| "installed worker failed verification".into());
+            if let Some(warmup) = &warmup_failure {
+                message = format!("{message}; first-launch warm-up: {warmup}");
+            }
             let rollback = ssh_request(worker, rollback_command(&id), control_policy());
             let warnings = run_success(self.runner, &rollback, SetupFailureKind::Infrastructure)
                 .err()
@@ -296,7 +308,14 @@ impl<'a> Installer<'a> {
             message: HERDR_UNAVAILABLE_MESSAGE.to_owned(),
         });
         let protocol_version = health.probe.map(|probe| probe.protocol_version);
-        let mut warnings = self.success_cleanup_warnings(worker, &id, &digest);
+        let mut warnings = Vec::new();
+        if let Some(message) = warmup_failure {
+            warnings.push(SetupWarning {
+                code: SetupWarningCode::WarmupFailed,
+                message,
+            });
+        }
+        warnings.extend(self.success_cleanup_warnings(worker, &id, &digest));
         warnings.extend(herdr_warning);
         SetupHostResult {
             name: worker.name.clone(),
@@ -802,6 +821,15 @@ if { require_exact_file "$transaction/state" prepared 8 \
 fi
 printf '%s\n' unknown"#;
 
+const WARMUP_BODY: &str = r#"resolve_locked_context || exit 76
+require_exact_file "$transaction/state" promoted 8 || exit 77
+require_absent "$transaction/worker.new" || exit 77
+read_canonical_hex "$transaction/candidate.sha256" 64 || exit 77
+[ "$canonical_hex" = "$expected_digest" ] || exit 77
+digest_regular_file "$worker_path" || exit 77
+[ "$canonical_digest" = "$expected_digest" ] || exit 77
+"$worker_path" --version"#;
+
 const VERIFICATION_BODY: &str = r#"resolve_locked_context || exit 76
 require_exact_file "$transaction/state" promoted 8 || exit 77
 require_absent "$transaction/worker.new" || exit 77
@@ -959,6 +987,10 @@ fn reconciliation_command(id: &str, digest: &str) -> String {
     )
 }
 
+fn warmup_command(id: &str, digest: &str) -> String {
+    locked_command(id, &format!("expected_digest='{digest}'\n{WARMUP_BODY}"))
+}
+
 fn verification_command(id: &str, digest: &str) -> String {
     locked_command(
         id,
@@ -986,6 +1018,19 @@ fn probe_policy() -> ProcessPolicy {
         stdout_limit: 1024 * 1024,
         stderr_limit: 1024 * 1024,
         deadline: Duration::from_secs(15),
+    }
+}
+
+/// Generous deadline for the one-shot first launch of a freshly copied helper.
+/// macOS Gatekeeper may spend tens of seconds looking up a notarization ticket
+/// before the process may run; that verdict is then cached by code hash. The
+/// later verification probe keeps its own 15 s cap so ordinary
+/// `worker workers` probes stay protected.
+fn warmup_policy() -> ProcessPolicy {
+    ProcessPolicy {
+        stdout_limit: 64 * 1024,
+        stderr_limit: 64 * 1024,
+        deadline: Duration::from_secs(90),
     }
 }
 

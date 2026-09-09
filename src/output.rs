@@ -425,6 +425,7 @@ fn setup_warning_code(code: &crate::protocol::SetupWarningCode) -> &'static str 
         crate::protocol::SetupWarningCode::HerdrUnavailable => {
             crate::protocol::HERDR_UNAVAILABLE_CODE
         }
+        crate::protocol::SetupWarningCode::WarmupFailed => "WARMUP_FAILED",
     }
 }
 
