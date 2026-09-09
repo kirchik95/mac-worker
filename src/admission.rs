@@ -301,32 +301,30 @@ fn probe_bound_observation(
     {
         let refresh_budget = request_budget(deadline, REFRESH_CAP);
         if refresh_budget.is_zero() {
-            health.status = HealthStatus::Unavailable;
-        } else {
-            match transport.refresh_facts_with_deadline(worker, refresh_budget) {
-                Ok(()) => {
-                    let reprobe_budget = request_budget(deadline, PROBE_CAP);
-                    if reprobe_budget.is_zero() {
-                        health.status = HealthStatus::Unavailable;
-                    } else {
-                        let refreshed = probe_once(&transport, worker, reprobe_budget)?;
-                        health = refreshed.0;
-                        probe_started = refreshed.1;
-                        started_millis = refreshed.2;
-                    }
+            return Ok(None);
+        }
+        match transport.refresh_facts_with_deadline(worker, refresh_budget) {
+            Ok(()) => {
+                let reprobe_budget = request_budget(deadline, PROBE_CAP);
+                if reprobe_budget.is_zero() {
+                    return Ok(None);
                 }
-                Err(
-                    error @ WorkerError::Transport {
-                        code: "REFRESH_FACTS_FAILED",
-                        ..
-                    },
-                ) => {
-                    health.status = HealthStatus::Unavailable;
-                    health.error_code = Some(error.public_code());
-                    health.error_message = Some(error.public_message());
-                }
-                Err(error) => return Err(error),
+                let refreshed = probe_once(&transport, worker, reprobe_budget)?;
+                health = refreshed.0;
+                probe_started = refreshed.1;
+                started_millis = refreshed.2;
             }
+            Err(
+                error @ WorkerError::Transport {
+                    code: "REFRESH_FACTS_FAILED",
+                    ..
+                },
+            ) => {
+                health.status = HealthStatus::Unavailable;
+                health.error_code = Some(error.public_code());
+                health.error_message = Some(error.public_message());
+            }
+            Err(error) => return Err(error),
         }
     }
     if health.status == HealthStatus::Ready
@@ -631,6 +629,7 @@ mod tests {
         probe_release: Mutex<Option<mpsc::Receiver<()>>>,
         wait_before: Mutex<HashMap<String, mpsc::Receiver<()>>>,
         notify_after: Mutex<HashMap<String, mpsc::Sender<()>>>,
+        refresh_delay: Mutex<HashMap<String, Duration>>,
     }
 
     impl ScriptedRunner {
@@ -650,11 +649,19 @@ mod tests {
                 probe_release: Mutex::new(None),
                 wait_before: Mutex::new(HashMap::new()),
                 notify_after: Mutex::new(HashMap::new()),
+                refresh_delay: Mutex::new(HashMap::new()),
             }
         }
 
         fn delay(&self, ssh: &str, delay: Duration) {
             self.delay.lock().unwrap().insert(ssh.to_owned(), delay);
+        }
+
+        fn delay_refresh(&self, ssh: &str, delay: Duration) {
+            self.refresh_delay
+                .lock()
+                .unwrap()
+                .insert(ssh.to_owned(), delay);
         }
 
         fn fail(&self, ssh: &str) {
@@ -696,11 +703,14 @@ mod tests {
             self.max_in_flight.fetch_max(current, Ordering::SeqCst);
             let _guard = InFlightGuard(&self.in_flight);
             if is_refresh(request) {
-                self.refreshes.lock().unwrap().push(ssh);
+                self.refreshes.lock().unwrap().push(ssh.clone());
                 self.refresh_deadlines
                     .lock()
                     .unwrap()
                     .push(request.policy.deadline);
+                if let Some(delay) = self.refresh_delay.lock().unwrap().get(&ssh).copied() {
+                    thread::sleep(delay);
+                }
                 return Ok(success(Vec::new()));
             }
             self.probes.lock().unwrap().push(ssh.clone());
@@ -1037,6 +1047,99 @@ mod tests {
         let peeked = store.peek_admission_observation("mini-1").unwrap().unwrap();
         assert!(peeked.ready());
         assert_eq!(peeked.observed_at_millis(), at);
+    }
+
+    fn plant_stale_ready(store: &ClientStateStore, entry: &WorkerEntry) -> AdmissionObservation {
+        let planted = bound_ready(entry, now(), Some(FACTS_TTL + 1));
+        store
+            .publish_admission_observation(planted.clone())
+            .unwrap();
+        planted
+    }
+
+    #[test]
+    fn exhausted_refresh_budget_does_not_cache_a_synthetic_negative() {
+        let (_dir, store) = temp_store();
+        let mini1 = worker("mini-1", "mac1");
+        let config = config(vec![mini1.clone()]);
+        let planted = plant_stale_ready(&store, &mini1);
+        let runner = ScriptedRunner::new();
+        runner.facts_age("mac1", FACTS_TTL + 1);
+        runner.delay("mac1", Duration::from_millis(80));
+        let remaining = Duration::from_millis(80);
+        let outcome = worker_pipeline_inner(
+            &runner,
+            &config,
+            &store,
+            &mini1,
+            remaining,
+            Instant::now() + remaining,
+        )
+        .unwrap();
+        assert!(
+            outcome.is_none(),
+            "a budget skip after a Ready probe must stay ephemeral"
+        );
+        assert_eq!(runner.probes.lock().unwrap().len(), 1);
+        assert!(runner.refreshes.lock().unwrap().is_empty());
+        let peeked = store.peek_admission_observation("mini-1").unwrap().unwrap();
+        assert_eq!(peeked, planted);
+        let retry = worker_pipeline_inner(
+            &runner,
+            &config,
+            &store,
+            &mini1,
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap()
+        .expect("fresh remaining budget must retry probe/refresh");
+        assert!(retry.0.ready());
+        assert_eq!(runner.refreshes.lock().unwrap().len(), 1);
+        assert_eq!(runner.probes.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn exhausted_reprobe_budget_does_not_cache_a_synthetic_negative() {
+        let (_dir, store) = temp_store();
+        let mini1 = worker("mini-1", "mac1");
+        let config = config(vec![mini1.clone()]);
+        let planted = plant_stale_ready(&store, &mini1);
+        let runner = ScriptedRunner::new();
+        runner.facts_age("mac1", FACTS_TTL + 1);
+        runner.delay("mac1", Duration::from_millis(40));
+        runner.delay_refresh("mac1", Duration::from_millis(80));
+        let remaining = Duration::from_millis(120);
+        let outcome = worker_pipeline_inner(
+            &runner,
+            &config,
+            &store,
+            &mini1,
+            remaining,
+            Instant::now() + remaining,
+        )
+        .unwrap();
+        assert!(
+            outcome.is_none(),
+            "a budget skip after a successful refresh must stay ephemeral"
+        );
+        assert_eq!(runner.probes.lock().unwrap().len(), 1);
+        assert_eq!(runner.refreshes.lock().unwrap().len(), 1);
+        let peeked = store.peek_admission_observation("mini-1").unwrap().unwrap();
+        assert_eq!(peeked, planted);
+        let retry = worker_pipeline_inner(
+            &runner,
+            &config,
+            &store,
+            &mini1,
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap()
+        .expect("fresh remaining budget must retry after a skipped re-probe");
+        assert!(retry.0.ready());
+        assert_eq!(runner.refreshes.lock().unwrap().len(), 2);
+        assert_eq!(runner.probes.lock().unwrap().len(), 3);
     }
 
     #[test]
@@ -1414,16 +1517,16 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["mini-4", "mini-3", "mini-2", "mini-1"]
             );
-            let mut probed = inner.probes.lock().unwrap().clone();
-            probed.sort();
-            probed.dedup();
+            let probes = inner.probes.lock().unwrap().clone();
+            let mut unique = probes.clone();
+            unique.sort();
+            unique.dedup();
             assert_eq!(
-                inner.probes.lock().unwrap().len(),
-                probed.len(),
-                "common workers must single-flight, probes={:?}",
-                inner.probes.lock().unwrap()
+                probes.len(),
+                unique.len(),
+                "common workers must single-flight, probes={probes:?}"
             );
-            assert_eq!(probed.len(), 4);
+            assert_eq!(unique.len(), 4);
             assert!(forward_ranked.iter().all(|candidate| candidate.ready()));
             assert!(reversed_ranked.iter().all(|candidate| candidate.ready()));
         });
