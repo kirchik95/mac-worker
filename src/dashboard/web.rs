@@ -19,9 +19,7 @@ use crate::{
     agent_settings::{AgentSettingsError, AgentSettingsSaveRequest, validate_save_request},
     dashboard::{
         model::{ApiError, DashboardError, DashboardJob, DashboardLogChunk},
-        service::{
-            Clock, DashboardDataSource, DashboardService, DashboardSnapshotRequest, MonotonicClock,
-        },
+        service::{Clock, CollectorHandle, DashboardDataSource, DashboardService, MonotonicClock},
         settings::DashboardSettingsSource,
         task::DashboardTaskSource,
     },
@@ -64,6 +62,7 @@ pub struct DashboardHttpServer {
     local_addr: SocketAddr,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<Result<(), ApiError>>,
+    collector: CollectorHandle,
 }
 
 impl DashboardHttpServer {
@@ -92,6 +91,7 @@ impl DashboardHttpServer {
             )
         })?;
         let (shutdown, shutdown_receiver) = watch::channel(false);
+        let collector = state.service.start_background_collection();
         let app_state = AppState {
             dashboard: state,
             expected_host: local_addr.to_string(),
@@ -111,6 +111,7 @@ impl DashboardHttpServer {
             local_addr,
             shutdown,
             task,
+            collector,
         })
     }
 
@@ -119,6 +120,7 @@ impl DashboardHttpServer {
     }
 
     pub async fn shutdown(self) -> Result<(), ApiError> {
+        self.collector.stop();
         let _ = self.shutdown.send(true);
         self.task.await.map_err(|_| {
             ApiError::new(
@@ -264,7 +266,7 @@ where
     M: MonotonicClock,
 {
     let service = Arc::clone(&state.dashboard.service);
-    match tokio::task::spawn_blocking(move || service.snapshot(DashboardSnapshotRequest)).await {
+    match tokio::task::spawn_blocking(move || service.read_snapshot()).await {
         Ok(Ok(snapshot)) => api_json(StatusCode::OK, snapshot),
         Ok(Err(error)) => api_error(
             StatusCode::SERVICE_UNAVAILABLE,

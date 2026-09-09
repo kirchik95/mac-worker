@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mac_worker::{
@@ -22,7 +22,7 @@ use mac_worker::{
         service::{
             Clock, DashboardDataSource, DashboardDeadlines, DashboardQueueReader, DashboardService,
             DashboardSnapshotRequest, EmptyDashboardQueueReader, GLOBAL_COLLECTION_DEADLINE,
-            MAX_COLLECTION_ERRORS, MAX_RECENT_TERMINAL_JOBS, MonotonicClock,
+            MAX_COLLECTION_ERRORS, MAX_RECENT_TERMINAL_JOBS, MonotonicClock, SNAPSHOT_PENDING,
             WORKER_COLLECTION_DEADLINE, WorkerObservationResult,
         },
         source::project_worker,
@@ -679,6 +679,155 @@ fn panicking_monotonic_completes_installed_flight_and_allows_a_later_leader() {
     assert_eq!(recovered.revision, 1);
     assert_eq!(source.worker_call_count(), 0);
     assert_read_only(&source);
+}
+
+#[test]
+fn read_snapshot_is_pending_until_the_first_completed_collection() {
+    let source = FakeSource::new();
+    let service = DashboardService::new(
+        source.clone(),
+        ManualClock::new(100),
+        ManualMonotonic::new(0),
+    );
+    let error = service.read_snapshot().unwrap_err();
+    assert_eq!(error.code, SNAPSHOT_PENDING);
+    assert_eq!(source.worker_call_count(), 0);
+}
+
+#[test]
+fn background_collection_proceeds_without_http_and_reads_do_not_probe() {
+    let source = FakeSource::new();
+    let service = Arc::new(
+        DashboardService::new(
+            source.clone(),
+            ManualClock::new(100),
+            ManualMonotonic::new(0),
+        )
+        .with_collection_interval(Duration::from_secs(60)),
+    );
+    let collector = service.start_background_collection();
+    let first = wait_for_read(&service, Duration::from_secs(2));
+    assert_eq!(first.collection.freshness, Freshness::Current);
+    assert_eq!(first.generated_at_millis, 100);
+    let probes = source.worker_call_count();
+    assert!(probes >= 1, "collector must collect without HTTP {probes}");
+    let _ = service.read_snapshot().unwrap();
+    let _ = service.read_snapshot().unwrap();
+    assert_eq!(source.worker_call_count(), probes);
+    collector.join();
+    assert_read_only(&source);
+}
+
+#[test]
+fn slow_collection_does_not_stall_a_ready_read() {
+    let source = FakeSource::new();
+    let service = Arc::new(
+        DashboardService::new(
+            source.clone(),
+            ManualClock::new(100),
+            ManualMonotonic::new(0),
+        )
+        .with_collection_interval(Duration::from_secs(60)),
+    );
+    let first = service.snapshot(Default::default()).unwrap();
+    let gate = Arc::new(Gate::default());
+    source.set_collect_gate(Some(Arc::clone(&gate)));
+    let collector = service.start_background_collection();
+    gate.wait_until_entered();
+    let started = Instant::now();
+    let ready = service.read_snapshot().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "ready read waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(ready.revision, first.revision);
+    assert_eq!(ready.generated_at_millis, first.generated_at_millis);
+    assert_eq!(ready.collection.freshness, Freshness::Current);
+    gate.release();
+    collector.join();
+}
+
+#[test]
+fn collector_stop_and_restart_does_not_overlap_collectors() {
+    let source = FakeSource::new();
+    let service = Arc::new(
+        DashboardService::new(
+            source.clone(),
+            ManualClock::new(100),
+            ManualMonotonic::new(0),
+        )
+        .with_collection_interval(Duration::from_secs(60)),
+    );
+    let first = service.start_background_collection();
+    wait_for_read(&service, Duration::from_secs(2));
+    let after_first = source.worker_call_count();
+    first.join();
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(source.worker_call_count(), after_first);
+    let second = service.start_background_collection();
+    wait_for_read(&service, Duration::from_secs(2));
+    second.join();
+    assert!(source.worker_call_count() >= after_first);
+    assert_read_only(&source);
+}
+
+#[test]
+fn failed_collection_keeps_last_good_stale_and_original_generation_time() {
+    let source = FakeSource::new();
+    source.set_workers(vec![WorkerObservationResult::Current(observation(
+        "mini-1",
+        500,
+        "accepted.local",
+    ))]);
+    let wall = ManualClock::new(500);
+    let service = Arc::new(
+        DashboardService::new(source.clone(), wall.clone(), ManualMonotonic::new(0))
+            .with_collection_interval(Duration::from_secs(60)),
+    );
+    let completed = service.snapshot(Default::default()).unwrap();
+    assert_eq!(completed.generated_at_millis, 500);
+    assert_eq!(completed.collection.freshness, Freshness::Current);
+
+    source.panic_collect_once();
+    assert_eq!(
+        service.snapshot(Default::default()).unwrap_err().code,
+        "DASHBOARD_REFRESH_ABORTED"
+    );
+    wall.set(800);
+    let stale = service.read_snapshot().unwrap();
+    assert_eq!(stale.revision, completed.revision);
+    assert_eq!(stale.generated_at_millis, completed.generated_at_millis);
+    assert_eq!(stale.collection.freshness, Freshness::Stale);
+    assert_eq!(stale.workers[0].hostname.as_deref(), Some("accepted.local"));
+    assert!(
+        error_codes(&stale)
+            .iter()
+            .any(|code| *code == "DASHBOARD_REFRESH_ABORTED"),
+        "{:?}",
+        error_codes(&stale)
+    );
+}
+
+fn wait_for_read<S, C, M>(
+    service: &DashboardService<S, C, M>,
+    timeout: Duration,
+) -> DashboardSnapshot
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        match service.read_snapshot() {
+            Ok(snapshot) => return snapshot,
+            Err(error) if error.code == SNAPSHOT_PENDING && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("read_snapshot failed: {} {}", error.code, error.message),
+        }
+    }
 }
 
 #[test]

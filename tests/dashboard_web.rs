@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mac_worker::{
@@ -77,7 +77,7 @@ async fn loopback_router_serves_embedded_assets_snapshot_and_security_headers() 
     }
     assert_eq!(request(&host, "/assets/private.ttf", &host).status, 404);
 
-    let snapshot = request(&host, "/api/v1/snapshot", &host);
+    let snapshot = wait_for_ok_snapshot(&host);
     assert_eq!(snapshot.status, 200);
     assert_eq!(snapshot.header("cache-control"), Some("no-store"));
     assert_security(&snapshot);
@@ -266,11 +266,10 @@ async fn http_fixture_preserves_mixed_freshness_fifo_terminal_cursors_and_read_o
     let source = FixtureSource::new(terminal.clone(), mutations);
     let logs = Arc::new(FixtureLogs::new(terminal.clone()));
     let state = Arc::new(DashboardHttpState {
-        service: Arc::new(DashboardService::new(
-            source.clone(),
-            FixedClock,
-            FixedMonotonic,
-        )),
+        service: Arc::new(
+            DashboardService::new(source.clone(), FixedClock, FixedMonotonic)
+                .with_collection_interval(Duration::from_millis(20)),
+        ),
         log_source: logs,
         task_source: Arc::new(FixtureTaskSource::default()),
         settings_source: None,
@@ -278,13 +277,11 @@ async fn http_fixture_preserves_mixed_freshness_fifo_terminal_cursors_and_read_o
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     let host = listener_host(&server);
 
-    let warm = request(&host, "/api/v1/snapshot", &host);
-    assert_eq!(warm.status, 200);
-
-    let snapshot = request(&host, "/api/v1/snapshot", &host);
-    assert_eq!(snapshot.status, 200);
-    let snapshot_json: serde_json::Value = serde_json::from_slice(&snapshot.body).unwrap();
-    assert_eq!(snapshot_json["workers"].as_array().unwrap().len(), 3);
+    let snapshot_json = wait_for_snapshot_matching(&host, |snapshot| {
+        snapshot["workers"]
+            .as_array()
+            .is_some_and(|workers| workers.len() == 3 && workers[2]["freshness"] == "stale")
+    });
     assert_eq!(snapshot_json["workers"][0]["freshness"], "current");
     assert_eq!(snapshot_json["workers"][1]["freshness"], "current");
     assert_eq!(snapshot_json["workers"][2]["freshness"], "stale");
@@ -328,37 +325,41 @@ async fn http_fixture_preserves_mixed_freshness_fifo_terminal_cursors_and_read_o
 async fn two_http_clients_share_one_in_flight_snapshot_refresh() {
     let gate = Arc::new(CollectionGate::default());
     let source = CoalescingSource::new(Arc::clone(&gate));
-    let monotonic = CountingMonotonic::default();
     let state = Arc::new(DashboardHttpState {
-        service: Arc::new(DashboardService::new(
-            source.clone(),
-            FixedClock,
-            monotonic.clone(),
-        )),
+        service: Arc::new(
+            DashboardService::new(source.clone(), FixedClock, FixedMonotonic)
+                .with_collection_interval(Duration::from_secs(60)),
+        ),
         log_source: Arc::new(RecordingLogs::new(job(job_id(1)))),
         task_source: Arc::new(FixtureTaskSource::default()),
         settings_source: None,
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     let host = listener_host(&server);
-
-    let first_host = host.clone();
-    let first = thread::spawn(move || request(&first_host, "/api/v1/snapshot", &first_host));
     gate.wait_until_entered();
 
-    let second_host = host.clone();
-    let second = thread::spawn(move || request(&second_host, "/api/v1/snapshot", &second_host));
-    monotonic.wait_for_calls(3);
-    gate.release();
+    let started = Instant::now();
+    let first = request(&host, "/api/v1/snapshot", &host);
+    let second = request(&host, "/api/v1/snapshot", &host);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "ready reads waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(first.status, 503);
+    assert_eq!(second.status, 503);
+    assert_eq!(error_code(&first), "DASHBOARD_SNAPSHOT_PENDING");
+    assert_eq!(error_code(&second), "DASHBOARD_SNAPSHOT_PENDING");
+    assert_eq!(source.collect_calls(), 1);
 
-    let first = first.join().unwrap();
-    let second = second.join().unwrap();
-    assert_eq!(first.status, 200);
-    assert_eq!(second.status, 200);
-    let first_json: serde_json::Value = serde_json::from_slice(&first.body).unwrap();
-    let second_json: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
-    assert_eq!(first_json["revision"], 1);
-    assert_eq!(second_json["revision"], 1);
+    gate.release();
+    let ready = wait_for_ok_snapshot(&host);
+    let ready_json: serde_json::Value = serde_json::from_slice(&ready.body).unwrap();
+    let again = request(&host, "/api/v1/snapshot", &host);
+    let again_json: serde_json::Value = serde_json::from_slice(&again.body).unwrap();
+    assert_eq!(again.status, 200);
+    assert_eq!(ready_json["revision"], 1);
+    assert_eq!(again_json["revision"], 1);
     assert_eq!(source.collect_calls(), 1);
 
     server.shutdown().await.unwrap();
@@ -405,6 +406,41 @@ fn request(address: &str, path: &str, host: &str) -> HttpResponse {
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).unwrap();
     HttpResponse::parse(raw)
+}
+
+fn wait_for_ok_snapshot(host: &str) -> HttpResponse {
+    wait_for_snapshot(host, |response| response.status == 200)
+}
+
+fn wait_for_snapshot_matching(
+    host: &str,
+    predicate: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let response = wait_for_snapshot(host, |response| {
+        response.status == 200
+            && serde_json::from_slice::<serde_json::Value>(&response.body)
+                .is_ok_and(|snapshot| predicate(&snapshot))
+    });
+    serde_json::from_slice(&response.body).unwrap()
+}
+
+fn wait_for_snapshot(host: &str, predicate: impl Fn(&HttpResponse) -> bool) -> HttpResponse {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let response = request(host, "/api/v1/snapshot", host);
+        if predicate(&response) {
+            return response;
+        }
+        if Instant::now() >= deadline {
+            let preview = String::from_utf8_lossy(&response.body);
+            panic!(
+                "snapshot never matched: status={} body={}",
+                response.status,
+                preview.chars().take(400).collect::<String>()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn log_request(address: &str, job_id: JobId, stream: &str, offset: u64) -> serde_json::Value {
@@ -612,11 +648,17 @@ impl DashboardDataSource for FixtureSource {
     }
 
     fn collect_workers(&self, _deadline: Duration) -> Vec<WorkerObservationResult> {
-        self.observations
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("fixture contains an observation row for each snapshot")
+        let mut observations = self.observations.lock().unwrap();
+        if observations.len() > 1 {
+            observations
+                .pop_front()
+                .expect("fixture contains an observation row for each snapshot")
+        } else {
+            observations
+                .front()
+                .cloned()
+                .expect("fixture contains a repeating observation row")
+        }
     }
 
     fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
@@ -808,33 +850,6 @@ impl CollectionGate {
         let mut state = self.state.lock().unwrap();
         state.released = true;
         self.changed.notify_all();
-    }
-}
-
-#[derive(Clone, Default)]
-struct CountingMonotonic(Arc<CountingMonotonicState>);
-
-#[derive(Default)]
-struct CountingMonotonicState {
-    calls: Mutex<usize>,
-    changed: Condvar,
-}
-
-impl CountingMonotonic {
-    fn wait_for_calls(&self, minimum: usize) {
-        let mut calls = self.0.calls.lock().unwrap();
-        while *calls < minimum {
-            calls = self.0.changed.wait(calls).unwrap();
-        }
-    }
-}
-
-impl MonotonicClock for CountingMonotonic {
-    fn now_millis(&self) -> u64 {
-        let mut calls = self.0.calls.lock().unwrap();
-        *calls += 1;
-        self.0.changed.notify_all();
-        0
     }
 }
 

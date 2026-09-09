@@ -12,7 +12,7 @@ use std::{
 use crate::{
     agent_facts::FACTS_TTL,
     dashboard::{
-        cache::{Observation, ObservationCache},
+        cache::{Observation, ObservationCache, SNAPSHOT_INTERVAL_MILLIS},
         model::{
             AgentFactsFreshness, CollectionSummary, DASHBOARD_API_VERSION, DashboardActiveTask,
             DashboardError, DashboardJob, DashboardJobState, DashboardProjectDefaults,
@@ -30,6 +30,7 @@ pub const MAX_RECENT_TERMINAL_JOBS: usize = 100;
 pub const MAX_COLLECTION_ERRORS: usize = 64;
 pub const WORKER_COLLECTION_DEADLINE: Duration = Duration::from_secs(15);
 pub const GLOBAL_COLLECTION_DEADLINE: Duration = Duration::from_secs(20);
+pub const SNAPSHOT_PENDING: &str = "DASHBOARD_SNAPSHOT_PENDING";
 
 const INVALID_DEADLINES: &str = "INVALID_DASHBOARD_DEADLINES";
 const DEADLINE_OVERFLOW: &str = "DASHBOARD_DEADLINE_OVERFLOW";
@@ -205,6 +206,7 @@ pub struct DashboardService<S, C, M> {
     source: Arc<S>,
     cache: Mutex<ObservationCache>,
     completed: Mutex<Option<Arc<DashboardSnapshot>>>,
+    last_failure: Mutex<Option<DashboardError>>,
     revision: AtomicU64,
     refresh: Mutex<RefreshState>,
     facts_refresh: Arc<Mutex<FactsRefreshTracker>>,
@@ -212,6 +214,43 @@ pub struct DashboardService<S, C, M> {
     monotonic: M,
     deadlines: DashboardDeadlines,
     refresh_stale_facts: bool,
+    collection_interval: Duration,
+}
+
+/// Stop handle for the single background observation collector.
+///
+/// [`Self::stop`] never waits out an in-flight collect. Tests that need the
+/// thread to exit can call [`Self::join`].
+pub struct CollectorHandle {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl CollectorHandle {
+    pub fn stop(self) {
+        self.signal_stop();
+        let _ = lock_recover(&self.thread).take();
+    }
+
+    pub fn join(self) {
+        self.signal_stop();
+        if let Some(thread) = lock_recover(&self.thread).take() {
+            let _ = thread.join();
+        }
+    }
+
+    fn signal_stop(&self) {
+        let (lock, changed) = &*self.stop;
+        *lock_recover(lock) = true;
+        changed.notify_all();
+    }
+}
+
+impl Drop for CollectorHandle {
+    fn drop(&mut self) {
+        self.signal_stop();
+        let _ = lock_recover(&self.thread).take();
+    }
 }
 
 struct RefreshState {
@@ -305,6 +344,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             source: Arc::new(source),
             cache: Mutex::new(ObservationCache::new()),
             completed: Mutex::new(None),
+            last_failure: Mutex::new(None),
             revision: AtomicU64::new(0),
             refresh: Mutex::new(RefreshState {
                 next_generation: 1,
@@ -315,12 +355,76 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             monotonic,
             deadlines,
             refresh_stale_facts: config.refresh_stale_facts,
+            collection_interval: Duration::from_millis(SNAPSHOT_INTERVAL_MILLIS),
         }
     }
 
     pub fn with_refresh_stale_facts(mut self, enabled: bool) -> Self {
         self.refresh_stale_facts = enabled;
         self
+    }
+
+    pub fn with_collection_interval(mut self, interval: Duration) -> Self {
+        if !interval.is_zero() {
+            self.collection_interval = interval;
+        }
+        self
+    }
+
+    /// HTTP snapshot path: last completed snapshot only. Never probes.
+    pub fn read_snapshot(&self) -> Result<DashboardSnapshot, DashboardError> {
+        let now_millis = self.clock.now_millis();
+        let completed = lock_recover(&self.completed).as_ref().map(Arc::clone);
+        let failure = lock_recover(&self.last_failure).clone();
+        match completed {
+            None => Err(failure.unwrap_or_else(snapshot_pending_error)),
+            Some(snapshot) => {
+                let mut snapshot = snapshot.as_ref().clone();
+                refresh_agent_facts_freshness(&mut snapshot.workers, now_millis);
+                if let Some(error) = failure {
+                    apply_stale_collection(&mut snapshot, error);
+                }
+                Ok(snapshot)
+            }
+        }
+    }
+
+    pub fn start_background_collection(self: &Arc<Self>) -> CollectorHandle {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let wait = Arc::clone(&stop);
+        let service = Arc::clone(self);
+        let interval = self.collection_interval;
+        let thread = thread::Builder::new()
+            .name("dashboard-collector".into())
+            .spawn(move || service.run_collector(wait, interval))
+            .ok();
+        CollectorHandle {
+            stop,
+            thread: Mutex::new(thread),
+        }
+    }
+
+    fn run_collector(&self, stop: Arc<(Mutex<bool>, Condvar)>, interval: Duration) {
+        let (lock, changed) = &*stop;
+        loop {
+            if *lock_recover(lock) {
+                break;
+            }
+            let _ = self.snapshot(DashboardSnapshotRequest);
+            let mut stopped = lock_recover(lock);
+            if *stopped {
+                break;
+            }
+            let waited = changed.wait_timeout(stopped, interval);
+            let (next, _) = match waited {
+                Ok(pair) => pair,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            stopped = next;
+            if *stopped {
+                break;
+            }
+        }
     }
 
     pub fn snapshot(
@@ -364,6 +468,9 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
 
         if let Ok(snapshot) = &result {
             *lock_recover(&self.completed) = Some(Arc::clone(snapshot));
+            *lock_recover(&self.last_failure) = None;
+        } else if let Err(error) = &result {
+            *lock_recover(&self.last_failure) = Some(error.clone());
         }
         *lock_recover(&flight.result) = Some(result.clone());
 
@@ -694,19 +801,8 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         let timeout = DashboardError::new(REFRESH_TIMEOUT, "dashboard refresh wait timed out");
         if let Some(completed) = lock_recover(&self.completed).as_ref() {
             let mut fallback = completed.as_ref().clone();
-            fallback.collection.freshness = Freshness::Stale;
-            for worker in &mut fallback.workers {
-                if worker.freshness == Freshness::Current {
-                    worker.freshness = Freshness::Stale;
-                }
-            }
-            for task in &mut fallback.task_view.tasks {
-                if task.freshness == TaskFreshness::Current {
-                    task.freshness = TaskFreshness::Stale;
-                }
-            }
             refresh_agent_facts_freshness(&mut fallback.workers, self.clock.now_millis());
-            push_error(&mut fallback.collection.errors, timeout);
+            apply_stale_collection(&mut fallback, timeout);
             return fallback;
         }
 
@@ -726,6 +822,28 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             recent_jobs: Vec::new(),
         }
     }
+}
+
+fn apply_stale_collection(snapshot: &mut DashboardSnapshot, error: DashboardError) {
+    snapshot.collection.freshness = Freshness::Stale;
+    for worker in &mut snapshot.workers {
+        if worker.freshness == Freshness::Current {
+            worker.freshness = Freshness::Stale;
+        }
+    }
+    for task in &mut snapshot.task_view.tasks {
+        if task.freshness == TaskFreshness::Current {
+            task.freshness = TaskFreshness::Stale;
+        }
+    }
+    push_error(&mut snapshot.collection.errors, error);
+}
+
+fn snapshot_pending_error() -> DashboardError {
+    DashboardError::new(
+        SNAPSHOT_PENDING,
+        "dashboard snapshot has not been collected yet",
+    )
 }
 
 fn enrich_active_tasks(workers: &mut [DashboardWorker], task_view: &TaskListProjection) {
@@ -1041,6 +1159,11 @@ mod tests {
                 drop(lock_recover(&service.completed));
                 let _guard = service.completed.lock().unwrap();
                 panic!("poison completed");
+            },
+            |service: &DashboardService<_, _, _>| {
+                drop(lock_recover(&service.last_failure));
+                let _guard = service.last_failure.lock().unwrap();
+                panic!("poison last_failure");
             },
             |service: &DashboardService<_, _, _>| {
                 drop(lock_recover(&service.refresh));
