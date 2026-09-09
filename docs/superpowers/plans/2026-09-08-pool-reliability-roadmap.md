@@ -134,6 +134,8 @@ git diff --check
 
 До изменения записать время и счётчики для cold/warm submit, нескольких задач, offline worker, длинных логов и большой истории. Измерять queue wait, admission, preparation, transfer, publication/fetch; число SSH-вызовов, durable writes и пиковую память.
 
+**Прогресс 2026-09-09 — поднабор, не весь этап 5.** На изолированной ветке `performance-validation-20260909`, исходный HEAD измерений `1c0bb51703c65587d25c658c046f236f671c6fab` (cherry-pick `1a11257` / `41b02be` / `45f02013` поверх `69aa8a6`): пакетное заполнение индекса (`update-index -z --index-info`), reuse digest→OID внутри одного `build_wip_base` при повторном свежем чтении байтов, cleanup owner-regular scratch-index, locked point lookup для dashboard detail/log. Первый capture по-прежнему вызывает Git `hash-object` на каждый distinct content (нет batched hash-object protocol). Admission/probes, пропуск no-op записей, фоновые observations, SSH multiplexing и origin delivery в этом инкременте не менялись. Полный Rust на этом HEAD: 67 `Running` targets, 1710 passed / 0 failed / 0 ignored, `logs/ci-test-all-targets.log` (~797.8 с); не путать с прежним прогоном этапа 4 на `7d91125` (1615 / 738.252 с). Подробности, ограничения измерений и таблица before/after: [2026-09-09-performance-improvements.md](../../2026-09-09-performance-improvements.md). Этап 5 целиком не закрыт; пункты ниже остаются.
+
 Порядок:
 
 1. Пакетное хеширование файлов вместо отдельного `git hash-object` на файл. Проверить совпадение base tree/OID для changed/deleted/untracked файлов, symlinks и необычных имён.
