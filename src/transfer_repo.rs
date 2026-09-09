@@ -584,9 +584,10 @@ impl TransferRepo {
         reject_merge_in_progress(runner, context)?;
         let head_oid = resolve_commit(runner, context, "HEAD")?;
         let branch = resolve_branch_name(runner, context, "HEAD")?;
-        let first = self.capture_tree(runner, context, settings)?;
+        let mut blob_oids = BTreeMap::<[u8; 32], String>::new();
+        let first = self.capture_tree(runner, context, settings, &mut blob_oids)?;
         hook()?;
-        let second = self.capture_tree(runner, context, settings)?;
+        let second = self.capture_tree(runner, context, settings, &mut blob_oids)?;
         if first.tree != second.tree {
             return Err(WorkerError::Snapshot {
                 code: "SNAPSHOT_CHANGED",
@@ -776,6 +777,7 @@ impl TransferRepo {
         runner: &dyn ProcessRunner,
         context: &ProjectContext,
         settings: &ProjectSettings,
+        blob_oids: &mut BTreeMap<[u8; 32], String>,
     ) -> Result<CapturedSelection, WorkerError> {
         let selection = InputSelector::new(runner)
             .select(context, &settings.snapshot)
@@ -808,7 +810,8 @@ impl TransferRepo {
                     crate::inputs::InputOrigin::IncludedUntracked
                     | crate::inputs::InputOrigin::IncludedIgnored => dirty.added += 1,
                 }
-                let (mode, oid) = self.hash_worktree_entry(runner, &source, &entry.path)?;
+                let (mode, oid) =
+                    self.hash_worktree_entry(runner, &source, &entry.path, blob_oids)?;
                 index_info.extend_from_slice(mode.as_bytes());
                 index_info.push(b' ');
                 index_info.extend_from_slice(oid.as_bytes());
@@ -846,22 +849,14 @@ impl TransferRepo {
         runner: &dyn ProcessRunner,
         source: &RootedDir,
         path: &RelativePath,
+        blob_oids: &mut BTreeMap<[u8; 32], String>,
     ) -> Result<(&'static str, String), WorkerError> {
         let mut inspection = source.inspect(path)?;
         match inspection.kind {
             EntryKind::Symlink => {
                 let target = source.read_symlink(path)?;
-                let output = self.transfer_git(
-                    runner,
-                    &[
-                        OsString::from("hash-object"),
-                        OsString::from("-w"),
-                        OsString::from("--stdin"),
-                    ],
-                    None,
-                    Some(target.into_bytes()),
-                )?;
-                Ok(("120000", parse_hex_oid(&output)?))
+                let oid = self.hash_blob_bytes(runner, target.into_bytes(), false, blob_oids)?;
+                Ok(("120000", oid))
             }
             EntryKind::RegularFile => {
                 let mut bytes = Vec::new();
@@ -871,20 +866,32 @@ impl TransferRepo {
                 } else {
                     "100644"
                 };
-                let output = self.transfer_git(
-                    runner,
-                    &[
-                        OsString::from("hash-object"),
-                        OsString::from("-w"),
-                        OsString::from("--no-filters"),
-                        OsString::from("--stdin"),
-                    ],
-                    None,
-                    Some(bytes),
-                )?;
-                Ok((mode, parse_hex_oid(&output)?))
+                let oid = self.hash_blob_bytes(runner, bytes, true, blob_oids)?;
+                Ok((mode, oid))
             }
         }
+    }
+
+    fn hash_blob_bytes(
+        &self,
+        runner: &dyn ProcessRunner,
+        bytes: Vec<u8>,
+        no_filters: bool,
+        blob_oids: &mut BTreeMap<[u8; 32], String>,
+    ) -> Result<String, WorkerError> {
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if let Some(oid) = blob_oids.get(&digest) {
+            return Ok(oid.clone());
+        }
+        let mut args = vec![OsString::from("hash-object"), OsString::from("-w")];
+        if no_filters {
+            args.push(OsString::from("--no-filters"));
+        }
+        args.push(OsString::from("--stdin"));
+        let output = self.transfer_git(runner, &args, None, Some(bytes))?;
+        let oid = parse_hex_oid(&output)?;
+        blob_oids.insert(digest, oid.clone());
+        Ok(oid)
     }
 
     fn commit_tree(

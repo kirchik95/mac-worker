@@ -1089,8 +1089,8 @@ fn expected_batched_tree(repo: &Fixture) -> BTreeMap<String, (String, Vec<u8>)> 
 
 #[test]
 fn wip_capture_batches_index_updates_and_preserves_tree_bytes() {
-    // Break caught: per-file update-index --cacheinfo (or comma-split cacheinfo)
-    // dropping unusual names or emitting O(H) index processes.
+    // Break caught: per-file update-index --cacheinfo, or 2H hash-object on a
+    // stable worktree after the digest memo, or a later build reusing that memo.
     let repo = repo_for_batched_index();
     let expected = expected_batched_tree(&repo);
     let hashed_entries = expected.len();
@@ -1118,7 +1118,23 @@ fn wip_capture_batches_index_updates_and_preserves_tree_bytes() {
             .map(|request| request.args.clone())
             .collect::<Vec<_>>()
     );
-    assert_eq!(hash_object_count(&recorder), hashed_entries * 2);
+    assert_eq!(hash_object_count(&recorder), hashed_entries);
+    let second_task = TaskId::new(Uuid::from_u128(2));
+    let second_recorder = RecordingRunner::passthrough();
+    transfer
+        .build_wip_base(
+            &second_recorder,
+            &repo.context(),
+            second_task,
+            &settings_including(&["fixtures/**"]),
+            &identity(),
+        )
+        .unwrap();
+    assert_eq!(
+        hash_object_count(&second_recorder),
+        hashed_entries,
+        "a later build_wip_base must not reuse the previous memo"
+    );
     for request in &updates {
         let args: Vec<&str> = request
             .args
@@ -1235,4 +1251,91 @@ fn unusual_name_mutation_between_captures_is_still_snapshot_changed() {
     assert_eq!(error.public_code(), "SNAPSHOT_CHANGED");
     assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{}", task_id())));
     assert_eq!(scratch_index_residue(&transfer), [] as [String; 0]);
+}
+
+#[test]
+fn wip_capture_hashes_identical_blob_bytes_once_per_build() {
+    // Break caught: hashing every path twice, or refusing to share a blob OID
+    // between a regular file and a symlink whose target bytes match.
+    let repo = repo_with_commits();
+    repo.write("twin.txt", b"src/app.rs");
+    symlink("src/app.rs", repo.path().join("twin-link")).unwrap();
+    repo.write("other.txt", b"unique\n");
+    repo.commit_all("shared blob bytes");
+    let cache = cache_root();
+    let recorder = RecordingRunner::passthrough();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let base = transfer
+        .build_wip_base(
+            &recorder,
+            &repo.context(),
+            task_id(),
+            &settings(),
+            &identity(),
+        )
+        .unwrap();
+    // README, src/app.rs, twin.txt, twin-link, other.txt → H=5, D=4
+    // (twin.txt bytes equal the symlink target "src/app.rs").
+    assert_eq!(hash_object_count(&recorder), 4);
+    assert_eq!(update_index_requests(&recorder).len(), 2);
+    let tree = transfer_tree_nul(transfer.path(), base.oid().as_str());
+    assert_eq!(
+        tree.get("twin.txt").map(|(mode, _)| mode.as_str()),
+        Some("100644")
+    );
+    assert_eq!(
+        tree.get("twin-link").map(|(mode, _)| mode.as_str()),
+        Some("120000")
+    );
+    assert_eq!(tree["twin.txt"].1, tree["twin-link"].1);
+}
+
+#[test]
+fn executable_mode_change_between_captures_is_snapshot_changed() {
+    // Break caught: memoizing mode with content so a chmod is invisible.
+    let repo = repo_with_commits();
+    repo.write("tool.sh", b"#!/bin/sh\n");
+    repo.commit_all("non-executable tool");
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let error = transfer
+        .build_wip_base_with_hook(
+            &runner(),
+            &repo.context(),
+            task_id(),
+            &settings(),
+            &identity(),
+            &|| {
+                make_executable(&repo.path().join("tool.sh"));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "SNAPSHOT_CHANGED");
+}
+
+#[test]
+fn symlink_target_change_between_captures_is_snapshot_changed() {
+    // Break caught: skipping the second rooted read because the path already
+    // has a blob OID in the memo.
+    let repo = repo_with_commits();
+    symlink("src/app.rs", repo.path().join("link")).unwrap();
+    repo.commit_all("symlink");
+    let cache = cache_root();
+    let transfer = TransferRepo::open_or_create(cache.path(), &repo.common_dir()).unwrap();
+    let error = transfer
+        .build_wip_base_with_hook(
+            &runner(),
+            &repo.context(),
+            task_id(),
+            &settings(),
+            &identity(),
+            &|| {
+                fs::remove_file(repo.path().join("link")).unwrap();
+                symlink("README.md", repo.path().join("link")).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "SNAPSHOT_CHANGED");
 }
