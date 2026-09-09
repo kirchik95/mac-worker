@@ -2466,34 +2466,7 @@ impl<'a> TaskClient<'a> {
         &self,
         preference: &WorkerPreference,
     ) -> Result<Vec<CandidateObservation>, WorkerError> {
-        use crate::turn_runner::{
-            admission_from_health, candidate_from_admission, probe_with_fresh_facts,
-            single_worker_config,
-        };
-        self.config
-            .workers
-            .iter()
-            .filter(|worker| match preference {
-                WorkerPreference::Automatic => true,
-                WorkerPreference::Pinned { worker: pinned } => worker.name == *pinned,
-            })
-            .map(|worker| {
-                let one = single_worker_config(self.config, worker);
-                let observed_at = current_time_millis()?;
-                // A fresh cached observation stands.  Otherwise probe, and
-                // refresh facts that aged out before judging capabilities,
-                // so a pinned submit is not refused for agents the worker
-                // still has.
-                let cached =
-                    self.client_state
-                        .admission_observation(&worker.name, observed_at, || {
-                            let (health, _) =
-                                probe_with_fresh_facts(self.runner, &one, worker, observed_at)?;
-                            admission_from_health(&one, &health, observed_at)
-                        })?;
-                candidate_from_admission(cached.observation())
-            })
-            .collect()
+        crate::admission::observe_admission(self.runner, self.config, self.client_state, preference)
     }
 
     fn read_runner_log(&self, task_id: TaskId, turn_id: TurnId) -> Result<Vec<u8>, WorkerError> {

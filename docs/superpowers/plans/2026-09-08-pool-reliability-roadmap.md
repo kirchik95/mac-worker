@@ -141,7 +141,7 @@ git diff --check
 Порядок:
 
 1. Пакетное хеширование файлов вместо отдельного `git hash-object` на файл. Проверить совпадение base tree/OID для changed/deleted/untracked файлов, symlinks и необычных имён. **Сделано через bounded blob batching (этот инкремент); этап 5 целиком открыт.**
-2. Admission cache до сети и bounded parallel probes через существующий `WorkersService`.
+2. Admission cache до сети и bounded parallel probes через существующий `WorkersService`. Реализация Stage 5.2 на ветке `admission-cache-20260909`: bound skip-SSH, общий 3-wide pipeline, один 60s deadline; измерение и полный suite — после freeze.
 3. Прямой lookup task по ID; пропуск no-op записей; отсутствие перекрывающихся detail polls; сбор observations независимо от HTTP-запроса.
 4. Объединённое/адаптивное чтение статуса и логов; проверить фактическую SSH-конфигурацию до добавления multiplexing.
 5. Устранить лишнюю Git-операцию для source=origin с сохранением pins/OID checks; потоковый разбор больших результатов и cap stderr.

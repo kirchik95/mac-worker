@@ -123,6 +123,59 @@ impl<R: ProcessRunner> WorkersService<R> {
         self.inspect_budgeted(config, requirements, budget, true)
     }
 
+    pub(crate) fn map_workers_budgeted<T, F>(
+        &self,
+        workers: &[WorkerEntry],
+        budget: Duration,
+        work: F,
+    ) -> Vec<Option<T>>
+    where
+        T: Send,
+        F: Fn(&WorkerEntry, Duration) -> T + Sync,
+    {
+        if workers.is_empty() {
+            return Vec::new();
+        }
+        let started = self.clock.now();
+        let next = AtomicUsize::new(0);
+        let results = Mutex::new(
+            workers
+                .iter()
+                .map(|_| None)
+                .collect::<Vec<Option<Option<T>>>>(),
+        );
+
+        thread::scope(|scope| {
+            for _ in 0..MAX_CONCURRENT_PROBES.min(workers.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(worker) = workers.get(index) else {
+                            break;
+                        };
+                        let outcome = catch_unwind(AssertUnwindSafe(|| {
+                            let elapsed = self.clock.now().saturating_sub(started);
+                            let remaining = budget.saturating_sub(elapsed);
+                            work(worker, remaining)
+                        }))
+                        .ok();
+                        results
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] =
+                            Some(outcome);
+                    }
+                });
+            }
+        });
+
+        results
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .into_iter()
+            .map(Option::flatten)
+            .collect()
+    }
+
     fn inspect_budgeted(
         &self,
         config: &Config,
@@ -130,58 +183,23 @@ impl<R: ProcessRunner> WorkersService<R> {
         budget: Duration,
         include_project_requirements: bool,
     ) -> WorkersReport {
-        let started = self.clock.now();
-        let next = AtomicUsize::new(0);
-        let results = Mutex::new(
-            config
-                .workers
-                .iter()
-                .map(|_| None)
-                .collect::<Vec<Option<WorkerHealth>>>(),
-        );
-
-        thread::scope(|scope| {
-            for _ in 0..MAX_CONCURRENT_PROBES.min(config.workers.len()) {
-                scope.spawn(|| {
-                    loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(worker) = config.workers.get(index) else {
-                            break;
-                        };
-                        let health = catch_unwind(AssertUnwindSafe(|| {
-                            let elapsed = self.clock.now().saturating_sub(started);
-                            let remaining = budget.saturating_sub(elapsed);
-                            if include_project_requirements {
-                                let required = stable_required_capabilities(worker, requirements);
-                                self.transport
-                                    .probe_with_required_deadline_and_failure_kind(
-                                        worker, &required, remaining,
-                                    )
-                                    .0
-                            } else {
-                                self.transport.probe_with_deadline(worker, remaining)
-                            }
-                        }))
-                        .unwrap_or_else(|_| probe_aborted(worker));
-                        results
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] = Some(health);
-                    }
-                });
+        let outcomes = self.map_workers_budgeted(&config.workers, budget, |worker, remaining| {
+            if include_project_requirements {
+                let required = stable_required_capabilities(worker, requirements);
+                self.transport
+                    .probe_with_required_deadline_and_failure_kind(worker, &required, remaining)
+                    .0
+            } else {
+                self.transport.probe_with_deadline(worker, remaining)
             }
         });
-
-        let mut results = results
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let workers = results
-            .iter_mut()
-            .zip(&config.workers)
-            .map(|(health, worker)| health.take().unwrap_or_else(|| probe_aborted(worker)))
-            .collect();
         WorkersReport {
             protocol_version: PROTOCOL_VERSION,
-            workers,
+            workers: outcomes
+                .into_iter()
+                .zip(&config.workers)
+                .map(|(health, worker)| health.unwrap_or_else(|| probe_aborted(worker)))
+                .collect(),
         }
     }
 }
@@ -204,17 +222,29 @@ impl<R: ProcessRunner> SshTransport<R> {
     }
 
     pub fn refresh_facts(&self, worker: &WorkerEntry) -> Result<(), WorkerError> {
+        self.refresh_facts_with_deadline(worker, REFRESH_FACTS_POLICY.deadline)
+    }
+
+    pub(crate) fn refresh_facts_with_deadline(
+        &self,
+        worker: &WorkerEntry,
+        deadline: Duration,
+    ) -> Result<(), WorkerError> {
         if !valid_ssh_destination(&worker.ssh) || worker.remote_binary != "~/.local/bin/worker" {
             return Err(WorkerError::Transport {
                 code: "INVALID_REQUEST",
                 message: "worker transport configuration is invalid".into(),
             });
         }
-        let request = ssh_request(
-            worker,
-            HostOperation::RefreshFacts.command().into(),
-            REFRESH_FACTS_POLICY,
-        );
+        let mut policy = REFRESH_FACTS_POLICY;
+        policy.deadline = deadline.min(REFRESH_FACTS_POLICY.deadline);
+        if policy.deadline.is_zero() {
+            return Err(WorkerError::Transport {
+                code: "REFRESH_FACTS_FAILED",
+                message: "worker fact refresh failed".into(),
+            });
+        }
+        let request = ssh_request(worker, HostOperation::RefreshFacts.command().into(), policy);
         let result = self
             .runner
             .run(&request)

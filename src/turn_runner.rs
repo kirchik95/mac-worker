@@ -18,17 +18,15 @@ use crate::{
     error::WorkerError,
     git_transport::GitTransport,
     job::{
-        AdmissionObservation, CommandSpec, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
-        LeaseToken, LogCursor, LogStream, ProcessIdentity, QueueEntryKind, QueueState,
-        RequestFingerprintMaterial, ResolveOrAbandonRequest, SubmitRequest, TerminalLogDrain,
+        CommandSpec, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LogCursor,
+        LogStream, ProcessIdentity, QueueEntryKind, QueueState, RequestFingerprintMaterial,
+        ResolveOrAbandonRequest, SubmitRequest, TerminalLogDrain,
     },
     paths::PathLayout,
     process::ProcessRunner,
     project_state::ProjectState,
-    protocol::HealthStatus,
     runner_log::{Completion, RunnerLog as LogWriter},
     scheduler::{CandidateObservation, SchedulerPolicy, WorkerPreference},
-    scheduler_adapter::SchedulerProbeAdapter,
     supervisor::SystemProcessInspector,
     task::{
         LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId,
@@ -40,7 +38,6 @@ use crate::{
     },
     transfer::{RemoteJobClient, TransferIdentity},
     transfer_repo::TransferRepo,
-    transport::{SshTransport, WorkersService},
     turn::{TaskTurnRequest, TurnMaterial},
 };
 
@@ -559,17 +556,23 @@ impl<'a> TurnRunner<'a> {
                         // A ready pinned turn takes its fast path above. Only
                         // a blocked donor with parked work needs observations
                         // for the remaining fleet; keep its existing sample.
-                        for worker in &self.config.workers {
-                            if !observations
-                                .iter()
-                                .any(|observation| observation.worker_name() == worker.name)
-                            {
-                                observations.extend(self.observe_admission(
-                                    &WorkerPreference::Pinned {
-                                        worker: worker.name.clone(),
-                                    },
-                                )?);
-                            }
+                        let missing = self
+                            .config
+                            .workers
+                            .iter()
+                            .filter(|worker| {
+                                !observations
+                                    .iter()
+                                    .any(|observation| observation.worker_name() == worker.name)
+                            })
+                            .collect::<Vec<_>>();
+                        if !missing.is_empty() {
+                            observations.extend(crate::admission::observe_workers(
+                                self.runner,
+                                self.config,
+                                self.client_state,
+                                &missing,
+                            )?);
                         }
                         if let Some((next_task, claim)) =
                             self.client_state.claim_parked_for_waiting_runner(
@@ -1467,149 +1470,8 @@ impl<'a> TurnRunner<'a> {
         &self,
         preference: &WorkerPreference,
     ) -> Result<Vec<CandidateObservation>, WorkerError> {
-        observe_admission(self.runner, self.config, self.client_state, preference)
+        crate::admission::observe_admission(self.runner, self.config, self.client_state, preference)
     }
-}
-
-/// The runner's admission observation per candidate worker: probe now,
-/// refreshing stale agent facts first, and publish a stale or unavailable
-/// worker so an earlier ready cache entry cannot admit work to it.
-fn observe_admission(
-    runner: &dyn ProcessRunner,
-    config: &Config,
-    client_state: &ClientStateStore,
-    preference: &WorkerPreference,
-) -> Result<Vec<CandidateObservation>, WorkerError> {
-    config
-        .workers
-        .iter()
-        .filter(|worker| match preference {
-            WorkerPreference::Automatic => true,
-            WorkerPreference::Pinned { worker: pinned } => worker.name == *pinned,
-        })
-        .map(|worker| {
-            let one = single_worker_config(config, worker);
-            let observed_at = now_millis()?;
-            let (health, facts_stale) = probe_with_fresh_facts(runner, &one, worker, observed_at)?;
-            if facts_stale || health.status == HealthStatus::Unavailable {
-                // A failed worker is an unavailable candidate, not a failed
-                // fleet observation.  Publish it so an earlier ready cache
-                // entry cannot admit work to this worker.
-                let candidate = candidate_from_health(&one, &health)?;
-                client_state.publish_admission_observation(admission_from_health(
-                    &one,
-                    &health,
-                    observed_at,
-                )?)?;
-                return Ok(candidate);
-            }
-            let cached = client_state.admission_observation(&worker.name, observed_at, || {
-                admission_from_health(&one, &health, observed_at)
-            })?;
-            candidate_from_admission(cached.observation())
-        })
-        .collect()
-}
-
-/// The inventory reduced to one worker, as the probe and the scheduler
-/// adapter want it.
-pub(crate) fn single_worker_config(config: &Config, worker: &WorkerEntry) -> Config {
-    Config {
-        version: config.version,
-        notifications: crate::config::NotificationsConfig::default(),
-        workers: vec![worker.clone()],
-    }
-}
-
-fn probe_one(
-    runner: &dyn ProcessRunner,
-    one: &Config,
-) -> Result<crate::protocol::WorkerHealth, WorkerError> {
-    WorkersService::new(SshTransport::new(runner))
-        .inspect(one)
-        .workers
-        .into_iter()
-        .next()
-        .ok_or_else(|| WorkerError::Protocol("worker probe was empty".into()))
-}
-
-/// Probes one worker and, when its agent facts have aged out, refreshes
-/// them and probes again, so facts that merely expired are never read as
-/// missing agents.  A refresh that fails leaves the worker unavailable for
-/// this observation.  Submit and the runner share it.  The flag says whether
-/// the facts were stale on the first probe.
-pub(crate) fn probe_with_fresh_facts(
-    runner: &dyn ProcessRunner,
-    one: &Config,
-    worker: &WorkerEntry,
-    observed_at: u64,
-) -> Result<(crate::protocol::WorkerHealth, bool), WorkerError> {
-    let mut health = probe_one(runner, one)?;
-    let facts_stale = health.status == HealthStatus::Ready
-        && health.probe.as_ref().is_none_or(|probe| {
-            probe
-                .agent_facts
-                .as_ref()
-                .is_none_or(|facts| facts.is_stale(observed_at))
-        });
-    if facts_stale {
-        match SshTransport::new(runner).refresh_facts(worker) {
-            Ok(()) => health = probe_one(runner, one)?,
-            Err(
-                error @ WorkerError::Transport {
-                    code: "REFRESH_FACTS_FAILED",
-                    ..
-                },
-            ) => {
-                health.status = HealthStatus::Unavailable;
-                health.error_code = Some(error.public_code());
-                health.error_message = Some(error.public_message());
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok((health, facts_stale))
-}
-
-pub(crate) fn candidate_from_admission(
-    observation: &AdmissionObservation,
-) -> Result<CandidateObservation, WorkerError> {
-    CandidateObservation::new(
-        observation.worker_name().to_owned(),
-        observation.ready(),
-        observation.slot(),
-        observation.capabilities().to_vec(),
-        observation.available_memory_bytes(),
-        observation.free_disk_bytes(),
-    )
-    .map_err(|_| WorkerError::Protocol("cached scheduler observation is invalid".into()))
-}
-
-fn candidate_from_health(
-    config: &Config,
-    health: &crate::protocol::WorkerHealth,
-) -> Result<CandidateObservation, WorkerError> {
-    SchedulerProbeAdapter::observations(config, std::slice::from_ref(health))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| WorkerError::Protocol("worker probe was empty".into()))
-}
-
-pub(crate) fn admission_from_health(
-    config: &Config,
-    health: &crate::protocol::WorkerHealth,
-    observed_at: u64,
-) -> Result<AdmissionObservation, WorkerError> {
-    let candidate = candidate_from_health(config, health)?;
-    AdmissionObservation::new(
-        candidate.worker_name().to_owned(),
-        candidate.ready(),
-        candidate.slot(),
-        candidate.capabilities().to_vec(),
-        candidate.available_memory_bytes(),
-        candidate.free_disk_bytes(),
-        observed_at,
-    )
 }
 
 /// Transfer a waiting or dispatching task row to the process that will

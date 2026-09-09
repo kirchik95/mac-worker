@@ -14,7 +14,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::herdr::HerdrSocket;
@@ -1058,6 +1058,30 @@ fn runner_refreshes_stale_agent_facts_before_claiming() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
+    let worker = &fixture.config.workers[0];
+    fixture
+        .state
+        .publish_admission_observation(
+            AdmissionObservation::new(
+                worker.name.clone(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec!["darwin-arm64".into()],
+                Some(12 * 1024 * 1024 * 1024),
+                100 * 1024 * 1024 * 1024,
+                query_now,
+            )
+            .unwrap()
+            .with_local_binding(
+                worker.ssh.clone(),
+                worker.remote_binary.clone(),
+                worker.capabilities.clone(),
+                worker.slots,
+                Some(FACTS_TTL + 1),
+                query_now,
+            ),
+        )
+        .unwrap();
     let outcome = fixture.run(&mut Vec::new()).unwrap();
 
     assert_eq!(outcome.status().state(), TaskState::Closed);
@@ -1138,6 +1162,35 @@ fn add_second_worker(fixture: &mut AcceptedThenTerminalFixture, first: bool) {
     worker.name = "mini-2".into();
     worker.ssh = "mac2".into();
     fixture.config.workers.insert(usize::from(!first), worker);
+}
+
+fn plant_bound_mini1_ready(state: &ClientStateStore, capabilities: Vec<String>) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .publish_admission_observation(
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                capabilities,
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+            .unwrap()
+            .with_local_binding(
+                "mac1".into(),
+                "~/.local/bin/worker".into(),
+                vec!["darwin-arm64".into()],
+                1,
+                Some(0),
+                now,
+            ),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -1695,6 +1748,7 @@ fn pinned_admission_does_not_fall_back_when_its_worker_is_unreachable() {
         false,
     );
     add_second_worker(&mut fixture, true);
+    fs::remove_file(fixture.paths.state.join("observations/mini-1.json")).unwrap();
     let runner = AdmissionFailureRunner {
         inner: &fixture.runner,
         ssh: "mac1",
@@ -2311,27 +2365,14 @@ fn assert_submit_rolls_back_post_create_state(
     let executor = InlineRunnerExecutor;
     let client = TaskClient::new(&runner, &config, &paths, &state, &executor);
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    state
-        .admission_observation("mini-1", now, || {
-            AdmissionObservation::new(
-                "mini-1".into(),
-                true,
-                mac_worker::scheduler::CandidateSlot::Idle,
-                vec![
-                    "darwin-arm64".into(),
-                    "origin:github.com".into(),
-                    "agent:codex".into(),
-                ],
-                Some(8 * 1024 * 1024 * 1024),
-                64 * 1024 * 1024 * 1024,
-                now,
-            )
-        })
-        .unwrap();
+    plant_bound_mini1_ready(
+        &state,
+        vec![
+            "darwin-arm64".into(),
+            "origin:github.com".into(),
+            "agent:codex".into(),
+        ],
+    );
     if fault == ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement {
         state.inject_write_failure_once(ClientStateWritePoint::BeforeSubmissionReport);
         state.inject_submission_rollback_cleanup_failure_once(fault);
@@ -2667,23 +2708,7 @@ fn reconciliation_excludes_retired_pending_rollback_turn_before_dead_owner_adopt
     .unwrap();
     let runner = AcceptedThenTerminalRunner::new();
     let executor = InlineRunnerExecutor;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    state
-        .admission_observation("mini-1", now, || {
-            AdmissionObservation::new(
-                "mini-1".into(),
-                true,
-                mac_worker::scheduler::CandidateSlot::Idle,
-                vec!["darwin-arm64".into(), "agent:codex".into()],
-                Some(8 * 1024 * 1024 * 1024),
-                64 * 1024 * 1024 * 1024,
-                now,
-            )
-        })
-        .unwrap();
+    plant_bound_mini1_ready(&state, vec!["darwin-arm64".into(), "agent:codex".into()]);
     state.inject_write_failure_once(ClientStateWritePoint::BeforeSubmissionReport);
     state.inject_submission_rollback_cleanup_failure_once(
         ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement,
@@ -2728,6 +2753,10 @@ fn reconciliation_excludes_retired_pending_rollback_turn_before_dead_owner_adopt
     state
         .remove_task_turn_for_submission_rollback(turn_id)
         .unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     state
         .enqueue(
             QueueEntry::new(
@@ -2805,32 +2834,19 @@ fn rollback_retry_does_not_release_a_later_tasks_reacquired_run_publish_branch()
         )
         .unwrap();
     let config = Config::parse(
-        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 2\ncapabilities = [\"darwin-arm64\"]\n",
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
     )
     .unwrap();
     let runner = AcceptedThenTerminalRunner::new();
     let executor = InlineRunnerExecutor;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    state
-        .admission_observation("mini-1", now, || {
-            AdmissionObservation::new(
-                "mini-1".into(),
-                true,
-                mac_worker::scheduler::CandidateSlot::Idle,
-                vec![
-                    "darwin-arm64".into(),
-                    "origin:github.com".into(),
-                    "agent:codex".into(),
-                ],
-                Some(8 * 1024 * 1024 * 1024),
-                64 * 1024 * 1024 * 1024,
-                now,
-            )
-        })
-        .unwrap();
+    plant_bound_mini1_ready(
+        &state,
+        vec![
+            "darwin-arm64".into(),
+            "origin:github.com".into(),
+            "agent:codex".into(),
+        ],
+    );
     let request = || TaskSubmitRequest {
         agent: AgentKind::Codex,
         model: None,
@@ -2916,23 +2932,7 @@ fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
     .unwrap();
     let runner = AcceptedThenTerminalRunner::new();
     let executor = InlineRunnerExecutor;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    state
-        .admission_observation("mini-1", now, || {
-            AdmissionObservation::new(
-                "mini-1".into(),
-                true,
-                mac_worker::scheduler::CandidateSlot::Idle,
-                vec!["darwin-arm64".into(), "agent:codex".into()],
-                Some(8 * 1024 * 1024 * 1024),
-                64 * 1024 * 1024 * 1024,
-                now,
-            )
-        })
-        .unwrap();
+    plant_bound_mini1_ready(&state, vec!["darwin-arm64".into(), "agent:codex".into()]);
     let request = || TaskSubmitRequest {
         agent: AgentKind::Codex,
         model: None,
@@ -3019,23 +3019,7 @@ fn reconciliation_does_not_rollback_a_submission_that_cleared_its_intent_while_w
     .unwrap();
     let runner = AcceptedThenTerminalRunner::new();
     let executor = InlineRunnerExecutor;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    state
-        .admission_observation("mini-1", now, || {
-            AdmissionObservation::new(
-                "mini-1".into(),
-                true,
-                mac_worker::scheduler::CandidateSlot::Idle,
-                vec!["darwin-arm64".into(), "agent:codex".into()],
-                Some(8 * 1024 * 1024 * 1024),
-                64 * 1024 * 1024 * 1024,
-                now,
-            )
-        })
-        .unwrap();
+    plant_bound_mini1_ready(&state, vec!["darwin-arm64".into(), "agent:codex".into()]);
     let request = || TaskSubmitRequest {
         agent: AgentKind::Codex,
         model: None,
@@ -3130,23 +3114,7 @@ fn intent_clear_fsync_failure_does_not_restore_a_stale_submission_snapshot_after
     .unwrap();
     let runner = AcceptedThenTerminalRunner::new();
     let executor = InlineRunnerExecutor;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    state
-        .admission_observation("mini-1", now, || {
-            AdmissionObservation::new(
-                "mini-1".into(),
-                true,
-                mac_worker::scheduler::CandidateSlot::Idle,
-                vec!["darwin-arm64".into(), "agent:codex".into()],
-                Some(8 * 1024 * 1024 * 1024),
-                64 * 1024 * 1024 * 1024,
-                now,
-            )
-        })
-        .unwrap();
+    plant_bound_mini1_ready(&state, vec!["darwin-arm64".into(), "agent:codex".into()]);
     state.inject_write_failure_once(
         ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync,
     );
@@ -3248,23 +3216,7 @@ fn reconciliation_keeps_pending_submission_intent_out_of_runner_startup_until_re
     .unwrap();
     let runner = AcceptedThenTerminalRunner::with_base_release_failure();
     let executor = InlineRunnerExecutor;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    state
-        .admission_observation("mini-1", now, || {
-            AdmissionObservation::new(
-                "mini-1".into(),
-                true,
-                mac_worker::scheduler::CandidateSlot::Idle,
-                vec!["darwin-arm64".into(), "agent:codex".into()],
-                Some(8 * 1024 * 1024 * 1024),
-                64 * 1024 * 1024 * 1024,
-                now,
-            )
-        })
-        .unwrap();
+    plant_bound_mini1_ready(&state, vec!["darwin-arm64".into(), "agent:codex".into()]);
     state.inject_write_failure_once(ClientStateWritePoint::BeforeSubmissionReport);
     state.inject_task_rollback_update_failures(2);
 
@@ -3365,27 +3317,14 @@ fn restart_recovers_prompt_failure_when_every_rollback_marker_write_fails() {
     .unwrap();
     let runner = AcceptedThenTerminalRunner::new();
     let executor = InlineRunnerExecutor;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    state
-        .admission_observation("mini-1", now, || {
-            AdmissionObservation::new(
-                "mini-1".into(),
-                true,
-                mac_worker::scheduler::CandidateSlot::Idle,
-                vec![
-                    "darwin-arm64".into(),
-                    "origin:github.com".into(),
-                    "agent:codex".into(),
-                ],
-                Some(8 * 1024 * 1024 * 1024),
-                64 * 1024 * 1024 * 1024,
-                now,
-            )
-        })
-        .unwrap();
+    plant_bound_mini1_ready(
+        &state,
+        vec![
+            "darwin-arm64".into(),
+            "origin:github.com".into(),
+            "agent:codex".into(),
+        ],
+    );
     state.inject_write_failure_once(ClientStateWritePoint::BeforeTurnPromptWrite);
     state.inject_task_rollback_update_failures(2);
 
@@ -3601,19 +3540,7 @@ fn runner_that_exits_early_writes_one_diagnostic_line_and_no_secret() {
         )
         .unwrap();
     state.write_turn_prompt(task_id, turn_id, &prompt).unwrap();
-    state
-        .admission_observation("mini-1", now, || {
-            AdmissionObservation::new(
-                "mini-1".into(),
-                true,
-                mac_worker::scheduler::CandidateSlot::Idle,
-                vec!["darwin-arm64".into()],
-                Some(8 * 1024 * 1024 * 1024),
-                64 * 1024 * 1024 * 1024,
-                now,
-            )
-        })
-        .unwrap();
+    plant_bound_mini1_ready(&state, vec!["darwin-arm64".into()]);
     state
         .enqueue(
             QueueEntry::new(
@@ -4647,4 +4574,620 @@ fn a_runner_for_a_row_held_by_another_identity_stops_after_the_adoption_wait() {
     let log = String::from_utf8(fixture.runner_log()).unwrap();
     let line = log.lines().next().unwrap_or_default();
     assert!(line.contains("QUEUE_OWNER_MISMATCH"), "{log}");
+}
+
+fn is_host_probe(request: &ProcessRequest) -> bool {
+    request.program == OsStr::new("/usr/bin/ssh")
+        && request
+            .args
+            .last()
+            .is_some_and(|argument| argument == "~/.local/bin/worker host probe")
+}
+
+fn ssh_destination(request: &ProcessRequest) -> String {
+    request
+        .args
+        .windows(2)
+        .find(|window| window[0] == "--")
+        .map(|window| window[1].to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+const ADMISSION_GATE_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct ProbeStartGate {
+    state: Arc<(Mutex<ProbeGateState>, std::sync::Condvar)>,
+}
+
+struct ProbeGateState {
+    started: Vec<String>,
+    released: std::collections::HashSet<String>,
+    release_all: bool,
+}
+
+impl ProbeStartGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(ProbeGateState {
+                    started: Vec::new(),
+                    released: std::collections::HashSet::new(),
+                    release_all: false,
+                }),
+                std::sync::Condvar::new(),
+            )),
+        }
+    }
+
+    fn enter(&self, destination: &str) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.started.push(destination.to_owned());
+        changed.notify_all();
+        let deadline = Instant::now() + ADMISSION_GATE_TIMEOUT;
+        while !state.release_all && !state.released.contains(destination) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.release_all = true;
+                changed.notify_all();
+                return;
+            }
+            let (next, timeout) = changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if timeout.timed_out() {
+                state.release_all = true;
+                changed.notify_all();
+                return;
+            }
+        }
+    }
+
+    fn wait_for_started(&self, count: usize) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        let deadline = Instant::now() + ADMISSION_GATE_TIMEOUT;
+        while state.started.len() < count {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let started = state.started.clone();
+                state.release_all = true;
+                changed.notify_all();
+                drop(state);
+                panic!(
+                    "timed out after {ADMISSION_GATE_TIMEOUT:?} waiting for {count} admission probes to start; started {started:?}"
+                );
+            }
+            let (next, timeout) = changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if timeout.timed_out() && state.started.len() < count {
+                let started = state.started.clone();
+                state.release_all = true;
+                changed.notify_all();
+                drop(state);
+                panic!(
+                    "timed out after {ADMISSION_GATE_TIMEOUT:?} waiting for {count} admission probes to start; started {started:?}"
+                );
+            }
+        }
+    }
+
+    fn release_all(&self) {
+        let (state, changed) = &*self.state;
+        state.lock().unwrap().release_all = true;
+        changed.notify_all();
+    }
+
+    fn started(&self) -> Vec<String> {
+        self.state.0.lock().unwrap().started.clone()
+    }
+}
+
+struct GatedAdmissionRunner<'a> {
+    inner: &'a AcceptedThenTerminalRunner,
+    gate: ProbeStartGate,
+}
+
+impl ProcessRunner for GatedAdmissionRunner<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if is_host_probe(request) {
+            self.gate.enter(&ssh_destination(request));
+        }
+        self.inner.run(request)
+    }
+}
+
+/// Break caught: TurnRunner probes every worker before consulting the 2s cache,
+/// so a just-written submit observation still causes a second host probe.
+#[test]
+fn runner_does_not_host_probe_when_submit_cache_is_fresh() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let probes_after_submit = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    fixture.run(&mut Vec::new()).unwrap();
+    let probes_after_run = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    assert_eq!(
+        probes_after_run, probes_after_submit,
+        "runner added host probes despite a TTL-fresh submit observation; after={probes_after_run} before={probes_after_submit}"
+    );
+    assert!(
+        fixture.runner.requests().iter().any(|request| {
+            request
+                .args
+                .iter()
+                .any(|argument| argument == HostOperation::LeaseAcquire.command())
+        }),
+        "a ready cache hit must still run remote lease/prebind"
+    );
+}
+
+/// Break caught: TaskClient keys the cache by worker name only, so an SSH
+/// destination change under the same name is served from the previous host.
+#[test]
+fn submit_probes_new_ssh_destination_after_same_name_identity_change() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture = AcceptedThenTerminalFixture::new();
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    fixture.config.workers[0].ssh = "mac1-renamed".into();
+    let error = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .submit(
+        submit_request(
+            fixture._repo.root(),
+            None,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            false,
+        ),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    let _ = error;
+    let probed_renamed = fixture
+        .runner
+        .requests()
+        .iter()
+        .any(|request| is_host_probe(request) && ssh_destination(request) == "mac1-renamed");
+    assert!(
+        probed_renamed,
+        "same-name SSH identity change must miss the cache and probe the new destination"
+    );
+}
+
+/// Config::validate requires exactly one slot; invalid local config is a
+/// caller error and must not SSH, even with a fresh bound cache.
+#[test]
+fn submit_rejects_invalid_slot_count_without_probing() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture = AcceptedThenTerminalFixture::new();
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    let probes_before = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    fixture.config.workers[0].slots = 2;
+    let error = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .submit(
+        submit_request(
+            fixture._repo.root(),
+            None,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            false,
+        ),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, WorkerError::Config(_)),
+        "slots != 1 must fail locally, got {error:?}"
+    );
+    let probes_after = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    assert_eq!(
+        probes_after, probes_before,
+        "invalid local config must not start a host probe; before={probes_before} after={probes_after}"
+    );
+}
+
+#[test]
+fn submit_probes_again_when_declared_capabilities_change() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture = AcceptedThenTerminalFixture::new();
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    let probes_before = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    fixture.config.workers[0].capabilities.push("gpu".into());
+    let _ = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .submit(
+        submit_request(
+            fixture._repo.root(),
+            None,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            false,
+        ),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    let probes_after = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    assert!(
+        probes_after > probes_before,
+        "declared capability change must miss the bound cache; before={probes_before} after={probes_after}"
+    );
+}
+
+#[test]
+fn submit_does_not_reuse_a_future_bound_probe_timestamp() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    let worker = &fixture.config.workers[0];
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    fixture
+        .state
+        .publish_admission_observation(
+            AdmissionObservation::new(
+                worker.name.clone(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec!["darwin-arm64".into(), "agent:codex".into()],
+                Some(10),
+                20,
+                now + 60_000,
+            )
+            .unwrap()
+            .with_local_binding(
+                worker.ssh.clone(),
+                worker.remote_binary.clone(),
+                worker.capabilities.clone(),
+                worker.slots,
+                Some(0),
+                now + 60_000,
+            ),
+        )
+        .unwrap();
+    let probes_before = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    let _ = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .submit(
+        submit_request(
+            fixture._repo.root(),
+            None,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            false,
+        ),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    let probes_after = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    assert!(
+        probes_after > probes_before,
+        "a future bound probe timestamp must not skip SSH; before={probes_before} after={probes_after}"
+    );
+}
+
+#[test]
+fn submit_reuses_a_bound_negative_without_facts() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    let worker = &fixture.config.workers[0];
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    fixture
+        .state
+        .publish_admission_observation(
+            AdmissionObservation::new(
+                worker.name.clone(),
+                false,
+                mac_worker::scheduler::CandidateSlot::Busy,
+                Vec::new(),
+                None,
+                0,
+                now,
+            )
+            .unwrap()
+            .with_local_binding(
+                worker.ssh.clone(),
+                worker.remote_binary.clone(),
+                worker.capabilities.clone(),
+                worker.slots,
+                None,
+                now,
+            ),
+        )
+        .unwrap();
+    let probes_before = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    let error = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .submit(
+        submit_request(
+            fixture._repo.root(),
+            None,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            false,
+        ),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.public_code(), "CAPACITY_BUSY");
+    let probes_after = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    assert_eq!(
+        probes_after, probes_before,
+        "a bound negative within TTL must suppress SSH; before={probes_before} after={probes_after}"
+    );
+}
+
+#[test]
+fn submit_rejects_invalid_transport_on_a_cache_hit_without_probing() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture = AcceptedThenTerminalFixture::new();
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    let probes_before = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    fixture.config.workers[0].remote_binary = "/tmp/worker".into();
+    let error = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .submit(
+        submit_request(
+            fixture._repo.root(),
+            None,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            false,
+        ),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.public_code(), "INVALID_REQUEST");
+    let probes_after = fixture
+        .runner
+        .requests()
+        .iter()
+        .filter(|request| is_host_probe(request))
+        .count();
+    assert_eq!(
+        probes_after, probes_before,
+        "invalid local transport must fail before cache or SSH; before={probes_before} after={probes_after}"
+    );
+}
+
+struct DelayedPeerRunner<'a> {
+    inner: &'a AcceptedThenTerminalRunner,
+    ssh: &'static str,
+    delay: Duration,
+}
+
+impl ProcessRunner for DelayedPeerRunner<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if is_host_probe(request) && ssh_destination(request) == self.ssh {
+            thread::sleep(self.delay);
+            return Ok(ProcessResult {
+                status: ExitStatus::from_raw(255 << 8),
+                stdout: Vec::new(),
+                stderr: b"offline peer".to_vec(),
+            });
+        }
+        self.inner.run(request)
+    }
+}
+
+#[test]
+fn slow_offline_peer_does_not_erase_healthy_warm_eligibility() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture =
+        AcceptedThenTerminalFixture::new_with_options(None, WorkerPreference::Automatic, false);
+    add_second_worker(&mut fixture, false);
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    let _ = fs::remove_file(fixture.paths.state.join("observations/mini-2.json"));
+    let worker = fixture.config.workers[0].clone();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    fixture
+        .state
+        .publish_admission_observation(
+            AdmissionObservation::new(
+                worker.name.clone(),
+                true,
+                mac_worker::scheduler::CandidateSlot::Idle,
+                vec![
+                    "darwin-arm64".into(),
+                    "origin:example.test".into(),
+                    "agent:codex".into(),
+                ],
+                Some(10),
+                20,
+                now.saturating_sub(1_900),
+            )
+            .unwrap()
+            .with_local_binding(
+                worker.ssh.clone(),
+                worker.remote_binary.clone(),
+                worker.capabilities.clone(),
+                worker.slots,
+                Some(0),
+                now.saturating_sub(1_900),
+            ),
+        )
+        .unwrap();
+    let runner = DelayedPeerRunner {
+        inner: &fixture.runner,
+        ssh: "mac2",
+        delay: Duration::from_millis(250),
+    };
+    TaskClient::new(
+        &runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .submit(
+        submit_request(
+            fixture._repo.root(),
+            None,
+            WorkerPreference::Automatic,
+            false,
+        ),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .expect("healthy warm worker must stay eligible while an offline peer is slow");
+}
+
+/// Break caught: admission still probes workers sequentially, so four cold
+/// workers never have three host probes in flight.
+#[test]
+fn automatic_cold_admission_runs_three_host_probes_before_the_fourth() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut fixture =
+        AcceptedThenTerminalFixture::new_with_options(None, WorkerPreference::Automatic, false);
+    add_second_worker(&mut fixture, false);
+    let mut mini3 = fixture.config.workers[0].clone();
+    mini3.name = "mini-3".into();
+    mini3.ssh = "mac3".into();
+    fixture.config.workers.push(mini3);
+    let mut mini4 = fixture.config.workers[0].clone();
+    mini4.name = "mini-4".into();
+    mini4.ssh = "mac4".into();
+    fixture.config.workers.push(mini4);
+    *fixture.runner.facts_fresh.lock().unwrap() = true;
+    let _ = fs::remove_file(fixture.paths.state.join("observations/mini-1.json"));
+    let gate = ProbeStartGate::new();
+    let runner = GatedAdmissionRunner {
+        inner: &fixture.runner,
+        gate: ProbeStartGate {
+            state: Arc::clone(&gate.state),
+        },
+    };
+    let submit = thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            TaskClient::new(
+                &runner,
+                &fixture.config,
+                &fixture.paths,
+                &fixture.state,
+                &fixture.executor,
+            )
+            .submit(
+                submit_request(
+                    fixture._repo.root(),
+                    None,
+                    WorkerPreference::Automatic,
+                    false,
+                ),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+        });
+        gate.wait_for_started(3);
+        let started = gate.started();
+        gate.release_all();
+        let _ = handle.join().unwrap();
+        started
+    });
+    assert!(
+        submit.len() >= 3,
+        "expected at least three in-flight admission probes, started {submit:?}"
+    );
 }

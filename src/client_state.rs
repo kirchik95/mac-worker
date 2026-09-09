@@ -14,7 +14,7 @@ use std::{
         Arc, Condvar, LazyLock, Mutex, Weak,
         atomic::{AtomicU8, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use uuid::Uuid;
@@ -65,7 +65,7 @@ const TASKS_NAME: &CStr = c"tasks";
 const RUNS_NAME: &CStr = c"runs";
 const TURNS_NAME: &CStr = c"turns";
 const RUNNERS_NAME: &CStr = c"runners";
-const OBSERVATION_TTL_MILLIS: u64 = 2_000;
+pub(crate) const OBSERVATION_TTL_MILLIS: u64 = 2_000;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1415,17 +1415,12 @@ impl ClientStateStore {
                 "refreshed observation belongs to another worker",
             ));
         }
-        let cached = cached_admission(observation.clone(), now_millis)?;
-        let bytes = canonical_json_bytes(&observation, "admission observation")?;
-        {
-            let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
-            self.reach_concurrency_point(
-                ClientStateConcurrencyPoint::ObservationRefreshPublication,
-            );
-            publish_observation(self.inner.observations.as_raw_fd(), worker, &bytes, self)?;
-        }
+        let expected = current
+            .as_ref()
+            .map(CachedAdmissionObservation::observation);
+        let winner = self.commit_admission_observation(worker, expected, observation)?;
         drop(refresh_lock);
-        Ok(cached)
+        cached_admission(winner, now_millis)
     }
 
     /// Replaces the advisory admission projection after a runner has
@@ -1448,6 +1443,64 @@ impl ClientStateStore {
             return Ok(());
         }
         publish_observation(self.inner.observations.as_raw_fd(), worker, &bytes, self)
+    }
+
+    pub(crate) fn peek_admission_observation(
+        &self,
+        worker: &str,
+    ) -> Result<Option<AdmissionObservation>, WorkerError> {
+        validate_state_worker_name(worker)?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        read_observation_optional(self.inner.observations.as_raw_fd(), worker)
+    }
+
+    /// Publishes `incoming` only when the on-disk record still matches
+    /// `expected`. Returns the winning record (incoming or the replacement).
+    pub(crate) fn commit_admission_observation(
+        &self,
+        worker: &str,
+        expected: Option<&AdmissionObservation>,
+        incoming: AdmissionObservation,
+    ) -> Result<AdmissionObservation, WorkerError> {
+        incoming.validate()?;
+        validate_state_worker_name(worker)?;
+        if incoming.worker_name() != worker {
+            return Err(queue_error(
+                "OBSERVATION_WORKER_MISMATCH",
+                "refreshed observation belongs to another worker",
+            ));
+        }
+        let bytes = canonical_json_bytes(&incoming, "admission observation")?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        self.reach_concurrency_point(ClientStateConcurrencyPoint::ObservationRefreshPublication);
+        let existing = read_observation_optional(self.inner.observations.as_raw_fd(), worker)?;
+        if existing.as_ref() != expected {
+            return existing.ok_or_else(|| {
+                queue_error(
+                    "OBSERVATION_REPLACED",
+                    "admission observation was replaced during refresh",
+                )
+            });
+        }
+        publish_observation(self.inner.observations.as_raw_fd(), worker, &bytes, self)?;
+        Ok(incoming)
+    }
+
+    pub(crate) fn acquire_observation_refresh(
+        &self,
+        worker: &str,
+        deadline: Instant,
+    ) -> Result<Option<ObservationRefreshGuard>, WorkerError> {
+        validate_state_worker_name(worker)?;
+        let marker = {
+            let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+            open_or_create_refresh_marker(
+                self.inner.observations.as_raw_fd(),
+                worker,
+                &self.inner.sync_counts,
+            )?
+        };
+        ObservationRefreshGuard::poll_until(marker, deadline)
     }
 
     fn update_queue<R, F>(&self, update: F) -> Result<R, WorkerError>
@@ -3026,6 +3079,31 @@ impl RefreshLock {
 impl Drop for RefreshLock {
     fn drop(&mut self) {
         let _ = unsafe { libc::flock(self.marker.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+pub(crate) struct ObservationRefreshGuard {
+    _lock: RefreshLock,
+}
+
+impl ObservationRefreshGuard {
+    fn poll_until(marker: OwnedFd, deadline: Instant) -> Result<Option<Self>, WorkerError> {
+        loop {
+            match cvt(unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) {
+                Ok(()) => {
+                    return Ok(Some(Self {
+                        _lock: RefreshLock { marker },
+                    }));
+                }
+                Err(error) if lock_would_block(&error) => {
+                    if Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(WorkerError::Io(error)),
+            }
+        }
     }
 }
 

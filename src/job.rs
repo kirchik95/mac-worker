@@ -1667,6 +1667,12 @@ pub struct AdmissionObservation {
     available_memory_bytes: Option<u64>,
     free_disk_bytes: u64,
     observed_at_millis: u64,
+    ssh: String,
+    remote_binary: String,
+    inventory_capabilities: Option<Vec<String>>,
+    slots: Option<u8>,
+    facts_age_millis: Option<u64>,
+    final_probe_started_at_millis: Option<u64>,
 }
 
 impl AdmissionObservation {
@@ -1688,9 +1694,60 @@ impl AdmissionObservation {
             available_memory_bytes,
             free_disk_bytes,
             observed_at_millis,
+            ssh: String::new(),
+            remote_binary: String::new(),
+            inventory_capabilities: None,
+            slots: None,
+            facts_age_millis: None,
+            final_probe_started_at_millis: None,
         };
         observation.validate()?;
         Ok(observation)
+    }
+
+    /// Local cache binding for skip-SSH. Missing fields keep the record an
+    /// unbound miss. Not part of the public task/wire schema.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_local_binding(
+        mut self,
+        ssh: String,
+        remote_binary: String,
+        inventory_capabilities: Vec<String>,
+        slots: u8,
+        facts_age_millis: Option<u64>,
+        final_probe_started_at_millis: u64,
+    ) -> Self {
+        self.ssh = ssh;
+        self.remote_binary = remote_binary;
+        self.inventory_capabilities = Some(inventory_capabilities);
+        self.slots = Some(slots);
+        self.facts_age_millis = facts_age_millis;
+        self.final_probe_started_at_millis = Some(final_probe_started_at_millis);
+        self
+    }
+
+    pub(crate) fn binding_complete(&self) -> bool {
+        !self.ssh.is_empty()
+            && !self.remote_binary.is_empty()
+            && self.inventory_capabilities.is_some()
+            && self.slots.is_some()
+            && self.final_probe_started_at_millis.is_some()
+    }
+
+    pub(crate) fn matches_worker(&self, worker: &crate::config::WorkerEntry) -> bool {
+        self.ssh == worker.ssh
+            && self.remote_binary == worker.remote_binary
+            && self.inventory_capabilities.as_deref() == Some(worker.capabilities.as_slice())
+            && self.slots == Some(worker.slots)
+    }
+
+    pub(crate) fn facts_age_millis(&self) -> Option<u64> {
+        self.facts_age_millis
+    }
+
+    pub(crate) fn final_probe_started_at_millis(&self) -> Option<u64> {
+        self.final_probe_started_at_millis
     }
 
     pub fn validate(&self) -> Result<(), WorkerError> {
@@ -1736,7 +1793,9 @@ impl AdmissionObservation {
 impl Serialize for AdmissionObservation {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("AdmissionObservation", 7)?;
+        let bound = self.binding_complete();
+        let fields = if bound { 13 } else { 7 };
+        let mut record = serializer.serialize_struct("AdmissionObservation", fields)?;
         record.serialize_field("worker_name", &self.worker_name)?;
         record.serialize_field("ready", &self.ready)?;
         record.serialize_field(
@@ -1750,6 +1809,17 @@ impl Serialize for AdmissionObservation {
         record.serialize_field("available_memory_bytes", &self.available_memory_bytes)?;
         record.serialize_field("free_disk_bytes", &self.free_disk_bytes)?;
         record.serialize_field("observed_at_millis", &self.observed_at_millis)?;
+        if bound {
+            record.serialize_field("ssh", &self.ssh)?;
+            record.serialize_field("remote_binary", &self.remote_binary)?;
+            record.serialize_field("inventory_capabilities", &self.inventory_capabilities)?;
+            record.serialize_field("slots", &self.slots)?;
+            record.serialize_field("facts_age_millis", &self.facts_age_millis)?;
+            record.serialize_field(
+                "final_probe_started_at_millis",
+                &self.final_probe_started_at_millis,
+            )?;
+        }
         record.end()
     }
 }
@@ -1766,6 +1836,18 @@ impl<'de> Deserialize<'de> for AdmissionObservation {
             available_memory_bytes: Option<u64>,
             free_disk_bytes: u64,
             observed_at_millis: u64,
+            #[serde(default)]
+            ssh: String,
+            #[serde(default)]
+            remote_binary: String,
+            #[serde(default)]
+            inventory_capabilities: Option<Vec<String>>,
+            #[serde(default)]
+            slots: Option<u8>,
+            #[serde(default)]
+            facts_age_millis: Option<u64>,
+            #[serde(default)]
+            final_probe_started_at_millis: Option<u64>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let slot = match wire.slot.as_str() {
@@ -1773,7 +1855,7 @@ impl<'de> Deserialize<'de> for AdmissionObservation {
             "busy" => CandidateSlot::Busy,
             _ => return Err(de::Error::custom("admission observation slot is invalid")),
         };
-        Self::new(
+        let mut observation = Self::new(
             wire.worker_name,
             wire.ready,
             slot,
@@ -1782,7 +1864,14 @@ impl<'de> Deserialize<'de> for AdmissionObservation {
             wire.free_disk_bytes,
             wire.observed_at_millis,
         )
-        .map_err(de::Error::custom)
+        .map_err(de::Error::custom)?;
+        observation.ssh = wire.ssh;
+        observation.remote_binary = wire.remote_binary;
+        observation.inventory_capabilities = wire.inventory_capabilities;
+        observation.slots = wire.slots;
+        observation.facts_age_millis = wire.facts_age_millis;
+        observation.final_probe_started_at_millis = wire.final_probe_started_at_millis;
+        Ok(observation)
     }
 }
 

@@ -60,6 +60,7 @@ use turn::TaskTurnRequest;
 use turn_runner::{DetachedRunnerExecutor, InlineRunnerExecutor, TurnRunner};
 
 mod account_launch;
+pub(crate) mod admission;
 pub mod agent;
 pub mod agent_facts;
 pub mod agent_settings;
