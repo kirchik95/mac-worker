@@ -31,6 +31,7 @@ pub const MAX_COLLECTION_ERRORS: usize = 64;
 pub const WORKER_COLLECTION_DEADLINE: Duration = Duration::from_secs(15);
 pub const GLOBAL_COLLECTION_DEADLINE: Duration = Duration::from_secs(20);
 pub const SNAPSHOT_PENDING: &str = "DASHBOARD_SNAPSHOT_PENDING";
+pub const COLLECTOR_START_FAILED: &str = "DASHBOARD_COLLECTOR_START_FAILED";
 
 const INVALID_DEADLINES: &str = "INVALID_DASHBOARD_DEADLINES";
 const DEADLINE_OVERFLOW: &str = "DASHBOARD_DEADLINE_OVERFLOW";
@@ -389,7 +390,9 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         }
     }
 
-    pub fn start_background_collection(self: &Arc<Self>) -> CollectorHandle {
+    pub fn start_background_collection(
+        self: &Arc<Self>,
+    ) -> Result<CollectorHandle, DashboardError> {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let wait = Arc::clone(&stop);
         let service = Arc::clone(self);
@@ -397,11 +400,16 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         let thread = thread::Builder::new()
             .name("dashboard-collector".into())
             .spawn(move || service.run_collector(wait, interval))
-            .ok();
-        CollectorHandle {
+            .map_err(|_| {
+                DashboardError::new(
+                    COLLECTOR_START_FAILED,
+                    "dashboard observation collector failed to start",
+                )
+            })?;
+        Ok(CollectorHandle {
             stop,
-            thread: Mutex::new(thread),
-        }
+            thread: Mutex::new(Some(thread)),
+        })
     }
 
     fn run_collector(&self, stop: Arc<(Mutex<bool>, Condvar)>, interval: Duration) {

@@ -91,7 +91,10 @@ impl DashboardHttpServer {
             )
         })?;
         let (shutdown, shutdown_receiver) = watch::channel(false);
-        let collector = state.service.start_background_collection();
+        let collector = state
+            .service
+            .start_background_collection()
+            .map_err(|error| ApiError::new(error.code, error.message))?;
         let app_state = AppState {
             dashboard: state,
             expected_host: local_addr.to_string(),

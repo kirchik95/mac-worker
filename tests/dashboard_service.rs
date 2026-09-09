@@ -705,7 +705,7 @@ fn background_collection_proceeds_without_http_and_reads_do_not_probe() {
         )
         .with_collection_interval(Duration::from_secs(60)),
     );
-    let collector = service.start_background_collection();
+    let collector = service.start_background_collection().unwrap();
     let first = wait_for_read(&service, Duration::from_secs(2));
     assert_eq!(first.collection.freshness, Freshness::Current);
     assert_eq!(first.generated_at_millis, 100);
@@ -732,7 +732,7 @@ fn slow_collection_does_not_stall_a_ready_read() {
     let first = service.snapshot(Default::default()).unwrap();
     let gate = Arc::new(Gate::default());
     source.set_collect_gate(Some(Arc::clone(&gate)));
-    let collector = service.start_background_collection();
+    let collector = service.start_background_collection().unwrap();
     gate.wait_until_entered();
     let started = Instant::now();
     let ready = service.read_snapshot().unwrap();
@@ -759,16 +759,80 @@ fn collector_stop_and_restart_does_not_overlap_collectors() {
         )
         .with_collection_interval(Duration::from_secs(60)),
     );
-    let first = service.start_background_collection();
-    wait_for_read(&service, Duration::from_secs(2));
+    let first = service.start_background_collection().unwrap();
+    wait_for_worker_calls(&source, 1, Duration::from_secs(2));
     let after_first = source.worker_call_count();
+    let first_revision = service.read_snapshot().unwrap().revision;
     first.join();
     thread::sleep(Duration::from_millis(50));
     assert_eq!(source.worker_call_count(), after_first);
-    let second = service.start_background_collection();
-    wait_for_read(&service, Duration::from_secs(2));
+    let second = service.start_background_collection().unwrap();
+    wait_for_worker_calls(&source, after_first + 1, Duration::from_secs(2));
+    let restarted = service.read_snapshot().unwrap();
+    assert!(
+        restarted.revision > first_revision,
+        "restarted collector reused revision {} after {first_revision}",
+        restarted.revision
+    );
+    assert!(
+        source.worker_call_count() > after_first,
+        "restarted collector never collected"
+    );
     second.join();
-    assert!(source.worker_call_count() >= after_first);
+    assert_read_only(&source);
+}
+
+#[test]
+fn collector_stop_without_join_does_not_leave_a_recurring_orphan() {
+    let source = FakeSource::new();
+    let gate = Arc::new(Gate::default());
+    source.set_collect_gate(Some(Arc::clone(&gate)));
+    let service = Arc::new(
+        DashboardService::new(
+            source.clone(),
+            ManualClock::new(100),
+            ManualMonotonic::new(0),
+        )
+        .with_collection_interval(Duration::from_millis(20)),
+    );
+    let first = service.start_background_collection().unwrap();
+    gate.wait_until_entered();
+    assert_eq!(source.worker_call_count(), 1);
+    first.stop();
+    thread::sleep(Duration::from_millis(40));
+    assert_eq!(source.worker_call_count(), 1);
+    gate.release();
+    thread::sleep(Duration::from_millis(120));
+    assert_eq!(
+        source.worker_call_count(),
+        1,
+        "stopped collector kept collecting after the in-flight snapshot finished"
+    );
+
+    let second = service.start_background_collection().unwrap();
+    wait_for_worker_calls(&source, 2, Duration::from_secs(2));
+    assert!(source.worker_call_count() >= 2);
+    second.join();
+    assert_read_only(&source);
+}
+
+#[test]
+fn collector_drop_stops_future_collection() {
+    let source = FakeSource::new();
+    let service = Arc::new(
+        DashboardService::new(
+            source.clone(),
+            ManualClock::new(100),
+            ManualMonotonic::new(0),
+        )
+        .with_collection_interval(Duration::from_millis(20)),
+    );
+    let collector = service.start_background_collection().unwrap();
+    wait_for_worker_calls(&source, 1, Duration::from_secs(2));
+    let after_start = source.worker_call_count();
+    drop(collector);
+    thread::sleep(Duration::from_millis(120));
+    assert_eq!(source.worker_call_count(), after_start);
     assert_read_only(&source);
 }
 
@@ -827,6 +891,22 @@ where
             }
             Err(error) => panic!("read_snapshot failed: {} {}", error.code, error.message),
         }
+    }
+}
+
+fn wait_for_worker_calls(source: &FakeSource, target: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if source.worker_call_count() >= target {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "collector calls stayed at {} (wanted {target})",
+                source.worker_call_count()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 

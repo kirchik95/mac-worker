@@ -365,6 +365,30 @@ async fn two_http_clients_share_one_in_flight_snapshot_refresh() {
     server.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_http_server_stops_background_collection() {
+    let gate = Arc::new(CollectionGate::default());
+    gate.release();
+    let source = CoalescingSource::new(Arc::clone(&gate));
+    let state = Arc::new(DashboardHttpState {
+        service: Arc::new(
+            DashboardService::new(source.clone(), FixedClock, FixedMonotonic)
+                .with_collection_interval(Duration::from_secs(60)),
+        ),
+        log_source: Arc::new(RecordingLogs::new(job(job_id(1)))),
+        task_source: Arc::new(FixtureTaskSource::default()),
+        settings_source: None,
+    });
+    let server = DashboardHttpServer::bind(None, state).await.unwrap();
+    let host = listener_host(&server);
+    let _ = wait_for_ok_snapshot(&host);
+    let after_start = source.collect_calls();
+    assert!(after_start >= 1);
+    drop(server);
+    thread::sleep(Duration::from_millis(120));
+    assert_eq!(source.collect_calls(), after_start);
+}
+
 async fn started_server() -> (DashboardHttpServer, Arc<RecordingLogs>) {
     started_server_with_task_source(Arc::new(FixtureTaskSource::default())).await
 }
