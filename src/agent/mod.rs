@@ -411,6 +411,15 @@ pub trait AgentAdapter: Send + Sync {
         None
     }
     fn parse_event(&self, line: &str) -> Option<AgentEvent>;
+    /// Structured event keys this adapter treats as intentional noise.
+    ///
+    /// The turn log renderer hides these instead of folding them into an
+    /// `event: <type>` summary. A key is `type` or `type/subtype` after the
+    /// renderer sanitises each identifier. The default is none: every
+    /// unrecognised structured line is summarised.
+    fn quiet_event_keys(&self) -> &'static [&'static str] {
+        &[]
+    }
     fn session_ref(&self, events: &[AgentEvent]) -> Option<String> {
         events.iter().find_map(|event| match event {
             AgentEvent::SessionStarted { session_ref } => Some(session_ref.clone()),

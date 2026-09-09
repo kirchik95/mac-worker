@@ -104,6 +104,13 @@ impl AgentAdapter for CodexAdapter {
         }
     }
 
+    fn quiet_event_keys(&self) -> &'static [&'static str] {
+        // `item.updated` is the streaming patch Codex emits while an item
+        // is still growing (token-by-token assistant text). The completed
+        // item is already rendered; the patches would only repeat it.
+        &["item.updated"]
+    }
+
     fn extract_result(
         &self,
         stream: &str,

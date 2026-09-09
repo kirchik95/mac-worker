@@ -1,6 +1,7 @@
 session ses_f8a1b792bffeJSvEZ94X826hDO
 I'll create note.txt with a shell command now.
 printf 'hello' > note.txt (Some(0))
+event: step_finish
 session ses_f8a1b792bffeJSvEZ94X826hDO
 {"status":"done","summary":"note created","questions":[],"files_changed":["note.txt"]}
 stop

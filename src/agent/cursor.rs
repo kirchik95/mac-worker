@@ -86,6 +86,13 @@ impl AgentAdapter for CursorAdapter {
         }
     }
 
+    fn quiet_event_keys(&self) -> &'static [&'static str] {
+        // Per-token thinking deltas flood the log and carry private
+        // reasoning. The completed thinking event is enough to show that
+        // the model thought; the token stream itself is noise.
+        &["thinking/delta"]
+    }
+
     fn extract_result(
         &self,
         stream: &str,

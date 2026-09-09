@@ -45,6 +45,8 @@ worker task reconcile              # re-own dead runners, re-queue orphaned turn
 worker gc [--apply]                # preview, then reclaim old tasks, branches, mirrors on the workers
 ```
 
+`worker task logs` prints one line per recognised agent event, folds consecutive unrecognised structured events into `event: <type>` summaries, and keeps stderr and launch failures verbatim.
+
 Outcomes are recorded on the task, independent of the process exit code:
 
 - `done`: the agent finished and the branch is published. Tasks close themselves by default (`--close-on done`).

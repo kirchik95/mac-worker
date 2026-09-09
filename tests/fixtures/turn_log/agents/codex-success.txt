@@ -1,4 +1,5 @@
 session 0d3c…
+event: turn.started
 cargo test --locked --test agent_adapters (Some(0))
 src/agent/mod.rs
 {"status":"done","summary":"ok","questions":[],"files_changed":["src/agent/mod.rs"]}

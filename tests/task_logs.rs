@@ -349,9 +349,15 @@ warning: invalid byte "#
     bytes.extend_from_slice(b"\xff\n");
     fixture.append(turn.turn_id(), &bytes);
     assert_eq!(fixture.logs(None, true).unwrap(), bytes);
+    let rendered = fixture.logs(None, false).unwrap();
     assert_eq!(
-        fixture.logs(None, false).unwrap(),
-        "working\nwarning: invalid byte \u{fffd}\n".as_bytes()
+        rendered,
+        "working\nevent: turn_accepted\nwarning: invalid byte \u{fffd}\n".as_bytes()
+    );
+    assert!(
+        !String::from_utf8_lossy(&rendered).contains("do not render"),
+        "unrecognised structured events must not leak payload: {}",
+        String::from_utf8_lossy(&rendered)
     );
 }
 
