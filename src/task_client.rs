@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -1137,13 +1138,10 @@ impl<'a> TaskClient<'a> {
     pub fn close(&self, task_id: TaskId, discard: bool) -> Result<TaskReport, WorkerError> {
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
-        if record.status().state() == TaskState::Active {
-            return Err(task_error("TASK_BUSY", "task has an active turn"));
+        if let Some(reason) = self.operator_busy_reason(task_id, &record)? {
+            return Err(task_error("TASK_BUSY", reason));
         }
         if let Some(entry) = self.client_state.queue_entry_for_task_turn(task_id)? {
-            if matches!(entry.state(), QueueState::Dispatching { .. }) {
-                return Err(task_error("TASK_BUSY", "task turn is being dispatched"));
-            }
             let mut log =
                 crate::runner_log::RunnerLog::open(&self.paths.state, task_id, entry.job_id())?;
             if log.current_entry(self.client_state)?.as_ref() != Some(&entry) {
@@ -1710,6 +1708,13 @@ impl<'a> TaskClient<'a> {
         self.report_for(task_id)
     }
 
+    /// Blocks until every selected task is wait-terminal and quiescent.
+    ///
+    /// A turn can already be Open while the detached runner is still
+    /// finishing: its queue row may still be Dispatching and a runner identity
+    /// may still be recorded. `close`, `say`, and `fetch` refuse that window
+    /// with TASK_BUSY, so wait must not return until those commands would
+    /// succeed.
     pub fn wait(
         &self,
         selector: WaitSelector,
@@ -1726,10 +1731,7 @@ impl<'a> TaskClient<'a> {
                 .iter()
                 .map(|task_id| self.client_state.load_task(*task_id))
                 .collect::<Result<Vec<_>, _>>()?;
-            if records
-                .iter()
-                .all(|record| is_wait_terminal(record.status().state()))
-            {
+            if self.tasks_are_quiescent(&records)? {
                 let exit_code = if records.iter().any(|record| {
                     matches!(
                         record.status().last_outcome(),
@@ -1753,10 +1755,10 @@ impl<'a> TaskClient<'a> {
             }
             if timeout.is_some_and(|limit| started.elapsed().is_ok_and(|elapsed| elapsed >= limit))
             {
-                return Err(WorkerError::Task {
-                    code: "WAIT_TIMEOUT",
-                    message: "task wait timed out without cancelling the task".into(),
-                });
+                return Err(task_error(
+                    "WAIT_TIMEOUT",
+                    "task wait timed out without cancelling the task",
+                ));
             }
             std::thread::sleep(WAIT_POLL.min(WAIT_MAX_POLL));
         }
@@ -2514,6 +2516,41 @@ impl<'a> TaskClient<'a> {
         }
         std::env::current_dir().map_err(WorkerError::Io)
     }
+
+    /// `close`, `say`, and `fetch` refuse while a detached runner is still
+    /// finishing. `wait` uses the same check so it does not return in that
+    /// window.
+    fn operator_busy_reason(
+        &self,
+        task_id: TaskId,
+        record: &LocalTaskRecord,
+    ) -> Result<Option<&'static str>, WorkerError> {
+        if record.status().state() == TaskState::Active {
+            return Ok(Some("task has an active turn"));
+        }
+        if let Some(entry) = self.client_state.queue_entry_for_task_turn(task_id)?
+            && matches!(entry.state(), QueueState::Dispatching { .. })
+        {
+            return Ok(Some("task turn is being dispatched"));
+        }
+        if record.runner().is_some() {
+            return Ok(Some("task runner is still finishing"));
+        }
+        Ok(None)
+    }
+
+    fn tasks_are_quiescent(&self, records: &[LocalTaskRecord]) -> Result<bool, WorkerError> {
+        for record in records {
+            if !is_wait_terminal(record.status().state())
+                || self
+                    .operator_busy_reason(record.meta().task_id(), record)?
+                    .is_some()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 fn event_task_created(report: &TaskReport) -> serde_json::Value {
@@ -3000,18 +3037,12 @@ fn capability_missing(worker: &str, missing: &[String]) -> WorkerError {
     }
 }
 
-fn task_error(code: &'static str, message: impl Into<String>) -> WorkerError {
-    WorkerError::Task {
-        code,
-        message: message.into(),
-    }
+fn task_error(code: &'static str, message: impl Into<Cow<'static, str>>) -> WorkerError {
+    WorkerError::task(code, message)
 }
 
 fn task_view_error(error: TaskViewError) -> WorkerError {
-    WorkerError::Task {
-        code: error.code(),
-        message: error.message().to_owned(),
-    }
+    WorkerError::task(error.code(), error.message().to_owned())
 }
 
 fn current_time_millis() -> Result<u64, WorkerError> {

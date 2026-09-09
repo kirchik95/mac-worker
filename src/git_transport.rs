@@ -607,10 +607,10 @@ fn lease_mismatch() -> WorkerError {
 }
 
 fn task_not_found() -> WorkerError {
-    WorkerError::Task {
-        code: "TASK_NOT_FOUND",
-        message: "task metadata or published branch is absent".into(),
-    }
+    WorkerError::task(
+        "TASK_NOT_FOUND",
+        "task metadata or published branch is absent",
+    )
 }
 
 fn git_error(code: &'static str, message: impl Into<String>) -> WorkerError {

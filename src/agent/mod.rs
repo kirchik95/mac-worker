@@ -524,25 +524,23 @@ pub fn prebind_login_request(
 }
 
 pub fn parse_prebind_session_ref(stdout: &[u8]) -> Result<String, WorkerError> {
-    let text = std::str::from_utf8(stdout).map_err(|_| WorkerError::Task {
-        code: "TASK_SESSION_INVALID",
-        message: "prebind output is not UTF-8".into(),
-    })?;
+    let text = std::str::from_utf8(stdout)
+        .map_err(|_| WorkerError::task("TASK_SESSION_INVALID", "prebind output is not UTF-8"))?;
     let trimmed = text.trim();
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         if let Some(session_ref) = json_session_id(&value) {
             return validate_prebind_id(session_ref);
         }
-        return Err(WorkerError::Task {
-            code: "TASK_SESSION_INVALID",
-            message: "prebind JSON did not contain a session identifier".into(),
-        });
+        return Err(WorkerError::task(
+            "TASK_SESSION_INVALID",
+            "prebind JSON did not contain a session identifier",
+        ));
     }
     if trimmed.starts_with(['{', '[']) {
-        return Err(WorkerError::Task {
-            code: "TASK_SESSION_INVALID",
-            message: "prebind output looks like malformed JSON".into(),
-        });
+        return Err(WorkerError::task(
+            "TASK_SESSION_INVALID",
+            "prebind output looks like malformed JSON",
+        ));
     }
     let mut lines = trimmed
         .lines()
@@ -550,10 +548,10 @@ pub fn parse_prebind_session_ref(stdout: &[u8]) -> Result<String, WorkerError> {
         .filter(|line| !line.is_empty());
     let line = lines.next().unwrap_or("");
     if lines.next().is_some() {
-        return Err(WorkerError::Task {
-            code: "TASK_SESSION_INVALID",
-            message: "prebind output contains multiple non-empty lines".into(),
-        });
+        return Err(WorkerError::task(
+            "TASK_SESSION_INVALID",
+            "prebind output contains multiple non-empty lines",
+        ));
     }
     validate_prebind_id(line)
 }
@@ -575,10 +573,10 @@ fn validate_prebind_id(session_ref: &str) -> Result<String, WorkerError> {
             .chars()
             .any(|character| character.is_control() || character.is_whitespace())
     {
-        return Err(WorkerError::Task {
-            code: "TASK_SESSION_INVALID",
-            message: "session reference is empty, too long, or contains whitespace/control".into(),
-        });
+        return Err(WorkerError::task(
+            "TASK_SESSION_INVALID",
+            "session reference is empty, too long, or contains whitespace/control",
+        ));
     }
     Ok(session_ref.to_string())
 }

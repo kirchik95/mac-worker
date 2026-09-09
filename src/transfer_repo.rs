@@ -1686,11 +1686,8 @@ fn git_error(code: &'static str, message: &str) -> WorkerError {
     }
 }
 
-fn task_config(message: impl Into<String>) -> WorkerError {
-    WorkerError::Task {
-        code: "TASK_CONFIG_INVALID",
-        message: message.into(),
-    }
+fn task_config(message: impl Into<std::borrow::Cow<'static, str>>) -> WorkerError {
+    WorkerError::task("TASK_CONFIG_INVALID", message)
 }
 
 #[cfg(test)]

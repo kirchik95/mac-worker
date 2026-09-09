@@ -1095,10 +1095,7 @@ fn make_task_limits(
         max_turns.or(defaults.turn.max_turns),
         max_budget.or(defaults.turn.max_budget_usd_cents),
     )
-    .map_err(|error| WorkerError::Task {
-        code: "TASK_CONFIG_INVALID",
-        message: error.to_string(),
-    })?;
+    .map_err(|error| WorkerError::task("TASK_CONFIG_INVALID", error.to_string()))?;
     crate::task::TaskLimits::new(turn, max_followups.unwrap_or(defaults.max_followups))
 }
 
@@ -3185,6 +3182,17 @@ mod tests {
         assert!(!text.contains(planted_path));
         assert!(!text.contains(planted_secret));
         assert!(!text.as_bytes().contains(&0));
+    }
+
+    #[test]
+    fn public_diagnostics_print_static_task_busy_reasons() {
+        let error = WorkerError::task("TASK_BUSY", "task turn is being dispatched");
+        let mut stderr = Vec::new();
+        super::write_public_diagnostic(&mut stderr, &error);
+        assert_eq!(
+            std::str::from_utf8(&stderr).unwrap(),
+            "TASK_BUSY: task turn is being dispatched\n"
+        );
     }
 
     #[test]
