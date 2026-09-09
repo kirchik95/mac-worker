@@ -38,6 +38,14 @@ const HERDR_VERSION_MAX_BYTES: usize = 64;
 /// does not always put on PATH; the lookup appends it so the operator's own
 /// PATH still wins.
 const HERDR_PATH_EXTENSION: &str = r#"export PATH="$PATH:$HOME/.local/bin"; "#;
+/// Marker line between `command -v` stdout and `--version` stdout. A version
+/// token must start with a digit, so this can never be parsed as a version.
+const LOCATE_VERSION_SEPARATOR: &str = "MAC_WORKER_FACTS_VERSION";
+/// Profile env names that can change which binary a login shell's
+/// `command -v` finds. Other entries (tokens, keychain keys) cannot, so
+/// locate+version from the default profile is reused. The names live on
+/// [`EnvProfile::entries`].
+const BINARY_RESOLUTION_ENV: &[&str] = &["PATH", "ZDOTDIR", "HOME", "SHELL"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentAuth {
@@ -745,16 +753,16 @@ where
         let adapter = adapter_for(kind);
         let binary = adapter.binary();
         let auth_probe = adapter.auth_probe();
-        let base_available = timing.probe(Some(name), Some("-"), "locate", PROBE_DEADLINE, || {
-            adapter_available(runner, account_home, binary, &[])
-        });
-        let version = if base_available {
-            timing.probe(Some(name), Some("-"), "version", PROBE_DEADLINE, || {
-                run_version_in_shell(runner, account_home, binary, &[])
-            })
-        } else {
-            None
-        };
+        let LocateVersion {
+            available: base_available,
+            version,
+        } = timing.probe(
+            Some(name),
+            Some("-"),
+            "locate+version",
+            PROBE_DEADLINE,
+            || run_locate_and_version(runner, account_home, binary, &[]),
+        );
         let auth = if base_available {
             timing.probe_with_result(
                 Some(name),
@@ -775,64 +783,29 @@ where
         {
             let profile_name = profile.profile_name();
             let entries = profile.profile_entries();
-            let available = timing.probe(
-                Some(name),
-                Some(profile_name),
-                "locate",
-                PROBE_DEADLINE,
-                || adapter_available(runner, account_home, binary, &entries),
+            let available = resolve_profile_binary(
+                runner,
+                account_home,
+                binary,
+                name,
+                profile_name,
+                &entries,
+                base_available,
+                timing,
             );
             any_profile_binary |= available;
-            let auth = if !available {
-                AgentAuth::Unknown
-            } else {
-                match profile.keychain_config() {
-                    Some(config) => {
-                        let unlocked = timing.probe(
-                            Some(name),
-                            Some(profile_name),
-                            "keychain-unlock",
-                            crate::keychain::UNLOCK_TIMEOUT,
-                            || unlock_for_probe(runner, &config),
-                        );
-                        if unlocked {
-                            let _ = timing.probe(
-                                Some(name),
-                                Some(profile_name),
-                                "version",
-                                PROBE_DEADLINE,
-                                || run_version_in_shell(runner, account_home, binary, &entries),
-                            );
-                            timing.probe_with_result(
-                                Some(name),
-                                Some(profile_name),
-                                "auth",
-                                PROBE_DEADLINE,
-                                |auth: &AgentAuth| Some(auth.as_str()),
-                                || {
-                                    run_auth_in_shell(
-                                        runner,
-                                        account_home,
-                                        binary,
-                                        &auth_probe,
-                                        &entries,
-                                    )
-                                },
-                            )
-                        } else {
-                            AgentAuth::UnknownWithReason(crate::keychain::UNLOCK_FAILED_REASON)
-                        }
-                    }
-                    None => timing.probe_with_result(
-                        Some(name),
-                        Some(profile_name),
-                        "auth",
-                        PROBE_DEADLINE,
-                        |auth: &AgentAuth| Some(auth.as_str()),
-                        || run_auth_in_shell(runner, account_home, binary, &auth_probe, &entries),
-                    ),
-                }
-            };
+            let auth = probe_profile_auth(
+                runner,
+                account_home,
+                binary,
+                &auth_probe,
+                name,
+                profile_name,
+                &entries,
+                profile.keychain_config(),
+                available,
+                timing,
+            );
             auth_by_profile.push((profile_name.to_owned(), auth));
         }
         if !base_available && !any_profile_binary {
@@ -867,9 +840,13 @@ fn collect_herdr_facts(
     account_home: &Path,
     timing: &mut FactsTiming,
 ) -> HerdrFacts {
-    let available = timing.probe(Some("herdr"), Some("-"), "locate", PROBE_DEADLINE, || {
-        herdr_binary_available(runner, account_home)
-    });
+    let LocateVersion { available, version } = timing.probe(
+        Some("herdr"),
+        Some("-"),
+        "locate+version",
+        PROBE_DEADLINE,
+        || herdr_locate_and_version(runner, account_home),
+    );
     if !available {
         return HerdrFacts {
             state: HerdrFactState::NotInstalled,
@@ -877,9 +854,6 @@ fn collect_herdr_facts(
             interactive_agents: None,
         };
     }
-    let version = timing.probe(Some("herdr"), Some("-"), "version", PROBE_DEADLINE, || {
-        herdr_version(runner, account_home)
-    });
     let socket = HerdrSocket::default_for_home(account_home);
     if !socket.path().exists() {
         return HerdrFacts {
@@ -940,31 +914,100 @@ fn count_interactive_agents(listed: &[ListedAgent]) -> Option<u32> {
     u32::try_from(count).ok()
 }
 
-fn herdr_binary_available(runner: &dyn ProcessRunner, account_home: &Path) -> ProbeRun<bool> {
-    let shell = format!("{HERDR_PATH_EXTENSION}command -v {HERDR_BINARY}");
-    let request = account_login_shell_request(account_home, &[], &shell, probe_policy());
-    run_availability(runner, &request)
+#[allow(clippy::too_many_arguments)]
+fn resolve_profile_binary(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    binary: &str,
+    agent: &str,
+    profile_name: &str,
+    entries: &[(OsString, OsString)],
+    base_available: bool,
+    timing: &mut FactsTiming,
+) -> bool {
+    if !profile_can_change_binary_resolution(entries) {
+        return base_available;
+    }
+    timing
+        .probe(
+            Some(agent),
+            Some(profile_name),
+            "locate+version",
+            PROBE_DEADLINE,
+            || run_locate_and_version(runner, account_home, binary, entries),
+        )
+        .available
 }
 
-fn herdr_version(runner: &dyn ProcessRunner, account_home: &Path) -> ProbeRun<Option<String>> {
-    let Ok(exec) = render_prebind_shell(&[HERDR_BINARY.to_owned(), "--version".to_owned()]) else {
-        return ProbeRun::ok(None);
-    };
-    let shell = format!("{HERDR_PATH_EXTENSION}{exec}");
-    let request = account_login_shell_request(account_home, &[], &shell, probe_policy());
-    match runner.run(&request) {
-        Ok(result) if result.status.success() => {
-            let version = parse_version(&result.stdout)
-                .map(|version| truncate_text_to(&version, HERDR_VERSION_MAX_BYTES))
-                .filter(|version| !version.is_empty());
-            ProbeRun::ok(version)
-        }
-        Ok(_) => ProbeRun::ok(None),
-        Err(error) => ProbeRun {
-            value: None,
-            hit_deadline: is_deadline_error(&error),
-        },
+#[allow(clippy::too_many_arguments)]
+fn probe_profile_auth(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    binary: &str,
+    auth_probe: &AuthProbe,
+    agent: &str,
+    profile_name: &str,
+    entries: &[(OsString, OsString)],
+    keychain: Option<crate::keychain::KeychainUnlockConfig>,
+    available: bool,
+    timing: &mut FactsTiming,
+) -> AgentAuth {
+    if !available {
+        return AgentAuth::Unknown;
     }
+    match keychain {
+        Some(config) => {
+            let unlocked = timing.probe(
+                Some(agent),
+                Some(profile_name),
+                "keychain-unlock",
+                crate::keychain::UNLOCK_TIMEOUT,
+                || unlock_for_probe(runner, &config),
+            );
+            if unlocked {
+                timing.probe_with_result(
+                    Some(agent),
+                    Some(profile_name),
+                    "auth",
+                    PROBE_DEADLINE,
+                    |auth: &AgentAuth| Some(auth.as_str()),
+                    || run_auth_in_shell(runner, account_home, binary, auth_probe, entries),
+                )
+            } else {
+                AgentAuth::UnknownWithReason(crate::keychain::UNLOCK_FAILED_REASON)
+            }
+        }
+        None => timing.probe_with_result(
+            Some(agent),
+            Some(profile_name),
+            "auth",
+            PROBE_DEADLINE,
+            |auth: &AgentAuth| Some(auth.as_str()),
+            || run_auth_in_shell(runner, account_home, binary, auth_probe, entries),
+        ),
+    }
+}
+
+/// Whether a profile's entries can change which binary `command -v` finds.
+/// Only [`BINARY_RESOLUTION_ENV`] (`PATH`, `ZDOTDIR`, `HOME`, `SHELL`) do.
+fn profile_can_change_binary_resolution(entries: &[(OsString, OsString)]) -> bool {
+    entries
+        .iter()
+        .any(|(name, _)| BINARY_RESOLUTION_ENV.iter().any(|env| name == env))
+}
+
+fn herdr_locate_and_version(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+) -> ProbeRun<LocateVersion> {
+    run_locate_and_version_script(
+        runner,
+        account_home,
+        HERDR_BINARY,
+        &[],
+        HERDR_PATH_EXTENSION,
+        HERDR_VERSION_MAX_BYTES,
+    )
 }
 
 fn current_time_millis() -> u64 {
@@ -983,47 +1026,94 @@ fn agent_name(kind: AgentKind) -> &'static str {
     }
 }
 
-fn adapter_available(
+fn run_locate_and_version(
     runner: &dyn ProcessRunner,
     account_home: &Path,
     binary: &str,
     profile_entries: &[(OsString, OsString)],
-) -> ProbeRun<bool> {
-    let shell = format!("command -v {binary}");
-    let request =
-        account_login_shell_request(account_home, profile_entries, &shell, probe_policy());
-    run_availability(runner, &request)
+) -> ProbeRun<LocateVersion> {
+    run_locate_and_version_script(
+        runner,
+        account_home,
+        binary,
+        profile_entries,
+        "",
+        MAX_TEXT_BYTES,
+    )
 }
 
-fn run_availability(runner: &dyn ProcessRunner, request: &ProcessRequest) -> ProbeRun<bool> {
-    match runner.run(request) {
-        Ok(result) => ProbeRun::ok(result.status.success()),
-        Err(error) => ProbeRun {
-            value: false,
-            hit_deadline: is_deadline_error(&error),
-        },
-    }
-}
-
-fn run_version_in_shell(
+fn run_locate_and_version_script(
     runner: &dyn ProcessRunner,
     account_home: &Path,
     binary: &str,
     profile_entries: &[(OsString, OsString)],
-) -> ProbeRun<Option<String>> {
-    let Ok(shell) = render_prebind_shell(&[binary.to_owned(), "--version".to_owned()]) else {
-        return ProbeRun::ok(None);
+    path_extension: &str,
+    version_max_bytes: usize,
+) -> ProbeRun<LocateVersion> {
+    let Ok(version_exec) = render_prebind_shell(&[binary.to_owned(), "--version".to_owned()])
+    else {
+        return ProbeRun::ok(LocateVersion {
+            available: false,
+            version: None,
+        });
     };
+    let shell = format!(
+        "{path_extension}command -v {binary} && printf '%s\\n' '{LOCATE_VERSION_SEPARATOR}' && {version_exec}"
+    );
     let request =
         account_login_shell_request(account_home, profile_entries, &shell, probe_policy());
     match runner.run(&request) {
-        Ok(result) if result.status.success() => ProbeRun::ok(parse_version(&result.stdout)),
-        Ok(_) => ProbeRun::ok(None),
+        Ok(result) => ProbeRun::ok(parse_locate_and_version(
+            &result.stdout,
+            result.status.success(),
+            version_max_bytes,
+        )),
         Err(error) => ProbeRun {
-            value: None,
+            value: LocateVersion {
+                available: false,
+                version: None,
+            },
             hit_deadline: is_deadline_error(&error),
         },
     }
+}
+
+struct LocateVersion {
+    available: bool,
+    version: Option<String>,
+}
+
+fn parse_locate_and_version(
+    stdout: &[u8],
+    version_succeeded: bool,
+    version_max_bytes: usize,
+) -> LocateVersion {
+    let Some(version_out) = stdout_after_separator(stdout) else {
+        return LocateVersion {
+            available: false,
+            version: None,
+        };
+    };
+    let version = if version_succeeded {
+        parse_version(version_out)
+            .map(|version| truncate_text_to(&version, version_max_bytes))
+            .filter(|version| !version.is_empty())
+    } else {
+        None
+    };
+    LocateVersion {
+        available: true,
+        version,
+    }
+}
+
+fn stdout_after_separator(stdout: &[u8]) -> Option<&[u8]> {
+    let needle = LOCATE_VERSION_SEPARATOR.as_bytes();
+    let pos = stdout
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    let after = &stdout[pos + needle.len()..];
+    Some(after.strip_prefix(b"\n").unwrap_or(after))
 }
 
 fn run_auth_in_shell(

@@ -58,16 +58,22 @@ impl ProcessRunner for RecordingRunner {
             let shell = shell
                 .rsplit_once("; ")
                 .map_or(shell, |(_, command)| command);
-            if shell.starts_with("command -v ") {
-                let binary = shell.strip_prefix("command -v ").unwrap_or_default();
-                let stdout = if binary == "codex" {
-                    b"/opt/tools/codex\n".to_vec()
-                } else {
-                    Vec::new()
-                };
+            if let Some(binary) = command_v_binary(shell) {
                 let success = binary == "codex";
+                if !success {
+                    return Ok(ProcessResult {
+                        status: exit_status(1),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    });
+                }
+                let mut stdout = b"/opt/tools/codex\n".to_vec();
+                if shell.contains("MAC_WORKER_FACTS_VERSION") {
+                    stdout.extend_from_slice(b"MAC_WORKER_FACTS_VERSION\n");
+                    stdout.extend_from_slice(b"codex-cli 0.152.1\n");
+                }
                 return Ok(ProcessResult {
-                    status: exit_status(if success { 0 } else { 1 }),
+                    status: exit_status(0),
                     stdout,
                     stderr: Vec::new(),
                 });
@@ -142,6 +148,13 @@ impl RecordingRunner {
 
 fn exit_status(code: i32) -> ExitStatus {
     ExitStatus::from_raw(code << 8)
+}
+
+fn command_v_binary(shell: &str) -> Option<&str> {
+    let rest = shell.strip_prefix("command -v ")?;
+    rest.split(|character: char| character.is_whitespace() || character == '&')
+        .next()
+        .filter(|binary| !binary.is_empty())
 }
 
 fn worker() -> WorkerEntry {
@@ -600,18 +613,13 @@ fn refresh_facts_timing_prints_named_steps_on_stderr_after_writing_facts() {
     assert_eq!(
         names,
         vec![
-            "timing agent=codex profile=- step=locate",
-            "timing agent=codex profile=- step=version",
+            "timing agent=codex profile=- step=locate+version",
             "timing agent=codex profile=- step=auth result=unauthenticated",
-            "timing agent=codex profile=agents step=locate",
             "timing agent=codex profile=agents step=auth result=authenticated",
-            "timing agent=claude profile=- step=locate",
-            "timing agent=claude profile=agents step=locate",
-            "timing agent=cursor profile=- step=locate",
-            "timing agent=cursor profile=agents step=locate",
-            "timing agent=opencode profile=- step=locate",
-            "timing agent=opencode profile=agents step=locate",
-            "timing agent=herdr profile=- step=locate",
+            "timing agent=claude profile=- step=locate+version",
+            "timing agent=cursor profile=- step=locate+version",
+            "timing agent=opencode profile=- step=locate+version",
+            "timing agent=herdr profile=- step=locate+version",
             "timing step=total",
         ]
     );

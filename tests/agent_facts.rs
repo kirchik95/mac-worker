@@ -45,6 +45,7 @@ enum Scenario {
     KeychainUnlockFailure,
     KeychainOrdering,
     StallingCodexAuth,
+    StallingLocateVersion,
 }
 
 /// What the scripted account login shell knows about a `herdr` binary.
@@ -159,43 +160,8 @@ impl ProcessRunner for FakeProcessRunner {
                 Some((prefix, command)) => (Some(prefix), command),
                 None => (None, shell),
             };
-            if shell.starts_with("command -v ") {
-                if self.scenario == Scenario::NoBinariesResolve {
-                    return Ok(failure(b"command not found\n"));
-                }
-                let binary = shell.strip_prefix("command -v ").unwrap_or_default();
-                if binary == "herdr" {
-                    assert!(
-                        prefix.is_some_and(|prefix| prefix.contains("$HOME/.local/bin")),
-                        "the herdr lookup must search ~/.local/bin: {prefix:?}"
-                    );
-                    return Ok(match self.herdr {
-                        HerdrBinary::Missing => failure(b"herdr: command not found\n"),
-                        HerdrBinary::Installed | HerdrBinary::VersionFails => {
-                            success(b"/Users/worker/.local/bin/herdr\n")
-                        }
-                    });
-                }
-                if self.scenario == Scenario::KeychainOrdering && binary != "claude" {
-                    return Ok(failure(b"command not found\n"));
-                }
-                if binary == "opencode" && self.scenario == Scenario::MissingOpenCode {
-                    return Ok(failure(b"opencode: command not found\n"));
-                }
-                return Ok(success(format!("/opt/tools/{binary}\n").as_bytes()));
-            }
-            if shell == "exec 'herdr' '--version'" {
-                assert!(
-                    prefix.is_some_and(|prefix| prefix.contains("$HOME/.local/bin")),
-                    "the herdr version probe must search ~/.local/bin: {prefix:?}"
-                );
-                return Ok(match self.herdr {
-                    HerdrBinary::Installed => {
-                        success(format!("herdr {HERDR_VERSION}\n").as_bytes())
-                    }
-                    HerdrBinary::VersionFails => failure(b"herdr: unrecognized option\n"),
-                    HerdrBinary::Missing => panic!("herdr --version ran without a herdr binary"),
-                });
+            if let Some(binary) = command_v_binary(shell) {
+                return self.locate_or_merged(request, prefix, binary, shell);
             }
             if shell.starts_with("exec ") {
                 return self.exec_command(request, shell);
@@ -207,6 +173,63 @@ impl ProcessRunner for FakeProcessRunner {
 }
 
 impl FakeProcessRunner {
+    fn locate_or_merged(
+        &self,
+        request: &ProcessRequest,
+        prefix: Option<&str>,
+        binary: &str,
+        shell: &str,
+    ) -> Result<ProcessResult, WorkerError> {
+        if self.scenario == Scenario::StallingLocateVersion && binary == "codex" {
+            return Err(WorkerError::Process(ProcessError::DeadlineExceeded {
+                deadline: request.policy.deadline,
+            }));
+        }
+        let locate = self.locate_binary(prefix, binary);
+        if !is_merged_locate_version(shell) || !locate.status.success() {
+            return Ok(locate);
+        }
+        let version = if binary == "herdr" {
+            self.herdr_version()
+        } else {
+            self.exec_command(request, &format!("exec '{binary}' '--version'"))?
+        };
+        Ok(combine_locate_and_version(locate, version))
+    }
+
+    fn locate_binary(&self, prefix: Option<&str>, binary: &str) -> ProcessResult {
+        if self.scenario == Scenario::NoBinariesResolve {
+            return failure(b"command not found\n");
+        }
+        if binary == "herdr" {
+            assert!(
+                prefix.is_some_and(|prefix| prefix.contains("$HOME/.local/bin")),
+                "the herdr lookup must search ~/.local/bin: {prefix:?}"
+            );
+            return match self.herdr {
+                HerdrBinary::Missing => failure(b"herdr: command not found\n"),
+                HerdrBinary::Installed | HerdrBinary::VersionFails => {
+                    success(b"/Users/worker/.local/bin/herdr\n")
+                }
+            };
+        }
+        if self.scenario == Scenario::KeychainOrdering && binary != "claude" {
+            return failure(b"command not found\n");
+        }
+        if binary == "opencode" && self.scenario == Scenario::MissingOpenCode {
+            return failure(b"opencode: command not found\n");
+        }
+        success(format!("/opt/tools/{binary}\n").as_bytes())
+    }
+
+    fn herdr_version(&self) -> ProcessResult {
+        match self.herdr {
+            HerdrBinary::Installed => success(format!("herdr {HERDR_VERSION}\n").as_bytes()),
+            HerdrBinary::VersionFails => failure(b"herdr: unrecognized option\n"),
+            HerdrBinary::Missing => panic!("herdr --version ran without a herdr binary"),
+        }
+    }
+
     fn exec_command(
         &self,
         request: &ProcessRequest,
@@ -325,6 +348,39 @@ fn has_environment(request: &ProcessRequest, name: &str) -> bool {
         .environment
         .iter()
         .any(|(key, _)| key == &OsString::from(name))
+}
+
+fn command_v_binary(shell: &str) -> Option<&str> {
+    let rest = shell.strip_prefix("command -v ")?;
+    rest.split(|character: char| character.is_whitespace() || character == '&')
+        .next()
+        .filter(|binary| !binary.is_empty())
+}
+
+fn is_merged_locate_version(shell: &str) -> bool {
+    shell.contains("MAC_WORKER_FACTS_VERSION")
+}
+
+fn combine_locate_and_version(locate: ProcessResult, version: ProcessResult) -> ProcessResult {
+    let mut stdout = locate.stdout;
+    if !stdout.ends_with(b"\n") {
+        stdout.push(b'\n');
+    }
+    stdout.extend_from_slice(b"MAC_WORKER_FACTS_VERSION\n");
+    stdout.extend_from_slice(&version.stdout);
+    ProcessResult {
+        status: version.status,
+        stdout,
+        stderr: version.stderr,
+    }
+}
+
+fn account_login_shells(runner: &FakeProcessRunner) -> Vec<ProcessRequest> {
+    runner
+        .requests()
+        .into_iter()
+        .filter(|request| request.program == "/bin/zsh")
+        .collect()
 }
 
 fn profiles() -> Vec<EnvProfile> {
@@ -829,6 +885,87 @@ fn account_login_shell_requests_use_isolation_and_profile_entries() {
 }
 
 #[test]
+fn five_agents_and_one_profile_drop_from_21_login_shells_to_13() {
+    // Four adapters plus herdr, one secure profile that does not set PATH,
+    // ZDOTDIR, HOME, or SHELL. Before: each adapter ran locate, version, auth,
+    // profile locate, and profile auth (20) plus herdr locate (1) = 21. After:
+    // locate+version, auth, and profile auth (12) plus herdr locate+version
+    // (1) = 13. Reused profile resolution emits no locate/version timing line.
+    let runner = FakeProcessRunner::new(Scenario::AllAgents);
+    let _ = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
+    let shells = account_login_shells(&runner);
+    assert_eq!(
+        shells.len(),
+        13,
+        "account login shells: {:?}",
+        shells.iter().map(shell_command).collect::<Vec<_>>()
+    );
+    let locate_version = shells
+        .iter()
+        .filter(|request| is_merged_locate_version(shell_command(request)))
+        .count();
+    assert_eq!(
+        locate_version, 5,
+        "one locate+version per adapter plus herdr, none for the reused profile"
+    );
+}
+
+#[test]
+fn profiles_that_set_path_zdotdir_home_or_shell_re_resolve_binaries() {
+    for name in ["PATH", "ZDOTDIR", "HOME", "SHELL"] {
+        let profile = EnvProfile {
+            name: "override".into(),
+            secure: true,
+            entries: vec![(OsString::from(name), OsString::from("/profile/bin"))],
+        };
+        let runner = FakeProcessRunner::new(Scenario::AllAgents);
+        collect_agent_facts_at(&runner, account_home(), &[profile], COLLECTED_AT);
+        let re_resolved = account_login_shells(&runner)
+            .into_iter()
+            .filter(|request| {
+                is_merged_locate_version(shell_command(request))
+                    && request
+                        .environment
+                        .iter()
+                        .any(|(key, value)| key == name && value == "/profile/bin")
+            })
+            .count();
+        assert_eq!(
+            re_resolved, 4,
+            "{name} must re-run locate+version for each adapter"
+        );
+    }
+}
+
+#[test]
+fn a_locate_version_deadline_is_unavailable_with_no_version() {
+    let runner = FakeProcessRunner::new(Scenario::StallingLocateVersion);
+    let (facts, timing) =
+        collect_agent_facts_at_with_timing(&runner, account_home(), &profiles(), COLLECTED_AT);
+    assert!(
+        !facts.agents.iter().any(|agent| agent.name == "codex"),
+        "a locate+version timeout is availability false, so the agent is omitted"
+    );
+    let stalled = timing
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("agent=codex") && line.contains("step=locate+version"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stalled.len(),
+        1,
+        "the profile reuses the failed default resolution: {stalled:?}"
+    );
+    assert!(stalled[0].contains("hit_deadline=true"), "{}", stalled[0]);
+    assert!(
+        stalled[0].contains(&format!("deadline_ms={}", PROBE_DEADLINE.as_millis())),
+        "{}",
+        stalled[0]
+    );
+    assert_timing_privacy(&timing.lines());
+}
+
+#[test]
 fn login_shell_command_resolution_failure_omits_all_agents() {
     let runner = FakeProcessRunner::new(Scenario::NoBinariesResolve);
     let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
@@ -923,14 +1060,14 @@ fn herdr_fact_is_not_installed_when_no_binary_resolves_on_the_login_shell() {
     assert_eq!(lookups.len(), 1, "one herdr lookup through the login shell");
     assert_eq!(lookups[0].program, OsString::from("/bin/zsh"));
     assert!(lookups[0].isolate_parent_environment);
+    let shell = shell_command(&lookups[0]);
     assert!(
-        shell_command(&lookups[0]).contains("$HOME/.local/bin"),
-        "the lookup must reach herdr's install directory: {:?}",
-        shell_command(&lookups[0])
+        shell.contains("$HOME/.local/bin"),
+        "the lookup must reach herdr's install directory: {shell:?}"
     );
     assert!(
-        requests_containing(&runner, "'herdr' '--version'").is_empty(),
-        "no version probe runs without a binary"
+        shell.contains("'herdr' '--version'"),
+        "locate and version share one login shell: {shell:?}"
     );
 }
 
@@ -947,6 +1084,11 @@ fn herdr_fact_is_no_socket_when_the_binary_answers_without_a_socket() {
     let versions = requests_containing(&runner, "'herdr' '--version'");
     assert_eq!(versions.len(), 1, "one version probe for one binary");
     let version = &versions[0];
+    assert!(
+        shell_command(version).contains("command -v herdr"),
+        "herdr locate and version share one login shell: {:?}",
+        shell_command(version)
+    );
     assert_eq!(version.program, OsString::from("/bin/zsh"));
     assert!(version.isolate_parent_environment);
     assert!(
@@ -1217,25 +1359,24 @@ fn expected_all_agents_timing_names() -> Vec<String> {
         } else {
             "unauthenticated"
         };
-        names.push(format!("timing agent={agent} profile=- step=locate"));
-        names.push(format!("timing agent={agent} profile=- step=version"));
+        names.push(format!(
+            "timing agent={agent} profile=- step=locate+version"
+        ));
         names.push(format!(
             "timing agent={agent} profile=- step=auth result={auth}"
         ));
-        names.push(format!("timing agent={agent} profile=agents step=locate"));
         names.push(format!(
             "timing agent={agent} profile=agents step=auth result=authenticated"
         ));
     }
-    names.push("timing agent=herdr profile=- step=locate".into());
+    names.push("timing agent=herdr profile=- step=locate+version".into());
     names.push("timing step=total".into());
     names
 }
 
 fn expected_available_herdr_timing_names() -> Vec<String> {
     vec![
-        "timing agent=herdr profile=- step=locate".into(),
-        "timing agent=herdr profile=- step=version".into(),
+        "timing agent=herdr profile=- step=locate+version".into(),
         "timing step=herdr-ping".into(),
         "timing step=herdr-agents".into(),
         "timing step=total".into(),
