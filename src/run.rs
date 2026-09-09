@@ -1851,7 +1851,7 @@ fn admission_from_candidate(
     candidate: CandidateObservation,
     observed_at_millis: u64,
 ) -> Result<AdmissionObservation, WorkerError> {
-    AdmissionObservation::new(
+    Ok(AdmissionObservation::new(
         candidate.worker_name().to_owned(),
         candidate.ready(),
         candidate.slot(),
@@ -1859,7 +1859,8 @@ fn admission_from_candidate(
         candidate.available_memory_bytes(),
         candidate.free_disk_bytes(),
         observed_at_millis,
-    )
+    )?
+    .with_interactive_agents(candidate.interactive_agents()))
 }
 
 fn candidate_from_admission(
@@ -1873,6 +1874,7 @@ fn candidate_from_admission(
         observation.available_memory_bytes(),
         observation.free_disk_bytes(),
     )
+    .map(|candidate| candidate.with_interactive_agents(observation.interactive_agents()))
     .map_err(|_| WorkerError::Protocol("cached scheduler observation is invalid".into()))
 }
 
@@ -1897,10 +1899,10 @@ fn ranked_worker_names(
 }
 
 fn capacity_busy() -> WorkerError {
-    WorkerError::Capacity {
-        code: "CAPACITY_BUSY",
-        message: "no eligible worker currently has an available heavy slot".into(),
-    }
+    WorkerError::capacity(
+        "CAPACITY_BUSY",
+        "no eligible worker currently has an available heavy slot",
+    )
 }
 
 fn dispatch_cancelled() -> WorkerError {

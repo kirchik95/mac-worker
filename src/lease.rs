@@ -110,10 +110,10 @@ impl<'a> LeaseService<'a> {
             if lease_matches_request(&existing, request)? {
                 return Ok(LeaseAcquireResponse::Acquired { lease: existing });
             }
-            return Err(WorkerError::Capacity {
-                code: "CAPACITY_BUSY",
-                message: "one heavy job is already active".into(),
-            });
+            return Err(WorkerError::capacity(
+                "CAPACITY_BUSY",
+                "one heavy job is already active",
+            ));
         }
         validate_admission(facts)?;
 
@@ -292,22 +292,22 @@ impl<'a> LeaseService<'a> {
 fn validate_admission(facts: &AdmissionFacts) -> Result<(), WorkerError> {
     let minimum = (facts.total_disk_bytes / 5).max(50 * GIB);
     if facts.free_disk_bytes < minimum {
-        return Err(WorkerError::Capacity {
-            code: "INSUFFICIENT_DISK",
-            message: "worker data filesystem is below its free-space threshold".into(),
-        });
+        return Err(WorkerError::capacity(
+            "INSUFFICIENT_DISK",
+            "worker data filesystem is below its free-space threshold",
+        ));
     }
     if facts.memory_pressure == MemoryPressure::Critical {
-        return Err(WorkerError::Capacity {
-            code: "MEMORY_PRESSURE",
-            message: "worker memory pressure is critical".into(),
-        });
+        return Err(WorkerError::capacity(
+            "MEMORY_PRESSURE",
+            "worker memory pressure is critical",
+        ));
     }
     if facts.swap_used_bytes.is_some_and(|bytes| bytes > 2 * GIB) {
-        return Err(WorkerError::Capacity {
-            code: "SWAP_LIMIT",
-            message: "worker swap usage exceeds 2 GiB".into(),
-        });
+        return Err(WorkerError::capacity(
+            "SWAP_LIMIT",
+            "worker swap usage exceeds 2 GiB",
+        ));
     }
     Ok(())
 }

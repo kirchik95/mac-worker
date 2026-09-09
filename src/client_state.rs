@@ -636,6 +636,9 @@ impl ClientStateStore {
                             observation.available_memory_bytes(),
                             observation.free_disk_bytes(),
                         )
+                        .map(|candidate| {
+                            candidate.with_interactive_agents(observation.interactive_agents())
+                        })
                         .map_err(|_| {
                             WorkerError::Protocol("cached scheduler observation is invalid".into())
                         })

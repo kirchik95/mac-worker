@@ -11,8 +11,8 @@ use crate::{
         cache::{CpuCounters, Observation},
         model::{
             ApiError, DashboardAgent, DashboardAgentFacts, DashboardCommandMode,
-            DashboardCommandSummary, DashboardError, DashboardJob, DashboardJobState,
-            DashboardLogChunk, DashboardMemoryPressure, DashboardProfileAuth,
+            DashboardCommandSummary, DashboardError, DashboardHerdr, DashboardJob,
+            DashboardJobState, DashboardLogChunk, DashboardMemoryPressure, DashboardProfileAuth,
             DashboardProjectDefaults, DashboardSlotState, DashboardWorker, Freshness, SlotSummary,
             SystemSummary, WorkerHealth,
         },
@@ -30,7 +30,7 @@ use crate::{
     process::{ProcessRunner, SystemProcessRunner},
     project_config::ProjectSettings,
     protocol::{
-        CpuCounters as ProbeCpuCounters, HealthStatus, MemoryPressure,
+        CpuCounters as ProbeCpuCounters, HealthStatus, MemoryPressure, ProbeResponse,
         WorkerHealth as ProbeWorkerHealth, WorkersReport,
     },
     redaction::RedactionBoundary,
@@ -426,6 +426,7 @@ pub fn project_worker(
                 )),
                 _ => None,
             },
+            herdr: project_dashboard_herdr(probe),
             slot: SlotSummary {
                 state: match probe.slot_state {
                     SlotState::Idle => DashboardSlotState::Idle,
@@ -488,6 +489,7 @@ fn project_agent_facts(
             .version
             .as_deref()
             .map(|version| boundary.text(version, 64)),
+        interactive_agents: herdr.interactive_agents,
     });
     DashboardAgentFacts::from_observation(
         facts.collected_at_millis(),
@@ -496,6 +498,19 @@ fn project_agent_facts(
         agents,
         herdr,
     )
+}
+
+fn project_dashboard_herdr(probe: &ProbeResponse) -> Option<DashboardHerdr> {
+    let herdr = probe.herdr_fact()?;
+    let boundary = RedactionBoundary::from_env();
+    Some(DashboardHerdr {
+        state: herdr.state.as_str().to_owned(),
+        version: herdr
+            .version
+            .as_deref()
+            .map(|version| boundary.text(version, 64)),
+        interactive_agents: herdr.interactive_agents,
+    })
 }
 
 fn project_defaults(settings: &ProjectSettings) -> DashboardProjectDefaults {

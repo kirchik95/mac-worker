@@ -237,8 +237,8 @@ impl ProcessRunner for ProductionLeaseRunner {
                     acquire.material().created_at_millis(),
                 ) {
                     Ok(response) => canonical_process(&response),
-                    Err(WorkerError::Capacity { code, message }) => {
-                        host_error_process(code, message)
+                    Err(WorkerError::Capacity { code, message, .. }) => {
+                        host_error_process(code, message.into_owned())
                     }
                     Err(error) => Err(error),
                 }

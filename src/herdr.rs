@@ -194,6 +194,17 @@ pub struct ProcessInfo {
     pub foreground: Vec<ForegroundProcess>,
 }
 
+/// The fields `agent.list` is allowed to keep. Herdr's AgentInfo also
+/// carries titles, cwds, and tokens; those stay on the wire and are never
+/// copied into this type, so a facts collector can count agents without
+/// storing anything that could leak a worker path or a pane's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedAgent {
+    pub pane_id: String,
+    pub agent_status: String,
+    pub display_agent: Option<String>,
+}
+
 impl ProcessInfo {
     /// The pane's shell is at its prompt with nothing running in front of it.
     pub fn is_idle_shell(&self) -> bool {
@@ -319,6 +330,22 @@ impl HerdrClient {
 
     pub fn ping(&self) -> Result<(), HerdrError> {
         self.request("ping", json!({})).map(|_| ())
+    }
+
+    /// Agents herdr currently knows. Only `pane_id`, `agent_status`, and
+    /// `display_agent` are read; every other AgentInfo field is ignored.
+    pub fn agent_list(&self) -> Result<Vec<ListedAgent>, HerdrError> {
+        let result = self.request("agent.list", json!({}))?;
+        array_at(&result, "agents")?
+            .iter()
+            .map(|agent| {
+                Ok(ListedAgent {
+                    pane_id: required_string(agent, "pane_id")?,
+                    agent_status: required_string(agent, "agent_status")?,
+                    display_agent: string_at(agent, "display_agent"),
+                })
+            })
+            .collect()
     }
 
     pub fn workspace_list(&self) -> Result<Vec<Workspace>, HerdrError> {

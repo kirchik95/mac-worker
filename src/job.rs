@@ -1667,6 +1667,9 @@ pub struct AdmissionObservation {
     available_memory_bytes: Option<u64>,
     free_disk_bytes: u64,
     observed_at_millis: u64,
+    /// Interactive herdr agents excluding mac-worker's reporter. Absent
+    /// from cache files written before this field existed.
+    interactive_agents: Option<u32>,
     ssh: String,
     remote_binary: String,
     inventory_capabilities: Option<Vec<String>>,
@@ -1694,6 +1697,7 @@ impl AdmissionObservation {
             available_memory_bytes,
             free_disk_bytes,
             observed_at_millis,
+            interactive_agents: None,
             ssh: String::new(),
             remote_binary: String::new(),
             inventory_capabilities: None,
@@ -1703,6 +1707,11 @@ impl AdmissionObservation {
         };
         observation.validate()?;
         Ok(observation)
+    }
+
+    pub fn with_interactive_agents(mut self, interactive_agents: Option<u32>) -> Self {
+        self.interactive_agents = interactive_agents;
+        self
     }
 
     /// Local cache binding for skip-SSH. Missing fields keep the record an
@@ -1788,13 +1797,17 @@ impl AdmissionObservation {
     pub fn observed_at_millis(&self) -> u64 {
         self.observed_at_millis
     }
+
+    pub fn interactive_agents(&self) -> Option<u32> {
+        self.interactive_agents
+    }
 }
 
 impl Serialize for AdmissionObservation {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
         let bound = self.binding_complete();
-        let fields = if bound { 13 } else { 7 };
+        let fields = 7 + usize::from(self.interactive_agents.is_some()) + if bound { 6 } else { 0 };
         let mut record = serializer.serialize_struct("AdmissionObservation", fields)?;
         record.serialize_field("worker_name", &self.worker_name)?;
         record.serialize_field("ready", &self.ready)?;
@@ -1809,6 +1822,9 @@ impl Serialize for AdmissionObservation {
         record.serialize_field("available_memory_bytes", &self.available_memory_bytes)?;
         record.serialize_field("free_disk_bytes", &self.free_disk_bytes)?;
         record.serialize_field("observed_at_millis", &self.observed_at_millis)?;
+        if let Some(interactive_agents) = self.interactive_agents {
+            record.serialize_field("interactive_agents", &interactive_agents)?;
+        }
         if bound {
             record.serialize_field("ssh", &self.ssh)?;
             record.serialize_field("remote_binary", &self.remote_binary)?;
@@ -1837,6 +1853,8 @@ impl<'de> Deserialize<'de> for AdmissionObservation {
             free_disk_bytes: u64,
             observed_at_millis: u64,
             #[serde(default)]
+            interactive_agents: Option<u32>,
+            #[serde(default)]
             ssh: String,
             #[serde(default)]
             remote_binary: String,
@@ -1864,7 +1882,8 @@ impl<'de> Deserialize<'de> for AdmissionObservation {
             wire.free_disk_bytes,
             wire.observed_at_millis,
         )
-        .map_err(de::Error::custom)?;
+        .map_err(de::Error::custom)?
+        .with_interactive_agents(wire.interactive_agents);
         observation.ssh = wire.ssh;
         observation.remote_binary = wire.remote_binary;
         observation.inventory_capabilities = wire.inventory_capabilities;

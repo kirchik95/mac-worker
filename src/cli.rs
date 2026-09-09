@@ -280,7 +280,11 @@ pub enum HostCommand {
     #[command(name = "migrate-layout")]
     MigrateLayout,
     #[command(name = "refresh-facts")]
-    RefreshFacts,
+    RefreshFacts {
+        /// Print per-step collection durations on stderr after writing facts
+        #[arg(long)]
+        timing: bool,
+    },
     #[command(name = "task-prepare")]
     TaskPrepare,
     #[command(name = "task-status")]

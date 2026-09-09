@@ -26,6 +26,19 @@ fn observation(
     .unwrap()
 }
 
+fn observation_with_agents(
+    name: &str,
+    ready: bool,
+    slot: CandidateSlot,
+    capabilities: &[&str],
+    memory: Option<u64>,
+    disk: u64,
+    interactive_agents: Option<u32>,
+) -> CandidateObservation {
+    observation(name, ready, slot, capabilities, memory, disk)
+        .with_interactive_agents(interactive_agents)
+}
+
 fn names(ranked: &[mac_worker::scheduler::RankedCandidate]) -> Vec<&str> {
     ranked
         .iter()
@@ -118,6 +131,149 @@ fn ranks_known_memory_before_missing_memory_then_disk_and_name() {
         names(&ranked),
         vec!["charlie", "delta", "echo", "bravo", "alpha"]
     );
+}
+
+#[test]
+fn ranks_fewer_interactive_agents_only_after_affinity_memory_and_disk() {
+    let ranked = SchedulerPolicy::rank(
+        &[
+            observation_with_agents(
+                "loaded",
+                true,
+                CandidateSlot::Idle,
+                &["node"],
+                Some(8),
+                100,
+                Some(5),
+            ),
+            observation_with_agents(
+                "quiet",
+                true,
+                CandidateSlot::Idle,
+                &["node"],
+                Some(8),
+                100,
+                Some(1),
+            ),
+            observation_with_agents(
+                "unknown",
+                true,
+                CandidateSlot::Idle,
+                &["node"],
+                Some(8),
+                100,
+                None,
+            ),
+        ],
+        &["node".into()],
+        &AffinityHints::none(),
+    );
+    assert_eq!(names(&ranked), vec!["unknown", "quiet", "loaded"]);
+}
+
+#[test]
+fn interactive_agents_never_override_affinity_or_more_memory() {
+    let ranked = SchedulerPolicy::rank(
+        &[
+            observation_with_agents(
+                "affined",
+                true,
+                CandidateSlot::Idle,
+                &["node"],
+                Some(8),
+                100,
+                Some(9),
+            ),
+            observation_with_agents(
+                "other",
+                true,
+                CandidateSlot::Idle,
+                &["node"],
+                Some(8),
+                100,
+                Some(0),
+            ),
+        ],
+        &["node".into()],
+        &AffinityHints {
+            worktree_worker: Some("affined".into()),
+            project_worker: None,
+        },
+    );
+    assert_eq!(names(&ranked), vec!["affined", "other"]);
+
+    let memory = SchedulerPolicy::rank(
+        &[
+            observation_with_agents(
+                "rich",
+                true,
+                CandidateSlot::Idle,
+                &["node"],
+                Some(32),
+                100,
+                Some(9),
+            ),
+            observation_with_agents(
+                "poor",
+                true,
+                CandidateSlot::Idle,
+                &["node"],
+                Some(8),
+                100,
+                Some(0),
+            ),
+        ],
+        &["node".into()],
+        &AffinityHints::none(),
+    );
+    assert_eq!(names(&memory), vec!["rich", "poor"]);
+}
+
+#[test]
+fn interactive_agents_never_make_an_unready_or_incompatible_worker_eligible() {
+    let ranked = SchedulerPolicy::rank(
+        &[
+            observation_with_agents(
+                "offline",
+                false,
+                CandidateSlot::Idle,
+                &["node"],
+                Some(64),
+                1_000,
+                Some(0),
+            ),
+            observation_with_agents(
+                "busy",
+                true,
+                CandidateSlot::Busy,
+                &["node"],
+                Some(8),
+                100,
+                Some(0),
+            ),
+            observation_with_agents(
+                "lacks-node",
+                true,
+                CandidateSlot::Idle,
+                &["ruby"],
+                Some(8),
+                100,
+                Some(0),
+            ),
+            observation_with_agents(
+                "ready",
+                true,
+                CandidateSlot::Idle,
+                &["node"],
+                Some(8),
+                100,
+                Some(4),
+            ),
+        ],
+        &["node".into()],
+        &AffinityHints::none(),
+    );
+    assert_eq!(names(&ranked), vec!["ready"]);
 }
 
 #[test]

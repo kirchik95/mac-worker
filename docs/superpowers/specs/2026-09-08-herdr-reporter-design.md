@@ -262,7 +262,7 @@ One implementation plan, `docs/superpowers/plans/2026-09-08-herdr-reporter.md`, 
 ## 15. Deferred
 
 - **Interactive mode.** Still deferred and still needing its own review. With this design in place it would reuse the workspace, the tab, and the client, and replace `follow-turn` with `agent.start` of the agent's TUI plus `agent.prompt --wait` and `agent.wait --until blocked`. What it changes is the completion signal, result extraction, and the no-injection rule, none of which this design touches.
-- **Herdr facts in scheduling and the dashboard.** Counting a worker's interactive agents as load, and a herdr chip on the dashboard worker card. The fact exists after this design; the policy does not.
+- **Herdr facts in scheduling and the dashboard.** Landed: the dashboard worker card and capabilities view show a herdr chip, `refresh-facts` records `interactive_agents` when the state is `available`, and scheduling uses that count only as the last tie-breaker among otherwise equal workers. The count never excludes a worker and never stores titles, cwds, or pane ids.
 - **Worker-originated notifications** through the machine link, once their propagation is confirmed.
 - **A pane per turn kept side by side** instead of tab replacement, if reading a previous turn in herdr proves more useful than `task logs`.
 

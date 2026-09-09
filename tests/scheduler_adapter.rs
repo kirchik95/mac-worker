@@ -131,3 +131,43 @@ fn ready_probe_without_memory_fact_preserves_unavailable_memory() {
 
     assert_eq!(facts[0].available_memory_bytes(), None);
 }
+
+#[test]
+fn adapter_threads_interactive_agents_from_a_fresh_herdr_fact() {
+    use mac_worker::agent_facts::{AgentFacts, HerdrFactState, HerdrFacts};
+
+    let mut health = ready_health();
+    let probe = health.probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: false,
+        collected_at_millis: 1,
+        herdr: Some(HerdrFacts {
+            state: HerdrFactState::Available,
+            version: Some("0.9.0".into()),
+            interactive_agents: Some(3),
+        }),
+    });
+    probe.facts_age_millis = Some(0);
+
+    let facts = SchedulerProbeAdapter::observations(&config(), &[health]).unwrap();
+    assert_eq!(facts[0].interactive_agents(), Some(3));
+
+    let mut stale = ready_health();
+    let probe = stale.probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: false,
+        collected_at_millis: 1,
+        herdr: Some(HerdrFacts {
+            state: HerdrFactState::Available,
+            version: Some("0.9.0".into()),
+            interactive_agents: Some(3),
+        }),
+    });
+    probe.facts_age_millis = Some(mac_worker::agent_facts::FACTS_TTL + 1);
+    let stale_facts = SchedulerProbeAdapter::observations(&config(), &[stale]).unwrap();
+    assert_eq!(stale_facts[0].interactive_agents(), None);
+}

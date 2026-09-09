@@ -770,6 +770,7 @@ fn offline_worker(worker_name: &str, error: DashboardError) -> DashboardWorker {
         },
         error: Some(error),
         active_task: None,
+        herdr: None,
     }
 }
 

@@ -353,7 +353,7 @@ fn execute_with_context(
             "host migrate-layout requires the stdio execution boundary".into(),
         )),
         Command::Host {
-            command: HostCommand::RefreshFacts,
+            command: HostCommand::RefreshFacts { .. },
         } => Err(WorkerError::Protocol(
             "host refresh-facts requires the stdio execution boundary".into(),
         )),
@@ -1541,13 +1541,11 @@ pub fn run_with_rsync_executor_in_context(
     ) {
         return run_host_migrate_layout(cli.config, runtime, stderr);
     }
-    if matches!(
-        &cli.command,
-        Command::Host {
-            command: HostCommand::RefreshFacts
-        }
-    ) {
-        return run_host_refresh_facts(cli.config, runtime, runner, stderr);
+    if let Command::Host {
+        command: HostCommand::RefreshFacts { timing },
+    } = cli.command
+    {
+        return run_host_refresh_facts(cli.config, runtime, runner, stderr, timing);
     }
     if let Command::Host {
         command:
@@ -2564,10 +2562,18 @@ fn run_host_refresh_facts(
     runtime: &RuntimeContext,
     runner: &dyn ProcessRunner,
     stderr: &mut dyn Write,
+    timing: bool,
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
-        ProbeCollector::refresh_facts_at(&paths.host_state_root(), &runtime.home, runner)?;
+        let (_, collected) = ProbeCollector::refresh_facts_at_with_timing(
+            &paths.host_state_root(),
+            &runtime.home,
+            runner,
+        )?;
+        if timing {
+            collected.write_to(stderr);
+        }
         Ok(())
     })();
     match result {
@@ -3197,6 +3203,48 @@ mod tests {
             std::str::from_utf8(&stderr).unwrap(),
             "TASK_BUSY: task turn is being dispatched\n"
         );
+    }
+
+    #[test]
+    fn json_error_events_follow_capacity_public_message_rules() {
+        let public = WorkerError::capacity(
+            "CAPACITY_BUSY",
+            "no eligible worker currently has an available heavy slot",
+        );
+        let mut stdout = Vec::new();
+        super::write_json_error_event(&mut stdout, &public).unwrap();
+        let event: crate::job::JsonEvent =
+            serde_json::from_slice(stdout.strip_suffix(b"\n").unwrap()).unwrap();
+        match event {
+            crate::job::JsonEvent::Error { code, message, .. } => {
+                assert_eq!(code, "CAPACITY_BUSY");
+                assert_eq!(
+                    message,
+                    "no eligible worker currently has an available heavy slot"
+                );
+            }
+            other => panic!("expected a JSON error event, got {other:?}"),
+        }
+
+        let planted_path = "/Users/alice/PLANTED_PUBLIC_PATH";
+        let redacted = WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            message: format!("busy lease at {planted_path}").into(),
+            public: false,
+        };
+        stdout.clear();
+        super::write_json_error_event(&mut stdout, &redacted).unwrap();
+        let event: crate::job::JsonEvent =
+            serde_json::from_slice(stdout.strip_suffix(b"\n").unwrap()).unwrap();
+        match event {
+            crate::job::JsonEvent::Error { code, message, .. } => {
+                assert_eq!(code, "CAPACITY_BUSY");
+                assert_eq!(message, "capacity error");
+            }
+            other => panic!("expected a JSON error event, got {other:?}"),
+        }
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(!text.contains(planted_path));
     }
 
     #[test]

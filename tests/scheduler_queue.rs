@@ -3524,6 +3524,31 @@ fn exact_two_second_observation_is_fresh_and_unknown_fields_fail_closed() {
 }
 
 #[test]
+fn admission_observation_loads_records_that_predate_interactive_agents() {
+    let json = r#"{"worker_name":"mini-1","ready":true,"slot":"idle","capabilities":["rust"],"available_memory_bytes":1,"free_disk_bytes":2,"observed_at_millis":10}"#;
+    let observation: AdmissionObservation = serde_json::from_str(json).unwrap();
+    assert_eq!(observation.interactive_agents(), None);
+    assert_eq!(observation.worker_name(), "mini-1");
+
+    let with_count = AdmissionObservation::new(
+        "mini-1".into(),
+        true,
+        CandidateSlot::Idle,
+        vec!["rust".into()],
+        Some(1),
+        2,
+        10,
+    )
+    .unwrap()
+    .with_interactive_agents(Some(4));
+    let bytes = serde_json::to_vec(&with_count).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(text.contains(r#""interactive_agents":4"#), "{text}");
+    let back: AdmissionObservation = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(back.interactive_agents(), Some(4));
+}
+
+#[test]
 fn observation_cache_rejects_symlink_and_fifo_replacement() {
     // Break caught: cache reads follow external files or hang on attacker FIFOs.
     for kind in ["symlink", "fifo"] {

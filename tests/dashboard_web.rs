@@ -511,6 +511,7 @@ impl DashboardDataSource for FakeSource {
                 observed_at_millis: Some(1_000),
                 hostname: Some("mini-1.local".into()),
                 agent_facts: None,
+                herdr: None,
                 slot: SlotSummary {
                     state: DashboardSlotState::Idle,
                     capacity: 1,
@@ -846,6 +847,7 @@ fn worker_observation(name: &str, observed_at_millis: u64) -> Observation {
             observed_at_millis: Some(observed_at_millis),
             hostname: Some(format!("{name}.local")),
             agent_facts: None,
+            herdr: None,
             slot: SlotSummary {
                 state: DashboardSlotState::Idle,
                 capacity: 1,

@@ -2199,6 +2199,7 @@ fn all_four_admission_codes_decode_to_capacity_exit_75() {
             WorkerError::Capacity {
                 code: actual_code,
                 message: actual_message,
+                ..
             } if *actual_code == code && actual_message == message
         ));
         assert_eq!(error.exit_code(), 75, "{code}: {error}");
@@ -2806,10 +2807,10 @@ fn resolution_outcomes_keep_host_authority_and_submission_error_rules_exact() {
         .resolve_submission(
             &worker(),
             &submit,
-            Err(WorkerError::Capacity {
-                code: "CAPACITY_BUSY",
-                message: "original typed error".into(),
-            }),
+            Err(WorkerError::capacity(
+                "CAPACITY_BUSY",
+                "original typed error",
+            )),
         )
         .unwrap_err();
     assert!(matches!(
@@ -2838,10 +2839,10 @@ fn resolution_outcomes_keep_host_authority_and_submission_error_rules_exact() {
         .resolve_submission(
             &worker(),
             &submit,
-            Err(WorkerError::Capacity {
-                code: "CAPACITY_BUSY",
-                message: "original typed error".into(),
-            }),
+            Err(WorkerError::capacity(
+                "CAPACITY_BUSY",
+                "original typed error",
+            )),
         )
         .unwrap_err();
     assert!(matches!(
@@ -2865,10 +2866,10 @@ fn resolution_outcomes_keep_host_authority_and_submission_error_rules_exact() {
         .resolve_submission(
             &worker(),
             &submit,
-            Err(WorkerError::Capacity {
-                code: "CAPACITY_BUSY",
-                message: "original typed error".into(),
-            }),
+            Err(WorkerError::capacity(
+                "CAPACITY_BUSY",
+                "original typed error",
+            )),
         )
         .unwrap_err();
     assert!(matches!(

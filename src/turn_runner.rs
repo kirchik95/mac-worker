@@ -1649,17 +1649,14 @@ fn early_exit_diagnostic_line(
 }
 
 fn capacity_busy() -> WorkerError {
-    WorkerError::Capacity {
-        code: "CAPACITY_BUSY",
-        message: "no eligible worker currently has an available heavy slot".into(),
-    }
+    WorkerError::capacity(
+        "CAPACITY_BUSY",
+        "no eligible worker currently has an available heavy slot",
+    )
 }
 
-fn capacity_error(message: impl Into<String>) -> WorkerError {
-    WorkerError::Capacity {
-        code: "CAPACITY_BUSY",
-        message: message.into(),
-    }
+fn capacity_error(message: &'static str) -> WorkerError {
+    WorkerError::capacity("CAPACITY_BUSY", message)
 }
 
 fn queue_error(code: &'static str, message: impl Into<String>) -> WorkerError {
