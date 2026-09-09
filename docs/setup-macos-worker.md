@@ -95,13 +95,15 @@ Do these steps as the same **worker account** used by SSH. Agent credentials sta
 
 ### Codex (default)
 
-On the **worker**, if Homebrew is installed:
+On the **worker**, with Node.js and npm available (Homebrew's `node` is enough):
 
 ```bash
-brew install --cask codex
+npm install -g --prefix "$HOME/.local" @openai/codex
 codex login --device-auth
 codex login status
 ```
+
+`~/.local/bin` must be on the login shell's PATH ahead of Homebrew. Prefer this npm install over `brew install --cask codex`: the cask's binaries carry a quarantine attribute, and on a headless Mac Gatekeeper's first-launch assessment of its `codex-code-mode-host` helper can hang, after which every Codex shell command fails with "timed out negotiating with the code-mode host". Files unpacked by npm are not quarantined. If a cask is already installed, remove it with `brew uninstall --cask codex` so the login shell resolves the npm copy.
 
 Open the device-login URL in a browser and enter the code. Device login may need to be enabled in your ChatGPT account or workspace. If unavailable, run `codex login` in the worker's desktop session and sign in there. See the [official installation guide](https://developers.openai.com/codex/cli/) for other installation methods and [authentication guide](https://developers.openai.com/codex/auth/) for login options. mac-worker checks the login again through SSH.
 
