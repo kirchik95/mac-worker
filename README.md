@@ -91,6 +91,15 @@ worker task fetch <task-id>
 
 `result` shows the outcome and summary. `fetch` prints the remote-tracking ref to inspect with `git show` or `git diff`. Your current working tree stays unchanged; you choose whether to merge. Use the same `--agent` you checked with `init`.
 
+Submit starts from HEAD by default. Pass `--base <ref>` to use another commit. Uncommitted edits stay on your laptop. To send tracked worktree changes as a temporary base:
+
+```bash
+worker task submit --agent codex --wip --wait \
+  --prompt "Use the uncommitted edits and add a one-line note to SETUP_CHECK.md."
+```
+
+`--wip` is opt-in and needs a local source with fetch-only publication; origin source and push need a committed base. Name new files with `--include` or `snapshot.include_untracked`; unmatched non-ignored untracked files cause `UNTRACKED_INPUT`. `--include` can select ignored files, but sensitive paths still need an exact `snapshot.allow_sensitive` entry.
+
 For real coding tasks, install your project's language tools and dependencies on the worker too. Start with this small file task to check the connection and agent before running a build.
 
 ### 4. Follow the work
@@ -102,6 +111,8 @@ worker workers --refresh
 ```
 
 The dashboard opens locally in your browser. To submit and return immediately, omit `--wait`.
+
+`worker task wait --task-id <task-id>` blocks until the task has settled and the previous runner has released ownership. Then run `worker task result <task-id>` for the outcome (finished, needs input, or failed).
 
 If a turn fails, run `worker task logs <task-id>` to see agent diagnostics and the recorded failure reason. Use `--turn N` to inspect an earlier turn, or `--raw` for the original log bytes.
 
@@ -135,6 +146,8 @@ flowchart LR
 2. **Run.** Over SSH, mac-worker transfers the base commit into the worker's project mirror, prepares a separate task worktree and launches the agent under a supervisor. The agent uses the worker's own login and project tools.
 3. **Follow or reply.** The CLI and dashboard read task status and logs. If the agent needs input, `worker task say <id> --message "…"` starts another turn in the same task workspace and agent session.
 4. **Review.** The worker publishes `task/<id>`, and the laptop fetches it as a remote-tracking ref. `worker task fetch <id>` can fetch it again and prints the ref to inspect. Your current working tree stays unchanged; you decide what to merge.
+
+`--wip` preparation now uses fewer Git operations and compares two fresh captures so concurrent edits can be detected. Dashboard detail and logs read one task directly; listing the collection still scans history.
 
 The dashboard is embedded in the CLI, listens only on loopback and does not start or cancel tasks. The queue and task records live on the laptop; project mirrors, task worktrees and agent sessions live on the workers. Use `worker gc` to preview retained worker data that can be reclaimed.
 
@@ -185,6 +198,9 @@ Node.js is needed only when changing the dashboard source in `ui/`; its built as
 - [Build and publish a release](docs/releasing.md): archives, checksums and Homebrew distribution.
 - [Acceptance runbook](docs/phase-five-acceptance-runbook.md) and [validation record](docs/phase-five-validation.md).
 - [Herdr reporter validation](docs/herdr-reporter-validation.md): turns in the herdr sidebar, notifications, and the herdr facts, proven on the pool.
+- [Snapshot batching](docs/2026-09-09-snapshot-batch-performance.md): bounded Git work for `--wip` capture.
+- [Snapshot and dashboard lookup](docs/2026-09-09-performance-improvements.md): faster snapshot prep and per-task detail/log reads.
+- [Pool reliability roadmap](docs/superpowers/plans/2026-09-08-pool-reliability-roadmap.md): completed and upcoming reliability and performance work.
 - [Design notes](docs/superpowers/specs/) and [implementation plans](docs/superpowers/plans/).
 
 ## License
