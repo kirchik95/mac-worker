@@ -11,6 +11,9 @@ use super::{
 };
 
 const ENV_NAMES: [&str; 1] = ["CURSOR_API_KEY"];
+/// `cursor-agent status` can print `Logged in (...)` when a credential exists
+/// but cannot be used. The reason is interned so facts.json round-trips it.
+pub(crate) const LOGIN_UNVERIFIED_REASON: &str = "login unverified: user details unavailable";
 
 pub(super) struct CursorAdapter;
 
@@ -103,25 +106,28 @@ fn classify_cursor_auth(result: &ProcessResult) -> AuthProbeResult {
     }) {
         return AuthProbeResult::UnknownWithReason(KEYCHAIN_LOCKED_REASON);
     }
-    // Every non-empty line must be a recognised status line and all of them
-    // must agree; anything else is ambiguous and stays unknown.
+    // Every non-empty line must be a recognised status line. Authenticated
+    // and unverified may share a status dump (`Login successful!` plus
+    // `Logged in (unable to fetch user details)`); unverified wins so a
+    // degraded credential is never advertised as ready. Any other mix is
+    // ambiguous and stays unknown.
     let mut verdict = None;
     for line in text.lines().map(normalize_status_line) {
         if line.is_empty() {
             continue;
         }
-        let Some(authenticated) = classify_status_line(&line) else {
+        let Some(classified) = classify_status_line(&line) else {
             return AuthProbeResult::Unknown;
         };
-        match verdict {
-            None => verdict = Some(authenticated),
-            Some(previous) if previous != authenticated => return AuthProbeResult::Unknown,
-            Some(_) => {}
+        match merge_status_line(verdict, classified) {
+            Some(merged) => verdict = Some(merged),
+            None => return AuthProbeResult::Unknown,
         }
     }
     match verdict {
-        Some(true) => AuthProbeResult::Authenticated,
-        Some(false) => AuthProbeResult::Unauthenticated,
+        Some(StatusLine::Authenticated) => AuthProbeResult::Authenticated,
+        Some(StatusLine::Unauthenticated) => AuthProbeResult::Unauthenticated,
+        Some(StatusLine::Unverified) => AuthProbeResult::UnknownWithReason(LOGIN_UNVERIFIED_REASON),
         None => AuthProbeResult::Unknown,
     }
 }
@@ -134,12 +140,40 @@ fn normalize_status_line(line: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn classify_status_line(line: &str) -> Option<bool> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusLine {
+    Authenticated,
+    Unauthenticated,
+    Unverified,
+}
+
+fn merge_status_line(previous: Option<StatusLine>, next: StatusLine) -> Option<StatusLine> {
+    match previous {
+        None => Some(next),
+        Some(same) if same == next => Some(same),
+        Some(StatusLine::Authenticated) if next == StatusLine::Unverified => {
+            Some(StatusLine::Unverified)
+        }
+        Some(StatusLine::Unverified) if next == StatusLine::Authenticated => {
+            Some(StatusLine::Unverified)
+        }
+        Some(_) => None,
+    }
+}
+
+fn classify_status_line(line: &str) -> Option<StatusLine> {
     if matches!(line, "unauthenticated" | "authenticated: false")
         || line.starts_with("not logged in")
         || line.starts_with("not authenticated")
     {
-        return Some(false);
+        return Some(StatusLine::Unauthenticated);
+    }
+    if let Some(detail) = line.strip_prefix("logged in (") {
+        return Some(if parenthetical_names_a_failure(detail) {
+            StatusLine::Unverified
+        } else {
+            StatusLine::Authenticated
+        });
     }
     if matches!(
         line,
@@ -150,11 +184,17 @@ fn classify_status_line(line: &str) -> Option<bool> {
         || line
             .strip_prefix("logged in as ")
             .is_some_and(|user| !user.trim().is_empty())
-        || line.starts_with("logged in (")
     {
-        return Some(true);
+        return Some(StatusLine::Authenticated);
     }
     None
+}
+
+fn parenthetical_names_a_failure(detail: &str) -> bool {
+    let detail = detail.strip_suffix(')').unwrap_or(detail);
+    ["unable", "failed", "error", "expired"]
+        .iter()
+        .any(|marker| detail.contains(marker))
 }
 
 fn cursor_args(model: Option<&str>, session_ref: &str) -> Vec<String> {

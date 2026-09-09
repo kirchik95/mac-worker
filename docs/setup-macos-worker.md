@@ -123,7 +123,7 @@ No environment profile is required for a working Codex login.
 | Cursor | [Official installer](https://cursor.com/docs/cli/installation); see executable name below | `cursor-agent login` or an API-key profile | `worker init yourname@mini.local --agent cursor --env-profile agents` |
 | Claude Code | [Official installer](https://code.claude.com/docs/en/setup) | Sign in with Claude Code or provision a supported token/API-key profile | `worker init yourname@mini.local --agent claude` (add `--env-profile agents` when needed) |
 
-This version of mac-worker invokes Cursor as `cursor-agent`. If the official installer provides only `agent`, confirm it is the Cursor executable, then expose that executable under the expected name on the worker's login `PATH`. Do not replace an unrelated `agent` or an existing `cursor-agent`. Probes and turns use the account's login-shell PATH; a tool visible only in an interactive shell may need its PATH setup moved to the login-shell configuration.
+This version of mac-worker invokes Cursor as `cursor-agent`. If the official installer provides only `agent`, confirm it is the Cursor executable, then expose that executable under the expected name on the worker's login `PATH`. Do not replace an unrelated `agent` or an existing `cursor-agent`. Probes and turns use the account's login-shell PATH; a tool visible only in an interactive shell may need its PATH setup moved to the login-shell configuration. `worker workers` reports `unknown (login unverified …)` when `cursor-agent status` cannot fetch user details; fix that with `cursor-agent login` on the worker, or put `CURSOR_API_KEY` in the env profile.
 
 Use only the selected agent to finish your first task. Additional agents can be installed and checked later.
 

@@ -17,6 +17,8 @@ use opencode::OpencodeAdapter;
 use serde::Deserialize;
 use serde_json::Value;
 
+pub(crate) use cursor::LOGIN_UNVERIFIED_REASON;
+
 const PREBIND_OUTPUT_LIMIT: usize = 4 * 1024;
 const PREBIND_DEADLINE: Duration = Duration::from_secs(15);
 

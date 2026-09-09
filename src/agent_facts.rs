@@ -112,6 +112,7 @@ fn known_auth_reason(value: &str) -> Option<&'static str> {
     match value {
         crate::keychain::UNLOCK_FAILED_REASON => Some(crate::keychain::UNLOCK_FAILED_REASON),
         crate::keychain::KEYCHAIN_LOCKED_REASON => Some(crate::keychain::KEYCHAIN_LOCKED_REASON),
+        crate::agent::LOGIN_UNVERIFIED_REASON => Some(crate::agent::LOGIN_UNVERIFIED_REASON),
         _ => None,
     }
 }

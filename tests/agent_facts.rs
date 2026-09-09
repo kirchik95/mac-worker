@@ -15,8 +15,15 @@ use mac_worker::{
         AgentAuth, AgentFacts, AgentProbe, EnvProfile, FACTS_TTL, HerdrFactState, HerdrFacts,
         ProfileProbe, collect_agent_facts_at,
     },
+    config::{Config, WorkerEntry},
     error::WorkerError,
+    lease::SlotState,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+    protocol::{
+        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+        WorkerHealth,
+    },
+    scheduler_adapter::SchedulerProbeAdapter,
 };
 
 const COLLECTED_AT: u64 = 100_000;
@@ -33,6 +40,7 @@ enum Scenario {
     NetworkCodex,
     AmbiguousOpenCode,
     InvalidUtf8Cursor,
+    UnverifiedCursorLogin,
     NoBinariesResolve,
     KeychainUnlockFailure,
     KeychainOrdering,
@@ -247,6 +255,12 @@ impl FakeProcessRunner {
             ["cursor-agent", "status"] => {
                 if self.scenario == Scenario::InvalidUtf8Cursor {
                     return Ok(success(&[0xff, b'\n']));
+                }
+                if self.scenario == Scenario::UnverifiedCursorLogin {
+                    return Ok(success(
+                        "\u{1b}[32m\u{2713}\u{1b}[0m Login successful!\nLogged in (unable to fetch user details)\n"
+                            .as_bytes(),
+                    ));
                 }
                 if has_environment(request, "CURSOR_API_KEY") {
                     Ok(success(b"Authenticated as test-user\n"))
@@ -505,6 +519,88 @@ fn ambiguous_network_and_non_utf8_auth_outputs_are_unknown() {
         .unwrap();
     assert_eq!(cursor.auth, AgentAuth::Unknown);
     assert_eq!(cursor.auth_by_profile[0].1, AgentAuth::Unknown);
+}
+
+#[test]
+fn unverified_cursor_login_reaches_facts_and_is_not_an_agent_capability() {
+    let runner = FakeProcessRunner::new(Scenario::UnverifiedCursorLogin);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
+    let cursor = facts
+        .agents
+        .iter()
+        .find(|agent| agent.name == "cursor")
+        .expect("cursor probe must be present");
+    assert_eq!(
+        cursor.auth,
+        AgentAuth::UnknownWithReason("login unverified: user details unavailable")
+    );
+    assert_eq!(
+        cursor.auth_by_profile,
+        vec![(
+            "agents".into(),
+            AgentAuth::UnknownWithReason("login unverified: user details unavailable")
+        )]
+    );
+    let bytes = facts.canonical_bytes().unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(
+        text.contains(r#""state":"unknown","reason":"login unverified: user details unavailable""#)
+    );
+    let parsed: AgentFacts = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed.canonical_bytes().unwrap(), bytes);
+
+    let observations = SchedulerProbeAdapter::observations(
+        &Config {
+            version: 1,
+            notifications: mac_worker::config::NotificationsConfig::default(),
+            workers: vec![WorkerEntry {
+                name: "mini-1".into(),
+                ssh: "mac1".into(),
+                slots: 1,
+                capabilities: vec!["darwin-arm64".into()],
+                remote_binary: "~/.local/bin/worker".into(),
+                herdr: false,
+            }],
+        },
+        &[WorkerHealth {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            status: HealthStatus::Ready,
+            probe: Some(ProbeResponse {
+                protocol_version: PROTOCOL_VERSION,
+                supervision_version: SUPERVISION_VERSION,
+                hostname: "mini-1.local".into(),
+                arch: "arm64".into(),
+                os_version: "26.2".into(),
+                free_disk_bytes: 500,
+                total_disk_bytes: 1_000,
+                memory_pressure: MemoryPressure::Normal,
+                swap_used_bytes: None,
+                available_memory_bytes: None,
+                cpu_counters: None,
+                slot_state: SlotState::Idle,
+                active_lease: None,
+                capabilities: vec!["darwin-arm64".into()],
+                agent_facts: Some(facts),
+                facts_age_millis: Some(0),
+            }),
+            missing_capabilities: Vec::new(),
+            error_code: None,
+            error_message: None,
+        }],
+    )
+    .unwrap();
+    let capabilities = observations[0].capabilities();
+    assert!(
+        !capabilities
+            .iter()
+            .any(|capability| capability == "agent:cursor")
+    );
+    assert!(
+        !capabilities
+            .iter()
+            .any(|capability| capability == "agent:cursor@agents")
+    );
 }
 
 fn keychain_unlock_ordering_profiles() -> Vec<EnvProfile> {

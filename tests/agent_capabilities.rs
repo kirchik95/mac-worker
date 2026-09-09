@@ -6,6 +6,7 @@ use std::{
 
 use mac_worker::{
     agent::{AgentKind, AuthProbeResult, adapter_for},
+    agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
     config::{Config, WorkerEntry},
     error::WorkerError,
     lease::SlotState,
@@ -116,17 +117,30 @@ fn ambiguous_agent_auth_output_is_not_projected_as_authenticated() {
 }
 
 #[test]
-fn cursor_status_login_output_is_authenticated() {
+fn cursor_status_distinguishes_usable_logins_from_unverified_details() {
     let cursor = adapter_for(AgentKind::Cursor).auth_probe();
     // cursor-agent 2026.09 prints two lines after a keychain-backed login.
+    // The second line means the stored credential cannot be used.
     assert_eq!(
         cursor.classify(&result(
             "\u{1b}[32m\u{2713}\u{1b}[0m Login successful!\nLogged in (unable to fetch user details)\n".as_bytes()
         )),
-        AuthProbeResult::Authenticated
+        AuthProbeResult::UnknownWithReason("login unverified: user details unavailable")
+    );
+    assert_eq!(
+        cursor.classify(&result(b"Logged in (unable to fetch user details)\n")),
+        AuthProbeResult::UnknownWithReason("login unverified: user details unavailable")
     );
     assert_eq!(
         cursor.classify(&result(b"Logged in as user@example.invalid\n")),
+        AuthProbeResult::Authenticated
+    );
+    assert_eq!(
+        cursor.classify(&result(b"Logged in\n")),
+        AuthProbeResult::Authenticated
+    );
+    assert_eq!(
+        cursor.classify(&result(b"Login successful!\n")),
         AuthProbeResult::Authenticated
     );
     assert_eq!(
@@ -138,6 +152,10 @@ fn cursor_status_login_output_is_authenticated() {
     assert_eq!(
         cursor.classify(&result(b"Login successful!\nNot logged in\n")),
         AuthProbeResult::Unknown
+    );
+    assert_eq!(
+        cursor.classify(&result(b"Logged in (session expired)\n")),
+        AuthProbeResult::UnknownWithReason("login unverified: user details unavailable")
     );
 }
 
@@ -280,5 +298,44 @@ fn scheduler_uses_only_inventory_declared_origin_capabilities() {
         !observations[0]
             .capabilities()
             .contains(&"origin:untrusted.example.com".to_owned())
+    );
+}
+
+#[test]
+fn unverified_cursor_login_is_not_advertised_as_an_agent_capability() {
+    let mut health = raw_health_without_origin();
+    let probe = health.probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: vec![AgentProbe {
+            name: "cursor".into(),
+            version: Some("2026.09.02".into()),
+            auth: AgentAuth::UnknownWithReason("login unverified: user details unavailable"),
+            auth_by_profile: vec![(
+                "agents".into(),
+                AgentAuth::UnknownWithReason("login unverified: user details unavailable"),
+            )],
+        }],
+        env_profiles: vec![ProfileProbe {
+            name: "agents".into(),
+            secure: true,
+        }],
+        git_identity: true,
+        collected_at_millis: 10,
+        herdr: None,
+    });
+    probe.facts_age_millis = Some(1_000);
+
+    let observations = SchedulerProbeAdapter::observations(&origin_config(), &[health]).unwrap();
+    let capabilities = observations[0].capabilities();
+
+    assert!(
+        !capabilities
+            .iter()
+            .any(|capability| capability == "agent:cursor")
+    );
+    assert!(
+        !capabilities
+            .iter()
+            .any(|capability| capability == "agent:cursor@agents")
     );
 }
