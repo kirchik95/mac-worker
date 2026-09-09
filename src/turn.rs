@@ -1184,12 +1184,12 @@ pub fn prebind_session(
         task_store.bind_session(request.project_id(), request.task_id(), binding.clone())?;
         return Ok(TaskSessionResponse::new(binding));
     }
-    let argv = adapter_for(agent)
-        .prebind_session()
-        .ok_or_else(|| WorkerError::Task {
-            code: "TASK_CONFIG_INVALID",
-            message: "agent does not expose a session prebind command".into(),
-        })?;
+    let argv = adapter_for(agent).prebind_session().ok_or_else(|| {
+        WorkerError::task(
+            "TASK_CONFIG_INVALID",
+            "agent does not expose a session prebind command",
+        )
+    })?;
     let profile = match request.env_profile() {
         Some(name) => EnvProfile::load_for_home(
             &account_home

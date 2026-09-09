@@ -3,6 +3,7 @@ mod support;
 
 use std::{
     ffi::OsStr, os::unix::process::ExitStatusExt, path::PathBuf, process::ExitStatus, sync::Mutex,
+    time::Duration,
 };
 
 use mac_worker::{
@@ -28,7 +29,7 @@ use mac_worker::{
         RunnerIdentity, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
         TaskState, TaskStatus, TurnSummary, TurnTerminal,
     },
-    task_client::{TaskClient, TaskListFilter},
+    task_client::{TaskClient, TaskListFilter, WaitSelector},
     task_store::{TaskCloseRequest, TaskCloseResponse, TaskStatusResponse},
     transfer::HostOperation,
     turn_runner::InlineRunnerExecutor,
@@ -759,6 +760,97 @@ fn reconcile_leaves_dispatching_task_turn_with_live_owner_untouched() {
     let entry = store.queue_entry(turn_id).unwrap().unwrap();
     assert_eq!(entry.owner_opt(), Some(&live_owner));
     assert!(matches!(entry.state(), QueueState::Dispatching { .. }));
+}
+
+#[test]
+fn wait_does_not_return_while_a_finished_turn_is_still_dispatching() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let live_owner = owner(907);
+    let dead_owner = owner(908);
+    let task_id = TaskId::new(Uuid::from_u128(907));
+    let turn_id = job(908);
+    let record = task_record(
+        task_id,
+        turn_id,
+        TaskState::Open,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        Some(live_owner),
+    );
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    let store = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        DeadOwnerInspector { dead_owner },
+    )
+    .unwrap();
+    store.create_task(record).unwrap();
+    store
+        .write_turn_prompt(task_id, turn_id, "fixture prompt")
+        .unwrap();
+    cache_idle(&store, "mini-1", 10);
+    store
+        .enqueue(turn(
+            &store,
+            908,
+            10,
+            live_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            None,
+        ))
+        .unwrap();
+    store
+        .claim_next(live_owner, &["mini-1".into()], 11)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store.queue_entry(turn_id).unwrap().unwrap().state(),
+        QueueState::Dispatching { .. }
+    ));
+
+    let config = task_config();
+    let executor = InlineRunnerExecutor;
+    let client = TaskClient::new(&remote, &config, &paths, &store, &executor);
+    let error = client
+        .wait(
+            WaitSelector::Task(task_id),
+            Some(Duration::from_millis(350)),
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "WAIT_TIMEOUT");
+    assert!(matches!(
+        store.queue_entry(turn_id).unwrap().unwrap().state(),
+        QueueState::Dispatching { .. }
+    ));
+
+    store
+        .remove_task_turn_after_terminal(turn_id, live_owner)
+        .unwrap();
+    let error = client
+        .wait(
+            WaitSelector::Task(task_id),
+            Some(Duration::from_millis(350)),
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "WAIT_TIMEOUT");
+    assert!(store.load_task(task_id).unwrap().runner().is_some());
+    let error = client.close(task_id, true).unwrap_err();
+    assert_eq!(error.public_code(), "TASK_BUSY");
+    assert_eq!(error.public_message(), "task runner is still finishing");
+
+    store.record_runner(task_id, None).unwrap();
+    let waited = client
+        .wait(WaitSelector::Task(task_id), Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(waited.exit_code(), 0);
+    assert_eq!(waited.task_ids(), &[task_id]);
 }
 
 #[test]

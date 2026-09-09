@@ -50,10 +50,10 @@ pub(crate) struct RunnerLog {
     poisoned: bool,
 }
 fn invalid() -> WorkerError {
-    WorkerError::Task {
-        code: "LOG_CHECKPOINT_INVALID",
-        message: "runner log checkpoint is inconsistent".into(),
-    }
+    WorkerError::task(
+        "LOG_CHECKPOINT_INVALID",
+        "runner log checkpoint is inconsistent",
+    )
 }
 fn directory(root: &Path, task: TaskId, create: bool) -> Result<RootedDir, WorkerError> {
     let mut root = RootedDir::open(root)?;
@@ -103,9 +103,11 @@ impl RunnerLog {
     ) -> Result<crate::job::QueueEntry, WorkerError> {
         self.current_entry(store)?
             .filter(|entry| entry.owner_opt() == Some(&owner))
-            .ok_or_else(|| WorkerError::Task {
-                code: "TASK_BUSY",
-                message: "task turn ownership changed before finalization".into(),
+            .ok_or_else(|| {
+                WorkerError::task(
+                    "TASK_BUSY",
+                    "task turn ownership changed before finalization",
+                )
             })
     }
 
@@ -126,10 +128,10 @@ impl RunnerLog {
         let len = dir.validate_private_append_binding(&name, &file)?;
         if !dir.entry_exists(&sidecar)? {
             if len != 0 {
-                return Err(WorkerError::Task {
-                    code: "LOG_CHECKPOINT_MISSING",
-                    message: "nonempty legacy log has no native offsets".into(),
-                });
+                return Err(WorkerError::task(
+                    "LOG_CHECKPOINT_MISSING",
+                    "nonempty legacy log has no native offsets",
+                ));
             }
             let initial = Journal {
                 version: 1,

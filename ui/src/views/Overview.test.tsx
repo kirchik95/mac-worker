@@ -76,11 +76,15 @@ describe('Overview', () => {
   })
 
   it('surfaces the reason an unreachable worker is offline', () => {
-    const broken = worker({ health: 'unavailable', error: 'SSH_UNAVAILABLE' })
+    const broken = worker({
+      health: 'unavailable',
+      error: { code: 'SSH_UNAVAILABLE', message: 'ssh timed out connecting to mini-1' },
+    })
     render(<Overview snapshot={snapshot({ workers: [broken] })} />)
     const mini = card('mini-1')
 
     expect(within(mini).getByText('offline')).toBeInTheDocument()
+    expect(within(mini).getByText('ssh timed out connecting to mini-1')).toBeInTheDocument()
     expect(within(mini).getByText('SSH_UNAVAILABLE')).toBeInTheDocument()
   })
 

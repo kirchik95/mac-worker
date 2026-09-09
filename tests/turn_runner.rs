@@ -44,7 +44,7 @@ use mac_worker::{
         TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
         TaskStatus, TurnId, TurnSummary, TurnTerminal,
     },
-    task_client::{TaskClient, TaskSubmitRequest},
+    task_client::{TaskClient, TaskSubmitRequest, WaitSelector},
     task_store::{
         TaskCloseRequest, TaskCloseResponse, TaskPrepareRequest, TaskPrepareResponse,
         TaskStatusRequest, TaskStatusResponse,
@@ -2193,6 +2193,76 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
             TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
         assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
     }
+
+    let closed = client.close(task_id, true).unwrap();
+    assert_eq!(closed.status().state(), TaskState::Abandoned);
+}
+
+#[test]
+fn close_succeeds_immediately_after_wait_returns() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+
+    let state_root = tempfile::tempdir().unwrap();
+    let state_root_path = state_root.path().canonicalize().unwrap();
+    let paths = support::task_harness::paths(&state_root_path);
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = FetchFailingRunner::new();
+    let executor = InlineRunnerExecutor;
+    let client = TaskClient::new(&runner, &config, &paths, &state, &executor);
+
+    let report = client
+        .submit(
+            TaskSubmitRequest {
+                agent: AgentKind::Codex,
+                model: None,
+                effort: None,
+                prompt: "make the change".into(),
+                project: repo.root().to_path_buf(),
+                base: "main".into(),
+                wip: true,
+                source: None,
+                publish: None,
+                publish_branch: None,
+                cli_includes: Vec::new(),
+                limits: TaskLimits::default(),
+                close_policy: ClosePolicy::Never,
+                env_profile: None,
+                preference: WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                wait_for_capacity: true,
+                attached: false,
+                run_id: None,
+            },
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    let task_id = report.task_id();
+    let turn_id = state
+        .queue_entry_for_task_turn(task_id)
+        .unwrap()
+        .unwrap()
+        .job_id();
+
+    TurnRunner::new(&runner, &config, &paths, &state, &executor)
+        .run(task_id, turn_id, None)
+        .unwrap();
+
+    let waited = client
+        .wait(WaitSelector::Task(task_id), Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(waited.task_ids(), &[task_id]);
+    assert!(state.queue_entry_for_task_turn(task_id).unwrap().is_none());
+    assert_eq!(state.runner_liveness(task_id).unwrap(), None);
 
     let closed = client.close(task_id, true).unwrap();
     assert_eq!(closed.status().state(), TaskState::Abandoned);

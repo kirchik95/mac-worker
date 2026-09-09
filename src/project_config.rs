@@ -383,11 +383,8 @@ fn validate_task_text(value: &str, field: &str) -> Result<(), WorkerError> {
     Ok(())
 }
 
-fn task_config(message: impl Into<String>) -> WorkerError {
-    WorkerError::Task {
-        code: "TASK_CONFIG_INVALID",
-        message: message.into(),
-    }
+fn task_config(message: impl Into<std::borrow::Cow<'static, str>>) -> WorkerError {
+    WorkerError::task("TASK_CONFIG_INVALID", message)
 }
 
 fn validate_requirements(requires: &[String]) -> Result<(), WorkerError> {

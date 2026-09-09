@@ -181,6 +181,9 @@ pub enum SetupWarningCode {
     /// `herdr = true` but the verification probe's herdr fact is not
     /// `available`; the host is still installed.
     HerdrUnavailable,
+    /// First-launch warm-up of the promoted helper failed or timed out;
+    /// verification still decided the outcome.
+    WarmupFailed,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

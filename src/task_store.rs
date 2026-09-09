@@ -1972,11 +1972,11 @@ fn task_not_found() -> WorkerError {
     task_error("TASK_NOT_FOUND", "task metadata or workspace is absent")
 }
 
-fn task_error(code: &'static str, message: impl Into<String>) -> WorkerError {
-    WorkerError::Task {
-        code,
-        message: message.into(),
-    }
+fn task_error(
+    code: &'static str,
+    message: impl Into<std::borrow::Cow<'static, str>>,
+) -> WorkerError {
+    WorkerError::task(code, message)
 }
 
 fn push_close_warning(warnings: &mut Vec<String>, warning: &str) {

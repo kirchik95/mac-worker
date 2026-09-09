@@ -16,7 +16,7 @@ use std::{
 use mac_worker::{
     cli::{Cli, Command, HostCommand},
     config::WorkerEntry,
-    error::WorkerError,
+    error::{ProcessError, WorkerError},
     execute_with,
     install::Installer,
     output::CommandOutput,
@@ -176,6 +176,60 @@ fn setup_verification_refreshes_agent_facts_before_the_final_probe() {
     assert!(refresh < probe);
 }
 
+#[test]
+fn setup_warms_the_promoted_helper_with_version_before_the_verification_probe() {
+    // Gatekeeper's first-launch assessment must not share the 15 s probe
+    // deadline used later by `worker workers`. `--version` is the cheap
+    // launch that does not migrate layout or refresh facts.
+    let commands = generated_setup_commands();
+    let warmup = &commands.warmup;
+    let verification = &commands.verification;
+
+    assert!(
+        warmup.contains("\"$worker_path\" --version"),
+        "warm-up must launch the promoted helper: {warmup}"
+    );
+    assert!(
+        !warmup.contains("host migrate-layout"),
+        "warm-up must not touch host layout: {warmup}"
+    );
+    assert!(
+        !warmup.contains("host refresh-facts"),
+        "warm-up must not refresh facts: {warmup}"
+    );
+    assert!(
+        !warmup.contains("host probe"),
+        "warm-up must not run the verification probe: {warmup}"
+    );
+
+    let (_directory, current_exe) = executable_fixture();
+    let runner = RecordingRunner::returning_results(success_results());
+    let installer =
+        Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+    assert!(installer.install(&current_exe, &worker()).installed);
+    let requests = runner.requests();
+    let ssh: Vec<&ProcessRequest> = requests
+        .iter()
+        .filter(|request| request.program == "/usr/bin/ssh")
+        .collect();
+    let warmup_at = ssh
+        .iter()
+        .position(|request| request_command(request) == *warmup)
+        .expect("warm-up must be issued");
+    let verification_at = ssh
+        .iter()
+        .position(|request| request_command(request) == *verification)
+        .expect("verification must be issued");
+    let promotion_at = ssh
+        .iter()
+        .position(|request| request_command(request) == commands.promotion)
+        .expect("promotion must be issued");
+
+    assert!(promotion_at < warmup_at);
+    assert!(warmup_at < verification_at);
+    assert_eq!(ssh[warmup_at].policy, warmup_policy());
+}
+
 fn expected_setup_json(expected: &[u8]) -> Vec<u8> {
     String::from_utf8(expected.to_vec())
         .unwrap()
@@ -219,6 +273,14 @@ fn control_policy() -> ProcessPolicy {
         stdout_limit: 64 * 1024,
         stderr_limit: 64 * 1024,
         deadline: Duration::from_secs(30),
+    }
+}
+
+fn warmup_policy() -> ProcessPolicy {
+    ProcessPolicy {
+        stdout_limit: 64 * 1024,
+        stderr_limit: 64 * 1024,
+        deadline: Duration::from_secs(90),
     }
 }
 
@@ -274,6 +336,7 @@ fn success_results() -> Vec<Result<ProcessResult, WorkerError>> {
         Ok(result(0, b"", b"")),
         Ok(result(0, b"", b"")),
         Ok(result(0, b"promoted\n", b"")),
+        Ok(result(0, b"worker 0.1.0\n", b"")),
         Ok(result(0, valid_probe_json(), b"")),
         Ok(result(0, b"", b"")),
     ]
@@ -286,6 +349,7 @@ struct GeneratedSetupCommands {
     prepare: String,
     promotion: String,
     reconciliation: String,
+    warmup: String,
     verification: String,
     success_cleanup: String,
     cleanup: String,
@@ -322,7 +386,7 @@ fn generated_setup_commands() -> GeneratedSetupCommands {
     let requests = runner.requests();
 
     let mut rollback_results = success_results();
-    rollback_results[7] = Ok(result(255, b"", b"candidate failed"));
+    rollback_results[8] = Ok(result(255, b"", b"candidate failed"));
     let rollback_runner = RecordingRunner::returning_results(rollback_results);
     let rollback_installer = Installer::with_installation_id(
         &rollback_runner,
@@ -351,10 +415,11 @@ fn generated_setup_commands() -> GeneratedSetupCommands {
         prepare: request_command(&requests[4]),
         promotion: request_command(&requests[5]),
         reconciliation: request_command(&requests[6]),
-        verification: request_command(&requests[7]),
-        success_cleanup: request_command(&requests[8]),
+        warmup: request_command(&requests[7]),
+        verification: request_command(&requests[8]),
+        success_cleanup: request_command(&requests[9]),
         cleanup: request_command(&cleanup_requests[3]),
-        rollback: request_command(&rollback_requests[8]),
+        rollback: request_command(&rollback_requests[9]),
     }
 }
 
@@ -1120,7 +1185,7 @@ fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv
     assert_eq!(installed.protocol_version, Some(PROTOCOL_VERSION));
     assert!(installed.warnings.is_empty());
     let requests = runner.requests();
-    assert_eq!(requests.len(), 9);
+    assert_eq!(requests.len(), 10);
     assert_eq!(
         requests[0],
         ProcessRequest {
@@ -1138,8 +1203,9 @@ fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv
     for request in [&requests[3], &requests[4], &requests[5], &requests[6]] {
         assert_ssh_request_shape(request, control_policy());
     }
-    assert_ssh_request_shape(&requests[7], preflight_policy());
-    assert_ssh_request_shape(&requests[8], control_policy());
+    assert_ssh_request_shape(&requests[7], warmup_policy());
+    assert_ssh_request_shape(&requests[8], preflight_policy());
+    assert_ssh_request_shape(&requests[9], control_policy());
     assert!(
         requests
             .iter()
@@ -1276,7 +1342,7 @@ fn disconnected_promotion_reconciled_as_candidate_continues_to_probe() {
 
     assert!(installed.installed);
     let requests = runner.requests();
-    assert_eq!(requests.len(), 9);
+    assert_eq!(requests.len(), 10);
     assert_ssh_request_shape(&requests[5], control_policy());
     assert_ssh_request_shape(&requests[6], control_policy());
     let commands = generated_setup_commands();
@@ -1452,6 +1518,7 @@ fn failed_verification_restores_owned_backup_and_releases_lock() {
         result(0, b"", b""),
         result(0, b"", b""),
         result(0, b"promoted\n", b""),
+        result(0, b"worker 0.1.0\n", b""),
         result(255, b"", b"candidate failed"),
         result(0, b"", b""),
     ]);
@@ -1462,10 +1529,103 @@ fn failed_verification_restores_owned_backup_and_releases_lock() {
 
     assert!(!installed.installed);
     assert_eq!(installed.error_code.as_deref(), Some("VERIFICATION_FAILED"));
+    assert!(installed.warnings.is_empty());
     let requests = runner.requests();
-    assert_eq!(requests.len(), 9);
-    assert_ssh_request_shape(&requests[8], control_policy());
-    assert_remote_command(&requests[8], &generated_setup_commands().rollback);
+    assert_eq!(requests.len(), 10);
+    let commands = generated_setup_commands();
+    assert_remote_command(&requests[7], &commands.warmup);
+    assert_remote_command(&requests[8], &commands.verification);
+    assert_ssh_request_shape(&requests[9], control_policy());
+    assert_remote_command(&requests[9], &commands.rollback);
+}
+
+#[test]
+fn a_failed_or_stalled_warmup_does_not_fail_setup_when_verification_passes() {
+    // Warm-up exists only to absorb Gatekeeper's first launch; verification
+    // still decides, and a diagnostic warning is the only leftover.
+    let (_directory, current_exe) = executable_fixture();
+    for (label, warmup) in [
+        (
+            "nonzero",
+            Ok(result(1, b"", b"gatekeeper assessment failed")),
+        ),
+        (
+            "deadline",
+            Err(WorkerError::Process(ProcessError::DeadlineExceeded {
+                deadline: Duration::from_secs(90),
+            })),
+        ),
+    ] {
+        let mut results = success_results();
+        results[7] = warmup;
+        let runner = RecordingRunner::returning_results(results);
+        let installer =
+            Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+
+        let installed = installer.install(&current_exe, &worker());
+
+        assert!(installed.installed, "{label}");
+        assert_eq!(
+            installed.protocol_version,
+            Some(PROTOCOL_VERSION),
+            "{label}"
+        );
+        assert_eq!(installed.error_code, None, "{label}");
+        assert_eq!(installed.warnings.len(), 1, "{label}");
+        assert_eq!(
+            installed.warnings[0].code,
+            SetupWarningCode::WarmupFailed,
+            "{label}"
+        );
+        let requests = runner.requests();
+        let commands = generated_setup_commands();
+        assert_remote_command(&requests[7], &commands.warmup);
+        assert_remote_command(&requests[8], &commands.verification);
+        assert_remote_command(&requests[9], &commands.success_cleanup);
+        assert!(!contains_remote_command(&requests, &commands.rollback));
+    }
+}
+
+#[test]
+fn failed_verification_after_warmup_failure_still_rolls_back_and_keeps_warmup_on_the_message() {
+    // A warm-up miss must not change rollback, become a warning on the
+    // failure path, or hide the verification cause.
+    let (_directory, current_exe) = executable_fixture();
+    let runner = RecordingRunner::returning_results(vec![
+        Ok(result(0, valid_probe_json(), b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"match\n", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"", b"")),
+        Ok(result(0, b"promoted\n", b"")),
+        Err(WorkerError::Process(ProcessError::DeadlineExceeded {
+            deadline: Duration::from_secs(90),
+        })),
+        Ok(result(255, b"", b"candidate failed")),
+        Ok(result(0, b"", b"")),
+    ]);
+    let installer =
+        Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+
+    let installed = installer.install(&current_exe, &worker());
+
+    assert!(!installed.installed);
+    assert_eq!(installed.error_code.as_deref(), Some("VERIFICATION_FAILED"));
+    let message = installed.error_message.as_deref().unwrap();
+    assert!(message.contains("candidate failed"), "{message}");
+    assert!(message.contains("first-launch warm-up:"), "{message}");
+    assert!(
+        message.contains("process exceeded its 90s execution deadline"),
+        "{message}"
+    );
+    assert!(installed.warnings.is_empty());
+    let requests = runner.requests();
+    let commands = generated_setup_commands();
+    assert_eq!(requests.len(), 10);
+    assert_remote_command(&requests[7], &commands.warmup);
+    assert_remote_command(&requests[8], &commands.verification);
+    assert_remote_command(&requests[9], &commands.rollback);
 }
 
 #[test]
@@ -1474,7 +1634,7 @@ fn verified_install_with_cleanup_failure_stays_installed_with_typed_warning() {
     // targeted cleanup did not finish.
     let (_directory, current_exe) = executable_fixture();
     let mut results = success_results();
-    results[8] = Ok(result(1, b"", b"lock release failed"));
+    results[9] = Ok(result(1, b"", b"lock release failed"));
     let runner = RecordingRunner::returning_results(results);
     let installer =
         Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
@@ -1665,6 +1825,33 @@ fn setup_human_output_surfaces_cleanup_warning_after_verified_success() {
         output.render_human(),
         format!(
             "mini-1: installed (protocol {PROTOCOL_VERSION})\n  warning [CLEANUP_FAILED]: lock release failed"
+        )
+    );
+}
+
+#[test]
+fn setup_human_output_surfaces_warmup_warning_after_verified_success() {
+    let output = CommandOutput::Setup(SetupReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![SetupHostResult {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            installed: true,
+            protocol_version: Some(PROTOCOL_VERSION),
+            error_code: None,
+            error_message: None,
+            failure_kind: None,
+            warnings: vec![SetupWarning {
+                code: SetupWarningCode::WarmupFailed,
+                message: "process exceeded its 90s execution deadline".into(),
+            }],
+        }],
+    });
+
+    assert_eq!(
+        output.render_human(),
+        format!(
+            "mini-1: installed (protocol {PROTOCOL_VERSION})\n  warning [WARMUP_FAILED]: process exceeded its 90s execution deadline"
         )
     );
 }
@@ -1948,6 +2135,7 @@ fn executable_setup_verification_io_rolls_back_renders_report_and_exits_io() {
         Ok(result(0, b"", b"")),
         Ok(result(0, b"", b"")),
         Ok(result(0, b"promoted\n", b"")),
+        Ok(result(0, b"worker 0.1.0\n", b"")),
         Err(WorkerError::Io(std::io::Error::other(
             "verification result read failed",
         ))),
@@ -1960,7 +2148,7 @@ fn executable_setup_verification_io_rolls_back_renders_report_and_exits_io() {
         stdout,
         expected_setup_json(b"{\"kind\":\"setup\",\"protocol_version\":1,\"workers\":[{\"name\":\"mini-1\",\"ssh\":\"mac1\",\"installed\":false,\"protocol_version\":null,\"error_code\":\"VERIFICATION_FAILED\",\"error_message\":\"failed to launch SSH probe: I/O error: verification result read failed\",\"warnings\":[]}]}\n")
     );
-    assert_eq!(requests.len(), 9);
+    assert_eq!(requests.len(), 10);
 }
 
 #[test]
@@ -2246,7 +2434,7 @@ fn herdr_worker() -> WorkerEntry {
 fn install_with_verification_probe(probe: Vec<u8>, worker: &WorkerEntry) -> SetupHostResult {
     let (_directory, current_exe) = executable_fixture();
     let mut results = success_results();
-    results[7] = Ok(result(0, probe, b""));
+    results[8] = Ok(result(0, probe, b""));
     let runner = RecordingRunner::returning_results(results);
     let installer =
         Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());

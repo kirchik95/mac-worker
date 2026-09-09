@@ -727,10 +727,10 @@ impl TaskMeta {
         if matches!(self.source, TaskSource::Local { wip: true, .. })
             && self.publish.contains(&PublishMode::Push)
         {
-            return Err(WorkerError::Task {
-                code: "PUBLISH_REQUIRES_COMMITTED_BASE",
-                message: "publish push requires a committed base".into(),
-            });
+            return Err(WorkerError::task(
+                "PUBLISH_REQUIRES_COMMITTED_BASE",
+                "publish push requires a committed base",
+            ));
         }
         if self
             .publish
@@ -2076,9 +2076,6 @@ fn validate_pinned_worker(name: &str) -> Result<(), WorkerError> {
     Ok(())
 }
 
-fn task_config(message: impl Into<String>) -> WorkerError {
-    WorkerError::Task {
-        code: "TASK_CONFIG_INVALID",
-        message: message.into(),
-    }
+fn task_config(message: impl Into<std::borrow::Cow<'static, str>>) -> WorkerError {
+    WorkerError::task("TASK_CONFIG_INVALID", message)
 }

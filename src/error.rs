@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitKind {
@@ -55,7 +55,10 @@ pub enum WorkerError {
     #[error("agent error [{code}]: {message}")]
     Agent { code: &'static str, message: String },
     #[error("task error [{code}]: {message}")]
-    Task { code: &'static str, message: String },
+    Task {
+        code: &'static str,
+        message: Cow<'static, str>,
+    },
     #[error("command exited with status {code}")]
     CommandExit { code: u8 },
     #[error("I/O error: {0}")]
@@ -134,13 +137,26 @@ impl WorkerError {
             Self::Transport { .. } => "transport error".into(),
             Self::Git { .. } => "git error".into(),
             Self::Agent { .. } => "agent error".into(),
-            Self::Task { .. } => "task error".into(),
+            Self::Task { message, .. } => match message {
+                Cow::Borrowed(text) => (*text).into(),
+                Cow::Owned(_) => "task error".into(),
+            },
             Self::Config(_) => "configuration error".into(),
             Self::Unavailable(_) => "worker unavailable".into(),
             Self::Protocol(_) => "protocol error".into(),
             Self::CommandExit { .. } => "command exited".into(),
             Self::Io(_) => "I/O error".into(),
             Self::Process(_) => "process error".into(),
+        }
+    }
+
+    /// Task errors whose message is a `'static` literal are operator-facing
+    /// (`TASK_BUSY` reasons never contain a path or prompt). Owned strings stay
+    /// redacted because they are often formatted around a path or remote detail.
+    pub fn task(code: &'static str, message: impl Into<Cow<'static, str>>) -> Self {
+        Self::Task {
+            code,
+            message: message.into(),
         }
     }
 }
@@ -260,12 +276,25 @@ mod tests {
 
     #[test]
     fn task_wait_timeout_uses_the_infrastructure_exit_code() {
-        let error = WorkerError::Task {
-            code: "WAIT_TIMEOUT",
-            message: "task wait timed out without cancelling the task".into(),
-        };
+        let error = WorkerError::task(
+            "WAIT_TIMEOUT",
+            "task wait timed out without cancelling the task",
+        );
         assert_eq!(error.public_code(), "WAIT_TIMEOUT");
         assert_eq!(error.exit_code(), 70);
+        assert_eq!(
+            error.public_message(),
+            "task wait timed out without cancelling the task"
+        );
+    }
+
+    #[test]
+    fn static_task_busy_reasons_are_public_diagnostics() {
+        let error = WorkerError::task("TASK_BUSY", "task turn is being dispatched");
+        assert_eq!(error.public_code(), "TASK_BUSY");
+        assert_eq!(error.public_message(), "task turn is being dispatched");
+        assert!(error.public_message().len() <= 4096);
+        assert!(!error.public_message().as_bytes().contains(&0));
     }
 
     #[test]
@@ -418,10 +447,15 @@ mod tests {
             (
                 WorkerError::Task {
                     code: "TASK_NOT_FOUND",
-                    message: format!("no task at {planted_path}"),
+                    message: format!("no task at {planted_path}").into(),
                 },
                 "TASK_NOT_FOUND",
                 "task error",
+            ),
+            (
+                WorkerError::task("TASK_BUSY", "task turn is being dispatched"),
+                "TASK_BUSY",
+                "task turn is being dispatched",
             ),
             (
                 WorkerError::CommandExit { code: 64 },

@@ -1899,11 +1899,11 @@ fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerEr
     )
 }
 
-fn task_error(code: &'static str, message: impl Into<String>) -> WorkerError {
-    WorkerError::Task {
-        code,
-        message: message.into(),
-    }
+fn task_error(
+    code: &'static str,
+    message: impl Into<std::borrow::Cow<'static, str>>,
+) -> WorkerError {
+    WorkerError::task(code, message)
 }
 
 fn now_millis() -> Result<u64, WorkerError> {

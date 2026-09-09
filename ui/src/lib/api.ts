@@ -5,6 +5,9 @@ export type WorkerHealth = 'ready' | 'busy' | 'unavailable' | string
 export type TaskState = 'queued' | 'active' | 'open' | 'closed' | 'abandoned' | 'lost'
 export type AgentAuth = 'authenticated' | 'unauthenticated' | 'unknown'
 
+/** Matches DashboardError in src/dashboard/model.rs: `{ "code", "message" }`. */
+export type DashboardError = { code: string; message: string }
+
 export interface AgentFact {
   name: string
   version: string | null
@@ -29,7 +32,7 @@ export interface Worker {
     swap_used_bytes: number | null
     cpu_busy_percent: number | null
   }
-  error: string | null
+  error: DashboardError | null
   active_task: { task_id: string; title: string; agent: string; model: string | null; effort: string | null; turn_number: number } | null
 }
 
@@ -98,7 +101,7 @@ export interface Snapshot {
   api_version: number
   revision: number
   generated_at_millis: number
-  collection: { freshness: Freshness; errors: string[] }
+  collection: { freshness: Freshness; errors: DashboardError[] }
   project_defaults: Record<string, unknown> | null
   tasks: TaskRow[]
   runs: RunRow[]
@@ -224,6 +227,22 @@ export const questionText = (question: string | Question) =>
 
 export const questionOptions = (question: string | Question) =>
   typeof question === 'string' ? [] : question.options
+
+/**
+ * The host serializes DashboardError as `{ code, message }`. A legacy string is
+ * still shown as the message so a worker error cannot crash the page (React #31).
+ */
+export function describeError(error: unknown): { code: string | null; message: string } | null {
+  if (error == null) return null
+  if (typeof error === 'string') return error ? { code: null, message: error } : null
+  if (typeof error !== 'object') return null
+  const record = error as { code?: unknown; message?: unknown }
+  const code = typeof record.code === 'string' && record.code ? record.code : null
+  const message = typeof record.message === 'string' && record.message ? record.message : null
+  if (message) return { code, message }
+  if (code) return { code, message: code }
+  return null
+}
 
 export type LogStream = 'stdout' | 'stderr'
 

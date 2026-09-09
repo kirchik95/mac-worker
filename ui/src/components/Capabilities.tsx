@@ -2,7 +2,7 @@ import { Icon, type IconName } from '@/components/Icon'
 import { duration, shortId } from '@/lib/format'
 import { FACTS_TTL_MILLIS, advertisedAgents, factsAge, factsLapsed } from '@/lib/queue'
 import { cn } from '@/lib/utils'
-import type { Snapshot, Worker } from '@/lib/api'
+import { describeError, type Snapshot, type Worker } from '@/lib/api'
 
 function glyph(worker: Worker): IconName {
   if (worker.health === 'unavailable') return 'cpuOff'
@@ -93,6 +93,7 @@ export function Capabilities({ snapshot, now = Date.now() }: { snapshot: Snapsho
         {snapshot.workers.map((worker) => {
           const lapsed = factsLapsed(worker, now)
           const agents = advertisedAgents(worker)
+          const described = describeError(worker.error)
           return (
             <li key={worker.name} className="flex flex-wrap items-center gap-y-2 px-5.5 py-4">
               <span className="flex w-37.5 shrink-0 items-center gap-2.5">
@@ -125,8 +126,20 @@ export function Capabilities({ snapshot, now = Date.now() }: { snapshot: Snapsho
               <Facts worker={worker} now={now} />
 
               <span className="flex min-w-0 flex-1 flex-wrap items-center gap-2.5">
-                {worker.error ? (
-                  <span className="font-mono text-[11px] text-destructive">{worker.error}</span>
+                {described ? (
+                  <span
+                    className="flex min-w-0 items-center gap-2"
+                    title={described.code ?? undefined}
+                  >
+                    {described.code && described.code !== described.message ? (
+                      <span className="rounded-full border px-2.5 py-1 font-mono text-[11px] text-destructive">
+                        {described.code}
+                      </span>
+                    ) : null}
+                    <span className="min-w-0 truncate font-mono text-[11px] text-destructive">
+                      {described.message}
+                    </span>
+                  </span>
                 ) : agents.length === 0 ? (
                   <span className="font-mono text-[11px] text-observatory-hollow">
                     no agent reported

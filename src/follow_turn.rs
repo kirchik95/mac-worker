@@ -411,10 +411,7 @@ fn validate_digest_component(value: &str, label: &str) -> Result<(), WorkerError
 }
 
 fn invalid_component(label: &str) -> WorkerError {
-    WorkerError::Task {
-        code: "INVALID_COMPONENT",
-        message: format!("invalid {label}"),
-    }
+    WorkerError::task("INVALID_COMPONENT", format!("invalid {label}"))
 }
 
 fn not_a_turn() -> WorkerError {
