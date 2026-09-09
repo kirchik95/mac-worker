@@ -4,7 +4,9 @@ Use this reference only when `worker init` or `worker setup` reports an installa
 
 ## Recovery from retained setup state
 
-If `setup` reports `INSTALL_LOCKED`, `UNKNOWN_INSTALLATION_STATE`, or a cleanup/rollback warning, connect as the configured worker account and recover only the transaction owned by the retained lock. Do not retry setup until the following checks are complete. `VERIFICATION_FAILED` after a completed rollback is not a retained lock and can be retried; setup now warms the helper's first launch so Gatekeeper assessment is not the usual cause. Never use `sudo`, `rm -rf`, globs, or broad cleanup under `~/.local/share/mac-worker/setup/`.
+If `setup` reports `INSTALL_LOCKED`, `UNKNOWN_INSTALLATION_STATE`, or a cleanup/rollback warning, connect as the configured worker account and recover only the transaction owned by the retained lock. Do not retry setup until the following checks are complete. `VERIFICATION_FAILED` after a completed rollback is not a retained lock and can be retried. Never use `sudo`, `rm -rf`, globs, or broad cleanup under `~/.local/share/mac-worker/setup/`.
+
+To diagnose a slow facts refresh, run the hidden diagnostic `worker host refresh-facts --timing` as the worker account. On success it writes the facts, then prints one `timing ...` line per step and a `total` line to stderr; the output contains only agent and profile names, step names, millisecond timings, and bounded status fields, never command lines, paths, or profile values.
 
 Read and validate the exact lock owner before forming a transaction path. The owner file must contain exactly 32 lowercase hexadecimal bytes followed by one newline and no other bytes or lines. Recorded digest files use the same canonical representation with 64 lowercase hexadecimal bytes followed by one newline. Any other representation must retain the lock and stop.
 

@@ -71,7 +71,7 @@ For another agent or a custom name:
 worker init yourname@mini.local --name build-mini --agent opencode
 ```
 
-No manual TOML or extra SSH alias is required. The [worker setup guide](docs/setup-macos-worker.md) covers agent installation, login and keeping the Mac awake.
+No manual TOML or extra SSH alias is required. The [worker setup guide](docs/setup-macos-worker.md) covers agent installation, login and keeping the Mac awake. If a Cursor status check cannot fetch user details, `worker workers` reports `unknown (login unverified: user details unavailable)`; run `cursor-agent login` on the worker or use `CURSOR_API_KEY` in an env profile.
 
 ### 3. Get your first branch
 
@@ -152,7 +152,7 @@ worker workers --refresh
 
 The dashboard opens locally in your browser. To submit and return immediately, omit `--wait`.
 
-`worker task wait --task-id <task-id>` blocks until the task has settled and the previous runner has released ownership. Then run `worker task result <task-id>` for the outcome (finished, needs input, or failed).
+`worker task wait --task-id <task-id>` blocks until the task is quiescent and the previous runner has released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. `TASK_BUSY` and capacity errors such as `CAPABILITY_MISSING` include their reason. Then run `worker task result <task-id>` for the outcome (finished, needs input, or failed).
 
 If a turn fails, run `worker task logs <task-id>` to see agent diagnostics and the recorded failure reason. Use `--turn N` to inspect an earlier turn, or `--raw` for the original log bytes.
 
@@ -210,7 +210,7 @@ worker setup
 worker workers --refresh
 ```
 
-`worker setup` with no names updates every configured worker. It does not install or update the agents themselves. See [installation recovery](docs/setup-recovery.md) if an older installation needs attention.
+`worker setup` with no names updates every configured worker. It does not install or update the agents themselves. It warms each helper before verification and refreshes facts under a separate 120 s deadline. After successful verification, a warm-up failure is a `WARMUP_FAILED` warning and a slow facts refresh is a `FACTS_REFRESH_FAILED` warning; verification failure still rolls back the helper. See [installation recovery](docs/setup-recovery.md) if an older installation needs attention.
 
 To remove the CLI installed by the script, delete `~/.local/bin/worker` (or the file in your chosen `--bin-dir`). This keeps configuration and task history. See [removal and stored data](docs/setup-macos-worker.md#removal-and-stored-data) before retiring a worker.
 
