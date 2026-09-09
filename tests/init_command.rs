@@ -323,6 +323,7 @@ fn init_installs_a_missing_helper_through_the_transactional_installer() {
         reply(0, ""),
         reply(0, ""),
         reply(0, "promoted\n"),
+        reply(0, "worker 0.1.0\n"), // Gatekeeper warm-up (--version) before verification.
         reply(0, &ready),
         reply(0, ""), // Verified install, scoped cleanup.
         reply(0, ""),
