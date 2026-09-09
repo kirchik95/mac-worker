@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { ApiError, getJson, questionOptions, questionText, saveAgentSettings } from './api'
+import { ApiError, describeError, getJson, questionOptions, questionText, saveAgentSettings } from './api'
 
 describe('questions', () => {
   it('accepts both shapes the host emits', () => {
@@ -8,6 +8,25 @@ describe('questions', () => {
     expect(questionOptions('Which base?')).toEqual([])
     expect(questionText({ text: 'Which base?', options: ['main'] })).toBe('Which base?')
     expect(questionOptions({ text: 'Which base?', options: ['main'] })).toEqual(['main'])
+  })
+})
+
+describe('describeError', () => {
+  it('reads the object the host serializes', () => {
+    expect(describeError({ code: 'SSH_UNAVAILABLE', message: 'ssh timed out' })).toEqual({
+      code: 'SSH_UNAVAILABLE',
+      message: 'ssh timed out',
+    })
+  })
+
+  it('treats a legacy string as the message', () => {
+    expect(describeError('SSH_UNAVAILABLE')).toEqual({ code: null, message: 'SSH_UNAVAILABLE' })
+  })
+
+  it('does not throw on junk that is not a valid React child', () => {
+    expect(describeError({})).toBeNull()
+    expect(describeError({ code: 31 })).toBeNull()
+    expect(describeError(null)).toBeNull()
   })
 })
 

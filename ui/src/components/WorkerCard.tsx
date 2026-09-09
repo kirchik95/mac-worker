@@ -2,7 +2,7 @@ import { Metric } from '@/components/Metric'
 import { WorkerIcon } from '@/components/WorkerIcon'
 import { bytes, humanize, relativeTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import type { Worker } from '@/lib/api'
+import { describeError, type Worker } from '@/lib/api'
 
 type Presence = 'available' | 'running' | 'stale' | 'offline'
 
@@ -27,11 +27,20 @@ function elapsed(sinceMillis: number | null | undefined, now: number): string {
   return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
 }
 
+function ErrorCodeChip({ code }: { code: string }) {
+  return (
+    <span className="shrink-0 rounded-full border px-2 py-0.5 font-mono text-[10px] tracking-[0.06em] text-destructive">
+      {code}
+    </span>
+  )
+}
+
 export function WorkerCard({ worker, now }: { worker: Worker; now: number }) {
   const presence = presenceOf(worker)
   const task = worker.active_task
   const running = presence === 'running'
   const occupied = worker.slot.state !== 'idle'
+  const described = describeError(worker.error)
 
   return (
     <article
@@ -96,13 +105,23 @@ export function WorkerCard({ worker, now }: { worker: Worker; now: number }) {
           </>
         ) : (
           <>
-            <p className="truncate text-sm">
-              {presence === 'offline'
-                ? (worker.error ?? 'The worker did not answer')
-                : presence === 'stale'
-                  ? 'Observation is out of date'
-                  : 'Ready for the next task'}
-            </p>
+            {presence === 'offline' ? (
+              <p
+                className="flex min-w-0 items-center gap-2 text-sm"
+                title={described?.code ?? undefined}
+              >
+                {described?.code && described.code !== described.message ? (
+                  <ErrorCodeChip code={described.code} />
+                ) : null}
+                <span className="min-w-0 truncate">
+                  {described?.message ?? 'The worker did not answer'}
+                </span>
+              </p>
+            ) : (
+              <p className="truncate text-sm">
+                {presence === 'stale' ? 'Observation is out of date' : 'Ready for the next task'}
+              </p>
+            )}
             <div className="mt-2.5 flex items-baseline gap-3">
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
                 {presence === 'available'

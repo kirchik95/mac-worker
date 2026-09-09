@@ -1,7 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { snapshot, task } from '@/test/fixtures'
+import { snapshot, task, worker } from '@/test/fixtures'
 import App, { documentTitle } from './App'
 
 afterEach(() => {
@@ -64,5 +64,47 @@ describe('tab title', () => {
     render(<App />)
 
     await waitFor(() => expect(document.title).toBe('(1) mac-worker — pool'))
+  })
+})
+
+describe('worker errors', () => {
+  it('shows a worker error object as text instead of crashing (React #31)', async () => {
+    const withError = snapshot({
+      workers: [
+        worker({
+          health: 'unavailable',
+          error: {
+            code: 'SSH_UNAVAILABLE',
+            message: 'ssh timed out connecting to mini-1',
+          },
+        }),
+      ],
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => withError }),
+    )
+    render(<App />)
+
+    await waitFor(() =>
+      expect(screen.getAllByText('ssh timed out connecting to mini-1').length).toBeGreaterThan(0),
+    )
+    expect(screen.getAllByText('SSH_UNAVAILABLE').length).toBeGreaterThan(0)
+  })
+
+  it('still shows a legacy string error instead of crashing', async () => {
+    const withError = snapshot({
+      workers: [worker({ health: 'unavailable' })],
+    })
+    ;(withError.workers[0] as { error: unknown }).error = 'SSH_UNAVAILABLE'
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => withError }),
+    )
+    render(<App />)
+
+    await waitFor(() =>
+      expect(screen.getAllByText('SSH_UNAVAILABLE').length).toBeGreaterThan(0),
+    )
   })
 })
