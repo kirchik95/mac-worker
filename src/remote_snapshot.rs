@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, io,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{
@@ -542,22 +542,40 @@ impl<'a> RemoteSnapshotService<'a> {
     }
 
     fn recover_cache(&self, lease: &LeaseRecord, digest: &str) -> Result<RootedDir, WorkerError> {
-        let cache = self
-            .open_cache(lease, digest)?
-            .ok_or_else(manifest_mismatch)?;
-        let mode = (cache.root_metadata().map_err(unsafe_snapshot_io)?.st_mode & 0o7777) as u32;
-        match mode {
-            0o500 => {
-                validate_bundle(&cache, lease, digest, BundlePolicy::Cache)?;
+        // A sibling publisher may still be sealing the just-renamed digest
+        // (0o700 → 0o500). That changes mode and ctime of the same inode, so
+        // Prepared validation observes unstable metadata and would report
+        // UNSAFE_REMOTE_SNAPSHOT. Re-open until the sealed cache is stable,
+        // or seal crash residue once no sibling is still mutating it.
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(100))
+            .ok_or_else(unsafe_remote_snapshot)?;
+        loop {
+            let cache = self
+                .open_cache(lease, digest)?
+                .ok_or_else(manifest_mismatch)?;
+            match snapshot_root_mode(&cache)? {
+                0o500 => {
+                    validate_bundle(&cache, lease, digest, BundlePolicy::Cache)?;
+                    return Ok(cache);
+                }
+                0o700 => match seal_recovered_prepared_cache(&cache, lease, digest) {
+                    Ok(()) => return Ok(cache),
+                    Err(error) => {
+                        if snapshot_root_mode(&cache).ok() == Some(0o500) {
+                            validate_bundle(&cache, lease, digest, BundlePolicy::Cache)?;
+                            return Ok(cache);
+                        }
+                        if Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                },
+                _ => return Err(unsafe_remote_snapshot()),
             }
-            0o700 => {
-                validate_bundle(&cache, lease, digest, BundlePolicy::Prepared)?;
-                cache.seal_snapshot_root().map_err(unsafe_snapshot_io)?;
-                validate_bundle(&cache, lease, digest, BundlePolicy::Cache)?;
-            }
-            _ => return Err(unsafe_remote_snapshot()),
         }
-        Ok(cache)
     }
 
     fn read_receipt_optional(&self, job_id: JobId) -> Result<Option<VerifiedReceipt>, WorkerError> {
@@ -1226,6 +1244,21 @@ fn unsafe_snapshot_io(_error: io::Error) -> WorkerError {
     unsafe_remote_snapshot()
 }
 
+fn snapshot_root_mode(root: &RootedDir) -> Result<u32, WorkerError> {
+    Ok((root.root_metadata().map_err(unsafe_snapshot_io)?.st_mode & 0o7777) as u32)
+}
+
+fn seal_recovered_prepared_cache(
+    cache: &RootedDir,
+    lease: &LeaseRecord,
+    digest: &str,
+) -> Result<(), WorkerError> {
+    validate_bundle(cache, lease, digest, BundlePolicy::Prepared)?;
+    cache.seal_snapshot_root().map_err(unsafe_snapshot_io)?;
+    validate_bundle(cache, lease, digest, BundlePolicy::Cache)?;
+    Ok(())
+}
+
 fn map_verified_cleanup_io(error: io::Error) -> WorkerError {
     if error.raw_os_error() == Some(libc::ESTALE) {
         unsafe_remote_snapshot()
@@ -1829,6 +1862,8 @@ mod tests {
         // Two simultaneous live heavy leases are forbidden. Exercise the
         // shared cache boundary directly after each distinct token-owned root
         // has independently passed exact validation and conversion.
+        // The barrier is the no-replace claim, not a sealed-cache handshake:
+        // the loser must recover while the winner may still be sealing.
         let fixture = tempfile::tempdir().unwrap();
         let host_root = fixture.path().join("host");
         let store = HostStore::open(&host_root).unwrap();

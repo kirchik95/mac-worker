@@ -113,6 +113,9 @@ pub mod turn;
 pub mod turn_log;
 pub mod turn_runner;
 
+#[cfg(test)]
+pub(crate) mod test_sync;
+
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct RuntimeContext {

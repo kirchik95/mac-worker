@@ -821,6 +821,8 @@ impl SupervisorLauncher for SystemSupervisorLauncher {
         let exec_result = Pipe::cloexec()?;
         let dev_null = open_dev_null()?;
         let descriptor_ceiling = descriptor_ceiling()?;
+        #[cfg(test)]
+        let _fork_exclusion = crate::test_sync::HeldFork::acquire();
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(WorkerError::Io(io::Error::last_os_error()));
@@ -2753,6 +2755,8 @@ impl GatedChild {
         let go = Pipe::cloexec()?;
         let exec_result = Pipe::cloexec()?;
         let descriptor_ceiling = descriptor_ceiling()?;
+        #[cfg(test)]
+        let _fork_exclusion = crate::test_sync::HeldFork::acquire();
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(WorkerError::Io(io::Error::last_os_error()));
@@ -4008,7 +4012,7 @@ mod tests {
     use std::{
         fs::{self, OpenOptions},
         os::unix::{ffi::OsStringExt, process::CommandExt},
-        process::Command,
+        process::{Command, Stdio},
         sync::{
             Mutex,
             atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
@@ -4278,6 +4282,8 @@ mod tests {
         leader: libc::pid_t,
         identity: Option<ProcessIdentity>,
         armed: bool,
+        /// Lives until this child (and its descendants) are reaped.
+        _fork_exclusion: crate::test_sync::HeldFork,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4288,11 +4294,12 @@ mod tests {
     }
 
     impl RawProcessGroupGuard {
-        fn new(leader: libc::pid_t) -> Self {
+        fn new(leader: libc::pid_t, fork_exclusion: crate::test_sync::HeldFork) -> Self {
             Self {
                 leader,
                 identity: None,
                 armed: true,
+                _fork_exclusion: fork_exclusion,
             }
         }
 
@@ -4475,11 +4482,16 @@ mod tests {
     struct RawChildGuard {
         pid: libc::pid_t,
         armed: bool,
+        _fork_exclusion: crate::test_sync::HeldFork,
     }
 
     impl RawChildGuard {
-        fn new(pid: libc::pid_t) -> Self {
-            Self { pid, armed: true }
+        fn new(pid: libc::pid_t, fork_exclusion: crate::test_sync::HeldFork) -> Self {
+            Self {
+                pid,
+                armed: true,
+                _fork_exclusion: fork_exclusion,
+            }
         }
 
         fn disarm(&mut self) {
@@ -4679,15 +4691,47 @@ mod tests {
         }
     }
 
+    /// Drop extra inherited FDs after a test-only fork-without-exec.
+    /// Production children still walk `RLIMIT_NOFILE`; 4096 covers the FDs
+    /// this process actually opens without a million-syscall wait.
+    #[cfg(target_os = "macos")]
+    unsafe fn retain_descriptors_after_close_from(keep: &[RawFd]) {
+        const LIMIT: RawFd = 4096;
+        let mut descriptor = 3;
+        while descriptor < LIMIT {
+            if !keep.contains(&descriptor) {
+                unsafe { libc::close(descriptor) };
+            }
+            descriptor += 1;
+        }
+    }
+
+    /// Fork without exec. The returned `HeldFork` must live until the child
+    /// is reaped: a live child that still has copies of parent FDs makes a
+    /// later `LOCK_EX | LOCK_NB` on those files `WouldBlock`.
+    ///
+    /// The child forgets its copy and must `_exit`. Dropping `HeldFork` after
+    /// `fork` in a multithreaded process would lock a mutex the child copied.
+    #[cfg(target_os = "macos")]
+    fn fork_without_exec() -> (Option<crate::test_sync::HeldFork>, libc::pid_t) {
+        let exclusion = crate::test_sync::HeldFork::acquire();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            std::mem::forget(exclusion);
+            return (None, 0);
+        }
+        (Some(exclusion), pid)
+    }
+
     #[cfg(target_os = "macos")]
     fn spawn_blocked_group_leader(exit_code: u8) -> (RawProcessGroupGuard, OwnedFd) {
         let mut descriptors = [-1; 2];
         assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
-        let pid = unsafe { libc::fork() };
+        let (fork_exclusion, pid) = fork_without_exec();
         assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
         if pid == 0 {
             unsafe {
-                libc::close(descriptors[1]);
+                retain_descriptors_after_close_from(&[descriptors[0]]);
                 if libc::setpgid(0, 0) != 0 {
                     libc::_exit(70);
                 }
@@ -4696,7 +4740,8 @@ mod tests {
                 libc::_exit(exit_code as i32);
             }
         }
-        let mut cleanup = RawProcessGroupGuard::new(pid);
+        let mut cleanup =
+            RawProcessGroupGuard::new(pid, fork_exclusion.expect("parent keeps HeldFork"));
         cleanup.bind_identity(wait_for_group_identity(pid));
         assert_eq!(unsafe { libc::close(descriptors[0]) }, 0);
         (cleanup, unsafe { OwnedFd::from_raw_fd(descriptors[1]) })
@@ -4707,10 +4752,17 @@ mod tests {
         let mut descriptors = [-1; 2];
         assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
         let gate = RawDescendantGate::new().unwrap();
-        let leader = unsafe { libc::fork() };
+        let (fork_exclusion, leader) = fork_without_exec();
         assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
         if leader == 0 {
             unsafe {
+                retain_descriptors_after_close_from(&[
+                    descriptors[1],
+                    gate.ready.read.as_raw_fd(),
+                    gate.ready.write.as_raw_fd(),
+                    gate.go.read.as_raw_fd(),
+                    gate.go.write.as_raw_fd(),
+                ]);
                 libc::close(descriptors[0]);
                 if libc::setpgid(0, 0) != 0 {
                     libc::_exit(70);
@@ -4723,6 +4775,7 @@ mod tests {
                     libc::_exit(70);
                 }
                 if descendant == 0 {
+                    retain_descriptors_after_close_from(&[descriptors[1]]);
                     libc::signal(libc::SIGHUP, libc::SIG_IGN);
                     libc::signal(libc::SIGTERM, libc::SIG_IGN);
                     let own_pid = libc::getpid();
@@ -4740,7 +4793,8 @@ mod tests {
                 }
             }
         }
-        let mut cleanup = RawProcessGroupGuard::new(leader);
+        let mut cleanup =
+            RawProcessGroupGuard::new(leader, fork_exclusion.expect("parent keeps HeldFork"));
         gate.parent_bind_and_go(&mut cleanup, |pid| Ok(wait_for_group_identity(pid)))
             .unwrap();
         assert_eq!(unsafe { libc::close(descriptors[1]) }, 0);
@@ -4764,10 +4818,18 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(report.as_mut_ptr()) }, 0);
         assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
         let gate = RawDescendantGate::new().unwrap();
-        let leader = unsafe { libc::fork() };
+        let (fork_exclusion, leader) = fork_without_exec();
         assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
         if leader == 0 {
             unsafe {
+                retain_descriptors_after_close_from(&[
+                    report[1],
+                    release[0],
+                    gate.ready.read.as_raw_fd(),
+                    gate.ready.write.as_raw_fd(),
+                    gate.go.read.as_raw_fd(),
+                    gate.go.write.as_raw_fd(),
+                ]);
                 libc::close(report[0]);
                 libc::close(release[1]);
                 if libc::setpgid(0, 0) != 0 {
@@ -4781,6 +4843,7 @@ mod tests {
                     libc::_exit(70);
                 }
                 if descendant == 0 {
+                    retain_descriptors_after_close_from(&[report[1], release[0]]);
                     let own_pid = libc::getpid();
                     libc::write(
                         report[1],
@@ -4799,7 +4862,8 @@ mod tests {
                 }
             }
         }
-        let mut cleanup = RawProcessGroupGuard::new(leader);
+        let mut cleanup =
+            RawProcessGroupGuard::new(leader, fork_exclusion.expect("parent keeps HeldFork"));
         gate.parent_bind_and_go(&mut cleanup, |pid| Ok(wait_for_group_identity(pid)))
             .unwrap();
         assert_eq!(unsafe { libc::close(report[1]) }, 0);
@@ -4825,10 +4889,11 @@ mod tests {
         let mut ready = [-1; 2];
         assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
         assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
-        let leader = unsafe { libc::fork() };
+        let (fork_exclusion, leader) = fork_without_exec();
         assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
         if leader == 0 {
             unsafe {
+                retain_descriptors_after_close_from(&[release[0], ready[1]]);
                 libc::close(release[1]);
                 libc::close(ready[0]);
                 if libc::setpgid(0, 0) != 0 {
@@ -4850,7 +4915,8 @@ mod tests {
                 libc::_exit(exit_code as i32);
             }
         }
-        let mut cleanup = RawProcessGroupGuard::new(leader);
+        let mut cleanup =
+            RawProcessGroupGuard::new(leader, fork_exclusion.expect("parent keeps HeldFork"));
         cleanup.bind_identity(wait_for_group_identity(leader));
         assert_eq!(unsafe { libc::close(release[0]) }, 0);
         assert_eq!(unsafe { libc::close(ready[1]) }, 0);
@@ -4872,11 +4938,15 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn fence_test_subprocess_descriptors(command: &mut Command) -> Result<(), WorkerError> {
-        let descriptor_ceiling = descriptor_ceiling()?;
+        // SETFD CLOEXEC, never close: libstd reports exec failures over a
+        // pipe in this range, and closing it aborts with
+        // `output.write(&bytes).is_ok()`. Walk a modest bound so this
+        // fork-before-exec window stays short under parallel libtest.
+        const LIMIT: RawFd = 4096;
         unsafe {
-            command.pre_exec(move || {
+            command.pre_exec(|| {
                 let mut descriptor = 3;
-                while descriptor < descriptor_ceiling {
+                while descriptor < LIMIT {
                     let flags = libc::fcntl(descriptor, libc::F_GETFD);
                     if flags < 0 {
                         let error = io::Error::last_os_error();
@@ -4965,9 +5035,16 @@ mod tests {
             .env(SENTINEL_FD_ENV, sentinel.as_raw_fd().to_string())
             .env(SENTINEL_DEVICE_ENV, sentinel_stat.st_dev.to_string())
             .env(SENTINEL_INODE_ENV, sentinel_stat.st_ino.to_string())
-            .args(["--exact", test_name, "--nocapture", "--test-threads=1"]);
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         fence_test_subprocess_descriptors(&mut command).unwrap();
-        let output = command.output().unwrap();
+        let output = {
+            let _fork_exclusion = crate::test_sync::HeldFork::acquire();
+            let child = command.spawn().unwrap();
+            drop(_fork_exclusion);
+            child.wait_with_output().unwrap()
+        };
         assert!(
             output.status.success(),
             "stdout={} stderr={}",
@@ -5028,10 +5105,17 @@ mod tests {
         let marker = Pipe::cloexec().unwrap();
         let gate = RawDescendantGate::new().unwrap();
         let started = Instant::now();
-        let leader = unsafe { libc::fork() };
+        let (fork_exclusion, leader) = fork_without_exec();
         assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
         if leader == 0 {
             unsafe {
+                retain_descriptors_after_close_from(&[
+                    marker.write.as_raw_fd(),
+                    gate.ready.read.as_raw_fd(),
+                    gate.ready.write.as_raw_fd(),
+                    gate.go.read.as_raw_fd(),
+                    gate.go.write.as_raw_fd(),
+                ]);
                 libc::close(marker.read.as_raw_fd());
                 if libc::setpgid(0, 0) != 0 || !gate.child_ready_then_wait_for_go() {
                     libc::_exit(0);
@@ -5041,6 +5125,7 @@ mod tests {
                     libc::_exit(70);
                 }
                 if descendant == 0 {
+                    retain_descriptors_after_close_from(&[marker.write.as_raw_fd()]);
                     let created = 1_u8;
                     libc::write(
                         marker.write.as_raw_fd(),
@@ -5057,7 +5142,8 @@ mod tests {
         }
 
         // Ownership is armed before any parent-side handshake or identity step.
-        let cleanup = RawProcessGroupGuard::new(leader);
+        let cleanup =
+            RawProcessGroupGuard::new(leader, fork_exclusion.expect("parent keeps HeldFork"));
         drop(marker.write);
         let outcome = match mode {
             InjectedBindMode::Panic => {
@@ -5569,14 +5655,16 @@ mod tests {
                 let inspector = TransientLauncherInspector {
                     ambiguous: AtomicBool::new(true),
                 };
-                let pid = unsafe { libc::fork() };
+                let (fork_exclusion, pid) = fork_without_exec();
                 assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
                 if pid == 0 {
+                    unsafe { retain_descriptors_after_close_from(&[]) };
                     loop {
                         unsafe { libc::pause() };
                     }
                 }
-                let mut cleanup = RawChildGuard::new(pid);
+                let mut cleanup =
+                    RawChildGuard::new(pid, fork_exclusion.expect("parent keeps HeldFork"));
                 let started = Instant::now();
 
                 let error =

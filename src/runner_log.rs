@@ -48,6 +48,9 @@ pub(crate) struct RunnerLog {
     journal: Journal,
     encoded: Vec<u8>,
     poisoned: bool,
+    /// Dropped after `file` so the exclusion covers the locked FD's lifetime.
+    #[cfg(test)]
+    _fork_exclusion: crate::test_sync::HeldFlock,
 }
 fn invalid() -> WorkerError {
     WorkerError::task(
@@ -112,6 +115,8 @@ impl RunnerLog {
     }
 
     pub(crate) fn open(root: &Path, task_id: TaskId, turn_id: TurnId) -> Result<Self, WorkerError> {
+        #[cfg(test)]
+        let fork_exclusion = crate::test_sync::HeldFlock::acquire();
         let dir = directory(root, task_id, true)?;
         let name = format!("{turn_id}.log");
         let sidecar = format!("{turn_id}.checkpoint.json");
@@ -155,6 +160,8 @@ impl RunnerLog {
             journal,
             encoded,
             poisoned: false,
+            #[cfg(test)]
+            _fork_exclusion: fork_exclusion,
         };
         writer.recover()?;
         Ok(writer)

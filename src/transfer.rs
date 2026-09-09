@@ -419,7 +419,12 @@ fn execute_server_child(
             Ok(())
         });
     }
-    let status = command.spawn()?.wait()?;
+    let status = {
+        #[cfg(test)]
+        let _fork_exclusion = crate::test_sync::HeldFork::acquire();
+        command.spawn()?
+    }
+    .wait()?;
     if status.success() {
         return Ok(());
     }
