@@ -45,7 +45,11 @@ pub enum WorkerError {
     #[error("snapshot error [{code}]: {message}")]
     Snapshot { code: &'static str, message: String },
     #[error("capacity error [{code}]: {message}")]
-    Capacity { code: &'static str, message: String },
+    Capacity {
+        code: &'static str,
+        message: Cow<'static, str>,
+        public: bool,
+    },
     #[error("queue error [{code}]: {message}")]
     Queue { code: &'static str, message: String },
     #[error("transport error [{code}]: {message}")]
@@ -132,7 +136,15 @@ impl WorkerError {
         match self {
             Self::Project { .. } => "project error".into(),
             Self::Snapshot { .. } => "snapshot error".into(),
-            Self::Capacity { .. } => "capacity error".into(),
+            Self::Capacity {
+                message, public, ..
+            } => {
+                if *public {
+                    message.as_ref().to_owned()
+                } else {
+                    "capacity error".into()
+                }
+            }
             Self::Queue { .. } => "queue error".into(),
             Self::Transport { .. } => "transport error".into(),
             Self::Git { .. } => "git error".into(),
@@ -157,6 +169,28 @@ impl WorkerError {
         Self::Task {
             code,
             message: message.into(),
+        }
+    }
+
+    /// Capacity errors whose message is a `'static` literal are operator-facing.
+    /// Admission reasons such as `CAPACITY_BUSY` are fixed inventory text, not a
+    /// path, prompt, or env value.
+    pub fn capacity(code: &'static str, message: &'static str) -> Self {
+        Self::Capacity {
+            code,
+            message: Cow::Borrowed(message),
+            public: true,
+        }
+    }
+
+    /// Formatted capacity messages that contain only inventory worker names and
+    /// capability names. Those strings come from the operator's own config and
+    /// requirements, not from a path, prompt, or env value.
+    pub fn capacity_public(code: &'static str, message: String) -> Self {
+        Self::Capacity {
+            code,
+            message: Cow::Owned(message),
+            public: true,
         }
     }
 }
@@ -237,10 +271,7 @@ mod tests {
                 ExitKind::Infrastructure,
             ),
             (
-                WorkerError::Capacity {
-                    code: "CAPACITY_BUSY",
-                    message: "one heavy job is already active".into(),
-                },
+                WorkerError::capacity("CAPACITY_BUSY", "one heavy job is already active"),
                 ExitKind::Capacity,
             ),
             (
@@ -295,6 +326,51 @@ mod tests {
         assert_eq!(error.public_message(), "task turn is being dispatched");
         assert!(error.public_message().len() <= 4096);
         assert!(!error.public_message().as_bytes().contains(&0));
+    }
+
+    #[test]
+    fn static_capacity_busy_reasons_are_public_diagnostics() {
+        let error = WorkerError::capacity(
+            "CAPACITY_BUSY",
+            "no eligible worker currently has an available heavy slot",
+        );
+        assert_eq!(error.public_code(), "CAPACITY_BUSY");
+        assert_eq!(
+            error.public_message(),
+            "no eligible worker currently has an available heavy slot"
+        );
+        assert!(error.public_message().len() <= 4096);
+        assert!(!error.public_message().as_bytes().contains(&0));
+    }
+
+    #[test]
+    fn capacity_messages_built_from_worker_and_capability_names_are_public() {
+        let error = WorkerError::capacity_public(
+            "CAPABILITY_MISSING",
+            format!(
+                "pinned worker {worker} is missing required capabilities: {capability}",
+                worker = "mini-1",
+                capability = "agent:cursor@agents"
+            ),
+        );
+        assert_eq!(error.public_code(), "CAPABILITY_MISSING");
+        assert_eq!(
+            error.public_message(),
+            "pinned worker mini-1 is missing required capabilities: agent:cursor@agents"
+        );
+    }
+
+    #[test]
+    fn formatted_capacity_messages_with_other_content_stay_redacted() {
+        let planted_path = "/Users/alice/PLANTED_PUBLIC_PATH/secret.toml";
+        let error = WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            message: format!("busy lease at {planted_path}").into(),
+            public: false,
+        };
+        assert_eq!(error.public_code(), "CAPACITY_BUSY");
+        assert_eq!(error.public_message(), "capacity error");
+        assert!(!error.public_message().contains(planted_path));
     }
 
     #[test]
@@ -383,7 +459,8 @@ mod tests {
             (
                 WorkerError::Capacity {
                     code: "CAPACITY_BUSY",
-                    message: format!("busy lease {CLIENT_ID} {LEASE_TOKEN}",),
+                    message: format!("busy lease {CLIENT_ID} {LEASE_TOKEN}").into(),
+                    public: false,
                 },
                 "CAPACITY_BUSY",
                 "capacity error",
@@ -392,9 +469,30 @@ mod tests {
                 WorkerError::Capacity {
                     code: "busy!",
                     message: planted_secret.into(),
+                    public: false,
                 },
                 "CAPACITY",
                 "capacity error",
+            ),
+            (
+                WorkerError::capacity(
+                    "CAPACITY_BUSY",
+                    "no eligible worker currently has an available heavy slot",
+                ),
+                "CAPACITY_BUSY",
+                "no eligible worker currently has an available heavy slot",
+            ),
+            (
+                WorkerError::capacity_public(
+                    "CAPABILITY_MISSING",
+                    format!(
+                        "pinned worker {worker} is missing required capabilities: {capability}",
+                        worker = "mini-1",
+                        capability = "agent:cursor@agents"
+                    ),
+                ),
+                "CAPABILITY_MISSING",
+                "pinned worker mini-1 is missing required capabilities: agent:cursor@agents",
             ),
             (
                 WorkerError::Queue {

@@ -3021,20 +3021,20 @@ fn validate_prompt(prompt: &str) -> Result<(), WorkerError> {
 }
 
 fn capacity_busy() -> WorkerError {
-    WorkerError::Capacity {
-        code: "CAPACITY_BUSY",
-        message: "no eligible worker currently has an available heavy slot".into(),
-    }
+    WorkerError::capacity(
+        "CAPACITY_BUSY",
+        "no eligible worker currently has an available heavy slot",
+    )
 }
 
 fn capability_missing(worker: &str, missing: &[String]) -> WorkerError {
-    WorkerError::Capacity {
-        code: "CAPABILITY_MISSING",
-        message: format!(
+    WorkerError::capacity_public(
+        "CAPABILITY_MISSING",
+        format!(
             "pinned worker {worker} is missing required capabilities: {}",
             missing.join(", ")
         ),
-    }
+    )
 }
 
 fn task_error(code: &'static str, message: impl Into<Cow<'static, str>>) -> WorkerError {

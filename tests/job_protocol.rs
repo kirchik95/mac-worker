@@ -501,11 +501,7 @@ fn streaming_events_are_versioned_strict_ndjson_records() {
 fn protocol_and_exit_kinds_keep_their_wire_contracts() {
     assert_eq!(PROTOCOL_VERSION, 6);
     assert_eq!(
-        WorkerError::Capacity {
-            code: "CAPACITY_BUSY",
-            message: "busy".into()
-        }
-        .exit_kind(),
+        WorkerError::capacity("CAPACITY_BUSY", "busy").exit_kind(),
         ExitKind::Capacity
     );
     assert_eq!(

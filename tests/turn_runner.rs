@@ -4614,6 +4614,60 @@ fn a_pinned_submit_whose_refresh_fails_reports_the_worker_not_its_capabilities()
 }
 
 #[test]
+fn a_pinned_submit_for_a_missing_agent_prints_the_capability_reason() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+
+    let state_root = tempfile::tempdir().unwrap();
+    let state_root_path = state_root.path().canonicalize().unwrap();
+    let paths = support::task_harness::paths(&state_root_path);
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let runner = AcceptedThenTerminalRunner::new();
+    let executor = InlineRunnerExecutor;
+
+    let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
+        .submit(
+            TaskSubmitRequest {
+                agent: AgentKind::Cursor,
+                model: None,
+                effort: None,
+                prompt: "make the change".into(),
+                project: repo.root().to_path_buf(),
+                base: "main".into(),
+                wip: true,
+                source: None,
+                publish: None,
+                publish_branch: None,
+                cli_includes: Vec::new(),
+                limits: TaskLimits::default(),
+                close_policy: ClosePolicy::Never,
+                env_profile: Some("agents".into()),
+                preference: WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                wait_for_capacity: false,
+                attached: false,
+                run_id: None,
+            },
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        format!("{}: {}", error.public_code(), error.public_message()),
+        "CAPABILITY_MISSING: pinned worker mini-1 is missing required capabilities: agent:cursor@agents"
+    );
+}
+
+#[test]
 fn a_runner_for_a_row_held_by_another_identity_stops_after_the_adoption_wait() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
     let fixture = AcceptedThenTerminalFixture::new();

@@ -3205,6 +3205,48 @@ mod tests {
     }
 
     #[test]
+    fn json_error_events_follow_capacity_public_message_rules() {
+        let public = WorkerError::capacity(
+            "CAPACITY_BUSY",
+            "no eligible worker currently has an available heavy slot",
+        );
+        let mut stdout = Vec::new();
+        super::write_json_error_event(&mut stdout, &public).unwrap();
+        let event: crate::job::JsonEvent =
+            serde_json::from_slice(stdout.strip_suffix(b"\n").unwrap()).unwrap();
+        match event {
+            crate::job::JsonEvent::Error { code, message, .. } => {
+                assert_eq!(code, "CAPACITY_BUSY");
+                assert_eq!(
+                    message,
+                    "no eligible worker currently has an available heavy slot"
+                );
+            }
+            other => panic!("expected a JSON error event, got {other:?}"),
+        }
+
+        let planted_path = "/Users/alice/PLANTED_PUBLIC_PATH";
+        let redacted = WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            message: format!("busy lease at {planted_path}").into(),
+            public: false,
+        };
+        stdout.clear();
+        super::write_json_error_event(&mut stdout, &redacted).unwrap();
+        let event: crate::job::JsonEvent =
+            serde_json::from_slice(stdout.strip_suffix(b"\n").unwrap()).unwrap();
+        match event {
+            crate::job::JsonEvent::Error { code, message, .. } => {
+                assert_eq!(code, "CAPACITY_BUSY");
+                assert_eq!(message, "capacity error");
+            }
+            other => panic!("expected a JSON error event, got {other:?}"),
+        }
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(!text.contains(planted_path));
+    }
+
+    #[test]
     fn unknown_toml_fields_are_rejected() {
         let error = Config::parse(
             "version = 1\nunknown = true\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1",

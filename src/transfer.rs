@@ -1197,9 +1197,12 @@ fn decode_host_control_error(bytes: &[u8]) -> Option<WorkerError> {
         _ => None,
     };
     if let Some(code) = capacity_code {
+        // Host-control admission payloads are owned strings from the wire;
+        // they are not proven to contain only worker and capability names.
         return Some(WorkerError::Capacity {
             code,
-            message: error.error().message().to_owned(),
+            message: error.error().message().to_owned().into(),
+            public: false,
         });
     }
     Some(WorkerError::Protocol(format!(

@@ -1897,10 +1897,10 @@ fn ranked_worker_names(
 }
 
 fn capacity_busy() -> WorkerError {
-    WorkerError::Capacity {
-        code: "CAPACITY_BUSY",
-        message: "no eligible worker currently has an available heavy slot".into(),
-    }
+    WorkerError::capacity(
+        "CAPACITY_BUSY",
+        "no eligible worker currently has an available heavy slot",
+    )
 }
 
 fn dispatch_cancelled() -> WorkerError {

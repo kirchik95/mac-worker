@@ -93,10 +93,7 @@ fn phase_five_d_json_output_keeps_publication_codes_sanitized() {
             code: "ENV_PROFILE_PERMISSIONS",
             message: "named profile is insecure".into(),
         },
-        WorkerError::Capacity {
-            code: "CAPABILITY_MISSING",
-            message: "pinned worker lacks origin:<host>".into(),
-        },
+        WorkerError::capacity("CAPABILITY_MISSING", "pinned worker lacks origin:<host>"),
         WorkerError::Project {
             code: "TASK_CONFIG_INVALID",
             message: "publish branch is already reserved".into(),
