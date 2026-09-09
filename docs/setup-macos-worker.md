@@ -227,7 +227,7 @@ worker setup
 worker workers --refresh
 ```
 
-Use inventory names to update a subset, for example `worker setup mini`. These commands update mac-worker helpers, not agents or project dependencies. Setup warms up the helper's first launch before the 15 s verification probe, so macOS Gatekeeper's initial assessment is not mistaken for a failed install. If a helper reports a retained installation lock or an outdated layout, use [installation recovery](setup-recovery.md).
+Use inventory names to update a subset, for example `worker setup mini`. These commands update mac-worker helpers, not agents or project dependencies. Setup warms up the helper's first launch before the 15 s verification probe, so macOS Gatekeeper's initial assessment is not mistaken for a failed install. Setup refreshes the worker's agent facts under its own deadline, and reports `FACTS_REFRESH_FAILED` instead of failing when that refresh is slow. If a helper reports a retained installation lock or an outdated layout, use [installation recovery](setup-recovery.md).
 
 ## Removal and stored data
 

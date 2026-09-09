@@ -8,8 +8,8 @@ use crate::{
     error::WorkerError,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
-        HERDR_UNAVAILABLE_MESSAGE, HealthStatus, PROTOCOL_VERSION, ProbeResponse, SetupFailureKind,
-        SetupHostResult, SetupWarning, SetupWarningCode,
+        FACTS_REFRESH_FAILED_MESSAGE, HERDR_UNAVAILABLE_MESSAGE, HealthStatus, PROTOCOL_VERSION,
+        ProbeResponse, SetupFailureKind, SetupHostResult, SetupWarning, SetupWarningCode,
     },
     transport::{SshTransport, ssh_request},
 };
@@ -267,30 +267,40 @@ impl<'a> Installer<'a> {
             .err()
             .map(|failure| failure.message);
 
+        // `host refresh-facts` launches every installed agent and can take
+        // ~14 s on a loaded mini; the 15 s probe deadline must not absorb
+        // that. Layout migration stays a hard failure (exit 77), matching
+        // the former verification script.
+        let facts_refresh = ssh_request(
+            worker,
+            facts_refresh_command(&id, &digest),
+            facts_refresh_policy(),
+        );
+        let facts_refresh_failure = match run_facts_refresh(self.runner, &facts_refresh) {
+            Ok(failure) => failure,
+            Err(failure) => {
+                return self.rollback_unverified_promotion(
+                    worker,
+                    &id,
+                    failure.message,
+                    warmup_failure.as_deref(),
+                    failure.kind,
+                );
+            }
+        };
+
         let (health, probe_failure_kind) = SshTransport::new(self.runner)
             .probe_with_command_and_failure_kind(worker, verification_command(&id, &digest));
         if health.status != HealthStatus::Ready {
-            let mut message = health
+            let message = health
                 .error_message
                 .unwrap_or_else(|| "installed worker failed verification".into());
-            if let Some(warmup) = &warmup_failure {
-                message = format!("{message}; first-launch warm-up: {warmup}");
-            }
-            let rollback = ssh_request(worker, rollback_command(&id), control_policy());
-            let warnings = run_success(self.runner, &rollback, SetupFailureKind::Infrastructure)
-                .err()
-                .map(|failure| SetupWarning {
-                    code: SetupWarningCode::RollbackFailed,
-                    message: failure.message,
-                })
-                .into_iter()
-                .collect();
-            return failed(
+            return self.rollback_unverified_promotion(
                 worker,
-                "VERIFICATION_FAILED",
+                &id,
                 message,
+                warmup_failure.as_deref(),
                 probe_failure_kind.unwrap_or(SetupFailureKind::Infrastructure),
-                warnings,
             );
         }
 
@@ -313,6 +323,12 @@ impl<'a> Installer<'a> {
             warnings.push(SetupWarning {
                 code: SetupWarningCode::WarmupFailed,
                 message,
+            });
+        }
+        if let Some(message) = facts_refresh_failure {
+            warnings.push(SetupWarning {
+                code: SetupWarningCode::FactsRefreshFailed,
+                message: format!("{FACTS_REFRESH_FAILED_MESSAGE}: {message}"),
             });
         }
         warnings.extend(self.success_cleanup_warnings(worker, &id, &digest));
@@ -457,6 +473,38 @@ impl<'a> Installer<'a> {
             })
             .into_iter()
             .collect()
+    }
+
+    /// Roll back a promoted helper that did not pass verification. Layout
+    /// migration failures use this same path so an outdated host is never
+    /// left active.
+    fn rollback_unverified_promotion(
+        &self,
+        worker: &WorkerEntry,
+        id: &str,
+        mut message: String,
+        warmup_failure: Option<&str>,
+        failure_kind: SetupFailureKind,
+    ) -> SetupHostResult {
+        if let Some(warmup) = warmup_failure {
+            message = format!("{message}; first-launch warm-up: {warmup}");
+        }
+        let rollback = ssh_request(worker, rollback_command(id), control_policy());
+        let warnings = run_success(self.runner, &rollback, SetupFailureKind::Infrastructure)
+            .err()
+            .map(|failure| SetupWarning {
+                code: SetupWarningCode::RollbackFailed,
+                message: failure.message,
+            })
+            .into_iter()
+            .collect();
+        failed(
+            worker,
+            "VERIFICATION_FAILED",
+            message,
+            failure_kind,
+            warnings,
+        )
     }
 }
 
@@ -830,7 +878,7 @@ digest_regular_file "$worker_path" || exit 77
 [ "$canonical_digest" = "$expected_digest" ] || exit 77
 "$worker_path" --version"#;
 
-const VERIFICATION_BODY: &str = r#"resolve_locked_context || exit 76
+const FACTS_REFRESH_BODY: &str = r#"resolve_locked_context || exit 76
 require_exact_file "$transaction/state" promoted 8 || exit 77
 require_absent "$transaction/worker.new" || exit 77
 read_canonical_hex "$transaction/candidate.sha256" 64 || exit 77
@@ -838,7 +886,15 @@ read_canonical_hex "$transaction/candidate.sha256" 64 || exit 77
 digest_regular_file "$worker_path" || exit 77
 [ "$canonical_digest" = "$expected_digest" ] || exit 77
 "$worker_path" host migrate-layout || exit 77
-"$worker_path" host refresh-facts || exit 77
+"$worker_path" host refresh-facts"#;
+
+const VERIFICATION_BODY: &str = r#"resolve_locked_context || exit 76
+require_exact_file "$transaction/state" promoted 8 || exit 77
+require_absent "$transaction/worker.new" || exit 77
+read_canonical_hex "$transaction/candidate.sha256" 64 || exit 77
+[ "$canonical_hex" = "$expected_digest" ] || exit 77
+digest_regular_file "$worker_path" || exit 77
+[ "$canonical_digest" = "$expected_digest" ] || exit 77
 exec "$worker_path" host probe"#;
 
 const CLEANUP_BODY: &str = r#"verify_cleanup_state() {
@@ -991,6 +1047,13 @@ fn warmup_command(id: &str, digest: &str) -> String {
     locked_command(id, &format!("expected_digest='{digest}'\n{WARMUP_BODY}"))
 }
 
+fn facts_refresh_command(id: &str, digest: &str) -> String {
+    locked_command(
+        id,
+        &format!("expected_digest='{digest}'\n{FACTS_REFRESH_BODY}"),
+    )
+}
+
 fn verification_command(id: &str, digest: &str) -> String {
     locked_command(
         id,
@@ -1034,6 +1097,22 @@ fn warmup_policy() -> ProcessPolicy {
     }
 }
 
+/// Generous deadline for post-promotion layout migration and agent-facts
+/// collection. `host refresh-facts` launches every installed agent (version
+/// and auth probes, per env profile, with a keychain unlock) and pings herdr;
+/// on 2026-09-09 that took 14.0 s and 13.6 s on mini-3, versus 0.15 s for
+/// `host probe` alone, so the 15 s probe deadline fired on most setup
+/// attempts. This step is allowed 120 s so a slow facts refresh cannot be
+/// mistaken for a failed install. The later verification probe keeps its
+/// own 15 s cap.
+fn facts_refresh_policy() -> ProcessPolicy {
+    ProcessPolicy {
+        stdout_limit: 64 * 1024,
+        stderr_limit: 64 * 1024,
+        deadline: Duration::from_secs(120),
+    }
+}
+
 fn control_policy() -> ProcessPolicy {
     ProcessPolicy {
         stdout_limit: 64 * 1024,
@@ -1047,6 +1126,31 @@ fn transfer_policy() -> ProcessPolicy {
         stdout_limit: 64 * 1024,
         stderr_limit: 64 * 1024,
         deadline: Duration::from_secs(5 * 60),
+    }
+}
+
+/// Run the locked facts-refresh step. Exit 76/77 are the script's lock and
+/// layout-invariant failures, including `host migrate-layout`; those still
+/// roll the promotion back. Any other failure, including a 120 s timeout of
+/// `host refresh-facts`, is a warning on an otherwise successful install.
+fn run_facts_refresh(
+    runner: &dyn ProcessRunner,
+    request: &ProcessRequest,
+) -> Result<Option<String>, ProcessFailure> {
+    match runner.run(request) {
+        Ok(result) if result.status.success() => Ok(None),
+        Ok(result) if matches!(result.status.code(), Some(76 | 77)) => Err(ProcessFailure {
+            message: process_failure(&request.program.to_string_lossy(), &result),
+            kind: SetupFailureKind::Infrastructure,
+        }),
+        Ok(result) => Ok(Some(process_failure(
+            &request.program.to_string_lossy(),
+            &result,
+        ))),
+        Err(error) => Ok(Some(format!(
+            "failed to launch {}: {error}",
+            request.program.to_string_lossy()
+        ))),
     }
 }
 

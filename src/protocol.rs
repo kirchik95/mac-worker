@@ -11,6 +11,10 @@ pub const HERDR_UNAVAILABLE_MESSAGE: &str =
 /// The same warning when the answer is simply not known: the herdr fact is
 /// missing or older than its TTL, which a facts refresh settles.
 pub const HERDR_FACTS_STALE_MESSAGE: &str = "herdr = true but the worker's herdr facts are stale or missing; run `worker workers --refresh`";
+/// Setup installed the helper but could not collect agent facts; the operator
+/// can retry collection without reinstalling.
+pub const FACTS_REFRESH_FAILED_MESSAGE: &str =
+    "agent facts were not refreshed during setup; run `worker workers --refresh`";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -184,6 +188,9 @@ pub enum SetupWarningCode {
     /// First-launch warm-up of the promoted helper failed or timed out;
     /// verification still decided the outcome.
     WarmupFailed,
+    /// Post-promotion `host refresh-facts` failed or timed out; the helper
+    /// stayed installed and verification still decided the outcome.
+    FactsRefreshFailed,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
