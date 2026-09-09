@@ -6,7 +6,7 @@
 
 **Send a coding task to another Mac. Get a Git branch back.**
 
-`mac-worker` runs coding agents on your spare Macs while you keep working on your laptop. Submit a prompt from a Git repository; a worker runs Codex, Cursor, OpenCode or Claude Code in a separate worktree and returns a branch you can review and merge. Start with one Mac and add more when you need them.
+`mac-worker` runs coding agents on your spare Macs while you keep working on your laptop. Ask a local coding agent to prepare and dispatch the work, or submit a prompt yourself from a Git repository. A worker runs Codex, Cursor, OpenCode or Claude Code in a separate worktree and returns a branch you can review and merge. Start with one Mac and add more when you need them.
 
 ## Contents
 
@@ -25,7 +25,7 @@
 
 ## What you need
 
-- **Your laptop:** an Apple Silicon Mac, Git and SSH.
+- **Your laptop:** an Apple Silicon Mac, Git and SSH. For the primary path, a local coding agent (Claude Code, Codex, Cursor, or OpenCode) that can run `worker` from the project. CLI-only use does not need one.
 - **One worker:** another Apple Silicon Mac with Remote Login enabled and Git installed. It needs network access to the agent provider and must stay awake while working.
 - **One coding agent on the worker**, signed in as the account you connect to. Codex is the default; the setup guide covers its installation and login.
 
@@ -49,7 +49,7 @@ export PATH="$HOME/.local/bin:$PATH"
 worker --version
 ```
 
-Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zprofile` to make it available in new macOS terminal sessions. To choose a different location, pass `--bin-dir /your/bin` to the installer.
+Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zprofile` to make it available in new macOS terminal sessions. To choose a different location, pass `--bin-dir /your/bin` to the installer. The installer copies the `worker` binary only; laptop skills are a separate local install in [Get your first branch](#3-get-your-first-branch).
 
 **Before the first release is published**, use [Build from source](#build-from-source) below. The repository includes release automation and a Homebrew formula generator; a public release and tap must be published before their download/install commands are available. Check [Releases](https://github.com/kirchik95/mac-worker/releases) for downloadable versions.
 
@@ -74,6 +74,46 @@ worker init yourname@mini.local --name build-mini --agent opencode
 No manual TOML or extra SSH alias is required. The [worker setup guide](docs/setup-macos-worker.md) covers agent installation, login and keeping the Mac awake.
 
 ### 3. Get your first branch
+
+Ask the coding agent on this MacBook to send work to the pool. Direct CLI remains available below.
+
+#### Ask your laptop agent
+
+The laptop agent prepares independent briefs and dispatches them; a configured agent on the worker executes. They need not be the same agent or provider. Install the skills on the laptop, not on every worker. The local agent must be able to run `worker` from the project.
+
+Use [pool-task-authoring](.claude/skills/pool-task-authoring/SKILL.md) to prepare independent briefs and [pool-dispatch](.claude/skills/pool-dispatch/SKILL.md) to submit, wait, follow up, and fetch the result. Copy them into the personal directory for the agent you use across projects on this MacBook:
+
+| Local coding agent | Personal skills directory | Docs |
+| --- | --- | --- |
+| Claude Code | `~/.claude/skills` | [Skills](https://code.claude.com/docs/en/skills) |
+| Codex | `~/.agents/skills` | [Build skills](https://learn.chatgpt.com/docs/build-skills) |
+| Cursor | `~/.cursor/skills` | [Skills](https://cursor.com/docs/skills) |
+| OpenCode | `~/.config/opencode/skills` | [Skills](https://opencode.ai/docs/skills) |
+
+These are personal directories for local agent sessions, not web or cloud chats. The templates contain the maintainer's pool defaults — model choices, Cursor's `agents` profile, and deferred Claude worker routing — and should be adapted for your configured pool.
+
+Ask your local agent to install the skills:
+
+```text
+Obtain .claude/skills/pool-task-authoring and .claude/skills/pool-dispatch
+from https://github.com/kirchik95/mac-worker. Install those two skill
+directories into the correct personal skills directory for this agent
+across projects on this MacBook. Preserve existing customizations. Adapt
+the template agent, model, and profile routing to my configured pool
+without reading or copying credential profile contents. Then verify both
+skills are available and that you can invoke the worker CLI before
+submitting any work.
+```
+
+In a Git repository with at least one commit:
+
+```text
+Send this task to the pool: create SETUP_CHECK.md containing mac-worker works. Wait for the result and show me the branch.
+```
+
+Expect a task ID, an outcome/checks summary, and a result branch/ref to review when available. Your current working tree stays unchanged; you choose whether to merge. You can ask the same agent to follow up if the task needs input. Confirm both skills are loaded before you dispatch.
+
+#### Manual CLI
 
 In a Git repository with at least one commit, submit a small task:
 
@@ -126,7 +166,7 @@ Your laptop coordinates the work. The selected Mac runs the agent and keeps its 
 
 ```mermaid
 flowchart LR
-    laptop["Your laptop<br/><br/>worker CLI + local queue<br/>Scheduler + task history<br/>Dashboard + Git repository"]
+    laptop["Your laptop<br/><br/>Optional local agent + skills<br/>worker CLI + local queue<br/>Scheduler + task history<br/>Dashboard + Git repository"]
 
     subgraph pool["Your Mac workers — one task turn per Mac"]
         selected["Selected Mac<br/><br/>Helper + project mirror<br/>Task worktree + coding agent"]
@@ -142,7 +182,7 @@ flowchart LR
     others <-->|Agent API| provider
 ```
 
-1. **Submit.** The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with the required agent and capabilities.
+1. **Submit.** Ask your laptop agent or run the CLI. The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with the required agent and capabilities.
 2. **Run.** Over SSH, mac-worker transfers the base commit into the worker's project mirror, prepares a separate task worktree and launches the agent under a supervisor. The agent uses the worker's own login and project tools.
 3. **Follow or reply.** The CLI and dashboard read task status and logs. If the agent needs input, `worker task say <id> --message "…"` starts another turn in the same task workspace and agent session.
 4. **Review.** The worker publishes `task/<id>`, and the laptop fetches it as a remote-tracking ref. `worker task fetch <id>` can fetch it again and prints the ref to inspect. Your current working tree stays unchanged; you decide what to merge.
