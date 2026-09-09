@@ -18,7 +18,8 @@ use crate::{
     account_launch::account_login_shell_request,
     agent::{AgentKind, AuthProbe, AuthProbeResult, adapter_for, render_prebind_shell},
     error::{ProcessError, WorkerError},
-    herdr::{HerdrClient, HerdrError, HerdrSocket, RESPONSE_DEADLINE},
+    herdr::{HerdrClient, HerdrError, HerdrSocket, ListedAgent, RESPONSE_DEADLINE},
+    herdr_reporter::DISPLAY_AGENT,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
 };
 
@@ -363,6 +364,12 @@ pub struct HerdrFacts {
     pub state: HerdrFactState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Agents herdr's `agent.list` reported whose `display_agent` is not
+    /// mac-worker's reporter. Present only when the state is `available` and
+    /// the list call succeeded; absent from records that predate the count.
+    /// The list itself is never stored: only this number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive_agents: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,6 +383,17 @@ pub enum HerdrFactState {
     NoSocket,
     /// A socket that did not answer `ping` in time.
     NoResponse,
+}
+
+impl HerdrFactState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::NotInstalled => "not_installed",
+            Self::NoSocket => "no_socket",
+            Self::NoResponse => "no_response",
+        }
+    }
 }
 
 impl HerdrFacts {
@@ -840,7 +858,10 @@ where
 /// Whether the account's herdr can show turns: a `herdr` binary on the login
 /// shell's PATH (plus `~/.local/bin`), its `--version`, the default session
 /// socket, and an answer to `ping` under the client deadlines.  The version is
-/// recorded whenever the binary answered; the ping carries no path.
+/// recorded whenever the binary answered; the ping carries no path.  When
+/// the socket is `available`, one timed `agent.list` step counts interactive
+/// agents best-effort; a failed list leaves the count absent and does not
+/// change the state.
 fn collect_herdr_facts(
     runner: &dyn ProcessRunner,
     account_home: &Path,
@@ -853,6 +874,7 @@ fn collect_herdr_facts(
         return HerdrFacts {
             state: HerdrFactState::NotInstalled,
             version: None,
+            interactive_agents: None,
         };
     }
     let version = timing.probe(Some("herdr"), Some("-"), "version", PROBE_DEADLINE, || {
@@ -863,14 +885,16 @@ fn collect_herdr_facts(
         return HerdrFacts {
             state: HerdrFactState::NoSocket,
             version,
+            interactive_agents: None,
         };
     }
+    let client = HerdrClient::new(socket);
     let state = timing.probe(
         None,
         None,
         "herdr-ping",
         RESPONSE_DEADLINE,
-        || match HerdrClient::new(socket).ping() {
+        || match client.ping() {
             Ok(()) => ProbeRun::ok(HerdrFactState::Available),
             Err(HerdrError::Absent) => ProbeRun::ok(HerdrFactState::NoSocket),
             Err(HerdrError::Timeout) => ProbeRun {
@@ -880,7 +904,40 @@ fn collect_herdr_facts(
             Err(_) => ProbeRun::ok(HerdrFactState::NoResponse),
         },
     );
-    HerdrFacts { state, version }
+    let interactive_agents = if state == HerdrFactState::Available {
+        timing.probe(
+            None,
+            None,
+            "herdr-agents",
+            RESPONSE_DEADLINE,
+            || match client.agent_list() {
+                Ok(listed) => ProbeRun::ok(count_interactive_agents(&listed)),
+                Err(HerdrError::Timeout) => ProbeRun {
+                    value: None,
+                    hit_deadline: true,
+                },
+                Err(_) => ProbeRun::ok(None),
+            },
+        )
+    } else {
+        None
+    };
+    HerdrFacts {
+        state,
+        version,
+        interactive_agents,
+    }
+}
+
+/// Agents herdr lists whose `display_agent` is not the mac-worker reporter.
+/// Only the count is returned; titles, cwds, and pane ids from the list
+/// never leave this function.
+fn count_interactive_agents(listed: &[ListedAgent]) -> Option<u32> {
+    let count = listed
+        .iter()
+        .filter(|agent| agent.display_agent.as_deref() != Some(DISPLAY_AGENT))
+        .count();
+    u32::try_from(count).ok()
 }
 
 fn herdr_binary_available(runner: &dyn ProcessRunner, account_home: &Path) -> ProbeRun<bool> {

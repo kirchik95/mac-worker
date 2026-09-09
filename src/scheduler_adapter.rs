@@ -69,6 +69,11 @@ impl SchedulerProbeAdapter {
                             probe.available_memory_bytes,
                             probe.free_disk_bytes,
                         )
+                        .map(|observation| {
+                            observation.with_interactive_agents(
+                                probe.herdr_fact().and_then(|herdr| herdr.interactive_agents),
+                            )
+                        })
                     }
                     _ => CandidateObservation::new(
                         worker_health.name.clone(),

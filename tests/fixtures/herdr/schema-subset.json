@@ -241,6 +241,9 @@
    ],
    "type": "object"
   },
+  "agent.list": {
+   "type": "object"
+  },
   "ping": {
    "type": "object"
   },

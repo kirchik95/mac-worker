@@ -15,6 +15,12 @@ export interface AgentFact {
   auth_by_profile: { profile: string; auth: AgentAuth }[]
 }
 
+export interface DashboardHerdr {
+  state: string
+  version?: string | null
+  interactive_agents?: number | null
+}
+
 export interface Worker {
   name: string
   health: WorkerHealth
@@ -22,6 +28,7 @@ export interface Worker {
   observed_at_millis: number | null
   hostname: string | null
   agent_facts: { collected_at_millis: number; freshness: Freshness; agents: AgentFact[] } | null
+  herdr: DashboardHerdr | null
   slot: { state: string; capacity: number; active_job_id: string | null }
   capabilities: string[]
   missing_capabilities: string[]

@@ -1,3 +1,4 @@
+import { HerdrChip } from '@/components/HerdrChip'
 import { Icon, type IconName } from '@/components/Icon'
 import { duration, shortId } from '@/lib/format'
 import { FACTS_TTL_MILLIS, advertisedAgents, factsAge, factsLapsed } from '@/lib/queue'
@@ -126,6 +127,7 @@ export function Capabilities({ snapshot, now = Date.now() }: { snapshot: Snapsho
               <Facts worker={worker} now={now} />
 
               <span className="flex min-w-0 flex-1 flex-wrap items-center gap-2.5">
+                <HerdrChip herdr={worker.herdr} className="px-2.5 py-1 text-[11px]" />
                 {described ? (
                   <span
                     className="flex min-w-0 items-center gap-2"

@@ -1692,6 +1692,7 @@ fn workers_output_renders_the_herdr_line_for_every_state_after_the_agents_block(
             } else {
                 version.clone()
             },
+            interactive_agents: None,
         };
         let (rendered, json) = render_workers(herdr_health(
             Some(facts_with_herdr(Some(herdr.clone()))),
@@ -1736,6 +1737,7 @@ fn workers_output_renders_herdr_unknown_when_facts_are_missing_stale_or_predate_
     let available = HerdrFacts {
         state: HerdrFactState::Available,
         version: Some("0.9.0".into()),
+        interactive_agents: None,
     };
     for (label, health) in [
         ("missing facts", herdr_health(None, None)),
@@ -1776,11 +1778,59 @@ fn workers_output_renders_herdr_unknown_when_facts_are_missing_stale_or_predate_
         Some(facts_with_herdr(Some(HerdrFacts {
             state: HerdrFactState::NoSocket,
             version: None,
+            interactive_agents: None,
         }))),
         Some(0),
     ));
     assert!(
         installed_without_version.contains("  herdr: installed, no socket"),
         "{installed_without_version}"
+    );
+}
+
+#[test]
+fn workers_output_appends_interactive_agents_when_the_count_is_known_and_nonzero() {
+    let with_two = HerdrFacts {
+        state: HerdrFactState::Available,
+        version: Some("0.9.0".into()),
+        interactive_agents: Some(2),
+    };
+    let (rendered, json) = render_workers(herdr_health(
+        Some(facts_with_herdr(Some(with_two.clone()))),
+        Some(0),
+    ));
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line == "  herdr: available (0.9.0), 2 interactive agents"),
+        "{rendered}"
+    );
+    assert!(json.contains(r#""interactive_agents":2"#), "{json}");
+
+    let with_one = HerdrFacts {
+        state: HerdrFactState::Available,
+        version: Some("0.9.0".into()),
+        interactive_agents: Some(1),
+    };
+    let (one, _) = render_workers(herdr_health(
+        Some(facts_with_herdr(Some(with_one))),
+        Some(0),
+    ));
+    assert!(
+        one.lines()
+            .any(|line| line == "  herdr: available (0.9.0), 1 interactive agent"),
+        "{one}"
+    );
+
+    let zero = HerdrFacts {
+        state: HerdrFactState::Available,
+        version: Some("0.9.0".into()),
+        interactive_agents: Some(0),
+    };
+    let (none, _) = render_workers(herdr_health(Some(facts_with_herdr(Some(zero))), Some(0)));
+    assert!(
+        none.lines()
+            .any(|line| line == "  herdr: available (0.9.0)"),
+        "a zero count is omitted: {none}"
     );
 }

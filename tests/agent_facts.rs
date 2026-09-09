@@ -862,6 +862,7 @@ fn herdr_facts_round_trip_and_stay_absent_for_records_that_predate_them() {
             herdr: Some(HerdrFacts {
                 state,
                 version: Some("0.9.0".into()),
+                interactive_agents: None,
             }),
             ..without.clone()
         };
@@ -878,6 +879,7 @@ fn herdr_facts_round_trip_and_stay_absent_for_records_that_predate_them() {
         herdr: Some(HerdrFacts {
             state: HerdrFactState::Available,
             version: Some("0.9\u{7}".into()),
+            interactive_agents: None,
         }),
         ..without
     };
@@ -907,6 +909,7 @@ fn herdr_fact(state: HerdrFactState, version: Option<&str>) -> Option<HerdrFacts
     Some(HerdrFacts {
         state,
         version: version.map(str::to_owned),
+        interactive_agents: None,
     })
 }
 
@@ -983,10 +986,11 @@ fn herdr_fact_is_available_when_the_socket_answers_ping_and_no_path_crosses_it()
         herdr_fact(HerdrFactState::Available, Some(HERDR_VERSION))
     );
     assert_eq!(herdr.requests_for("ping").len(), 1);
+    assert_eq!(herdr.requests_for("agent.list").len(), 1);
     assert_eq!(
         herdr.requests().len(),
-        1,
-        "the fact costs exactly one request"
+        2,
+        "available facts cost ping then a best-effort agent.list"
     );
     let wire = serde_json::to_string(&herdr.requests()).unwrap();
     let home_text = home.path().to_string_lossy().into_owned();
@@ -1016,6 +1020,96 @@ fn herdr_fact_is_no_response_when_the_socket_stays_silent() {
         started.elapsed() < Duration::from_secs(6),
         "the ping honours the client deadlines"
     );
+}
+
+#[test]
+fn herdr_fact_counts_interactive_agents_and_stores_nothing_but_the_count() {
+    let home = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start_in_home(home.path());
+    herdr.reply(
+        "agent.list",
+        Reply::Result(serde_json::json!({
+            "type": "agent_list",
+            "agents": [
+                {
+                    "pane_id": "w1:p1",
+                    "agent_status": "working",
+                    "display_agent": "codex",
+                    "title": "secret review",
+                    "cwd": "/Users/operator/secret"
+                },
+                {
+                    "pane_id": "w1:p2",
+                    "agent_status": "working",
+                    "display_agent": "mac-worker",
+                    "title": "task abc123def456 · leak"
+                },
+                {
+                    "pane_id": "w1:p3",
+                    "agent_status": "idle",
+                    "display_agent": "claude"
+                }
+            ]
+        })),
+    );
+    let runner = FakeProcessRunner::with_herdr(Scenario::AllAgents, HerdrBinary::Installed);
+    let (facts, timing) =
+        collect_agent_facts_at_with_timing(&runner, home.path(), &profiles(), COLLECTED_AT);
+
+    let herdr_facts = facts.herdr.as_ref().expect("herdr fact");
+    assert_eq!(herdr_facts.state, HerdrFactState::Available);
+    assert_eq!(herdr_facts.interactive_agents, Some(2));
+    let json = String::from_utf8(facts.canonical_bytes().unwrap()).unwrap();
+    assert!(json.contains(r#""interactive_agents":2"#), "{json}");
+    for forbidden in [
+        "w1:p1",
+        "w1:p2",
+        "w1:p3",
+        "secret review",
+        "task abc123def456",
+        "/Users/operator/secret",
+        "cwd",
+        "pane_id",
+        "title",
+    ] {
+        assert!(
+            !json.contains(forbidden),
+            "{forbidden:?} leaked into facts: {json}"
+        );
+    }
+    let names = timing_names(&timing.lines());
+    assert!(
+        names.iter().any(|name| name == "timing step=herdr-agents"),
+        "available herdr records herdr-agents: {names:?}"
+    );
+    assert_timing_privacy(&timing.lines());
+}
+
+#[test]
+fn herdr_fact_keeps_available_when_agent_list_fails() {
+    let home = tempfile::tempdir().unwrap();
+    let herdr = FakeHerdr::start_in_home(home.path());
+    herdr.reply("agent.list", Reply::Silence);
+    let runner = FakeProcessRunner::with_herdr(Scenario::AllAgents, HerdrBinary::Installed);
+
+    let started = Instant::now();
+    let facts = collect_agent_facts_at(&runner, home.path(), &profiles(), COLLECTED_AT);
+
+    assert_eq!(
+        facts.herdr,
+        herdr_fact(HerdrFactState::Available, Some(HERDR_VERSION))
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "a silent agent.list honours the client deadlines"
+    );
+}
+
+#[test]
+fn herdr_facts_omit_interactive_agents_from_records_that_predate_the_count() {
+    let json = r#"{"agents":[],"env_profiles":[],"git_identity":false,"collected_at_millis":1,"herdr":{"state":"available","version":"0.9.0"}}"#;
+    let facts: AgentFacts = serde_json::from_str(json).unwrap();
+    assert_eq!(facts.herdr.unwrap().interactive_agents, None);
 }
 
 #[test]
@@ -1099,6 +1193,22 @@ fn timing_lines_never_contain_paths_profile_values_or_command_text() {
     assert_timing_privacy(&lines);
 }
 
+#[test]
+fn available_herdr_timing_names_include_herdr_agents_after_ping() {
+    let home = tempfile::tempdir().unwrap();
+    let _herdr = FakeHerdr::start_in_home(home.path());
+    let runner = FakeProcessRunner::with_herdr(Scenario::AllAgents, HerdrBinary::Installed);
+    let (_, timing) =
+        collect_agent_facts_at_with_timing(&runner, home.path(), &profiles(), COLLECTED_AT);
+    let names = timing_names(&timing.lines());
+    let herdr_and_total: Vec<_> = names
+        .into_iter()
+        .filter(|name| name.contains("herdr") || name.ends_with("step=total"))
+        .collect();
+    assert_eq!(herdr_and_total, expected_available_herdr_timing_names());
+    assert_timing_privacy(&timing.lines());
+}
+
 fn expected_all_agents_timing_names() -> Vec<String> {
     let mut names = Vec::new();
     for agent in ["codex", "claude", "cursor", "opencode"] {
@@ -1120,6 +1230,16 @@ fn expected_all_agents_timing_names() -> Vec<String> {
     names.push("timing agent=herdr profile=- step=locate".into());
     names.push("timing step=total".into());
     names
+}
+
+fn expected_available_herdr_timing_names() -> Vec<String> {
+    vec![
+        "timing agent=herdr profile=- step=locate".into(),
+        "timing agent=herdr profile=- step=version".into(),
+        "timing step=herdr-ping".into(),
+        "timing step=herdr-agents".into(),
+        "timing step=total".into(),
+    ]
 }
 
 fn timing_names(lines: &[String]) -> Vec<String> {

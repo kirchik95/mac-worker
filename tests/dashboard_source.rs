@@ -766,6 +766,7 @@ fn source_passes_the_herdr_fact_through_agent_facts_and_projects_null_without_it
         herdr: Some(HerdrFacts {
             state: HerdrFactState::NoSocket,
             version: Some("0.9.0".into()),
+            interactive_agents: None,
         }),
     });
     probe.facts_age_millis = Some(0);
@@ -798,4 +799,63 @@ fn source_passes_the_herdr_fact_through_agent_facts_and_projects_null_without_it
     let value = serde_json::to_value(observation.worker.agent_facts.unwrap()).unwrap();
     assert!(value.get("herdr").is_some(), "the key is present: {value}");
     assert!(value["herdr"].is_null(), "{value}");
+}
+
+#[test]
+fn source_projects_a_fresh_herdr_chip_and_omits_it_when_facts_are_stale() {
+    use mac_worker::agent_facts::{HerdrFactState, HerdrFacts};
+
+    let mut report = ready_report(job_id(93));
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: true,
+        collected_at_millis: 1,
+        herdr: Some(HerdrFacts {
+            state: HerdrFactState::Available,
+            version: Some("0.9.0".into()),
+            interactive_agents: Some(2),
+        }),
+    });
+    probe.facts_age_millis = Some(0);
+    let fixture = Fixture::new(report);
+    let rows = fixture.source().collect_workers(Duration::from_secs(7));
+    let WorkerObservationResult::Current(observation) = rows.into_iter().next().unwrap() else {
+        panic!("ready probe must project to a current observation");
+    };
+    let value = serde_json::to_value(observation.worker.herdr.as_ref()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "state": "available",
+            "version": "0.9.0",
+            "interactive_agents": 2
+        })
+    );
+    let json = value.to_string();
+    for forbidden in ["pane_id", "cwd", "title", "w1:"] {
+        assert!(!json.contains(forbidden), "{forbidden:?} leaked: {json}");
+    }
+
+    let mut report = ready_report(job_id(94));
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.agent_facts = Some(AgentFacts {
+        agents: Vec::new(),
+        env_profiles: Vec::new(),
+        git_identity: true,
+        collected_at_millis: 1,
+        herdr: Some(HerdrFacts {
+            state: HerdrFactState::Available,
+            version: Some("0.9.0".into()),
+            interactive_agents: Some(2),
+        }),
+    });
+    probe.facts_age_millis = Some(FACTS_TTL + 1);
+    let fixture = Fixture::new(report);
+    let rows = fixture.source().collect_workers(Duration::from_secs(7));
+    let WorkerObservationResult::Current(observation) = rows.into_iter().next().unwrap() else {
+        panic!("stale facts still project a worker");
+    };
+    assert_eq!(observation.worker.herdr, None);
 }

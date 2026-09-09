@@ -1582,6 +1582,7 @@ pub(crate) fn candidate_from_admission(
         observation.available_memory_bytes(),
         observation.free_disk_bytes(),
     )
+    .map(|candidate| candidate.with_interactive_agents(observation.interactive_agents()))
     .map_err(|_| WorkerError::Protocol("cached scheduler observation is invalid".into()))
 }
 
@@ -1601,7 +1602,7 @@ pub(crate) fn admission_from_health(
     observed_at: u64,
 ) -> Result<AdmissionObservation, WorkerError> {
     let candidate = candidate_from_health(config, health)?;
-    AdmissionObservation::new(
+    Ok(AdmissionObservation::new(
         candidate.worker_name().to_owned(),
         candidate.ready(),
         candidate.slot(),
@@ -1609,7 +1610,8 @@ pub(crate) fn admission_from_health(
         candidate.available_memory_bytes(),
         candidate.free_disk_bytes(),
         observed_at,
-    )
+    )?
+    .with_interactive_agents(candidate.interactive_agents()))
 }
 
 /// Transfer a waiting or dispatching task row to the process that will

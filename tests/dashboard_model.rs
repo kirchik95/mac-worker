@@ -63,6 +63,7 @@ fn snapshot_v1_serializes_the_complete_projection_contract() {
                     "observed_at_millis": null,
                     "hostname": null,
                     "agent_facts": null,
+                    "herdr": null,
                     "slot": {
                         "state": "idle",
                         "capacity": 1,
@@ -87,6 +88,7 @@ fn snapshot_v1_serializes_the_complete_projection_contract() {
                     "observed_at_millis": 1_725_000_000_099_u64,
                     "hostname": "mini-observed.local",
                     "agent_facts": null,
+                    "herdr": null,
                     "slot": {
                         "state": "busy",
                         "capacity": 1,
@@ -365,6 +367,7 @@ fn fixture_snapshot() -> DashboardSnapshot {
             observed_at_millis: Some(1_725_000_000_000),
             hostname: Some("mini-a.local".into()),
             agent_facts: None,
+            herdr: None,
             slot: SlotSummary {
                 state: DashboardSlotState::Idle,
                 capacity: 1,
@@ -410,6 +413,7 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
                 observed_at_millis: None,
                 hostname: None,
                 agent_facts: None,
+                herdr: None,
                 slot: SlotSummary {
                     state: DashboardSlotState::Idle,
                     capacity: 1,
@@ -434,6 +438,7 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
                 observed_at_millis: Some(1_725_000_000_099),
                 hostname: Some("mini-observed.local".into()),
                 agent_facts: None,
+                herdr: None,
                 slot: SlotSummary {
                     state: DashboardSlotState::Busy,
                     capacity: 1,

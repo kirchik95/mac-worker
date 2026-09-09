@@ -253,7 +253,8 @@ fn render_agent_auth(auth: crate::agent_facts::AgentAuth) -> String {
 
 /// Spec 5.3: `available (0.9.0)`, `not installed`, `installed (0.9.0), no
 /// socket`, `installed (0.9.0), no response`, or `unknown` when the facts are
-/// stale, missing, or predate the fact.
+/// stale, missing, or predate the fact. A known non-zero interactive-agent
+/// count is appended so the operator can see load that is not a pool turn.
 fn render_herdr_fact(probe: &crate::protocol::ProbeResponse) -> String {
     use crate::agent_facts::HerdrFactState;
 
@@ -264,12 +265,19 @@ fn render_herdr_fact(probe: &crate::protocol::ProbeResponse) -> String {
         Some(version) => format!("{label} ({version})"),
         None => label.to_owned(),
     };
-    match herdr.state {
+    let mut rendered = match herdr.state {
         HerdrFactState::Available => versioned("available"),
         HerdrFactState::NotInstalled => "not installed".into(),
         HerdrFactState::NoSocket => format!("{}, no socket", versioned("installed")),
         HerdrFactState::NoResponse => format!("{}, no response", versioned("installed")),
+    };
+    if let Some(count) = herdr.interactive_agents.filter(|count| *count > 0) {
+        rendered.push_str(&format!(
+            ", {count} interactive agent{}",
+            if count == 1 { "" } else { "s" }
+        ));
     }
+    rendered
 }
 
 fn render_doctor_worker_health(worker: &crate::protocol::WorkerHealth) -> String {

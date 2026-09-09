@@ -296,6 +296,33 @@ fn typed_results_are_parsed_from_the_shapes_herdr_answers_with() {
     let busy = client.pane_process_info("w4:p2").unwrap();
     assert!(!busy.is_idle_shell());
     assert_eq!(busy.foreground[1].name, "worker");
+
+    server.reply(
+        "agent.list",
+        Reply::Result(json!({
+            "type": "agent_list",
+            "agents": [
+                {
+                    "pane_id": "w4:p1",
+                    "agent_status": "working",
+                    "display_agent": "codex",
+                    "title": "must not be required to parse",
+                    "cwd": "/Users/someone/secret"
+                },
+                {
+                    "pane_id": "w4:p2",
+                    "agent_status": "idle",
+                    "display_agent": "mac-worker"
+                }
+            ]
+        })),
+    );
+    let listed = client.agent_list().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].pane_id, "w4:p1");
+    assert_eq!(listed[0].agent_status, "working");
+    assert_eq!(listed[0].display_agent.as_deref(), Some("codex"));
+    assert_eq!(listed[1].display_agent.as_deref(), Some("mac-worker"));
 }
 
 #[test]
@@ -318,6 +345,7 @@ fn typed_calls_match_the_captured_herdr_schema() {
     metadata.tokens.insert("turn".into(), "1".into());
 
     client.ping().unwrap();
+    let _ = client.agent_list();
     client.workspace_list().unwrap_or_default();
     let _ = client.workspace_create("mac-worker", Some(cwd));
     let _ = client.tab_list("w1");
@@ -349,7 +377,7 @@ fn typed_calls_match_the_captured_herdr_schema() {
         .expect("schema fixture");
     let methods = schema["methods"].as_object().expect("methods");
     let requests = server.requests();
-    assert_eq!(requests.len(), 12, "every typed call reached the socket");
+    assert_eq!(requests.len(), 13, "every typed call reached the socket");
     for request in &requests {
         let method = request["method"].as_str().expect("method");
         let params = methods

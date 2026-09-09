@@ -525,6 +525,7 @@ fn refresh_collects_the_herdr_fact_and_cached_reads_never_probe_it() {
         Some(HerdrFacts {
             state: HerdrFactState::NotInstalled,
             version: None,
+            interactive_agents: None,
         })
     );
     let lookup = runner

@@ -204,6 +204,35 @@ describe('Overview', () => {
     render(<Overview snapshot={snapshot({ workers: [] })} />)
     expect(screen.getByText('No workers are configured.')).toBeInTheDocument()
   })
+
+  it('shows a herdr chip on the worker card and in capabilities', () => {
+    const withHerdr = snapshot({
+      workers: [
+        worker({
+          herdr: { state: 'available', version: '0.9.0', interactive_agents: 2 },
+        }),
+        worker({
+          name: 'mini-2',
+          herdr: { state: 'not_installed' },
+        }),
+        worker({
+          name: 'mini-3',
+          herdr: { state: 'no_socket', version: '0.9.0' },
+        }),
+      ],
+    })
+    render(<Overview snapshot={withHerdr} />)
+
+    expect(screen.getAllByText('herdr 0.9.0 · 2 agents').length).toBe(2)
+    expect(screen.getAllByText('no herdr').length).toBe(2)
+    expect(screen.getAllByText('herdr: no socket').length).toBe(2)
+    expect(within(card('mini-1')).getByText('herdr 0.9.0 · 2 agents')).toBeInTheDocument()
+  })
+
+  it('says herdr is unknown when the fact is absent', () => {
+    render(<Overview snapshot={snapshot()} />)
+    expect(screen.getAllByText('herdr: unknown').length).toBeGreaterThan(0)
+  })
 })
 
 describe('Overview attention strip', () => {

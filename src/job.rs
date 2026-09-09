@@ -1667,6 +1667,9 @@ pub struct AdmissionObservation {
     available_memory_bytes: Option<u64>,
     free_disk_bytes: u64,
     observed_at_millis: u64,
+    /// Interactive herdr agents excluding mac-worker's reporter. Absent
+    /// from cache files written before this field existed.
+    interactive_agents: Option<u32>,
 }
 
 impl AdmissionObservation {
@@ -1688,9 +1691,15 @@ impl AdmissionObservation {
             available_memory_bytes,
             free_disk_bytes,
             observed_at_millis,
+            interactive_agents: None,
         };
         observation.validate()?;
         Ok(observation)
+    }
+
+    pub fn with_interactive_agents(mut self, interactive_agents: Option<u32>) -> Self {
+        self.interactive_agents = interactive_agents;
+        self
     }
 
     pub fn validate(&self) -> Result<(), WorkerError> {
@@ -1731,12 +1740,21 @@ impl AdmissionObservation {
     pub fn observed_at_millis(&self) -> u64 {
         self.observed_at_millis
     }
+
+    pub fn interactive_agents(&self) -> Option<u32> {
+        self.interactive_agents
+    }
 }
 
 impl Serialize for AdmissionObservation {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("AdmissionObservation", 7)?;
+        let fields = if self.interactive_agents.is_some() {
+            8
+        } else {
+            7
+        };
+        let mut record = serializer.serialize_struct("AdmissionObservation", fields)?;
         record.serialize_field("worker_name", &self.worker_name)?;
         record.serialize_field("ready", &self.ready)?;
         record.serialize_field(
@@ -1750,6 +1768,9 @@ impl Serialize for AdmissionObservation {
         record.serialize_field("available_memory_bytes", &self.available_memory_bytes)?;
         record.serialize_field("free_disk_bytes", &self.free_disk_bytes)?;
         record.serialize_field("observed_at_millis", &self.observed_at_millis)?;
+        if let Some(interactive_agents) = self.interactive_agents {
+            record.serialize_field("interactive_agents", &interactive_agents)?;
+        }
         record.end()
     }
 }
@@ -1766,6 +1787,8 @@ impl<'de> Deserialize<'de> for AdmissionObservation {
             available_memory_bytes: Option<u64>,
             free_disk_bytes: u64,
             observed_at_millis: u64,
+            #[serde(default)]
+            interactive_agents: Option<u32>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let slot = match wire.slot.as_str() {
@@ -1782,6 +1805,7 @@ impl<'de> Deserialize<'de> for AdmissionObservation {
             wire.free_disk_bytes,
             wire.observed_at_millis,
         )
+        .map(|observation| observation.with_interactive_agents(wire.interactive_agents))
         .map_err(de::Error::custom)
     }
 }

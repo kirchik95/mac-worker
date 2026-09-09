@@ -160,6 +160,15 @@ pub struct DashboardProfileAuth {
     pub auth: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DashboardHerdr {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interactive_agents: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct DashboardWorker {
     pub name: String,
@@ -168,6 +177,9 @@ pub struct DashboardWorker {
     pub observed_at_millis: Option<u64>,
     pub hostname: Option<String>,
     pub agent_facts: Option<DashboardAgentFacts>,
+    /// Fresh herdr fact for the worker card chip; `null` when facts are
+    /// missing, stale, or predate the fact. Never a capability.
+    pub herdr: Option<DashboardHerdr>,
     pub slot: SlotSummary,
     pub capabilities: Vec<String>,
     pub missing_capabilities: Vec<String>,

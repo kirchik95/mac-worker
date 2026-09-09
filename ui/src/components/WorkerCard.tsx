@@ -1,3 +1,4 @@
+import { HerdrChip } from '@/components/HerdrChip'
 import { Metric } from '@/components/Metric'
 import { WorkerIcon } from '@/components/WorkerIcon'
 import { bytes, humanize, relativeTime } from '@/lib/format'
@@ -55,9 +56,10 @@ export function WorkerCard({ worker, now }: { worker: Worker; now: number }) {
         <span className="text-muted-foreground">
           <WorkerIcon />
         </span>
-        <h2 className="flex-1 text-[22px] leading-7 font-medium tracking-[-0.025em]">
+        <h2 className="min-w-0 flex-1 truncate text-[22px] leading-7 font-medium tracking-[-0.025em]">
           {worker.name}
         </h2>
+        <HerdrChip herdr={worker.herdr} />
         <span className="flex items-center gap-[7px]">
           <span className={cn('size-[5px] shrink-0 rounded-full', DOT[presence])} aria-hidden="true" />
           <span className="font-mono text-[10px] tracking-[0.06em] text-muted-foreground uppercase">

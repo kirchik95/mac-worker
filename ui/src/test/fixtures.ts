@@ -17,6 +17,7 @@ export function worker(overrides: Partial<Worker> = {}): Worker {
         { name: 'claude', version: '2.1.252', auth: 'unknown', auth_by_profile: [] },
       ],
     },
+    herdr: null,
     slot: { state: 'idle', capacity: 1, active_job_id: null },
     capabilities: ['darwin-arm64'],
     missing_capabilities: [],
