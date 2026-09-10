@@ -36,12 +36,13 @@ pub use crate::gc::{
 };
 
 const MAX_HOST_FILE_BYTES: u64 = 1024 * 1024;
-pub const HOST_LAYOUT_VERSION: u32 = 2;
-/// Layout version a restored previous helper can still `open()`. Literal **2**,
-/// not `HOST_LAYOUT_VERSION`: SCHED keeps this at 2 when the live layout is 3.
-pub const ROLLBACK_HELPER_LAYOUT_VERSION: u32 = 2;
+pub const HOST_LAYOUT_VERSION: u32 = 3;
 pub type StagingNonce = [u8; 16];
-const PREVIOUS_HOST_LAYOUT_VERSION: u32 = 1;
+pub const PREVIOUS_HOST_LAYOUT_VERSION: u32 = 2;
+/// FLOW rollback may restore a previous helper only while stored layout
+/// still equals this value. After a successful 2→3 rewrite it is 3, so
+/// rollback is refused (`HOST_UPGRADE_ROLLBACK_UNSAFE`). Never 3.
+pub const ROLLBACK_HELPER_LAYOUT_VERSION: u32 = PREVIOUS_HOST_LAYOUT_VERSION;
 const HOST_INSTALLATION_VERSION: u32 = 1;
 const INSTALLATION_PREFIX: &str = ".mac-worker-installation-";
 const INSTALLATION_IDENTITY_REFRESH_NAME: &str = ".mac-worker-anchor-refresh-identity.json";
@@ -920,9 +921,14 @@ impl HostStore {
         Self::open_inner(root, None, false, false, None)
     }
 
-    /// Migrate an initialized v1 host root to the current layout. This is
-    /// intentionally separate from `open`: normal host operations fail closed
-    /// until the setup flow invokes this command.
+    /// Idle / facts-refresh entry: takes the construction installation lock,
+    /// inspects drain, promotes slot directories, then refreshes `layout.json`
+    /// and the parent installation identity (new inodes) under that same lock.
+    /// FLOW's `complete_protocol_upgrade` already holds the lock and must call
+    /// [`crate::lease::promote_slot_directories`] after inspect and binary
+    /// rename instead of this function (a second flock fd deadlocks), then the
+    /// same layout/installation refresh. In-place rewrite of `layout.json` is
+    /// not sufficient: a handle opened before promotion would still validate.
     pub fn migrate_layout(root: &Path) -> Result<(), WorkerError> {
         let _ = Self::open_inner(root, None, false, true, None)?;
         Ok(())
@@ -997,6 +1003,15 @@ impl HostStore {
         let result = op();
         PUBLISHED_LAYOUT_VERSION_OVERRIDE.with(|slot| slot.set(None));
         result
+    }
+
+    #[doc(hidden)]
+    pub fn migrate_layout_with_write_fault(
+        root: &Path,
+        point: HostStoreWritePoint,
+    ) -> Result<(), WorkerError> {
+        let _ = Self::open_inner(root, Some(point), false, true, None)?;
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -1250,6 +1265,7 @@ impl HostStore {
             if !existed {
                 leases.sync_root()?;
             }
+            crate::lease::promote_slot_directories(leases)?;
             inject_open_fault(point, HostStoreWritePoint::AfterHostCapacityLock)?;
         }
         if !initialize && !parent.entry_exists(&names.identity)? {
@@ -1269,25 +1285,24 @@ impl HostStore {
             } else {
                 stored.clone()
             };
-            if promote || !layout_present || layout_is_volume_remount(&stored, &current_layout) {
+            if needs_migration {
+                refuse_layout3_promotion(&namespaces)?;
+                let leases = namespaces
+                    .get("leases")
+                    .expect("owned leases namespace was inserted");
+                crate::lease::promote_slot_directories(leases)?;
+                // Same construction lock as FLOW's complete_protocol_upgrade:
+                // unlink→layout.refresh.json→publish (new inode), then
+                // restore_or_refresh_installation_identity(..., layout_refreshed).
+                // In-place rewrite leaves the pre-migration handle valid.
                 layout_refreshed = true;
                 refresh_host_layout(&rooted, &namespaces, point)?
-            } else if needs_migration {
-                let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
-                let current_layout = build_host_layout(&rooted, &namespaces, layout_file_identity)?;
-                let replacement = serde_json::to_vec(&current_layout).map_err(|error| {
-                    WorkerError::Protocol(format!(
-                        "failed to serialize migrated host layout: {error}"
-                    ))
-                })?;
-                let expected = serde_json::to_vec(&stored).map_err(|error| {
-                    WorkerError::Protocol(format!("failed to serialize host layout: {error}"))
-                })?;
-                rooted.rewrite_private_regular_exact(HOST_LAYOUT_FILE, &expected, &replacement)?;
-                current_layout
+            } else if promote || !layout_present || layout_is_volume_remount(&stored, &current_layout)
+            {
+                layout_refreshed = true;
+                refresh_host_layout(&rooted, &namespaces, point)?
             } else {
                 validate_host_layout(&stored, &current_layout)?;
-                remove_private_if_present(&rooted, HOST_LAYOUT_REFRESH_NAME)?;
                 stored
             }
         };
@@ -1317,6 +1332,10 @@ impl HostStore {
                 point,
             )?
         };
+        // Keep layout.refresh.json until installation identity matches the new
+        // layout inode, so a crash between those publications remains repairable
+        // without truncating the only authoritative layout.
+        remove_private_if_present(&rooted, HOST_LAYOUT_REFRESH_NAME)?;
         parent.validate_private_regular_binding(
             &names.lock,
             &installation_lock,
@@ -1326,7 +1345,10 @@ impl HostStore {
             let name = std::str::from_utf8(&bytes).map_err(|_| {
                 WorkerError::Protocol("host data root contains a non-UTF-8 entry".into())
             })?;
-            if !OWNED_DIRECTORIES.contains(&name) && name != HOST_LAYOUT_FILE {
+            if !OWNED_DIRECTORIES.contains(&name)
+                && name != HOST_LAYOUT_FILE
+                && name != HOST_LAYOUT_REFRESH_NAME
+            {
                 rooted.validate_private_entry(name)?;
             }
         }
@@ -1413,6 +1435,9 @@ impl HostStore {
 
     #[allow(dead_code)] // Standalone capacity locking is exercised by host integrity tests.
     pub(crate) fn capacity_lock(&self) -> Result<AdmissionGuard, WorkerError> {
+        // Installation then capacity. Callers that also need session.lock
+        // must acquire this first: session then capacity deadlocks with GC
+        // (installation held, then session) and with this order.
         let outer = Arc::new(self.installation_lock()?);
         self.capacity_lock_with_outer(outer)
     }
@@ -2210,6 +2235,9 @@ impl HostStore {
     }
 
     pub(crate) fn session_lock(&self) -> Result<SessionGuard, WorkerError> {
+        // Session is last relative to capacity/installation. Close takes
+        // capacity (installation) first, then this lock. Retention runs
+        // under GC's installation lock and then this lock, never capacity.
         let locks = self.open_directory("locks", false)?;
         let file = locks.open_private_lock(SESSION_LOCK_FILE)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
@@ -3953,7 +3981,6 @@ fn refresh_host_layout(
     if !rooted.entry_exists(HOST_LAYOUT_FILE)? {
         let stored = publish_host_layout(rooted, namespaces)?;
         inject_open_fault(point, HostStoreWritePoint::AfterHostLayoutRefreshPublish)?;
-        remove_private_if_present(rooted, HOST_LAYOUT_REFRESH_NAME)?;
         return Ok(stored);
     }
     let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
@@ -3961,7 +3988,6 @@ fn refresh_host_layout(
     let stored: HostLayoutIdentity = read_json_strict_at(rooted, HOST_LAYOUT_FILE)?;
     validate_host_layout(&stored, &current)?;
     inject_open_fault(point, HostStoreWritePoint::AfterHostLayoutRefreshPublish)?;
-    remove_private_if_present(rooted, HOST_LAYOUT_REFRESH_NAME)?;
     Ok(stored)
 }
 
@@ -3992,6 +4018,10 @@ fn restore_or_refresh_installation_identity(
             installation_file_identity,
         )?;
         let stored: HostInstallationIdentity = read_json_strict_at(parent, &names.identity)?;
+        if stored == current {
+            remove_private_if_present(parent, INSTALLATION_IDENTITY_REFRESH_NAME)?;
+            return Ok((stored, installation_file_identity));
+        }
         let refresh = reanchored
             || installation_is_volume_remount(&stored, &current)
             || (installation_inodes_match(&stored, &current) && stored.key != current.key);
@@ -4122,6 +4152,308 @@ fn host_layout_outdated() -> WorkerError {
     WorkerError::Unavailable(
         "HOST_LAYOUT_OUTDATED: host layout requires worker setup migration".to_string(),
     )
+}
+
+fn upgrade_drain_required(message: &str) -> WorkerError {
+    WorkerError::Unavailable(format!("HOST_UPGRADE_DRAIN_REQUIRED: {message}"))
+}
+
+fn refuse_layout3_promotion(
+    namespaces: &BTreeMap<&'static str, RootedDir>,
+) -> Result<(), WorkerError> {
+    inspect_upgrade_drain(namespaces)
+}
+
+fn inspect_upgrade_drain(
+    namespaces: &BTreeMap<&'static str, RootedDir>,
+) -> Result<(), WorkerError> {
+    let leases = namespaces
+        .get("leases")
+        .expect("owned leases namespace was inserted");
+    inspect_lease_namespace(leases)?;
+    let incoming = namespaces
+        .get("incoming")
+        .expect("owned incoming namespace was inserted");
+    inspect_residue_namespace(incoming, "incoming transfer residue is still present")?;
+    let jobs = namespaces
+        .get("jobs")
+        .expect("owned jobs namespace was inserted");
+    inspect_jobs_namespace(jobs)?;
+    let index = namespaces
+        .get("job-index")
+        .expect("owned job-index namespace was inserted");
+    inspect_job_index(index, namespaces)?;
+    Ok(())
+}
+
+fn inspect_lease_namespace(leases: &RootedDir) -> Result<(), WorkerError> {
+    if leases.entry_exists("heavy")? {
+        return Err(upgrade_drain_required(
+            "layout-2 heavy lease residue is still present",
+        ));
+    }
+    for raw in leases.list_names()? {
+        let name = utf8_inventory_name(&raw, "leases")?;
+        if is_rooted_bookkeeping(&name)
+            || name == "capacity.lock"
+            || name == "capacity.json"
+            || name == "slots"
+        {
+            continue;
+        }
+        return Err(upgrade_drain_required(
+            "lease namespace still has live or leftover entries",
+        ));
+    }
+    if leases.entry_exists("slots")? {
+        let slots = leases.open_child_directory(&relative("slots")?, false)?;
+        inspect_slot_tree(&slots)?;
+    }
+    Ok(())
+}
+
+fn inspect_slot_tree(slots: &RootedDir) -> Result<(), WorkerError> {
+    for raw in slots.list_names()? {
+        let name = utf8_inventory_name(&raw, "leases/slots")?;
+        if is_rooted_bookkeeping(&name) {
+            continue;
+        }
+        let Ok(slot_id) = name.parse::<u8>() else {
+            return Err(upgrade_drain_required(
+                "lease namespace still has live or leftover entries",
+            ));
+        };
+        if slot_id.to_string() != name {
+            return Err(upgrade_drain_required(
+                "lease namespace still has live or leftover entries",
+            ));
+        }
+        let slot = slots.open_child_directory(&relative(&name)?, false)?;
+        inspect_residue_namespace(&slot, "a live lease is still present")?;
+    }
+    Ok(())
+}
+
+fn inspect_residue_namespace(directory: &RootedDir, message: &str) -> Result<(), WorkerError> {
+    for raw in directory.list_names()? {
+        let name = utf8_inventory_name(&raw, "host namespace")?;
+        if is_rooted_bookkeeping(&name) {
+            continue;
+        }
+        return Err(upgrade_drain_required(message));
+    }
+    Ok(())
+}
+
+fn inspect_job_index(
+    index: &RootedDir,
+    namespaces: &BTreeMap<&'static str, RootedDir>,
+) -> Result<(), WorkerError> {
+    for raw in index.list_names()? {
+        let name = utf8_inventory_name(&raw, "job-index")?;
+        if is_rooted_bookkeeping(&name) {
+            continue;
+        }
+        if name.starts_with(".accept-") {
+            return Err(upgrade_drain_required(
+                "accepted-index staging residue is still present",
+            ));
+        }
+        if name.starts_with('.') {
+            return Err(upgrade_drain_required("job-index residue is still present"));
+        }
+        let Some(stem) = name.strip_suffix(".json") else {
+            return Err(upgrade_drain_required("job-index inventory is unreadable"));
+        };
+        let parsed: JobId = match stem.parse() {
+            Ok(job_id) => job_id,
+            Err(_) => {
+                return Err(upgrade_drain_required("job-index inventory is unreadable"));
+            }
+        };
+        let disposition: JobDisposition = match read_json_strict_at(index, &name) {
+            Ok(disposition) => disposition,
+            Err(_) => {
+                return Err(upgrade_drain_required("job-index inventory is unreadable"));
+            }
+        };
+        if disposition_job_id(&disposition) != parsed {
+            return Err(upgrade_drain_required(
+                "job-index filename does not match its record",
+            ));
+        }
+        match disposition {
+            JobDisposition::Abandoned { .. } => {}
+            JobDisposition::Accepted {
+                job_id,
+                client_id,
+                project_id,
+                worktree_id,
+                request_fingerprint,
+                ..
+            } => {
+                inspect_terminal_accepted_job(
+                    namespaces,
+                    job_id,
+                    client_id,
+                    &project_id,
+                    &worktree_id,
+                    &request_fingerprint,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_terminal_accepted_job(
+    namespaces: &BTreeMap<&'static str, RootedDir>,
+    job_id: crate::job::JobId,
+    client_id: crate::job::ClientId,
+    project_id: &str,
+    worktree_id: &str,
+    request_fingerprint: &crate::job::RequestFingerprint,
+) -> Result<(), WorkerError> {
+    let jobs = namespaces
+        .get("jobs")
+        .expect("owned jobs namespace was inserted");
+    let project = match jobs.open_child_directory(&relative(project_id)?, false) {
+        Ok(project) => project,
+        Err(_) => {
+            return Err(upgrade_drain_required(
+                "accepted job directory is absent or unreadable",
+            ));
+        }
+    };
+    let worktree = match project.open_child_directory(&relative(worktree_id)?, false) {
+        Ok(worktree) => worktree,
+        Err(_) => {
+            return Err(upgrade_drain_required(
+                "accepted job directory is absent or unreadable",
+            ));
+        }
+    };
+    let job = match worktree.open_child_directory(&relative(&job_id.to_string())?, false) {
+        Ok(job) => job,
+        Err(_) => {
+            return Err(upgrade_drain_required(
+                "accepted job directory is absent or unreadable",
+            ));
+        }
+    };
+    let meta: crate::job::JobMeta = match read_json_strict_at(&job, "meta.json") {
+        Ok(meta) => meta,
+        Err(_) => {
+            return Err(upgrade_drain_required(
+                "accepted job metadata is unreadable",
+            ));
+        }
+    };
+    let status: crate::job::JobStatus = match read_json_strict_at(&job, "status.json") {
+        Ok(status) => status,
+        Err(_) => {
+            return Err(upgrade_drain_required("accepted job status is unreadable"));
+        }
+    };
+    if meta.job_id() != job_id
+        || meta.client_id() != client_id
+        || meta.project_id() != project_id
+        || meta.worktree_id() != worktree_id
+        || meta.request_fingerprint() != request_fingerprint
+        || !status.state().is_terminal()
+    {
+        return Err(upgrade_drain_required(
+            "accepted job is not a terminal archive",
+        ));
+    }
+    for name in ["workspace", "home", "tmp", "execution.json"] {
+        if job.entry_exists(name)? {
+            return Err(upgrade_drain_required(
+                "accepted job still has mutable execution residue",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn utf8_inventory_name(raw: &[u8], label: &str) -> Result<String, WorkerError> {
+    std::str::from_utf8(raw)
+        .map(str::to_owned)
+        .map_err(|_| upgrade_drain_required(&format!("{label} inventory is not UTF-8")))
+}
+
+fn is_rooted_bookkeeping(name: &str) -> bool {
+    name == ".mac-worker-rooted-fs"
+}
+
+fn inspect_jobs_namespace(jobs: &RootedDir) -> Result<(), WorkerError> {
+    for project_raw in jobs.list_names()? {
+        let project_name = utf8_inventory_name(&project_raw, "jobs")?;
+        if is_rooted_bookkeeping(&project_name) {
+            continue;
+        }
+        let project = match jobs.open_child_directory(&relative(&project_name)?, false) {
+            Ok(project) => project,
+            Err(_) => {
+                return Err(upgrade_drain_required("jobs inventory is unreadable"));
+            }
+        };
+        for worktree_raw in project.list_names()? {
+            let worktree_name = utf8_inventory_name(&worktree_raw, "jobs")?;
+            if is_rooted_bookkeeping(&worktree_name) {
+                continue;
+            }
+            let worktree = match project.open_child_directory(&relative(&worktree_name)?, false) {
+                Ok(worktree) => worktree,
+                Err(_) => {
+                    return Err(upgrade_drain_required("jobs inventory is unreadable"));
+                }
+            };
+            for job_raw in worktree.list_names()? {
+                let job_name = utf8_inventory_name(&job_raw, "jobs")?;
+                if is_rooted_bookkeeping(&job_name) {
+                    continue;
+                }
+                let job = match worktree.open_child_directory(&relative(&job_name)?, false) {
+                    Ok(job) => job,
+                    Err(_) => {
+                        return Err(upgrade_drain_required("jobs inventory is unreadable"));
+                    }
+                };
+                inspect_archived_job_directory(&job)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_archived_job_directory(job: &RootedDir) -> Result<(), WorkerError> {
+    let meta: crate::job::JobMeta = match read_json_strict_at(job, "meta.json") {
+        Ok(meta) => meta,
+        Err(_) => {
+            return Err(upgrade_drain_required("job metadata is unreadable"));
+        }
+    };
+    let status: crate::job::JobStatus = match read_json_strict_at(job, "status.json") {
+        Ok(status) => status,
+        Err(_) => {
+            return Err(upgrade_drain_required("job status is unreadable"));
+        }
+    };
+    if !status.state().is_terminal() {
+        return Err(upgrade_drain_required(
+            "a non-terminal job is still present",
+        ));
+    }
+    let _ = meta;
+    for name in ["workspace", "home", "tmp", "execution.json"] {
+        if job.entry_exists(name)? {
+            return Err(upgrade_drain_required(
+                "accepted job still has mutable execution residue",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn build_transfer_lock_identity(
@@ -4821,18 +5153,8 @@ fn protocol_code(code: &'static str, message: &str) -> WorkerError {
     WorkerError::Protocol(format!("{code}: {message}"))
 }
 
-fn upgrade_drain_required(message: &str) -> WorkerError {
-    protocol_code("HOST_UPGRADE_DRAIN_REQUIRED", message)
-}
-
 fn upgrade_rollback_unsafe(message: &str) -> WorkerError {
     protocol_code("HOST_UPGRADE_ROLLBACK_UNSAFE", message)
-}
-
-fn utf8_inventory_name(raw: &[u8], label: &str) -> Result<String, WorkerError> {
-    std::str::from_utf8(raw)
-        .map(str::to_owned)
-        .map_err(|_| upgrade_drain_required(&format!("{label} inventory is not UTF-8")))
 }
 
 fn is_private_namespace(name: &str) -> bool {
@@ -5677,6 +5999,38 @@ mod review_regression_tests {
     }
 
     #[test]
+    fn installation_layout_mismatch_without_refresh_residue_is_refused() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let _store = HostStore::open(&root).unwrap();
+        let identity = installation_entries(temp.path())
+            .into_iter()
+            .find(|path| path.extension().is_some_and(|value| value == "json"))
+            .expect("installation identity");
+        let layout_bytes = fs::read(root.join(HOST_LAYOUT_FILE)).unwrap();
+        let mut stored: HostInstallationIdentity =
+            serde_json::from_slice(&fs::read(&identity).unwrap()).unwrap();
+        stored.layout.inode = stored.layout.inode.wrapping_add(1);
+        let tampered = serde_json::to_vec(&stored).unwrap();
+        fs::write(&identity, &tampered).unwrap();
+        fs::set_permissions(&identity, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = match HostStore::open(&root) {
+            Ok(_) => panic!("layout-inode mismatch without residue was refreshed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("canonical host installation identity changed"),
+            "unexpected error: {error:?}"
+        );
+        assert!(!root.join(HOST_LAYOUT_REFRESH_NAME).exists());
+        assert_eq!(fs::read(&identity).unwrap(), tampered);
+        assert_eq!(fs::read(root.join(HOST_LAYOUT_FILE)).unwrap(), layout_bytes);
+    }
+
+    #[test]
     fn copied_layout_bytes_cannot_bless_a_replacement_layout_file() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -5796,7 +6150,7 @@ mod review_regression_tests {
 
         assert!(HostStore::open(&root).is_err());
         assert!(!root.exists());
-        assert!(detached.join("leases/heavy/lease.json").is_file());
+        assert!(detached.join("leases/slots/0/lease.json").is_file());
     }
 
     #[test]
@@ -6754,9 +7108,8 @@ mod review_regression_tests {
         let target = temp.path().join("worker");
         fs::write(&previous, b"previous-helper").unwrap();
         fs::write(&target, b"candidate-helper").unwrap();
-        // Combined SCHED case: live publish would be layout 3 while previous
-        // helper still only opens 2. FLOW still writes HOST_LAYOUT_VERSION (2);
-        // the override is only the compatibility check.
+        // Combined SCHED case: live publish is layout 3 while previous helper
+        // still only opens 2. The override is only the compatibility check.
         let error = HostStore::with_published_layout_version(3, || {
             HostStore::complete_unverified_rollback(&root, Some(&previous), &target)
         })

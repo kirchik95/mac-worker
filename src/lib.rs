@@ -381,6 +381,11 @@ fn execute_with_context(
             "host complete-unverified-rollback requires the stdio execution boundary".into(),
         )),
         Command::Host {
+            command: HostCommand::SetSlots { .. },
+        } => Err(WorkerError::Protocol(
+            "host set-slots requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
             command: HostCommand::RefreshFacts { .. },
         } => Err(WorkerError::Protocol(
             "host refresh-facts requires the stdio execution boundary".into(),
@@ -1731,6 +1736,12 @@ pub fn run_with_rsync_executor_in_context(
         );
     }
     if let Command::Host {
+        command: HostCommand::SetSlots { slots },
+    } = cli.command
+    {
+        return run_host_set_slots(cli.config, runtime, slots, stderr);
+    }
+    if let Command::Host {
         command:
             HostCommand::RefreshFacts {
                 timing,
@@ -2901,6 +2912,26 @@ fn run_host_complete_unverified_rollback(
     }
 }
 
+fn run_host_set_slots(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    slots: u8,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        let store = HostStore::open(&paths.host_state_root())?;
+        LeaseService::new(&store).set_slot_count(slots)
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            write_error(stderr, &error);
+            error.exit_code()
+        }
+    }
+}
+
 fn run_host_refresh_facts(
     config_override: Option<PathBuf>,
     runtime: &RuntimeContext,
@@ -3434,10 +3465,15 @@ mod tests {
     }
 
     #[test]
-    fn slots_other_than_one_are_rejected_in_v1() {
+    fn slots_outside_host_bound_are_rejected() {
         let mut config = Config::parse(include_str!("../config.example.toml")).unwrap();
         config.workers[0].slots = 2;
+        assert!(config.validate().is_ok());
 
+        config.workers[0].slots = 0;
+        assert!(matches!(config.validate(), Err(WorkerError::Config(_))));
+
+        config.workers[0].slots = crate::lease::MAX_HOST_SLOTS + 1;
         assert!(matches!(config.validate(), Err(WorkerError::Config(_))));
     }
 

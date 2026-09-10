@@ -1089,7 +1089,7 @@ struct SupervisorErrorLog {
 
 impl SupervisorErrorLog {
     fn prepare(store: &HostStore, job_id: JobId) -> Result<Option<Self>, WorkerError> {
-        let Some(lease) = LeaseService::new(store).load()? else {
+        let Some(lease) = LeaseService::new(store).load_for_job(job_id)? else {
             return Ok(None);
         };
         if lease.job_id() != job_id {
@@ -1271,7 +1271,7 @@ impl<'a> Supervisor<'a> {
             ));
         }
         let lease = LeaseService::new(self.store)
-            .load()?
+            .load_for_job(job_id)?
             .ok_or_else(|| protocol_code("LEASE_MISSING", "matching live lease is absent"))?;
         if lease.job_id() != job_id {
             return Err(protocol_code(

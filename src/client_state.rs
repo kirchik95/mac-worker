@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::{CStr, CString, OsStr},
     fs::File,
     io::{self, Read, Write},
@@ -1151,7 +1151,23 @@ impl ClientStateStore {
         ranked_workers: &[String],
         claimed_at_millis: u64,
     ) -> Result<Option<QueueClaim>, WorkerError> {
-        self.claim_next_matching(owner, ranked_workers, claimed_at_millis, None)
+        self.claim_next_matching(owner, ranked_workers, claimed_at_millis, None, None)
+    }
+
+    pub fn claim_next_with_slot_ceilings(
+        &self,
+        owner: ProcessIdentity,
+        ranked_workers: &[String],
+        claimed_at_millis: u64,
+        slot_ceilings: &BTreeMap<String, u8>,
+    ) -> Result<Option<QueueClaim>, WorkerError> {
+        self.claim_next_matching(
+            owner,
+            ranked_workers,
+            claimed_at_millis,
+            None,
+            Some(slot_ceilings),
+        )
     }
 
     /// Keeps an attached or resumed task runner bound to its requested turn,
@@ -1163,7 +1179,30 @@ impl ClientStateStore {
         ranked_workers: &[String],
         claimed_at_millis: u64,
     ) -> Result<Option<QueueClaim>, WorkerError> {
-        self.claim_next_matching(owner, ranked_workers, claimed_at_millis, Some(turn_id))
+        self.claim_next_matching(
+            owner,
+            ranked_workers,
+            claimed_at_millis,
+            Some(turn_id),
+            None,
+        )
+    }
+
+    pub fn claim_task_turn_with_slot_ceilings(
+        &self,
+        owner: ProcessIdentity,
+        turn_id: TurnId,
+        ranked_workers: &[String],
+        claimed_at_millis: u64,
+        slot_ceilings: &BTreeMap<String, u8>,
+    ) -> Result<Option<QueueClaim>, WorkerError> {
+        self.claim_next_matching(
+            owner,
+            ranked_workers,
+            claimed_at_millis,
+            Some(turn_id),
+            Some(slot_ceilings),
+        )
     }
 
     fn claim_next_matching(
@@ -1172,6 +1211,7 @@ impl ClientStateStore {
         ranked_workers: &[String],
         claimed_at_millis: u64,
         turn_id: Option<TurnId>,
+        slot_ceilings: Option<&BTreeMap<String, u8>>,
     ) -> Result<Option<QueueClaim>, WorkerError> {
         owner.validate()?;
         if claimed_at_millis == 0 {
@@ -1200,13 +1240,21 @@ impl ClientStateStore {
             };
             let mut selected = None;
             for worker in ranked_workers {
-                if snapshot.entries.iter().any(|entry| {
-                    matches!(
-                        entry.state(),
-                        QueueState::Dispatching { selected_worker, .. }
-                            if selected_worker == worker
-                    )
-                }) {
+                let ceiling = slot_ceilings
+                    .and_then(|ceilings| ceilings.get(worker).copied())
+                    .unwrap_or(1);
+                let occupied = snapshot
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.state(),
+                            QueueState::Dispatching { selected_worker, .. }
+                                if selected_worker == worker
+                        )
+                    })
+                    .count();
+                if occupied >= usize::from(ceiling) {
                     continue;
                 }
                 let capabilities = read_observation_optional(

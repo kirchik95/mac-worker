@@ -1227,10 +1227,11 @@ impl<'a> RunService<'a> {
                     return Err(error);
                 }
             };
-            let claim = match self.client_state.claim_next(
+            let claim = match self.client_state.claim_next_with_slot_ceilings(
                 identity.dispatch_owner,
                 &ranked_workers,
                 claimed_at_millis,
+                &self.config.worker_slot_ceilings(),
             ) {
                 Ok(claim) => claim,
                 Err(error) => {

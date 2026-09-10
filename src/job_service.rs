@@ -15,10 +15,11 @@ use crate::{
     },
     inputs::RelativePath,
     job::{
-        CancelRequest, CancelResponse, ClientId, CommandSpec, JobId, JobMeta, JobState, JobStatus,
-        LeaseRecord, LeaseToken, LogChunk, LogStream, ProcessIdentity, RequestFingerprint,
-        RequestFingerprintMaterial, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
-        StatusLogsRequest, StatusLogsResponse, StatusResponse, SubmitRequest, SubmitResponse,
+        CancelRequest, CancelResponse, ClientId, CommandSpec, ExecutionScope, JobId, JobMeta,
+        JobState, JobStatus, LeaseRecord, LeaseToken, LogChunk, LogStream, ProcessIdentity,
+        RequestFingerprint, RequestFingerprintMaterial, ResolveOrAbandonRequest,
+        ResolveOrAbandonResponse, StatusLogsRequest, StatusLogsResponse, StatusResponse,
+        SubmitRequest, SubmitResponse,
     },
     lease::LeaseService,
     process::SystemProcessRunner,
@@ -413,6 +414,12 @@ impl<'a> JobService<'a> {
                 .filter(|lease| lease.job_id() == job_id)
             {
                 require_exact_lease(&lease, &submit)?;
+                require_bound_scope(
+                    &self.leases,
+                    job_id,
+                    submit.execution_scope(),
+                    &ExecutionScope::task(turn.task_id()),
+                )?;
                 let (meta, status) = self.read_exact_job(&submit, &lease)?;
                 if status.state().is_terminal() {
                     let authoritative =
@@ -488,6 +495,12 @@ impl<'a> JobService<'a> {
             .filter(|lease| lease.job_id() == job_id)
             .ok_or_else(|| protocol_code("LEASE_MISSING", "matching task lease is absent"))?;
         require_exact_lease(&lease, &submit)?;
+        require_bound_scope(
+            &self.leases,
+            job_id,
+            submit.execution_scope(),
+            &ExecutionScope::task(turn.task_id()),
+        )?;
 
         let (meta, prepared_status) = {
             let current = task_store.load_status(material.project_id(), turn.task_id())?;
@@ -998,6 +1011,12 @@ impl<'a> JobService<'a> {
                 "active task lease does not match task metadata",
             ));
         }
+        require_bound_scope(
+            &self.leases,
+            request.turn_id(),
+            &ExecutionScope::task(request.task_id()),
+            &ExecutionScope::task(request.task_id()),
+        )?;
         let cancel = CancelRequest::new(
             request.turn_id(),
             lease.client_id(),
@@ -2064,6 +2083,12 @@ impl<'a> JobService<'a> {
                 .filter(|lease| lease.job_id() == job_id)
             {
                 require_exact_lease(&lease, &request)?;
+                require_bound_scope(
+                    &self.leases,
+                    job_id,
+                    request.execution_scope(),
+                    &ExecutionScope::Job,
+                )?;
                 let (_, authoritative) = self.read_exact_job(&request, &lease)?;
                 self.store.repair_indexed_publication_after(
                     &admission,
@@ -2114,6 +2139,12 @@ impl<'a> JobService<'a> {
             .filter(|lease| lease.job_id() == job_id)
             .ok_or_else(|| protocol_code("LEASE_MISSING", "matching live lease is absent"))?;
         require_exact_lease(&lease, &request)?;
+        require_bound_scope(
+            &self.leases,
+            job_id,
+            request.execution_scope(),
+            &ExecutionScope::Job,
+        )?;
 
         let verified = self.snapshots.load_verified_after(
             &admission,
@@ -2320,6 +2351,12 @@ impl<'a> JobService<'a> {
                         protocol_code("LEASE_MISSING", "matching live lease is absent")
                     })?;
                 require_exact_lease(&authoritative_lease, request)?;
+                require_bound_scope(
+                    &self.leases,
+                    job_id,
+                    request.execution_scope(),
+                    &ExecutionScope::Job,
+                )?;
                 let (_, status) = self.read_exact_job(request, &authoritative_lease)?;
                 self.store.repair_indexed_publication_after(
                     &admission,
@@ -3171,6 +3208,24 @@ fn require_exact_lease(lease: &LeaseRecord, request: &SubmitRequest) -> Result<(
         return Err(protocol_code(
             "JOB_ID_CONFLICT",
             "live lease does not match the immutable submit request",
+        ));
+    }
+    Ok(())
+}
+
+fn require_bound_scope(
+    leases: &LeaseService<'_>,
+    job: JobId,
+    requested: &ExecutionScope,
+    required: &ExecutionScope,
+) -> Result<(), WorkerError> {
+    let slot = leases
+        .occupied_slot_for_job(job)?
+        .ok_or_else(|| protocol_code("LEASE_MISSING", "matching live lease is absent"))?;
+    if slot.execution_scope != *requested || slot.execution_scope != *required {
+        return Err(protocol_code(
+            "EXECUTION_SCOPE_CONFLICT",
+            "request execution scope does not match the live lease binding",
         ));
     }
     Ok(())

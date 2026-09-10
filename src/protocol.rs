@@ -50,6 +50,10 @@ pub struct ProbeResponse {
     pub agent_facts: Option<AgentFacts>,
     #[serde(default)]
     pub facts_age_millis: Option<u64>,
+    #[serde(default)]
+    pub configured_slots: u8,
+    #[serde(default)]
+    pub busy_slots: u8,
 }
 
 impl ProbeResponse {
@@ -70,6 +74,29 @@ impl ProbeResponse {
     pub fn herdr_available(&self) -> bool {
         self.herdr_fact()
             .is_some_and(|herdr| herdr.state == HerdrFactState::Available)
+    }
+
+    pub fn configured_slot_count(&self) -> u8 {
+        if self.configured_slots == 0 {
+            1
+        } else {
+            self.configured_slots
+        }
+    }
+
+    pub fn busy_slot_count(&self) -> u8 {
+        if self.configured_slots == 0 {
+            match self.slot_state {
+                crate::lease::SlotState::Busy => 1,
+                crate::lease::SlotState::Idle => 0,
+            }
+        } else {
+            self.busy_slots
+        }
+    }
+
+    pub fn has_free_execution_slot(&self) -> bool {
+        self.busy_slot_count() < self.configured_slot_count()
     }
 }
 
@@ -242,6 +269,8 @@ mod tests {
                 capabilities: vec!["darwin-arm64".into(), "git".into()],
                 agent_facts: None,
                 facts_age_millis: None,
+                configured_slots: 0,
+                busy_slots: 0,
             }
         }
 

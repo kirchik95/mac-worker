@@ -20,9 +20,9 @@ use crate::{
     error::WorkerError,
     git_transport::GitTransport,
     job::{
-        CommandSpec, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LogCursor,
-        LogStream, ProcessIdentity, QueueEntryKind, QueueState, RequestFingerprintMaterial,
-        ResolveOrAbandonRequest, SubmitRequest, TerminalLogDrain,
+        CommandSpec, ExecutionScope, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
+        LeaseToken, LogCursor, LogStream, ProcessIdentity, QueueEntryKind, QueueState,
+        RequestFingerprintMaterial, ResolveOrAbandonRequest, SubmitRequest, TerminalLogDrain,
     },
     paths::PathLayout,
     process::ProcessRunner,
@@ -397,7 +397,7 @@ impl<'a> TurnRunner<'a> {
             self.paths,
             task_id,
             entry.job_id(),
-            self.config.workers.len(),
+            self.config.configured_runner_slots(),
             true,
         ) {
             Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => Ok(()),
@@ -592,11 +592,12 @@ impl<'a> TurnRunner<'a> {
                             })
                             .map(|candidate| candidate.worker_name().to_owned())
                             .collect::<Vec<_>>();
-                    if let Some(claim) = self.client_state.claim_task_turn(
+                    if let Some(claim) = self.client_state.claim_task_turn_with_slot_ceilings(
                         runner_owner,
                         turn_id,
                         &ranked,
                         now_millis()?,
+                        &self.config.worker_slot_ceilings(),
                     )? {
                         return match claim.entry().state() {
                             QueueState::Dispatching { dispatch_owner, .. } => {
@@ -891,7 +892,9 @@ impl<'a> TurnRunner<'a> {
             "heavy".into(),
             CommandSpec::shell(shell)?,
         )?;
-        let lease_request = LeaseAcquireRequest::new(material.clone());
+        let execution_scope = ExecutionScope::task(task_id);
+        let lease_request = LeaseAcquireRequest::new(material.clone())
+            .with_execution_scope(execution_scope.clone());
         let acquired = match remote.lease_acquire(worker, &lease_request) {
             Ok(acquired) => acquired,
             Err(error)
@@ -1012,7 +1015,8 @@ impl<'a> TurnRunner<'a> {
                     prepared.status().clone()
                 } else {
                     let request = TaskTurnRequest::new_with_origin(
-                        SubmitRequest::new(material.clone()),
+                        SubmitRequest::new(material.clone())
+                            .with_execution_scope(execution_scope.clone()),
                         turn.clone(),
                         prompt.clone(),
                         turn_origin_url(initial_record.meta()),

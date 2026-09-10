@@ -297,6 +297,10 @@ pub enum HostCommand {
         target: HiddenComponent,
         previous: Option<HiddenComponent>,
     },
+    #[command(name = "set-slots", hide = true)]
+    SetSlots {
+        slots: u8,
+    },
     #[command(name = "refresh-facts")]
     RefreshFacts {
         /// Print per-step collection durations on stderr after writing facts

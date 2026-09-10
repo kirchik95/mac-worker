@@ -1723,7 +1723,6 @@ impl QueueSnapshot {
         let mut previous_id = 0;
         let mut previous_timestamp = 0;
         let mut jobs = HashSet::new();
-        let mut dispatch_workers = BTreeSet::new();
         let mut run_caps = HashMap::new();
         for entry in &self.entries {
             entry.validate()?;
@@ -1745,15 +1744,6 @@ impl QueueSnapshot {
             {
                 return Err(protocol_error(
                     "queue contains conflicting maximum parallelism for one run ID",
-                ));
-            }
-            if let QueueState::Dispatching {
-                selected_worker, ..
-            } = &entry.state
-                && !dispatch_workers.insert(selected_worker.as_str())
-            {
-                return Err(protocol_error(
-                    "queue contains duplicate dispatch worker reservations",
                 ));
             }
             previous_id = queue_id;
@@ -3207,10 +3197,51 @@ impl<'de> Deserialize<'de> for LeaseRecord {
     }
 }
 
+/// Admission-only execution workspace binding. Not part of the request fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionScope {
+    #[default]
+    Job,
+    Task {
+        task_id: crate::task::TaskId,
+    },
+}
+
+impl ExecutionScope {
+    pub fn task(task_id: crate::task::TaskId) -> Self {
+        Self::Task { task_id }
+    }
+
+    pub fn is_job(&self) -> bool {
+        matches!(self, Self::Job)
+    }
+
+    pub fn require_job(&self) -> Result<(), WorkerError> {
+        if self.is_job() {
+            Ok(())
+        } else {
+            Err(protocol_error(
+                "EXECUTION_SCOPE_CONFLICT: live lease is bound to a task workspace",
+            ))
+        }
+    }
+
+    pub fn require_task(&self, task_id: crate::task::TaskId) -> Result<(), WorkerError> {
+        match self {
+            Self::Task { task_id: bound } if *bound == task_id => Ok(()),
+            _ => Err(protocol_error(
+                "EXECUTION_SCOPE_CONFLICT: live lease is not bound to this task workspace",
+            )),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct LeaseAcquireRequest {
     material: RequestFingerprintMaterial,
     request_fingerprint: RequestFingerprint,
+    execution_scope: ExecutionScope,
 }
 
 impl fmt::Debug for LeaseAcquireRequest {
@@ -3220,6 +3251,7 @@ impl fmt::Debug for LeaseAcquireRequest {
             .field("job_id", &self.material.job_id())
             .field("client_id", &self.material.client_id())
             .field("request_fingerprint", &self.request_fingerprint)
+            .field("execution_scope", &self.execution_scope)
             .finish_non_exhaustive()
     }
 }
@@ -3227,9 +3259,14 @@ impl fmt::Debug for LeaseAcquireRequest {
 impl Serialize for LeaseAcquireRequest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("LeaseAcquireRequest", 2)?;
+        let emit_scope = !self.execution_scope.is_job();
+        let mut record =
+            serializer.serialize_struct("LeaseAcquireRequest", 2 + usize::from(emit_scope))?;
         record.serialize_field("material", &self.material)?;
         record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
+        if emit_scope {
+            record.serialize_field("execution_scope", &self.execution_scope)?;
+        }
         record.end()
     }
 }
@@ -3240,7 +3277,13 @@ impl LeaseAcquireRequest {
         Self {
             material,
             request_fingerprint,
+            execution_scope: ExecutionScope::Job,
         }
+    }
+
+    pub fn with_execution_scope(mut self, execution_scope: ExecutionScope) -> Self {
+        self.execution_scope = execution_scope;
+        self
     }
 
     pub fn validate(&self) -> Result<(), WorkerError> {
@@ -3259,6 +3302,9 @@ impl LeaseAcquireRequest {
     pub fn request_fingerprint(&self) -> &RequestFingerprint {
         &self.request_fingerprint
     }
+    pub fn execution_scope(&self) -> &ExecutionScope {
+        &self.execution_scope
+    }
 }
 
 impl<'de> Deserialize<'de> for LeaseAcquireRequest {
@@ -3268,11 +3314,14 @@ impl<'de> Deserialize<'de> for LeaseAcquireRequest {
         struct Wire {
             material: RequestFingerprintMaterial,
             request_fingerprint: RequestFingerprint,
+            #[serde(default)]
+            execution_scope: ExecutionScope,
         }
         let wire = Wire::deserialize(deserializer)?;
         let request = Self {
             material: wire.material,
             request_fingerprint: wire.request_fingerprint,
+            execution_scope: wire.execution_scope,
         };
         request.validate().map_err(de::Error::custom)?;
         Ok(request)
@@ -3333,6 +3382,7 @@ impl<'de> Deserialize<'de> for LeaseAcquireResponse {
 pub struct SubmitRequest {
     material: RequestFingerprintMaterial,
     request_fingerprint: RequestFingerprint,
+    execution_scope: ExecutionScope,
 }
 
 impl fmt::Debug for SubmitRequest {
@@ -3349,9 +3399,14 @@ impl fmt::Debug for SubmitRequest {
 impl Serialize for SubmitRequest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("SubmitRequest", 2)?;
+        let emit_scope = !self.execution_scope.is_job();
+        let mut record =
+            serializer.serialize_struct("SubmitRequest", 2 + usize::from(emit_scope))?;
         record.serialize_field("material", &self.material)?;
         record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
+        if emit_scope {
+            record.serialize_field("execution_scope", &self.execution_scope)?;
+        }
         record.end()
     }
 }
@@ -3362,13 +3417,20 @@ impl SubmitRequest {
         Self {
             material,
             request_fingerprint,
+            execution_scope: ExecutionScope::Job,
         }
+    }
+
+    pub fn with_execution_scope(mut self, execution_scope: ExecutionScope) -> Self {
+        self.execution_scope = execution_scope;
+        self
     }
 
     pub fn validate(&self) -> Result<(), WorkerError> {
         LeaseAcquireRequest {
             material: self.material.clone(),
             request_fingerprint: self.request_fingerprint.clone(),
+            execution_scope: self.execution_scope.clone(),
         }
         .validate()
     }
@@ -3379,6 +3441,9 @@ impl SubmitRequest {
     pub fn request_fingerprint(&self) -> &RequestFingerprint {
         &self.request_fingerprint
     }
+    pub fn execution_scope(&self) -> &ExecutionScope {
+        &self.execution_scope
+    }
 }
 
 impl<'de> Deserialize<'de> for SubmitRequest {
@@ -3388,11 +3453,14 @@ impl<'de> Deserialize<'de> for SubmitRequest {
         struct Wire {
             material: RequestFingerprintMaterial,
             request_fingerprint: RequestFingerprint,
+            #[serde(default)]
+            execution_scope: ExecutionScope,
         }
         let wire = Wire::deserialize(deserializer)?;
         let request = Self {
             material: wire.material,
             request_fingerprint: wire.request_fingerprint,
+            execution_scope: wire.execution_scope,
         };
         request.validate().map_err(de::Error::custom)?;
         Ok(request)

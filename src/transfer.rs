@@ -495,7 +495,7 @@ impl<'a> HostTransferService<'a> {
         let admission = self.store.admission_lock(identity.job_id)?;
         admission.validate()?;
         if crate::lease::LeaseService::new(self.store)
-            .load()?
+            .load_for_job(identity.job_id)?
             .is_none()
         {
             require_receivable_identity_disposition(self.store, identity)?;
@@ -1510,7 +1510,7 @@ pub(crate) fn require_live_identity(
     identity: &TransferIdentity,
 ) -> Result<LeaseRecord, WorkerError> {
     let live = crate::lease::LeaseService::new(store)
-        .load()?
+        .load_for_job(identity.job_id)?
         .ok_or_else(|| {
             host_transfer_error(
                 "LEASE_IDENTITY_MISMATCH",

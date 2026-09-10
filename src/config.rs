@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use serde::Deserialize;
 
@@ -109,10 +113,11 @@ impl Config {
                     worker.ssh
                 )));
             }
-            if worker.slots != 1 {
+            if worker.slots == 0 || worker.slots > crate::lease::MAX_HOST_SLOTS {
                 return Err(WorkerError::Config(format!(
-                    "worker {:?} must declare exactly one slot",
-                    worker.name
+                    "worker {:?} slots must be between 1 and {}",
+                    worker.name,
+                    crate::lease::MAX_HOST_SLOTS
                 )));
             }
             if worker.remote_binary != REMOTE_BINARY {
@@ -138,6 +143,20 @@ impl Config {
 
     pub fn worker(&self, name: &str) -> Option<&WorkerEntry> {
         self.workers.iter().find(|worker| worker.name == name)
+    }
+
+    pub fn configured_runner_slots(&self) -> usize {
+        self.workers
+            .iter()
+            .map(|worker| usize::from(worker.slots))
+            .sum()
+    }
+
+    pub fn worker_slot_ceilings(&self) -> BTreeMap<String, u8> {
+        self.workers
+            .iter()
+            .map(|worker| (worker.name.clone(), worker.slots))
+            .collect()
     }
 }
 

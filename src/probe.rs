@@ -193,6 +193,8 @@ impl ProbeCollector {
         let occupancy = LeaseService::load_if_present(host_state_root)?;
         response.slot_state = occupancy.slot_state;
         response.active_lease = occupancy.active_lease;
+        response.configured_slots = occupancy.configured_slots;
+        response.busy_slots = occupancy.busy_slots;
         response.agent_facts = Self::cached_facts_at(host_state_root)?;
         response.facts_age_millis = response
             .agent_facts
@@ -311,6 +313,8 @@ impl ProbeCollector {
             capabilities,
             agent_facts: None,
             facts_age_millis: None,
+            configured_slots: 0,
+            busy_slots: 0,
         })
     }
 }
@@ -1024,6 +1028,8 @@ mod tests {
                 capabilities: vec!["darwin-arm64".into(), "git".into(), "python".into()],
                 agent_facts: None,
                 facts_age_millis: None,
+                configured_slots: 0,
+                busy_slots: 0,
             }
         );
     }

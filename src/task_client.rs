@@ -2182,8 +2182,12 @@ impl<'a> TaskClient<'a> {
                 "This version can preview dependencies but cannot execute them.",
             ));
         }
+        if batch.tasks.is_empty() {
+            return Err(task_error("TASK_CONFIG_INVALID", "batch has no tasks"));
+        }
         self.reconcile_runners()?;
-        let max_parallel = resolve_batch_max_parallel(max_parallel, self.config.workers.len())?;
+        let max_parallel =
+            resolve_batch_max_parallel(max_parallel, self.config.configured_runner_slots())?;
         let run_id = RunId::generate();
         let created = current_time_millis()?;
         let batch_dir = file.parent().unwrap_or_else(|| Path::new("."));
@@ -2549,7 +2553,7 @@ impl<'a> TaskClient<'a> {
         let slot_limit = if attached {
             usize::MAX
         } else {
-            self.config.workers.len()
+            self.config.configured_runner_slots()
         };
         start_runner_with_reservation(
             self.client_state,

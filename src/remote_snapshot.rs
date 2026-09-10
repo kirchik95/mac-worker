@@ -117,7 +117,7 @@ impl<'a> RemoteSnapshotService<'a> {
     ) -> Result<VerifiedSnapshotResponse, WorkerError> {
         request.validate()?;
         let live = LeaseService::new(self.store)
-            .load()?
+            .load_for_job(request.job_id())?
             .ok_or_else(lease_identity_mismatch)?;
         if request.job_id() != live.job_id()
             || request.client_id() != live.client_id()

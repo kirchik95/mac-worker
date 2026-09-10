@@ -12,6 +12,7 @@ use std::{
 use crate::{
     config::{Config, WorkerEntry, valid_ssh_destination},
     error::{ProcessError, ProcessStream, WorkerError},
+    lease::{LeaseSummary, MAX_HOST_SLOTS, SlotState},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::{
         HealthStatus, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION, SetupFailureKind,
@@ -544,16 +545,40 @@ fn valid_probe_response(probe: &ProbeResponse) -> bool {
             .iter()
             .all(|capability| valid_capability(capability))
         && probe.capabilities.iter().collect::<HashSet<_>>().len() == probe.capabilities.len()
-        && match (probe.slot_state, probe.active_lease.as_ref()) {
-            (crate::lease::SlotState::Idle, None) => true,
-            (crate::lease::SlotState::Busy, Some(summary)) => {
-                summary.project_id.len() == 64
-                    && summary.project_id.bytes().all(is_lower_hex)
-                    && summary.worktree_id.len() == 64
-                    && summary.worktree_id.bytes().all(is_lower_hex)
-            }
+        && valid_probe_occupancy(probe)
+}
+
+fn valid_lease_summary(summary: &LeaseSummary) -> bool {
+    summary.project_id.len() == 64
+        && summary.project_id.bytes().all(is_lower_hex)
+        && summary.worktree_id.len() == 64
+        && summary.worktree_id.bytes().all(is_lower_hex)
+}
+
+fn valid_probe_occupancy(probe: &ProbeResponse) -> bool {
+    if probe.configured_slots == 0 {
+        // Legacy one-slot wire: occupancy is only slot_state + active_lease.
+        return match (probe.slot_state, probe.active_lease.as_ref()) {
+            (SlotState::Idle, None) => true,
+            (SlotState::Busy, Some(summary)) => valid_lease_summary(summary),
             _ => false,
-        }
+        };
+    }
+    if probe.configured_slots > MAX_HOST_SLOTS || probe.busy_slots > probe.configured_slots {
+        return false;
+    }
+    let free = probe.busy_slots < probe.configured_slots;
+    match (
+        probe.slot_state,
+        free,
+        probe.busy_slots,
+        probe.active_lease.as_ref(),
+    ) {
+        (SlotState::Idle, true, 0, None) => true,
+        (SlotState::Idle, true, busy, Some(summary)) if busy > 0 => valid_lease_summary(summary),
+        (SlotState::Busy, false, busy, Some(summary)) if busy > 0 => valid_lease_summary(summary),
+        _ => false,
+    }
 }
 
 fn is_lower_hex(byte: u8) -> bool {
@@ -614,6 +639,8 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
         capabilities: legacy.capabilities,
         agent_facts: legacy.agent_facts,
         facts_age_millis: legacy.facts_age_millis,
+        configured_slots: 0,
+        busy_slots: 0,
     };
     match serde_json::from_str::<ProbeResponse>(response) {
         Ok(probe) => Ok(probe),
@@ -637,6 +664,8 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
                     capabilities: legacy.capabilities,
                     agent_facts: None,
                     facts_age_millis: None,
+                    configured_slots: 0,
+                    busy_slots: 0,
                 }),
                 Err(_) => Err(full_error),
             },

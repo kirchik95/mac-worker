@@ -14,6 +14,7 @@ use crate::{
     git_transport::GitTransport,
     host_store::{HostStore, TransferGuard},
     job::JobId,
+    lease::{LeaseService, OccupiedSlot},
     outbox::OriginOutbox,
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::PROTOCOL_VERSION,
@@ -708,8 +709,24 @@ impl<'a> TaskStore<'a> {
                 "task preparation requires the matching transfer guard",
             ));
         }
+        let bound = LeaseService::new(self.store)
+            .occupied_slot_for_job(request.job_id())?
+            .ok_or_else(|| {
+                task_error(
+                    "TASK_LEASE_MISMATCH",
+                    "task preparation requires a live lease for the job",
+                )
+            })?;
         let meta = request.meta();
         let task_id = meta.task_id();
+        require_task_execution_lease(
+            &bound,
+            meta.project_id(),
+            task_id,
+            request.job_id(),
+            request.worker(),
+            Some(meta.worktree_id()),
+        )?;
         // This is intentionally the first filesystem lookup under `tasks/`:
         // a missing or invalid base must not leave a task directory behind.
         let mirror = match meta.source() {
@@ -831,6 +848,9 @@ impl<'a> TaskStore<'a> {
 
     pub fn close(&self, request: &TaskCloseRequest) -> Result<TaskCloseResponse, WorkerError> {
         request.validate()?;
+        // capacity (installation) then session — never reverse. GC holds
+        // installation then session; acquire never takes session.
+        let _capacity = self.store.capacity_lock()?;
         let _session_lock = self.store.session_lock()?;
         self.close_locked(request)
     }
@@ -840,6 +860,11 @@ impl<'a> TaskStore<'a> {
         let status = self.read_status(&task)?;
         if status.state() == TaskState::Active {
             return Err(task_error("TASK_BUSY", "task has an active turn"));
+        }
+        if LeaseService::new(self.store)
+            .task_scope_is_live(request.project_id(), request.task_id())?
+        {
+            return Err(task_error("TASK_BUSY", "task has a live execution lease"));
         }
         if request.discard()
             && OriginOutbox::new(self.store, self.runner).retains(
@@ -912,11 +937,17 @@ impl<'a> TaskStore<'a> {
         now_millis: u64,
     ) -> Result<Option<TaskStatus>, WorkerError> {
         validate_project_id(project_id)?;
+        // GC already holds the installation lock for collect+apply, which
+        // serializes acquire. Do not re-enter capacity_lock: it would open a
+        // second installation fd and deadlock this process.
         let _session_lock = self.store.session_lock()?;
         let task = self.open_existing_task(project_id, task_id)?;
         let status = self.read_status(&task)?;
         let reported_to_herdr = status.turns().iter().any(|turn| turn.herdr().is_some());
         if status.state() != TaskState::Open {
+            return Ok(None);
+        }
+        if LeaseService::new(self.store).task_scope_is_live(project_id, task_id)? {
             return Ok(None);
         }
         let workspace_present = task.entry_exists("workspace")?;
@@ -1047,8 +1078,24 @@ impl<'a> TaskStore<'a> {
             ));
         }
 
+        let bound = LeaseService::new(self.store)
+            .occupied_slot_for_job(turn_id)?
+            .ok_or_else(|| {
+                task_error(
+                    "TASK_LEASE_MISMATCH",
+                    "task resume requires a live lease for the turn",
+                )
+            })?;
+        require_task_execution_lease(&bound, project_id, task_id, turn_id, worker, None)?;
+
         let task = self.open_existing_task(project_id, task_id)?;
         let meta = self.read_meta(&task)?;
+        if bound.lease.worktree_id() != meta.worktree_id() {
+            return Err(task_error(
+                "TASK_LEASE_MISMATCH",
+                "live lease does not match the task request",
+            ));
+        }
         let current = self.read_status(&task)?;
         match current.state() {
             TaskState::Open => {}
@@ -2108,6 +2155,33 @@ fn map_task_not_found(error: WorkerError) -> WorkerError {
         WorkerError::Io(error) if error.kind() == io::ErrorKind::NotFound => task_not_found(),
         other => other,
     }
+}
+
+fn require_task_execution_lease(
+    bound: &OccupiedSlot,
+    project_id: &str,
+    task_id: TaskId,
+    job_id: JobId,
+    worker: &str,
+    worktree_id: Option<&str>,
+) -> Result<(), WorkerError> {
+    if !bound.owns_task(project_id, task_id) {
+        return Err(task_error(
+            "EXECUTION_SCOPE_CONFLICT",
+            "live lease is not bound to this task workspace",
+        ));
+    }
+    if bound.lease.job_id() != job_id
+        || bound.lease.project_id() != project_id
+        || bound.lease.worker_name() != worker
+        || worktree_id.is_some_and(|worktree| bound.lease.worktree_id() != worktree)
+    {
+        return Err(task_error(
+            "TASK_LEASE_MISMATCH",
+            "live lease does not match the task request",
+        ));
+    }
+    Ok(())
 }
 
 fn task_not_found() -> WorkerError {

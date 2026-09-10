@@ -4,7 +4,6 @@ use crate::{
     agent_facts::{AgentAuth, AgentFacts, FACTS_TTL},
     config::Config,
     error::WorkerError,
-    lease::SlotState,
     protocol::{HealthStatus, PROTOCOL_VERSION, WorkerHealth},
     scheduler::{CandidateObservation, CandidateSlot},
 };
@@ -45,9 +44,10 @@ impl SchedulerProbeAdapter {
                                 probe.protocol_version
                             )));
                         }
-                        let slot = match probe.slot_state {
-                            SlotState::Idle => CandidateSlot::Idle,
-                            SlotState::Busy => CandidateSlot::Busy,
+                        let slot = if probe.has_free_execution_slot() {
+                            CandidateSlot::Idle
+                        } else {
+                            CandidateSlot::Busy
                         };
                         let mut capabilities = probe
                             .capabilities

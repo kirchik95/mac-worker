@@ -5,12 +5,41 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::WorkerError,
     host_store::{CleanupReceipt, HostStore, HostStoreWritePoint, JobDisposition},
-    job::{JobId, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord},
+    job::{ExecutionScope, JobId, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord},
     protocol::MemoryPressure,
     rooted_fs::RootedDir,
+    task::TaskId,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
+/// Host and laptop slot counts are this `u8` inclusive maximum.
+pub const MAX_HOST_SLOTS: u8 = 8;
+const CAPACITY_FILE: &str = "capacity.json";
+const SLOTS_DIR: &str = "slots";
+const SCOPE_FILE: &str = "scope.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccupiedSlot {
+    pub slot_id: u8,
+    pub lease: LeaseRecord,
+    pub execution_scope: ExecutionScope,
+}
+
+impl OccupiedSlot {
+    pub fn owns_task(&self, project_id: &str, task_id: TaskId) -> bool {
+        self.lease.project_id() == project_id
+            && matches!(
+                &self.execution_scope,
+                ExecutionScope::Task { task_id: bound } if *bound == task_id
+            )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HostSlotCapacity {
+    slot_count: u8,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionFacts {
@@ -41,6 +70,10 @@ pub struct LeaseSummary {
 pub struct LeaseOccupancy {
     pub slot_state: SlotState,
     pub active_lease: Option<LeaseSummary>,
+    #[serde(default)]
+    pub configured_slots: u8,
+    #[serde(default)]
+    pub busy_slots: u8,
 }
 
 pub struct LeaseService<'a> {
@@ -106,15 +139,51 @@ impl<'a> LeaseService<'a> {
         guard.validate()?;
         capacity.validate()?;
 
-        if let Some(existing) = self.load_locked()? {
-            if lease_matches_request(&existing, request)? {
-                return Ok(LeaseAcquireResponse::Acquired { lease: existing });
+        let occupied = self.load_all_locked()?;
+        if let Some(existing) = occupied
+            .iter()
+            .find(|slot| slot.lease.job_id() == request.material().job_id())
+        {
+            if lease_matches_request(&existing.lease, request)? {
+                if existing.execution_scope != *request.execution_scope() {
+                    return Err(protocol_code(
+                        "EXECUTION_SCOPE_CONFLICT",
+                        "retry execution scope does not match the live lease binding",
+                    ));
+                }
+                return Ok(LeaseAcquireResponse::Acquired {
+                    lease: existing.lease.clone(),
+                });
             }
-            return Err(WorkerError::capacity(
-                "CAPACITY_BUSY",
-                "one heavy job is already active",
+            return Err(protocol_code(
+                "JOB_ID_CONFLICT",
+                "job ID belongs to another immutable request",
             ));
         }
+        let incoming_scope = request.execution_scope();
+        refuse_terminal_task_scope(self.store, request.material().project_id(), incoming_scope)?;
+        if occupied.iter().any(|slot| {
+            scopes_conflict(
+                request.material().project_id(),
+                incoming_scope,
+                slot.lease.project_id(),
+                &slot.execution_scope,
+            )
+        }) {
+            return Err(WorkerError::capacity(
+                "WORKSPACE_BUSY",
+                "another live lease already owns this execution workspace",
+            ));
+        }
+        let slot_count = self.slot_count_locked()?;
+        let Some(slot_id) =
+            (0..slot_count).find(|id| occupied.iter().all(|slot| slot.slot_id != *id))
+        else {
+            return Err(WorkerError::capacity(
+                "CAPACITY_BUSY",
+                "all host execution slots are busy",
+            ));
+        };
         validate_admission(facts)?;
 
         let expires = now
@@ -126,13 +195,87 @@ impl<'a> LeaseService<'a> {
             now,
             expires,
         )?;
-        self.publish_lease(&lease, &guard, &capacity)?;
+        self.publish_lease(slot_id, &lease, incoming_scope, &guard, &capacity)?;
         Ok(LeaseAcquireResponse::Acquired { lease })
     }
 
     pub fn load(&self) -> Result<Option<LeaseRecord>, WorkerError> {
         self.store.validate_layout()?;
-        self.load_locked()
+        let occupied = self.load_all_locked()?;
+        match occupied.as_slice() {
+            [] => Ok(None),
+            [slot] => Ok(Some(slot.lease.clone())),
+            _ => Err(protocol_code(
+                "MULTIPLE_LIVE_LEASES",
+                "host has more than one live lease; use load_for_job",
+            )),
+        }
+    }
+
+    pub fn load_all(&self) -> Result<Vec<(u8, LeaseRecord)>, WorkerError> {
+        self.store.validate_layout()?;
+        Ok(self
+            .load_all_locked()?
+            .into_iter()
+            .map(|slot| (slot.slot_id, slot.lease))
+            .collect())
+    }
+
+    pub fn load_for_job(&self, job: JobId) -> Result<Option<LeaseRecord>, WorkerError> {
+        Ok(self.occupied_slot_for_job(job)?.map(|slot| slot.lease))
+    }
+
+    pub fn occupied_slot_for_job(&self, job: JobId) -> Result<Option<OccupiedSlot>, WorkerError> {
+        self.store.validate_layout()?;
+        Ok(self
+            .load_all_locked()?
+            .into_iter()
+            .find(|slot| slot.lease.job_id() == job))
+    }
+
+    pub fn occupied_slots(&self) -> Result<Vec<OccupiedSlot>, WorkerError> {
+        self.store.validate_layout()?;
+        self.load_all_locked()
+    }
+
+    pub fn task_scope_is_live(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+    ) -> Result<bool, WorkerError> {
+        Ok(self
+            .occupied_slots()?
+            .iter()
+            .any(|slot| slot.owns_task(project_id, task_id)))
+    }
+
+    pub fn slot_count(&self) -> Result<u8, WorkerError> {
+        self.store.validate_layout()?;
+        self.slot_count_locked()
+    }
+
+    pub fn set_slot_count(&self, slot_count: u8) -> Result<(), WorkerError> {
+        validate_slot_count(slot_count)?;
+        self.store.validate_layout()?;
+        let capacity = self.store.capacity_lock()?;
+        capacity.validate()?;
+        let occupied = self.load_all_locked()?;
+        if occupied.iter().any(|slot| slot.slot_id >= slot_count) {
+            return Err(WorkerError::capacity(
+                "CAPACITY_BUSY",
+                "a live lease occupies a slot that shrink would remove",
+            ));
+        }
+        self.write_slot_count(slot_count)?;
+        Ok(())
+    }
+
+    pub fn promotion_blocked(&self) -> Result<(), WorkerError> {
+        self.store.validate_layout()?;
+        if !self.load_all_locked()?.is_empty() {
+            return Err(upgrade_drain_required("a live lease is still present"));
+        }
+        Ok(())
     }
 
     pub(crate) fn load_after(
@@ -141,11 +284,12 @@ impl<'a> LeaseService<'a> {
         job: JobId,
     ) -> Result<Option<LeaseRecord>, WorkerError> {
         admission.validate_for(job)?;
-        self.load_locked()
+        self.load_for_job(job)
     }
 
     pub fn occupancy(&self) -> Result<LeaseOccupancy, WorkerError> {
-        occupancy_from_lease(self.load()?)
+        let occupied = self.load_all()?;
+        occupancy_from_leases(self.slot_count()?, &occupied)
     }
 
     pub fn load_if_present(root: &Path) -> Result<LeaseOccupancy, WorkerError> {
@@ -167,27 +311,27 @@ impl<'a> LeaseService<'a> {
         let capacity = self.store.capacity_lock_after(&guard)?;
         guard.validate()?;
         capacity.validate()?;
-        let live = match self.load_locked()? {
+        let occupied = self.load_all_locked()?;
+        let live = match occupied
+            .iter()
+            .find(|slot| slot.lease.job_id() == expected.job_id())
+        {
             None => {
-                // The slot is already free. A concurrent cancel, supervisor
-                // finish, or status retry can reach release after the winner
-                // retired the exact lease. Prove this identity still owns the
-                // durable cleanup receipt instead of recording
-                // LEASE_RELEASE_FAILED against an idle worker.
                 receipt.validate_durable(self.store, expected)?;
                 return Ok(());
             }
-            Some(live) if live != *expected => {
+            Some(slot) if slot.lease != *expected => {
                 return Err(WorkerError::Protocol("live lease identity mismatch".into()));
             }
-            Some(live) => live,
+            Some(slot) => (slot.slot_id, slot.lease.clone()),
         };
         let leases = self.store.open_directory("leases", false)?;
-        let retired = format!(".released-{}", live.job_id());
+        let slots = leases.open_child_directory(&relative(SLOTS_DIR)?, false)?;
+        let retired = format!(".released-{}", live.1.job_id());
         guard.validate()?;
         capacity.validate()?;
-        self.store.remove_owned_child_committed(&leases, &retired)?;
-        receipt.validate_durable(self.store, &live)?;
+        self.store.remove_owned_child_committed(&slots, &retired)?;
+        receipt.validate_durable(self.store, &live.1)?;
         guard.validate()?;
         capacity.validate()?;
         if self
@@ -198,50 +342,61 @@ impl<'a> LeaseService<'a> {
                 "injected lease retirement failure",
             )));
         }
-        let mut live_dir = leases.open_child_directory(&relative("heavy")?, false)?;
+        let mut live_dir = slots.open_child_directory(&relative(&live.0.to_string())?, false)?;
         guard.validate()?;
         capacity.validate()?;
-        live_dir.publish_owned_into(&leases, &retired)?;
-        leases.sync_root()?;
+        live_dir.publish_owned_into(&slots, &retired)?;
+        slots.sync_root()?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterJobLeaseRetirement)
         {
-            // The live lease rename and parent fsync are already durable. A
-            // crash here can only leave the retired operation directory; it
-            // cannot make the heavy slot live again.
             return Ok(());
         }
-        leases.remove_owned_child(&retired)?;
-        leases.sync_root()?;
+        slots.remove_owned_child(&retired)?;
+        slots.sync_root()?;
         Ok(())
     }
 
-    fn load_locked(&self) -> Result<Option<LeaseRecord>, WorkerError> {
-        match self.store.open_directory("leases/heavy", false) {
-            Ok(live) => Ok(Some(read_lease(&live)?)),
-            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
+    fn slot_count_locked(&self) -> Result<u8, WorkerError> {
+        let leases = self.store.open_directory("leases", false)?;
+        read_slot_count(&leases)
+    }
+
+    fn write_slot_count(&self, slot_count: u8) -> Result<(), WorkerError> {
+        validate_slot_count(slot_count)?;
+        let leases = self.store.open_directory("leases", false)?;
+        write_slot_count_at(&leases, slot_count)
+    }
+
+    fn load_all_locked(&self) -> Result<Vec<OccupiedSlot>, WorkerError> {
+        load_all_from_store(self.store)
     }
 
     fn publish_lease(
         &self,
+        slot_id: u8,
         lease: &LeaseRecord,
+        execution_scope: &ExecutionScope,
         admission: &crate::host_store::AdmissionGuard,
         capacity: &crate::host_store::AdmissionGuard,
     ) -> Result<(), WorkerError> {
         admission.validate()?;
         capacity.validate()?;
         let leases = self.store.open_directory("leases", false)?;
+        let slots = leases.open_child_directory(&relative(SLOTS_DIR)?, false)?;
         let operation_name = format!(".acquire-{}", lease.job_id());
         self.store
-            .remove_owned_child_committed(&leases, &operation_name)?;
-        let mut operation = leases.create_new_child_directory(&operation_name)?;
+            .remove_owned_child_committed(&slots, &operation_name)?;
+        let mut operation = slots.create_new_child_directory(&operation_name)?;
         let bytes = serde_json::to_vec(lease).map_err(|error| {
             WorkerError::Protocol(format!("failed to serialize lease: {error}"))
         })?;
         let file = operation.write_new_private_file("lease.json", &bytes)?;
+        let scope_bytes = serde_json::to_vec(execution_scope).map_err(|error| {
+            WorkerError::Protocol(format!("failed to serialize execution scope: {error}"))
+        })?;
+        let scope_file = operation.write_new_private_file(SCOPE_FILE, &scope_bytes)?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeaseWrite)
@@ -249,6 +404,7 @@ impl<'a> LeaseService<'a> {
             return Err(injected());
         }
         file.sync_all()?;
+        scope_file.sync_all()?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeaseFileSync)
@@ -262,7 +418,7 @@ impl<'a> LeaseService<'a> {
         {
             return Err(injected());
         }
-        leases.sync_root()?;
+        slots.sync_root()?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeaseParentSync)
@@ -271,14 +427,14 @@ impl<'a> LeaseService<'a> {
         }
         admission.validate()?;
         capacity.validate()?;
-        operation.publish_owned_into(&leases, "heavy")?;
+        operation.publish_owned_into(&slots, &slot_id.to_string())?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeasePublish)
         {
             return Err(injected());
         }
-        leases.sync_root()?;
+        slots.sync_root()?;
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeasePublishSync)
@@ -330,29 +486,175 @@ fn lease_matches_request(
         && lease.command_summary() == &material.command().summary()?)
 }
 
-fn occupancy_from_lease(lease: Option<LeaseRecord>) -> Result<LeaseOccupancy, WorkerError> {
-    match lease {
-        None => Ok(idle()),
-        Some(lease) => {
-            lease.validate()?;
-            Ok(LeaseOccupancy {
-                slot_state: SlotState::Busy,
-                active_lease: Some(LeaseSummary {
-                    job_id: lease.job_id(),
-                    project_id: lease.project_id().into(),
-                    worktree_id: lease.worktree_id().into(),
-                    created_at_millis: lease.created_at_millis(),
-                }),
-            })
-        }
+fn refuse_terminal_task_scope(
+    store: &HostStore,
+    project_id: &str,
+    scope: &ExecutionScope,
+) -> Result<(), WorkerError> {
+    let ExecutionScope::Task { task_id } = scope else {
+        return Ok(());
+    };
+    match store.task_status(project_id, *task_id) {
+        Ok(status) if status.state().is_terminal() => Err(protocol_code(
+            "TASK_CLOSED",
+            "closed task cannot acquire an execution slot",
+        )),
+        Ok(_) => Ok(()),
+        Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
+}
+
+fn scopes_conflict(
+    left_project: &str,
+    left: &ExecutionScope,
+    right_project: &str,
+    right: &ExecutionScope,
+) -> bool {
+    match (left, right) {
+        (
+            ExecutionScope::Task { task_id: left_task },
+            ExecutionScope::Task {
+                task_id: right_task,
+            },
+        ) => left_project == right_project && left_task == right_task,
+        _ => false,
+    }
+}
+
+fn occupancy_from_leases(
+    configured: u8,
+    occupied: &[(u8, LeaseRecord)],
+) -> Result<LeaseOccupancy, WorkerError> {
+    let busy = u8::try_from(occupied.len())
+        .map_err(|_| protocol_code("CAPACITY_BUSY", "live lease count exceeds the slot bound"))?;
+    let active_lease = occupied.first().map(|(_, lease)| LeaseSummary {
+        job_id: lease.job_id(),
+        project_id: lease.project_id().into(),
+        worktree_id: lease.worktree_id().into(),
+        created_at_millis: lease.created_at_millis(),
+    });
+    Ok(LeaseOccupancy {
+        slot_state: if busy < configured {
+            SlotState::Idle
+        } else {
+            SlotState::Busy
+        },
+        active_lease,
+        configured_slots: configured,
+        busy_slots: busy,
+    })
 }
 
 fn idle() -> LeaseOccupancy {
     LeaseOccupancy {
         slot_state: SlotState::Idle,
         active_lease: None,
+        configured_slots: 1,
+        busy_slots: 0,
     }
+}
+
+fn validate_slot_count(slot_count: u8) -> Result<(), WorkerError> {
+    if slot_count == 0 || slot_count > MAX_HOST_SLOTS {
+        return Err(WorkerError::Protocol(format!(
+            "slot_count must be between 1 and {MAX_HOST_SLOTS}"
+        )));
+    }
+    Ok(())
+}
+
+fn upgrade_drain_required(message: &str) -> WorkerError {
+    WorkerError::Unavailable(format!("HOST_UPGRADE_DRAIN_REQUIRED: {message}"))
+}
+
+fn read_slot_count(leases: &RootedDir) -> Result<u8, WorkerError> {
+    if !leases.entry_exists(CAPACITY_FILE)? {
+        return Ok(1);
+    }
+    let bytes = leases.read_private_regular(CAPACITY_FILE, 4096)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let record = HostSlotCapacity::deserialize(&mut deserializer)
+        .map_err(|error| WorkerError::Protocol(format!("invalid host JSON: {error}")))?;
+    deserializer
+        .end()
+        .map_err(|error| WorkerError::Protocol(format!("trailing host JSON data: {error}")))?;
+    validate_slot_count(record.slot_count)?;
+    Ok(record.slot_count)
+}
+
+fn write_slot_count_at(leases: &RootedDir, slot_count: u8) -> Result<(), WorkerError> {
+    validate_slot_count(slot_count)?;
+    let bytes = serde_json::to_vec(&HostSlotCapacity { slot_count }).map_err(|error| {
+        WorkerError::Protocol(format!("failed to serialize slot capacity: {error}"))
+    })?;
+    if leases.entry_exists(CAPACITY_FILE)? {
+        let expected = leases.read_private_regular(CAPACITY_FILE, 4096)?;
+        leases.rewrite_private_regular_exact(CAPACITY_FILE, &expected, &bytes)?;
+    } else {
+        let file = leases.write_new_private_file(CAPACITY_FILE, &bytes)?;
+        file.sync_all()?;
+        leases.sync_root()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn initialize_slot_layout(leases: &RootedDir) -> Result<(), WorkerError> {
+    if !leases.entry_exists(SLOTS_DIR)? {
+        let created = leases.create_new_child_directory(SLOTS_DIR)?;
+        created.sync_root()?;
+        leases.sync_root()?;
+    }
+    if !leases.entry_exists(CAPACITY_FILE)? {
+        write_slot_count_at(leases, 1)?;
+    }
+    Ok(())
+}
+
+/// Layout-2 → layout-3 slot directories. FLOW's `complete_protocol_upgrade`
+/// must invoke this **after** drain inspect and binary rename, while still
+/// holding the construction installation lock. Do not call
+/// [`HostStore::migrate_layout`] from that path (second flock fd).
+pub fn promote_slot_directories(leases: &RootedDir) -> Result<(), WorkerError> {
+    initialize_slot_layout(leases)
+}
+
+fn load_all_from_store(store: &HostStore) -> Result<Vec<OccupiedSlot>, WorkerError> {
+    let leases = store.open_directory("leases", false)?;
+    let slots = match leases.open_child_directory(&relative(SLOTS_DIR)?, false) {
+        Ok(slots) => slots,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(WorkerError::Io(error)),
+    };
+    let mut occupied = Vec::new();
+    for raw in slots.list_names()? {
+        let name = std::str::from_utf8(&raw)
+            .map_err(|_| WorkerError::Protocol("slot directory name is not UTF-8".into()))?;
+        if name.starts_with('.') {
+            continue;
+        }
+        let slot_id: u8 = name
+            .parse()
+            .map_err(|_| WorkerError::Protocol("slot directory name is not a slot id".into()))?;
+        let directory = slots.open_child_directory(&relative(name)?, false)?;
+        if !directory.entry_exists("lease.json")? {
+            if slot_directory_is_idle(&directory)? {
+                continue;
+            }
+            return Err(WorkerError::Protocol(
+                "slot directory is missing a canonical lease record".into(),
+            ));
+        }
+        occupied.push(OccupiedSlot {
+            slot_id,
+            lease: read_lease(&directory)?,
+            execution_scope: read_scope(&directory)?,
+        });
+    }
+    occupied.sort_by_key(|slot| slot.slot_id);
+    Ok(occupied)
 }
 
 fn injected() -> WorkerError {
@@ -362,6 +664,17 @@ fn injected() -> WorkerError {
 fn relative(path: &str) -> Result<crate::inputs::RelativePath, WorkerError> {
     crate::inputs::RelativePath::parse(path.as_bytes())
         .map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
+fn slot_directory_is_idle(directory: &RootedDir) -> Result<bool, WorkerError> {
+    for raw in directory.list_names()? {
+        let name = std::str::from_utf8(&raw)
+            .map_err(|_| WorkerError::Protocol("slot entry name is not UTF-8".into()))?;
+        if name != ".mac-worker-rooted-fs" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn read_lease(directory: &RootedDir) -> Result<LeaseRecord, WorkerError> {
@@ -380,6 +693,22 @@ fn read_lease(directory: &RootedDir) -> Result<LeaseRecord, WorkerError> {
     lease.validate()?;
     Ok(lease)
 }
+
+fn read_scope(directory: &RootedDir) -> Result<ExecutionScope, WorkerError> {
+    let bytes = directory.read_private_regular(SCOPE_FILE, 1024 * 1024)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let scope = ExecutionScope::deserialize(&mut deserializer)
+        .map_err(|error| WorkerError::Protocol(format!("invalid host JSON: {error}")))?;
+    deserializer
+        .end()
+        .map_err(|error| WorkerError::Protocol(format!("trailing host JSON data: {error}")))?;
+    if serde_json::to_vec(&scope).map_err(|error| WorkerError::Protocol(error.to_string()))?
+        != bytes
+    {
+        return Err(WorkerError::Protocol("host JSON is not canonical".into()));
+    }
+    Ok(scope)
+}
 fn protocol_code(code: &'static str, message: &str) -> WorkerError {
     WorkerError::Protocol(format!("{code}: {message}"))
 }
@@ -390,6 +719,7 @@ mod lifecycle_tests {
         collections::BTreeSet,
         fs,
         os::unix::fs::{PermissionsExt, symlink},
+        path::Path,
     };
 
     use super::*;
@@ -680,5 +1010,298 @@ mod lifecycle_tests {
             fs::read(incoming_a.join("sentinel")).unwrap(),
             b"must remain"
         );
+    }
+
+    fn task_request(seed: u128, task: u128) -> LeaseAcquireRequest {
+        request(seed).with_execution_scope(ExecutionScope::task(TaskId::new(
+            uuid::Uuid::from_u128(task),
+        )))
+    }
+
+    fn assert_capacity(code: &str, result: Result<LeaseAcquireResponse, WorkerError>) {
+        match result {
+            Err(error) => assert_eq!(error.public_code(), code, "{error}"),
+            Ok(value) => panic!("expected {code}, got {value:?}"),
+        }
+    }
+
+    #[test]
+    fn two_task_scopes_overlap_on_two_slots_and_third_is_capacity_busy() {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let service = LeaseService::new(&store);
+        service.set_slot_count(2).unwrap();
+        let first = acquire(&service, &task_request(1, 1));
+        let second = acquire(&service, &task_request(2, 2));
+        assert_ne!(first.job_id(), second.job_id());
+        assert_eq!(service.occupied_slots().unwrap().len(), 2);
+        assert_capacity(
+            "CAPACITY_BUSY",
+            service.acquire(&task_request(3, 3), &healthy(), 1),
+        );
+        assert_capacity(
+            "WORKSPACE_BUSY",
+            service.acquire(&task_request(4, 1), &healthy(), 1),
+        );
+    }
+
+    #[test]
+    fn two_job_scopes_from_the_same_origin_overlap() {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let service = LeaseService::new(&store);
+        service.set_slot_count(2).unwrap();
+        let first = acquire(&service, &request(1));
+        let second = acquire(&service, &request(2));
+        assert_eq!(first.project_id(), second.project_id());
+        assert_eq!(first.worktree_id(), second.worktree_id());
+        assert_eq!(service.occupied_slots().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn shrink_refuses_while_a_high_index_slot_is_live() {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let service = LeaseService::new(&store);
+        service.set_slot_count(2).unwrap();
+        let first_req = request(1);
+        let second_req = request(2);
+        let first = acquire(&service, &first_req);
+        acquire(&service, &second_req);
+        store.record_abandoned(&first_req, 2).unwrap();
+        let receipt = store.cleanup_job_owned(&first).unwrap();
+        service.release_after_cleanup(&first, &receipt).unwrap();
+        let occupied = service.occupied_slots().unwrap();
+        assert_eq!(occupied.len(), 1);
+        assert_eq!(occupied[0].slot_id, 1);
+        let error = service.set_slot_count(1).unwrap_err();
+        assert_eq!(error.public_code(), "CAPACITY_BUSY");
+        service.set_slot_count(2).unwrap();
+        store.record_abandoned(&second_req, 3).unwrap();
+        let receipt = store.cleanup_job_owned(&occupied[0].lease).unwrap();
+        service
+            .release_after_cleanup(&occupied[0].lease, &receipt)
+            .unwrap();
+        service.set_slot_count(1).unwrap();
+        assert_eq!(service.slot_count().unwrap(), 1);
+    }
+
+    fn plant_layout2(root: &Path, heavy_bytes: Option<&[u8]>) {
+        let leases = root.join("leases");
+        let slots = leases.join("slots");
+        if slots.exists() {
+            fs::remove_dir_all(&slots).unwrap();
+        }
+        let capacity = leases.join("capacity.json");
+        if capacity.exists() {
+            fs::remove_file(&capacity).unwrap();
+        }
+        if let Some(bytes) = heavy_bytes {
+            let heavy = leases.join("heavy");
+            private_dir(&heavy);
+            private_file(&heavy.join("lease.json"), bytes);
+        }
+        let layout = root.join("layout.json");
+        let current = format!("\"version\":{}", crate::host_store::HOST_LAYOUT_VERSION);
+        let previous = format!(
+            "\"version\":{}",
+            crate::host_store::PREVIOUS_HOST_LAYOUT_VERSION
+        );
+        let bytes = fs::read(&layout).unwrap();
+        fs::write(
+            &layout,
+            String::from_utf8(bytes)
+                .unwrap()
+                .replace(&current, &previous),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn genuine_layout2_heavy_residue_refuses_migrate_and_keeps_original_bytes() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let stale = store.clone();
+        drop(store);
+        let leftover = br#"{"layout2":"heavy-lease"}"#;
+        plant_layout2(&root, Some(leftover));
+        assert_eq!(
+            match HostStore::open(&root) {
+                Ok(_) => panic!("layout-2 host opened without migrate"),
+                Err(error) => error.public_code(),
+            },
+            "HOST_LAYOUT_OUTDATED"
+        );
+        assert!(stale.validate_layout().is_err());
+        let error = HostStore::migrate_layout(&root).unwrap_err();
+        assert_eq!(error.public_code(), "HOST_UPGRADE_DRAIN_REQUIRED");
+        assert!(error.to_string().contains("heavy"));
+        assert_eq!(
+            fs::read(root.join("leases/heavy/lease.json")).unwrap(),
+            leftover
+        );
+        assert!(!root.join("leases/slots").exists());
+        assert!(!root.join("leases/capacity.json").exists());
+        assert!(root.join("leases/capacity.lock").is_file());
+        let layout: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("layout.json")).unwrap()).unwrap();
+        assert_eq!(
+            layout["version"],
+            crate::host_store::PREVIOUS_HOST_LAYOUT_VERSION
+        );
+        assert!(stale.validate_layout().is_err());
+    }
+
+    #[test]
+    fn genuine_layout2_terminal_archive_migrates_and_stale_handle_fails() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        let req = request(1);
+        let lease = acquire(&service, &req);
+        publish_job(&store, &lease, &req);
+        store
+            .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
+            .unwrap();
+        let receipt = store.cleanup_job_owned(&lease).unwrap();
+        service.release_after_cleanup(&lease, &receipt).unwrap();
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        let archived_meta = fs::read(job.join("meta.json")).unwrap();
+        let archived_status = fs::read(job.join("status.json")).unwrap();
+        let index = fs::read(store.job_index(lease.job_id()).unwrap()).unwrap();
+        let stale = store.clone();
+        drop(store);
+        plant_layout2(&root, None);
+        assert!(!root.join("leases/slots").exists());
+        assert!(!root.join("leases/capacity.json").exists());
+        assert!(root.join("leases/capacity.lock").is_file());
+        assert_eq!(
+            match HostStore::open(&root) {
+                Ok(_) => panic!("layout-2 host opened without migrate"),
+                Err(error) => error.public_code(),
+            },
+            "HOST_LAYOUT_OUTDATED"
+        );
+        assert!(stale.validate_layout().is_err());
+        HostStore::migrate_layout(&root).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(root.join("layout.json")).unwrap()
+            )
+            .unwrap()["version"],
+            crate::host_store::HOST_LAYOUT_VERSION
+        );
+        assert!(root.join("leases/slots").is_dir());
+        assert!(root.join("leases/capacity.json").is_file());
+        assert_eq!(fs::read(job.join("meta.json")).unwrap(), archived_meta);
+        assert_eq!(fs::read(job.join("status.json")).unwrap(), archived_status);
+        assert_eq!(
+            fs::read(
+                HostStore::open(&root)
+                    .unwrap()
+                    .job_index(lease.job_id())
+                    .unwrap()
+            )
+            .unwrap(),
+            index
+        );
+        assert!(HostStore::open(&root).is_ok());
+        assert!(
+            stale.validate_layout().is_err(),
+            "pre-migration handle must fail after layout and installation identity refresh"
+        );
+        assert_eq!(
+            crate::host_store::ROLLBACK_HELPER_LAYOUT_VERSION,
+            crate::host_store::PREVIOUS_HOST_LAYOUT_VERSION
+        );
+    }
+
+    #[test]
+    fn genuine_layout2_migrate_refresh_crash_residue_reopens_and_rejects_stale() {
+        for point in [
+            crate::host_store::HostStoreWritePoint::AfterHostLayoutRefreshUnlink,
+            crate::host_store::HostStoreWritePoint::AfterHostLayoutRefreshPublish,
+            crate::host_store::HostStoreWritePoint::AfterInstallationIdentityRefreshUnlink,
+            crate::host_store::HostStoreWritePoint::AfterInstallationIdentityRefreshPublish,
+        ] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let store = HostStore::open(&root).unwrap();
+            let service = LeaseService::new(&store);
+            let req = request(1);
+            let lease = acquire(&service, &req);
+            publish_job(&store, &lease, &req);
+            store
+                .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
+                .unwrap();
+            let receipt = store.cleanup_job_owned(&lease).unwrap();
+            service.release_after_cleanup(&lease, &receipt).unwrap();
+            let job = store
+                .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                .unwrap();
+            let archived_meta = fs::read(job.join("meta.json")).unwrap();
+            let archived_status = fs::read(job.join("status.json")).unwrap();
+            let archived_index = fs::read(store.job_index(lease.job_id()).unwrap()).unwrap();
+            let stale = store.clone();
+            drop(store);
+            plant_layout2(&root, None);
+            assert!(
+                HostStore::migrate_layout_with_write_fault(&root, point).is_err(),
+                "fault at {point:?}"
+            );
+            match point {
+                crate::host_store::HostStoreWritePoint::AfterHostLayoutRefreshUnlink => {
+                    assert!(
+                        !root.join("layout.json").exists(),
+                        "unlink fault must not truncate layout.json in place: {point:?}"
+                    );
+                    let refresh = fs::read(root.join("layout.refresh.json")).unwrap();
+                    assert!(!refresh.is_empty(), "{point:?}");
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&refresh).unwrap()["version"],
+                        crate::host_store::PREVIOUS_HOST_LAYOUT_VERSION
+                    );
+                }
+                _ => {
+                    let layout = fs::read(root.join("layout.json")).unwrap();
+                    assert!(!layout.is_empty(), "{point:?}");
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&layout).unwrap()["version"],
+                        crate::host_store::HOST_LAYOUT_VERSION
+                    );
+                    assert!(
+                        root.join("layout.refresh.json").is_file(),
+                        "layout residue must survive until installation identity is bound: {point:?}"
+                    );
+                }
+            }
+            assert!(stale.validate_layout().is_err(), "{point:?}");
+            match HostStore::open(&root) {
+                Ok(_) => {}
+                Err(error) if error.public_code() == "HOST_LAYOUT_OUTDATED" => {
+                    HostStore::migrate_layout(&root).unwrap();
+                    HostStore::open(&root).expect("fresh open after migrate repair");
+                }
+                Err(error) => panic!("repair after {point:?} failed: {error}"),
+            }
+            assert!(stale.validate_layout().is_err(), "{point:?}");
+            assert_eq!(fs::read(job.join("meta.json")).unwrap(), archived_meta);
+            assert_eq!(fs::read(job.join("status.json")).unwrap(), archived_status);
+            assert_eq!(
+                fs::read(
+                    HostStore::open(&root)
+                        .unwrap()
+                        .job_index(lease.job_id())
+                        .unwrap()
+                )
+                .unwrap(),
+                archived_index
+            );
+            assert!(!root.join("layout.refresh.json").exists(), "{point:?}");
+        }
     }
 }

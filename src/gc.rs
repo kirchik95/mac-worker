@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ffi::OsString,
     io,
     path::Path,
@@ -12,7 +12,7 @@ use crate::{
     error::WorkerError,
     host_store::HostStore,
     inputs::RelativePath,
-    job::{JobId, JobMeta, JobStatus},
+    job::{ExecutionScope, JobId, JobMeta, JobStatus},
     lease::LeaseService,
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::PROTOCOL_VERSION,
@@ -352,8 +352,19 @@ impl<'a> HostGc<'a> {
     ) -> Result<(GcInventory, Vec<GcCandidate>, Vec<String>), WorkerError> {
         let mut warnings = Vec::new();
         let mut inventory = GcInventory::default();
-        match LeaseService::new(self.store).load() {
-            Ok(lease) => inventory.live_lease_job = lease.map(|lease| lease.job_id()),
+        match LeaseService::new(self.store).occupied_slots() {
+            Ok(slots) => {
+                inventory.live_lease_jobs = slots.iter().map(|slot| slot.lease.job_id()).collect();
+                inventory.live_task_scopes = slots
+                    .iter()
+                    .filter_map(|slot| match &slot.execution_scope {
+                        ExecutionScope::Task { task_id } => {
+                            Some((slot.lease.project_id().to_owned(), *task_id))
+                        }
+                        ExecutionScope::Job => None,
+                    })
+                    .collect();
+            }
             Err(error) => {
                 inventory.lease_uncertain = true;
                 push_warning(&mut warnings, "lease record unreadable; GC kept records");
@@ -500,11 +511,14 @@ impl<'a> HostGc<'a> {
             (false, false)
         };
         let active_work = inventory.lease_uncertain
+            || inventory
+                .live_task_scopes
+                .contains(&(project.to_owned(), meta.task_id()))
             || self.task_has_active_work(
                 project,
                 &meta,
                 &status,
-                inventory.live_lease_job,
+                &inventory.live_lease_jobs,
                 request.now_millis(),
             )?;
         let size_bytes = bounded_tree_size(task)?;
@@ -576,7 +590,7 @@ impl<'a> HostGc<'a> {
         project: &str,
         meta: &TaskMeta,
         status: &TaskStatus,
-        live_lease_job: Option<JobId>,
+        live_lease_jobs: &HashSet<JobId>,
         now_millis: u64,
     ) -> Result<bool, WorkerError> {
         for turn in status.turns() {
@@ -584,7 +598,7 @@ impl<'a> HostGc<'a> {
                 return Ok(true);
             }
             let job_id = turn.turn_id();
-            if live_lease_job == Some(job_id) {
+            if live_lease_jobs.contains(&job_id) {
                 return Ok(true);
             }
             let job_path = format!("jobs/{project}/{}/{job_id}", meta.worktree_id());
@@ -625,15 +639,24 @@ impl<'a> HostGc<'a> {
         };
         let meta: TaskMeta = read_gc_json(&task, "meta.json", "task metadata")?;
         let status: TaskStatus = read_gc_json(&task, "status.json", "task status")?;
-        self.task_has_active_work(
-            project,
-            &meta,
-            &status,
-            LeaseService::new(self.store)
-                .load()?
-                .map(|lease| lease.job_id()),
-            now_millis,
-        )
+        let occupied = match LeaseService::new(self.store).occupied_slots() {
+            Ok(occupied) => occupied,
+            Err(_) => return Ok(true),
+        };
+        let live_jobs: HashSet<_> = occupied.iter().map(|slot| slot.lease.job_id()).collect();
+        let live_tasks: HashSet<_> = occupied
+            .iter()
+            .filter_map(|slot| match &slot.execution_scope {
+                ExecutionScope::Task { task_id } => {
+                    Some((slot.lease.project_id().to_owned(), *task_id))
+                }
+                ExecutionScope::Job => None,
+            })
+            .collect();
+        if live_tasks.contains(&(project.to_owned(), task_id)) {
+            return Ok(true);
+        }
+        self.task_has_active_work(project, &meta, &status, &live_jobs, now_millis)
     }
 
     fn collect_jobs(
@@ -779,7 +802,7 @@ impl<'a> HostGc<'a> {
                 "job record sibling state is incomplete",
             ));
         }
-        if inventory.lease_uncertain || inventory.live_lease_job == Some(job_id) {
+        if inventory.lease_uncertain || inventory.live_lease_jobs.contains(&job_id) {
             return Ok(());
         }
         let mut mutable = false;
@@ -1028,17 +1051,8 @@ impl<'a> HostGc<'a> {
             let task = self
                 .store
                 .open_directory(&format!("tasks/{project}/{task_id}"), false)?;
-            let meta: TaskMeta = read_gc_json(&task, "meta.json", "task metadata")?;
             let status: TaskStatus = read_gc_json(&task, "status.json", "task status")?;
-            if self.task_has_active_work(
-                project,
-                &meta,
-                &status,
-                LeaseService::new(self.store)
-                    .load()?
-                    .map(|lease| lease.job_id()),
-                request.now_millis(),
-            )? {
+            if self.task_id_has_active_work(project, task_id, request.now_millis())? {
                 return Ok(false);
             }
             debug_assert_eq!(snapshot.state, status.state());
@@ -1108,8 +1122,9 @@ impl<'a> HostGc<'a> {
             return Ok(false);
         }
         if LeaseService::new(self.store)
-            .load()?
-            .is_some_and(|lease| lease.job_id() == job_id)
+            .occupied_slots()?
+            .iter()
+            .any(|slot| slot.lease.job_id() == job_id)
         {
             return Ok(false);
         }
@@ -1177,7 +1192,8 @@ struct GcInventory {
     /// Whether any task record shows a turn reported to herdr; the sweep
     /// runs only then, so a worker that never reported never opens the socket.
     herdr_reported: bool,
-    live_lease_job: Option<JobId>,
+    live_lease_jobs: HashSet<JobId>,
+    live_task_scopes: HashSet<(String, TaskId)>,
     lease_uncertain: bool,
     tasks: BTreeMap<String, TaskSnapshot>,
     task_projects: BTreeSet<String>,

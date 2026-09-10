@@ -11,6 +11,7 @@ use crate::{
     config::{WorkerEntry, valid_ssh_destination},
     error::WorkerError,
     job::AdmissionObservation,
+    lease::MAX_HOST_SLOTS,
     process::ProcessRunner,
     protocol::{HealthStatus, WorkerHealth},
     scheduler::{CandidateObservation, CandidateSlot, WorkerPreference},
@@ -469,9 +470,9 @@ fn rank_committed(
 }
 
 fn require_admission_worker(worker: &WorkerEntry) -> Result<(), WorkerError> {
-    if worker.slots != 1 {
+    if worker.slots == 0 || worker.slots > MAX_HOST_SLOTS {
         return Err(WorkerError::Config(format!(
-            "worker {:?} must declare exactly one slot",
+            "worker {:?} slots must be between 1 and {MAX_HOST_SLOTS}",
             worker.name
         )));
     }
@@ -974,6 +975,8 @@ mod tests {
             capabilities: vec!["darwin-arm64".into()],
             agent_facts,
             facts_age_millis: facts_age,
+            configured_slots: 0,
+            busy_slots: 0,
         };
         serde_json::to_vec(&probe).unwrap()
     }
