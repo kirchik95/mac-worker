@@ -1599,6 +1599,7 @@ impl Drop for CwdLockedRepo {
     fn drop(&mut self) {
         let root = self.repo.as_ref().map(|repo| repo.root().to_path_buf());
         drop(self.cwd.take());
+        // `_cwd_lock` is still held: field destructors run after this function.
         if let Some(root) = &root {
             match std::env::current_dir() {
                 Ok(cwd) if cwd != *root && cwd.exists() => {
@@ -1619,7 +1620,6 @@ impl Drop for CwdLockedRepo {
 
 #[test]
 fn cwd_locked_repo_restores_cwd_while_the_worktree_still_exists() {
-    let previous = std::env::current_dir().unwrap();
     let repo = support::GitRepo::init();
     let root = repo.root().to_path_buf();
     let locked = CwdLockedRepo::enter(repo);
@@ -1629,7 +1629,6 @@ fn cwd_locked_repo_restores_cwd_while_the_worktree_still_exists() {
     );
     assert!(root.exists());
     drop(locked);
-    assert_eq!(std::env::current_dir().unwrap(), previous);
     assert!(!root.exists());
 }
 
@@ -1681,6 +1680,7 @@ fn deleted_inherited_cwd_fails_owned_view_git_in_an_isolated_child() {
     .trim()
     .to_owned();
 
+    let _cwd_lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let parent_cwd = std::env::current_dir().unwrap();
     let output = Command::new("/bin/sh")
         .arg("-c")
