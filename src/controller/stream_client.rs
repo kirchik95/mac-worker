@@ -40,10 +40,35 @@ pub fn stream_source_receive(
     oid: &BaseOid,
 ) -> Result<(), WorkerError> {
     let fingerprint = RequestFingerprint::new(operation.payload_sha256().to_owned())?;
+    stream_nested_source(
+        runner,
+        controller,
+        operation.request_id(),
+        &fingerprint,
+        local_git,
+        project_id,
+        worktree_id,
+        oid,
+    )
+}
+
+/// Stream one nested source using the outer envelope fingerprint and the
+/// nested `request_id`. Laptop batch freeze reuses this so retries never
+/// re-freeze.
+pub fn stream_nested_source(
+    runner: &dyn ProcessRunner,
+    controller: &ControllerConfig,
+    request_id: &str,
+    fingerprint: &RequestFingerprint,
+    local_git: &Path,
+    project_id: &str,
+    worktree_id: &str,
+    oid: &BaseOid,
+) -> Result<(), WorkerError> {
     let prepare = transfer_request(
         "controller.transfer.source.prepare",
         json!({
-            "request_id": operation.request_id(),
+            "request_id": request_id,
             "fingerprint": fingerprint.as_str(),
             "project_id": project_id,
             "worktree_id": worktree_id,
@@ -53,17 +78,7 @@ pub fn stream_source_receive(
     let identity =
         send_controller_read::<ControllerSourcePrepareResult>(runner, controller, &prepare)?
             .into_result();
-    require_source_bind(
-        identity.request_id(),
-        identity.fingerprint(),
-        identity.project_id(),
-        identity.worktree_id(),
-        identity.expected_oid(),
-        operation,
-        project_id,
-        worktree_id,
-        oid,
-    )?;
+    require_source_bind(&identity, request_id, fingerprint.as_str(), project_id, worktree_id, oid)?;
     let worker = controller_worker_entry(controller)?;
     let ssh = SshTransport::new(runner).git_ssh_command(&worker)?;
     GitTransport::new(runner).push_controller_source(
@@ -71,8 +86,8 @@ pub fn stream_source_receive(
         &worker.ssh,
         &worker.remote_binary,
         identity.token(),
-        operation.request_id(),
-        &fingerprint,
+        request_id,
+        fingerprint,
         project_id,
         worktree_id,
         oid,
@@ -82,7 +97,7 @@ pub fn stream_source_receive(
         "controller.transfer.source.finish",
         json!({
             "token": identity.token(),
-            "request_id": operation.request_id(),
+            "request_id": request_id,
             "fingerprint": fingerprint.as_str(),
             "project_id": project_id,
             "worktree_id": worktree_id,
@@ -96,7 +111,7 @@ pub fn stream_source_receive(
         receipt.request_id(),
         receipt.oid(),
         receipt.request_ref(),
-        operation,
+        request_id,
         oid,
     )
 }
@@ -168,21 +183,18 @@ pub fn fetch_via_controller(
 }
 
 fn require_source_bind(
-    returned_request_id: &str,
-    returned_fingerprint: &str,
-    returned_project_id: &str,
-    returned_worktree_id: &str,
-    returned_oid: &str,
-    operation: &ControllerRequest,
+    identity: &ControllerSourcePrepareResult,
+    expected_request_id: &str,
+    expected_fingerprint: &str,
     project_id: &str,
     worktree_id: &str,
     oid: &BaseOid,
 ) -> Result<(), WorkerError> {
-    if returned_request_id != operation.request_id()
-        || returned_fingerprint != operation.payload_sha256()
-        || returned_project_id != project_id
-        || returned_worktree_id != worktree_id
-        || returned_oid != oid.as_str()
+    if identity.request_id() != expected_request_id
+        || identity.fingerprint() != expected_fingerprint
+        || identity.project_id() != project_id
+        || identity.worktree_id() != worktree_id
+        || identity.expected_oid() != oid.as_str()
     {
         return Err(source_conflict());
     }
@@ -193,11 +205,11 @@ fn require_receipt_bind(
     returned_request_id: &str,
     returned_oid: &str,
     returned_ref: &str,
-    operation: &ControllerRequest,
+    expected_request_id: &str,
     oid: &BaseOid,
 ) -> Result<(), WorkerError> {
-    let expected_ref = TransferRepo::frozen_request_ref(operation.request_id())?;
-    if returned_request_id != operation.request_id()
+    let expected_ref = TransferRepo::frozen_request_ref(expected_request_id)?;
+    if returned_request_id != expected_request_id
         || returned_oid != oid.as_str()
         || returned_ref != expected_ref
     {
@@ -364,6 +376,24 @@ mod tests {
         assert!(result.status.success());
     }
 
+    fn source_prepare_identity(
+        request_id: &str,
+        fingerprint: &str,
+        project_id: &str,
+        worktree_id: &str,
+        expected_oid: &str,
+    ) -> ControllerSourcePrepareResult {
+        serde_json::from_value(json!({
+            "token": "token",
+            "request_id": request_id,
+            "fingerprint": fingerprint,
+            "project_id": project_id,
+            "worktree_id": worktree_id,
+            "expected_oid": expected_oid,
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn source_prepare_must_match_original_operation_before_push() {
         let operation = parse_request(
@@ -381,34 +411,38 @@ mod tests {
             .unwrap();
         let project = "aa".repeat(32);
         let worktree = "bb".repeat(32);
-        assert!(
-            require_source_bind(
-                operation.request_id(),
-                "cd".repeat(32).as_str(),
-                &project,
-                &worktree,
-                oid.as_str(),
-                &operation,
-                &project,
-                &worktree,
-                &oid,
-            )
-            .is_err()
+        let mismatched = source_prepare_identity(
+            operation.request_id(),
+            "cd".repeat(32).as_str(),
+            &project,
+            &worktree,
+            oid.as_str(),
         );
-        assert!(
-            require_source_bind(
-                operation.request_id(),
-                operation.payload_sha256(),
-                &project,
-                &worktree,
-                oid.as_str(),
-                &operation,
-                &project,
-                &worktree,
-                &oid,
-            )
-            .is_ok()
+        assert!(require_source_bind(
+            &mismatched,
+            operation.request_id(),
+            operation.payload_sha256(),
+            &project,
+            &worktree,
+            &oid,
+        )
+        .is_err());
+        let matched = source_prepare_identity(
+            operation.request_id(),
+            operation.payload_sha256(),
+            &project,
+            &worktree,
+            oid.as_str(),
         );
+        assert!(require_source_bind(
+            &matched,
+            operation.request_id(),
+            operation.payload_sha256(),
+            &project,
+            &worktree,
+            &oid,
+        )
+        .is_ok());
     }
 
     #[test]

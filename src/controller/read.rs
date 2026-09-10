@@ -13,8 +13,11 @@ use crate::{
     error::WorkerError,
     job::MAX_LOG_CHUNK_BYTES,
     protocol::PROTOCOL_VERSION,
-    task::{RunId, RunnerState, TaskId, TaskState, TaskStatus, TurnId},
-    task_client::{TaskClient, TaskListFilter, TaskLogChunkReport, TaskReport, TaskResultReport},
+    task::{OriginDelivery, RunId, RunnerState, TaskId, TaskState, TaskStatus, TurnId},
+    task_client::{
+        ControllerTaskProjection, TaskClient, TaskListFilter, TaskLogChunkQuery,
+        TaskLogChunkReport, TaskReport, TaskResultReport,
+    },
     task_view::TaskListProjection,
 };
 
@@ -120,6 +123,10 @@ pub struct ControllerTaskStatusResult {
     events: Vec<Value>,
     runner: Option<RunnerState>,
     exit_code: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<OriginDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deliveries: Vec<OriginDelivery>,
 }
 
 impl ControllerTaskStatusResult {
@@ -132,19 +139,23 @@ impl ControllerTaskStatusResult {
             events: report.events().to_vec(),
             runner: report.runner(),
             exit_code: report.exit_code(),
+            delivery: report.delivery().cloned(),
+            deliveries: report.deliveries().to_vec(),
         }
     }
 
     pub fn into_report(self) -> TaskReport {
-        TaskReport::from_controller(
-            self.task_id,
-            self.run_id,
-            self.status,
-            self.warnings,
-            self.events,
-            self.runner,
-            self.exit_code,
-        )
+        TaskReport::from_controller(ControllerTaskProjection {
+            task_id: self.task_id,
+            run_id: self.run_id,
+            status: self.status,
+            warnings: self.warnings,
+            events: self.events,
+            runner: self.runner,
+            exit_code: self.exit_code,
+            delivery: self.delivery,
+            deliveries: self.deliveries,
+        })
     }
 
     pub fn task_id(&self) -> TaskId {
@@ -251,8 +262,7 @@ impl ControllerReadIdentity for ControllerTaskLogsResult {
         let requested_limit = optional_u64(request.body(), "limit", "task.logs")?
             .map(|value| usize::try_from(value).unwrap_or(MAX_LOG_CHUNK_BYTES))
             .unwrap_or(MAX_LOG_CHUNK_BYTES)
-            .min(MAX_LOG_CHUNK_BYTES)
-            .max(1);
+            .clamp(1, MAX_LOG_CHUNK_BYTES);
         if self.offset != requested_offset
             || self.raw != requested_raw
             || self.next_offset < self.offset
@@ -421,10 +431,18 @@ fn logs_reply(
     let limit = optional_u64(request.body(), "limit", "task.logs")?
         .map(|value| usize::try_from(value).unwrap_or(MAX_LOG_CHUNK_BYTES))
         .unwrap_or(MAX_LOG_CHUNK_BYTES)
-        .min(MAX_LOG_CHUNK_BYTES);
+        .clamp(1, MAX_LOG_CHUNK_BYTES);
     let raw = optional_bool(request.body(), "raw", "task.logs")?.unwrap_or(false);
     let follow = optional_bool(request.body(), "follow", "task.logs")?.unwrap_or(false);
-    let chunk = client.log_chunk(task_id, turn, pinned_turn_id, offset, limit, raw, follow)?;
+    let chunk = client.log_chunk(TaskLogChunkQuery {
+        task_id,
+        turn,
+        pinned_turn_id,
+        offset,
+        limit,
+        raw,
+        follow,
+    })?;
     Ok(reply(
         request,
         ControllerTaskLogsResult::from_chunk(&chunk, raw),
@@ -536,7 +554,7 @@ fn parse_agent(value: &str) -> Option<AgentKind> {
     }
 }
 
-fn optional_string(body: &Value, key: &str) -> Result<Option<String>, WorkerError> {
+pub(crate) fn optional_string(body: &Value, key: &str) -> Result<Option<String>, WorkerError> {
     match body.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
@@ -584,7 +602,7 @@ fn optional_u64(body: &Value, key: &str, command: &str) -> Result<Option<u64>, W
     }
 }
 
-fn reject_unknown_keys(body: &Value, allowed: &[&str], command: &str) -> Result<(), WorkerError> {
+pub(crate) fn reject_unknown_keys(body: &Value, allowed: &[&str], command: &str) -> Result<(), WorkerError> {
     let Some(object) = body.as_object() else {
         return Err(WorkerError::Protocol(format!(
             "CONTROLLER_TRANSPORT: {command} body must be a JSON object"
@@ -624,11 +642,155 @@ fn parse_task_outcome_kind(value: String) -> Result<&'static str, WorkerError> {
         ))
 }
 
-fn map_missing_task<T>(result: Result<T, WorkerError>) -> Result<T, WorkerError> {
+pub(crate) fn map_missing_task<T>(result: Result<T, WorkerError>) -> Result<T, WorkerError> {
     match result {
         Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Err(
             WorkerError::task("TASK_NOT_FOUND", "task is not present in controller state"),
         ),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::protocol::{decode_frame, parse_request};
+    use crate::protocol::PROTOCOL_VERSION as WIRE_VERSION;
+    use crate::task::{BaseOid, DeliveryState};
+    use serde_json::{Value, json};
+
+    fn fixture_oid() -> BaseOid {
+        "0123456789abcdef0123456789abcdef01234567".parse().unwrap()
+    }
+
+    fn fixture_status() -> TaskStatus {
+        TaskStatus::new(
+            TaskState::Open,
+            None,
+            Some("mini-1".into()),
+            false,
+            Some(fixture_oid()),
+            Some("seeded summary".into()),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            1,
+        )
+        .unwrap()
+    }
+
+    fn delivery(turn: TurnId, state: DeliveryState, created_at: u64) -> OriginDelivery {
+        OriginDelivery::new(
+            turn,
+            state,
+            fixture_oid(),
+            "https://example.test/repo.git".into(),
+            "refs/heads/release-candidate".into(),
+            1,
+            1,
+            None,
+            None,
+            created_at,
+            created_at,
+        )
+        .unwrap()
+    }
+
+    fn status_report(
+        delivery: Option<OriginDelivery>,
+        deliveries: Vec<OriginDelivery>,
+    ) -> TaskReport {
+        TaskReport::from_controller(ControllerTaskProjection {
+            task_id: TaskId::generate(),
+            run_id: None,
+            status: fixture_status(),
+            warnings: Vec::new(),
+            events: Vec::new(),
+            runner: None,
+            exit_code: None,
+            delivery,
+            deliveries,
+        })
+    }
+
+    fn status_request(task_id: TaskId) -> ControllerRequest {
+        parse_request(
+            &serde_json::to_vec(&json!({
+                "protocol_version": WIRE_VERSION,
+                "request_id": "018f0f4a6b5c7d8e9f00112233445588",
+                "command": "task.status",
+                "body": { "task_id": task_id.to_string() },
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn laptop_status_json(report: &TaskReport) -> Value {
+        let mut stdout = Vec::new();
+        crate::write_task_report(report, true, &mut stdout).unwrap();
+        serde_json::from_slice(&stdout).unwrap()
+    }
+
+    #[test]
+    fn status_result_preserves_queued_failed_and_published_deliveries() {
+        let queued = delivery(TurnId::generate(), DeliveryState::Pending, 3);
+        let failed = delivery(TurnId::generate(), DeliveryState::Failed, 2);
+        let published = delivery(TurnId::generate(), DeliveryState::Delivered, 1);
+        let deliveries = vec![queued.clone(), failed.clone(), published.clone()];
+        let report = status_report(Some(queued.clone()), deliveries.clone());
+        let result = ControllerTaskStatusResult::from_report(&report);
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["delivery"]["state"], "pending");
+        let states: Vec<&str> = encoded["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(states, ["pending", "failed", "delivered"]);
+
+        let request = status_request(report.task_id());
+        let frame = encode_json_frame(&reply(&request, result.clone())).unwrap();
+        let decoded: ControllerReadReply<ControllerTaskStatusResult> =
+            serde_json::from_slice(decode_frame(&frame).unwrap()).unwrap();
+        let round_trip = decoded.into_result().into_report();
+        assert_eq!(round_trip.delivery(), Some(&queued));
+        assert_eq!(round_trip.deliveries(), deliveries.as_slice());
+        assert_eq!(round_trip.deliveries()[0].state(), DeliveryState::Pending);
+        assert_eq!(round_trip.deliveries()[1].state(), DeliveryState::Failed);
+        assert_eq!(round_trip.deliveries()[2].state(), DeliveryState::Delivered);
+
+        let laptop = laptop_status_json(&round_trip);
+        assert_eq!(laptop["delivery"]["state"], "pending");
+        assert_eq!(laptop["deliveries"].as_array().unwrap().len(), 3);
+        assert_eq!(laptop["deliveries"][2]["state"], "delivered");
+    }
+
+    #[test]
+    fn status_result_legacy_json_without_delivery_fields_is_empty() {
+        let report = status_report(None, Vec::new());
+        let encoded =
+            serde_json::to_value(ControllerTaskStatusResult::from_report(&report)).unwrap();
+        assert!(encoded.get("delivery").is_none());
+        assert!(encoded.get("deliveries").is_none());
+
+        let legacy = json!({
+            "task_id": report.task_id().to_string(),
+            "run_id": null,
+            "status": fixture_status(),
+            "warnings": [],
+            "events": [],
+            "runner": null,
+            "exit_code": null,
+        });
+        let parsed: ControllerTaskStatusResult = serde_json::from_value(legacy).unwrap();
+        let restored = parsed.into_report();
+        assert!(restored.delivery().is_none());
+        assert!(restored.deliveries().is_empty());
+        let laptop = laptop_status_json(&restored);
+        assert!(laptop.get("delivery").is_none());
+        assert!(laptop.get("deliveries").is_none());
     }
 }

@@ -1800,6 +1800,7 @@ fn leftover_rooted_fs_namespaces_never_brick_the_state_root() {
         "runs",
         "dags",
         "dag-pending",
+        "active-tasks",
         "runners",
         "turns",
         "queue",

@@ -17,15 +17,14 @@ use std::{
 
 use clap::Parser;
 use mac_worker::{
-    RuntimeContext,
     agent::{AgentKind, PermissionPolicy},
     cli::{Cli, Command as WorkerCommand, HostCommand},
     client_state::ClientStateStore,
     config::Config,
     controller::{
-        ControllerFault, ControllerReadReply, ControllerStore, ControllerTaskLogsResult,
-        ControllerTaskStatusResult, canonical_request_sha256, decode_frame, encode_frame,
-        encode_json_frame, protocol::MAX_FRAME_BYTES, serve_rpc_with_runtime,
+        canonical_request_sha256, decode_frame, encode_frame, encode_json_frame,
+        protocol::MAX_FRAME_BYTES, serve_rpc_with_runtime, ControllerFault, ControllerReadReply,
+        ControllerStore, ControllerTaskLogsResult, ControllerTaskStatusResult,
     },
     error::WorkerError,
     job::{JobId, MAX_LOG_CHUNK_BYTES},
@@ -40,9 +39,9 @@ use mac_worker::{
     },
     task_store::{TaskDiffRequest, TaskDiffResponse},
     transfer::HostOperation,
-    turn_log,
+    turn_log, RuntimeContext,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 const SEEDED_TASK: u128 = 0x018f_0f4a_6b5c_7d8e_9f00_1122_3344_5566;
@@ -1216,14 +1215,14 @@ fn ordinary_rendered_log(bytes: &[u8]) -> Vec<u8> {
     rendered
 }
 
-fn run_laptop_task_logs(
+fn run_laptop_task(
     laptop: &IsolatedHome,
     runner: &dyn ProcessRunner,
     args: &[&str],
 ) -> (u8, Vec<u8>, Vec<u8>) {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let mut argv = vec!["worker", "task", "logs"];
+    let mut argv = vec!["worker", "task"];
     argv.extend_from_slice(args);
     let exit = run_with_stdio_in_context(
         Cli::try_parse_from(argv).unwrap(),
@@ -1234,6 +1233,16 @@ fn run_laptop_task_logs(
         &mut stderr,
     );
     (exit, stdout, stderr)
+}
+
+fn run_laptop_task_logs(
+    laptop: &IsolatedHome,
+    runner: &dyn ProcessRunner,
+    args: &[&str],
+) -> (u8, Vec<u8>, Vec<u8>) {
+    let mut argv = vec!["logs"];
+    argv.extend_from_slice(args);
+    run_laptop_task(laptop, runner, &argv)
 }
 
 fn assert_missing_log_not_missing_task(stderr: &[u8]) {
@@ -1763,4 +1772,186 @@ fn logs_failure_overlay_is_printed_once_and_ignored_for_raw() {
     assert_eq!(exit, 0, "raw stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(stdout, b"line\n");
     assert!(!laptop_task_store_exists(&laptop.paths));
+}
+
+#[test]
+fn seeded_open_wait_returns_without_laptop_store() {
+    let controller = IsolatedHome::new();
+    let laptop = IsolatedHome::new();
+    let record = seed_controller_task(&controller.paths, None);
+    write_enabled_config(&controller.paths);
+    write_enabled_config(&laptop.paths);
+    let runner = ssh_to_controller(&controller);
+    let task_id = record.meta().task_id().to_string();
+    let (exit, stdout, stderr) =
+        run_laptop_task(&laptop, &runner, &["wait", "--task-id", task_id.as_str()]);
+    assert_eq!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"wait complete (exit 0)\n");
+    assert!(!laptop_task_store_exists(&laptop.paths));
+    assert_eq!(request_row_count(&controller.paths), 0);
+    assert_eq!(request_row_count(&laptop.paths), 0);
+}
+
+#[test]
+fn seeded_missing_wait_is_task_not_found() {
+    let controller = IsolatedHome::new();
+    let laptop = IsolatedHome::new();
+    write_enabled_config(&controller.paths);
+    write_enabled_config(&laptop.paths);
+    let runner = ssh_to_controller(&controller);
+    let missing =
+        TaskId::new(Uuid::from_u128(0x018f_0f4a_6b5c_7d8e_9f00_dead_beef_0001)).to_string();
+    let (exit, stdout, stderr) =
+        run_laptop_task(&laptop, &runner, &["wait", "--task-id", missing.as_str()]);
+    assert_ne!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+    assert!(
+        stdout.is_empty(),
+        "stdout={}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        stderr.contains("TASK_NOT_FOUND"),
+        "missing wait must stay TASK_NOT_FOUND: {stderr}"
+    );
+    assert!(!laptop_task_store_exists(&laptop.paths));
+    assert_eq!(request_row_count(&controller.paths), 0);
+}
+
+#[test]
+fn laptop_wait_timeout_when_poll_stays_busy() {
+    let laptop = IsolatedHome::new();
+    write_enabled_config(&laptop.paths);
+    let task_id = seeded_ids().0.to_string();
+    let (exit, stdout, stderr) = run_laptop_task(
+        &laptop,
+        &BusyWaitPoll,
+        &["wait", "--task-id", task_id.as_str(), "--timeout", "1ms"],
+    );
+    assert_eq!(exit, 70, "stderr={}", String::from_utf8_lossy(&stderr));
+    assert!(
+        stdout.is_empty(),
+        "stdout={}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        stderr.contains("WAIT_TIMEOUT"),
+        "busy wait must not return success: {stderr}"
+    );
+    assert!(!laptop_task_store_exists(&laptop.paths));
+}
+
+#[test]
+fn seeded_reconcile_does_not_create_laptop_store() {
+    let controller = IsolatedHome::new();
+    let laptop = IsolatedHome::new();
+    write_enabled_config(&controller.paths);
+    write_enabled_config(&laptop.paths);
+    let runner = ssh_to_controller(&controller);
+    let (exit, stdout, stderr) = run_laptop_task(&laptop, &runner, &["reconcile"]);
+    assert_eq!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        stdout,
+        b"runners: 0 replaced, 0 started; task rows: 0 repaired\n"
+    );
+    assert!(!laptop_task_store_exists(&laptop.paths));
+    assert_eq!(request_row_count(&controller.paths), 0);
+}
+
+#[test]
+fn wait_poll_extra_keys_do_not_persist_durable_rows() {
+    let controller = IsolatedHome::new();
+    write_enabled_config(&controller.paths);
+    let (task_id, _) = seeded_ids();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let request = json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": "018f0f4a6b5c7d8e9f001122334455cc",
+        "command": "task.wait.poll",
+        "body": {
+            "task_id": task_id.to_string(),
+            "extra": true
+        }
+    });
+    let exit = run_with_stdio_in_context(
+        host_controller_rpc_cli(),
+        &SystemProcessRunner,
+        &controller.runtime,
+        &mut Cursor::new(frame_json(&request)),
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_ne!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+    let payload = decode_frame(&stdout).unwrap();
+    let error: Value = serde_json::from_slice(payload).unwrap();
+    assert_eq!(error["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(request_row_count(&controller.paths), 0);
+}
+
+#[test]
+fn enabled_say_wait_stays_unavailable() {
+    let laptop = IsolatedHome::new();
+    write_enabled_config(&laptop.paths);
+    let task_id = seeded_ids().0.to_string();
+    let (exit, stdout, stderr) = run_laptop_task(
+        &laptop,
+        &PanicSsh,
+        &["say", task_id.as_str(), "--message", "hi", "--wait"],
+    );
+    assert_ne!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+    assert!(
+        stdout.is_empty(),
+        "stdout={}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        stderr.contains("CONTROLLER_UNAVAILABLE"),
+        "say --wait is not independent: {stderr}"
+    );
+    assert!(!laptop_task_store_exists(&laptop.paths));
+}
+
+struct PanicSsh;
+
+impl ProcessRunner for PanicSsh {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        panic!(
+            "say --wait must stay UNAVAILABLE before SSH: {:?}",
+            request.program
+        );
+    }
+}
+
+struct BusyWaitPoll;
+
+impl ProcessRunner for BusyWaitPoll {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        assert_eq!(request.program, OsString::from("/usr/bin/ssh"));
+        let payload = decode_frame(request.stdin.as_ref().unwrap()).unwrap();
+        let parsed: Value = serde_json::from_slice(payload).unwrap();
+        let command = parsed["command"].as_str().unwrap();
+        assert_eq!(command, "task.wait.poll");
+        let request_id = parsed["request_id"].as_str().unwrap();
+        let body = parsed["body"].clone();
+        let digest = canonical_request_sha256(PROTOCOL_VERSION, command, &body).unwrap();
+        let reply = json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "command": command,
+            "request_id": request_id,
+            "payload_sha256": digest,
+            "result": {
+                "task_ids": [body["task_id"]],
+                "quiescent": false,
+                "exit_code": 0
+            }
+        });
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout: encode_json_frame(&reply).unwrap(),
+            stderr: Vec::new(),
+        })
+    }
 }

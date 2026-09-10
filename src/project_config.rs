@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::error::WorkerError;
 
-const PROJECT_CONFIG: &str = ".worker.toml";
+pub(crate) const PROJECT_CONFIG: &str = ".worker.toml";
 const DEFAULT_TIMEOUT: &str = "30m";
 const DEFAULT_SETUP_TIMEOUT: &str = "10m";
 const MAX_SETUP_COMMANDS: usize = 16;

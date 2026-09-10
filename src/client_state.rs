@@ -19,8 +19,14 @@ use std::{
 
 use uuid::Uuid;
 
+mod active_tasks;
 mod runner_dispatch;
 mod task_context;
+
+pub use active_tasks::{
+    ActiveTaskBootstrapReport, ActiveTaskConfig, ActiveTaskRefreshReport, ActiveTaskSelection,
+    task_record_needs_active_index,
+};
 
 #[cfg(test)]
 mod tests;
@@ -74,6 +80,7 @@ const TASKS_NAME: &CStr = c"tasks";
 const RUNS_NAME: &CStr = c"runs";
 const DAGS_NAME: &CStr = c"dags";
 const DAG_PENDING_NAME: &CStr = c"dag-pending";
+const ACTIVE_TASKS_NAME: &CStr = c"active-tasks";
 const TURNS_NAME: &CStr = c"turns";
 const RUNNERS_NAME: &CStr = c"runners";
 pub(crate) const OBSERVATION_TTL_MILLIS: u64 = 2_000;
@@ -120,6 +127,8 @@ pub enum ClientStateWritePoint {
     AfterDagRunMembership = 37,
     AfterDagBind = 38,
     AfterDagPendingBeforeDag = 39,
+    AfterActiveTaskIndexBeforeTaskPublish = 40,
+    AfterQuiescentTaskBeforeIndexRetire = 41,
 }
 
 #[doc(hidden)]
@@ -543,6 +552,13 @@ impl ClientStateStore {
             SyncKind::Root,
             &creation_race,
         )?;
+        let active_tasks = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            ACTIVE_TASKS_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
         let turns = open_or_create_owned_directory(
             root.as_raw_fd(),
             TURNS_NAME,
@@ -573,6 +589,7 @@ impl ClientStateStore {
                 runs.as_raw_fd(),
                 dags.as_raw_fd(),
                 dag_pending.as_raw_fd(),
+                active_tasks.as_raw_fd(),
                 turns.as_raw_fd(),
                 runners.as_raw_fd(),
             ],
@@ -714,7 +731,7 @@ impl ClientStateStore {
     ) -> Result<RunnerSlotDecision, WorkerError> {
         reserver.validate()?;
         self.update_queue(|snapshot| {
-            let tasks = self.list_tasks_locked()?;
+            let tasks = self.occupancy_task_records_locked()?;
             let entry = snapshot
                 .entries
                 .iter()
@@ -979,7 +996,7 @@ impl ClientStateStore {
         )?;
         let snapshot = read_queue_snapshot(self.inner.queue.as_raw_fd())?.0;
         require_queue_client(&snapshot, self.inner.client_id)?;
-        let tasks = self.list_tasks_locked()?;
+        let tasks = self.occupancy_task_records_locked()?;
         self.occupied_runner_slots_locked(&snapshot, &tasks, None, None)
     }
 
@@ -2160,7 +2177,7 @@ impl ClientStateStore {
         let Some(run) = candidate.run() else {
             return Ok(true);
         };
-        let tasks = self.list_tasks_locked()?;
+        let tasks = self.occupancy_task_records_locked()?;
         // Task-turn rows carry only the turn/job ID. Map each row back to its
         // task the same way `queue_entry_for_task_turn` does (turn directories)
         // and through the status last-turn used to skip a Dispatching row that
@@ -2538,21 +2555,28 @@ impl ClientStateStore {
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
         let tasks = self.tasks_dir()?;
         let name = task_file_name(task_id)?;
-        match tasks.write_private_atomic_no_replace(&name, &bytes) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let existing = read_task_from_dir(&tasks, &name, task_id)?;
-                if existing == record {
-                    Ok(())
-                } else {
-                    Err(queue_error(
-                        "TASK_ID_CONFLICT",
-                        "task ID is already present with different metadata",
-                    ))
-                }
+        if tasks.entry_exists(&name).map_err(WorkerError::Io)? {
+            let existing = read_task_from_dir(&tasks, &name, task_id)?;
+            if existing == record {
+                self.sync_active_task_index_locked(&existing)?;
+                return Ok(());
             }
-            Err(error) => Err(WorkerError::Io(error)),
+            return Err(queue_error(
+                "TASK_ID_CONFLICT",
+                "task ID is already present with different metadata",
+            ));
         }
+        if self.should_keep_active_index_locked(&record)? {
+            self.ensure_active_task_index_locked(task_id)?;
+            if self.take_fault(ClientStateWritePoint::AfterActiveTaskIndexBeforeTaskPublish) {
+                return Err(injected_failure(
+                    ClientStateWritePoint::AfterActiveTaskIndexBeforeTaskPublish,
+                ));
+            }
+        }
+        tasks
+            .write_private_atomic_no_replace(&name, &bytes)
+            .map_err(WorkerError::Io)
     }
 
     pub fn load_task(&self, task_id: TaskId) -> Result<LocalTaskRecord, WorkerError> {
@@ -2687,10 +2711,23 @@ impl ClientStateStore {
             return Err(invalid_state("task filename and record identity differ"));
         }
         if expected.is_some_and(|expected| expected != &existing) {
+            if self.should_keep_active_index_locked(&existing)? {
+                self.ensure_active_task_index_locked(existing.meta().task_id())?;
+            }
             return Ok(false);
         }
         if matches!(identical, IdenticalTaskWrite::Skip) && replacement == existing {
+            self.sync_active_task_index_locked(&existing)?;
             return Ok(true);
+        }
+        let keep = self.should_keep_active_index_locked(&replacement)?;
+        if keep {
+            self.ensure_active_task_index_locked(task_id)?;
+            if self.take_fault(ClientStateWritePoint::AfterActiveTaskIndexBeforeTaskPublish) {
+                return Err(injected_failure(
+                    ClientStateWritePoint::AfterActiveTaskIndexBeforeTaskPublish,
+                ));
+            }
         }
         tasks
             .replace_private_regular_exact_with_sync_hooks(
@@ -2716,8 +2753,16 @@ impl ClientStateStore {
                 },
                 before_final_sync,
             )
-            .map(|()| true)
-            .map_err(WorkerError::Io)
+            .map_err(WorkerError::Io)?;
+        if !keep {
+            if self.take_fault(ClientStateWritePoint::AfterQuiescentTaskBeforeIndexRetire) {
+                return Err(injected_failure(
+                    ClientStateWritePoint::AfterQuiescentTaskBeforeIndexRetire,
+                ));
+            }
+            self.retire_active_task_index_locked(task_id)?;
+        }
+        Ok(true)
     }
 
     pub fn list_tasks(&self) -> Result<Vec<LocalTaskRecord>, WorkerError> {
@@ -3366,6 +3411,21 @@ impl ClientStateStore {
         self.bootstrap_dag_pending_index_locked(&runs, &dags)
     }
 
+    /// Selected ticks skip the historical tasks/runs/dags sweep. Recover
+    /// leftover task replacement files only when residue is already present.
+    pub(crate) fn recover_task_replacement_residue_if_present(&self) -> Result<(), WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let tasks = self.tasks_dir()?;
+        if !tasks
+            .has_private_cleanup_residue()
+            .map_err(WorkerError::Io)?
+        {
+            return Ok(());
+        }
+        let names = tasks.list_names().map_err(WorkerError::Io)?;
+        self.recover_task_replacement_residue(&tasks, &names)
+    }
+
     fn recover_keyed_replacement_residue(&self, dir: &RootedDir) -> Result<(), WorkerError> {
         if dir.has_private_cleanup_residue().map_err(WorkerError::Io)? {
             dir.retry_pending_owned_regulars_matching(|name, _| is_private_replacement_name(name))
@@ -3786,6 +3846,22 @@ impl ClientStateStore {
         })
     }
 
+    pub fn unpark_row(
+        &self,
+        job_id: JobId,
+        owner: ProcessIdentity,
+    ) -> Result<Option<QueueEntry>, WorkerError> {
+        owner.validate()?;
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            if !matches!(entry.state(), QueueState::Parked) {
+                return Ok((None, false));
+            }
+            entry.unpark(owner)?;
+            Ok((Some(entry.clone()), true))
+        })
+    }
+
     /// Records a post-acceptance replacement-runner death on the queue row.
     ///
     /// Same public code increments the consecutive count; a different code
@@ -3942,6 +4018,83 @@ impl ClientStateStore {
         }
     }
 
+    /// Writes the durable exact-preparation binding for a follow-up turn.
+    ///
+    /// The binding lives beside `prompt.md` but, unlike the prompt, is never
+    /// removed when the turn completes: terminal replay after prompt
+    /// retirement and result-HEAD advance still verifies the original
+    /// message, expected snapshot, and frozen values. Same no-replace
+    /// publication boundary (and fault point) as the prompt write.
+    pub fn write_turn_prepared_binding(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        binding: &str,
+    ) -> Result<(), WorkerError> {
+        if self.take_fault(ClientStateWritePoint::BeforeTurnPromptWrite) {
+            return Err(injected_failure(
+                ClientStateWritePoint::BeforeTurnPromptWrite,
+            ));
+        }
+        if binding.len() > 256 || binding.is_empty() {
+            return Err(queue_error(
+                "TASK_STATE_INVALID",
+                "prepared follow-up binding is invalid",
+            ));
+        }
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let turns = self.turns_dir()?;
+        let task_dir = turns
+            .open_child_directory(&relative_path(&task_id.to_string())?, true)
+            .map_err(WorkerError::Io)?;
+        let turn_dir = task_dir
+            .open_child_directory(&relative_path(&turn_id.to_string())?, true)
+            .map_err(WorkerError::Io)?;
+        turn_dir
+            .write_private_atomic_no_replace("prepared_binding.sha256", binding.as_bytes())
+            .map_err(WorkerError::Io)
+    }
+
+    pub fn read_turn_prepared_binding(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<String, WorkerError> {
+        let turns = self.turns_dir()?;
+        let task_dir = turns
+            .open_child_directory(&relative_path(&task_id.to_string())?, false)
+            .map_err(WorkerError::Io)?;
+        let turn_dir = task_dir
+            .open_child_directory(&relative_path(&turn_id.to_string())?, false)
+            .map_err(WorkerError::Io)?;
+        let bytes = turn_dir
+            .read_private_regular("prepared_binding.sha256", 256)
+            .map_err(WorkerError::Io)?;
+        String::from_utf8(bytes).map_err(|_| invalid_state("prepared binding is not valid UTF-8"))
+    }
+
+    /// Removes the binding only while rolling back an unpublished turn whose
+    /// task CAS-back succeeded. Completion and terminal paths never call this.
+    pub fn remove_turn_prepared_binding(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<(), WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let turns = self.turns_dir()?;
+        let task_dir = turns
+            .open_child_directory(&relative_path(&task_id.to_string())?, false)
+            .map_err(WorkerError::Io)?;
+        let turn_dir = task_dir
+            .open_child_directory(&relative_path(&turn_id.to_string())?, false)
+            .map_err(WorkerError::Io)?;
+        match turn_dir.remove_owned_regular("prepared_binding.sha256") {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WorkerError::Io(error)),
+        }
+    }
+
     pub fn read_turn_prompt(
         &self,
         task_id: TaskId,
@@ -4012,6 +4165,12 @@ impl ClientStateStore {
     fn dag_pending_dir(&self) -> Result<RootedDir, WorkerError> {
         let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
         root.open_child_directory(&relative_path(DAG_PENDING_NAME.to_str().unwrap())?, false)
+            .map_err(WorkerError::Io)
+    }
+
+    fn active_tasks_dir(&self) -> Result<RootedDir, WorkerError> {
+        let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
+        root.open_child_directory(&relative_path(ACTIVE_TASKS_NAME.to_str().unwrap())?, false)
             .map_err(WorkerError::Io)
     }
 
@@ -6134,7 +6293,7 @@ fn validate_root_entries(root: RawFd) -> Result<(), WorkerError> {
         match entry.to_bytes() {
             b"client-id" | b"jobs" | b".mac-worker-state" | b"jobs.lock" | b"queue"
             | b"affinity" | b"observations" | b"tasks" | b"runs" | b"dags" | b"dag-pending"
-            | b"turns" | b"runners" => {}
+            | b"active-tasks" | b"turns" | b"runners" => {}
             bytes if std::str::from_utf8(bytes).is_err() => {
                 return Err(invalid_state("state root contains a non-UTF-8 entry"));
             }
@@ -6996,6 +7155,12 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         ClientStateWritePoint::AfterDagBind => "after DAG from-binding publication",
         ClientStateWritePoint::AfterDagPendingBeforeDag => {
             "after DAG pending-index publication before DAG file"
+        }
+        ClientStateWritePoint::AfterActiveTaskIndexBeforeTaskPublish => {
+            "after active-task index publication before task record"
+        }
+        ClientStateWritePoint::AfterQuiescentTaskBeforeIndexRetire => {
+            "after quiescent task publication before active-task index retirement"
         }
     };
     WorkerError::Io(io::Error::other(format!(

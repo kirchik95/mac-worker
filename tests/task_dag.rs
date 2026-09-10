@@ -25,6 +25,7 @@ use mac_worker::{
         ClientStateWritePoint,
     },
     config::Config,
+    controller::ProjectRegistry,
     dag::{
         DAG_PARENT_FAILED, DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, dag_pin_ref,
     },
@@ -3374,4 +3375,203 @@ fn dag_idle_pending_index_does_not_list_or_read_history_directory() {
     plant_closed_done_import(&harness.store, root_task, root_turn, result);
     harness.client().advance_pending_dags().unwrap();
     assert!(harness.store.list_pending_run_ids().unwrap().is_empty());
+}
+
+/// Bound is run candidates, not nodes inside a graph. A persistent failure on
+/// the lexicographically earliest pending run must not starve a later healthy
+/// run in the same page, and the cursor must still advance.
+#[test]
+fn pending_dag_page_advances_later_runs_after_an_earlier_failure() {
+    let harness = BatchHarness::new(ROOT_FROM_CHILD);
+    let first = harness.batch();
+    let second = harness.batch();
+    let mut ordered = [first.run_id(), second.run_id()];
+    ordered.sort_by_key(|id| id.to_string());
+    let earlier = ordered[0];
+    let later = ordered[1];
+
+    let later_dag = harness.store.load_run_dag(later).unwrap().unwrap();
+    let later_root = later_dag.nodes["root"].task_id;
+    let later_root_turn = later_dag.nodes["root"].turn_id;
+    let later_child = later_dag.nodes["child"].task_id;
+    drop(later_dag);
+
+    let result = harness.commit_result(b"later parent done\n");
+    plant_closed_done_import(&harness.store, later_root, later_root_turn, result);
+
+    fs::write(
+        harness.paths.state.join("dags").join(format!("{earlier}.json")),
+        b"corrupt-pending-run\n",
+    )
+    .unwrap();
+
+    let error = harness
+        .client()
+        .advance_pending_dags_page(2)
+        .expect_err("earliest corrupt run must still surface");
+    assert!(
+        !error.to_string().is_empty(),
+        "page must report the earlier failure: {error}"
+    );
+
+    let later_dag = harness.store.load_run_dag(later).unwrap().unwrap();
+    assert_eq!(later_dag.nodes["child"].task_id, later_child);
+    assert_eq!(
+        later_dag.nodes["child"].state,
+        DagNodeState::Submitted,
+        "later healthy run must progress in the same bounded page"
+    );
+}
+
+fn fetch_oid_into(cache: &Path, source: &Path, oid: &BaseOid) {
+    let spec = format!("{oid}:refs/mac-worker/scratch/{oid}");
+    let output = Command::new("/usr/bin/git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-C"])
+        .arg(cache)
+        .args(["fetch", "--quiet", "--no-write-fetch-head"])
+        .arg(source)
+        .arg(&spec)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "seed fetch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn seed_result_only_in_controller_cache(
+    cache: &Path,
+    project_id: &str,
+    worktree_id: &str,
+    contents: &[u8],
+) -> BaseOid {
+    let source = support::GitRepo::init();
+    source.write("result.txt", contents);
+    source.commit_all("imported turn");
+    let oid: BaseOid = String::from_utf8(source.git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let transfer =
+        TransferRepo::open_or_create_controller_cache(cache, project_id, worktree_id).unwrap();
+    fetch_oid_into(transfer.path(), &source.root().join(".git"), &oid);
+    assert!(
+        transfer.has_object(&oid),
+        "logical controller-transfer must contain the imported parent OID"
+    );
+    oid
+}
+
+/// Registered controller DAG: parent Closed+Done import lives only in
+/// `controller-transfer/<logical>`. The physical hash of the registered
+/// checkout is not seeded. Existing Closed+Done / import-OID gate is unchanged.
+#[test]
+fn registered_controller_dag_binds_parent_oid_from_logical_cache_only() {
+    let harness = BatchHarness::new(ROOT_FROM_CHILD);
+    let report = harness.batch();
+    let dag = harness
+        .store
+        .load_run_dag(report.run_id())
+        .unwrap()
+        .unwrap();
+    let project_id = dag.nodes["root"].frozen.project_id.clone();
+    let worktree_id = dag.nodes["root"].frozen.worktree_id.clone();
+    let root_task = dag.nodes["root"].task_id;
+    let root_turn = dag.nodes["root"].turn_id;
+    let child_id = dag.nodes["child"].task_id;
+    let child_turn = dag.nodes["child"].turn_id;
+    assert!(dag.nodes["child"].bound_oid.is_none());
+    drop(dag);
+
+    let checkout = support::GitRepo::init();
+    checkout.write("owned.txt", b"controller checkout\n");
+    checkout.commit_all("checkout base");
+    let checkout_root = checkout.root().canonicalize().unwrap();
+    ProjectRegistry::open(&harness.paths.controller_state_root())
+        .unwrap()
+        .register(&project_id, &worktree_id, &checkout_root)
+        .unwrap();
+
+    let result_oid = seed_result_only_in_controller_cache(
+        &harness.paths.cache,
+        &project_id,
+        &worktree_id,
+        b"imported parent result only in logical cache\n",
+    );
+    assert_ne!(result_oid.to_string(), harness.head());
+
+    plant_closed_done_import(&harness.store, root_task, root_turn, result_oid.clone());
+    harness.client().advance_pending_dags().unwrap();
+
+    let dag = harness
+        .store
+        .load_run_dag(report.run_id())
+        .unwrap()
+        .unwrap();
+    let child = &dag.nodes["child"];
+    assert_eq!(child.bound_oid.as_ref(), Some(&result_oid));
+    assert_eq!(child.bound_turn_id, Some(root_turn));
+    let pin_ref = dag_pin_ref(report.run_id(), "child");
+    assert_eq!(child.pin_ref.as_deref(), Some(pin_ref.as_str()));
+    assert_eq!(child.state, DagNodeState::Submitted);
+    assert_eq!(child.task_id, child_id);
+    let child_task = harness.store.load_task(child.task_id).unwrap();
+    assert_eq!(child_task.meta().base_oid(), &result_oid);
+    assert!(harness.store.queue_entry(child_turn).unwrap().is_some());
+
+    let logical =
+        TransferRepo::open_controller_cache(&harness.paths.cache, &project_id, &worktree_id)
+            .unwrap();
+    assert!(logical.has_object(&result_oid));
+    assert!(logical.has_ref(&pin_ref));
+    drop(logical);
+
+    let physical =
+        TransferRepo::open_or_create(&harness.paths.cache, &checkout_root.join(".git")).unwrap();
+    assert!(
+        !physical.has_object(&result_oid),
+        "physical transfer cache must not see a result that exists only in controller-transfer"
+    );
+}
+
+/// Ordinary local DAG still uses the physical hash cache. An object that exists
+/// only in `controller-transfer` is not an accepted import.
+#[test]
+fn unregistered_local_dag_does_not_bind_from_controller_transfer_cache() {
+    let harness = BatchHarness::new(ROOT_FROM_CHILD);
+    let report = harness.batch();
+    let dag = harness
+        .store
+        .load_run_dag(report.run_id())
+        .unwrap()
+        .unwrap();
+    let project_id = dag.nodes["root"].frozen.project_id.clone();
+    let worktree_id = dag.nodes["root"].frozen.worktree_id.clone();
+    let root_task = dag.nodes["root"].task_id;
+    let root_turn = dag.nodes["root"].turn_id;
+    drop(dag);
+
+    let result_oid = seed_result_only_in_controller_cache(
+        &harness.paths.cache,
+        &project_id,
+        &worktree_id,
+        b"logical-only object is not a local DAG import\n",
+    );
+    plant_closed_done_import(&harness.store, root_task, root_turn, result_oid.clone());
+    harness.client().advance_pending_dags().unwrap();
+
+    let dag = harness
+        .store
+        .load_run_dag(report.run_id())
+        .unwrap()
+        .unwrap();
+    assert!(
+        dag.nodes["child"].bound_oid.is_none(),
+        "local DAG must not bind an OID that exists only in controller-transfer"
+    );
+    assert_eq!(dag.nodes["child"].state, DagNodeState::Waiting);
 }

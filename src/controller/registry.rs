@@ -78,6 +78,14 @@ impl OwnedCheckoutMap {
                 )
             })
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, &Path)> {
+        self.inner
+            .iter()
+            .map(|((project_id, worktree_id), path)| {
+                (project_id.as_str(), worktree_id.as_str(), path.as_path())
+            })
+    }
 }
 
 impl ProjectRegistry {

@@ -13,74 +13,28 @@ description: "Dispatch independent coding tasks through the mac-worker pool and 
 
 Before the first submit, write the brief with `pool-task-authoring` unless the user already supplied a prompt file. Do not send work to the pool on your own initiative without one of the triggers above; when work merely looks parallelisable, say so and ask.
 
-This skill is the mechanical task loop. One task is one unit of work. Keep tasks independent unless a later task must start from an earlier accepted result (`depends_on` / `base = "from:<id>"`). The pool chooses workers. Never choose a worker yourself.
+This skill is the mechanical task loop. One task is one independent unit of work. The pool chooses workers. Never choose a worker yourself.
 
 The CLI is the only interface. The skill contains no scheduling logic.
 
-**Command availability:** the release exposes `worker task …` and `worker workers --refresh`. Verify the exact installed grammar with `worker task --help` and the relevant subcommand help before dispatching; do not replace a rejected public form with direct worker access, SSH, or another tool.
+**Command availability:** the release exposes `worker task …` and `worker workers --refresh`. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar; do not replace a rejected public form with direct worker access, SSH, or another tool.
 
-## Grammar
+## Grammar Source
 
-Exact public grammar. Confirm with `worker task --help` on the installed CLI.
+Do not copy CLI flags from this file. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar.
 
-```text
-worker task submit [options] (--prompt TEXT | --prompt-file PATH) [--title TEXT]
-worker task batch FILE [--name NAME] [--max-parallel N] [--wait | --preview]
-worker task list [--run RUN_ID] [--state STATE] [--outcome KIND] [--full]
-worker task status TASK_ID [--full]
-worker task logs [-f] TASK_ID [--turn N] [--raw]
-worker task diff TASK_ID [--stat]
-worker task say TASK_ID (--message TEXT | --message-file PATH) [--wait]
-worker task cancel TASK_ID
-worker task result TASK_ID
-worker task fetch TASK_ID
-worker task close TASK_ID [--discard]
-worker task wait (--task-id TASK_ID | --run RUN_ID) [--timeout DURATION]
-worker task reconcile     # re-own dead runners, re-enqueue orphans; may launch already-frozen eligible DAG children
-worker workers [--refresh]
-worker dashboard [--port N] [--no-open] [--no-facts-refresh]
-```
-
-There is no `worker task accept` verb. Human accept is `worker task close` after `--close-on never`. Dashboard reply/accept use the same `say`/`close` paths as the CLI; a stale card is rejected. `--no-facts-refresh` only skips stale facts refresh.
-
-`submit` options:
-
-```text
---agent codex|claude|cursor|opencode     optional; defaults from [task].default_agent
---model ID                               optional, agent-specific; default from [task].model
---effort LEVEL                           optional reasoning effort; default from [task].effort
---project PATH                           default: current worktree
---base REF                               default: HEAD
---wip                                    include uncommitted changes as a temporary base commit
---include PATTERN                        untracked inputs for --wip, same policy as v1
---source local|origin                    default from .worker.toml, else local
---publish fetch|push                     one CLI value; default from .worker.toml, else fetch
---publish-branch NAME                    origin branch name used only by publish = push
---timeout DURATION                       per turn; default 45m; max 24h
---max-turns N                            agent-internal turn cap where supported
---max-budget CENTS                       where supported
---max-followups N                        follow-up turns allowed after the first; default 10
---close-on done|never                    default done
---env-profile NAME                       overrides .worker.toml
---worker NAME                            diagnostic pin, never a raw SSH destination
---no-wait                                CAPACITY_BUSY instead of queueing
---wait                                   stay attached until the first turn ends
-```
-
-Without `--wait`, `submit`, `batch`, and `say` return as soon as the task record, the base commit in the transfer repository, and the queue row exist and a local turn runner has taken ownership of the row, or the row is parked behind the detached runner cap. That cap defaults to the **sum** of each worker’s `slots` (each worker defaults to 1). With `--wait` the same work happens in the foreground and the command follows the turn's event log to its end. `list`, `status`, `result`, `diff`, and `logs` are read-only; `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and `reconcile` perform runner recovery first. `batch --preview` validates the file and prints the plan (`dag.status = "enforced"`); it does not open client state or dispatch. Named `depends_on` / `base = "from:<id>"` execute when each parent is Closed and Done. Independent batches (no those edges) keep today's submit path. Invalid or cyclic graphs are `TASK_CONFIG_INVALID` and create no run.
-
-`--max-parallel` is a requested run cap: omitted, it defaults to that same slot sum; an explicit value may be any positive integer and is **not** rejected for exceeding host or client capacity. Extra tasks wait for a free execution slot. Host occupancy still admits at most `slot_count` live leases per Mac.
+Without `--wait`, `submit`, `batch`, and `say` return as soon as the task record, the base commit in the transfer repository, and the queue row exist and a local turn runner has taken ownership of the row, or the row is parked behind the per-worker runner cap. With `--wait` the same work happens in the foreground and the command follows the turn's event log to its end. `list`, `status`, `result`, `diff`, and `logs` are read-only; `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and `reconcile` perform runner recovery first.
 
 `--json` on any command emits the same typed records the dashboard consumes; `submit`, `say`, `logs -f`, and `wait` emit versioned NDJSON events, with log chunks base64-encoded as in v1.
 
-The current release accepts `source = local|origin` and `publish = fetch|push`; `--publish-branch` is valid only with `push`, and a `--wip` base cannot push (`PUBLISH_REQUIRES_COMMITTED_BASE`). Honor the user's requested `--agent` / `--model` / `--effort` / `--env-profile` when that combination is configured. The following are **maintainer pool defaults** to adapt, not credentials to copy:
+The current release accepts `source = local|origin` and `publish = fetch|push`; `--publish-branch` is valid only with `push`, and a `--wip` base cannot push (`PUBLISH_REQUIRES_COMMITTED_BASE`). Agents on this pool:
 
-- `codex`: this pool often uses `--model gpt-6-astra --effort xhigh`. The effort reaches Codex as `-c model_reasoning_effort="xhigh"`; without the flag the worker's own Codex configuration decides. Only Codex reads it — the other agents ignore it.
-- `opencode`: no model flag uses the worker's default; OpenCode Go models are `--model opencode-go/<model>`.
-- `cursor`: this pool uses `--env-profile agents` for the worker-side Cursor login and login-keychain unlock. Never read or copy profile contents. Use a different profile name if the user configured one.
-- `claude`: deferred on some workers by operator decision; do not submit it unless the user has enabled it.
+- `codex`: Codex with the configured defaults; pass `--model`/`--effort` only when the task needs a different one; see `worker skills get pool-dispatch` for the effective values. Only Codex reads `--effort` — the other agents ignore it.
+- `opencode`: no model flag uses the worker's default (OpenCode Zen, Muse Spark 1.3, free); OpenCode Go models are `--model opencode-go/<model>`.
+- `cursor`: always `--env-profile agents`; that worker-side profile carries the Cursor login and the login-keychain unlock. Never read or copy it.
+- `claude`: deferred on the workers by operator decision; do not submit it until the operator enables it.
 
-Watch the pool while tasks run: `worker dashboard --port 8765 --no-open`, then open `http://127.0.0.1:8765` (task deep link `#/tasks/<id>`).
+Watch the pool while tasks run: `worker dashboard --port 8765 --no-open`, then open `http://127.0.0.1:8765`.
 
 ## Submit
 
@@ -90,25 +44,13 @@ For each task, put its prompt in a Markdown file and submit it:
 worker task submit --agent <name> --prompt-file <file> --json
 ```
 
-Keep every returned `task_id`. For independent tasks, preview then submit a batch file:
+Keep every returned `task_id`. For a list of tasks, use the batch command with its batch file:
 
 ```text
-worker task batch <file> --preview --json
 worker task batch <file> --json
 ```
 
-Keep the returned run identifier and all task identifiers. `--max-parallel` does not have to be ≤ the slot sum; see Grammar.
-
-For a named DAG (later task starts from an earlier accepted result):
-
-```text
-worker task batch <file> --preview --json
-worker task batch <file> --name api-then-tests --wait --json
-```
-
-Children wait for Closed+Done parents, including `close_on = never` after human `close`. Open+NeedsInput on a parent waits; answer with `say` and keep waiting. A failed parent blocks descendants (`DAG_PARENT_FAILED`) and they are not launched. `from:` binds the parent's current accepted imported OID on the laptop; origin `pending` does not block that bind when the local import proof is complete. `wait --run` is not complete while DAG nodes are still waiting or claimed.
-
-For a review loop that should stay Open after agent `done`, pass `--close-on never` on submit, or `close_on` in the batch file. `.worker.toml` has no `close_on` field.
+Keep the returned run identifier and all task identifiers.
 
 ## Follow
 
@@ -124,8 +66,6 @@ Or block until the run completes:
 worker task wait --run <id>
 ```
 
-`wait --run` stays open while DAG nodes are waiting or claimed. List rows for not-yet-submitted nodes may show `DAG_WAITING` or `DAG_CLAIMED`. A blocked descendant after a failed parent shows `DAG_PARENT_FAILED`.
-
 For one task, use the release form:
 
 ```text
@@ -135,12 +75,9 @@ worker task wait --task-id <id>
 Inspect one task without mutating it:
 
 ```text
-worker task status <id> --json
-worker task result <id> --json
+worker task status <id>
 worker task diff <id> --stat
 ```
-
-Report the outcome, summary, agent-reported checks (if any), `diff --stat`, and — after fetch — the remote-tracking ref. Agent-reported checks are not independent verification. A `done` turn with origin `delivery.state` of `pending` or `retrying` is still `done`; do not treat pending origin as a failed turn.
 
 List exactly the tasks waiting on an answer:
 
@@ -154,7 +91,7 @@ For a task that reports `needs_input`, read its questions from `worker task stat
 worker task say <id> --message-file <file> --wait
 ```
 
-Do not send a message to an active turn. `say` is for the next turn. A `say` while a turn is running is `TASK_BUSY`. Public CLI `say` / `close` have no revision flags; wait until the previous runner has released ownership. Dashboard reply/accept use the current card; a stale card is rejected (`TASK_REVISION_CONFLICT`) and must not enqueue another turn.
+Do not send a message to an active turn. `say` is for the next turn. A `say` while a turn is running is `TASK_BUSY`.
 
 When a task reports `done`, fetch its result:
 
@@ -162,7 +99,7 @@ When a task reports `done`, fetch its result:
 worker task fetch <id>
 ```
 
-Report the remote-tracking ref returned by `fetch` (`refs/remotes/mac-worker/<worker>/task/<id>`). That is the current-turn import proof on the laptop.
+Report the remote-tracking ref returned by `fetch`.
 
 When a task reports `blocked`, or its turn fails, inspect both the structured result and the logs:
 
@@ -177,27 +114,43 @@ Then either write guidance and use `say`, or discard the task:
 worker task close <id> --discard
 ```
 
-Human accept after `--close-on never` (no new CLI verb):
+Close every finished task:
 
 ```text
 worker task close <id>
 ```
 
-Default `--close-on done` auto-closes after agent `done`; that is not human acceptance. `close --discard` also deletes the agent's session on the worker.
+`worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks. It does not submit work.
 
-`worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks. After that recovery it may launch already-frozen eligible DAG children. It does not start a new operator batch.
+## Liveness And Settlement
+
+Absence of evidence is not evidence of death. A `wait` timeout, an empty `list` poll, a task that has not changed state, or a row shown as `dispatching` under a pid you cannot see is a checkpoint, not a failure. Do not cancel, close, resubmit, or `reconcile` on a checkpoint alone.
+
+Act only on positive proof: the task status is terminal, the structured result is present, `logs` show the agent's exit, or `task list` names a blocking code such as `RUNNER_REPEATED_FAILURE:<code>`, `WAIT_BLOCKED`, or `LOG_DRAIN_UNAVAILABLE`. After three consecutive empty waits, enumerate instead of waiting blindly:
+
+```text
+worker task list --run <id> --json
+worker task list --state open --outcome needs-input --json
+worker workers --refresh
+```
+
+and act on each row's blocking code. `worker task reconcile` is the operator's reset for a parked turn; run it after reading the worker, not instead of reading it.
+
+A finished task owes exactly one decision after `fetch`: a follow-up with `say` (the same agent session continues), keeping it open for inspection, or `close` (`--discard` also deletes the session on the worker). `close` is post-settlement cleanup, never a cancellation; use `cancel` for a running turn.
 
 ## Rules
 
 - Never merge, check out, or push from this skill.
-- Never read environment profiles or copy credential files.
+- Never read environment profiles.
 - Never pick workers. The pool does. `--worker` is a diagnostic pin, never an SSH destination.
 - Keep task identifiers and the run identifier; do not infer them from display order.
-- Keep tasks independent unless a later task must start from an earlier accepted result (`depends_on` / `base = "from:<id>"`). Do not use one task's workspace as another task's workspace. Same `task_id` is serialized; distinct task IDs may overlap on a host with `slot_count >= 2`.
+- Keep tasks independent. Do not use one task's workspace as another task's workspace.
 - Never write a message into a running agent. Conversation is `say` between turns only.
-- Never ask an agent to commit, switch branches, or push. The publisher commits the worktree changes after the turn. On Codex the workspace sandbox keeps `.git` read-only and a commit attempt ends the turn `blocked`; do not assume that sandbox for Cursor, OpenCode, or Claude.
-- Honor the user's requested agent, model, and profile when configured. Do not silently switch providers.
+- Never ask an agent to commit, switch branches, or push. The publisher commits the worktree changes after the turn; on Codex the sandbox keeps `.git` read-only and a commit attempt ends the turn `blocked`.
+- A task with the default `--close-on done` closes itself after a `done` turn. `close --discard` also deletes the agent's session on the worker.
 - Read the durable task outcome as well as the process exit status. A zero exit with status `blocked` is a failed turn.
+- Never restart, resubmit, or repair a turn on an unverifiable observation. Restart only on positive proof the runner or the worker job exited; otherwise keep waiting or inspect.
+- Verify the installed grammar before every dispatch: `worker skills get pool-dispatch --grammar-only` and `worker task submit --help` are the source of truth, not this file.
 
 ## Exit Codes
 
@@ -209,7 +162,7 @@ CLI exit codes keep v1 semantics. New stable codes sit in the v1 classes plus tw
 - `git` (new): `BASE_PUSH_FAILED`, `BASE_UNAVAILABLE`, `WORKTREE_CREATE_FAILED`, `WORKTREE_INCONSISTENT`, `RESULT_FETCH_FAILED`, `PUBLISH_FAILED`.
 - `infrastructure`: `HOST_LAYOUT_OUTDATED`, reported by the probe as unavailable until `worker setup` migrates the worker.
 - `agent` (new): `AGENT_NOT_INSTALLED`, `AGENT_NOT_AUTHENTICATED`, `AGENT_EXITED`, `AGENT_LIMIT_REACHED`, `RESULT_UNPARSEABLE`, `SESSION_UNBOUND`, `ENV_PROFILE_PERMISSIONS`.
-- `task`: `TASK_BUSY`, `FOLLOWUP_LIMIT`, `TASK_CLOSED`, `TASK_NOT_FOUND`, `TASK_REVISION_CONFLICT`, and `RUNNER_HANDOFF_FAILED`, which alone maps to the local I/O exit status `74`.
+- `task`: `TASK_BUSY`, `FOLLOWUP_LIMIT`, `TASK_CLOSED`, `TASK_NOT_FOUND`, and `RUNNER_HANDOFF_FAILED`, which alone maps to the local I/O exit status `74`.
 
 CLI exit codes: `64` usage and configuration, `69` pre-acceptance transport, `70` protocol or infrastructure, `74` local I/O, `75` capacity. Commands that end with a turn map the turn's outcome as follows:
 

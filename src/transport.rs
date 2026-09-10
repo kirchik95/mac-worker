@@ -862,10 +862,12 @@ fn probe_aborted(worker: &WorkerEntry) -> WorkerHealth {
 pub(crate) fn ssh_program() -> Result<OsString, WorkerError> {
     #[cfg(debug_assertions)]
     {
-        return ssh_program_from_override(std::env::var_os(TEST_SSH_ENV));
+        ssh_program_from_override(std::env::var_os(TEST_SSH_ENV))
     }
     #[cfg(not(debug_assertions))]
-    Ok(OsString::from(SSH_PROGRAM))
+    {
+        Ok(OsString::from(SSH_PROGRAM))
+    }
 }
 
 pub(crate) fn ssh_program_from_override(value: Option<OsString>) -> Result<OsString, WorkerError> {

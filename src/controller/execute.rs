@@ -25,13 +25,23 @@ use crate::{
         read::{
             ControllerReadIdentity, invalid_controller_reply, is_read_command, serve_read_command,
         },
-        registry::{self, ProjectRegistry},
+        registry::{self, OwnedCheckoutMap, ProjectRegistry},
         store::{
             ActiveResumeConfig, ControllerAck, ControllerCommandHandler, ControllerFault,
-            ControllerStore,
+            ControllerStore, OperationMeta,
         },
         stream_rpc::{is_transfer_command, serve_transfer_command},
-        transfer::ControllerTransfer,
+        transfer::{ControllerTransfer, SourceSubmitBind},
+        lifecycle::{is_lifecycle_command, serve_lifecycle_command},
+        task_mutations::{
+            PreparedTaskMutation, execute_task_mutation, prepare_task_mutation,
+        },
+        batch::{
+            BatchExecuteContext, ControllerCheckoutMap, PreparedTaskBatch, execute_task_batch,
+            prepare_task_batch,
+        },
+        leader::now_millis,
+        read::ControllerTaskStatusResult,
     },
     error::WorkerError,
     job::{HostControlError, RequestFingerprint},
@@ -73,57 +83,59 @@ impl<'a> TaskSubmitHandler<'a> {
 }
 
 impl ControllerCommandHandler for TaskSubmitHandler<'_> {
-    fn execute(&self, record: &crate::controller::DurableRequest) -> Result<Value, WorkerError> {
-        self.execute_typed(record)
-    }
-}
-
-impl TaskSubmitHandler<'_> {
-    /// FLOW-owned prepare matching STORE rev2: `OperationMeta.prepared: Value`.
-    /// `task.submit` freeze is the original body (`prepared = Null`).
-    /// `task.say` / `task.cancel` / `task.close` consume SCHED `0b5ab338`
-    /// once OC `PreparedFollowup` / `say_prepared` / `cancel_from_expected`
-    /// compile. STORE persist waits on kernel `9902c70`. `task.batch` waits
-    /// for ENV `controller/batch.rs`; FLOW supplies freeze/multi-source
-    /// streaming and `OwnedCheckoutMap`. Do not duplicate those modules or
-    /// import 623 TaskClient.
-    pub fn prepare(
-        &self,
-        record: &crate::controller::DurableRequest,
-    ) -> Result<Value, WorkerError> {
-        match record.command() {
-            "checkpoint.submit" => Ok(Value::Null),
-            "task.submit" => {
-                let body: FrozenSubmitBody = serde_json::from_value(record.body().clone())
-                    .map_err(|_| {
-                        WorkerError::Protocol(
-                            "CONTROLLER_TRANSPORT: task.submit body is not a frozen submit".into(),
-                        )
-                    })?;
-                let expected_task = body.task_id.to_string();
-                let expected_turn = body.turn_id.to_string();
-                if record.task_id() != Some(expected_task.as_str())
-                    || record.turn_id() != Some(expected_turn.as_str())
-                {
-                    return Err(WorkerError::Protocol(
-                        "CONTROLLER_REQUEST_CONFLICT: frozen task IDs do not match the durable row"
-                            .into(),
-                    ));
-                }
-                Ok(Value::Null)
+    fn prepare(&self, request: &ControllerRequest) -> Result<OperationMeta, WorkerError> {
+        match request.command() {
+            "checkpoint.submit" | "task.submit" => {
+                crate::controller::default_prepare_operation(request)
             }
-            "task.say" | "task.cancel" | "task.close" => Err(WorkerError::Unavailable(
-                "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
-            )),
-            "task.batch" => Err(WorkerError::Unavailable(
-                "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
-            )),
+            "task.say" | "task.cancel" | "task.close" => {
+                let prepared =
+                    prepare_task_mutation(request, self.client_state, now_millis()?)?;
+                let encoded = serde_json::to_value(&prepared).map_err(|_| {
+                    WorkerError::Protocol(
+                        "CONTROLLER_TRANSPORT: prepared mutation could not be encoded".into(),
+                    )
+                })?;
+                Ok(OperationMeta {
+                    task_id: Some(prepared.task_id().to_string()),
+                    turn_id: prepared.turn_id().map(|id| id.to_string()),
+                    created_at_millis: prepared.created_at_millis(),
+                    prepared: encoded,
+                })
+            }
+            "task.batch" => {
+                let transfer = ControllerTransfer::open(&self.paths.controller_state_root())?;
+                let prepared = prepare_task_batch(
+                    request,
+                    &transfer,
+                    &self.paths.cache,
+                    self.runner,
+                    self.config,
+                )?;
+                let encoded = serde_json::to_value(&prepared).map_err(|_| {
+                    WorkerError::Protocol(
+                        "CONTROLLER_TRANSPORT: prepared batch could not be encoded".into(),
+                    )
+                })?;
+                Ok(OperationMeta {
+                    task_id: prepared.task_id().map(|id| id.to_string()),
+                    turn_id: prepared.turn_id().map(|id| id.to_string()),
+                    created_at_millis: prepared.created_at_millis(),
+                    prepared: encoded,
+                })
+            }
             other => Err(WorkerError::Protocol(format!(
                 "CONTROLLER_TRANSPORT: unsupported controller command {other}"
             ))),
         }
     }
 
+    fn execute(&self, record: &crate::controller::DurableRequest) -> Result<Value, WorkerError> {
+        self.execute_typed(record)
+    }
+}
+
+impl TaskSubmitHandler<'_> {
     pub fn execute_typed(
         &self,
         record: &crate::controller::DurableRequest,
@@ -134,23 +146,100 @@ impl TaskSubmitHandler<'_> {
                 "turn_id": record.turn_id(),
             })),
             "task.submit" => {
-                let _ = self.prepare(record)?;
                 self.submit_task(record)?;
                 Ok(json!({
                     "task_id": record.task_id(),
                     "turn_id": record.turn_id(),
                 }))
             }
-            "task.say" | "task.cancel" | "task.close" => Err(WorkerError::Unavailable(
-                "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
-            )),
-            "task.batch" => Err(WorkerError::Unavailable(
-                "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
-            )),
+            "task.say" | "task.cancel" | "task.close" => self.execute_prepared_mutation(record),
+            "task.batch" => self.execute_prepared_batch(record),
             other => Err(WorkerError::Protocol(format!(
                 "CONTROLLER_TRANSPORT: unsupported controller command {other}"
             ))),
         }
+    }
+
+    fn execute_prepared_mutation(
+        &self,
+        record: &crate::controller::DurableRequest,
+    ) -> Result<Value, WorkerError> {
+        let prepared: PreparedTaskMutation =
+            serde_json::from_value(record.prepared().clone()).map_err(|_| {
+                WorkerError::Protocol(
+                    "CONTROLLER_TRANSPORT: prepared mutation is invalid".into(),
+                )
+            })?;
+        let client = TaskClient::new(
+            self.runner,
+            self.config,
+            self.paths,
+            self.client_state,
+            &DETACHED_EXECUTOR,
+        );
+        let report = execute_task_mutation(&client, &prepared)?;
+        serde_json::to_value(ControllerTaskStatusResult::from_report(&report)).map_err(|_| {
+            WorkerError::Protocol(
+                "CONTROLLER_TRANSPORT: mutation result could not be encoded".into(),
+            )
+        })
+    }
+
+    fn execute_prepared_batch(
+        &self,
+        record: &crate::controller::DurableRequest,
+    ) -> Result<Value, WorkerError> {
+        let prepared: PreparedTaskBatch =
+            serde_json::from_value(record.prepared().clone()).map_err(|_| {
+                WorkerError::Protocol("CONTROLLER_TRANSPORT: prepared batch is invalid".into())
+            })?;
+        for source in prepared.sources() {
+            materialize_controller_checkout(
+                self.runner,
+                self.paths,
+                source.request_id(),
+                source.project_id(),
+                source.worktree_id(),
+                source.expected_oid(),
+            )?;
+        }
+        let identities: Vec<(String, String)> = prepared
+            .nodes()
+            .values()
+            .map(|node| {
+                (
+                    node.frozen.project_id.clone(),
+                    node.frozen.worktree_id.clone(),
+                )
+            })
+            .collect();
+        let owned = OwnedCheckoutMap::from_identities(
+            &ProjectRegistry::open(&self.paths.controller_state_root())?,
+            identities,
+        )?;
+        let mut checkouts = ControllerCheckoutMap::new();
+        for (project_id, worktree_id, path) in owned.iter() {
+            checkouts.insert(project_id, worktree_id, path.to_path_buf());
+        }
+        let client = TaskClient::new(
+            self.runner,
+            self.config,
+            self.paths,
+            self.client_state,
+            &DETACHED_EXECUTOR,
+        );
+        let ctx = BatchExecuteContext {
+            client: &client,
+            store: self.client_state,
+            paths: self.paths,
+            runner: self.runner,
+            checkouts: &checkouts,
+        };
+        let report = execute_task_batch(&ctx, &prepared)?;
+        Ok(json!({
+            "run_id": report.run_id().to_string(),
+            "task_ids": report.task_ids(),
+        }))
     }
 
     fn submit_task(&self, record: &crate::controller::DurableRequest) -> Result<(), WorkerError> {
@@ -180,11 +269,13 @@ impl TaskSubmitHandler<'_> {
         let receipt = transfer.bind_source_for_submit(
             &self.paths.cache,
             self.runner,
-            record.request_id(),
-            &fingerprint,
-            &body.project_id,
-            &body.worktree_id,
-            &body.base_oid,
+            SourceSubmitBind {
+                request_id: record.request_id(),
+                fingerprint: &fingerprint,
+                project_id: &body.project_id,
+                worktree_id: &body.worktree_id,
+                expected_oid: &body.base_oid,
+            },
         )?;
         if receipt.oid().as_str() != body.base_oid.as_str() {
             return Err(WorkerError::Protocol(
@@ -219,21 +310,33 @@ fn materialize_frozen_checkout(
     request_id: &str,
     body: &FrozenSubmitBody,
 ) -> Result<std::path::PathBuf, WorkerError> {
-    let checkout = registry::checkout_path(
-        &paths.controller_project_root(),
+    materialize_controller_checkout(
+        runner,
+        paths,
+        request_id,
         &body.project_id,
         &body.worktree_id,
-    )?;
+        &body.base_oid,
+    )
+}
+
+fn materialize_controller_checkout(
+    runner: &dyn ProcessRunner,
+    paths: &PathLayout,
+    request_id: &str,
+    project_id: &str,
+    worktree_id: &str,
+    base_oid: &crate::task::BaseOid,
+) -> Result<std::path::PathBuf, WorkerError> {
+    let checkout =
+        registry::checkout_path(&paths.controller_project_root(), project_id, worktree_id)?;
     registry::ensure_checkout_dir(&checkout)?;
     let git_dir = checkout.join(".git");
     if !git_dir.is_dir() {
         git_in(runner, &checkout, &["init", "-q"])?;
     }
-    let transfer = TransferRepo::open_or_create_controller_cache(
-        &paths.cache,
-        &body.project_id,
-        &body.worktree_id,
-    )?;
+    let transfer =
+        TransferRepo::open_or_create_controller_cache(&paths.cache, project_id, worktree_id)?;
     let source_ref = TransferRepo::frozen_request_ref(request_id)?;
     let checkout_ref = frozen_checkout_ref(request_id)?;
     let transfer_path = transfer.path().to_str().ok_or_else(|| WorkerError::Git {
@@ -255,9 +358,9 @@ fn materialize_frozen_checkout(
         ],
     )?;
     let worktree = checkout.join("requests").join(request_id);
-    ensure_request_worktree(runner, &git_dir, &worktree, &checkout_ref, &body.base_oid)?;
+    ensure_request_worktree(runner, &git_dir, &worktree, &checkout_ref, base_oid)?;
     let registry = ProjectRegistry::open(&paths.controller_state_root())?;
-    registry.register(&body.project_id, &body.worktree_id, &checkout)?;
+    registry.register(project_id, worktree_id, &checkout)?;
     Ok(worktree)
 }
 
@@ -389,6 +492,10 @@ pub fn serve_rpc_with_runtime(
         let client_state = ClientStateStore::open(&paths.state)?;
         let client = TaskClient::new(runner, config, paths, &client_state, &DETACHED_EXECUTOR);
         serve_read_command(&request, &client)?
+    } else if is_lifecycle_command(request.command()) {
+        let client_state = ClientStateStore::open(&paths.state)?;
+        let client = TaskClient::new(runner, config, paths, &client_state, &DETACHED_EXECUTOR);
+        serve_lifecycle_command(&request, &client)?
     } else if is_transfer_command(request.command()) {
         serve_transfer_command(&request, paths, runner)?
     } else if request.command() == "checkpoint.submit" {

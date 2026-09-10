@@ -11,6 +11,8 @@
 //! Dashboard transport: managed SSH local-forward to a loopback HTTP viewer
 //! (`controller_dashboard_ssh_request`). Not RPC DTOs.
 
+pub mod batch;
+pub mod batch_freeze;
 pub mod envelope;
 pub mod execute;
 pub mod leader;
@@ -18,13 +20,27 @@ pub mod protocol;
 pub mod read;
 pub mod registry;
 pub mod store;
+pub mod task_mutations;
+pub mod lifecycle;
 pub mod stream_client;
 pub mod stream_rpc;
 pub mod transfer;
 
 use std::time::Duration;
 
+pub use batch::{
+    BatchExecuteContext, BatchKind, ControllerCheckoutMap, FrozenBatchBody, FrozenBatchSource,
+    PreparedBatchSource, PreparedTaskBatch, execute_task_batch, prepare_task_batch,
+};
+pub use batch_freeze::{LaptopBatchSourceStream, LaptopFrozenBatch, freeze_laptop_batch};
 pub use envelope::{OperationEnvelope, load_operation_envelope, persist_operation_envelope};
+pub use lifecycle::{
+    ControllerReconcileResult, ControllerWaitPollResult, ControllerWaitSelector,
+    reconcile_via_controller, wait_via_controller,
+};
+pub use task_mutations::{
+    PreparedTaskMutation, execute_task_mutation, prepare_task_mutation,
+};
 pub use execute::{
     TaskSubmitHandler, send_controller_read, send_controller_request, serve_rpc_with_runtime,
     tick_controller_leader,
@@ -46,10 +62,13 @@ pub use store::{
     ControllerCommandHandler, ControllerFault, ControllerStore, DurableRequest,
     FakeControllerExecutor, OperationMeta, RequestPhase, serve_rpc,
 };
-pub use stream_client::{fetch_via_controller, stream_source_receive};
+pub use stream_client::{
+    fetch_via_controller, stream_nested_source, stream_source_receive,
+};
 pub use transfer::{
     CONTROLLER_TRANSFER_CACHE_DOMAIN, ControllerReceiveIdentity, ControllerResultIdentity,
-    ControllerSourceReceipt, ControllerTransfer, VerifiedResultMeta, controller_transfer_cache_id,
+    ControllerSourceReceipt, ControllerTransfer, SourceSubmitBind, VerifiedResultMeta,
+    controller_transfer_cache_id,
     controller_transfer_git_path, frozen_result_ref, import_controller_result, result_digest,
     source_digest,
 };
@@ -73,11 +92,11 @@ const CONTROLLER_RPC_POLICY: ProcessPolicy = ProcessPolicy {
 pub fn controller_rpc_ssh_request(
     controller: &ControllerConfig,
 ) -> Result<ProcessRequest, WorkerError> {
-    Ok(ssh_request(
+    ssh_request(
         &controller_worker_entry(controller)?,
         HostOperation::ControllerRpc.command().into(),
         CONTROLLER_RPC_POLICY,
-    )?)
+    )
 }
 
 pub(crate) fn controller_worker_entry(

@@ -112,6 +112,15 @@ struct ResultRecord {
     cache_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSubmitBind<'a> {
+    pub request_id: &'a str,
+    pub fingerprint: &'a RequestFingerprint,
+    pub project_id: &'a str,
+    pub worktree_id: &'a str,
+    pub expected_oid: &'a BaseOid,
+}
+
 pub struct ControllerTransfer {
     root: RootedDir,
 }
@@ -365,25 +374,21 @@ impl ControllerTransfer {
         &self,
         cache_root: &Path,
         runner: &dyn ProcessRunner,
-        request_id: &str,
-        fingerprint: &RequestFingerprint,
-        project_id: &str,
-        worktree_id: &str,
-        expected_oid: &BaseOid,
+        bind: SourceSubmitBind<'_>,
     ) -> Result<ControllerSourceReceipt, WorkerError> {
         let identity = {
             let _lock = self.lock_transfers()?;
             let record = self
-                .load_source_by_request(request_id)?
+                .load_source_by_request(bind.request_id)?
                 .ok_or_else(missing_token)?;
-            let digest = source_digest(project_id, worktree_id, expected_oid)?;
-            let cache_id = controller_transfer_cache_id(project_id, worktree_id)?;
+            let digest = source_digest(bind.project_id, bind.worktree_id, bind.expected_oid)?;
+            let cache_id = controller_transfer_cache_id(bind.project_id, bind.worktree_id)?;
             reuse_source(
                 &record,
-                fingerprint,
-                project_id,
-                worktree_id,
-                expected_oid,
+                bind.fingerprint,
+                bind.project_id,
+                bind.worktree_id,
+                bind.expected_oid,
                 &digest,
                 &cache_id,
             )?;

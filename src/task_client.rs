@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cell::Cell,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Condvar, Mutex, OnceLock},
@@ -12,7 +12,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLimits, result_instruction},
-    client_state::{ClientStateConcurrencyPoint, ClientStateStore},
+    client_state::{
+        ActiveTaskConfig, ClientStateConcurrencyPoint, ClientStateStore,
+    },
     config::{Config, WorkerEntry},
     dag::{
         DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, GraphNode, ParentGate,
@@ -26,6 +28,7 @@ use crate::{
         QueueRunReference, QueueSnapshot, QueueState,
     },
     paths::PathLayout,
+    prepared_followup::PreparedFollowup,
     prepared_submit::PreparedSubmit,
     process::ProcessRunner,
     project::ProjectInspector,
@@ -37,7 +40,7 @@ use crate::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, OriginDelivery,
         PublishMode, PushTarget, RunId, RunRecord, RunnerState, TaskCloseIntent, TaskId,
         TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
-        TurnId, TurnSummary, merge_origin_deliveries,
+        TurnId, TurnSummary, TurnTerminal, merge_origin_deliveries,
     },
     task_view::{
         TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
@@ -76,8 +79,8 @@ fn same_close_target(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> b
         && current.status().turns().last().map(TurnSummary::turn_id)
             == expected.status().turns().last().map(TurnSummary::turn_id)
 }
-const WAIT_POLL: Duration = Duration::from_millis(100);
-const WAIT_MAX_POLL: Duration = Duration::from_secs(1);
+pub(crate) const WAIT_POLL: Duration = Duration::from_millis(100);
+pub(crate) const WAIT_MAX_POLL: Duration = Duration::from_secs(1);
 
 pub(crate) enum FrozenSubmit<'a> {
     Dag(&'a DagNode),
@@ -86,6 +89,7 @@ pub(crate) enum FrozenSubmit<'a> {
 
 thread_local! {
     static ADVANCING_PENDING_DAGS: Cell<bool> = const { Cell::new(false) };
+    static PENDING_DAG_CURSOR: Cell<Option<RunId>> = const { Cell::new(None) };
 }
 
 struct InProcessSubmitLocks {
@@ -159,6 +163,30 @@ pub struct TaskListFilter {
     pub full: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct TaskLogChunkQuery {
+    pub task_id: TaskId,
+    pub turn: Option<u32>,
+    pub pinned_turn_id: Option<TurnId>,
+    pub offset: u64,
+    pub limit: usize,
+    pub raw: bool,
+    pub follow: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ControllerTaskProjection {
+    pub task_id: TaskId,
+    pub run_id: Option<RunId>,
+    pub status: TaskStatus,
+    pub warnings: Vec<String>,
+    pub events: Vec<serde_json::Value>,
+    pub runner: Option<RunnerState>,
+    pub exit_code: Option<u8>,
+    pub delivery: Option<OriginDelivery>,
+    pub deliveries: Vec<OriginDelivery>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskReport {
     task_id: TaskId,
@@ -209,25 +237,17 @@ impl TaskReport {
         &self.deliveries
     }
 
-    pub(crate) fn from_controller(
-        task_id: TaskId,
-        run_id: Option<RunId>,
-        status: TaskStatus,
-        warnings: Vec<String>,
-        events: Vec<serde_json::Value>,
-        runner: Option<RunnerState>,
-        exit_code: Option<u8>,
-    ) -> Self {
+    pub(crate) fn from_controller(projection: ControllerTaskProjection) -> Self {
         Self {
-            task_id,
-            run_id,
-            status,
-            warnings,
-            events,
-            runner,
-            exit_code,
-            delivery: None,
-            deliveries: Vec::new(),
+            task_id: projection.task_id,
+            run_id: projection.run_id,
+            status: projection.status,
+            warnings: projection.warnings,
+            events: projection.events,
+            runner: projection.runner,
+            exit_code: projection.exit_code,
+            delivery: projection.delivery,
+            deliveries: projection.deliveries,
         }
     }
 }
@@ -392,6 +412,18 @@ pub struct ReconcileReport {
 }
 
 impl ReconcileReport {
+    pub(crate) fn from_counts(
+        replaced_runners: usize,
+        started_runners: usize,
+        repaired_rows: usize,
+    ) -> Self {
+        Self {
+            replaced_runners,
+            started_runners,
+            repaired_rows,
+        }
+    }
+
     pub fn replaced_runners(&self) -> usize {
         self.replaced_runners
     }
@@ -418,6 +450,10 @@ pub struct WaitReport {
 }
 
 impl WaitReport {
+    pub(crate) fn new(task_ids: Vec<TaskId>, exit_code: u8) -> Self {
+        Self { task_ids, exit_code }
+    }
+
     pub fn task_ids(&self) -> &[TaskId] {
         &self.task_ids
     }
@@ -428,12 +464,50 @@ impl WaitReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WaitSnapshot {
+    task_ids: Vec<TaskId>,
+    quiescent: bool,
+    exit_code: u8,
+}
+
+impl WaitSnapshot {
+    pub(crate) fn task_ids(&self) -> &[TaskId] {
+        &self.task_ids
+    }
+
+    pub(crate) fn quiescent(&self) -> bool {
+        self.quiescent
+    }
+
+    pub(crate) fn exit_code(&self) -> u8 {
+        self.exit_code
+    }
+}
+
+enum ReconcileScope<'a> {
+    All,
+    Selected(&'a [TaskId]),
+}
+
+struct ReconcileSelection {
+    ids: Vec<TaskId>,
+    records: Vec<LocalTaskRecord>,
+    known_turns: HashSet<TurnId>,
+    turn_to_task: HashMap<TurnId, TaskId>,
+    selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
     run_id: RunId,
     task_ids: Vec<TaskId>,
 }
 
 impl RunReport {
+    pub(crate) fn from_parts(run_id: RunId, task_ids: Vec<TaskId>) -> Self {
+        Self { run_id, task_ids }
+    }
+
     pub fn run_id(&self) -> RunId {
         self.run_id
     }
@@ -1981,24 +2055,24 @@ impl<'a> TaskClient<'a> {
         Ok(())
     }
 
-    pub fn log_chunk(
-        &self,
-        task_id: TaskId,
-        turn: Option<u32>,
-        pinned_turn_id: Option<TurnId>,
-        offset: u64,
-        limit: usize,
-        raw: bool,
-        follow: bool,
-    ) -> Result<TaskLogChunkReport, WorkerError> {
+    pub fn log_chunk(&self, query: TaskLogChunkQuery) -> Result<TaskLogChunkReport, WorkerError> {
+        let task_id = query.task_id;
         let record = map_absent_task_record(self.client_state.load_task(task_id))?;
-        let (turn_id, turn_number) =
-            resolve_log_turn(&record, self.client_state, task_id, turn, pinned_turn_id)?;
+        let (turn_id, turn_number) = resolve_log_turn(
+            &record,
+            self.client_state,
+            task_id,
+            query.turn,
+            query.pinned_turn_id,
+        )?;
         let checkpoint = crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)?;
         let complete = checkpoint.as_ref().is_some_and(|s| s.completion.is_some());
         let may_initialize = turn_may_initialize(&record, turn_id);
-        let failure = log_failure_overlay(&record, turn_id, checkpoint.as_ref(), raw);
-        let limit = limit.min(MAX_LOG_CHUNK_BYTES).max(1);
+        let failure = log_failure_overlay(&record, turn_id, checkpoint.as_ref(), query.raw);
+        let limit = query.limit.clamp(1, MAX_LOG_CHUNK_BYTES);
+        let offset = query.offset;
+        let raw = query.raw;
+        let follow = query.follow;
         let (read, committed_len) = match &checkpoint {
             Some(checkpoint) => {
                 let read = crate::runner_log::read_committed_range(
@@ -2136,8 +2210,11 @@ impl<'a> TaskClient<'a> {
         }
         let worker = task_worker(self.config, record.status())?;
         let project = self.load_project_for_record(&record)?;
-        let transfer =
-            TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
+        let transfer = crate::controller::registry::open_transfer_repo(
+            self.paths,
+            &project,
+            record.meta(),
+        )?;
         let _remote_receipt = GitTransport::new(self.runner).fetch_result(
             worker,
             self.client_state.client_id(),
@@ -2338,31 +2415,61 @@ impl<'a> TaskClient<'a> {
     }
 
     pub fn reconcile_runners(&self) -> Result<ReconcileReport, WorkerError> {
-        self.reconcile_runners_inner(false)
+        self.reconcile_runners_inner(false, ReconcileScope::All)
     }
 
     /// Operator-driven `worker task reconcile`: clears the restart budget and
     /// retries once instead of waiting out backoff or leaving a parked row.
     pub fn operator_reconcile(&self) -> Result<ReconcileReport, WorkerError> {
-        self.reconcile_runners_inner(true)
+        self.reconcile_runners_inner(true, ReconcileScope::All)
+    }
+
+    pub fn reconcile_selected(&self, ids: &[TaskId]) -> Result<ReconcileReport, WorkerError> {
+        self.reconcile_runners_inner(false, ReconcileScope::Selected(ids))
+    }
+
+    /// One leader tick: bootstrap the derived index, recover the current
+    /// page, then refresh those IDs. Does not call unbounded `reconcile_runners`
+    /// per selected task. Pending DAG work is a separate bounded page.
+    pub fn tick_selected_recovery(&self) -> Result<ReconcileReport, WorkerError> {
+        let _ = self.client_state.bootstrap_active_task_index()?;
+        let config = ActiveTaskConfig::default();
+        let page = self.client_state.select_active_task_ids(&config)?;
+        let report = self.reconcile_selected(&page.selected)?;
+        let _ = self
+            .client_state
+            .refresh_active_task_index(&page.selected, &config)?;
+        match self.advance_pending_dags_page(config.max_tasks_per_tick) {
+            Ok(()) => {}
+            Err(error) if is_queue_job_conflict(&error) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(report)
     }
 
     fn reconcile_runners_inner(
         &self,
         reset_failure_budget: bool,
+        scope: ReconcileScope<'_>,
     ) -> Result<ReconcileReport, WorkerError> {
         let mut report = ReconcileReport::default();
         let owner = current_process_identity()?;
         if reset_failure_budget {
             self.client_state.reset_replacement_failures(owner)?;
         }
-        self.client_state.recover_replacement_residue()?;
+        if matches!(scope, ReconcileScope::All) {
+            self.client_state.recover_replacement_residue()?;
+        } else {
+            self.client_state
+                .recover_task_replacement_residue_if_present()?;
+        }
+        let mut selection = self.load_reconcile_selection(scope)?;
 
         // A submit can fail while compensating its locally-created state. The
         // pre-handoff intent is durable from initial task creation; the
         // rollback marker is a stronger terminal form of that intent. Both
         // are safe to compensate only while the turn is still pre-handoff.
-        for record in self.client_state.list_tasks()? {
+        for record in &selection.records {
             if !submission_recovery_pending(&record) {
                 continue;
             }
@@ -2408,7 +2515,7 @@ impl<'a> TaskClient<'a> {
             if entry.kind() == QueueEntryKind::TaskTurn
                 && entry.is_cancel_requested()
                 && !matches!(entry.state(), QueueState::Dispatching { .. })
-                && let Some(task_id) = self.client_state.task_id_for_turn(entry.job_id())?
+                && let Some(task_id) = self.selection_task_for_turn(&selection, entry.job_id())?
             {
                 let record = self.client_state.load_task(task_id)?;
                 if !submission_recovery_pending(&record) {
@@ -2430,13 +2537,16 @@ impl<'a> TaskClient<'a> {
             {
                 continue;
             }
+            if selection.selected && !selection.known_turns.contains(&entry.job_id()) {
+                continue;
+            }
             if self
-                .submission_recovery_task_for_turn(entry.job_id())?
+                .selection_recovery_task_for_turn(&selection, entry.job_id())?
                 .is_some()
             {
                 continue;
             }
-            if let Some(task_id) = self.client_state.task_id_for_turn(entry.job_id())?
+            if let Some(task_id) = self.selection_task_for_turn(&selection, entry.job_id())?
                 && self.task_has_submission_recovery_pending(task_id)?
             {
                 continue;
@@ -2450,7 +2560,7 @@ impl<'a> TaskClient<'a> {
                     ProcessObservation::Absent | ProcessObservation::Reused
                 )
             {
-                let Some(task_id) = self.client_state.task_id_for_turn(entry.job_id())? else {
+                let Some(task_id) = self.selection_task_for_turn(&selection, entry.job_id())? else {
                     continue;
                 };
                 let Some(log) = crate::runner_log::RunnerLog::try_open(
@@ -2496,8 +2606,8 @@ impl<'a> TaskClient<'a> {
         // read-only projections.  Probe failures are not evidence that a
         // worker lost a task, so a failed refresh leaves the local record
         // untouched for a later reconciliation.
-        for record in self.client_state.list_tasks()? {
-            if submission_recovery_pending(&record) {
+        for record in &selection.records {
+            if submission_recovery_pending(record) {
                 continue;
             }
             if record.close_intent().is_some() {
@@ -2537,9 +2647,14 @@ impl<'a> TaskClient<'a> {
         // original task and turn identifiers. Both recovery phases share one
         // snapshot so they agree on which tasks look row-less; re-enqueue is
         // idempotent if that snapshot is already stale.
+        // Reload the same candidates after status refresh so a turn that
+        // completed during refresh is not re-enqueued from the stale Active
+        // snapshot. Full/local still reloads all tasks; selected reloads only
+        // those IDs and rebuilds the turn map from the live records.
+        selection = self.reload_reconcile_selection(&selection)?;
         let snapshot = self.client_state.queue_snapshot()?;
-        let records = self.client_state.list_tasks()?;
-        for record in &records {
+        let records = &selection.records;
+        for record in records {
             if submission_recovery_pending(record) {
                 continue;
             }
@@ -2556,7 +2671,7 @@ impl<'a> TaskClient<'a> {
             }
         }
 
-        for record in &records {
+        for record in records {
             if submission_recovery_pending(record) {
                 continue;
             }
@@ -2665,11 +2780,168 @@ impl<'a> TaskClient<'a> {
             }
         }
 
-        while self.start_oldest_parked_runner(owner)? {
+        while self.start_oldest_parked_runner_scoped(owner, &selection)? {
             report.started_runners += 1;
         }
-        self.advance_pending_dags()?;
+        if !selection.selected {
+            self.advance_pending_dags()?;
+        }
         Ok(report)
+    }
+
+    fn load_reconcile_selection(
+        &self,
+        scope: ReconcileScope<'_>,
+    ) -> Result<ReconcileSelection, WorkerError> {
+        match scope {
+            ReconcileScope::All => Ok(ReconcileSelection {
+                ids: Vec::new(),
+                records: self.client_state.list_tasks()?,
+                known_turns: HashSet::new(),
+                turn_to_task: HashMap::new(),
+                selected: false,
+            }),
+            ReconcileScope::Selected(ids) => {
+                let mut records = Vec::new();
+                let mut known_turns = HashSet::new();
+                let mut turn_to_task = HashMap::new();
+                for task_id in ids {
+                    let Ok(record) = self.client_state.load_task(*task_id) else {
+                        continue;
+                    };
+                    for turn in record.status().turns() {
+                        known_turns.insert(turn.turn_id());
+                        turn_to_task.insert(turn.turn_id(), *task_id);
+                    }
+                    if let Some(turn) = submission_recovery_turn_id(&record) {
+                        known_turns.insert(turn);
+                        turn_to_task.insert(turn, *task_id);
+                    }
+                    if let Some(turn) = pending_turn_id(record.status()) {
+                        known_turns.insert(turn);
+                        turn_to_task.insert(turn, *task_id);
+                    }
+                    if let Ok(turns) = self.client_state.turn_ids_for_task(*task_id) {
+                        for turn in turns {
+                            known_turns.insert(turn);
+                            turn_to_task.insert(turn, *task_id);
+                        }
+                    }
+                    records.push(record);
+                }
+                Ok(ReconcileSelection {
+                    ids: ids.to_vec(),
+                    records,
+                    known_turns,
+                    turn_to_task,
+                    selected: true,
+                })
+            }
+        }
+    }
+
+    fn reload_reconcile_selection(
+        &self,
+        selection: &ReconcileSelection,
+    ) -> Result<ReconcileSelection, WorkerError> {
+        if selection.selected {
+            self.load_reconcile_selection(ReconcileScope::Selected(&selection.ids))
+        } else {
+            self.load_reconcile_selection(ReconcileScope::All)
+        }
+    }
+
+    fn selection_task_for_turn(
+        &self,
+        selection: &ReconcileSelection,
+        turn_id: TurnId,
+    ) -> Result<Option<TaskId>, WorkerError> {
+        if selection.selected {
+            Ok(selection.turn_to_task.get(&turn_id).copied())
+        } else {
+            Ok(self
+                .submission_recovery_task_for_turn(turn_id)?
+                .or(self.client_state.task_id_for_turn(turn_id)?))
+        }
+    }
+
+    fn selection_recovery_task_for_turn(
+        &self,
+        selection: &ReconcileSelection,
+        turn_id: TurnId,
+    ) -> Result<Option<TaskId>, WorkerError> {
+        if selection.selected {
+            Ok(selection
+                .records
+                .iter()
+                .find(|record| {
+                    submission_recovery_pending(record)
+                        && submission_recovery_turn_id(record) == Some(turn_id)
+                })
+                .map(|record| record.meta().task_id()))
+        } else {
+            self.submission_recovery_task_for_turn(turn_id)
+        }
+    }
+
+    fn start_oldest_parked_runner_scoped(
+        &self,
+        owner: ProcessIdentity,
+        selection: &ReconcileSelection,
+    ) -> Result<bool, WorkerError> {
+        if !selection.selected {
+            return self.start_oldest_parked_runner(owner);
+        }
+        let snapshot = self.client_state.queue_snapshot()?;
+        let Some(entry) = snapshot
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(entry.state(), QueueState::Parked)
+                    && !entry
+                        .replacement_failure()
+                        .is_some_and(crate::job::ReplacementFailureBudget::should_park)
+            })
+            .min_by_key(|entry| entry.queue_id())
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if !selection.known_turns.contains(&entry.job_id()) {
+            return Ok(false);
+        }
+        let Some(_) = self.client_state.unpark_row(entry.job_id(), owner)? else {
+            return Ok(false);
+        };
+        let task_id = self
+            .selection_recovery_task_for_turn(selection, entry.job_id())?
+            .or(selection.turn_to_task.get(&entry.job_id()).copied())
+            .ok_or_else(|| {
+                task_error("TASK_INCONSISTENT", "parked task turn has no task record")
+            })?;
+        if self.task_has_submission_recovery_pending(task_id)? {
+            self.client_state.park_row(entry.job_id())?;
+            return Ok(false);
+        }
+        match self.start_runner(task_id, entry.job_id(), false, false) {
+            Ok(RunnerStart::Started(_)) => Ok(true),
+            Ok(RunnerStart::Pending) => Ok(false),
+            Ok(RunnerStart::Saturated) => {
+                self.client_state.park_row(entry.job_id())?;
+                Ok(false)
+            }
+            Err(error) => {
+                if let Ok(record) = self.client_state.load_task(task_id)
+                    && let Ok(transfer) = self.transfer_for_record(&record)
+                {
+                    return Err(self.fail_handoff(task_id, entry.job_id(), transfer, error));
+                }
+                Err(task_error(
+                    "RUNNER_HANDOFF_FAILED",
+                    format!("runner handoff failed: {error}"),
+                ))
+            }
+        }
     }
 
     pub fn say(
@@ -2685,8 +2957,6 @@ impl<'a> TaskClient<'a> {
         self.say_from_expected(&record, message, attached, stdout, stderr)
     }
 
-    /// Follows up against a caller-supplied expected snapshot. Dashboard reply
-    /// passes the revision it already validated so a later reload cannot win.
     pub fn say_from_expected(
         &self,
         expected: &LocalTaskRecord,
@@ -2695,8 +2965,38 @@ impl<'a> TaskClient<'a> {
         stdout: &mut dyn Write,
         _stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
-        let task_id = expected.meta().task_id();
+        let prepared = PreparedFollowup::prepare(
+            expected,
+            message,
+            TurnId::generate(),
+            current_time_millis()?,
+        )?;
+        self.say_prepared(&prepared, attached, stdout, _stderr)
+    }
+
+    /// Performs one prepared follow-up, converging to a single new turn across
+    /// replays of the same value.
+    pub fn say_prepared(
+        &self,
+        prepared: &PreparedFollowup,
+        attached: bool,
+        stdout: &mut dyn Write,
+        _stderr: &mut dyn Write,
+    ) -> Result<TaskReport, WorkerError> {
+        let task_id = prepared.task_id();
+        let turn_id = prepared.turn_id();
+        let expected = prepared.expected();
+        if task_id != expected.meta().task_id() {
+            return Err(task_error(
+                "TASK_INCONSISTENT",
+                "prepared follow-up targets a different task",
+            ));
+        }
+        prepared.validate_self_consistency()?;
         let current = self.client_state.load_task(task_id)?;
+        if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
+            return self.resume_prepared_followup(prepared, &current, attached, stdout);
+        }
         if !operator_revision_matches(&current, expected) {
             return Err(task_error(
                 "TASK_REVISION_CONFLICT",
@@ -2708,11 +3008,6 @@ impl<'a> TaskClient<'a> {
             .queue_entry_for_task_turn(task_id)?
             .is_some()
         {
-            // The previous turn still owns a queue row, including the window
-            // where an undrainable finalizer has finished the journal but not
-            // yet published Failed / imported / retired. A follow-up would
-            // keep fetched_head from that earlier turn; refuse until the row
-            // is gone so expected-record CAS in the finalizer stays valid.
             return Err(task_error("TASK_BUSY", "previous turn is still finalizing"));
         }
         if expected.close_intent().is_some() || current.close_intent().is_some() {
@@ -2735,87 +3030,76 @@ impl<'a> TaskClient<'a> {
                 "task follow-up limit has been reached",
             ));
         }
-        let worker = task_worker(self.config, expected.status())?.name.clone();
-        let turn_id = TurnId::generate();
-        let turn_number = u32::try_from(expected.status().turns().len())
-            .ok()
-            .and_then(|turns| turns.checked_add(1))
-            .ok_or_else(|| task_error("TASK_INCONSISTENT", "turn history is too long"))?;
-        let base_oid = expected
-            .status()
-            .head_oid()
-            .cloned()
-            .unwrap_or_else(|| expected.meta().base_oid().clone());
-        let composed_prompt = compose_turn_prompt(
-            task_id,
-            turn_number,
-            expected.meta().agent(),
-            &base_oid,
-            None,
-            &message,
-            true,
-        );
-        validate_prompt(&composed_prompt)?;
-        self.client_state
-            .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
-        let pending = TurnSummary::new(
-            turn_number,
-            turn_id,
-            None,
-            None,
-            None,
-            false,
-            Some(current_time_millis()?),
-            None,
-        );
-        let active = TaskStatus::new(
-            TaskState::Active,
-            expected.status().last_outcome().cloned(),
-            Some(worker.clone()),
-            true,
-            Some(base_oid),
-            expected.status().summary().map(str::to_owned),
-            expected.status().questions().to_vec(),
-            expected.status().files_changed().to_vec(),
-            expected.status().diff_stat().map(str::to_owned),
-            expected
-                .status()
-                .turns()
-                .iter()
-                .cloned()
-                .chain([pending])
-                .collect(),
-            current_time_millis()?,
-        )?
-        .copying_reported_checks(expected.status())?;
-        let active_record = expected
-            .with_status(active)?
-            .with_runner(None)?
-            .with_abandon_code(None)?;
-        if !self
+        self.publish_prepared_evidence(prepared)?;
+        let build_active = |base: &LocalTaskRecord| -> Result<LocalTaskRecord, WorkerError> {
+            let worker = task_worker(self.config, base.status())?.name.clone();
+            let pending = TurnSummary::new(
+                prepared.turn_number(),
+                turn_id,
+                None,
+                None,
+                None,
+                false,
+                Some(prepared.created_at_millis()),
+                None,
+            );
+            let active = TaskStatus::new(
+                TaskState::Active,
+                base.status().last_outcome().cloned(),
+                Some(worker.clone()),
+                true,
+                Some(prepared.base_oid().clone()),
+                base.status().summary().map(str::to_owned),
+                base.status().questions().to_vec(),
+                base.status().files_changed().to_vec(),
+                base.status().diff_stat().map(str::to_owned),
+                base.status()
+                    .turns()
+                    .iter()
+                    .cloned()
+                    .chain([pending])
+                    .collect(),
+                prepared.created_at_millis(),
+            )?
+            .copying_reported_checks(base.status())?;
+            base.with_status(active)?
+                .with_runner(None)?
+                .with_abandon_code(None)
+        };
+        let active_record = build_active(expected)?;
+        let committed = if self
             .client_state
             .update_task_if_current(expected, active_record.clone())?
         {
-            let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
-            return Err(task_error(
-                "TASK_REVISION_CONFLICT",
-                "task changed before follow-up",
-            ));
-        }
-        let entry = match self.enqueue_followup(expected, turn_id, worker) {
-            Ok(entry) => entry,
-            Err(error) => {
-                self.rollback_followup(&active_record, expected, task_id, turn_id);
-                return Err(error);
+            active_record
+        } else {
+            let current = self.client_state.load_task(task_id)?;
+            if operator_revision_matches(&current, expected) {
+                let rebased = build_active(&current)?;
+                if !self
+                    .client_state
+                    .update_task_if_current(&current, rebased.clone())?
+                {
+                    return self
+                        .reload_resume_or_conflict(prepared, task_id, turn_id, attached, stdout);
+                }
+                rebased
+            } else {
+                return self
+                    .reload_resume_or_conflict(prepared, task_id, turn_id, attached, stdout);
             }
+        };
+        let entry = match self.client_state.queue_entry_for_task_turn(task_id)? {
+            Some(existing) if existing.job_id() == turn_id => existing,
+            Some(_) => {
+                return Err(task_error("TASK_BUSY", "previous turn is still finalizing"));
+            }
+            None => self.enqueue_prepared_followup(prepared, expected)?,
         };
         match self.start_runner(task_id, turn_id, attached, false) {
             Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => {}
             Ok(RunnerStart::Saturated) => {
-                if let Err(error) = self.client_state.park_row(entry.job_id()) {
-                    self.rollback_followup(&active_record, expected, task_id, turn_id);
-                    return Err(error);
-                }
+                self.park_prepared_turn(turn_id)?;
             }
             Err(error) => {
                 return Err(self.fail_handoff(
@@ -2826,7 +3110,7 @@ impl<'a> TaskClient<'a> {
                 ));
             }
         }
-        let mut report = self.report_for(task_id)?;
+        let mut report = self.report_fenced_say(&committed, task_id, turn_id)?;
         report.events.push(event_task_created(&report));
         if attached {
             let outcome = TurnRunner::new(
@@ -2845,26 +3129,392 @@ impl<'a> TaskClient<'a> {
         Ok(report)
     }
 
+    fn resume_prepared_followup(
+        &self,
+        prepared: &PreparedFollowup,
+        current: &LocalTaskRecord,
+        attached: bool,
+        stdout: &mut dyn Write,
+    ) -> Result<TaskReport, WorkerError> {
+        let task_id = prepared.task_id();
+        let turn_id = prepared.turn_id();
+        let Some(live_last) = current.status().turns().last() else {
+            return Err(task_error(
+                "TASK_INCONSISTENT",
+                "prepared follow-up turn is missing",
+            ));
+        };
+        if live_last.turn_number() != prepared.turn_number()
+            || current.meta().agent().as_str() != prepared.agent()
+            || current.meta().model() != prepared.model()
+            || current.meta().limits().max_followups != prepared.max_followups()
+            || current.status().worker() != Some(prepared.worker())
+        {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "prepared follow-up does not match the materialized turn",
+            ));
+        }
+        match self
+            .client_state
+            .read_turn_prepared_binding(task_id, turn_id)
+        {
+            Ok(binding) => {
+                if binding != prepared.binding() {
+                    return Err(task_error(
+                        "TASK_REVISION_CONFLICT",
+                        "prepared follow-up does not match the materialized turn",
+                    ));
+                }
+            }
+            Err(error) if is_not_found(&error) => {
+                return Err(task_error(
+                    "TASK_INCONSISTENT",
+                    "prepared follow-up binding is missing",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        if live_last.terminal().is_some() {
+            return self.report_from_record(current);
+        }
+        if current.status().head_oid() != Some(prepared.base_oid()) {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "prepared follow-up does not match the materialized turn",
+            ));
+        }
+        match self.client_state.read_turn_prompt(task_id, turn_id) {
+            Ok(stored) => {
+                if stored != prepared.composed_prompt() {
+                    return Err(task_error(
+                        "TASK_REVISION_CONFLICT",
+                        "follow-up input does not match the materialized turn",
+                    ));
+                }
+            }
+            Err(error) if is_not_found(&error) => {
+                return Err(task_error(
+                    "TASK_INCONSISTENT",
+                    "prepared follow-up turn evidence is missing",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        if current.close_intent().is_some() {
+            return Err(task_error("TASK_BUSY", CLOSE_IN_PROGRESS));
+        }
+        let entry = match self.client_state.queue_entry_for_task_turn(task_id)? {
+            Some(existing) if existing.job_id() == turn_id => existing,
+            Some(_) => {
+                return Err(task_error(
+                    "TASK_REVISION_CONFLICT",
+                    "task turn changed before follow-up",
+                ));
+            }
+            None => {
+                if current.runner().is_some() {
+                    return Err(task_error("TASK_BUSY", "task runner is still finishing"));
+                }
+                self.enqueue_prepared_followup(prepared, current)?
+            }
+        };
+        match self.start_runner(task_id, turn_id, attached, false) {
+            Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => {}
+            Ok(RunnerStart::Saturated) => {
+                self.park_prepared_turn(turn_id)?;
+            }
+            Err(error) => {
+                return Err(self.fail_handoff(
+                    task_id,
+                    turn_id,
+                    self.transfer_for_record(current)?,
+                    error,
+                ));
+            }
+        }
+        let mut report = self.report_fenced_say(current, task_id, turn_id)?;
+        report.events.push(event_task_created(&report));
+        if attached {
+            let outcome = TurnRunner::new(
+                self.runner,
+                self.config,
+                self.paths,
+                self.client_state,
+                self.executor,
+            )
+            .with_notifier(self.herdr_notifier.clone())
+            .run(task_id, entry.job_id(), Some(stdout))?;
+            report.status = outcome.status().clone();
+            report.events.extend(outcome.events().iter().cloned());
+            report.exit_code = Some(outcome.exit_code());
+        }
+        Ok(report)
+    }
+
+    fn publish_prepared_evidence(&self, prepared: &PreparedFollowup) -> Result<(), WorkerError> {
+        let task_id = prepared.task_id();
+        let turn_id = prepared.turn_id();
+        self.publish_prepared_artifact(
+            "follow-up input does not match the prepared turn",
+            || self.client_state.read_turn_prompt(task_id, turn_id),
+            || {
+                self.client_state
+                    .write_turn_prompt(task_id, turn_id, prepared.composed_prompt())
+            },
+            prepared.composed_prompt(),
+        )?;
+        self.publish_prepared_artifact(
+            "prepared follow-up binding does not match",
+            || {
+                self.client_state
+                    .read_turn_prepared_binding(task_id, turn_id)
+            },
+            || {
+                self.client_state
+                    .write_turn_prepared_binding(task_id, turn_id, &prepared.binding())
+            },
+            &prepared.binding(),
+        )
+    }
+
+    fn publish_prepared_artifact(
+        &self,
+        mismatch_message: &'static str,
+        read: impl Fn() -> Result<String, WorkerError>,
+        write: impl Fn() -> Result<(), WorkerError>,
+        expected_bytes: &str,
+    ) -> Result<(), WorkerError> {
+        match read() {
+            Ok(stored) => {
+                if stored != expected_bytes {
+                    return Err(task_error("TASK_REVISION_CONFLICT", mismatch_message));
+                }
+            }
+            Err(read_error) if is_not_found(&read_error) => {
+                if let Err(write_error) = write() {
+                    match read() {
+                        Ok(stored) if stored == expected_bytes => {}
+                        Ok(_) => {
+                            return Err(task_error("TASK_REVISION_CONFLICT", mismatch_message));
+                        }
+                        Err(reread) if is_not_found(&reread) => return Err(write_error),
+                        Err(reread) => return Err(reread),
+                    }
+                }
+            }
+            Err(read_error) => return Err(read_error),
+        }
+        Ok(())
+    }
+
+    fn reload_resume_or_conflict(
+        &self,
+        prepared: &PreparedFollowup,
+        task_id: TaskId,
+        turn_id: TurnId,
+        attached: bool,
+        stdout: &mut dyn Write,
+    ) -> Result<TaskReport, WorkerError> {
+        let current = self.client_state.load_task(task_id)?;
+        if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
+            return self.resume_prepared_followup(prepared, &current, attached, stdout);
+        }
+        Err(task_error(
+            "TASK_REVISION_CONFLICT",
+            "task changed before follow-up",
+        ))
+    }
+
+    fn park_prepared_turn(&self, turn_id: TurnId) -> Result<(), WorkerError> {
+        match self.client_state.park_row(turn_id) {
+            Ok(_) => Ok(()),
+            Err(error) if is_already_parked_state_error(&error) => {
+                let converged = self
+                    .client_state
+                    .queue_entry(turn_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| matches!(row.state(), QueueState::Parked));
+                if converged { Ok(()) } else { Err(error) }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn enqueue_prepared_followup(
+        &self,
+        prepared: &PreparedFollowup,
+        record: &LocalTaskRecord,
+    ) -> Result<QueueEntry, WorkerError> {
+        let task_id = prepared.task_id();
+        let turn_id = prepared.turn_id();
+        match self.enqueue_followup(record, turn_id, prepared.worker().to_owned()) {
+            Ok(entry) => Ok(entry),
+            Err(error) if error.public_code() == "QUEUE_JOB_CONFLICT" => {
+                let current = self.client_state.load_task(task_id)?;
+                if current.status().turns().last().map(TurnSummary::turn_id) != Some(turn_id) {
+                    return Err(error);
+                }
+                let prompt_matches = self
+                    .client_state
+                    .read_turn_prompt(task_id, turn_id)
+                    .map(|prompt| prompt == prepared.composed_prompt())
+                    .unwrap_or(false);
+                let binding_matches = self
+                    .client_state
+                    .read_turn_prepared_binding(task_id, turn_id)
+                    .map(|binding| binding == prepared.binding())
+                    .unwrap_or(false);
+                if prompt_matches
+                    && binding_matches
+                    && let Some(existing) = self.client_state.queue_entry_for_task_turn(task_id)?
+                    && existing.job_id() == turn_id
+                {
+                    return Ok(existing);
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn report_fenced_turn(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        turn_count: usize,
+    ) -> Result<TaskReport, WorkerError> {
+        let current = self.client_state.load_task(task_id)?;
+        if current.status().turns().last().map(TurnSummary::turn_id) != Some(turn_id)
+            || current.status().turns().len() != turn_count
+        {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before cancel",
+            ));
+        }
+        self.report_from_record(&current)
+    }
+
+    fn cancelled_or_conflict(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        turn_count: usize,
+    ) -> Result<TaskReport, WorkerError> {
+        let current = self.client_state.load_task(task_id)?;
+        let same = current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id)
+            && current.status().turns().len() == turn_count;
+        let cancelled = same
+            && current.status().turns().last().is_some_and(|turn| {
+                turn.terminal() == Some(TurnTerminal::Cancelled)
+                    && turn.outcome() == Some(&TaskOutcome::Cancelled)
+            });
+        if !cancelled {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before cancel",
+            ));
+        }
+        self.report_from_record(&current)
+    }
+
+    fn report_fenced_say(
+        &self,
+        committed: &LocalTaskRecord,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<TaskReport, WorkerError> {
+        let turn_count = committed.status().turns().len();
+        let current = self.client_state.load_task(task_id)?;
+        if current.status().turns().last().map(TurnSummary::turn_id) != Some(turn_id)
+            || current.status().turns().len() != turn_count
+        {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before follow-up",
+            ));
+        }
+        self.report_from_record(committed)
+    }
+
+    fn report_from_record(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
+        Ok(TaskReport {
+            task_id: record.meta().task_id(),
+            run_id: record.meta().run_id(),
+            status: record.status().clone(),
+            warnings: Vec::new(),
+            events: Vec::new(),
+            runner: self.client_state.runner_liveness(record.meta().task_id())?,
+            exit_code: None,
+            delivery: record.delivery().cloned(),
+            deliveries: record.deliveries().to_vec(),
+        })
+    }
+
     pub fn cancel(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
+        self.cancel_from_expected(&record)
+    }
+
+    pub fn cancel_from_expected(
+        &self,
+        expected: &LocalTaskRecord,
+    ) -> Result<TaskReport, WorkerError> {
+        let task_id = expected.meta().task_id();
+        let current = self.client_state.load_task(task_id)?;
+        let Some(expected_last) = expected.status().turns().last() else {
+            let current = self.client_state.load_task(task_id)?;
+            if current.status().turns().is_empty() {
+                return self.report_from_record(&current);
+            }
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before cancel",
+            ));
+        };
+        let expected_turn = expected_last.turn_id();
+        let Some(current_last) = current.status().turns().last().cloned() else {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before cancel",
+            ));
+        };
+        if current_last.turn_id() != expected_turn
+            || current.status().turns().len() != expected.status().turns().len()
+        {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before cancel",
+            ));
+        }
+        if current_last.terminal() == Some(TurnTerminal::Cancelled)
+            && current_last.outcome() == Some(&TaskOutcome::Cancelled)
+        {
+            return self.report_from_record(&current);
+        }
+        if !operator_revision_matches(&current, expected) {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before cancel",
+            ));
+        }
+        let record = current;
+        let turn_id = expected_turn;
         if matches!(
             record.status().state(),
             TaskState::Closed | TaskState::Abandoned | TaskState::Lost
         ) {
-            return self.report_for(task_id);
+            return self.report_from_record(&record);
+        }
+        let fenced_row = self.client_state.queue_entry(turn_id)?;
+        let prompt_exists = self.client_state.read_turn_prompt(task_id, turn_id).is_ok();
+        if current_last.terminal().is_some() && fenced_row.is_none() && !prompt_exists {
+            return self.report_fenced_turn(task_id, turn_id, record.status().turns().len());
         }
 
-        let queue_entry = self.client_state.queue_entry_for_task_turn(task_id)?;
-        let turn_id = pending_turn_id(record.status())
-            .or_else(|| queue_entry.as_ref().map(QueueEntry::job_id));
-        let Some(turn_id) = turn_id else {
-            return self.report_for(task_id);
-        };
-
-        // Keep the legacy path available for older local records; task turns
-        // never create one of these records and use the task-specific host
-        // cancellation protocol below.
         if let Some(job) = self.client_state.load_job_optional(turn_id)? {
             let worker = task_worker(self.config, record.status())?;
             let response = RemoteJobClient::new(self.runner)
@@ -2884,13 +3534,17 @@ impl<'a> TaskClient<'a> {
                 record.status().turns().to_vec(),
                 current_time_millis()?,
             )?;
-            self.client_state
-                .update_task(record.with_status(status)?.with_runner(None)?)?;
-            return self.report_for(task_id);
+            let fenced_len = record.status().turns().len();
+            if !self
+                .client_state
+                .update_task_if_current(&record, record.with_status(status)?.with_runner(None)?)?
+            {
+                return self.cancelled_or_conflict(task_id, turn_id, fenced_len);
+            }
+            return self.report_fenced_turn(task_id, turn_id, fenced_len);
         }
 
-        let entry = self.client_state.queue_entry(turn_id)?;
-        let prompt_exists = self.client_state.read_turn_prompt(task_id, turn_id).is_ok();
+        let entry = fenced_row;
         if entry.as_ref().is_some_and(|entry| {
             matches!(
                 entry.state(),
@@ -2903,15 +3557,16 @@ impl<'a> TaskClient<'a> {
                 .retain_task_turn_cancel(turn_id, current_time_millis()?)?
             {
                 Some(entry) if !matches!(entry.state(), QueueState::Dispatching { .. }) => {
-                    // An accepted turn parked after repeated replacement deaths
-                    // still has a remote job. Local pre-acceptance finish would
-                    // reject its journal; cancel it on the worker instead.
                     if !entry
                         .replacement_failure()
                         .is_some_and(|budget| budget.should_park())
                     {
                         self.finish_waiting_cancellation(&record, &entry)?;
-                        return self.report_for(task_id);
+                        return self.report_fenced_turn(
+                            task_id,
+                            turn_id,
+                            record.status().turns().len(),
+                        );
                     }
                 }
                 Some(_) => return Err(task_error("TASK_BUSY", "task turn is being dispatched")),
@@ -2936,10 +3591,14 @@ impl<'a> TaskClient<'a> {
                 ),
             )?;
             let status = response.status().clone();
-            // The remote cancellation targets this selected turn, but its
-            // response can arrive after publication or a subsequent say.
-            self.client_state
-                .update_task_if_current(&record, record.with_status(status)?)?;
+            let fenced_len = record.status().turns().len();
+            if !self
+                .client_state
+                .update_task_if_current(&record, record.with_status(status)?)?
+            {
+                return self.cancelled_or_conflict(task_id, turn_id, fenced_len);
+            }
+            return self.report_fenced_turn(task_id, turn_id, fenced_len);
         }
         if self
             .client_state
@@ -2955,7 +3614,7 @@ impl<'a> TaskClient<'a> {
             self.client_state
                 .remove_task_turn_after_terminal(turn_id, current_process_identity()?)?;
         }
-        self.report_for(task_id)
+        self.report_fenced_turn(task_id, turn_id, record.status().turns().len())
     }
 
     /// Blocks until every selected task is wait-terminal and quiescent.
@@ -2972,52 +3631,9 @@ impl<'a> TaskClient<'a> {
     ) -> Result<WaitReport, WorkerError> {
         let started = SystemTime::now();
         loop {
-            match self.reconcile_runners() {
-                Ok(_) => {}
-                Err(error) if is_queue_job_conflict(&error) => {}
-                Err(error) => return Err(error),
-            }
-            let (task_ids, dag_pending) = match selector {
-                WaitSelector::Task(task_id) => (vec![task_id], false),
-                WaitSelector::Run(run_id) => {
-                    let pending = self
-                        .client_state
-                        .load_run_dag(run_id)?
-                        .is_some_and(|dag| !dag_run_is_quiescent(&dag));
-                    (
-                        self.client_state.load_run(run_id)?.task_ids().to_vec(),
-                        pending,
-                    )
-                }
-            };
-            if let Some(error) = self.wait_blocked_error(&task_ids)? {
-                return Err(error);
-            }
-            let records = task_ids
-                .iter()
-                .map(|task_id| self.client_state.load_task(*task_id))
-                .collect::<Result<Vec<_>, _>>()?;
-            if !dag_pending && self.tasks_are_quiescent(&records)? {
-                let exit_code = if records.iter().any(|record| {
-                    matches!(
-                        record.status().last_outcome(),
-                        Some(
-                            TaskOutcome::Blocked
-                                | TaskOutcome::Failed { .. }
-                                | TaskOutcome::Cancelled
-                                | TaskOutcome::TimedOut
-                                | TaskOutcome::Lost
-                        )
-                    )
-                }) {
-                    1
-                } else {
-                    0
-                };
-                return Ok(WaitReport {
-                    task_ids,
-                    exit_code,
-                });
+            let snapshot = self.wait_poll(selector)?;
+            if snapshot.quiescent() {
+                return Ok(WaitReport::new(snapshot.task_ids, snapshot.exit_code));
             }
             if timeout.is_some_and(|limit| started.elapsed().is_ok_and(|elapsed| elapsed >= limit))
             {
@@ -3028,6 +3644,72 @@ impl<'a> TaskClient<'a> {
             }
             std::thread::sleep(WAIT_POLL.min(WAIT_MAX_POLL));
         }
+    }
+
+    /// One selected-ID reconcile plus DAG-aware quiescence. Controller wait
+    /// polls this over RPC so the 30s frame deadline is not held for the
+    /// whole wait. Re-resolves run task IDs after reconcile. Does not reset
+    /// the 00ce replacement budget.
+    pub(crate) fn wait_poll(&self, selector: WaitSelector) -> Result<WaitSnapshot, WorkerError> {
+        let waited = match selector {
+            WaitSelector::Task(task_id) => vec![task_id],
+            WaitSelector::Run(run_id) => self.client_state.load_run(run_id)?.task_ids().to_vec(),
+        };
+        match self.reconcile_selected(&waited) {
+            Ok(_) => {}
+            Err(error) if is_queue_job_conflict(&error) => {}
+            Err(error) => return Err(error),
+        }
+        if let WaitSelector::Run(run_id) = selector {
+            match self.advance_pending_dag(run_id, true) {
+                Ok(()) => {}
+                Err(error) if is_queue_job_conflict(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let (task_ids, dag_pending) = match selector {
+            WaitSelector::Task(task_id) => (vec![task_id], false),
+            WaitSelector::Run(run_id) => {
+                let pending = self
+                    .client_state
+                    .load_run_dag(run_id)?
+                    .is_some_and(|dag| !dag_run_is_quiescent(&dag));
+                (
+                    self.client_state.load_run(run_id)?.task_ids().to_vec(),
+                    pending,
+                )
+            }
+        };
+        if let Some(error) = self.wait_blocked_error(&task_ids)? {
+            return Err(error);
+        }
+        let records = task_ids
+            .iter()
+            .map(|task_id| self.client_state.load_task(*task_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let quiescent = !dag_pending && self.tasks_are_quiescent(&records)?;
+        let exit_code = if quiescent
+            && records.iter().any(|record| {
+                matches!(
+                    record.status().last_outcome(),
+                    Some(
+                        TaskOutcome::Blocked
+                            | TaskOutcome::Failed { .. }
+                            | TaskOutcome::Cancelled
+                            | TaskOutcome::TimedOut
+                            | TaskOutcome::Lost
+                    )
+                )
+            }) {
+            1
+        } else {
+            0
+        };
+        Ok(WaitSnapshot {
+            task_ids,
+            quiescent,
+            exit_code,
+        })
     }
 
     pub fn preview_batch(&self, file: &Path) -> Result<BatchPreview, WorkerError> {
@@ -3432,6 +4114,68 @@ impl<'a> TaskClient<'a> {
         self.advance_pending_dags_inner(true)
     }
 
+    pub fn advance_pending_dags_page(&self, max_runs: usize) -> Result<(), WorkerError> {
+        let bound = max_runs.max(1);
+        let mut ids = self.client_state.list_pending_run_ids()?;
+        ids.sort_by_key(|id| id.to_string());
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let start = PENDING_DAG_CURSOR.with(|cursor| {
+            cursor
+                .get()
+                .and_then(|last| {
+                    ids.iter()
+                        .position(|id| id.to_string() > last.to_string())
+                })
+                .unwrap_or(0)
+        });
+        let page: Vec<RunId> = ids
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(bound.min(ids.len()))
+            .copied()
+            .collect();
+        // Bound is run candidates, not DAG nodes. Record cursor progress for
+        // every attempted run, including persistent Err, so a busy/corrupt
+        // early graph cannot starve later healthy runs on the next tick.
+        let mut first_error = None;
+        for run_id in &page {
+            PENDING_DAG_CURSOR.with(|cursor| cursor.set(Some(*run_id)));
+            if let Err(error) = self.advance_pending_dag(*run_id, true)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn advance_pending_dag(&self, run_id: RunId, skip_reconcile: bool) -> Result<(), WorkerError> {
+        let Some(dag) = self.client_state.load_run_dag(run_id)? else {
+            return Ok(());
+        };
+        self.bind_ready_for_dag(&dag)?;
+        let caller = current_process_identity()?;
+        let now = current_time_millis()?;
+        while let Some(claim) = self
+            .client_state
+            .claim_next_eligible_dag_node(run_id, caller, now)?
+        {
+            self.submit_prepared_dag_node(run_id, &claim.node, skip_reconcile)?;
+            self.client_state.mark_dag_node_submitted(
+                run_id,
+                &claim.batch_id,
+                claim.node.task_id,
+            )?;
+        }
+        Ok(())
+    }
+
     fn advance_pending_dags_inner(&self, skip_reconcile: bool) -> Result<(), WorkerError> {
         self.bind_ready_from_nodes()?;
         let caller = current_process_identity()?;
@@ -3457,7 +4201,13 @@ impl<'a> TaskClient<'a> {
     /// the state write that reacquires StateLock.
     fn bind_ready_from_nodes(&self) -> Result<(), WorkerError> {
         for dag in self.client_state.list_pending_dags()? {
-            let candidates: Vec<(String, DagNode)> = dag
+            self.bind_ready_for_dag(&dag)?;
+        }
+        Ok(())
+    }
+
+    fn bind_ready_for_dag(&self, dag: &DagRecord) -> Result<(), WorkerError> {
+        let candidates: Vec<(String, DagNode)> = dag
                 .nodes
                 .iter()
                 .filter(|(_, node)| {
@@ -3527,7 +4277,6 @@ impl<'a> TaskClient<'a> {
                     pin_ref,
                 )?;
             }
-        }
         Ok(())
     }
 
@@ -3729,7 +4478,7 @@ impl<'a> TaskClient<'a> {
 
     fn transfer_for_record(&self, record: &LocalTaskRecord) -> Result<TransferRepo, WorkerError> {
         let project = self.load_project_for_record(record)?;
-        TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
+        crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())
     }
 
     fn refresh_task_status(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
@@ -3746,6 +4495,12 @@ impl<'a> TaskClient<'a> {
                 "TASK_SUBMISSION_RECOVERY_PENDING",
                 "task submission recovery is incomplete",
             ));
+        }
+        if !matches!(
+            record.status().state(),
+            TaskState::Queued | TaskState::Active
+        ) {
+            return Ok(None);
         }
         let turn_id = pending_turn_id(record.status())
             .or_else(|| {
@@ -4126,8 +4881,11 @@ impl<'a> TaskClient<'a> {
 
     fn release_task_base(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
         let project = self.load_project_for_record(record)?;
-        let transfer =
-            TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
+        let transfer = crate::controller::registry::open_transfer_repo(
+            self.paths,
+            &project,
+            record.meta(),
+        )?;
         transfer.release_base(self.runner, record.meta().task_id())
     }
 
@@ -4430,6 +5188,15 @@ fn task_turn_in_snapshot(
         .cloned()
 }
 
+
+fn is_not_found(error: &WorkerError) -> bool {
+    matches!(error, WorkerError::Io(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
+fn is_already_parked_state_error(error: &WorkerError) -> bool {
+    matches!(error, WorkerError::Protocol(message) if message == "only a waiting task turn can be parked")
+}
+
 fn is_queue_job_conflict(error: &WorkerError) -> bool {
     matches!(
         error,
@@ -4674,7 +5441,7 @@ pub(crate) fn effective_task_limits(
     TaskLimits::new(turn, max_followups)
 }
 
-fn compose_turn_prompt(
+pub(crate) fn compose_turn_prompt(
     task_id: TaskId,
     turn_number: u32,
     agent: AgentKind,
@@ -4708,14 +5475,14 @@ fn permission_policy(settings: &TaskSettings, agent: AgentKind) -> PermissionPol
     }
 }
 
-fn batch_has_dag_edges(defaults: &BatchDefaults, tasks: &[BatchTask]) -> bool {
+pub(crate) fn batch_has_dag_edges(defaults: &BatchDefaults, tasks: &[BatchTask]) -> bool {
     tasks.iter().any(|task| {
         !task.depends_on.is_empty()
             || parse_from_base(task.base.as_deref().unwrap_or(&defaults.base)).is_some()
     })
 }
 
-fn freeze_spec(
+pub(crate) fn freeze_spec(
     request: &TaskSubmitRequest,
     state: &ProjectState,
 ) -> Result<DagFrozenSpec, WorkerError> {
@@ -4791,7 +5558,7 @@ fn freeze_spec(
     })
 }
 
-fn request_from_frozen_node(
+pub(crate) fn request_from_frozen_node(
     node: &DagNode,
     run_id: Option<RunId>,
 ) -> Result<TaskSubmitRequest, WorkerError> {
@@ -4836,7 +5603,7 @@ fn parse_agent(value: &str) -> Result<AgentKind, WorkerError> {
     }
 }
 
-fn load_batch_file(file: &Path) -> Result<BatchFile, WorkerError> {
+pub(crate) fn load_batch_file(file: &Path) -> Result<BatchFile, WorkerError> {
     let contents = std::fs::read_to_string(file).map_err(WorkerError::Io)?;
     let batch: BatchFile = toml::from_str(&contents).map_err(|error| {
         task_error(
@@ -4856,8 +5623,24 @@ fn load_batch_file(file: &Path) -> Result<BatchFile, WorkerError> {
     Ok(batch)
 }
 
-fn resolve_batch_task(
+pub(crate) fn resolve_batch_task(
     config: &Config,
+    defaults: &BatchDefaults,
+    task: &BatchTask,
+    batch_dir: &Path,
+    project: &Path,
+    settings: &TaskSettings,
+) -> Result<TaskSubmitRequest, WorkerError> {
+    let request =
+        resolve_batch_task_without_local_workers(defaults, task, batch_dir, project, settings)?;
+    validate_preference(config, &request.preference)?;
+    Ok(request)
+}
+
+/// Same TOML/prompt/settings resolution as [`resolve_batch_task`], but does
+/// not look up pinned worker names in the local Config. Laptop freeze may run
+/// with `workers=[]`; controller Config remains the inventory authority.
+pub(crate) fn resolve_batch_task_without_local_workers(
     defaults: &BatchDefaults,
     task: &BatchTask,
     batch_dir: &Path,
@@ -4935,7 +5718,6 @@ fn resolve_batch_task(
         run_id: None,
     };
     validate_prompt(&request.prompt)?;
-    validate_preference(config, &request.preference)?;
     let _ = effective_task_limits(&request.limits, settings)?;
     Ok(request)
 }
@@ -5137,7 +5919,7 @@ fn configured_slot_count(config: &Config) -> usize {
     config.configured_runner_slots()
 }
 
-fn resolve_batch_max_parallel(
+pub(crate) fn resolve_batch_max_parallel(
     requested: Option<u32>,
     configured_slots: usize,
 ) -> Result<u32, WorkerError> {
@@ -5194,7 +5976,7 @@ fn validate_preference(config: &Config, preference: &WorkerPreference) -> Result
     Ok(())
 }
 
-fn validate_prompt(prompt: &str) -> Result<(), WorkerError> {
+pub(crate) fn validate_prompt(prompt: &str) -> Result<(), WorkerError> {
     if prompt.is_empty() {
         return Err(task_error("TASK_CONFIG_INVALID", "prompt is empty"));
     }
@@ -5221,7 +6003,7 @@ fn capability_missing(worker: &str, missing: &[String]) -> WorkerError {
     )
 }
 
-fn task_error(code: &'static str, message: impl Into<Cow<'static, str>>) -> WorkerError {
+pub(crate) fn task_error(code: &'static str, message: impl Into<Cow<'static, str>>) -> WorkerError {
     WorkerError::task(code, message)
 }
 
@@ -5290,6 +6072,179 @@ mod tests {
     fn batch_parallelism_defaults_to_the_configured_slot_count() {
         assert_eq!(resolve_batch_max_parallel(None, 3).unwrap(), 3);
         assert_eq!(resolve_batch_max_parallel(Some(2), 3).unwrap(), 2);
+    }
+
+    /// Terminal resume must report the saved validated N snapshot even after
+    /// live advances to N+1 — never a newer reload. Calls the actual private
+    /// terminal resume/report path with a stale snapshot: the old
+    /// check-then-`report_for` behavior returns N+1 here (red), the snapshot
+    /// report returns N (green). No threads, sleeps, or loops.
+    #[test]
+    fn terminal_resume_reports_saved_snapshot_not_newer_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        // Canonicalize like the integration harness: the rooted store walk
+        // does not traverse symlinked prefixes such as macOS /var.
+        let root = dir.path().canonicalize().unwrap();
+        let paths = crate::paths::PathLayout {
+            config: root.join("config.toml"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let config = Config::parse(
+            "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+        )
+        .unwrap();
+        let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
+        let result_oid: BaseOid = "c".repeat(40).parse().unwrap();
+        let task_id = TaskId::generate();
+        let turn_n = TurnId::generate();
+        let meta = TaskMeta::new(TaskMetaInput {
+            task_id,
+            run_id: None,
+            project_id: "a".repeat(64),
+            worktree_id: "b".repeat(64),
+            agent: AgentKind::Codex,
+            model: None,
+            effort: None,
+            policy: PermissionPolicy::Workspace,
+            source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            base_oid: base_oid.clone(),
+            limits: TaskLimits::default(),
+            close_policy: ClosePolicy::Never,
+            env_profile: None,
+            git_identity: GitIdentity::new("mac-worker", "mac-worker@example.test").unwrap(),
+            title: None,
+            prompt: "fixture task".into(),
+            created_at_millis: 1,
+        })
+        .unwrap();
+        let first = TurnSummary::new(
+            1,
+            TurnId::generate(),
+            Some(TurnTerminal::Succeeded),
+            Some(TaskOutcome::Done),
+            Some(true),
+            false,
+            Some(1),
+            Some(2),
+        );
+        let expected = LocalTaskRecord::new(
+            meta,
+            TaskStatus::new(
+                TaskState::Open,
+                Some(TaskOutcome::Done),
+                Some("mini-1".into()),
+                true,
+                Some(base_oid),
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                vec![first.clone()],
+                2,
+            )
+            .unwrap(),
+            None,
+            None,
+            None,
+            "a".repeat(64),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let prepared =
+            PreparedFollowup::prepare(&expected, "unit message".into(), turn_n, 5_000).unwrap();
+        // Live record: N completed with an advanced result head, binding kept.
+        let completed_turn = TurnSummary::new(
+            prepared.turn_number(),
+            turn_n,
+            Some(TurnTerminal::Succeeded),
+            Some(TaskOutcome::Done),
+            Some(true),
+            false,
+            Some(5_000),
+            Some(5_010),
+        );
+        let live = expected
+            .with_status(
+                TaskStatus::new(
+                    TaskState::Open,
+                    Some(TaskOutcome::Done),
+                    Some("mini-1".into()),
+                    true,
+                    Some(result_oid),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    vec![first, completed_turn],
+                    5_010,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .with_runner(None)
+            .unwrap();
+        store.create_task(live).unwrap();
+        store
+            .write_turn_prepared_binding(task_id, turn_n, &prepared.binding())
+            .unwrap();
+        // Validated completed-N snapshot, then live advances to N+1.
+        let saved = store.load_task(task_id).unwrap();
+        let mut advanced = saved.status().turns().to_vec();
+        advanced.push(TurnSummary::new(
+            3,
+            TurnId::generate(),
+            None,
+            None,
+            None,
+            false,
+            Some(5_020),
+            None,
+        ));
+        let advanced_status = TaskStatus::new(
+            TaskState::Active,
+            saved.status().last_outcome().cloned(),
+            saved.status().worker().map(str::to_owned),
+            saved.status().session_present(),
+            saved.status().head_oid().cloned(),
+            saved.status().summary().map(str::to_owned),
+            saved.status().questions().to_vec(),
+            saved.status().files_changed().to_vec(),
+            saved.status().diff_stat().map(str::to_owned),
+            advanced,
+            5_020,
+        )
+        .unwrap()
+        .copying_reported_checks(saved.status())
+        .unwrap();
+        store
+            .update_task(saved.with_status(advanced_status).unwrap())
+            .unwrap();
+
+        let client = TaskClient::new(
+            &crate::process::SystemProcessRunner,
+            &config,
+            &paths,
+            &store,
+            &crate::turn_runner::InlineRunnerExecutor,
+        );
+        let report = client
+            .resume_prepared_followup(&prepared, &saved, false, &mut Vec::new())
+            .unwrap();
+        assert_eq!(report.status().turns().len(), 2);
+        assert_eq!(report.status().turns().last().unwrap().turn_id(), turn_n);
+        // Live N+1 intact, no duplicate execution evidence.
+        let live = store.load_task(task_id).unwrap();
+        assert_eq!(live.status().turns().len(), 3);
     }
 
     #[test]

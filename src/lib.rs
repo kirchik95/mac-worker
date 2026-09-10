@@ -94,6 +94,7 @@ pub mod outbox;
 pub mod output;
 pub mod paths;
 pub mod prepare_turn;
+pub mod prepared_followup;
 pub mod prepared_submit;
 pub mod probe;
 pub mod process;
@@ -110,6 +111,7 @@ pub mod run;
 pub(crate) mod runner_log;
 pub mod scheduler;
 pub mod scheduler_adapter;
+pub mod skills;
 pub mod snapshot;
 pub mod supervisor;
 pub mod task;
@@ -270,6 +272,9 @@ fn execute_with_context(
         Command::Task { .. } => Err(WorkerError::Protocol(
             "public task commands require the stdio execution boundary".into(),
         )),
+        Command::Skills { command } => Ok(CommandOutput::Plain {
+            text: skills::execute(command, &runtime.current_dir()?)?,
+        }),
         Command::Controller { .. } => Err(WorkerError::Protocol(
             "public controller commands require the stdio execution boundary".into(),
         )),
@@ -903,7 +908,8 @@ fn run_controller_command(
             &client_state,
             &DETACHED_TASK_EXECUTOR,
         );
-        client.reconcile_runners()?;
+        client.client_state.recover_replacement_residue()?;
+        client.tick_selected_recovery()?;
         writeln!(stdout, "controller leader acquired").map_err(WorkerError::Io)?;
         stdout.flush().map_err(WorkerError::Io)?;
         let async_runtime = tokio::runtime::Builder::new_current_thread()
@@ -917,7 +923,7 @@ fn run_controller_command(
                     _ = tokio::signal::ctrl_c() => break,
                     _ = interval.tick() => {
                         let _ = crate::controller::tick_controller_leader(&store, &handler);
-                        let _ = client.reconcile_runners();
+                        let _ = client.tick_selected_recovery();
                     }
                 }
             }
@@ -1030,7 +1036,6 @@ fn run_task_command(
                 &config,
                 json,
                 stdout,
-                stderr,
             );
         }
         let client_state = ClientStateStore::open(&paths.state)?;
@@ -1470,7 +1475,7 @@ fn parse_task_state(value: &str) -> Result<crate::task::TaskState, WorkerError> 
     }
 }
 
-fn write_task_report(
+pub(crate) fn write_task_report(
     report: &task_client::TaskReport,
     json: bool,
     stdout: &mut dyn Write,
@@ -3585,9 +3590,7 @@ fn run_enabled_controller_task(
     config: &Config,
     json: bool,
     stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
 ) -> Result<u8, WorkerError> {
-    let _ = stderr;
     match command {
         Command::Task {
             command:
@@ -3631,30 +3634,44 @@ fn run_enabled_controller_task(
             };
             let ack = freeze_and_submit_via_controller(
                 runner,
-                runtime,
                 paths,
                 config,
-                project,
-                prompt,
-                title,
-                task_agent,
-                model,
-                effort,
-                base,
-                wip,
-                includes,
-                limits,
-                parse_task_close_policy(close_on.as_deref())?,
-                env_profile,
-                worker,
-                source,
-                publish,
-                publish_branch,
+                ControllerSubmitFields {
+                    project,
+                    prompt,
+                    title,
+                    agent: task_agent,
+                    model,
+                    effort,
+                    base,
+                    wip,
+                    includes,
+                    limits,
+                    close_on: parse_task_close_policy(close_on.as_deref())?,
+                    env_profile,
+                    worker,
+                    source,
+                    publish,
+                    publish_branch,
+                },
             )?;
             if wait {
-                return Err(WorkerError::Unavailable(
-                    "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
-                ));
+                let task_id: crate::task::TaskId = controller_ack_id(ack.task_id())
+                    .parse()
+                    .map_err(|_| {
+                        WorkerError::Unavailable(
+                            "CONTROLLER_UNAVAILABLE: controller host returned an invalid ACK"
+                                .into(),
+                        )
+                    })?;
+                let report = crate::controller::wait_via_controller(
+                    runner,
+                    &config.controller,
+                    crate::controller::ControllerWaitSelector::Task(task_id),
+                    None,
+                )?;
+                write_wait_report(&report, json, stdout)?;
+                return Ok(report.exit_code());
             }
             if json {
                 write_json_line(
@@ -3742,25 +3759,198 @@ fn run_enabled_controller_task(
             Ok(0)
         }
         Command::Task {
-            command: TaskCommand::Say { .. },
+            command:
+                TaskCommand::Say {
+                    task_id,
+                    message,
+                    message_file,
+                    wait,
+                },
+        } => {
+            let message = read_prompt(message, message_file)?;
+            let ack = persist_and_send_controller(
+                runner,
+                paths,
+                config,
+                "task.say",
+                serde_json::json!({
+                    "task_id": task_id.to_string(),
+                    "message": message,
+                }),
+            )?;
+            if wait {
+                crate::controller::wait_via_controller(
+                    runner,
+                    &config.controller,
+                    crate::controller::ControllerWaitSelector::Task(task_id),
+                    None,
+                )?;
+                let report = controller_task_status(runner, config, task_id)?;
+                write_task_report(&report, json, stdout)?;
+                Ok(report.exit_code().unwrap_or(0))
+            } else {
+                let report = task_report_from_controller_ack(&ack)?;
+                write_task_report(&report, json, stdout)?;
+                Ok(0)
+            }
         }
-        | Command::Task {
-            command: TaskCommand::Cancel { .. },
+        Command::Task {
+            command: TaskCommand::Cancel { task_id },
+        } => {
+            let ack = persist_and_send_controller(
+                runner,
+                paths,
+                config,
+                "task.cancel",
+                serde_json::json!({ "task_id": task_id.to_string() }),
+            )?;
+            let report = task_report_from_controller_ack(&ack)?;
+            write_task_report(&report, json, stdout)?;
+            Ok(0)
         }
-        | Command::Task {
-            command: TaskCommand::Close { .. },
+        Command::Task {
+            command: TaskCommand::Close { task_id, discard },
+        } => {
+            let ack = persist_and_send_controller(
+                runner,
+                paths,
+                config,
+                "task.close",
+                serde_json::json!({
+                    "task_id": task_id.to_string(),
+                    "discard": discard,
+                }),
+            )?;
+            let report = task_report_from_controller_ack(&ack)?;
+            write_task_report(&report, json, stdout)?;
+            Ok(0)
         }
-        | Command::Task {
-            command: TaskCommand::Wait { .. },
+        Command::Task {
+            command: TaskCommand::Wait {
+                task_id,
+                run,
+                timeout,
+            },
+        } => {
+            let selector = match (task_id, run) {
+                (Some(task_id), None) => crate::controller::ControllerWaitSelector::Task(task_id),
+                (None, Some(run)) => crate::controller::ControllerWaitSelector::Run(run),
+                _ => {
+                    return Err(WorkerError::Task {
+                        code: "TASK_CONFIG_INVALID",
+                        message: "wait requires exactly one of --task-id or --run".into(),
+                    });
+                }
+            };
+            let report =
+                crate::controller::wait_via_controller(runner, &config.controller, selector, timeout)?;
+            write_wait_report(&report, json, stdout)?;
+            Ok(report.exit_code())
         }
-        | Command::Task {
+        Command::Task {
             command: TaskCommand::Reconcile,
+        } => {
+            let report =
+                crate::controller::reconcile_via_controller(runner, &config.controller)?;
+            if json {
+                write_json_line(
+                    stdout,
+                    &serde_json::json!({
+                        "protocol_version": PROTOCOL_VERSION,
+                        "replaced_runners": report.replaced_runners(),
+                        "started_runners": report.started_runners(),
+                        "repaired_rows": report.repaired_rows(),
+                    }),
+                )?;
+            } else {
+                writeln!(
+                    stdout,
+                    "runners: {} replaced, {} started; task rows: {} repaired",
+                    report.replaced_runners(),
+                    report.started_runners(),
+                    report.repaired_rows()
+                )?;
+                stdout.flush()?;
+            }
+            Ok(0)
         }
-        | Command::Task {
-            command: TaskCommand::Batch { .. },
-        } => Err(WorkerError::Unavailable(
-            "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
-        )),
+        Command::Task {
+            command:
+                TaskCommand::Batch {
+                    file,
+                    name,
+                    max_parallel,
+                    wait,
+                    preview,
+                },
+        } => {
+            if preview {
+                unreachable!("batch --preview is handled before enabled controller routing");
+            }
+            let project = runtime.current_dir()?;
+            let frozen = crate::controller::freeze_laptop_batch(
+                runner,
+                config,
+                paths,
+                &project,
+                &file,
+                name,
+                max_parallel,
+            )?;
+            let body = serde_json::to_value(frozen.body()).map_err(|_| {
+                WorkerError::Protocol(
+                    "CONTROLLER_TRANSPORT: frozen batch could not be encoded".into(),
+                )
+            })?;
+            let request = controller_read_request("task.batch", body)?;
+            crate::controller::persist_operation_envelope(
+                &paths.controller_cache_root(),
+                &request,
+            )?;
+            let fingerprint =
+                crate::job::RequestFingerprint::new(request.payload_sha256().to_owned())?;
+            for source in frozen.sources() {
+                crate::controller::stream_nested_source(
+                    runner,
+                    &config.controller,
+                    source.request_id(),
+                    &fingerprint,
+                    source.git_path(),
+                    source.project_id(),
+                    source.worktree_id(),
+                    source.expected_oid(),
+                )?;
+            }
+            let ack = crate::controller::send_controller_request(
+                runner,
+                &config.controller,
+                &request,
+            )?;
+            let report = run_report_from_controller_ack(&ack)?;
+            write_run_report(&report, json, stdout)?;
+            if wait {
+                let waited = crate::controller::wait_via_controller(
+                    runner,
+                    &config.controller,
+                    crate::controller::ControllerWaitSelector::Run(report.run_id().to_string()),
+                    None,
+                )?;
+                if json {
+                    write_json_line(
+                        stdout,
+                        &serde_json::json!({
+                            "protocol_version": PROTOCOL_VERSION,
+                            "run_id": report.run_id().to_string(),
+                            "task_ids": waited.task_ids(),
+                            "exit_code": waited.exit_code(),
+                        }),
+                    )?;
+                }
+                Ok(waited.exit_code())
+            } else {
+                Ok(0)
+            }
+        }
         _ => Err(WorkerError::Unavailable(
             "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
         )),
@@ -3771,11 +3961,7 @@ fn controller_ack_id(id: Option<&str>) -> &str {
     id.unwrap_or("")
 }
 
-fn freeze_and_submit_via_controller(
-    runner: &dyn ProcessRunner,
-    _runtime: &RuntimeContext,
-    paths: &PathLayout,
-    config: &Config,
+struct ControllerSubmitFields {
     project: PathBuf,
     prompt: String,
     title: Option<String>,
@@ -3792,7 +3978,32 @@ fn freeze_and_submit_via_controller(
     source: Option<String>,
     publish: Vec<String>,
     publish_branch: Option<String>,
+}
+
+fn freeze_and_submit_via_controller(
+    runner: &dyn ProcessRunner,
+    paths: &PathLayout,
+    config: &Config,
+    cli: ControllerSubmitFields,
 ) -> Result<crate::controller::ControllerAck, WorkerError> {
+    let ControllerSubmitFields {
+        project,
+        prompt,
+        title,
+        agent,
+        model,
+        effort,
+        base,
+        wip,
+        includes,
+        limits,
+        close_on,
+        env_profile,
+        worker,
+        source,
+        publish,
+        publish_branch,
+    } = cli;
     let probed = crate::project_state::ProjectState::load(runner, &project, &includes)?;
     let limits = crate::task_client::effective_task_limits(&limits, &probed.settings.task)?;
     let transfer = crate::transfer_repo::TransferRepo::open_or_create(
@@ -3890,6 +4101,84 @@ fn freeze_and_submit_via_controller(
         captured.oid(),
     )?;
     crate::controller::send_controller_request(runner, &config.controller, &request)
+}
+
+fn persist_and_send_controller(
+    runner: &dyn ProcessRunner,
+    paths: &PathLayout,
+    config: &Config,
+    command: &str,
+    body: serde_json::Value,
+) -> Result<crate::controller::ControllerAck, WorkerError> {
+    let request = controller_read_request(command, body)?;
+    crate::controller::persist_operation_envelope(&paths.controller_cache_root(), &request)?;
+    crate::controller::send_controller_request(runner, &config.controller, &request)
+}
+
+fn task_report_from_controller_ack(
+    ack: &crate::controller::ControllerAck,
+) -> Result<task_client::TaskReport, WorkerError> {
+    let value = ack.result().cloned().ok_or_else(|| {
+        WorkerError::Unavailable(
+            "CONTROLLER_UNAVAILABLE: controller host returned an invalid ACK".into(),
+        )
+    })?;
+    let parsed: crate::controller::ControllerTaskStatusResult = serde_json::from_value(value)
+        .map_err(|_| {
+            WorkerError::Unavailable(
+                "CONTROLLER_UNAVAILABLE: controller host returned an invalid ACK".into(),
+            )
+        })?;
+    Ok(parsed.into_report())
+}
+
+fn run_report_from_controller_ack(
+    ack: &crate::controller::ControllerAck,
+) -> Result<task_client::RunReport, WorkerError> {
+    let value = ack.result().cloned().ok_or_else(|| {
+        WorkerError::Unavailable(
+            "CONTROLLER_UNAVAILABLE: controller host returned an invalid ACK".into(),
+        )
+    })?;
+    let run_id = value
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            WorkerError::Unavailable(
+                "CONTROLLER_UNAVAILABLE: controller host returned an invalid ACK".into(),
+            )
+        })?
+        .parse()
+        .map_err(|_| {
+            WorkerError::Unavailable(
+                "CONTROLLER_UNAVAILABLE: controller host returned an invalid ACK".into(),
+            )
+        })?;
+    let task_ids = value
+        .get("task_ids")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            WorkerError::Unavailable(
+                "CONTROLLER_UNAVAILABLE: controller host returned an invalid ACK".into(),
+            )
+        })?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .ok_or_else(|| {
+                    WorkerError::Unavailable(
+                        "CONTROLLER_UNAVAILABLE: controller host returned an invalid ACK".into(),
+                    )
+                })?
+                .parse()
+                .map_err(|_| {
+                    WorkerError::Unavailable(
+                        "CONTROLLER_UNAVAILABLE: controller host returned an invalid ACK".into(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(task_client::RunReport::from_parts(run_id, task_ids))
 }
 
 fn controller_read_request(
