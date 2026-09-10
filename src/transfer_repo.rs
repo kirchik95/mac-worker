@@ -2,10 +2,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fmt,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::fd::AsRawFd,
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::OpenOptionsExt,
+    },
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::Arc,
@@ -33,6 +36,7 @@ const BLOB_BATCH_MAX_BYTES: usize = 1024 * 1024;
 const BLOB_BATCH_MAX_OBJECTS: usize = 64;
 const GET_MARK_LINE_BYTES: usize = 41;
 const BASE_COMMIT_MESSAGE: &str = "mac-worker: task base";
+const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -100,6 +104,26 @@ impl BaseCommit {
             head_oid: oid.clone(),
             oid,
             kind: BaseKind::Committed,
+            branch: None,
+            dirty: DirtyReport {
+                modified: 0,
+                added: 0,
+                deleted: 0,
+            },
+        }
+    }
+
+    /// Frozen base already present in the transfer cache. Resume must not
+    /// recapture HEAD or the worktree.
+    pub fn from_pinned(oid: BaseOid, wip: bool) -> Self {
+        Self {
+            head_oid: oid.clone(),
+            oid,
+            kind: if wip {
+                BaseKind::Wip
+            } else {
+                BaseKind::Committed
+            },
             branch: None,
             dirty: DirtyReport {
                 modified: 0,
@@ -500,6 +524,553 @@ impl TransferRepo {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Cap for the first-slice control-frame bundle only. Ordinary repositories
+    /// must stream through GitTransport SSH (`host receive-pack` /
+    /// `host upload-pack` today; controller-owned receive/upload helpers are
+    /// still to land). Do not raise this cap to fit a real repo, and do not
+    /// put pack bytes in the 1 MiB RPC body on the final path.
+    pub const FROZEN_BUNDLE_MAX_BYTES: usize = 1024 * 1024;
+
+    /// Immutable request-scoped source ref. `git bundle create` with a raw
+    /// OID and stdout (`-`) can refuse an empty bundle; pin this named ref
+    /// first, then bundle the ref.
+    pub fn frozen_request_ref(request_id: &str) -> Result<String, WorkerError> {
+        if !is_lower_hex(request_id, 32) {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "frozen request identity is not a lowercase UUID",
+            ));
+        }
+        Ok(format!("refs/mac-worker/requests/{request_id}"))
+    }
+
+    pub fn pin_frozen_source(
+        &self,
+        runner: &dyn ProcessRunner,
+        request_id: &str,
+        oid: &BaseOid,
+    ) -> Result<String, WorkerError> {
+        self.require_frozen_commit(runner, oid)?;
+        self.materialize_owned_graph(runner, oid)?;
+        self.require_owned_frozen_commit(runner, oid)?;
+        let name = Self::frozen_request_ref(request_id)?;
+        self.pin_request_ref_cas(runner, &name, oid)?;
+        Ok(name)
+    }
+
+    /// First-slice fixture transfer: a git bundle of one frozen commit that
+    /// already fits in a 1 MiB controller RPC frame. This is not ordinary
+    /// repository transfer.
+    pub fn bundle_frozen_source(
+        &self,
+        runner: &dyn ProcessRunner,
+        request_id: &str,
+        oid: &BaseOid,
+    ) -> Result<Vec<u8>, WorkerError> {
+        let source_ref = self.pin_frozen_source(runner, request_id, oid)?;
+        self.with_scratch_regular(&[], |scratch_dir, name, path| {
+            self.transfer_git(
+                runner,
+                &[
+                    OsString::from("bundle"),
+                    OsString::from("create"),
+                    path.as_os_str().to_os_string(),
+                    OsString::from(&source_ref),
+                ],
+                None,
+                None,
+            )?;
+            let bytes = read_scratch_regular(scratch_dir, name)?;
+            if bytes.is_empty() {
+                return Err(git_error(
+                    "BASE_UNAVAILABLE",
+                    "frozen commit bundle was empty",
+                ));
+            }
+            if bytes.len() > Self::FROZEN_BUNDLE_MAX_BYTES {
+                return Err(git_error(
+                    "BASE_UNAVAILABLE",
+                    "frozen commit bundle exceeds the 1 MiB first-slice control-frame cap",
+                ));
+            }
+            Ok(bytes)
+        })
+    }
+
+    pub fn import_frozen_source(
+        &self,
+        runner: &dyn ProcessRunner,
+        request_id: &str,
+        bundle: &[u8],
+        oid: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        if bundle.is_empty() || bundle.len() > Self::FROZEN_BUNDLE_MAX_BYTES {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "frozen commit bundle is empty or exceeds the 1 MiB first-slice control-frame cap",
+            ));
+        }
+        let source_ref = Self::frozen_request_ref(request_id)?;
+        let incoming = format!("refs/mac-worker/incoming/{}", Uuid::new_v4().simple());
+        let fetched = self.with_scratch_regular(bundle, |scratch_dir, name, path| {
+            let written = read_scratch_regular(scratch_dir, name)?;
+            if written.len() != bundle.len() || written != bundle {
+                return Err(git_error(
+                    "BASE_UNAVAILABLE",
+                    "frozen commit bundle was truncated before unbundle",
+                ));
+            }
+            self.transfer_git(
+                runner,
+                &[
+                    OsString::from("-c"),
+                    OsString::from("core.fsyncObjectFiles=true"),
+                    OsString::from("bundle"),
+                    OsString::from("verify"),
+                    path.as_os_str().to_os_string(),
+                ],
+                None,
+                None,
+            )?;
+            self.require_advertised_frozen_head(runner, path, &source_ref, oid)?;
+            self.transfer_git(
+                runner,
+                &[
+                    OsString::from("-c"),
+                    OsString::from("core.fsyncObjectFiles=true"),
+                    OsString::from("fetch"),
+                    OsString::from("--no-write-fetch-head"),
+                    OsString::from("--no-tags"),
+                    path.as_os_str().to_os_string(),
+                    OsString::from(format!("{source_ref}:{incoming}")),
+                ],
+                None,
+                None,
+            )?;
+            Ok(())
+        });
+        let pinned = fetched.and_then(|()| {
+            self.require_frozen_commit(runner, oid)?;
+            self.materialize_owned_graph(runner, oid)?;
+            self.require_owned_frozen_commit(runner, oid)?;
+            self.pin_request_ref_cas(runner, &source_ref, oid)
+        });
+        self.delete_ref_if_present(runner, &incoming);
+        pinned
+    }
+
+    pub fn contains_commit(
+        &self,
+        runner: &dyn ProcessRunner,
+        oid: &BaseOid,
+    ) -> Result<bool, WorkerError> {
+        match self.object_type(runner, oid)? {
+            Some(kind) if kind == "commit" => Ok(true),
+            Some(_) | None => Ok(false),
+        }
+    }
+
+    pub fn require_frozen_commit(
+        &self,
+        runner: &dyn ProcessRunner,
+        oid: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        match self.object_type(runner, oid)? {
+            Some(kind) if kind == "commit" => Ok(()),
+            Some(_) => Err(git_error("BASE_UNAVAILABLE", "frozen base is not a commit")),
+            None => Err(git_error(
+                "BASE_UNAVAILABLE",
+                "frozen commit is missing from the transfer repository",
+            )),
+        }
+    }
+
+    /// Pin a frozen OID as the task base without recapturing HEAD or WIP.
+    pub fn attach_pinned_base(
+        &self,
+        runner: &dyn ProcessRunner,
+        task_id: TaskId,
+        oid: &BaseOid,
+        wip: bool,
+    ) -> Result<BaseCommit, WorkerError> {
+        self.require_owned_frozen_commit(runner, oid)?;
+        self.update_ref(runner, &base_ref(task_id), Some(oid.as_str()))?;
+        Ok(BaseCommit::from_pinned(oid.clone(), wip))
+    }
+
+    /// Copy the reachable graph into this repository's own object store.
+    /// Does not mutate `objects/info/alternates`; concurrent transfer users
+    /// keep their live alternate.
+    fn materialize_owned_graph(
+        &self,
+        runner: &dyn ProcessRunner,
+        oid: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        if self.owned_graph_complete(runner, oid)? {
+            return Ok(());
+        }
+        let pack = self.transfer_git(
+            runner,
+            &[
+                OsString::from("-c"),
+                OsString::from("core.fsyncObjectFiles=true"),
+                OsString::from("pack-objects"),
+                OsString::from("--revs"),
+                OsString::from("--stdout"),
+            ],
+            None,
+            Some(format!("{oid}\n").into_bytes()),
+        )?;
+        if pack.stdout.is_empty() {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "frozen reachable graph pack was empty",
+            ));
+        }
+        self.transfer_git(
+            runner,
+            &[
+                OsString::from("-c"),
+                OsString::from("core.fsyncObjectFiles=true"),
+                OsString::from("index-pack"),
+                OsString::from("--stdin"),
+                OsString::from("--strict"),
+            ],
+            None,
+            Some(pack.stdout),
+        )?;
+        if self.owned_graph_complete(runner, oid)? {
+            Ok(())
+        } else {
+            Err(git_error(
+                "BASE_UNAVAILABLE",
+                "frozen graph is missing from transfer-owned objects after materialization",
+            ))
+        }
+    }
+
+    fn require_owned_frozen_commit(
+        &self,
+        runner: &dyn ProcessRunner,
+        oid: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        if self.owned_graph_complete(runner, oid)? {
+            Ok(())
+        } else {
+            Err(git_error(
+                "BASE_UNAVAILABLE",
+                "frozen graph is not fully present in transfer-owned objects",
+            ))
+        }
+    }
+
+    fn owned_graph_complete(
+        &self,
+        runner: &dyn ProcessRunner,
+        oid: &BaseOid,
+    ) -> Result<bool, WorkerError> {
+        self.with_owned_object_view(|isolate| {
+            match git_at(
+                runner,
+                isolate,
+                &[
+                    OsString::from("cat-file"),
+                    OsString::from("-t"),
+                    OsString::from(oid.as_str()),
+                ],
+                None,
+            ) {
+                Ok(result) => {
+                    let kind = String::from_utf8(result.stdout)
+                        .map_err(|_| {
+                            git_error("BASE_UNAVAILABLE", "owned object type was not UTF-8")
+                        })?
+                        .trim()
+                        .to_owned();
+                    if kind != "commit" {
+                        return Ok(false);
+                    }
+                }
+                Err(error) if error.public_code() == "BASE_UNAVAILABLE" => return Ok(false),
+                Err(error) => return Err(error),
+            }
+            match git_at(
+                runner,
+                isolate,
+                &[
+                    OsString::from("rev-list"),
+                    OsString::from("--objects"),
+                    OsString::from(oid.as_str()),
+                ],
+                None,
+            ) {
+                Ok(_) => Ok(true),
+                Err(error) if error.public_code() == "BASE_UNAVAILABLE" => Ok(false),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn with_owned_object_view<T>(
+        &self,
+        work: impl FnOnce(&Path) -> Result<T, WorkerError>,
+    ) -> Result<T, WorkerError> {
+        let scratch = self.path.join("scratch");
+        fs::create_dir_all(&scratch).map_err(WorkerError::Io)?;
+        let isolate = scratch.join(format!("owned-{}", Uuid::new_v4().simple()));
+        fs::create_dir(&isolate).map_err(WorkerError::Io)?;
+        let result = (|| {
+            run_system_git(
+                None,
+                &[
+                    OsString::from("init"),
+                    OsString::from("-q"),
+                    OsString::from("--bare"),
+                    isolate.as_os_str().to_os_string(),
+                ],
+                None,
+                None,
+            )?;
+            link_owned_objects(&self.path, &isolate)?;
+            work(&isolate)
+        })();
+        let _ = fs::remove_dir_all(&isolate);
+        result
+    }
+
+    fn object_type(
+        &self,
+        runner: &dyn ProcessRunner,
+        oid: &BaseOid,
+    ) -> Result<Option<String>, WorkerError> {
+        match self.transfer_git(
+            runner,
+            &[
+                OsString::from("cat-file"),
+                OsString::from("-t"),
+                oid.to_string().into(),
+            ],
+            None,
+            None,
+        ) {
+            Ok(result) => {
+                let kind = String::from_utf8(result.stdout)
+                    .map_err(|_| git_error("BASE_UNAVAILABLE", "object type was not UTF-8"))?
+                    .trim()
+                    .to_owned();
+                if kind.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(kind))
+            }
+            Err(error) if error.public_code() == "BASE_UNAVAILABLE" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn require_advertised_frozen_head(
+        &self,
+        runner: &dyn ProcessRunner,
+        bundle: &Path,
+        source_ref: &str,
+        oid: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        let result = self.transfer_git(
+            runner,
+            &[
+                OsString::from("bundle"),
+                OsString::from("list-heads"),
+                bundle.as_os_str().to_os_string(),
+            ],
+            None,
+            None,
+        )?;
+        let stdout = String::from_utf8(result.stdout).map_err(|_| {
+            git_error(
+                "BASE_UNAVAILABLE",
+                "frozen bundle advertised heads were not UTF-8",
+            )
+        })?;
+        let mut advertised_oid = None;
+        for line in stdout.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let Some((head, name)) = line.split_once(' ') else {
+                return Err(git_error(
+                    "BASE_UNAVAILABLE",
+                    "frozen bundle advertised an unreadable head",
+                ));
+            };
+            if name != source_ref {
+                continue;
+            }
+            if advertised_oid.is_some() {
+                return Err(git_error(
+                    "BASE_UNAVAILABLE",
+                    "frozen bundle advertised the request ref more than once",
+                ));
+            }
+            advertised_oid = Some(head.to_owned());
+        }
+        match advertised_oid {
+            Some(head) if is_lower_hex(&head, 40) && head == oid.as_str() => Ok(()),
+            Some(_) => Err(git_error(
+                "BASE_UNAVAILABLE",
+                "frozen bundle advertised a different commit for the request ref",
+            )),
+            None => Err(git_error(
+                "BASE_UNAVAILABLE",
+                "frozen bundle does not advertise the request ref",
+            )),
+        }
+    }
+
+    fn delete_ref_if_present(&self, runner: &dyn ProcessRunner, name: &str) {
+        let _ = self.transfer_git(
+            runner,
+            &[
+                OsString::from("update-ref"),
+                OsString::from("-d"),
+                OsString::from(name),
+            ],
+            None,
+            None,
+        );
+    }
+
+    fn pin_request_ref_cas(
+        &self,
+        runner: &dyn ProcessRunner,
+        name: &str,
+        oid: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        for _ in 0..16 {
+            match self.read_ref_oid(runner, name)? {
+                Some(existing) if existing.as_str() == oid.as_str() => {
+                    self.sync_frozen_source(name)?;
+                    return Ok(());
+                }
+                Some(_) => return Err(frozen_source_conflict()),
+                None => match self.create_ref_exclusive(runner, name, oid) {
+                    Ok(()) => {
+                        self.sync_frozen_source(name)?;
+                        return Ok(());
+                    }
+                    Err(error) if error.public_code() == "BASE_UNAVAILABLE" => continue,
+                    Err(error) => return Err(error),
+                },
+            }
+        }
+        match self.read_ref_oid(runner, name)? {
+            Some(existing) if existing.as_str() == oid.as_str() => {
+                self.sync_frozen_source(name)?;
+                Ok(())
+            }
+            Some(_) => Err(frozen_source_conflict()),
+            None => Err(git_error(
+                "BASE_UNAVAILABLE",
+                "could not pin the frozen request ref",
+            )),
+        }
+    }
+
+    fn create_ref_exclusive(
+        &self,
+        runner: &dyn ProcessRunner,
+        name: &str,
+        oid: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        self.transfer_git(
+            runner,
+            &[
+                OsString::from("-c"),
+                OsString::from("core.fsyncObjectFiles=true"),
+                OsString::from("update-ref"),
+                OsString::from(name),
+                OsString::from(oid.as_str()),
+                OsString::from(ZERO_OID),
+            ],
+            None,
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn read_ref_oid(
+        &self,
+        runner: &dyn ProcessRunner,
+        name: &str,
+    ) -> Result<Option<BaseOid>, WorkerError> {
+        match self.transfer_git(
+            runner,
+            &[
+                OsString::from("rev-parse"),
+                OsString::from("--verify"),
+                OsString::from("--end-of-options"),
+                OsString::from(name),
+            ],
+            None,
+            None,
+        ) {
+            Ok(result) => parse_oid(&result).map(Some),
+            Err(error) if error.public_code() == "BASE_UNAVAILABLE" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn sync_frozen_source(&self, name: &str) -> Result<(), WorkerError> {
+        fsync_object_store(&self.path)?;
+        self.fsync_frozen_ref_storage(name)?;
+        fsync_directory(&self.path)
+    }
+
+    fn fsync_frozen_ref_storage(&self, name: &str) -> Result<(), WorkerError> {
+        let relative_name = name
+            .strip_prefix("refs/")
+            .map(|rest| format!("refs/{rest}"))
+            .unwrap_or_else(|| name.to_owned());
+        let root = RootedDir::open(&self.path)?;
+        match root.inspect(&relative(&relative_name)?) {
+            Ok(inspection) => {
+                if inspection.kind != EntryKind::RegularFile {
+                    return Err(git_error(
+                        "BASE_UNAVAILABLE",
+                        "frozen request ref is not a regular file",
+                    ));
+                }
+                fsync_regular_file(&self.path.join(&relative_name))?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let packed = root.inspect(&relative("packed-refs")?).map_err(|error| {
+                    if error.kind() == io::ErrorKind::NotFound {
+                        git_error(
+                            "BASE_UNAVAILABLE",
+                            "frozen request ref is missing from loose and packed storage",
+                        )
+                    } else {
+                        WorkerError::Io(error)
+                    }
+                })?;
+                if packed.kind != EntryKind::RegularFile {
+                    return Err(git_error(
+                        "BASE_UNAVAILABLE",
+                        "packed-refs is not a regular file",
+                    ));
+                }
+                fsync_regular_file(&self.path.join("packed-refs"))?;
+            }
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+        for dir in ["refs/mac-worker/requests", "refs/mac-worker", "refs"] {
+            let path = self.path.join(dir);
+            if path.is_dir() {
+                fsync_directory(&path)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn verify_alternates(&self) -> Result<(), WorkerError> {
@@ -1102,6 +1673,25 @@ impl TransferRepo {
                 "a transfer repository Git command failed",
             ))
         }
+    }
+
+    fn with_scratch_regular<T>(
+        &self,
+        bytes: &[u8],
+        work: impl FnOnce(&RootedDir, &str, &Path) -> Result<T, WorkerError>,
+    ) -> Result<T, WorkerError> {
+        let repo_root = RootedDir::open(&self.path)?;
+        let scratch_dir = repo_root.open_child_directory(&relative("scratch")?, true)?;
+        let name = format!("bundle-{}", Uuid::new_v4());
+        let file = scratch_dir
+            .write_new_private_file(&name, bytes)
+            .map_err(WorkerError::Io)?;
+        file.sync_all().map_err(WorkerError::Io)?;
+        drop(file);
+        let path = self.path.join("scratch").join(&name);
+        let result = work(&scratch_dir, &name, &path);
+        remove_scratch_index(&scratch_dir, &name);
+        result
     }
 }
 
@@ -1794,6 +2384,30 @@ fn restore_and_remove_scratch_regular(scratch_dir: &RootedDir, name: &str) -> io
     scratch_dir.remove_owned_regular(name)
 }
 
+fn read_scratch_regular(scratch_dir: &RootedDir, name: &str) -> Result<Vec<u8>, WorkerError> {
+    let mut inspection = scratch_dir
+        .inspect(&relative(name)?)
+        .map_err(WorkerError::Io)?;
+    if inspection.kind != EntryKind::RegularFile {
+        return Err(git_error(
+            "BASE_UNAVAILABLE",
+            "frozen bundle scratch is not a regular file",
+        ));
+    }
+    let expected = inspection.size;
+    let mut bytes = Vec::new();
+    inspection
+        .read_to_end(&mut bytes)
+        .map_err(WorkerError::Io)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected {
+        return Err(git_error(
+            "BASE_UNAVAILABLE",
+            "frozen bundle scratch was truncated",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn base_ref(task_id: TaskId) -> String {
     format!("refs/mac-worker/bases/{task_id}")
 }
@@ -1955,11 +2569,207 @@ fn write_alternates_atomic(info: &RootedDir, target: &Path) -> Result<(), Worker
     }
 }
 
+fn git_at(
+    runner: &dyn ProcessRunner,
+    git_dir: &Path,
+    args: &[OsString],
+    stdin: Option<Vec<u8>>,
+) -> Result<ProcessResult, WorkerError> {
+    let mut command_args = vec![
+        OsString::from("--git-dir"),
+        git_dir.as_os_str().to_os_string(),
+        OsString::from("-c"),
+        OsString::from("gc.auto=0"),
+    ];
+    command_args.extend(args.iter().cloned());
+    let request = ProcessRequest {
+        program: OsString::from(GIT_PROGRAM),
+        args: command_args,
+        environment: vec![
+            (
+                OsString::from("GIT_CONFIG_GLOBAL"),
+                OsString::from("/dev/null"),
+            ),
+            (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+            (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
+        ],
+        environment_remove: GIT_ENVIRONMENT_REMOVALS
+            .iter()
+            .map(OsString::from)
+            .collect(),
+        stdin,
+        policy: ProcessPolicy {
+            stdout_limit: GIT_OUTPUT_LIMIT,
+            stderr_limit: GIT_OUTPUT_LIMIT,
+            deadline: GIT_DEADLINE,
+        },
+        isolate_parent_environment: false,
+    };
+    let result = runner.run(&request)?;
+    if result.status.success() {
+        Ok(result)
+    } else {
+        Err(git_error(
+            "BASE_UNAVAILABLE",
+            "a transfer repository Git command failed",
+        ))
+    }
+}
+
+fn link_owned_objects(transfer: &Path, isolate: &Path) -> Result<(), WorkerError> {
+    let source_objects = transfer.join("objects");
+    let destination_objects = isolate.join("objects");
+    if !source_objects.is_dir() {
+        return Ok(());
+    }
+    let source_pack = source_objects.join("pack");
+    if source_pack.is_dir() {
+        let destination_pack = destination_objects.join("pack");
+        fs::create_dir_all(&destination_pack).map_err(WorkerError::Io)?;
+        for entry in fs::read_dir(&source_pack).map_err(WorkerError::Io)? {
+            let entry = entry.map_err(WorkerError::Io)?;
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if !(name_str.ends_with(".pack")
+                || name_str.ends_with(".idx")
+                || name_str.ends_with(".keep"))
+            {
+                continue;
+            }
+            hardlink_or_copy(&entry.path(), &destination_pack.join(name))?;
+        }
+    }
+    for entry in fs::read_dir(&source_objects).map_err(WorkerError::Io)? {
+        let entry = entry.map_err(WorkerError::Io)?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str == "pack" || name_str == "info" {
+            continue;
+        }
+        if name_str.len() != 2 || !name_str.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let source_fanout = source_objects.join(name_str);
+        if !source_fanout.is_dir() {
+            continue;
+        }
+        let destination_fanout = destination_objects.join(name_str);
+        fs::create_dir_all(&destination_fanout).map_err(WorkerError::Io)?;
+        for object in fs::read_dir(&source_fanout).map_err(WorkerError::Io)? {
+            let object = object.map_err(WorkerError::Io)?;
+            if !object.path().is_file() {
+                continue;
+            }
+            hardlink_or_copy(&object.path(), &destination_fanout.join(object.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+fn hardlink_or_copy(source: &Path, destination: &Path) -> Result<(), WorkerError> {
+    match fs::hard_link(source, destination) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(source, destination).map_err(WorkerError::Io)?;
+            Ok(())
+        }
+    }
+}
+
+fn fsync_regular_file(path: &Path) -> Result<(), WorkerError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(WorkerError::Io)?;
+    file.sync_all().map_err(WorkerError::Io)?;
+    Ok(())
+}
+
+fn fsync_directory(path: &Path) -> Result<(), WorkerError> {
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(WorkerError::Io)?;
+    dir.sync_all().map_err(WorkerError::Io)?;
+    Ok(())
+}
+
+fn fsync_object_store(git_dir: &Path) -> Result<(), WorkerError> {
+    let objects = git_dir.join("objects");
+    if !objects.is_dir() {
+        return Ok(());
+    }
+    let pack = objects.join("pack");
+    if pack.is_dir() {
+        let entries = fs::read_dir(&pack).map_err(WorkerError::Io)?;
+        for entry in entries {
+            let entry = entry.map_err(WorkerError::Io)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.ends_with(".pack") && !name.ends_with(".idx") {
+                continue;
+            }
+            let path = pack.join(name);
+            if path.is_file() {
+                fsync_regular_file(&path)?;
+            }
+        }
+        fsync_directory(&pack)?;
+    }
+    let entries = fs::read_dir(&objects).map_err(WorkerError::Io)?;
+    let mut fanouts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(WorkerError::Io)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == "pack" || name == "info" {
+            continue;
+        }
+        if name.len() != 2 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let fanout = objects.join(name);
+        if !fanout.is_dir() {
+            continue;
+        }
+        let objects_in_fanout = fs::read_dir(&fanout).map_err(WorkerError::Io)?;
+        for object in objects_in_fanout {
+            let object = object.map_err(WorkerError::Io)?;
+            let path = object.path();
+            if path.is_file() {
+                fsync_regular_file(&path)?;
+            }
+        }
+        fanouts.push(fanout);
+    }
+    for fanout in fanouts {
+        fsync_directory(&fanout)?;
+    }
+    fsync_directory(&objects)
+}
+
 fn git_error(code: &'static str, message: &str) -> WorkerError {
     WorkerError::Git {
         code,
         message: message.into(),
     }
+}
+
+fn frozen_source_conflict() -> WorkerError {
+    git_error(
+        "FROZEN_SOURCE_CONFLICT",
+        "frozen request ref is already bound to a different commit",
+    )
 }
 
 fn task_config(message: impl Into<std::borrow::Cow<'static, str>>) -> WorkerError {
@@ -2037,5 +2847,530 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(!repo_path.exists());
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) -> ProcessResult {
+        let mut command = vec![OsString::from("-C"), dir.as_os_str().to_os_string()];
+        command.extend(args.iter().map(OsString::from));
+        run_system_git(None, &command, None, None).unwrap()
+    }
+
+    fn committed_user_repository(root: &Path, name: &str, contents: &[u8]) -> (PathBuf, BaseOid) {
+        let user = root.join(name);
+        fs::create_dir_all(&user).unwrap();
+        run_system_git(
+            None,
+            &[
+                OsString::from("init"),
+                OsString::from("-q"),
+                user.as_os_str().to_os_string(),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        git_in(&user, &["config", "user.name", "mac-worker"]);
+        git_in(&user, &["config", "user.email", "mac-worker@localhost"]);
+        fs::write(user.join("README"), contents).unwrap();
+        git_in(&user, &["add", "README"]);
+        git_in(&user, &["commit", "-q", "-m", "init"]);
+        let oid = git_in(&user, &["rev-parse", "HEAD"])
+            .stdout
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b'\n')
+            .map(char::from)
+            .collect::<String>()
+            .parse::<BaseOid>()
+            .unwrap();
+        (user.join(".git"), oid)
+    }
+
+    const REQUEST_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
+
+    #[test]
+    fn a_named_request_ref_round_trips_a_tiny_commit_into_a_second_transfer_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (source_common, oid) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let source =
+            TransferRepo::open_or_create(&temp.path().join("source-cache"), &source_common)
+                .unwrap();
+        let bundle = source
+            .bundle_frozen_source(&runner, REQUEST_ID, &oid)
+            .unwrap();
+        assert!(!bundle.is_empty());
+        assert!(bundle.len() <= TransferRepo::FROZEN_BUNDLE_MAX_BYTES);
+        assert!(!source.path().join("mw-frozen.bundle").exists());
+        assert!(source.has_ref(&TransferRepo::frozen_request_ref(REQUEST_ID).unwrap()));
+
+        let (dest_common, _) = committed_user_repository(temp.path(), "dest", b"other\n");
+        let dest =
+            TransferRepo::open_or_create(&temp.path().join("dest-cache"), &dest_common).unwrap();
+        assert!(!dest.contains_commit(&runner, &oid).unwrap());
+        dest.import_frozen_source(&runner, REQUEST_ID, &bundle, &oid)
+            .unwrap();
+        assert!(dest.contains_commit(&runner, &oid).unwrap());
+        assert!(dest.has_ref(&TransferRepo::frozen_request_ref(REQUEST_ID).unwrap()));
+        assert!(!dest.path().join("mw-frozen.bundle").exists());
+        assert!(scratch_leftovers(&dest).is_empty());
+        assert!(incoming_refs(&dest).is_empty());
+    }
+
+    #[test]
+    fn import_keeps_the_full_graph_after_the_alternate_target_is_emptied() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (source_common, oid) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let source =
+            TransferRepo::open_or_create(&temp.path().join("source-cache"), &source_common)
+                .unwrap();
+        let bundle = source
+            .bundle_frozen_source(&runner, REQUEST_ID, &oid)
+            .unwrap();
+        let dest_common = clone_user_repository(temp.path(), "dest", &source_common);
+        let dest =
+            TransferRepo::open_or_create(&temp.path().join("dest-cache"), &dest_common).unwrap();
+        assert!(dest.contains_commit(&runner, &oid).unwrap());
+        dest.import_frozen_source(&runner, REQUEST_ID, &bundle, &oid)
+            .unwrap();
+        dest.import_frozen_source(&runner, REQUEST_ID, &bundle, &oid)
+            .unwrap();
+        let other = additional_commit(&dest_common, b"other-head\n");
+        let error = dest
+            .pin_frozen_source(&runner, REQUEST_ID, &other)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "FROZEN_SOURCE_CONFLICT");
+        assert!(dest.path().join("objects/info/alternates").is_file());
+        hide_user_objects(&dest_common);
+        assert_owned_reachable_graph(&dest, &runner, &oid);
+        assert!(dest.has_ref(&TransferRepo::frozen_request_ref(REQUEST_ID).unwrap()));
+    }
+
+    #[test]
+    fn import_copies_overlapping_parent_blobs_out_of_the_alternate() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (source_common, first) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let second = additional_commit(&source_common, b"second\n");
+        let source =
+            TransferRepo::open_or_create(&temp.path().join("source-cache"), &source_common)
+                .unwrap();
+        let bundle = source
+            .bundle_frozen_source(&runner, REQUEST_ID, &second)
+            .unwrap();
+        let (dest_common, dest_commit) = committed_user_repository(temp.path(), "dest", b"hello\n");
+        assert_ne!(dest_commit.as_str(), second.as_str());
+        let dest =
+            TransferRepo::open_or_create(&temp.path().join("dest-cache"), &dest_common).unwrap();
+        assert!(!dest.contains_commit(&runner, &second).unwrap());
+        dest.import_frozen_source(&runner, REQUEST_ID, &bundle, &second)
+            .unwrap();
+        assert!(dest.path().join("objects/info/alternates").is_file());
+        hide_user_objects(&dest_common);
+        assert_owned_reachable_graph(&dest, &runner, &second);
+        assert_owned_reachable_graph(&dest, &runner, &first);
+    }
+
+    #[test]
+    fn pin_keeps_the_full_graph_after_the_alternate_target_is_emptied() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (common, oid) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let transfer = TransferRepo::open_or_create(&temp.path().join("cache"), &common).unwrap();
+        transfer
+            .pin_frozen_source(&runner, REQUEST_ID, &oid)
+            .unwrap();
+        transfer
+            .pin_frozen_source(&runner, REQUEST_ID, &oid)
+            .unwrap();
+        assert!(transfer.path().join("objects/info/alternates").is_file());
+        hide_user_objects(&common);
+        assert_owned_reachable_graph(&transfer, &runner, &oid);
+        assert!(transfer.has_ref(&TransferRepo::frozen_request_ref(REQUEST_ID).unwrap()));
+    }
+
+    #[test]
+    fn a_truncated_bundle_does_not_leave_a_request_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (source_common, oid) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let source =
+            TransferRepo::open_or_create(&temp.path().join("source-cache"), &source_common)
+                .unwrap();
+        let bundle = source
+            .bundle_frozen_source(&runner, REQUEST_ID, &oid)
+            .unwrap();
+        let truncated = &bundle[..bundle.len() / 2];
+        assert!(!truncated.is_empty());
+
+        let (dest_common, _) = committed_user_repository(temp.path(), "dest", b"other\n");
+        let dest =
+            TransferRepo::open_or_create(&temp.path().join("dest-cache"), &dest_common).unwrap();
+        let error = dest
+            .import_frozen_source(&runner, REQUEST_ID, truncated, &oid)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "BASE_UNAVAILABLE");
+        assert!(!dest.contains_commit(&runner, &oid).unwrap());
+        assert!(!dest.has_ref(&TransferRepo::frozen_request_ref(REQUEST_ID).unwrap()));
+        assert!(!dest.path().join("mw-frozen.bundle").exists());
+        assert!(scratch_leftovers(&dest).is_empty());
+        assert!(incoming_refs(&dest).is_empty());
+    }
+
+    #[test]
+    fn concurrent_imports_use_unique_scratch_and_do_not_clobber() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (source_common, oid) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let source =
+            TransferRepo::open_or_create(&temp.path().join("source-cache"), &source_common)
+                .unwrap();
+        let first_bundle = source
+            .bundle_frozen_source(&runner, REQUEST_ID, &oid)
+            .unwrap();
+        let second_id = "018f0f4a6b5c7d8e9f00112233445577";
+        let second_bundle = source
+            .bundle_frozen_source(&runner, second_id, &oid)
+            .unwrap();
+        let (dest_common, _) = committed_user_repository(temp.path(), "dest", b"other\n");
+        let dest =
+            TransferRepo::open_or_create(&temp.path().join("dest-cache"), &dest_common).unwrap();
+
+        std::thread::scope(|scope| {
+            let left =
+                scope.spawn(|| dest.import_frozen_source(&runner, REQUEST_ID, &first_bundle, &oid));
+            let right =
+                scope.spawn(|| dest.import_frozen_source(&runner, second_id, &second_bundle, &oid));
+            left.join().unwrap().unwrap();
+            right.join().unwrap().unwrap();
+        });
+        assert!(dest.contains_commit(&runner, &oid).unwrap());
+        assert!(dest.has_ref(&TransferRepo::frozen_request_ref(REQUEST_ID).unwrap()));
+        assert!(dest.has_ref(&TransferRepo::frozen_request_ref(second_id).unwrap()));
+        assert!(!dest.path().join("mw-frozen.bundle").exists());
+        assert!(
+            scratch_leftovers(&dest).is_empty(),
+            "{:?}",
+            scratch_leftovers(&dest)
+        );
+        assert!(
+            incoming_refs(&dest).is_empty(),
+            "{:?}",
+            incoming_refs(&dest)
+        );
+    }
+
+    #[test]
+    fn import_rejects_a_bundle_advertising_a_different_request_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (source_common, oid) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let source =
+            TransferRepo::open_or_create(&temp.path().join("source-cache"), &source_common)
+                .unwrap();
+        let bundle = source
+            .bundle_frozen_source(&runner, REQUEST_ID, &oid)
+            .unwrap();
+        let second_id = "018f0f4a6b5c7d8e9f00112233445577";
+        let (dest_common, _) = committed_user_repository(temp.path(), "dest", b"other\n");
+        let dest =
+            TransferRepo::open_or_create(&temp.path().join("dest-cache"), &dest_common).unwrap();
+        let error = dest
+            .import_frozen_source(&runner, second_id, &bundle, &oid)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "BASE_UNAVAILABLE");
+        assert!(!dest.contains_commit(&runner, &oid).unwrap());
+        assert!(!dest.has_ref(&TransferRepo::frozen_request_ref(REQUEST_ID).unwrap()));
+        assert!(!dest.has_ref(&TransferRepo::frozen_request_ref(second_id).unwrap()));
+        assert!(
+            incoming_refs(&dest).is_empty(),
+            "{:?}",
+            incoming_refs(&dest)
+        );
+        assert!(scratch_leftovers(&dest).is_empty());
+    }
+
+    fn additional_commit(user_git_dir: &Path, contents: &[u8]) -> BaseOid {
+        let user = user_git_dir.parent().unwrap();
+        fs::write(user.join("README"), contents).unwrap();
+        git_in(user, &["add", "README"]);
+        git_in(user, &["commit", "-q", "-m", "next"]);
+        git_in(user, &["rev-parse", "HEAD"])
+            .stdout
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b'\n')
+            .map(char::from)
+            .collect::<String>()
+            .parse::<BaseOid>()
+            .unwrap()
+    }
+
+    fn clone_user_repository(root: &Path, name: &str, source_git_dir: &Path) -> PathBuf {
+        let source = source_git_dir.parent().unwrap();
+        let dest = root.join(name);
+        run_system_git(
+            None,
+            &[
+                OsString::from("clone"),
+                OsString::from("-q"),
+                source.as_os_str().to_os_string(),
+                dest.as_os_str().to_os_string(),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        dest.join(".git")
+    }
+
+    fn hide_user_objects(user_git_dir: &Path) {
+        let objects = user_git_dir.join("objects");
+        let hidden = user_git_dir.join(format!("objects-unavailable-{}", Uuid::new_v4().simple()));
+        fs::rename(&objects, &hidden).unwrap();
+        fs::create_dir(&objects).unwrap();
+        fs::create_dir(objects.join("pack")).unwrap();
+        fs::create_dir(objects.join("info")).unwrap();
+    }
+
+    fn assert_owned_reachable_graph(
+        repo: &TransferRepo,
+        runner: &SystemProcessRunner,
+        oid: &BaseOid,
+    ) {
+        assert!(
+            repo.owned_graph_complete(runner, oid).unwrap(),
+            "reachable graph must live in transfer-owned objects"
+        );
+        assert!(repo.contains_commit(runner, oid).unwrap());
+        repo.require_owned_frozen_commit(runner, oid).unwrap();
+        let listing = run_system_git(
+            Some(repo.path()),
+            &[
+                OsString::from("rev-list"),
+                OsString::from("--objects"),
+                OsString::from(oid.as_str()),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        let stdout = String::from_utf8(listing.stdout).unwrap();
+        assert!(
+            stdout.contains(oid.as_str()),
+            "rev-list must include the frozen commit: {stdout:?}"
+        );
+        let mut saw_tree = false;
+        let mut saw_blob = false;
+        for line in stdout.lines() {
+            let Some(object) = line.split_whitespace().next() else {
+                continue;
+            };
+            if object.len() != 40 {
+                continue;
+            }
+            let kind = run_system_git(
+                Some(repo.path()),
+                &[
+                    OsString::from("cat-file"),
+                    OsString::from("-t"),
+                    OsString::from(object),
+                ],
+                None,
+                None,
+            )
+            .unwrap();
+            match String::from_utf8(kind.stdout).unwrap().trim() {
+                "tree" => saw_tree = true,
+                "blob" => saw_blob = true,
+                _ => {}
+            }
+        }
+        assert!(saw_tree, "reachable graph must include a tree");
+        assert!(saw_blob, "reachable graph must include a blob");
+    }
+
+    fn blob_oid(user_git_dir: &Path, contents: &[u8]) -> BaseOid {
+        let user = user_git_dir.parent().unwrap();
+        fs::write(user.join("blob-fixture"), contents).unwrap();
+        git_in(user, &["hash-object", "-w", "blob-fixture"])
+            .stdout
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b'\n')
+            .map(char::from)
+            .collect::<String>()
+            .parse::<BaseOid>()
+            .unwrap()
+    }
+
+    fn annotated_tag_oid(user_git_dir: &Path) -> BaseOid {
+        let user = user_git_dir.parent().unwrap();
+        git_in(user, &["tag", "-a", "frozen-tag", "-m", "not a commit"]);
+        git_in(user, &["rev-parse", "refs/tags/frozen-tag"])
+            .stdout
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b'\n')
+            .map(char::from)
+            .collect::<String>()
+            .parse::<BaseOid>()
+            .unwrap()
+    }
+
+    fn scratch_leftovers(repo: &TransferRepo) -> Vec<String> {
+        fs::read_dir(repo.path().join("scratch"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("bundle-"))
+            .collect()
+    }
+
+    fn incoming_refs(repo: &TransferRepo) -> Vec<String> {
+        let output = run_system_git(
+            Some(repo.path()),
+            &[
+                OsString::from("for-each-ref"),
+                OsString::from("--format=%(refname)"),
+                OsString::from("refs/mac-worker/incoming"),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn pin_rejects_a_blob_masquerading_as_a_base_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (common, commit) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let transfer = TransferRepo::open_or_create(&temp.path().join("cache"), &common).unwrap();
+        assert!(transfer.contains_commit(&runner, &commit).unwrap());
+        let blob = blob_oid(&common, b"not-a-commit\n");
+        assert_eq!(
+            transfer.object_type(&runner, &blob).unwrap().as_deref(),
+            Some("blob")
+        );
+        assert!(!transfer.contains_commit(&runner, &blob).unwrap());
+        let error = transfer
+            .pin_frozen_source(&runner, REQUEST_ID, &blob)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "BASE_UNAVAILABLE");
+        match &error {
+            WorkerError::Git { message, .. } => {
+                assert!(message.contains("not a commit"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!transfer.has_ref(&TransferRepo::frozen_request_ref(REQUEST_ID).unwrap()));
+    }
+
+    #[test]
+    fn pin_rejects_an_annotated_tag_masquerading_as_a_base_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (common, commit) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let transfer = TransferRepo::open_or_create(&temp.path().join("cache"), &common).unwrap();
+        let tag = annotated_tag_oid(&common);
+        assert_ne!(tag.as_str(), commit.as_str());
+        assert_eq!(
+            transfer.object_type(&runner, &tag).unwrap().as_deref(),
+            Some("tag")
+        );
+        assert!(!transfer.contains_commit(&runner, &tag).unwrap());
+        let error = transfer
+            .pin_frozen_source(&runner, REQUEST_ID, &tag)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "BASE_UNAVAILABLE");
+        assert!(!transfer.has_ref(&TransferRepo::frozen_request_ref(REQUEST_ID).unwrap()));
+    }
+
+    #[test]
+    fn pin_is_create_or_same_and_rejects_a_different_oid() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (common, first) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let second = additional_commit(&common, b"second\n");
+        let transfer = TransferRepo::open_or_create(&temp.path().join("cache"), &common).unwrap();
+        let name = transfer
+            .pin_frozen_source(&runner, REQUEST_ID, &first)
+            .unwrap();
+        transfer
+            .pin_frozen_source(&runner, REQUEST_ID, &first)
+            .unwrap();
+        let error = transfer
+            .pin_frozen_source(&runner, REQUEST_ID, &second)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "FROZEN_SOURCE_CONFLICT");
+        let current = transfer.read_ref_oid(&runner, &name).unwrap().unwrap();
+        assert_eq!(current.as_str(), first.as_str());
+    }
+
+    #[test]
+    fn same_oid_pin_syncs_packed_ref_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (common, first) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let transfer = TransferRepo::open_or_create(&temp.path().join("cache"), &common).unwrap();
+        let name = transfer
+            .pin_frozen_source(&runner, REQUEST_ID, &first)
+            .unwrap();
+        run_system_git(
+            Some(transfer.path()),
+            &[OsString::from("pack-refs"), OsString::from("--all")],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!transfer.path().join(&name).exists());
+        transfer
+            .pin_frozen_source(&runner, REQUEST_ID, &first)
+            .unwrap();
+        let current = transfer.read_ref_oid(&runner, &name).unwrap().unwrap();
+        assert_eq!(current.as_str(), first.as_str());
+    }
+
+    #[test]
+    fn concurrent_differing_pins_keep_exactly_one_oid() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (common, first) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let second = additional_commit(&common, b"second\n");
+        let transfer = TransferRepo::open_or_create(&temp.path().join("cache"), &common).unwrap();
+        let name = TransferRepo::frozen_request_ref(REQUEST_ID).unwrap();
+
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| transfer.pin_frozen_source(&runner, REQUEST_ID, &first));
+            let right = scope.spawn(|| transfer.pin_frozen_source(&runner, REQUEST_ID, &second));
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        let outcomes = [left, right];
+        let wins = outcomes.iter().filter(|result| result.is_ok()).count();
+        let conflicts = outcomes
+            .iter()
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.public_code() == "FROZEN_SOURCE_CONFLICT")
+            })
+            .count();
+        assert_eq!(wins, 1, "{outcomes:?}");
+        assert_eq!(conflicts, 1, "{outcomes:?}");
+        let kept = transfer.read_ref_oid(&runner, &name).unwrap().unwrap();
+        assert!(kept.as_str() == first.as_str() || kept.as_str() == second.as_str());
     }
 }
