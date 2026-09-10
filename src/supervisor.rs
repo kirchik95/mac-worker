@@ -958,6 +958,8 @@ pub struct Supervisor<'a> {
     store: &'a HostStore,
     inspector: &'a dyn ProcessInspector,
     fault: Option<SupervisorFaultPoint>,
+    stdout_log_cap: Option<u64>,
+    stderr_log_cap: Option<u64>,
 }
 
 struct SupervisorErrorLog {
@@ -1080,6 +1082,8 @@ impl<'a> Supervisor<'a> {
             store,
             inspector,
             fault: None,
+            stdout_log_cap: None,
+            stderr_log_cap: None,
         }
     }
 
@@ -1093,7 +1097,24 @@ impl<'a> Supervisor<'a> {
             store,
             inspector,
             fault: Some(fault),
+            stdout_log_cap: None,
+            stderr_log_cap: None,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_log_caps(mut self, stdout: Option<u64>, stderr: Option<u64>) -> Self {
+        self.stdout_log_cap = stdout;
+        self.stderr_log_cap = stderr;
+        self
+    }
+
+    fn stdout_pump_config(&self) -> StreamPumpConfig {
+        StreamPumpConfig::production().with_cap(self.stdout_log_cap)
+    }
+
+    fn stderr_pump_config(&self) -> StreamPumpConfig {
+        StreamPumpConfig::production().with_cap(self.stderr_log_cap)
     }
 
     pub fn run_with_guard(&self, job_id: JobId, guard: SupervisorGuard) -> Result<(), WorkerError> {
@@ -1984,6 +2005,7 @@ impl<'a> Supervisor<'a> {
             tail,
             self.store.clone(),
             section.clone(),
+            self.stdout_pump_config(),
         ) {
             Ok(pump) => pump,
             Err(error) => {
@@ -2003,28 +2025,29 @@ impl<'a> Supervisor<'a> {
                 return result;
             }
         };
-        let stderr_pump = match TurnStderrPump::start(stderr_read, stderr) {
-            Ok(pump) => pump,
-            Err(error) => {
-                let abort = child.abort_and_reap();
-                let mut stdout_pump = stdout_pump;
-                let pump_result = stdout_pump.stop_and_join();
-                let result = self.finish_turn_prelaunch_failure(
-                    lease,
-                    job,
-                    guard,
-                    &meta,
-                    &section,
-                    status_bytes,
-                    status,
-                    "LOG_BINDING_INVALID",
-                    error,
-                );
-                abort?;
-                let _ = pump_result;
-                return result;
-            }
-        };
+        let stderr_pump =
+            match TurnStderrPump::start_with(stderr_read, stderr, self.stderr_pump_config()) {
+                Ok(pump) => pump,
+                Err(error) => {
+                    let abort = child.abort_and_reap();
+                    let mut stdout_pump = stdout_pump;
+                    let pump_result = stdout_pump.stop_and_join();
+                    let result = self.finish_turn_prelaunch_failure(
+                        lease,
+                        job,
+                        guard,
+                        &meta,
+                        &section,
+                        status_bytes,
+                        status,
+                        "LOG_BINDING_INVALID",
+                        error,
+                    );
+                    abort?;
+                    let _ = pump_result;
+                    return result;
+                }
+            };
         let mut pump = TurnIoPumps {
             stdout: stdout_pump,
             stderr: stderr_pump,
@@ -2342,6 +2365,7 @@ impl<'a> Supervisor<'a> {
             terminal_kind,
             terminal_path,
             exit_code,
+            pump_result.stdout_truncated,
             pump_result.log_truncated,
         )
     }
@@ -2384,6 +2408,7 @@ impl<'a> Supervisor<'a> {
             crate::task::TurnTerminal::Lost,
             TerminalPath::PrelaunchFailure,
             None,
+            false,
             false,
         );
         match finish {
@@ -2436,6 +2461,8 @@ impl<'a> Supervisor<'a> {
             None,
             pump_result
                 .as_ref()
+                .is_ok_and(|result| result.stdout_truncated),
+            pump_result
                 .as_ref()
                 .is_ok_and(|result| result.log_truncated),
         );
@@ -2495,6 +2522,7 @@ impl<'a> Supervisor<'a> {
         terminal_kind: crate::task::TurnTerminal,
         path: TerminalPath,
         exit_code: Option<i32>,
+        protocol_truncated: bool,
         log_truncated: bool,
     ) -> Result<(), WorkerError> {
         // Keep the execution payload until both the terminal job status and
@@ -2521,6 +2549,7 @@ impl<'a> Supervisor<'a> {
                 terminal_kind,
                 path,
                 exit_code,
+                protocol_truncated,
                 log_truncated,
             )
             .map(|_| ());
@@ -2951,6 +2980,7 @@ impl Drop for GatedChild {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TurnPumpResult {
     stdout_bytes: u64,
+    stdout_truncated: bool,
     log_truncated: bool,
 }
 
@@ -2970,6 +3000,13 @@ impl StreamPumpConfig {
             post_stop_drain: crate::turn::LOG_TAIL_BYTES as u64,
             read_chunk: 64 * 1024,
         }
+    }
+
+    fn with_cap(mut self, cap: Option<u64>) -> Self {
+        if let Some(cap) = cap {
+            self.cap = cap;
+        }
+        self
     }
 }
 
@@ -2991,6 +3028,7 @@ impl TurnOutputPump {
         mut tail_file: File,
         store: HostStore,
         section: TurnSection,
+        config: StreamPumpConfig,
     ) -> Result<Self, WorkerError> {
         set_nonblocking(read.as_raw_fd())?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -3005,7 +3043,7 @@ impl TurnOutputPump {
                     &store,
                     &section,
                     &thread_stop,
-                    StreamPumpConfig::production(),
+                    config,
                 )
             })
             .map_err(WorkerError::Io)?;
@@ -3049,9 +3087,12 @@ impl TurnIoPumps {
         let stdout = self.stdout.stop_and_join();
         let stderr = self.stderr.stop_and_join();
         let stderr = stderr?;
-        let mut stdout = stdout?;
-        stdout.log_truncated |= stderr.truncated;
-        Ok(stdout)
+        let stdout = stdout?;
+        Ok(TurnPumpResult {
+            stdout_bytes: stdout.stdout_bytes,
+            stdout_truncated: stdout.stdout_truncated,
+            log_truncated: stdout.stdout_truncated || stderr.truncated,
+        })
     }
 }
 
@@ -3061,10 +3102,6 @@ struct TurnStderrPump {
 }
 
 impl TurnStderrPump {
-    fn start(read: File, stderr: File) -> Result<Self, WorkerError> {
-        Self::start_with(read, stderr, StreamPumpConfig::production())
-    }
-
     fn start_with(
         read: File,
         mut stderr: File,
@@ -3298,6 +3335,7 @@ fn pump_turn_output(
     tail_file.sync_all().map_err(WorkerError::Io)?;
     Ok(TurnPumpResult {
         stdout_bytes: stored.min(config.cap),
+        stdout_truncated: total > config.cap,
         log_truncated: total > config.cap,
     })
 }
@@ -3984,6 +4022,7 @@ struct TurnTerminalWrite<'a> {
     terminal: crate::task::TurnTerminal,
     path: TerminalPath,
     exit_code: Option<i32>,
+    protocol_truncated: bool,
     log_truncated: bool,
 }
 
@@ -4018,6 +4057,7 @@ fn replace_status(
                 turn.terminal,
                 turn.path,
                 turn.exit_code,
+                turn.protocol_truncated,
                 turn.log_truncated,
             )
             .map(|_| ())?;
@@ -4294,8 +4334,15 @@ mod tests {
         let mut writer = unsafe { File::from_raw_fd(descriptors[1]) };
         let stdout = File::create(temp.path().join("stdout.log")).unwrap();
         let tail = File::create(temp.path().join("tail.log")).unwrap();
-        let mut pump =
-            TurnOutputPump::start(read, stdout, tail, store, pump_turn_section()).unwrap();
+        let mut pump = TurnOutputPump::start(
+            read,
+            stdout,
+            tail,
+            store,
+            pump_turn_section(),
+            StreamPumpConfig::production(),
+        )
+        .unwrap();
 
         let writing = Arc::new(AtomicBool::new(true));
         let writer_flag = Arc::clone(&writing);

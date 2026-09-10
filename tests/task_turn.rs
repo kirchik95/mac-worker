@@ -115,6 +115,27 @@ impl SupervisorLauncher for InlineTurnLauncher {
     }
 }
 
+struct CappedTurnLauncher {
+    store: HostStore,
+    stdout_log_cap: Option<u64>,
+    stderr_log_cap: Option<u64>,
+}
+
+impl SupervisorLauncher for CappedTurnLauncher {
+    fn launch(
+        &self,
+        job_id: JobId,
+        guard: mac_worker::host_store::SupervisorGuard,
+    ) -> Result<LaunchCandidate, WorkerError> {
+        let inspector = SystemProcessInspector;
+        let identity = inspector.identity_for_pid(process::id())?;
+        Supervisor::new(&self.store, &inspector)
+            .with_log_caps(self.stdout_log_cap, self.stderr_log_cap)
+            .run_with_guard(job_id, guard)?;
+        Ok(LaunchCandidate::new(identity))
+    }
+}
+
 struct CountingFailingLauncher {
     launches: Arc<AtomicUsize>,
 }
@@ -1792,6 +1813,63 @@ fn turn_section_carries_the_herdr_flag_only_when_set() {
     let old: TurnSection = serde_json::from_str(&plain_json).unwrap();
     assert!(!old.herdr_reporter());
     assert_eq!(old, plain);
+}
+
+#[test]
+fn verbose_stderr_overflow_does_not_fail_complete_stdout_publication() {
+    let script = r#"printf '%s\n' '{"type":"thread.started","thread_id":"session-stderr-cap"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"ok\",\"questions\":[],\"files_changed\":[]}"}}'; /usr/bin/head -c 80 /dev/zero >&2; printf 'LATE-STDERR-FAIL' >&2"#;
+    let (_temp, store, request, _cancel) = prepared_task_turn(script);
+    let launcher = CappedTurnLauncher {
+        store: store.clone(),
+        stdout_log_cap: None,
+        stderr_log_cap: Some(64),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .expect("complete stdout must publish despite stderr overflow");
+    assert_eq!(response.task().state(), TaskState::Open);
+    assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
+    assert!(
+        response.task().turns()[0].log_truncated(),
+        "stderr overflow must still set aggregate log_truncated"
+    );
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    assert!(!job_path.join("last.md").exists());
+    let stderr = fs::read(job_path.join("stderr.log")).unwrap();
+    assert!(
+        stderr
+            .windows(b"LATE-STDERR-FAIL".len())
+            .any(|window| window == b"LATE-STDERR-FAIL"),
+        "late stderr marker missing: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
+fn truncated_stdout_without_last_md_fails_publication() {
+    let script = r#"printf '%s\n' '{"type":"thread.started","thread_id":"session-trunc"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"finished\",\"questions\":[],\"files_changed\":[]}"}}'"#;
+    let (_temp, store, request, _cancel) = prepared_task_turn(script);
+    let launcher = CappedTurnLauncher {
+        store: store.clone(),
+        stdout_log_cap: Some(80),
+        stderr_log_cap: None,
+    };
+    let error = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "PUBLISH_FAILED");
+    let status = store.task_status(PROJECT_ID, task_id()).unwrap();
+    assert_eq!(status.state(), TaskState::Open);
+    assert!(matches!(
+        status.last_outcome(),
+        Some(TaskOutcome::Failed { reason }) if reason == "PUBLISH_FAILED"
+    ));
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    assert!(!job_path.join("last.md").exists());
 }
 
 // --- herdr reporter hooks -------------------------------------------------

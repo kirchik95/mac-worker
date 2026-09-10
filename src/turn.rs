@@ -39,6 +39,10 @@ use crate::{
 
 pub const LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 pub const LOG_TAIL_BYTES: usize = 64 * 1024;
+/// stderr.log is not a strict `LOG_CAP_BYTES` file: the pump writes a prefix of
+/// at most `LOG_CAP_BYTES`, then may append up to `LOG_TAIL_BYTES` of the late
+/// stream so a post-cap failure remains visible. Disk bound, not a cap.
+pub const STDERR_LOG_BOUND_BYTES: u64 = LOG_CAP_BYTES + LOG_TAIL_BYTES as u64;
 pub(crate) const MAX_NDJSON_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_ENV_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_ENV_NAME_BYTES: usize = 128;
@@ -692,6 +696,7 @@ impl TurnTerminalHook {
         terminal: TurnTerminal,
         path: TerminalPath,
         exit_code: Option<i32>,
+        protocol_truncated: bool,
         log_truncated: bool,
     ) -> Result<TurnResult, WorkerError> {
         let _ = path;
@@ -705,6 +710,7 @@ impl TurnTerminalHook {
             turn_dir,
             terminal,
             exit_code,
+            protocol_truncated,
             log_truncated,
             section.origin_url(),
         ) {
@@ -856,15 +862,19 @@ impl<'a> TurnPublisher<'a> {
             None => TurnTerminal::Lost,
         };
         let origin_url = task.meta().push_origin_url();
-        self.publish_with_terminal(task, turn_dir, terminal, exit_code, false, origin_url)
+        self.publish_with_terminal(
+            task, turn_dir, terminal, exit_code, false, false, origin_url,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_with_terminal(
         &self,
         task: &PreparedTask,
         turn_dir: &RootedDir,
         terminal: TurnTerminal,
         exit_code: Option<i32>,
+        protocol_truncated: bool,
         log_truncated: bool,
         origin_url: Option<&str>,
     ) -> Result<TurnResult, WorkerError> {
@@ -906,7 +916,10 @@ impl<'a> TurnPublisher<'a> {
         } else {
             scan_stdout_protocol(turn_dir, adapter)?
         };
-        if (log_truncated || scan.truncated) && !last_parses {
+        // Refuse capped or incomplete stdout protocol. Aggregate log truncation
+        // (stderr overflow) is recorded on the turn and must not fail a
+        // complete session/result when last.md is absent.
+        if (protocol_truncated || scan.truncated) && !last_parses {
             return Err(turn_error(
                 "PUBLISH_FAILED",
                 "truncated protocol output cannot be published as a result",

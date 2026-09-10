@@ -935,6 +935,7 @@ impl<'a> JobService<'a> {
                 TerminalPath::HostCancel,
                 None,
                 false,
+                false,
             )
             .map(|_| ())
     }
@@ -1753,6 +1754,7 @@ impl<'a> JobService<'a> {
                         TurnTerminalHook
                             .invoke(
                                 self.store, &job, &meta, section, terminal, path, exit_code, false,
+                                false,
                             )
                             .map(|_| ())
                     } else if task_status.state() == crate::task::TaskState::Active {
@@ -1854,6 +1856,7 @@ impl<'a> JobService<'a> {
                         crate::task::TurnTerminal::Lost,
                         TerminalPath::LostReconciliation,
                         None,
+                        false,
                         false,
                     )
                     .map(|_| ())
