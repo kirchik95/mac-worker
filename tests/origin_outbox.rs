@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::{
@@ -84,7 +84,10 @@ impl SupervisorLauncher for InlineSupervisorLauncher {
     ) -> Result<LaunchCandidate, WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
-        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        let helper = PathBuf::from(env!("CARGO_BIN_EXE_worker"));
+        Supervisor::new(&self.store, &inspector)
+            .with_prepare_turn_helper(helper)
+            .run_with_guard(job_id, guard)?;
         Ok(LaunchCandidate::new(identity))
     }
 }
@@ -560,6 +563,15 @@ fn commit(
     commit_for(store, PROJECT_ID, task_id(1), origin, oid, turn, now)
 }
 
+fn wall_clock_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock precedes the Unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("system clock is outside the supported range")
+}
+
 fn done_agent_script() -> &'static str {
     r#"printf changed > agent.txt; printf '%s\n' '{"type":"thread.started","thread_id":"session-outbox"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"finished\",\"questions\":[],\"files_changed\":[]}"}}'"#
 }
@@ -616,7 +628,7 @@ fn prepared_origin_push_turn(
         .acquire(
             &LeaseAcquireRequest::new(projected.clone()),
             &admissions(),
-            100,
+            wall_clock_millis(),
         )
         .unwrap();
     let meta = TaskMeta::new(TaskMetaInput {

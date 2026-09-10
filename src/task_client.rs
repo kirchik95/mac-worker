@@ -2677,7 +2677,9 @@ impl<'a> TaskClient<'a> {
         &self,
         record: &LocalTaskRecord,
     ) -> Result<LocalTaskRecord, WorkerError> {
-        if record.close_intent().is_some() || record.retains_log_drain_unavailable() {
+        if record.close_intent().is_some()
+            || record.abandon_code() == Some("LOG_DRAIN_UNAVAILABLE")
+        {
             return Ok(record.clone());
         }
         if !record.needs_remote_observation() {

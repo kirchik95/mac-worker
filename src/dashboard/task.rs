@@ -87,7 +87,9 @@ impl MacWorkerTaskSource {
         &self,
         record: &LocalTaskRecord,
     ) -> Result<(LocalTaskRecord, TaskFreshness), ApiError> {
-        if record.close_intent().is_some() || record.retains_log_drain_unavailable() {
+        if record.close_intent().is_some()
+            || record.abandon_code() == Some("LOG_DRAIN_UNAVAILABLE")
+        {
             return Ok((record.clone(), TaskFreshness::Current));
         }
         if !record.needs_remote_observation() {
@@ -194,7 +196,7 @@ pub(crate) fn collect_task_projection(
         let mut task_freshness = TaskFreshness::Current;
         let mut view = record.clone();
         if record.close_intent().is_none()
-            && !record.retains_log_drain_unavailable()
+            && record.abandon_code() != Some("LOG_DRAIN_UNAVAILABLE")
             && record.needs_remote_observation()
             && status.worker().is_some()
         {
