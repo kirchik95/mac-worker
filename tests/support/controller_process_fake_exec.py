@@ -378,6 +378,7 @@ def put_job(data: dict[str, Any], material: dict[str, Any], fingerprint: str, st
 def task_status_from_task(task: dict[str, Any]) -> dict[str, Any]:
     executions = task.get("executions") if isinstance(task.get("executions"), dict) else {}
     order = task.get("execution_order") if isinstance(task.get("execution_order"), list) else []
+    lifecycle = task.get("lifecycle")
     turns = []
     for job_id in order:
         if not isinstance(job_id, str) or job_id not in executions:
@@ -431,8 +432,12 @@ def task_status_from_task(task: dict[str, Any]) -> dict[str, Any]:
             "turns": turns,
             "updated_at_millis": created_at,
         }
+    state = "open" if completed else "active"
+    if lifecycle in ("closed", "abandoned"):
+        state = lifecycle
+    updated = int(task.get("updated_at_millis") or (created_at + (1 if completed else 0)))
     return {
-        "state": "open" if completed else "active",
+        "state": state,
         "last_outcome": {"kind": "done"} if completed else None,
         "worker": task.get("worker") or "mini-1",
         "session_present": completed,
@@ -444,7 +449,7 @@ def task_status_from_task(task: dict[str, Any]) -> dict[str, Any]:
         "files_changed": ["RESULT.txt"] if completed else [],
         "diff_stat": None,
         "turns": turns,
-        "updated_at_millis": created_at + (1 if completed else 0),
+        "updated_at_millis": updated,
     }
 
 
@@ -586,6 +591,8 @@ def handle_prepare(body: dict[str, Any], store: Store) -> dict[str, Any]:
                 ),
             }
         )
+        if isinstance(meta.get("project_id"), str) and meta["project_id"]:
+            task["project_id"] = meta["project_id"]
     return {
         "protocol_version": PROTOCOL_VERSION,
         "head": base_oid,
@@ -669,6 +676,8 @@ def complete_task(body: dict[str, Any], store: Store) -> tuple[dict[str, Any], d
             task["turn_id"] = job_id
         task["worker"] = worker
         task["base_oid"] = task["original_base_oid"]
+        if isinstance(material.get("project_id"), str) and material["project_id"]:
+            task["project_id"] = material["project_id"]
         if not task.get("created_at_millis"):
             task["created_at_millis"] = created
         meta = put_job(
@@ -733,6 +742,43 @@ def handle_log_chunk(body: dict[str, Any], store: Store) -> dict[str, Any]:
         "protocol_version": PROTOCOL_VERSION,
         "chunk": empty_chunk(stream, offset),
     }
+
+
+def fail_control(code: str, message: str) -> None:
+    emit(
+        {
+            "protocol_version": PROTOCOL_VERSION,
+            "error": {"code": code, "message": message},
+        }
+    )
+    raise SystemExit(1)
+
+
+def handle_task_close(body: dict[str, Any], store: Store) -> dict[str, Any]:
+    task_id = first_str(body, "task_id")
+    project_id = first_str(body, "project_id")
+    if not task_id or not project_id:
+        fail("task-close missing task_id/project_id")
+    discard = bool(body.get("discard"))
+    with store.mutate() as data:
+        task = data["tasks"].get(task_id)
+        if not isinstance(task, dict) or not task:
+            fail_control("TASK_NOT_FOUND", "task does not exist")
+        stored_project = task.get("project_id")
+        if isinstance(stored_project, str) and stored_project and stored_project != project_id:
+            fail_control("TASK_NOT_FOUND", "task does not exist in this project")
+        task["project_id"] = project_id
+        current = task_status_from_task(task)
+        if current["state"] == "active":
+            fail_control("TASK_BUSY", "task has an active turn")
+        created = int(task.get("created_at_millis") or 100)
+        if discard:
+            task["lifecycle"] = "abandoned"
+        else:
+            task["lifecycle"] = "closed"
+        task["updated_at_millis"] = int(task.get("updated_at_millis") or created) + 1
+        status = task_status_from_task(task)
+    return {"protocol_version": PROTOCOL_VERSION, "status": status}
 
 
 def handle_task_status(body: dict[str, Any], store: Store) -> dict[str, Any]:
@@ -825,6 +871,7 @@ HANDLERS = {
     "status-logs": handle_status_logs,
     "log-chunk": handle_log_chunk,
     "task-status": handle_task_status,
+    "task-close": handle_task_close,
     "task-diff": handle_task_diff,
     "resolve-or-abandon": handle_resolve,
     "snapshot-verify": handle_snapshot,

@@ -28,11 +28,13 @@ use mac_worker::{
     protocol::{PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     task::{
-        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
+        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
+        TaskMetaInput, TaskState,
     },
     task_store::{
-        TaskDiffRequest, TaskDiffResponse, TaskPrepareRequest, TaskPrepareResponse,
-        TaskSessionRequest, TaskSessionResponse,
+        TaskCloseRequest, TaskCloseResponse, TaskDiffRequest, TaskDiffResponse, TaskPrepareRequest,
+        TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse, TaskStatusRequest,
+        TaskStatusResponse,
     },
     transfer_repo::TransferRepo,
     turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
@@ -545,6 +547,99 @@ fn harness_fake_exec_protocol_and_descendant_git() {
     );
 }
 
+/// Production `host task-close` is a typed control opcode. Missing HANDLERS
+/// entry is INVALID_REQUEST, not a reason to skip close or invent a result.
+#[test]
+fn harness_fake_exec_task_close_is_canonical_and_idempotent() {
+    let fixture = ProcessFixture::new();
+    let source = support_git_repo();
+    let frozen = seed_controller_transfer(&fixture, &source);
+    let frozen_oid: BaseOid = frozen.parse().unwrap();
+
+    let material = plumbing_material("0".repeat(64));
+    let lease_req = LeaseAcquireRequest::new(material.clone())
+        .with_execution_scope(ExecutionScope::task(plumbing_task_id()));
+    let _: LeaseAcquireResponse = fakeexec_ok(
+        &fixture,
+        "host lease-acquire",
+        &serde_json::to_vec(&lease_req).unwrap(),
+    );
+    let _: TaskPrepareResponse = fakeexec_ok(
+        &fixture,
+        "host task-prepare",
+        &serde_json::to_vec(&TaskPrepareRequest::new(
+            plumbing_task_meta(frozen_oid.clone()),
+            plumbing_job_id(),
+            "mini-1",
+        ))
+        .unwrap(),
+    );
+    let close_req = TaskCloseRequest::new(PROJECT_ID, plumbing_task_id(), false);
+    let (active_status, active_stdout, active_stderr) =
+        fixture.run_fakeexec("host task-close", &serde_json::to_vec(&close_req).unwrap());
+    assert!(
+        !active_status.success(),
+        "close of an Active task must not succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&active_stdout),
+        String::from_utf8_lossy(&active_stderr)
+    );
+
+    let (_, turn) = fakeexec_turn(
+        &fixture,
+        FakeexecTurnInput {
+            job_id: plumbing_job_id(),
+            lease_token: plumbing_lease_token(),
+            created_at_millis: 100,
+            turn_number: 1,
+            base: &frozen_oid,
+            prompt: "close after a real fakeexec result",
+            resume: false,
+        },
+    );
+    let head = result_head(&turn);
+    assert_eq!(turn.task().state(), TaskState::Open);
+    assert_eq!(fakeexec_result_commit_count(&fixture), 1);
+
+    let closed: TaskCloseResponse = fakeexec_canonical(
+        &fixture,
+        "host task-close",
+        &serde_json::to_vec(&close_req).unwrap(),
+    );
+    assert_eq!(closed.status().state(), TaskState::Closed);
+    assert_eq!(closed.status().head_oid().unwrap().as_str(), head.as_str());
+    assert_eq!(closed.status().turns().len(), 1);
+    assert_eq!(closed.warnings().len(), 0);
+    assert_eq!(fakeexec_result_commit_count(&fixture), 1);
+
+    let replay: TaskCloseResponse = fakeexec_canonical(
+        &fixture,
+        "host task-close",
+        &serde_json::to_vec(&close_req).unwrap(),
+    );
+    assert_eq!(replay.status().state(), TaskState::Closed);
+    assert_eq!(replay.status().head_oid().unwrap().as_str(), head.as_str());
+    assert_eq!(replay.status().turns().len(), 1);
+    assert_eq!(fakeexec_result_commit_count(&fixture), 1);
+
+    let observed: TaskStatusResponse = fakeexec_canonical(
+        &fixture,
+        "host task-status",
+        &serde_json::to_vec(&TaskStatusRequest::new(PROJECT_ID, plumbing_task_id())).unwrap(),
+    );
+    assert_eq!(observed.status().state(), TaskState::Closed);
+    assert_eq!(
+        observed.status().head_oid().unwrap().as_str(),
+        head.as_str()
+    );
+    assert_eq!(observed.status().turns().len(), 1);
+    assert_eq!(
+        fixture.journal_opcode_count("host task-turn"),
+        1,
+        "close must not start another execution; journal={}",
+        fixture.exec_journal()
+    );
+}
+
 struct FakeexecTurnInput<'a> {
     job_id: JobId,
     lease_token: LeaseToken,
@@ -874,7 +969,13 @@ fn git_refs(git_dir: &Path) -> String {
 
 fn git_has_commit(git_dir: &Path, oid: &str) -> String {
     let output = std::process::Command::new("/usr/bin/git")
-        .args(["--git-dir", &git_dir.to_string_lossy(), "cat-file", "-t", oid])
+        .args([
+            "--git-dir",
+            &git_dir.to_string_lossy(),
+            "cat-file",
+            "-t",
+            oid,
+        ])
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output();
@@ -916,7 +1017,10 @@ fn walk_logs(path: &Path, out: &mut Vec<String>) {
         }
         return;
     }
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     if name.ends_with(".log") || name.ends_with(".json") {
         let bytes = std::fs::read(path).unwrap_or_default();
         out.push(format!(
