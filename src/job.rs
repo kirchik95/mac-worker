@@ -2140,6 +2140,14 @@ impl JobStatus {
         Ok(())
     }
 
+    /// Advances this status to `next`.
+    ///
+    /// A terminal record keeps its command outcome, identities, and
+    /// `error_code` sticky. The only later edits are a single
+    /// `cleanup_error_code` enrichment (`None → Some`) and a later clear
+    /// (`Some → None`). A retried deferred cleanup that succeeds must be
+    /// able to say so; replacing one cleanup error with another is
+    /// rejected.
     pub fn transition(&self, next: Self) -> Result<(), WorkerError> {
         self.validate()?;
         next.validate()?;
@@ -2176,14 +2184,7 @@ impl JobStatus {
             ));
         }
         if self.state.is_terminal() && self.state == next.state {
-            if self.cleanup_error_code.is_none()
-                && next.cleanup_error_code.is_some()
-                && self.exit_code == next.exit_code
-                && self.terminating_signal == next.terminating_signal
-                && self.final_stdout_bytes == next.final_stdout_bytes
-                && self.final_stderr_bytes == next.final_stderr_bytes
-                && self.error_code == next.error_code
-            {
+            if self.cleanup_error_transition_is_allowed(&next) {
                 return Ok(());
             }
             return Err(protocol_error(
@@ -2437,6 +2438,47 @@ impl JobStatus {
         )?;
         self.transition(next.clone())?;
         Ok(next)
+    }
+
+    /// Drops a previously recorded cleanup error after a later deferred
+    /// cleanup succeeds. A retried deferred cleanup that succeeds must be
+    /// able to say so; the command outcome stays untouched.
+    pub fn without_cleanup_error(&self, updated_at_millis: u64) -> Result<Self, WorkerError> {
+        if !self.state.is_terminal() || self.cleanup_error_code.is_none() {
+            return Err(protocol_error(
+                "cleanup error may be cleared from a terminal status once",
+            ));
+        }
+        let next = Self::new(
+            self.state,
+            updated_at_millis,
+            self.supervisor_pid,
+            self.supervisor_start_identity,
+            self.child_pid,
+            self.child_start_identity,
+            self.exit_code,
+            self.terminating_signal,
+            self.final_stdout_bytes,
+            self.final_stderr_bytes,
+            self.error_code.clone(),
+            None,
+        )?;
+        self.transition(next.clone())?;
+        Ok(next)
+    }
+
+    fn cleanup_error_transition_is_allowed(&self, next: &Self) -> bool {
+        let enriching = self.cleanup_error_code.is_none() && next.cleanup_error_code.is_some();
+        let clearing = self.cleanup_error_code.is_some() && next.cleanup_error_code.is_none();
+        (enriching || clearing) && self.same_terminal_result(next)
+    }
+
+    fn same_terminal_result(&self, next: &Self) -> bool {
+        self.exit_code == next.exit_code
+            && self.terminating_signal == next.terminating_signal
+            && self.final_stdout_bytes == next.final_stdout_bytes
+            && self.final_stderr_bytes == next.final_stderr_bytes
+            && self.error_code == next.error_code
     }
 
     pub fn state(&self) -> JobState {
@@ -5409,5 +5451,159 @@ mod tests {
             };
             assert!(serde_json::to_string(&invalid).is_err(), "{message:?}");
         }
+    }
+
+    fn succeeded_status() -> JobStatus {
+        let supervisor = ProcessIdentity::new(101, 1_000_001).unwrap();
+        let child = ProcessIdentity::new(202, 2_000_002).unwrap();
+        JobStatus::accepted(10)
+            .unwrap()
+            .with_supervisor(supervisor, 11)
+            .unwrap()
+            .with_child(child, 12)
+            .unwrap()
+            .into_running(13)
+            .unwrap()
+            .into_succeeded(14, 7, 9)
+            .unwrap()
+    }
+
+    fn failed_status() -> JobStatus {
+        let supervisor = ProcessIdentity::new(101, 1_000_001).unwrap();
+        let child = ProcessIdentity::new(202, 2_000_002).unwrap();
+        JobStatus::accepted(10)
+            .unwrap()
+            .with_supervisor(supervisor, 11)
+            .unwrap()
+            .with_child(child, 12)
+            .unwrap()
+            .into_running(13)
+            .unwrap()
+            .into_failed_exit(14, 7, 3, 4)
+            .unwrap()
+    }
+
+    #[test]
+    fn terminal_status_can_clear_a_cleanup_error_once_other_fields_stay_the_same() {
+        let succeeded = succeeded_status();
+        let failed_cleanup = succeeded
+            .clone()
+            .with_cleanup_error("MUTABLE_CLEANUP_FAILED".into(), 15)
+            .unwrap();
+        let cleared = failed_cleanup.without_cleanup_error(16).unwrap();
+
+        assert_eq!(cleared.state(), JobState::Succeeded);
+        assert_eq!(cleared.exit_code(), Some(0));
+        assert_eq!(cleared.terminating_signal(), None);
+        assert_eq!(cleared.final_stdout_bytes(), Some(7));
+        assert_eq!(cleared.final_stderr_bytes(), Some(9));
+        assert_eq!(cleared.error_code(), None);
+        assert_eq!(cleared.cleanup_error_code(), None);
+        assert_eq!(
+            cleared.supervisor_identity(),
+            failed_cleanup.supervisor_identity()
+        );
+        assert_eq!(cleared.child_identity(), failed_cleanup.child_identity());
+    }
+
+    #[test]
+    fn terminal_status_rejects_clearing_a_cleanup_error_when_other_fields_change() {
+        let failed_cleanup = failed_status()
+            .with_cleanup_error("MUTABLE_CLEANUP_FAILED".into(), 15)
+            .unwrap();
+
+        let supervisor = failed_cleanup.supervisor_identity().unwrap();
+        let child = failed_cleanup.child_identity().unwrap();
+
+        let changed_exit = JobStatus::new(
+            JobState::Failed,
+            16,
+            Some(supervisor.pid()),
+            Some(supervisor.start_time_micros()),
+            Some(child.pid()),
+            Some(child.start_time_micros()),
+            Some(8),
+            None,
+            Some(3),
+            Some(4),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            failed_cleanup.transition(changed_exit).is_err(),
+            "Some → None must not rewrite the exit code"
+        );
+
+        let changed_bytes = JobStatus::new(
+            JobState::Failed,
+            16,
+            Some(supervisor.pid()),
+            Some(supervisor.start_time_micros()),
+            Some(child.pid()),
+            Some(child.start_time_micros()),
+            Some(7),
+            None,
+            Some(30),
+            Some(4),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            failed_cleanup.transition(changed_bytes).is_err(),
+            "Some → None must not rewrite final byte counts"
+        );
+
+        let changed_error = JobStatus::new(
+            JobState::Failed,
+            16,
+            Some(supervisor.pid()),
+            Some(supervisor.start_time_micros()),
+            Some(child.pid()),
+            Some(child.start_time_micros()),
+            Some(7),
+            None,
+            Some(3),
+            Some(4),
+            Some("SUPERVISOR_LOST".into()),
+            None,
+        )
+        .unwrap();
+        assert!(
+            failed_cleanup.transition(changed_error).is_err(),
+            "Some → None must not rewrite error_code"
+        );
+    }
+
+    #[test]
+    fn terminal_status_rejects_replacing_one_cleanup_error_with_another() {
+        let failed_cleanup = succeeded_status()
+            .with_cleanup_error("MUTABLE_CLEANUP_FAILED".into(), 15)
+            .unwrap();
+        assert!(
+            failed_cleanup
+                .with_cleanup_error("LEASE_RELEASE_FAILED".into(), 16)
+                .is_err()
+        );
+
+        let supervisor = failed_cleanup.supervisor_identity().unwrap();
+        let child = failed_cleanup.child_identity().unwrap();
+        let replaced = JobStatus::new(
+            failed_cleanup.state(),
+            16,
+            Some(supervisor.pid()),
+            Some(supervisor.start_time_micros()),
+            Some(child.pid()),
+            Some(child.start_time_micros()),
+            failed_cleanup.exit_code(),
+            failed_cleanup.terminating_signal(),
+            failed_cleanup.final_stdout_bytes(),
+            failed_cleanup.final_stderr_bytes(),
+            failed_cleanup.error_code().map(str::to_owned),
+            Some("LEASE_RELEASE_FAILED".into()),
+        )
+        .unwrap();
+        assert!(failed_cleanup.transition(replaced).is_err());
     }
 }

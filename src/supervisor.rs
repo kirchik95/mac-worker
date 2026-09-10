@@ -2543,7 +2543,7 @@ impl<'a> Supervisor<'a> {
                     )?;
                     return Err(error);
                 }
-                Ok(())
+                clear_cleanup_error(self.store, lease, job, &terminal)
             }
             Err(error) => {
                 enrich_cleanup_error(self.store, lease, job, &terminal, "MUTABLE_CLEANUP_FAILED")?;
@@ -3748,6 +3748,47 @@ fn enrich_cleanup_error(
     )
 }
 
+fn clear_cleanup_error(
+    store: &HostStore,
+    lease: &LeaseRecord,
+    job: &RootedDir,
+    terminal: &JobStatus,
+) -> Result<(), WorkerError> {
+    if terminal.cleanup_error_code().is_none() {
+        return Ok(());
+    }
+    let admission = store.admission_lock(lease.job_id())?;
+    let mut status_guard = store
+        .supervisor_lock_after(&admission, lease.job_id(), true)?
+        .ok_or_else(|| {
+            protocol_code(
+                "STATUS_CAPABILITY_BUSY",
+                "status capability remained busy during terminal cleanup-error clear",
+            )
+        })?;
+    drop(admission);
+    let (bytes, current): (Vec<u8>, JobStatus) =
+        read_canonical_json_with_bytes(job, "status.json")?;
+    if current != *terminal {
+        return Ok(());
+    }
+    let cleared = current.without_cleanup_error(now_millis()?)?;
+    match replace_status(
+        store,
+        lease,
+        &mut status_guard,
+        job,
+        &bytes,
+        &current,
+        &cleared,
+        None,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if is_status_changed(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 struct TurnTerminalWrite<'a> {
     meta: &'a JobMeta,
     section: &'a TurnSection,
@@ -3971,6 +4012,10 @@ fn now_millis() -> Result<u64, WorkerError> {
 
 fn protocol_code(code: &'static str, message: &str) -> WorkerError {
     WorkerError::Protocol(format!("{code}: {message}"))
+}
+
+fn is_status_changed(error: &WorkerError) -> bool {
+    matches!(error, WorkerError::Protocol(message) if message.starts_with("STATUS_CHANGED:"))
 }
 
 fn injected_supervisor_fault(boundary: &str) -> WorkerError {

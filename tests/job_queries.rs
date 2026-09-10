@@ -1543,13 +1543,91 @@ fn after_cleanup_intent_commit_whole_incoming_job_terminal_retries() {
         .status(lease.job_id())
         .unwrap();
     assert_eq!(response.status().state(), status.state());
-    assert_eq!(
-        response.status().cleanup_error_code(),
-        Some("MUTABLE_CLEANUP_FAILED")
-    );
+    assert_eq!(response.status().cleanup_error_code(), None);
     assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
     assert!(!incoming_job.exists());
     assert_journal_empty_or_absent(&incoming_namespace);
+}
+
+#[test]
+fn retried_terminal_cleanup_clears_cleanup_error_after_an_injected_fault() {
+    // Catches a succeeded job whose first deferred cleanup failed (FIFO residue
+    // or an injected intent-commit fault): status.json kept
+    // MUTABLE_CLEANUP_FAILED even after a later read finished cleanup and
+    // released the lease.
+    for later_caller in ["status", "log_chunk", "reconcile"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp
+            .path()
+            .join(format!("retried-cleanup-clear-{later_caller}"));
+        let (store, lease, _request) = indexed_identityless_job(&root);
+        let status = JobStatus::accepted(10)
+            .unwrap()
+            .with_supervisor(identity(97_201), 11)
+            .unwrap()
+            .with_child(identity(97_202), 12)
+            .unwrap()
+            .into_running(13)
+            .unwrap()
+            .into_succeeded(14, 0, 0)
+            .unwrap();
+        install_job_status(&store, &lease, &status, true);
+        drop(store);
+
+        let faulted =
+            HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+                .unwrap();
+        let first = JobService::new(&faulted, &RejectLauncher)
+            .status(lease.job_id())
+            .unwrap();
+        assert_eq!(first.status().state(), JobState::Succeeded);
+        assert_eq!(
+            first.status().cleanup_error_code(),
+            Some("MUTABLE_CLEANUP_FAILED")
+        );
+        assert_eq!(
+            LeaseService::new(&faulted).load().unwrap(),
+            Some(lease.clone())
+        );
+        drop(faulted);
+
+        let reopened = HostStore::open(&root).unwrap();
+        let service = JobService::new(&reopened, &RejectLauncher);
+        match later_caller {
+            "status" => {
+                let response = service.status(lease.job_id()).unwrap();
+                assert_eq!(response.status().state(), JobState::Succeeded);
+                assert_eq!(response.status().cleanup_error_code(), None);
+            }
+            "log_chunk" => {
+                let chunk = service
+                    .read_log(lease.job_id(), LogStream::Stdout, 0, 64)
+                    .unwrap();
+                assert_eq!(chunk.decoded_bytes().unwrap(), b"");
+                assert_eq!(
+                    read_job_status(&reopened, &lease).cleanup_error_code(),
+                    None
+                );
+            }
+            "reconcile" => {
+                let response = service.reconcile_job(lease.job_id()).unwrap();
+                assert_eq!(response.status().state(), JobState::Succeeded);
+                assert_eq!(response.status().cleanup_error_code(), None);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            read_job_status(&reopened, &lease).cleanup_error_code(),
+            None,
+            "{later_caller}"
+        );
+        assert_eq!(
+            LeaseService::new(&reopened).load().unwrap(),
+            None,
+            "{later_caller}"
+        );
+        assert_mutable_job_scopes_absent(&reopened, &lease);
+    }
 }
 
 #[test]
