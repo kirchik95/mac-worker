@@ -1551,6 +1551,8 @@ fn workers_render_a_turn_auth_failure_reason() {
                     herdr: None,
                 }),
                 facts_age_millis: Some(0),
+                configured_slots: 0,
+                busy_slots: 0,
             }),
             missing_capabilities: Vec::new(),
             error_code: None,
