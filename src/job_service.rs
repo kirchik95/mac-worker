@@ -689,12 +689,49 @@ impl<'a> JobService<'a> {
         if let Some(boundary) = &self.log_read_boundary {
             boundary();
         }
+        Self::log_chunk_from(&authoritative.directory, stream, offset, limit)
+    }
+
+    pub fn status_logs(
+        &self,
+        request: &StatusLogsRequest,
+    ) -> Result<StatusLogsResponse, WorkerError> {
+        request.validate()?;
+        // One validated AuthoritativeJob for status and both bounded reads.
+        // Separate status+read_log lookups retry cleanup three times; a
+        // one-shot fault then succeeds on the second read, so the response
+        // status and the busy-lease proof diverge.
+        let authoritative =
+            self.authoritative_job_with_supervisor_ensure(request.job_id(), true, false)?;
+        if let Some(boundary) = &self.log_read_boundary {
+            boundary();
+        }
+        let stdout = Self::log_chunk_from(
+            &authoritative.directory,
+            LogStream::Stdout,
+            request.stdout_offset(),
+            request.stdout_limit(),
+        )?;
+        let stderr = Self::log_chunk_from(
+            &authoritative.directory,
+            LogStream::Stderr,
+            request.stderr_offset(),
+            request.stderr_limit(),
+        )?;
+        StatusLogsResponse::new(authoritative.into_response(), stdout, stderr)
+    }
+
+    fn log_chunk_from(
+        directory: &RootedDir,
+        stream: LogStream,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LogChunk, WorkerError> {
         let name = match stream {
             LogStream::Stdout => "stdout.log",
             LogStream::Stderr => "stderr.log",
         };
-        let bytes = authoritative
-            .directory
+        let bytes = directory
             .read_private_regular_chunk(
                 name,
                 offset,
@@ -711,27 +748,6 @@ impl<'a> JobService<'a> {
                 }
             })?;
         LogChunk::new(stream, offset, bytes)
-    }
-
-    pub fn status_logs(
-        &self,
-        request: &StatusLogsRequest,
-    ) -> Result<StatusLogsResponse, WorkerError> {
-        request.validate()?;
-        let status = self.status(request.job_id())?;
-        let stdout = self.read_log(
-            request.job_id(),
-            LogStream::Stdout,
-            request.stdout_offset(),
-            request.stdout_limit(),
-        )?;
-        let stderr = self.read_log(
-            request.job_id(),
-            LogStream::Stderr,
-            request.stderr_offset(),
-            request.stderr_limit(),
-        )?;
-        StatusLogsResponse::new(status, stdout, stderr)
     }
 
     pub fn reconcile_job(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {

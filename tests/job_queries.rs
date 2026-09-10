@@ -1590,10 +1590,13 @@ fn terminal_cleanup_removes_a_fifo_left_in_tmp() {
 
 #[test]
 fn terminal_status_and_log_chunk_succeed_when_mutable_cleanup_still_fails() {
-    // Catches log_chunk/status going through supervisor-ensure cleanup and
-    // turning a leftover FIFO (or any injected cleanup fault) into HOST_IO, so
-    // the laptop can never drain an already-terminal turn.
-    for caller in ["status", "log_chunk", "reconcile"] {
+    // Catches log_chunk/status/status_logs going through supervisor-ensure
+    // cleanup and turning a leftover FIFO (or any injected cleanup fault) into
+    // HOST_IO, so the laptop can never drain an already-terminal turn.
+    // Combined status_logs must reuse one AuthoritativeJob so a one-shot
+    // cleanup fault stays visible on the returned status and the busy lease
+    // until a later independent poll/reconcile. Reconcile still errors.
+    for caller in ["status", "log_chunk", "status_logs", "reconcile"] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join(format!("terminal-cleanup-{caller}"));
         let (store, lease, _request) = indexed_identityless_job(&root);
@@ -1631,6 +1634,18 @@ fn terminal_status_and_log_chunk_succeed_when_mutable_cleanup_still_fails() {
                     read_job_status(&faulted, &lease).cleanup_error_code(),
                     Some("MUTABLE_CLEANUP_FAILED")
                 );
+            }
+            "status_logs" => {
+                let combined = service
+                    .status_logs(&StatusLogsRequest::new(lease.job_id(), 0, 64, 0, 64))
+                    .unwrap();
+                assert_eq!(combined.status().status().state(), JobState::Succeeded);
+                assert_eq!(
+                    combined.status().status().cleanup_error_code(),
+                    Some("MUTABLE_CLEANUP_FAILED")
+                );
+                assert_eq!(combined.stdout().decoded_bytes().unwrap(), b"");
+                assert_eq!(combined.stderr().decoded_bytes().unwrap(), b"");
             }
             "reconcile" => {
                 let error = service.reconcile_job(lease.job_id()).unwrap_err();
