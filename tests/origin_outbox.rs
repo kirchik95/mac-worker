@@ -21,8 +21,9 @@ use mac_worker::{
     git_transport::{GitTransport, OBJECT_STORE_SYNC_RECEIPT},
     host_store::{HostGc, HostStore, HostStoreWritePoint},
     job::{
-        ClientId, CommandSpec, ExecutionScope, JobId, JobState, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseRecord, LeaseToken, RequestFingerprintMaterial, SubmitRequest,
+        CancelRequest, ClientId, CommandSpec, ExecutionScope, JobId, JobState, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseRecord, LeaseToken, RequestFingerprintMaterial,
+        StatusLogsRequest, SubmitRequest,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService, SlotState},
@@ -1331,6 +1332,209 @@ fn submit_turn_visible_intent_before_parent_sync_stays_recoverable() {
     ));
     let delivered = outbox(&store).pump_due(1).unwrap();
     assert_eq!(delivered[0].state(), DeliveryState::Delivered);
+}
+
+fn reopen_two_shot_faults(host: &Path, point: HostStoreWritePoint) -> HostStore {
+    HostStore::open_with_write_faults(host, point, point).unwrap()
+}
+
+fn assert_own_turn_still_recoverable(store: &HostStore, request: &TaskTurnRequest) {
+    let job = request.submit().material().job_id();
+    let status = TaskStore::new(store, &SystemProcessRunner)
+        .load_status(PROJECT_ID, task_id(1))
+        .unwrap();
+    assert_ne!(status.last_outcome(), Some(&TaskOutcome::Done));
+    assert!(
+        !matches!(
+            status.last_outcome(),
+            Some(TaskOutcome::Failed { reason }) if reason == "PUBLISH_FAILED"
+        ),
+        "own turn must stay recoverable, got {:?}",
+        status.last_outcome()
+    );
+    assert_eq!(
+        LeaseService::new(store).occupancy().unwrap().slot_state,
+        SlotState::Busy
+    );
+    assert!(
+        store
+            .job(PROJECT_ID, WORKTREE_ID, job)
+            .unwrap()
+            .join("execution.json")
+            .is_file()
+    );
+    let error = TaskStore::new(store, &SystemProcessRunner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(1), false))
+        .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_BUSY");
+}
+
+fn probe_recovery_paths_while_faults_stay_armed(
+    host: &Path,
+    request: &TaskTurnRequest,
+    point: HostStoreWritePoint,
+) {
+    let job = request.submit().material().job_id();
+    let material = request.submit().material();
+    let fingerprint = request.submit().request_fingerprint().clone();
+
+    let store = reopen_two_shot_faults(host, point);
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    JobService::new(&store, &launcher).status(job).unwrap_err();
+    assert_own_turn_still_recoverable(&store, request);
+    drop(store);
+
+    let store = reopen_two_shot_faults(host, point);
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    JobService::new(&store, &launcher)
+        .status_logs(&StatusLogsRequest::new(job, 0, 0, 0, 0))
+        .unwrap_err();
+    assert_own_turn_still_recoverable(&store, request);
+    drop(store);
+
+    let store = reopen_two_shot_faults(host, point);
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    JobService::new(&store, &launcher)
+        .reconcile_job(job)
+        .unwrap_err();
+    assert_own_turn_still_recoverable(&store, request);
+    drop(store);
+
+    let store = reopen_two_shot_faults(host, point);
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    JobService::new(&store, &launcher)
+        .cancel(
+            CancelRequest::new(
+                material.job_id(),
+                material.client_id(),
+                material.lease_token(),
+                fingerprint,
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_own_turn_still_recoverable(&store, request);
+    drop(store);
+
+    let store = reopen_two_shot_faults(host, point);
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    JobService::new(&store, &launcher)
+        .submit_turn(request.clone())
+        .unwrap_err();
+    assert_own_turn_still_recoverable(&store, request);
+}
+
+fn recover_after_removing_faults(host: &Path, request: TaskTurnRequest) {
+    let store = HostStore::open(host).unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(response.task().summary(), Some("finished"));
+    assert_eq!(
+        LeaseService::new(&store).occupancy().unwrap().slot_state,
+        SlotState::Idle
+    );
+    let pin = OriginOutbox::delivery_refs(task_id(1), turn_id(2));
+    assert!(ref_exists(
+        store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
+        &pin
+    ));
+    let delivered = outbox(&store).pump_due(1).unwrap();
+    assert_eq!(delivered[0].state(), DeliveryState::Delivered);
+}
+
+#[test]
+fn persistent_intent_publish_fault_keeps_payload_across_recovery_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let store = HostStore::open(&host).unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"one\n");
+    source.commit_all("one");
+    let oid: BaseOid = git(source.root(), &["rev-parse", "HEAD"]).parse().unwrap();
+    push_base(&source, &store, PROJECT_ID, task_id(1), "HEAD");
+    let (_origin_dir, origin) = origin_bare();
+    let origin_url = file_url(&origin);
+    let request = prepared_origin_push_turn(&store, &origin_url, &oid);
+    drop(store);
+    let point = HostStoreWritePoint::AfterOutboxIntentPublish;
+    let store = reopen_two_shot_faults(&host, point);
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    JobService::new(&store, &launcher)
+        .submit_turn(request.clone())
+        .unwrap_err();
+    assert_own_turn_still_recoverable(&store, &request);
+    let delivery = outbox(&store)
+        .dto(PROJECT_ID, task_id(1))
+        .unwrap()
+        .expect("intent name is visible before parent sync");
+    drop(store);
+    probe_recovery_paths_while_faults_stay_armed(&host, &request, point);
+    let store = HostStore::open(&host).unwrap();
+    assert_eq!(
+        outbox(&store)
+            .dto(PROJECT_ID, task_id(1))
+            .unwrap()
+            .map(|later| later.state()),
+        Some(delivery.state())
+    );
+    drop(store);
+    recover_after_removing_faults(&host, request);
+}
+
+#[test]
+fn persistent_pin_fsync_fault_keeps_payload_across_recovery_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let store = HostStore::open(&host).unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"one\n");
+    source.commit_all("one");
+    let oid: BaseOid = git(source.root(), &["rev-parse", "HEAD"]).parse().unwrap();
+    push_base(&source, &store, PROJECT_ID, task_id(1), "HEAD");
+    let (_origin_dir, origin) = origin_bare();
+    let origin_url = file_url(&origin);
+    let request = prepared_origin_push_turn(&store, &origin_url, &oid);
+    drop(store);
+    let point = HostStoreWritePoint::AfterOutboxUpdateRef;
+    let store = reopen_two_shot_faults(&host, point);
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    JobService::new(&store, &launcher)
+        .submit_turn(request.clone())
+        .unwrap_err();
+    assert_own_turn_still_recoverable(&store, &request);
+    let pin = OriginOutbox::delivery_refs(task_id(1), turn_id(2));
+    assert!(ref_exists(
+        store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
+        &pin
+    ));
+    drop(store);
+    probe_recovery_paths_while_faults_stay_armed(&host, &request, point);
+    let store = HostStore::open(&host).unwrap();
+    assert!(ref_exists(
+        store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
+        &pin
+    ));
+    drop(store);
+    recover_after_removing_faults(&host, request);
 }
 
 #[test]

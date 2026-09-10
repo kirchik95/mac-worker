@@ -2688,11 +2688,12 @@ impl<'a> Supervisor<'a> {
             )
             .map(|_| ());
         let unfinished_publication = publication.is_err()
-            && crate::task_store::TaskStore::new(self.store, &crate::process::SystemProcessRunner)
-                .load_status(section.project_id(), section.turn().task_id())
-                .ok()
-                .and_then(|status| status.turns().last().cloned())
-                .is_some_and(|turn| turn.turn_id() == meta.job_id() && turn.terminal().is_none());
+            && crate::turn::own_turn_publication_still_recoverable(
+                self.store,
+                section.project_id(),
+                section.turn().task_id(),
+                meta.job_id(),
+            );
         let payload_removal = if unfinished_publication {
             Ok(())
         } else if job.entry_exists("execution.json")? {

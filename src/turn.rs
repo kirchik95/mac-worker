@@ -682,6 +682,25 @@ pub enum TerminalPath {
     LostReconciliation,
 }
 
+/// True when a publication error must keep `execution.json` and the own lease:
+/// the exact own turn is still nonterminal, or the task status cannot be read.
+pub(crate) fn own_turn_publication_still_recoverable(
+    store: &HostStore,
+    project_id: &str,
+    task_id: TaskId,
+    job_id: JobId,
+) -> bool {
+    match TaskStore::new(store, &crate::process::SystemProcessRunner)
+        .load_status(project_id, task_id)
+    {
+        Ok(status) => status
+            .turns()
+            .last()
+            .is_some_and(|turn| turn.turn_id() == job_id && turn.terminal().is_none()),
+        Err(_) => true,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TurnTerminalHook;
 

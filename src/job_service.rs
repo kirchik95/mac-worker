@@ -32,7 +32,8 @@ use crate::{
     task::PublishMode,
     task_store::{TaskCancelRequest, TaskStore},
     turn::{
-        TaskTurnRequest, TaskTurnResponse, TerminalPath, TurnReceipt, TurnSection, TurnTerminalHook,
+        TaskTurnRequest, TaskTurnResponse, TerminalPath, TurnReceipt, TurnSection,
+        TurnTerminalHook, own_turn_publication_still_recoverable,
     },
 };
 
@@ -828,6 +829,15 @@ impl<'a> JobService<'a> {
                 let terminal = current.status.clone();
                 let meta = current.meta.clone();
                 let job = current.directory;
+                let publication =
+                    self.recover_terminal_turn_publication(lease, &job, &meta, &terminal)?;
+                if let Err(error) = publication
+                    && self.retain_execution_after_publication_error(&job, lease)
+                {
+                    drop(supervisor);
+                    drop(admission);
+                    return Err(error);
+                }
                 drop(supervisor);
                 drop(admission);
                 self.cleanup_and_release_reconciled(lease, &job, &terminal)?;
@@ -1803,39 +1813,29 @@ impl<'a> JobService<'a> {
         }
         if !identityless_accepted {
             if current.state().is_terminal() {
-                let turn_section = if job.entry_exists("execution.json")? {
-                    let payload: ExecutionPayload = read_canonical_json(&job, "execution.json")?;
-                    payload.validate_for_durable_job(&lease, &meta)?;
-                    payload.turn().cloned()
-                } else {
-                    None
-                };
-                let publication = if let Some(section) = turn_section.as_ref() {
-                    let task_store = TaskStore::new(self.store, &SystemProcessRunner);
-                    let task_status =
-                        task_store.load_status(section.project_id(), section.turn().task_id())?;
-                    let pending = task_status.turns().last().is_some_and(|turn| {
-                        turn.turn_id() == lease.job_id() && turn.terminal().is_none()
-                    });
-                    if task_status.state() == crate::task::TaskState::Active && pending {
-                        let (terminal, path, exit_code) = terminal_turn_recovery(&current)?;
-                        TurnTerminalHook
-                            .invoke(
-                                self.store, &job, &meta, section, terminal, path, exit_code, false,
-                                false,
-                            )
-                            .map(|_| ())
-                    } else if task_status.state() == crate::task::TaskState::Active {
-                        return Err(protocol_code(
-                            "TASK_TURN_CONFLICT",
-                            "terminal job retains a turn payload but task has another active turn",
-                        ));
+                let publication =
+                    self.recover_terminal_turn_publication(&lease, &job, &meta, &current)?;
+                if let Err(error) = publication {
+                    if self.retain_execution_after_publication_error(&job, &lease) {
+                        drop(admission);
+                        drop(supervisor);
+                        return Err(error);
+                    }
+                    let payload_removal = if job.entry_exists("execution.json")? {
+                        self.store
+                            .remove_owned_regular_committed(&job, "execution.json")
                     } else {
                         Ok(())
-                    }
-                } else {
-                    Ok(())
-                };
+                    };
+                    drop(admission);
+                    drop(supervisor);
+                    let cleanup = match payload_removal {
+                        Ok(()) => self.cleanup_and_release_reconciled(&lease, &job, &current),
+                        Err(io_error) => Err(WorkerError::Io(io_error)),
+                    };
+                    let _ = cleanup;
+                    return Err(error);
+                }
                 let payload_removal = if job.entry_exists("execution.json")? {
                     self.store
                         .remove_owned_regular_committed(&job, "execution.json")
@@ -1848,10 +1848,6 @@ impl<'a> JobService<'a> {
                     Ok(()) => self.cleanup_and_release_reconciled(&lease, &job, &current),
                     Err(error) => Err(WorkerError::Io(error)),
                 };
-                if let Err(error) = publication {
-                    let _ = cleanup;
-                    return Err(error);
-                }
                 // Terminal log/status reads still retry cleanup so a leftover
                 // FIFO can be drained later, but they must not fail the read.
                 // Reconcile and resolution keep returning the cleanup error so
@@ -1985,6 +1981,64 @@ impl<'a> JobService<'a> {
                 let observed = read_mutable_canonical_json(&job, "status.json").unwrap_or(current);
                 AuthoritativeJob::new(job, meta, observed)
             }
+        }
+    }
+
+    fn recover_terminal_turn_publication(
+        &self,
+        lease: &LeaseRecord,
+        job: &RootedDir,
+        meta: &JobMeta,
+        current: &JobStatus,
+    ) -> Result<Result<(), WorkerError>, WorkerError> {
+        let turn_section = if job.entry_exists("execution.json")? {
+            let payload: ExecutionPayload = read_canonical_json(job, "execution.json")?;
+            payload.validate_for_durable_job(lease, meta)?;
+            payload.turn().cloned()
+        } else {
+            None
+        };
+        let Some(section) = turn_section.as_ref() else {
+            return Ok(Ok(()));
+        };
+        let task_store = TaskStore::new(self.store, &SystemProcessRunner);
+        let task_status = task_store.load_status(section.project_id(), section.turn().task_id())?;
+        let pending = task_status
+            .turns()
+            .last()
+            .is_some_and(|turn| turn.turn_id() == lease.job_id() && turn.terminal().is_none());
+        if task_status.state() == crate::task::TaskState::Active && pending {
+            let (terminal, path, exit_code) = terminal_turn_recovery(current)?;
+            Ok(TurnTerminalHook
+                .invoke(
+                    self.store, job, meta, section, terminal, path, exit_code, false, false,
+                )
+                .map(|_| ()))
+        } else if task_status.state() == crate::task::TaskState::Active {
+            Err(protocol_code(
+                "TASK_TURN_CONFLICT",
+                "terminal job retains a turn payload but task has another active turn",
+            ))
+        } else {
+            Ok(Ok(()))
+        }
+    }
+
+    fn retain_execution_after_publication_error(
+        &self,
+        job: &RootedDir,
+        lease: &LeaseRecord,
+    ) -> bool {
+        match read_canonical_json::<ExecutionPayload>(job, "execution.json") {
+            Ok(payload) => payload.turn().is_some_and(|section| {
+                own_turn_publication_still_recoverable(
+                    self.store,
+                    section.project_id(),
+                    section.turn().task_id(),
+                    lease.job_id(),
+                )
+            }),
+            Err(_) => job.entry_exists("execution.json").unwrap_or(true),
         }
     }
 
