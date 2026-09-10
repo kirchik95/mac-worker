@@ -1295,10 +1295,17 @@ impl LocalTaskRecord {
         self.abandon_code.as_deref()
     }
 
-    /// Local drain failure is durable evidence. Remote Closed/Done must not
-    /// replace it: the remaining stdout/stderr were never proven.
+    /// Local drain failure is durable evidence for the current turn. A later
+    /// follow-up turn is a new publication boundary: remote Closed/Done must
+    /// not replace the failed turn, but must not freeze every later turn.
     pub fn retains_log_drain_unavailable(&self) -> bool {
         self.abandon_code() == Some("LOG_DRAIN_UNAVAILABLE")
+            && self.status().turns().last().is_some_and(|turn| {
+                matches!(
+                    turn.outcome(),
+                    Some(TaskOutcome::Failed { reason }) if reason == "LOG_DRAIN_UNAVAILABLE"
+                )
+            })
     }
 
     pub fn submission_rollback_turn_id(&self) -> Option<TurnId> {
@@ -1333,6 +1340,9 @@ impl LocalTaskRecord {
     }
 
     pub fn with_status(&self, status: TaskStatus) -> Result<Self, WorkerError> {
+        // Keep fetched_head as last successful import history. Presence is not
+        // proof the current turn's result was imported; follow-up recovery
+        // must fetch this turn before releasing its base pin.
         let mut replacement = Self::new(
             self.meta.clone(),
             status,

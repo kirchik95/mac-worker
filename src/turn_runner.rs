@@ -30,7 +30,7 @@ use crate::{
     supervisor::SystemProcessInspector,
     task::{
         LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId,
-        TurnSummary,
+        TurnSummary, TurnTerminal,
     },
     task_store::{
         TaskCancelRequest, TaskPrebindRequest, TaskPrepareRequest, TaskSessionRequest,
@@ -639,13 +639,18 @@ impl<'a> TurnRunner<'a> {
         {
             if let Some(completion) = log.completion() {
                 let exit_code = turn_exit_code(&completion.outcome);
-                transfer.release_base(self.runner, task_id)?;
-                self.client_state.record_runner(task_id, None)?;
-                self.client_state
-                    .remove_task_turn_after_terminal(turn_id, owner)?;
-                self.client_state.remove_turn_prompt(task_id, turn_id)?;
+                let status = finalize_completed_turn(
+                    self.client_state,
+                    self.runner,
+                    self.config,
+                    self.paths,
+                    task_id,
+                    turn_id,
+                    owner,
+                    completion,
+                )?;
                 return Ok(TurnOutcomeReport {
-                    status: initial_record.status().clone(),
+                    status,
                     events: vec![],
                     exit_code,
                 });
@@ -1020,17 +1025,7 @@ impl<'a> TurnRunner<'a> {
             match self.follow_remote(worker, task_id, turn_id, task_status, &mut log, follow) {
                 Ok(status) => status,
                 Err(error) => {
-                    return Err(self.recover_undrainable(
-                        task_id,
-                        turn_id,
-                        owner,
-                        &initial_record,
-                        &project,
-                        &transfer,
-                        worker,
-                        &mut log,
-                        error,
-                    ));
+                    return Err(self.recover_undrainable(task_id, turn_id, owner, &mut log, error));
                 }
             };
         self.finish_terminal(
@@ -1067,17 +1062,7 @@ impl<'a> TurnRunner<'a> {
         ) {
             Ok(response) => response.status().clone(),
             Err(error) => {
-                return Err(self.recover_undrainable(
-                    task_id,
-                    turn_id,
-                    owner,
-                    initial_record,
-                    project,
-                    &transfer,
-                    worker,
-                    log,
-                    error,
-                ));
+                return Err(self.recover_undrainable(task_id, turn_id, owner, log, error));
             }
         };
         self.persist_status(task_id, status.clone())?;
@@ -1089,17 +1074,7 @@ impl<'a> TurnRunner<'a> {
         let terminal = match self.follow_remote(worker, task_id, turn_id, status, log, follow) {
             Ok(status) => status,
             Err(error) => {
-                return Err(self.recover_undrainable(
-                    task_id,
-                    turn_id,
-                    owner,
-                    initial_record,
-                    project,
-                    &transfer,
-                    worker,
-                    log,
-                    error,
-                ));
+                return Err(self.recover_undrainable(task_id, turn_id, owner, log, error));
             }
         };
         self.finish_terminal(
@@ -1382,75 +1357,34 @@ impl<'a> TurnRunner<'a> {
 
     /// JOB_NOT_FOUND / TASK_NOT_FOUND after acceptance means remaining
     /// stdout/stderr cannot be proven. Finish the journal as an explicit
-    /// undrainable failure (`drained=false`) so `task logs -f` stops, keep
-    /// the local Failed outcome through later refresh, try to import a
-    /// still-reachable result, and only then release the base pin.
-    #[allow(clippy::too_many_arguments)]
+    /// undrainable failure (`drained=false`) so `task logs -f` stops, then
+    /// publish local Failed/abandon_code through the shared finalizer. A crash
+    /// after the journal write is recovered by the same finalizer.
     fn recover_undrainable(
         &self,
         task_id: TaskId,
         turn_id: TurnId,
         owner: ProcessIdentity,
-        initial_record: &LocalTaskRecord,
-        project: &ProjectState,
-        transfer: &TransferRepo,
-        worker: &WorkerEntry,
         log: &mut LogWriter,
         error: WorkerError,
     ) -> WorkerError {
         let mapped = map_log_drain_unavailable(error);
         if mapped.public_code() == "LOG_DRAIN_UNAVAILABLE"
-            && let Err(persist_error) = self.persist_log_drain_unavailable(
-                task_id,
-                turn_id,
-                owner,
-                initial_record,
-                project,
-                transfer,
-                worker,
-                log,
-            )
+            && let Err(persist_error) =
+                self.persist_log_drain_unavailable(task_id, turn_id, owner, log)
         {
             return persist_error;
         }
         mapped
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn persist_log_drain_unavailable(
         &self,
         task_id: TaskId,
         turn_id: TurnId,
         owner: ProcessIdentity,
-        initial_record: &LocalTaskRecord,
-        project: &ProjectState,
-        transfer: &TransferRepo,
-        worker: &WorkerEntry,
         log: &mut LogWriter,
     ) -> Result<(), WorkerError> {
-        let imported = GitTransport::new(self.runner)
-            .fetch_result(
-                worker,
-                self.client_state.client_id(),
-                initial_record.meta().project_id(),
-                task_id,
-                transfer.path(),
-            )
-            .ok()
-            .and_then(|_| {
-                transfer
-                    .import_result(
-                        self.runner,
-                        &project.context.common_dir,
-                        worker.name.as_str(),
-                        task_id,
-                    )
-                    .ok()
-                    .map(|receipt| receipt.head().clone())
-            });
-        if imported.is_some() {
-            transfer.release_base(self.runner, task_id)?;
-        }
         let workers = self
             .config
             .workers
@@ -1483,21 +1417,19 @@ impl<'a> TurnRunner<'a> {
             },
             line.as_bytes(),
         )?;
-        let record = self.client_state.load_task(task_id)?;
-        let status = publication_failure_status(record.status(), outcome, now_millis()?)?;
-        let record = record
-            .with_status(status)?
-            .with_abandon_code(Some("LOG_DRAIN_UNAVAILABLE".into()))?;
-        let record = if let Some(head) = imported {
-            record.with_fetched_head(Some(head))?
-        } else {
-            record
-        };
-        self.client_state.update_task(record)?;
-        self.client_state.record_runner(task_id, None)?;
-        self.client_state
-            .remove_task_turn_after_terminal(turn_id, owner)?;
-        self.client_state.remove_turn_prompt(task_id, turn_id)?;
+        let completion = log.completion().cloned().ok_or_else(|| {
+            task_error("LOG_CHECKPOINT_INVALID", "undrainable journal is missing")
+        })?;
+        finalize_completed_turn(
+            self.client_state,
+            self.runner,
+            self.config,
+            self.paths,
+            task_id,
+            turn_id,
+            owner,
+            &completion,
+        )?;
         Ok(())
     }
 
@@ -1657,6 +1589,186 @@ impl<'a> TurnRunner<'a> {
     ) -> Result<Vec<CandidateObservation>, WorkerError> {
         crate::admission::observe_admission(self.runner, self.config, self.client_state, preference)
     }
+}
+
+/// Journal completion is not by itself proof that local status, abandon_code,
+/// fetched_head, or the base pin were published. Both reconcile and a replacement
+/// runner must run this finalizer: restore an undrainable Failed record when
+/// needed, import this turn's result, release the pin only after that import,
+/// then retire the row.
+///
+/// `say` refuses with TASK_BUSY while this queue row remains, so a follow-up
+/// cannot appear until retirement. `fetched_head` is still kept across
+/// `with_status`/`say` as last successful import history; it is not proof that
+/// the current turn's result was imported. Publication uses expected-record CAS
+/// across the remote fetch, and rewrites only this journal's turn.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_completed_turn(
+    client_state: &ClientStateStore,
+    runner: &dyn ProcessRunner,
+    config: &Config,
+    paths: &PathLayout,
+    task_id: TaskId,
+    turn_id: TurnId,
+    owner: ProcessIdentity,
+    completion: &Completion,
+) -> Result<TaskStatus, WorkerError> {
+    let record = client_state.load_task(task_id)?;
+    let (project, transfer) = transfer_for_completed_turn(client_state, runner, paths, &record)?;
+    if completion.is_undrainable() {
+        let imported = try_import_completed_result(
+            client_state,
+            runner,
+            config,
+            &project,
+            &transfer,
+            &record,
+            task_id,
+        );
+        let mut next = record.clone();
+        if !record.retains_log_drain_unavailable() {
+            let status = undrainable_failure_status(record.status(), turn_id, now_millis()?)?;
+            next = next
+                .with_status(status)?
+                .with_abandon_code(Some("LOG_DRAIN_UNAVAILABLE".into()))?;
+        }
+        if let Some(head) = imported.clone() {
+            next = next.with_fetched_head(Some(head))?;
+        }
+        if next != record {
+            client_state.undrainable_record_fault()?;
+            if !client_state.update_task_if_current(&record, next)? {
+                return Err(task_error(
+                    "TASK_BUSY",
+                    "task record changed during undrainable finalization",
+                ));
+            }
+        }
+        let published = client_state.load_task(task_id)?;
+        if imported.is_some() {
+            transfer.release_base(runner, task_id)?;
+        }
+        retire_completed_turn(client_state, turn_id, owner, task_id)?;
+        return Ok(published.status().clone());
+    }
+    transfer.release_base(runner, task_id)?;
+    retire_completed_turn(client_state, turn_id, owner, task_id)?;
+    Ok(client_state.load_task(task_id)?.status().clone())
+}
+
+fn transfer_for_completed_turn(
+    client_state: &ClientStateStore,
+    runner: &dyn ProcessRunner,
+    paths: &PathLayout,
+    record: &LocalTaskRecord,
+) -> Result<(ProjectState, TransferRepo), WorkerError> {
+    let project_path = match client_state.task_project_path(record)? {
+        Some(path) => path,
+        None => std::env::current_dir().map_err(WorkerError::Io)?,
+    };
+    let project = ProjectState::load_for_task(runner, &project_path, &[], record.meta())?;
+    require_project_match(
+        &project,
+        record.meta().project_id(),
+        record.meta().worktree_id(),
+    )?;
+    let transfer = TransferRepo::open_or_create(&paths.cache, &project.context.common_dir)?;
+    Ok((project, transfer))
+}
+
+fn try_import_completed_result(
+    client_state: &ClientStateStore,
+    runner: &dyn ProcessRunner,
+    config: &Config,
+    project: &ProjectState,
+    transfer: &TransferRepo,
+    record: &LocalTaskRecord,
+    task_id: TaskId,
+) -> Option<crate::task::BaseOid> {
+    let worker_name = record
+        .status()
+        .worker()
+        .or_else(|| record.pinned_worker())?;
+    let worker = config.worker(worker_name)?;
+    GitTransport::new(runner)
+        .fetch_result(
+            worker,
+            client_state.client_id(),
+            record.meta().project_id(),
+            task_id,
+            transfer.path(),
+        )
+        .ok()
+        .and_then(|_| {
+            transfer
+                .import_result(
+                    runner,
+                    &project.context.common_dir,
+                    worker.name.as_str(),
+                    task_id,
+                )
+                .ok()
+                .map(|receipt| receipt.head().clone())
+        })
+}
+
+fn retire_completed_turn(
+    client_state: &ClientStateStore,
+    turn_id: TurnId,
+    owner: ProcessIdentity,
+    task_id: TaskId,
+) -> Result<(), WorkerError> {
+    client_state.record_runner(task_id, None)?;
+    client_state.remove_task_turn_after_terminal(turn_id, owner)?;
+    client_state.remove_turn_prompt(task_id, turn_id)?;
+    Ok(())
+}
+
+fn undrainable_failure_status(
+    terminal: &TaskStatus,
+    turn_id: TurnId,
+    ended_at_millis: u64,
+) -> Result<TaskStatus, WorkerError> {
+    let last = terminal.turns().last().ok_or_else(|| {
+        task_error(
+            "TASK_INCONSISTENT",
+            "undrainable journal has no turn to publish",
+        )
+    })?;
+    if last.turn_id() != turn_id {
+        return Err(task_error(
+            "TASK_BUSY",
+            "a newer turn exists; refusing to rewrite it",
+        ));
+    }
+    let outcome = TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE");
+    let mut turns = terminal.turns().to_vec();
+    let replacement = TurnSummary::new(
+        last.turn_number(),
+        last.turn_id(),
+        Some(TurnTerminal::Failed),
+        Some(outcome.clone()),
+        last.agent_committed(),
+        last.log_truncated(),
+        last.started_at_millis(),
+        Some(ended_at_millis),
+    );
+    *turns
+        .last_mut()
+        .expect("cloned last turn must remain present") = replacement;
+    TaskStatus::new(
+        TaskState::Open,
+        Some(outcome),
+        terminal.worker().map(str::to_owned),
+        terminal.session_present(),
+        terminal.head_oid().cloned(),
+        terminal.summary().map(str::to_owned),
+        terminal.questions().to_vec(),
+        terminal.files_changed().to_vec(),
+        terminal.diff_stat().map(str::to_owned),
+        turns,
+        ended_at_millis,
+    )
 }
 
 /// Transfer a waiting or dispatching task row to the process that will

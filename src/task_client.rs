@@ -1267,9 +1267,9 @@ impl<'a> TaskClient<'a> {
         // A task-turn row is owned by its runner in both waiting and
         // dispatching states.  A dead owner is normally adopted so the next
         // runner can resume the accepted turn or retry the pre-acceptance
-        // handoff. A dispatching row whose journal proves completion needs
-        // only local cleanup. Release its base before retiring the row;
-        // task status alone is never evidence that logs were drained.
+        // handoff. A dispatching row whose journal proves completion is handed
+        // to the shared finalizer: journal completion is not proof that local
+        // Failed status, this-turn import, or pin release finished.
         for entry in self.client_state.queue_snapshot()?.entries().iter() {
             if entry.kind() != QueueEntryKind::TaskTurn
                 || matches!(entry.state(), QueueState::Parked)
@@ -1320,20 +1320,19 @@ impl<'a> TaskClient<'a> {
                 }
                 self.client_state.adopt_row(entry.job_id(), owner)?;
                 if matches!(entry.state(), QueueState::Dispatching { .. })
-                    && log.completion().is_some()
+                    && let Some(completion) = log.completion()
                 {
-                    self.release_task_base(&self.client_state.load_task(task_id)?)?;
-                    self.client_state.record_runner(task_id, None)?;
-                    if self
-                        .client_state
-                        .remove_task_turn_after_terminal(entry.job_id(), owner)?
-                        .is_some()
-                    {
-                        let _ = self
-                            .client_state
-                            .remove_turn_prompt(task_id, entry.job_id());
-                        report.repaired_rows += 1;
-                    }
+                    crate::turn_runner::finalize_completed_turn(
+                        self.client_state,
+                        self.runner,
+                        self.config,
+                        self.paths,
+                        task_id,
+                        entry.job_id(),
+                        owner,
+                        completion,
+                    )?;
+                    report.repaired_rows += 1;
                 }
             }
         }
@@ -1498,6 +1497,11 @@ impl<'a> TaskClient<'a> {
             .queue_entry_for_task_turn(task_id)?
             .is_some()
         {
+            // The previous turn still owns a queue row, including the window
+            // where an undrainable finalizer has finished the journal but not
+            // yet published Failed / imported / retired. A follow-up would
+            // keep fetched_head from that earlier turn; refuse until the row
+            // is gone so expected-record CAS in the finalizer stays valid.
             return Err(task_error("TASK_BUSY", "previous turn is still finalizing"));
         }
         match record.status().state() {
@@ -1569,7 +1573,10 @@ impl<'a> TaskClient<'a> {
                 .collect(),
             current_time_millis()?,
         )?;
-        let active_record = record.with_status(active)?.with_runner(None)?;
+        let active_record = record
+            .with_status(active)?
+            .with_runner(None)?
+            .with_abandon_code(None)?;
         if let Err(error) = self.client_state.update_task(active_record) {
             let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
             return Err(error);

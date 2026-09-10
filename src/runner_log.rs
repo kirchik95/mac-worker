@@ -63,6 +63,15 @@ fn is_undrainable_outcome(outcome: &TaskOutcome) -> bool {
     matches!(outcome, TaskOutcome::Failed { reason } if reason == "LOG_DRAIN_UNAVAILABLE")
 }
 
+impl Completion {
+    /// Accepted journals may finish as not-drained only for this explicit
+    /// degraded outcome. Completion here is not proof that local Failed
+    /// status, abandon_code, or result/base publication finished.
+    pub(crate) fn is_undrainable(&self) -> bool {
+        !self.drained && is_undrainable_outcome(&self.outcome)
+    }
+}
+
 /// `drained=true` still requires acceptance. `drained=false` is the empty
 /// pre-acceptance finish, or the explicit undrainable degraded state: the
 /// host accepted the turn but remaining stdout/stderr cannot be proven.

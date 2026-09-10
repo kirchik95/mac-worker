@@ -11,7 +11,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -297,6 +297,40 @@ impl ProcessRunner for MissingJobLogsRunner<'_> {
     }
 }
 
+struct RejectResultFetch<'a, R> {
+    inner: &'a R,
+    result_fetches: AtomicUsize,
+}
+
+impl<'a, R> RejectResultFetch<'a, R> {
+    fn new(inner: &'a R) -> Self {
+        Self {
+            inner,
+            result_fetches: AtomicUsize::new(0),
+        }
+    }
+
+    fn result_fetch_count(&self) -> usize {
+        self.result_fetches.load(Ordering::SeqCst)
+    }
+}
+
+impl<R: ProcessRunner> ProcessRunner for RejectResultFetch<'_, R> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == OsStr::new("/usr/bin/git")
+            && request.args.iter().any(|arg| arg == "fetch")
+            && request.args.iter().any(|arg| {
+                arg.to_string_lossy().contains("refs/mac-worker/results/")
+                    || arg.to_string_lossy().starts_with("--upload-pack=")
+            })
+        {
+            self.result_fetches.fetch_add(1, Ordering::SeqCst);
+            return Err(WorkerError::Protocol("RESULT_FETCH_FAILED".into()));
+        }
+        self.inner.run(request)
+    }
+}
+
 #[derive(Default)]
 struct BoundedFollowWriter {
     bytes: Vec<u8>,
@@ -430,6 +464,233 @@ fn persist_local_open_success(fixture: &AcceptedThenTerminalFixture) {
         .state
         .update_task(record.with_status(status).unwrap())
         .unwrap();
+}
+
+fn plant_undrainable_journal_ahead_of_success_record(fixture: &AcceptedThenTerminalFixture) {
+    persist_local_open_success(fixture);
+    fixture
+        .state
+        .open_runner_log(fixture.task_id, fixture.turn_id)
+        .unwrap();
+    write_fixture_checkpoint(
+        fixture,
+        &serde_json::json!({
+            "version": 1,
+            "task_id": fixture.task_id,
+            "turn_id": fixture.turn_id,
+            "committed": {
+                "offsets": [0, 0],
+                "len": 0,
+                "accepted": true,
+                "completion": {
+                    "outcome": {"kind": "failed", "reason": "LOG_DRAIN_UNAVAILABLE"},
+                    "drained": false
+                }
+            },
+            "pending": null
+        }),
+    );
+    fixture.state.record_runner(fixture.task_id, None).unwrap();
+}
+
+/// Prior-turn `fetched_head` is kept by `with_status`/`say`. The current
+/// journal/queue row still belongs to `fixture.turn_id`, now as turn 2.
+fn plant_undrainable_follow_up_with_prior_fetched_head(
+    fixture: &AcceptedThenTerminalFixture,
+) -> BaseOid {
+    persist_local_open_success(fixture);
+    let earlier = BaseOid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let first_turn_id = TurnId::generate();
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    let now = record.status().updated_at_millis().saturating_add(1);
+    let first = TurnSummary::new(
+        1,
+        first_turn_id,
+        Some(TurnTerminal::Succeeded),
+        Some(TaskOutcome::Done),
+        Some(true),
+        false,
+        Some(1),
+        Some(2),
+    );
+    let second = TurnSummary::new(
+        2,
+        fixture.turn_id,
+        Some(TurnTerminal::Succeeded),
+        Some(TaskOutcome::Done),
+        Some(true),
+        false,
+        Some(3),
+        Some(4),
+    );
+    let status = TaskStatus::new(
+        TaskState::Open,
+        Some(TaskOutcome::Done),
+        Some("mini-1".into()),
+        record.status().session_present(),
+        record.status().head_oid().cloned(),
+        Some("finished".into()),
+        record.status().questions().to_vec(),
+        record.status().files_changed().to_vec(),
+        record.status().diff_stat().map(str::to_owned),
+        vec![first, second],
+        now,
+    )
+    .unwrap();
+    fixture
+        .state
+        .update_task(
+            record
+                .with_status(status)
+                .unwrap()
+                .with_fetched_head(Some(earlier.clone()))
+                .unwrap(),
+        )
+        .unwrap();
+    fixture
+        .state
+        .open_runner_log(fixture.task_id, fixture.turn_id)
+        .unwrap();
+    write_fixture_checkpoint(
+        fixture,
+        &serde_json::json!({
+            "version": 1,
+            "task_id": fixture.task_id,
+            "turn_id": fixture.turn_id,
+            "committed": {
+                "offsets": [0, 0],
+                "len": 0,
+                "accepted": true,
+                "completion": {
+                    "outcome": {"kind": "failed", "reason": "LOG_DRAIN_UNAVAILABLE"},
+                    "drained": false
+                }
+            },
+            "pending": null
+        }),
+    );
+    fixture.state.record_runner(fixture.task_id, None).unwrap();
+    earlier
+}
+
+fn claim_waiting_turn(fixture: &AcceptedThenTerminalFixture) {
+    let live_owner = fixture
+        .state
+        .queue_entry(fixture.turn_id)
+        .unwrap()
+        .unwrap()
+        .owner_opt()
+        .copied()
+        .expect("submitted turn has an owner");
+    fixture
+        .state
+        .claim_next(live_owner, &["mini-1".into()], u64::MAX / 4)
+        .unwrap()
+        .expect("waiting turn must become dispatching");
+}
+
+fn assert_undrainable_publication_kept_the_base_pin(
+    store: &ClientStateStore,
+    fixture: &AcceptedThenTerminalFixture,
+) {
+    let record = store.load_task(fixture.task_id).unwrap();
+    assert_eq!(
+        record.status().last_outcome(),
+        Some(&TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
+    );
+    assert_eq!(record.status().state(), TaskState::Open);
+    assert_eq!(record.abandon_code(), Some("LOG_DRAIN_UNAVAILABLE"));
+    assert!(record.fetched_head().is_none());
+    assert!(
+        store
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.runner_liveness(fixture.task_id).unwrap(), None);
+    assert!(transfer_for_fixture(fixture).has_ref(&base_pin_name(fixture)));
+}
+
+fn assert_wait_and_dashboard_keep_undrainable_failure<R: ProcessRunner>(
+    remote: &R,
+    store: ClientStateStore,
+    fixture: &AcceptedThenTerminalFixture,
+    host_success: TaskStatus,
+) {
+    let client = TaskClient::new(
+        remote,
+        &fixture.config,
+        &fixture.paths,
+        &store,
+        &fixture.executor,
+    );
+    let waited = client
+        .wait(
+            WaitSelector::Task(fixture.task_id),
+            Some(Duration::from_secs(2)),
+        )
+        .unwrap();
+    assert_eq!(waited.exit_code(), 1);
+    let mut follow = BoundedFollowWriter::default();
+    client
+        .logs(
+            fixture.task_id,
+            None,
+            true,
+            true,
+            &mut follow,
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert!(follow.polls <= 5);
+    drop(client);
+
+    let store = std::sync::Arc::new(store);
+    let config = std::sync::Arc::new(fixture.config.clone());
+    let dashboard_remote = std::sync::Arc::new(HostReportsSuccessReader {
+        status: host_success,
+    });
+    let tasks = MacWorkerTaskSource::new(
+        std::sync::Arc::clone(&config),
+        std::sync::Arc::clone(&store),
+        std::sync::Arc::clone(&dashboard_remote)
+            as std::sync::Arc<dyn mac_worker::dashboard::source::DashboardRemoteReader>,
+    );
+    let detail = tasks.task_detail(fixture.task_id).unwrap();
+    assert_eq!(detail.task.state, TaskState::Open);
+    assert_eq!(
+        detail.task.last_outcome,
+        Some(TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
+    );
+    let log_error = tasks
+        .read_task_log(fixture.task_id, fixture.turn_id, LogStream::Stdout, 0, 64)
+        .unwrap_err();
+    assert_eq!(log_error.code, "LOG_DRAIN_UNAVAILABLE");
+
+    let snapshot = DashboardService::new(
+        MacWorkerDashboardSource::new(
+            std::sync::Arc::clone(&config),
+            std::sync::Arc::new(IdleDashboardWorkers),
+            std::sync::Arc::clone(&store),
+            dashboard_remote
+                as std::sync::Arc<dyn mac_worker::dashboard::source::DashboardRemoteReader>,
+        ),
+        SystemClock,
+        SystemMonotonicClock::new(),
+    )
+    .snapshot(Default::default())
+    .unwrap();
+    let row = snapshot
+        .task_view
+        .tasks
+        .iter()
+        .find(|row| row.task_id == fixture.task_id)
+        .expect("undrainable task is present in the dashboard snapshot");
+    assert_eq!(row.state, TaskState::Open);
+    assert_eq!(
+        row.last_outcome,
+        Some(TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
+    );
 }
 
 fn fixture_checkpoint(fixture: &AcceptedThenTerminalFixture) -> serde_json::Value {
@@ -1630,6 +1891,184 @@ fn recovery_records_log_drain_unavailable_when_the_worker_job_is_gone() {
         row.last_outcome,
         Some(TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
     );
+}
+
+#[test]
+fn reconcile_repairs_an_undrainable_journal_left_ahead_of_the_local_record() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    plant_undrainable_journal_ahead_of_success_record(&fixture);
+    claim_waiting_turn(&fixture);
+    assert_eq!(
+        fixture
+            .state
+            .load_task(fixture.task_id)
+            .unwrap()
+            .status()
+            .last_outcome(),
+        Some(&TaskOutcome::Done)
+    );
+    assert!(transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
+
+    let host_success = fixture
+        .state
+        .load_task(fixture.task_id)
+        .unwrap()
+        .status()
+        .clone();
+    let remote = RejectResultFetch::new(&fixture.runner);
+    let dead_owner = ProcessIdentity::new(424_246, 4_242_467).unwrap();
+    let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
+    assert_eq!(report.repaired_rows(), 1);
+    assert_eq!(report.started_runners(), 0);
+    assert_undrainable_publication_kept_the_base_pin(&store, &fixture);
+    assert_wait_and_dashboard_keep_undrainable_failure(&remote, store, &fixture, host_success);
+}
+
+#[test]
+fn runner_repairs_an_undrainable_journal_left_ahead_of_the_local_record() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    plant_undrainable_journal_ahead_of_success_record(&fixture);
+    claim_waiting_turn(&fixture);
+    let host_success = fixture
+        .state
+        .load_task(fixture.task_id)
+        .unwrap()
+        .status()
+        .clone();
+    let remote = RejectResultFetch::new(&fixture.runner);
+    let report = TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap();
+    assert_eq!(
+        report.status().last_outcome(),
+        Some(&TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
+    );
+    assert_eq!(report.status().state(), TaskState::Open);
+    assert_eq!(report.exit_code(), 1);
+    assert_undrainable_publication_kept_the_base_pin(&fixture.state, &fixture);
+    assert_wait_and_dashboard_keep_undrainable_failure(
+        &remote,
+        fixture.state.clone(),
+        &fixture,
+        host_success,
+    );
+}
+
+#[test]
+fn undrainable_record_write_failure_after_journal_finish_is_recovered() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let inner = ReplayableLogsRunner::new(&fixture.runner);
+    inner.fail_stderr_once.store(true, Ordering::SeqCst);
+    TurnRunner::new(
+        &inner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    persist_independent_terminal_status(&fixture);
+    assert_eq!(
+        fixture
+            .state
+            .load_task(fixture.task_id)
+            .unwrap()
+            .status()
+            .last_outcome(),
+        Some(&TaskOutcome::Done)
+    );
+    assert!(transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
+
+    let missing = MissingJobLogsRunner { inner };
+    let remote = RejectResultFetch::new(&missing);
+    let host_success = fixture.runner.task_status(fixture.task_id, true).unwrap();
+    fixture
+        .state
+        .inject_write_failure_once(ClientStateWritePoint::BeforeUndrainableRecordUpdate);
+    let error = TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    assert_eq!(error.public_code(), "IO", "{error}");
+    let checkpoint = fixture_checkpoint(&fixture);
+    assert_eq!(checkpoint["committed"]["completion"]["drained"], false);
+    assert_eq!(
+        checkpoint["committed"]["completion"]["outcome"]["reason"],
+        "LOG_DRAIN_UNAVAILABLE"
+    );
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(record.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(record.abandon_code(), None);
+    assert!(record.fetched_head().is_none());
+    assert!(transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
+
+    let dead_owner = ProcessIdentity::new(424_247, 4_242_477).unwrap();
+    let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
+    assert_eq!(report.repaired_rows(), 1);
+    assert_undrainable_publication_kept_the_base_pin(&store, &fixture);
+    assert_wait_and_dashboard_keep_undrainable_failure(&remote, store, &fixture, host_success);
+}
+
+#[test]
+fn undrainable_follow_up_still_imports_when_prior_fetched_head_is_present() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let earlier = plant_undrainable_follow_up_with_prior_fetched_head(&fixture);
+    claim_waiting_turn(&fixture);
+    let planted = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(planted.fetched_head(), Some(&earlier));
+    assert_eq!(planted.status().turns().len(), 2);
+    assert_eq!(planted.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert!(transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
+    let host_success = planted.status().clone();
+
+    let remote = RejectResultFetch::new(&fixture.runner);
+    let dead_owner = ProcessIdentity::new(424_248, 4_242_487).unwrap();
+    let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
+    assert_eq!(report.repaired_rows(), 1);
+    assert!(remote.result_fetch_count() >= 1);
+
+    let record = store.load_task(fixture.task_id).unwrap();
+    assert_eq!(record.fetched_head(), Some(&earlier));
+    assert_eq!(record.status().state(), TaskState::Open);
+    assert_eq!(
+        record.status().last_outcome(),
+        Some(&TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
+    );
+    assert_eq!(record.abandon_code(), Some("LOG_DRAIN_UNAVAILABLE"));
+    let turns = record.status().turns();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].terminal(), Some(TurnTerminal::Succeeded));
+    assert_eq!(turns[0].outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(turns[1].turn_id(), fixture.turn_id);
+    assert_eq!(turns[1].terminal(), Some(TurnTerminal::Failed));
+    assert_eq!(
+        turns[1].outcome(),
+        Some(&TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"))
+    );
+    assert!(
+        store
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
+    assert_wait_and_dashboard_keep_undrainable_failure(&remote, store, &fixture, host_success);
 }
 
 fn assert_remote_turn_completed(

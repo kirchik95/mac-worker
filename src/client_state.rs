@@ -106,6 +106,7 @@ pub enum ClientStateWritePoint {
     AfterTaskReplacementExchangeBeforeFirstDirectorySync = 31,
     AfterRunReplacementExchangeBeforeFirstDirectorySync = 32,
     AfterRunnerYieldQueuePublication = 33,
+    BeforeUndrainableRecordUpdate = 34,
 }
 
 #[doc(hidden)]
@@ -2834,6 +2835,16 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    pub fn undrainable_record_fault(&self) -> Result<(), WorkerError> {
+        if self.take_fault(ClientStateWritePoint::BeforeUndrainableRecordUpdate) {
+            return Err(injected_failure(
+                ClientStateWritePoint::BeforeUndrainableRecordUpdate,
+            ));
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
     pub fn inject_task_rollback_update_failures(&self, count: u8) {
         self.inner
             .task_rollback_update_failures
@@ -5507,6 +5518,7 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
         ClientStateWritePoint::AfterRunnerYieldQueuePublication => {
             "after runner yield queue publication"
         }
+        ClientStateWritePoint::BeforeUndrainableRecordUpdate => "before undrainable record update",
     };
     WorkerError::Io(io::Error::other(format!(
         "injected local state failure {label}"
