@@ -38,11 +38,18 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
     ] {
         let mut command = Command::cargo_bin("worker").unwrap();
         command.args([public_command, "--help"]);
-        command
+        let mut assertion = command
             .assert()
             .success()
             .stdout(predicate::str::contains(public_command))
             .stdout(predicate::str::contains("Usage:"));
+        if public_command == "dashboard" {
+            assertion = assertion
+                .stdout(predicate::str::contains("--port"))
+                .stdout(predicate::str::contains("--no-open"))
+                .stdout(predicate::str::contains("--no-facts-refresh"))
+                .stdout(predicate::str::contains("controller-viewer").not());
+        }
     }
 }
 

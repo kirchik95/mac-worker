@@ -1,14 +1,18 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use crate::{
+    dag::DagFrozenSpec,
     error::WorkerError,
     inputs::{InputSelector, SelectionFailure, SelectionWarning},
     process::ProcessRunner,
     project::{ProjectContext, ProjectInspector},
-    project_config::ProjectSettings,
+    project_config::{
+        ArtifactSettings, ProjectSettings, ResourceClass, SnapshotSettings, TaskSettings,
+    },
     requirements::RequirementDetector,
     snapshot::{Snapshot, SnapshotBuilder},
     task::TaskMeta,
@@ -100,6 +104,76 @@ impl ProjectState {
             settings,
             requirements,
         })
+    }
+
+    /// Reconstructs submit-time project settings from a DAG freeze. `setup`
+    /// stays `None` so `prepare_turn` still reads setup from the selected task
+    /// workspace. Callers must not reread `.worker.toml` for DAG tasks.
+    pub(crate) fn settings_from_frozen(spec: &DagFrozenSpec) -> ProjectSettings {
+        let mut permissions = BTreeMap::new();
+        permissions.insert(spec.agent.clone(), spec.permissions.clone());
+        ProjectSettings {
+            requires: spec.requires.clone(),
+            resource_class: ResourceClass::Heavy,
+            timeout: Duration::from_millis(spec.timeout_millis),
+            snapshot: SnapshotSettings {
+                include_untracked: spec.include_untracked.clone(),
+                include_empty_dirs: spec.include_empty_dirs.clone(),
+                allow_sensitive: spec.allow_sensitive.clone(),
+            },
+            artifacts: ArtifactSettings {
+                include: Vec::new(),
+                max_total_bytes: None,
+            },
+            task: TaskSettings {
+                source: spec.source.clone(),
+                publish: spec.publish.clone(),
+                env_profile: spec.env_profile.clone(),
+                model: spec.model.clone(),
+                effort: spec.effort.clone(),
+                default_agent: spec.agent.clone(),
+                timeout: Duration::from_millis(spec.timeout_millis),
+                max_followups: spec.max_followups,
+                permissions,
+            },
+            setup: None,
+        }
+    }
+
+    /// Inspects the frozen project path with the pinned project id. Worktree
+    /// identity must still match the freeze; local `.worker.toml` is ignored.
+    pub(crate) fn load_for_frozen_dag_task(
+        runner: &dyn ProcessRunner,
+        spec: &DagFrozenSpec,
+    ) -> Result<Self, WorkerError> {
+        let context = ProjectInspector::new(runner)
+            .inspect_with_pinned_project_id(Path::new(&spec.project_path), &spec.project_id)?;
+        if context.worktree_id != spec.worktree_id {
+            return Err(WorkerError::task(
+                "PROJECT_MISMATCH",
+                "current project is not the task's project",
+            ));
+        }
+        Ok(Self {
+            context,
+            origin: None,
+            settings: Self::settings_from_frozen(spec),
+            requirements: spec.requires.clone(),
+        })
+    }
+
+    /// DAG tasks use the freeze; independent runs and tasks with no run load
+    /// current project settings. `ordinary` runs only when
+    /// `ClientStateStore::frozen_spec_for_record` returned `None`.
+    pub(crate) fn load_validated_for_task(
+        runner: &dyn ProcessRunner,
+        frozen: Option<&DagFrozenSpec>,
+        ordinary: impl FnOnce() -> Result<Self, WorkerError>,
+    ) -> Result<Self, WorkerError> {
+        match frozen {
+            Some(spec) => Self::load_for_frozen_dag_task(runner, spec),
+            None => ordinary(),
+        }
     }
 
     pub fn prepare(

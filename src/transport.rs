@@ -765,6 +765,41 @@ pub(crate) fn ssh_request(
     }
 }
 
+/// SSH argv for a same-port local forward. Unlike [`ssh_request`], this keeps
+/// local forwards (`ExitOnForwardFailure=yes`, no `ClearAllForwardings`) so the
+/// dashboard tunnel can bind `-L 127.0.0.1:N:127.0.0.1:N`.
+pub(crate) fn ssh_local_forward_request(
+    destination: &str,
+    port: u16,
+    remote_command: String,
+    policy: ProcessPolicy,
+) -> ProcessRequest {
+    let forward = format!("127.0.0.1:{port}:127.0.0.1:{port}");
+    ProcessRequest {
+        program: SSH_PROGRAM.into(),
+        args: vec![
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=5".into(),
+            "-o".into(),
+            "ForwardAgent=no".into(),
+            "-o".into(),
+            "ExitOnForwardFailure=yes".into(),
+            "-L".into(),
+            forward.into(),
+            "--".into(),
+            destination.into(),
+            remote_command.into(),
+        ],
+        environment: Vec::new(),
+        environment_remove: Vec::new(),
+        stdin: None,
+        policy,
+        isolate_parent_environment: false,
+    }
+}
+
 fn unavailable(
     worker: &WorkerEntry,
     error_code: &str,

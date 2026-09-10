@@ -8,8 +8,8 @@ use crate::{
     scheduler::QueueBlockingReason,
     task::{
         BaseOid, BranchName, ClosePolicy, LocalTaskRecord, OriginDelivery, RunId, RunProgress,
-        RunRecord,
-        RunnerState, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        RunRecord, RunnerState, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary,
+        TurnTerminal,
     },
 };
 
@@ -94,6 +94,8 @@ pub struct TaskListProjection {
     pub tasks: Vec<TaskListRow>,
     pub runs: Vec<TaskRunProjection>,
     pub progress: RunProgress,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dag_nodes: Vec<crate::dag::DagNodeProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -335,6 +337,7 @@ pub fn project_task_list_with_blocking_codes(
         tasks,
         runs,
         progress,
+        dag_nodes: Vec::new(),
     })
 }
 

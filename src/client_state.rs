@@ -28,6 +28,11 @@ mod tests;
 use crate::{
     agent_facts::FACTS_TTL,
     config::Config,
+    dag::{
+        ClaimedNodeAction, DAG_PARENT_FAILED, DagClaim, DagFrozenSpec, DagNodeState, DagRecord,
+        ParentGate, claim_owner_is_live, claimed_node_action, dag_pin_ref, dag_run_is_quiescent,
+        dag_submission_complete, parent_gate, parents_failed, parents_ready,
+    },
     error::WorkerError,
     job::{
         AdmissionObservation, CachedAdmissionObservation, ClientId, JobId, JobState, JobStatus,
@@ -43,7 +48,7 @@ use crate::{
     supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
     task::{
         BaseOid, BranchName, LocalTaskRecord, RunId, RunRecord, RunnerIdentity, RunnerState,
-        TaskId, TurnId, TurnSummary,
+        TaskId, TaskOutcome, TurnId, TurnSummary,
     },
     transfer::PreacceptanceAbandonmentReceipt,
 };
@@ -67,6 +72,8 @@ const AFFINITY_WORKTREES_NAME: &CStr = c"worktrees";
 const OBSERVATIONS_NAME: &CStr = c"observations";
 const TASKS_NAME: &CStr = c"tasks";
 const RUNS_NAME: &CStr = c"runs";
+const DAGS_NAME: &CStr = c"dags";
+const DAG_PENDING_NAME: &CStr = c"dag-pending";
 const TURNS_NAME: &CStr = c"turns";
 const RUNNERS_NAME: &CStr = c"runners";
 pub(crate) const OBSERVATION_TTL_MILLIS: u64 = 2_000;
@@ -108,6 +115,11 @@ pub enum ClientStateWritePoint {
     AfterRunReplacementExchangeBeforeFirstDirectorySync = 32,
     AfterRunnerYieldQueuePublication = 33,
     BeforeUndrainableRecordUpdate = 34,
+    AfterDagClaim = 35,
+    AfterDagPublishBeforeRun = 36,
+    AfterDagRunMembership = 37,
+    AfterDagBind = 38,
+    AfterDagPendingBeforeDag = 39,
 }
 
 #[doc(hidden)]
@@ -130,6 +142,9 @@ pub enum ClientStateConcurrencyPoint {
     SubmissionIntentClearResultUncertain,
     SubmissionIntentReconciliationBeforeTransferLock,
     SubmissionIntentReconciliationAfterTransferLock,
+    DagClaim,
+    DagSubmit,
+    SubmissionRollbackRecover,
     ObservationRefreshPublication,
     TaskReplacementPreExchange,
     RunnerLogContention,
@@ -514,6 +529,20 @@ impl ClientStateStore {
             SyncKind::Root,
             &creation_race,
         )?;
+        let dags = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            DAGS_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
+        let dag_pending = open_or_create_owned_directory(
+            root.as_raw_fd(),
+            DAG_PENDING_NAME,
+            &sync_counts,
+            SyncKind::Root,
+            &creation_race,
+        )?;
         let turns = open_or_create_owned_directory(
             root.as_raw_fd(),
             TURNS_NAME,
@@ -542,6 +571,8 @@ impl ClientStateStore {
                 observations.as_raw_fd(),
                 tasks.as_raw_fd(),
                 runs.as_raw_fd(),
+                dags.as_raw_fd(),
+                dag_pending.as_raw_fd(),
                 turns.as_raw_fd(),
                 runners.as_raw_fd(),
             ],
@@ -2125,7 +2156,8 @@ impl ClientStateStore {
         }
         // Task turns do not create legacy job records. Their local Active
         // status is nevertheless an accepted turn and must consume the same
-        // run slot while the queue lock is held.
+        // run slot while the queue lock is held. The candidate's own current
+        // turn is that occupying work, not a second parallel task.
         for task in tasks {
             if task
                 .meta()
@@ -2133,6 +2165,12 @@ impl ClientStateStore {
                 .is_some_and(|run_id| run_id.to_string() == run.run_id().as_str())
                 && task.status().state() == crate::task::TaskState::Active
             {
+                if candidate.kind() == QueueEntryKind::TaskTurn
+                    && task.status().turns().last().map(|turn| turn.turn_id())
+                        == Some(candidate.job_id())
+                {
+                    continue;
+                }
                 active.insert(task.meta().task_id().to_string());
             }
         }
@@ -2817,6 +2855,373 @@ impl ClientStateStore {
         }
     }
 
+    pub fn create_run_with_dag(
+        &self,
+        record: RunRecord,
+        dag: DagRecord,
+    ) -> Result<(), WorkerError> {
+        if record.run_id() != dag.run_id {
+            return Err(WorkerError::task(
+                "TASK_CONFIG_INVALID",
+                "DAG run_id must match the run record",
+            ));
+        }
+        if record.max_parallel() != dag.max_parallel {
+            return Err(WorkerError::task(
+                "TASK_CONFIG_INVALID",
+                "DAG max_parallel must match the run record",
+            ));
+        }
+        if record.name() != dag.name.as_deref() {
+            return Err(WorkerError::task(
+                "TASK_CONFIG_INVALID",
+                "DAG name must match the run record",
+            ));
+        }
+        if record.created_at_millis() != dag.created_at_millis {
+            return Err(WorkerError::task(
+                "TASK_CONFIG_INVALID",
+                "DAG created_at_millis must match the run record",
+            ));
+        }
+        dag.validate()?;
+        let run_id = record.run_id();
+        let run_bytes = run_record_bytes(&record)?;
+        let dag_bytes = dag_record_bytes(&dag)?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let runs = self.runs_dir()?;
+        let dags = self.dags_dir()?;
+        self.recover_keyed_replacement_residue(&runs)?;
+        self.recover_keyed_replacement_residue(&dags)?;
+        if !dag_run_is_quiescent(&dag) {
+            self.register_pending_dag_locked(run_id)?;
+        }
+        if self.take_fault(ClientStateWritePoint::AfterDagPendingBeforeDag) {
+            return Err(injected_failure(
+                ClientStateWritePoint::AfterDagPendingBeforeDag,
+            ));
+        }
+        let dag_name = dag_file_name(run_id)?;
+        let run_name = run_file_name(run_id)?;
+        match dags.write_private_atomic_no_replace(&dag_name, &dag_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = read_dag_from_dir(&dags, &dag_name, run_id)?;
+                if existing != dag {
+                    return Err(queue_error(
+                        "RUN_ID_CONFLICT",
+                        "run ID is already present with different metadata",
+                    ));
+                }
+            }
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+        if self.take_fault(ClientStateWritePoint::AfterDagPublishBeforeRun) {
+            return Err(injected_failure(
+                ClientStateWritePoint::AfterDagPublishBeforeRun,
+            ));
+        }
+        match runs.write_private_atomic_no_replace(&run_name, &run_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = read_run_from_dir(&runs, &run_name, run_id)?;
+                if existing == record {
+                    {}
+                } else {
+                    return Err(queue_error(
+                        "RUN_ID_CONFLICT",
+                        "run ID is already present with different metadata",
+                    ));
+                }
+            }
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+        Ok(())
+    }
+
+    pub fn load_run_dag(&self, run_id: RunId) -> Result<Option<DagRecord>, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        self.load_run_dag_locked(run_id)
+    }
+
+    /// Frozen project spec for a durable DAG node. `None` means ordinary
+    /// project load: no run, or an independent batch whose run has no DAG
+    /// file. A DAG file that does not contain this task is inconsistent; it
+    /// is not a `.worker.toml` fallback.
+    pub(crate) fn frozen_spec_for_record(
+        &self,
+        record: &LocalTaskRecord,
+    ) -> Result<Option<DagFrozenSpec>, WorkerError> {
+        let Some(run_id) = record.meta().run_id() else {
+            return Ok(None);
+        };
+        let Some(dag) = self.load_run_dag(run_id)? else {
+            return Ok(None);
+        };
+        match dag
+            .nodes
+            .values()
+            .find(|node| node.task_id == record.meta().task_id())
+        {
+            Some(node) => Ok(Some(node.frozen.clone())),
+            None => Err(WorkerError::task(
+                "TASK_INCONSISTENT",
+                "DAG run is missing this task's frozen node",
+            )),
+        }
+    }
+
+    pub fn list_run_dags(&self) -> Result<Vec<DagRecord>, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let dags = self.dags_dir()?;
+        let mut names = dags.list_names().map_err(WorkerError::Io)?;
+        names.retain(|name| {
+            name.as_slice() != ROOTED_FS_NAMESPACE && !is_private_replacement_name(name)
+        });
+        names.sort();
+        let mut records = Vec::new();
+        for name in names {
+            match parse_dag_registry_entry(&name)? {
+                Some(DagRegistryEntry::Json(run_id)) => {
+                    records.push(read_dag_from_dir(&dags, &dag_file_name(run_id)?, run_id)?);
+                }
+                Some(DagRegistryEntry::Pending) | None => {}
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn list_pending_dags(&self) -> Result<Vec<DagRecord>, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        self.list_pending_dags_locked()
+    }
+
+    pub fn list_pending_run_ids(&self) -> Result<Vec<RunId>, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        self.list_pending_index_ids_locked()
+    }
+
+    pub fn retire_pending_dag_if_quiescent(&self, run_id: RunId) -> Result<(), WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let Some(dag) = self.load_run_dag_locked(run_id)? else {
+            return Ok(());
+        };
+        if dag_run_is_quiescent(&dag) {
+            self.retire_pending_dag_locked(run_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn claim_next_eligible_dag_node(
+        &self,
+        run_id: RunId,
+        caller: ProcessIdentity,
+        now_millis: u64,
+    ) -> Result<Option<DagClaim>, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let runs = self.runs_dir()?;
+        let dags = self.dags_dir()?;
+        self.recover_keyed_replacement_residue(&runs)?;
+        self.recover_keyed_replacement_residue(&dags)?;
+        if self
+            .complete_unpublished_dag_run_locked(&runs, &dags, run_id)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let Some(mut dag) = self.load_run_dag_locked(run_id)? else {
+            return Ok(None);
+        };
+        let tasks = self.tasks_dir()?;
+        let gates = self.dag_parent_gates_locked(&dag, &tasks)?;
+        let mut changed = false;
+        let mut claim = None;
+        let ids: Vec<String> = dag.nodes.keys().cloned().collect();
+        for batch_id in ids {
+            let node = dag.nodes.get(&batch_id).expect("id from keys");
+            if node.state == DagNodeState::Submitted {
+                self.append_run_task_id_locked(run_id, node.task_id)?;
+                continue;
+            }
+            if node.state != DagNodeState::Blocked && parents_failed(node, &gates) {
+                dag.nodes
+                    .get_mut(&batch_id)
+                    .expect("id from keys")
+                    .mark_blocked(DAG_PARENT_FAILED);
+                changed = true;
+                continue;
+            }
+            match dag.nodes.get(&batch_id).expect("id from keys").state {
+                DagNodeState::Blocked | DagNodeState::Submitted => {}
+                DagNodeState::Claimed => {
+                    let node = dag.nodes.get(&batch_id).expect("id from keys").clone();
+                    let task = self.task_optional_from_dir(&tasks, node.task_id)?;
+                    let task_exists = task.is_some();
+                    let has_turn = self
+                        .turn_ids_for_task(node.task_id)?
+                        .contains(&node.turn_id);
+                    let submission_complete =
+                        task.as_ref().is_some_and(dag_submission_complete) && has_turn;
+                    let owner_live = node.claimed_by.is_some_and(|owner| {
+                        claim_owner_is_live(self.inner.owner_inspector.observe(owner))
+                    });
+                    match claimed_node_action(
+                        node.claimed_by,
+                        caller,
+                        owner_live,
+                        task_exists,
+                        submission_complete,
+                    ) {
+                        ClaimedNodeAction::MarkSubmitted => {
+                            self.append_run_task_id_locked(run_id, node.task_id)?;
+                            dag.nodes
+                                .get_mut(&batch_id)
+                                .expect("id from keys")
+                                .mark_submitted();
+                            changed = true;
+                        }
+                        ClaimedNodeAction::SkipLive => {}
+                        ClaimedNodeAction::Continue => {
+                            if node.execution_oid().is_some() {
+                                claim = Some(DagClaim {
+                                    batch_id: batch_id.clone(),
+                                    node,
+                                });
+                                break;
+                            }
+                        }
+                        ClaimedNodeAction::Retake => {
+                            if node.execution_oid().is_some() {
+                                dag.nodes
+                                    .get_mut(&batch_id)
+                                    .expect("id from keys")
+                                    .take_claim(caller, now_millis);
+                                let node = dag.nodes.get(&batch_id).expect("id from keys").clone();
+                                self.persist_dag_locked(&dags, run_id, &dag)?;
+                                if self.take_fault(ClientStateWritePoint::AfterDagClaim) {
+                                    return Err(injected_failure(
+                                        ClientStateWritePoint::AfterDagClaim,
+                                    ));
+                                }
+                                self.reach_concurrency_point(ClientStateConcurrencyPoint::DagClaim);
+                                return Ok(Some(DagClaim { batch_id, node }));
+                            }
+                        }
+                    }
+                }
+                DagNodeState::Waiting => {
+                    let node = dag.nodes.get(&batch_id).expect("id from keys").clone();
+                    if parents_ready(&dag, &node, &gates) {
+                        dag.nodes
+                            .get_mut(&batch_id)
+                            .expect("id from keys")
+                            .take_claim(caller, now_millis);
+                        let node = dag.nodes.get(&batch_id).expect("id from keys").clone();
+                        self.persist_dag_locked(&dags, run_id, &dag)?;
+                        if self.take_fault(ClientStateWritePoint::AfterDagClaim) {
+                            return Err(injected_failure(ClientStateWritePoint::AfterDagClaim));
+                        }
+                        self.reach_concurrency_point(ClientStateConcurrencyPoint::DagClaim);
+                        return Ok(Some(DagClaim { batch_id, node }));
+                    }
+                }
+            }
+        }
+        if changed {
+            self.persist_dag_locked(&dags, run_id, &dag)?;
+        }
+        Ok(claim)
+    }
+
+    pub fn mark_dag_node_submitted(
+        &self,
+        run_id: RunId,
+        batch_id: &str,
+        task_id: TaskId,
+    ) -> Result<(), WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let dags = self.dags_dir()?;
+        let mut dag = self
+            .load_run_dag_locked(run_id)?
+            .ok_or_else(|| invalid_state("DAG record is missing"))?;
+        let node = dag
+            .nodes
+            .get(batch_id)
+            .ok_or_else(|| invalid_state("DAG node is missing"))?;
+        if node.task_id != task_id {
+            return Err(invalid_state("DAG node task ID does not match submit"));
+        }
+        self.append_run_task_id_locked(run_id, task_id)?;
+        if self.take_fault(ClientStateWritePoint::AfterDagRunMembership) {
+            return Err(injected_failure(
+                ClientStateWritePoint::AfterDagRunMembership,
+            ));
+        }
+        if node.state != DagNodeState::Submitted {
+            let node = dag
+                .nodes
+                .get_mut(batch_id)
+                .ok_or_else(|| invalid_state("DAG node is missing"))?;
+            node.mark_submitted();
+            dag.validate()?;
+            self.persist_dag_locked(&dags, run_id, &dag)?;
+        }
+        Ok(())
+    }
+
+    pub fn publish_dag_binding(
+        &self,
+        run_id: RunId,
+        batch_id: &str,
+        bound_oid: BaseOid,
+        bound_turn_id: TurnId,
+        pin_ref: String,
+    ) -> Result<(), WorkerError> {
+        let canonical = dag_pin_ref(run_id, batch_id);
+        if pin_ref != canonical {
+            return Err(WorkerError::task(
+                "TASK_CONFIG_INVALID",
+                "DAG bind pin_ref must be the canonical TransferRepo pin",
+            ));
+        }
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let dags = self.dags_dir()?;
+        let mut dag = self
+            .load_run_dag_locked(run_id)?
+            .ok_or_else(|| invalid_state("DAG record is missing"))?;
+        let node = dag
+            .nodes
+            .get_mut(batch_id)
+            .ok_or_else(|| invalid_state("DAG node is missing"))?;
+        match (
+            node.bound_oid.as_ref(),
+            node.bound_turn_id,
+            node.pin_ref.as_deref(),
+        ) {
+            (None, None, None) => {
+                node.bound_oid = Some(bound_oid);
+                node.bound_turn_id = Some(bound_turn_id);
+                node.pin_ref = Some(canonical);
+            }
+            (Some(existing_oid), Some(existing_turn), Some(existing_pin))
+                if existing_oid == &bound_oid
+                    && existing_turn == bound_turn_id
+                    && existing_pin == canonical => {}
+            _ => {
+                return Err(WorkerError::task(
+                    "TASK_CONFIG_INVALID",
+                    "from: binding is immutable after the first verified pin",
+                ));
+            }
+        }
+        dag.validate()?;
+        self.persist_dag_locked(&dags, run_id, &dag)?;
+        if self.take_fault(ClientStateWritePoint::AfterDagBind) {
+            return Err(injected_failure(ClientStateWritePoint::AfterDagBind));
+        }
+        Ok(())
+    }
+
     pub fn load_run(&self, run_id: RunId) -> Result<RunRecord, WorkerError> {
         if self.take_fault(ClientStateWritePoint::BeforeRunLoad) {
             return Err(injected_failure(ClientStateWritePoint::BeforeRunLoad));
@@ -2893,7 +3298,76 @@ impl ClientStateStore {
 
         let runs = self.runs_dir()?;
         let run_names = runs.list_names().map_err(WorkerError::Io)?;
-        self.recover_run_replacement_residue(&runs, &run_names)
+        self.recover_run_replacement_residue(&runs, &run_names)?;
+
+        let dags = self.dags_dir()?;
+        let dag_names = dags.list_names().map_err(WorkerError::Io)?;
+        self.recover_dag_replacement_residue(&dags, &dag_names)?;
+        let pending = self.dag_pending_dir()?;
+        self.recover_keyed_replacement_residue(&pending)?;
+        self.bootstrap_dag_pending_index_locked(&runs, &dags)
+    }
+
+    fn recover_keyed_replacement_residue(&self, dir: &RootedDir) -> Result<(), WorkerError> {
+        if dir.has_private_cleanup_residue().map_err(WorkerError::Io)? {
+            dir.retry_pending_owned_regulars_matching(|name, _| is_private_replacement_name(name))
+                .map_err(WorkerError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn bootstrap_dag_pending_index_locked(
+        &self,
+        runs: &RootedDir,
+        dags: &RootedDir,
+    ) -> Result<(), WorkerError> {
+        let pending = self.dag_pending_dir()?;
+        let existing = match pending
+            .read_private_regular(DAG_PENDING_BOOTSTRAP, MAX_STATE_FILE_BYTES as u64)
+        {
+            Ok(bytes) if bytes == DAG_PENDING_BOOTSTRAP_BYTES => return Ok(()),
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(WorkerError::Io(error)),
+        };
+        for name in dags.list_names().map_err(WorkerError::Io)? {
+            match parse_dag_registry_entry(&name)? {
+                Some(DagRegistryEntry::Json(run_id)) => {
+                    self.complete_unpublished_dag_run_locked(runs, dags, run_id)?;
+                }
+                Some(DagRegistryEntry::Pending) | None => {}
+            }
+        }
+        match existing {
+            Some(old) => pending
+                .replace_private_regular_exact(
+                    DAG_PENDING_BOOTSTRAP,
+                    &old,
+                    DAG_PENDING_BOOTSTRAP_BYTES,
+                )
+                .map_err(WorkerError::Io),
+            None => match pending
+                .write_private_atomic_no_replace(DAG_PENDING_BOOTSTRAP, DAG_PENDING_BOOTSTRAP_BYTES)
+            {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let current = pending
+                        .read_private_regular(DAG_PENDING_BOOTSTRAP, MAX_STATE_FILE_BYTES as u64)
+                        .map_err(WorkerError::Io)?;
+                    if current == DAG_PENDING_BOOTSTRAP_BYTES {
+                        return Ok(());
+                    }
+                    pending
+                        .replace_private_regular_exact(
+                            DAG_PENDING_BOOTSTRAP,
+                            &current,
+                            DAG_PENDING_BOOTSTRAP_BYTES,
+                        )
+                        .map_err(WorkerError::Io)
+                }
+                Err(error) => Err(WorkerError::Io(error)),
+            },
+        }
     }
 
     fn recover_run_replacement_residue(
@@ -2936,6 +3410,83 @@ impl ClientStateStore {
             runs.remove_owned_regular(name).map_err(WorkerError::Io)?;
         }
         Ok(())
+    }
+
+    fn recover_dag_replacement_residue(
+        &self,
+        dags: &RootedDir,
+        names: &[Vec<u8>],
+    ) -> Result<(), WorkerError> {
+        let has_replacement = names.iter().any(|name| is_private_replacement_name(name));
+        if has_replacement
+            || dags
+                .has_private_cleanup_residue()
+                .map_err(WorkerError::Io)?
+        {
+            dags.retry_pending_owned_regulars_matching(|name, _| is_private_replacement_name(name))
+                .map_err(WorkerError::Io)?;
+        }
+
+        for name in dags.list_names().map_err(WorkerError::Io)? {
+            if !is_private_replacement_name(&name) {
+                continue;
+            }
+            let name = std::str::from_utf8(&name)
+                .map_err(|_| invalid_state("dag replacement residue is not UTF-8"))?;
+            let bytes = dags
+                .read_private_regular(name, MAX_STATE_FILE_BYTES as u64)
+                .map_err(WorkerError::Io)?;
+            let residue = parse_dag_record(&bytes)?;
+            let run_id = residue.run_id;
+            let current = read_dag_from_dir(dags, &dag_file_name(run_id)?, run_id)?;
+            if residue != current {
+                return Err(invalid_state(
+                    "dag replacement residue is not bound to the live DAG record",
+                ));
+            }
+            dags.remove_owned_regular(name).map_err(WorkerError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn complete_unpublished_dag_run_locked(
+        &self,
+        runs: &RootedDir,
+        dags: &RootedDir,
+        run_id: RunId,
+    ) -> Result<Option<RunRecord>, WorkerError> {
+        let dag_name = dag_file_name(run_id)?;
+        let dag = match read_dag_from_dir(dags, &dag_name, run_id) {
+            Ok(dag) => dag,
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let run_name = run_file_name(run_id)?;
+        let run = match read_run_from_dir(runs, &run_name, run_id) {
+            Ok(run) => run,
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                let run = RunRecord::new(
+                    run_id,
+                    dag.name.clone(),
+                    Vec::new(),
+                    dag.max_parallel,
+                    dag.created_at_millis,
+                )?;
+                let bytes = run_record_bytes(&run)?;
+                match runs.write_private_atomic_no_replace(&run_name, &bytes) {
+                    Ok(()) => run,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        read_run_from_dir(runs, &run_name, run_id)?
+                    }
+                    Err(error) => return Err(WorkerError::Io(error)),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        self.sync_pending_dag_locked(run_id, &dag)?;
+        Ok(Some(run))
     }
 
     fn replace_run_record(
@@ -3246,9 +3797,23 @@ impl ClientStateStore {
         let turn_dir = task_dir
             .open_child_directory(&relative_path(&turn_id.to_string())?, true)
             .map_err(WorkerError::Io)?;
-        turn_dir
-            .write_private_atomic_no_replace("prompt.md", prompt.as_bytes())
-            .map_err(WorkerError::Io)
+        match turn_dir.write_private_atomic_no_replace("prompt.md", prompt.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = turn_dir
+                    .read_private_regular("prompt.md", crate::task::MAX_PROMPT_BYTES as u64)
+                    .map_err(WorkerError::Io)?;
+                if existing == prompt.as_bytes() {
+                    Ok(())
+                } else {
+                    Err(queue_error(
+                        "TASK_PROMPT_CONFLICT",
+                        "task turn prompt already exists with different content",
+                    ))
+                }
+            }
+            Err(error) => Err(WorkerError::Io(error)),
+        }
     }
 
     pub fn read_turn_prompt(
@@ -3312,6 +3877,168 @@ impl ClientStateStore {
             .map_err(WorkerError::Io)
     }
 
+    fn dags_dir(&self) -> Result<RootedDir, WorkerError> {
+        let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
+        root.open_child_directory(&relative_path(DAGS_NAME.to_str().unwrap())?, false)
+            .map_err(WorkerError::Io)
+    }
+
+    fn dag_pending_dir(&self) -> Result<RootedDir, WorkerError> {
+        let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
+        root.open_child_directory(&relative_path(DAG_PENDING_NAME.to_str().unwrap())?, false)
+            .map_err(WorkerError::Io)
+    }
+
+    fn load_run_dag_locked(&self, run_id: RunId) -> Result<Option<DagRecord>, WorkerError> {
+        let dags = self.dags_dir()?;
+        let name = dag_file_name(run_id)?;
+        match read_dag_from_dir(&dags, &name, run_id) {
+            Ok(record) => Ok(Some(record)),
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn persist_dag_locked(
+        &self,
+        dags: &RootedDir,
+        run_id: RunId,
+        dag: &DagRecord,
+    ) -> Result<(), WorkerError> {
+        dag.validate()?;
+        let name = dag_file_name(run_id)?;
+        let old = dags
+            .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
+            .map_err(WorkerError::Io)?;
+        let bytes = dag_record_bytes(dag)?;
+        if old != bytes {
+            self.replace_dag_record(dags, &name, &old, &bytes)?;
+        }
+        self.sync_pending_dag_locked(run_id, dag)
+    }
+
+    fn list_pending_dags_locked(&self) -> Result<Vec<DagRecord>, WorkerError> {
+        let mut records = Vec::new();
+        for run_id in self.list_pending_index_ids_locked()? {
+            if let Some(dag) = self.load_run_dag_locked(run_id)? {
+                records.push(dag);
+            }
+        }
+        Ok(records)
+    }
+
+    fn list_pending_index_ids_locked(&self) -> Result<Vec<RunId>, WorkerError> {
+        let pending = self.dag_pending_dir()?;
+        let mut names = pending.list_names().map_err(WorkerError::Io)?;
+        names.retain(|name| {
+            name.as_slice() != ROOTED_FS_NAMESPACE && !is_private_replacement_name(name)
+        });
+        names.sort();
+        let mut ids = Vec::new();
+        for name in names {
+            if let Some(run_id) = parse_dag_pending_index_entry(&name)? {
+                ids.push(run_id);
+            }
+        }
+        Ok(ids)
+    }
+
+    fn register_pending_dag_locked(&self, run_id: RunId) -> Result<(), WorkerError> {
+        let pending = self.dag_pending_dir()?;
+        let name = dag_pending_file_name(run_id)?;
+        match pending.write_private_atomic_no_replace(&name, &[]) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(WorkerError::Io(error)),
+        }
+    }
+
+    fn retire_pending_dag_locked(&self, run_id: RunId) -> Result<(), WorkerError> {
+        let pending = self.dag_pending_dir()?;
+        let name = dag_pending_file_name(run_id)?;
+        match pending.remove_owned_regular(&name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WorkerError::Io(error)),
+        }
+    }
+
+    fn sync_pending_dag_locked(&self, run_id: RunId, dag: &DagRecord) -> Result<(), WorkerError> {
+        if dag_run_is_quiescent(dag) {
+            self.retire_pending_dag_locked(run_id)
+        } else {
+            self.register_pending_dag_locked(run_id)
+        }
+    }
+
+    fn replace_dag_record(
+        &self,
+        dags: &RootedDir,
+        name: &str,
+        old: &[u8],
+        replacement: &[u8],
+    ) -> Result<(), WorkerError> {
+        dags.replace_private_regular_exact_with_sync_hooks(
+            name,
+            old,
+            replacement,
+            || Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .map_err(WorkerError::Io)
+    }
+
+    fn dag_parent_gates_locked(
+        &self,
+        dag: &DagRecord,
+        tasks: &RootedDir,
+    ) -> Result<BTreeMap<String, ParentGate>, WorkerError> {
+        let mut gates = BTreeMap::new();
+        for (batch_id, node) in &dag.nodes {
+            let gate = match node.state {
+                DagNodeState::Blocked => ParentGate::Failed,
+                DagNodeState::Waiting | DagNodeState::Claimed => ParentGate::Waiting,
+                DagNodeState::Submitted => {
+                    match self.task_optional_from_dir(tasks, node.task_id)? {
+                        Some(record) => parent_gate(&record),
+                        None => ParentGate::Waiting,
+                    }
+                }
+            };
+            gates.insert(batch_id.clone(), gate);
+        }
+        Ok(gates)
+    }
+
+    fn task_optional_from_dir(
+        &self,
+        tasks: &RootedDir,
+        task_id: TaskId,
+    ) -> Result<Option<LocalTaskRecord>, WorkerError> {
+        let name = task_file_name(task_id)?;
+        match read_task_from_dir(tasks, &name, task_id) {
+            Ok(record) => Ok(Some(record)),
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn append_run_task_id_locked(&self, run_id: RunId, task_id: TaskId) -> Result<(), WorkerError> {
+        let runs = self.runs_dir()?;
+        let name = run_file_name(run_id)?;
+        let old = runs
+            .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
+            .map_err(WorkerError::Io)?;
+        let existing = parse_run_record(&old)?;
+        let replacement = existing.with_appended_task_id(task_id)?;
+        let bytes = run_record_bytes(&replacement)?;
+        if old == bytes {
+            return Ok(());
+        }
+        self.replace_run_record(&runs, &name, &old, &bytes)
+    }
+
     fn turns_dir(&self) -> Result<RootedDir, WorkerError> {
         let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
         root.open_child_directory(&relative_path(TURNS_NAME.to_str().unwrap())?, false)
@@ -3322,6 +4049,17 @@ impl ClientStateStore {
         let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
         root.open_child_directory(&relative_path(RUNNERS_NAME.to_str().unwrap())?, false)
             .map_err(WorkerError::Io)
+    }
+
+    #[doc(hidden)]
+    pub fn finish_local_runner_log(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        outcome: TaskOutcome,
+    ) -> Result<(), WorkerError> {
+        let mut log = crate::runner_log::RunnerLog::open(&self.inner.state_root, task_id, turn_id)?;
+        log.finish_local(task_id, turn_id, outcome)
     }
 
     #[doc(hidden)]
@@ -4368,6 +5106,66 @@ fn run_file_name(run_id: RunId) -> Result<String, WorkerError> {
     Ok(name)
 }
 
+fn dag_file_name(run_id: RunId) -> Result<String, WorkerError> {
+    let name = format!("{run_id}.json");
+    if name.as_bytes().contains(&0) {
+        return Err(invalid_state("run ID produced an invalid filename"));
+    }
+    Ok(name)
+}
+
+fn dag_pending_file_name(run_id: RunId) -> Result<String, WorkerError> {
+    let name = run_id.to_string();
+    if name.as_bytes().contains(&0) {
+        return Err(invalid_state("run ID produced an invalid pending filename"));
+    }
+    Ok(name)
+}
+
+const DAG_PENDING_BOOTSTRAP: &str = "bootstrap.json";
+const DAG_PENDING_BOOTSTRAP_BYTES: &[u8] = b"{\"version\":1}\n";
+
+fn parse_dag_pending_index_entry(name: &[u8]) -> Result<Option<RunId>, WorkerError> {
+    if name == ROOTED_FS_NAMESPACE || is_private_replacement_name(name) {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(name)
+        .map_err(|_| invalid_state("DAG pending index contains a non-UTF-8 entry"))?;
+    if text == DAG_PENDING_BOOTSTRAP {
+        return Ok(None);
+    }
+    let run_id = text
+        .parse::<RunId>()
+        .map_err(|_| invalid_state("DAG pending index contains an invalid run filename"))?;
+    Ok(Some(run_id))
+}
+
+enum DagRegistryEntry {
+    Json(RunId),
+    Pending,
+}
+
+fn parse_dag_registry_entry(name: &[u8]) -> Result<Option<DagRegistryEntry>, WorkerError> {
+    if name == ROOTED_FS_NAMESPACE || is_private_replacement_name(name) {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(name)
+        .map_err(|_| invalid_state("dag registry contains a non-UTF-8 entry"))?;
+    if let Some(id_text) = text.strip_suffix(".pending") {
+        id_text
+            .parse::<RunId>()
+            .map_err(|_| invalid_state("dag registry contains an invalid pending filename"))?;
+        return Ok(Some(DagRegistryEntry::Pending));
+    }
+    let Some(id_text) = text.strip_suffix(".json") else {
+        return Err(invalid_state("dag registry contains an unexpected entry"));
+    };
+    let run_id = id_text
+        .parse::<RunId>()
+        .map_err(|_| invalid_state("dag registry contains an invalid run filename"))?;
+    Ok(Some(DagRegistryEntry::Json(run_id)))
+}
+
 fn relative_path(value: &str) -> Result<crate::inputs::RelativePath, WorkerError> {
     crate::inputs::RelativePath::parse(value.as_bytes())
         .map_err(|_| invalid_state("state path is not a safe relative path"))
@@ -4396,6 +5194,12 @@ fn run_record_bytes(record: &RunRecord) -> Result<Vec<u8>, WorkerError> {
         .map_err(|_| invalid_state("run record cannot be serialized"))
 }
 
+fn dag_record_bytes(record: &DagRecord) -> Result<Vec<u8>, WorkerError> {
+    record
+        .canonical_bytes()
+        .map_err(|_| invalid_state("DAG record cannot be serialized"))
+}
+
 fn parse_task_record(bytes: &[u8]) -> Result<LocalTaskRecord, WorkerError> {
     if bytes.len() > MAX_STATE_FILE_BYTES {
         return Err(invalid_state("task record is too large"));
@@ -4416,6 +5220,21 @@ fn parse_run_record(bytes: &[u8]) -> Result<RunRecord, WorkerError> {
         serde_json::from_slice(bytes).map_err(|_| invalid_state("run record is corrupt"))?;
     if run_record_bytes(&record)? != bytes {
         return Err(invalid_state("run record is not canonical JSON"));
+    }
+    Ok(record)
+}
+
+fn parse_dag_record(bytes: &[u8]) -> Result<DagRecord, WorkerError> {
+    if bytes.len() > MAX_STATE_FILE_BYTES {
+        return Err(invalid_state("DAG record is too large"));
+    }
+    let record: DagRecord =
+        serde_json::from_slice(bytes).map_err(|_| invalid_state("DAG record is corrupt"))?;
+    record
+        .validate()
+        .map_err(|_| invalid_state("DAG record is corrupt"))?;
+    if dag_record_bytes(&record)? != bytes {
+        return Err(invalid_state("DAG record is not canonical JSON"));
     }
     Ok(record)
 }
@@ -4446,6 +5265,21 @@ fn read_run_from_dir(
     let record = parse_run_record(&bytes)?;
     if record.run_id() != run_id {
         return Err(invalid_state("run filename and record identity differ"));
+    }
+    Ok(record)
+}
+
+fn read_dag_from_dir(
+    directory: &RootedDir,
+    name: &str,
+    run_id: RunId,
+) -> Result<DagRecord, WorkerError> {
+    let bytes = directory
+        .read_private_regular(name, MAX_STATE_FILE_BYTES as u64)
+        .map_err(WorkerError::Io)?;
+    let record = parse_dag_record(&bytes)?;
+    if record.run_id != run_id {
+        return Err(invalid_state("DAG filename and record identity differ"));
     }
     Ok(record)
 }
@@ -5173,7 +6007,8 @@ fn validate_root_entries(root: RawFd) -> Result<(), WorkerError> {
     for entry in directory_entries(root)? {
         match entry.to_bytes() {
             b"client-id" | b"jobs" | b".mac-worker-state" | b"jobs.lock" | b"queue"
-            | b"affinity" | b"observations" | b"tasks" | b"runs" | b"turns" | b"runners" => {}
+            | b"affinity" | b"observations" | b"tasks" | b"runs" | b"dags" | b"dag-pending"
+            | b"turns" | b"runners" => {}
             bytes if std::str::from_utf8(bytes).is_err() => {
                 return Err(invalid_state("state root contains a non-UTF-8 entry"));
             }
@@ -6025,6 +6860,17 @@ fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
             "after runner yield queue publication"
         }
         ClientStateWritePoint::BeforeUndrainableRecordUpdate => "before undrainable record update",
+        ClientStateWritePoint::AfterDagClaim => "after DAG claim publication",
+        ClientStateWritePoint::AfterDagPublishBeforeRun => {
+            "after DAG file publication before run record"
+        }
+        ClientStateWritePoint::AfterDagRunMembership => {
+            "after DAG run membership append before submitted"
+        }
+        ClientStateWritePoint::AfterDagBind => "after DAG from-binding publication",
+        ClientStateWritePoint::AfterDagPendingBeforeDag => {
+            "after DAG pending-index publication before DAG file"
+        }
     };
     WorkerError::Io(io::Error::other(format!(
         "injected local state failure {label}"

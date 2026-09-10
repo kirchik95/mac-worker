@@ -81,9 +81,9 @@ Ask the coding agent on this MacBook to send work to the pool. Direct CLI remain
 
 #### Ask your laptop agent
 
-The laptop agent prepares independent briefs and dispatches them; a configured agent on the worker executes. They need not be the same agent or provider. Install the skills on the laptop, not on every worker. The local agent must be able to run `worker` from the project.
+The laptop agent prepares briefs and dispatches them; a configured agent on the worker executes. They need not be the same agent or provider. Keep tasks independent unless a later brief must start from an earlier accepted result (`depends_on` / `base = "from:<id>"`). Install the skills on the laptop, not on every worker. The local agent must be able to run `worker` from the project.
 
-Use [pool-task-authoring](.claude/skills/pool-task-authoring/SKILL.md) to prepare independent briefs and [pool-dispatch](.claude/skills/pool-dispatch/SKILL.md) to submit, wait, follow up, and fetch the result. Copy them into the personal directory for the agent you use across projects on this MacBook:
+Use [pool-task-authoring](.claude/skills/pool-task-authoring/SKILL.md) to prepare briefs and [pool-dispatch](.claude/skills/pool-dispatch/SKILL.md) to submit, wait, follow up, and fetch the result. Copy them into the personal directory for the agent you use across projects on this MacBook:
 
 | Local coding agent | Personal skills directory | Docs |
 | --- | --- | --- |
@@ -142,7 +142,7 @@ worker task submit --agent codex --wip --wait \
 
 `--wip` is opt-in and needs a local source with fetch-only publication; origin source and push need a committed base. Name new files with `--include` or `snapshot.include_untracked`; unmatched non-ignored untracked files cause `UNTRACKED_INPUT`. `--include` can select ignored files, but sensitive paths still need an exact `snapshot.allow_sensitive` entry.
 
-For real coding tasks, install your project's language tools and dependencies on the worker yourself. Optional `[setup]` in `.worker.toml` can run an operator-written recipe in the task workspace; `check` only proves **this** workspace. `worker task batch FILE --preview` validates a batch without opening client state or dispatching. Start with this small file task to check the connection and agent before running a build.
+For real coding tasks, install your project's language tools and dependencies on the worker yourself. Optional `[setup]` in `.worker.toml` can run an operator-written recipe in the task workspace; `check` only proves **this** workspace. `worker task batch FILE --preview` validates a batch without opening client state or dispatching. Named `depends_on` / `base = "from:<id>"` edges execute when each parent is Closed and Done; batches without those fields stay independent. Start with this small file task to check the connection and agent before running a build.
 
 ### 4. Follow the work
 
@@ -188,7 +188,7 @@ flowchart LR
     others <-->|Agent API| provider
 ```
 
-1. **Submit.** Ask your laptop agent or run the CLI. The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with a free execution slot, the required agent, and capabilities. Each worker defaults to **one** slot (`1..=8` on that Mac). Combined detached runner capacity is the **sum** of those per-worker ceilings. A batch `--max-parallel` is a requested run cap (any positive value; default is that sum) and is not rejected for exceeding host capacity — extra tasks wait. The same `task_id` stays serialized; distinct tasks from one checkout may overlap when a host has opted into more than one slot.
+1. **Submit.** Ask your laptop agent or run the CLI. The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with a free execution slot, the required agent, and capabilities. Each worker defaults to **one** slot (`1..=8` on that Mac). Combined detached runner capacity is the **sum** of those per-worker ceilings. A batch `--max-parallel` is a requested run cap (any positive value; default is that sum) and is not rejected for exceeding host capacity — extra tasks wait. The same `task_id` stays serialized; distinct tasks from one checkout may overlap when a host has opted into more than one slot. A batch with `id` and `depends_on` (or `base = "from:<id>"`) holds later tasks until each parent is Closed and Done; `from:` binds that parent's current accepted imported OID on the laptop, not origin delivery. Independent batches (no those edges) still submit together.
 2. **Run.** Over SSH, mac-worker transfers the base commit into the worker's project mirror, prepares a separate task worktree and launches the agent under a supervisor. The agent uses the worker's own login and project tools.
 3. **Follow or reply.** The CLI and dashboard read task status and logs. If the agent needs input, `worker task say <id> --message "…"` (or a dashboard reply on that card’s current revision) starts another turn in the same task workspace and agent session.
 4. **Review.** The worker publishes `task/<id>`, and the laptop fetches it as a remote-tracking ref. `worker task fetch <id>` prints the ref to inspect. Your current working tree stays unchanged; you decide what to merge. With `publish = push`, origin delivery is a durable per-turn outbox: the execution slot is released independently of a slow remote, and a `done` turn may still show origin `pending`.
@@ -240,6 +240,7 @@ Node.js is needed only when changing the dashboard source in `ui/`; its built as
 
 - [Prepare a Mac worker](docs/setup-macos-worker.md): SSH, agents, profiles, power settings and removal.
 - [Usage reference](docs/usage.md): tasks, follow-ups, batches, defaults, dashboard and remote commands.
+- [Batch DAG](docs/dag-design.md): named `depends_on` / `from:` lifecycle, Closed+Done parent gate, freeze, wait, and reconcile.
 - [Multiple execution slots](docs/superpowers/specs/2026-09-10-slots-design.md): host `slot_count`, occupancy, migrate, and execution scope.
 - [Durable origin outbox](docs/superpowers/specs/2026-09-10-origin-outbox.md): per-turn origin delivery, slot release, and host `--watch` / `--enable` / `--once`.
 - [Installation recovery](docs/setup-recovery.md): retained installer state and older host layouts.

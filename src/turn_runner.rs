@@ -456,9 +456,7 @@ impl<'a> TurnRunner<'a> {
             turn_id,
             TaskOutcome::failed("RUNNER_HANDOFF_FAILED"),
         )?;
-        if let Ok(project_path) = self.task_project_path(&record)
-            && let Ok(project) =
-                ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
+        if let Ok(project) = self.load_project_for_record(&record)
             && project.context.project_id == record.meta().project_id()
             && let Ok(transfer) =
                 TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
@@ -690,9 +688,7 @@ impl<'a> TurnRunner<'a> {
             std::thread::sleep(WAIT_POLL);
         };
         let initial_record = self.client_state.load_task(task_id)?;
-        let project_path = self.task_project_path(&initial_record)?;
-        let project =
-            ProjectState::load_for_task(self.runner, &project_path, &[], initial_record.meta())?;
+        let project = self.load_project_for_record(&initial_record)?;
         require_project_match(
             &project,
             initial_record.meta().project_id(),
@@ -1241,10 +1237,12 @@ impl<'a> TurnRunner<'a> {
         });
         append_event(log, follow, event.clone())?;
         transfer.release_base(self.runner, task_id)?;
+        drop(transfer);
         self.client_state.record_runner(task_id, None)?;
         self.client_state
             .remove_task_turn_after_terminal(turn_id, owner)?;
         self.client_state.remove_turn_prompt(task_id, turn_id)?;
+        self.advance_pending_dags_after_transfer_drop()?;
         Ok(TurnOutcomeReport {
             status: terminal,
             events: vec![event],
@@ -1278,10 +1276,12 @@ impl<'a> TurnRunner<'a> {
         });
         append_event(log, follow, event.clone())?;
         transfer.release_base(self.runner, task_id)?;
+        drop(transfer);
         self.client_state.record_runner(task_id, None)?;
         self.client_state
             .remove_task_turn_after_terminal(turn_id, owner)?;
         self.client_state.remove_turn_prompt(task_id, turn_id)?;
+        self.advance_pending_dags_after_transfer_drop()?;
         Ok(TurnOutcomeReport {
             status,
             events: vec![event],
@@ -1598,9 +1598,7 @@ impl<'a> TurnRunner<'a> {
             drained: false,
         };
         log.finish(completion, line.as_bytes())?;
-        if let Ok(project_path) = self.task_project_path(record)
-            && let Ok(project) =
-                ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
+        if let Ok(project) = self.load_project_for_record(record)
             && project.context.project_id == record.meta().project_id()
             && let Ok(transfer) =
                 TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
@@ -1665,9 +1663,7 @@ impl<'a> TurnRunner<'a> {
                 .with_abandon_code(abandoned.then_some("CANCELLED".to_owned()))?,
         )?;
         log.finish_local(task_id, turn_id, TaskOutcome::Cancelled)?;
-        if let Ok(project_path) = self.task_project_path(record)
-            && let Ok(project) =
-                ProjectState::load_for_task(self.runner, &project_path, &[], record.meta())
+        if let Ok(project) = self.load_project_for_record(record)
             && project.context.project_id == record.meta().project_id()
             && let Ok(transfer) =
                 TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
@@ -1680,6 +1676,38 @@ impl<'a> TurnRunner<'a> {
             let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
         }
         Ok(())
+    }
+
+    fn advance_pending_dags_after_transfer_drop(&self) -> Result<(), WorkerError> {
+        crate::task_client::TaskClient::new(
+            self.runner,
+            self.config,
+            self.paths,
+            self.client_state,
+            self.executor,
+        )
+        .advance_pending_dags()
+    }
+
+    fn load_project_for_record(
+        &self,
+        record: &LocalTaskRecord,
+    ) -> Result<ProjectState, WorkerError> {
+        let frozen = self.client_state.frozen_spec_for_record(record)?;
+        let project = ProjectState::load_validated_for_task(self.runner, frozen.as_ref(), || {
+            ProjectState::load_for_task(
+                self.runner,
+                &self.task_project_path(record)?,
+                &[],
+                record.meta(),
+            )
+        })?;
+        require_project_match(
+            &project,
+            record.meta().project_id(),
+            record.meta().worktree_id(),
+        )?;
+        Ok(project)
     }
 
     fn task_project_path(

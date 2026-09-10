@@ -15,7 +15,7 @@ Use this skill to turn an objective into tasks that a headless coding agent can 
 
 ## Slice The Work
 
-- Make each task one independent unit of work.
+- Make each task one independent unit of work unless a later brief must start from an earlier accepted result. In that case give both tasks `id`s and use `depends_on` / `base = "from:<id>"`; file order is not an execution graph.
 - Fit the task in one turn, about 45 minutes.
 - Use one repository per task.
 - Do not run concurrent tasks that share files. If several tasks share one repository, each brief must name the other tasks' files as forbidden.
@@ -77,7 +77,7 @@ Expect one of these structured statuses. The process exit status is not enough; 
 - `needs_input`: the agent has a bounded question needed for the next turn. Answer it with `worker task say`, or close the task if the decision is out of scope.
 - `blocked`: the agent could not complete the task, including the case where the process exited zero. Read its result and logs, then write a follow-up that removes the concrete blocker, or close with discard.
 
-If the turn fails, inspect the structured result and logs before authoring a follow-up. A follow-up should contain the missing decision, file, command, or constraint. Do not repeat the same prompt. If the problem is a task boundary or dependency, split or reorder the work instead. Dependent-batch `depends_on` is not executed yet; keep tasks independent until that runtime is accepted.
+If the turn fails, inspect the structured result and logs before authoring a follow-up. A follow-up should contain the missing decision, file, command, or constraint. Do not repeat the same prompt. If the problem is a task boundary, split the work. If a later task must consume an earlier accepted result, name both tasks and use `depends_on` / `base = "from:<id>"` instead of hoping they run in file order. Keep tasks independent when there is no real edge.
 
 ## Route By Work
 
@@ -128,7 +128,7 @@ Report the changed files, the exact commands run, their results, and any remaini
 
 ## Example Batch File
 
-Preview with `worker task batch FILE --preview` before dispatch. Tasks in a run are independent; do not add `depends_on` until DAG execution is accepted.
+Preview with `worker task batch FILE --preview` before dispatch. Tasks without `depends_on` and without `base = "from:<id>"` are independent. Named edges execute only when each parent is Closed and Done; `from:` is that parent's current accepted imported OID on the laptop, not origin delivery.
 
 ```toml
 version = 1
@@ -152,4 +152,23 @@ publish = ["fetch", "push"]
 publish_branch = "feat/billing-client"
 ```
 
-Top-level keys are defaults. A task may override them. Validate every entry before submitting the batch. Tasks in a run are independent; the run groups them for status, waiting, and the CLI `--max-parallel` cap.
+Named DAG when a later task must start from an earlier accepted result:
+
+```toml
+version = 1
+agent = "codex"
+timeout = "45m"
+
+[[tasks]]
+id = "api"
+prompt_file = "tasks/api-validation.md"
+close_on = "never"
+
+[[tasks]]
+id = "tests"
+depends_on = ["api"]
+base = "from:api"
+prompt_file = "tasks/api-tests.md"
+```
+
+Top-level keys are defaults. A task may override them. Validate every entry before submitting the batch. Independent tasks group for status, waiting, and the CLI `--max-parallel` cap. `depends_on` / `from:` are a real execution graph: children wait for Closed+Done parents, and a failed parent blocks descendants (`DAG_PARENT_FAILED`).

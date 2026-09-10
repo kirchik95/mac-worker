@@ -1,7 +1,10 @@
 use std::{
     borrow::Cow,
+    cell::Cell,
+    collections::{BTreeMap, HashSet},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Condvar, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -11,22 +14,29 @@ use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLimits, result_instruction},
     client_state::{ClientStateConcurrencyPoint, ClientStateStore},
     config::{Config, WorkerEntry},
+    dag::{
+        DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, GraphNode, ParentGate,
+        accepted_import_oid, dag_pin_ref, dag_run_is_quiescent, merge_pending_into_projection,
+        parent_gate, parse_from_base, validate_batch_graph,
+    },
     error::WorkerError,
     git_transport::GitTransport,
     job::{
-        CommandSpec, ProcessIdentity, QueueEntry, QueueEntryKind, QueueRunReference, QueueState,
+        ClientId, CommandSpec, ProcessIdentity, QueueEntry, QueueEntryKind, QueueRunReference,
+        QueueState,
     },
     paths::PathLayout,
     process::ProcessRunner,
+    project::ProjectInspector,
     project_config::{SetupSettings, TaskSettings},
     project_state::ProjectState,
     scheduler::{CandidateObservation, SchedulerPolicy, Selection, WorkerPreference},
     supervisor::{ProcessObservation, SystemProcessInspector},
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, OriginDelivery,
-        PublishMode, PushTarget, RunId, RunRecord, RunnerState, TaskCloseIntent, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
-        TurnSummary, merge_origin_deliveries,
+        PublishMode, PushTarget, RunId, RunRecord, RunnerState, TaskCloseIntent, TaskId,
+        TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
+        TurnId, TurnSummary, merge_origin_deliveries,
     },
     task_view::{
         TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
@@ -46,6 +56,7 @@ const DEFAULT_GIT_NAME: &str = "mac-worker";
 const DEFAULT_GIT_EMAIL: &str = "mac-worker@localhost";
 const SUBMISSION_ROLLBACK_INCOMPLETE: &str = "SUBMISSION_ROLLBACK_INCOMPLETE";
 const CLOSE_IN_PROGRESS: &str = "task close is in progress";
+const SUBMISSION_ROLLBACK_RECOVER_ATTEMPTS: usize = 2;
 
 fn operator_revision_matches(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> bool {
     current.meta().task_id() == expected.meta().task_id()
@@ -66,6 +77,49 @@ fn same_close_target(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> b
 }
 const WAIT_POLL: Duration = Duration::from_millis(100);
 const WAIT_MAX_POLL: Duration = Duration::from_secs(1);
+
+thread_local! {
+    static ADVANCING_PENDING_DAGS: Cell<bool> = const { Cell::new(false) };
+}
+
+struct InProcessSubmitLocks {
+    held: Mutex<HashSet<(ClientId, TaskId)>>,
+    cond: Condvar,
+}
+
+fn in_process_submit_locks() -> &'static InProcessSubmitLocks {
+    static LOCKS: OnceLock<InProcessSubmitLocks> = OnceLock::new();
+    LOCKS.get_or_init(|| InProcessSubmitLocks {
+        held: Mutex::new(HashSet::new()),
+        cond: Condvar::new(),
+    })
+}
+
+struct InProcessSubmitGuard {
+    client_id: ClientId,
+    task_id: TaskId,
+}
+
+impl Drop for InProcessSubmitGuard {
+    fn drop(&mut self) {
+        let locks = in_process_submit_locks();
+        let mut held = locks.held.lock().expect("in-process submit guard");
+        held.remove(&(self.client_id, self.task_id));
+        locks.cond.notify_all();
+    }
+}
+
+/// Blocks same-store same-ID submits in this process. Keyed by client/task so
+/// unrelated stores and ordinary unique-ID submits do not wait. Acquire
+/// before TransferRepo; drop before attached runner reentry.
+fn acquire_in_process_submit_guard(client_id: ClientId, task_id: TaskId) -> InProcessSubmitGuard {
+    let locks = in_process_submit_locks();
+    let mut held = locks.held.lock().expect("in-process submit guard");
+    while !held.insert((client_id, task_id)) {
+        held = locks.cond.wait(held).expect("in-process submit guard");
+    }
+    InProcessSubmitGuard { client_id, task_id }
+}
 
 #[derive(Debug, Clone)]
 pub struct TaskSubmitRequest {
@@ -646,7 +700,7 @@ impl<'a> TaskClient<'a> {
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
-        self.submit_with_ids(request, None, None, None, stdout, stderr)
+        self.submit_with_ids(request, None, None, None, stdout, stderr, false, None, None)
     }
 
     /// Submits a task with an explicit, redacted title.  The public request
@@ -660,221 +714,517 @@ impl<'a> TaskClient<'a> {
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
-        self.submit_with_ids(request, None, None, title, stdout, stderr)
+        self.submit_with_ids(
+            request, None, None, title, stdout, stderr, false, None, None,
+        )
     }
 
-    fn submit_with_ids(
+    /// FLOW/controller entry for a claimed DAG node. Reuses the frozen
+    /// `submit_with_ids` resume path on this `ClientStateStore` and TransferRepo;
+    /// it does not create another queue or store. FLOW owns the non-DAG
+    /// `run_id = None` wrapper around this same inner transaction and must not
+    /// copy the metadata/queue/rollback body; this DAG path always passes
+    /// `Some(run_id)`.
+    pub fn submit_prepared_dag_node(
+        &self,
+        run_id: RunId,
+        node: &DagNode,
+        skip_reconcile: bool,
+    ) -> Result<TaskReport, WorkerError> {
+        let request = request_from_frozen_node(node, Some(run_id))?;
+        self.submit_with_ids(
+            request,
+            Some(node.task_id),
+            Some(node.turn_id),
+            node.frozen.title.clone(),
+            &mut io::sink(),
+            &mut io::sink(),
+            skip_reconcile,
+            Some(node),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Shared guarded submit transaction (full metadata, queue, intent, rollback
+    /// CAS). `submit_prepared_dag_node` is the DAG wrapper. FLOW's non-DAG
+    /// adapter must call this with `request.run_id = None` and the durable
+    /// `original_created_at` instead of copying this body.
+    pub(crate) fn submit_with_ids(
         &self,
         request: TaskSubmitRequest,
         task_id_override: Option<TaskId>,
-        _turn_id_override: Option<TurnId>,
+        turn_id_override: Option<TurnId>,
         title: Option<String>,
         stdout: &mut dyn Write,
         _stderr: &mut dyn Write,
+        skip_reconcile: bool,
+        frozen: Option<&DagNode>,
+        original_created_at: Option<u64>,
     ) -> Result<TaskReport, WorkerError> {
-        self.reconcile_runners()?;
+        if !skip_reconcile {
+            self.reconcile_runners()?;
+        }
         validate_prompt(&request.prompt)?;
         validate_task_agent(request.agent)?;
         validate_preference(self.config, &request.preference)?;
 
-        let initial = ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
-        let settings = &initial.settings.task;
-        let limits = effective_task_limits(&request.limits, settings)?;
-        let env_profile = request
-            .env_profile
-            .clone()
-            .or_else(|| settings.env_profile.clone());
-        let model = request.model.clone().or_else(|| settings.model.clone());
-        let effort = request.effort.clone().or_else(|| settings.effort.clone());
-        let publish_names = request.publish.as_deref().unwrap_or(&settings.publish);
-        let publish = parse_publish_modes(publish_names)?;
-        let source_name = request.source.as_deref().unwrap_or(&settings.source);
-        let needs_origin = source_name == "origin" || publish.contains(&PublishMode::Push);
-        let origin_url = if needs_origin {
-            initial
-                .origin
-                .clone()
-                .ok_or_else(|| task_error("INVALID_ORIGIN", "project origin is not configured"))?
-        } else {
-            String::new()
-        };
-        let source = parse_task_source(
-            source_name,
-            request.wip,
-            &origin_url,
-            publish.contains(&PublishMode::Push),
-        )?;
-        let publish_branch = parse_publish_branch(request.publish_branch.as_deref(), &publish)?;
-        if request.wip && publish.contains(&PublishMode::Push) {
-            return Err(task_error(
-                "PUBLISH_REQUIRES_COMMITTED_BASE",
-                "publish push requires a committed base",
-            ));
-        }
-        let requirements = task_requirements(
-            &initial.requirements,
-            request.agent,
-            env_profile.as_deref(),
-            source.origin_requirement()?.as_deref(),
-        );
-        let observations = self.observe_admission(&request.preference)?;
-        let affinity = self
-            .client_state
-            .affinity_hints(&initial.context.project_id, &initial.context.worktree_id)?;
-        if let Selection::NoEligible { rejections } =
-            SchedulerPolicy::select(&observations, &requirements, &request.preference, &affinity)
-        {
-            if let WorkerPreference::Pinned { worker } = &request.preference
-                && let Some(missing) = rejections.iter().find_map(|rejection| match rejection {
-                    crate::scheduler::CandidateRejection::MissingCapabilities { name, missing }
-                        if name == worker =>
-                    {
-                        Some(missing.as_slice())
-                    }
-                    _ => None,
-                })
-            {
-                return Err(capability_missing(worker, missing));
-            }
-            if !request.wait_for_capacity {
-                return Err(capacity_busy());
-            }
-        }
-
-        let task_id = task_id_override.unwrap_or_else(TaskId::generate);
-        let turn_id = _turn_id_override.unwrap_or_else(TurnId::generate);
-        let now = current_time_millis()?;
         let identity = GitIdentity::new(DEFAULT_GIT_NAME, DEFAULT_GIT_EMAIL)?;
+        let (
+            context,
+            limits,
+            env_profile,
+            model,
+            effort,
+            publish,
+            publish_branch,
+            source,
+            requirements,
+            policy,
+            prepared_base,
+            settings,
+            task_id,
+            turn_id,
+            title,
+        ) = if let Some(node) = frozen {
+            let spec = &node.frozen;
+            let context = ProjectInspector::new(self.runner)
+                .inspect_with_pinned_project_id(Path::new(&spec.project_path), &spec.project_id)?;
+            if context.worktree_id != spec.worktree_id {
+                return Err(task_error(
+                    "TASK_CONFIG_INVALID",
+                    "frozen DAG project identity does not match the worktree",
+                ));
+            }
+            let limits = spec.limits()?;
+            let env_profile = spec.env_profile.clone();
+            let model = spec.model.clone();
+            let effort = spec.effort.clone();
+            let publish = parse_publish_modes(&spec.publish)?;
+            let origin_url = spec.origin_url.clone().unwrap_or_default();
+            let source = parse_task_source(
+                &spec.source,
+                spec.wip,
+                &origin_url,
+                publish.contains(&PublishMode::Push),
+            )?;
+            let publish_branch = parse_publish_branch(spec.publish_branch.as_deref(), &publish)?;
+            if spec.wip && publish.contains(&PublishMode::Push) {
+                return Err(task_error(
+                    "PUBLISH_REQUIRES_COMMITTED_BASE",
+                    "publish push requires a committed base",
+                ));
+            }
+            let requirements = spec.requires.clone();
+            let policy = spec.permission_policy()?;
+            let observations = self.observe_admission(&request.preference)?;
+            let affinity = self
+                .client_state
+                .affinity_hints(&context.project_id, &context.worktree_id)?;
+            if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
+                &observations,
+                &requirements,
+                &request.preference,
+                &affinity,
+            ) {
+                if let WorkerPreference::Pinned { worker } = &request.preference
+                    && let Some(missing) = rejections.iter().find_map(|rejection| match rejection {
+                        crate::scheduler::CandidateRejection::MissingCapabilities {
+                            name,
+                            missing,
+                        } if name == worker => Some(missing.as_slice()),
+                        _ => None,
+                    })
+                {
+                    return Err(capability_missing(worker, missing));
+                }
+                if !request.wait_for_capacity {
+                    return Err(capacity_busy());
+                }
+            }
+            let oid = node.execution_oid().cloned().ok_or_else(|| {
+                task_error(
+                    "TASK_CONFIG_INVALID",
+                    "DAG node has no frozen or bound base OID",
+                )
+            })?;
+            // Bound from: objects live in the local TransferRepo. Rewrite Origin
+            // to Local so host prepare consumes the pushed cache object instead of
+            // fetching an unpublished OID. Keep push_target and frozen requires.
+            let imported_from_parent = node.from_parent().is_some() && node.bound_oid.is_some();
+            let source = if imported_from_parent {
+                execution_source_for_bound_from(source, &publish)?
+            } else {
+                if let TaskSource::Origin { url } = &source {
+                    GitTransport::new(self.runner).preflight_origin(url, &oid)?;
+                }
+                source
+            };
+            let prepared_base = PreparedSubmitBase::Ready(
+                crate::transfer_repo::BaseCommit::from_pinned(oid, spec.wip),
+            );
+            let settings = ProjectState::settings_from_frozen(spec);
+            (
+                context,
+                limits,
+                env_profile,
+                model,
+                effort,
+                publish,
+                publish_branch,
+                source,
+                requirements,
+                policy,
+                prepared_base,
+                settings,
+                node.task_id,
+                node.turn_id,
+                spec.title.clone().or(title),
+            )
+        } else {
+            let initial = ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
+            let settings = &initial.settings.task;
+            let limits = effective_task_limits(&request.limits, settings)?;
+            let env_profile = request
+                .env_profile
+                .clone()
+                .or_else(|| settings.env_profile.clone());
+            let model = request.model.clone().or_else(|| settings.model.clone());
+            let effort = request.effort.clone().or_else(|| settings.effort.clone());
+            let publish_names = request.publish.as_deref().unwrap_or(&settings.publish);
+            let publish = parse_publish_modes(publish_names)?;
+            let source_name = request.source.as_deref().unwrap_or(&settings.source);
+            let needs_origin = source_name == "origin" || publish.contains(&PublishMode::Push);
+            let origin_url = if needs_origin {
+                initial.origin.clone().ok_or_else(|| {
+                    task_error("INVALID_ORIGIN", "project origin is not configured")
+                })?
+            } else {
+                String::new()
+            };
+            let source = parse_task_source(
+                source_name,
+                request.wip,
+                &origin_url,
+                publish.contains(&PublishMode::Push),
+            )?;
+            let publish_branch = parse_publish_branch(request.publish_branch.as_deref(), &publish)?;
+            if request.wip && publish.contains(&PublishMode::Push) {
+                return Err(task_error(
+                    "PUBLISH_REQUIRES_COMMITTED_BASE",
+                    "publish push requires a committed base",
+                ));
+            }
+            let requirements = task_requirements(
+                &initial.requirements,
+                request.agent,
+                env_profile.as_deref(),
+                source.origin_requirement()?.as_deref(),
+            );
+            let observations = self.observe_admission(&request.preference)?;
+            let affinity = self
+                .client_state
+                .affinity_hints(&initial.context.project_id, &initial.context.worktree_id)?;
+            if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
+                &observations,
+                &requirements,
+                &request.preference,
+                &affinity,
+            ) {
+                if let WorkerPreference::Pinned { worker } = &request.preference
+                    && let Some(missing) = rejections.iter().find_map(|rejection| match rejection {
+                        crate::scheduler::CandidateRejection::MissingCapabilities {
+                            name,
+                            missing,
+                        } if name == worker => Some(missing.as_slice()),
+                        _ => None,
+                    })
+                {
+                    return Err(capability_missing(worker, missing));
+                }
+                if !request.wait_for_capacity {
+                    return Err(capacity_busy());
+                }
+            }
+
+            let task_id = task_id_override.unwrap_or_else(TaskId::generate);
+            let turn_id = turn_id_override.unwrap_or_else(TurnId::generate);
+            let prepared_base = if let TaskSource::Origin { url } = &source {
+                let oid =
+                    TransferRepo::resolve_base_oid(self.runner, &initial.context, &request.base)?;
+                GitTransport::new(self.runner).preflight_origin(url, &oid)?;
+                PreparedSubmitBase::Ready(crate::transfer_repo::BaseCommit::from_origin(oid))
+            } else {
+                PreparedSubmitBase::Resolve {
+                    wip: request.wip,
+                    request_base: request.base.clone(),
+                }
+            };
+            let policy = permission_policy(settings, request.agent);
+            (
+                initial.context,
+                limits,
+                env_profile,
+                model,
+                effort,
+                publish,
+                publish_branch,
+                source,
+                requirements,
+                policy,
+                prepared_base,
+                initial.settings,
+                task_id,
+                turn_id,
+                title,
+            )
+        };
+        let now = current_time_millis()?;
+        let created_at = original_created_at.unwrap_or(now);
+        let submit_guard = acquire_in_process_submit_guard(self.client_state.client_id(), task_id);
+        self.client_state
+            .reach_concurrency_point(ClientStateConcurrencyPoint::DagSubmit);
+        let transfer = TransferRepo::open_or_create(&self.paths.cache, &context.common_dir)?;
+        let built_local_base = matches!(prepared_base, PreparedSubmitBase::Resolve { .. });
+        let base = match prepared_base {
+            PreparedSubmitBase::Ready(base) => base,
+            PreparedSubmitBase::Resolve { wip, request_base } => {
+                if wip {
+                    transfer.build_wip_base(self.runner, &context, task_id, &settings, &identity)?
+                } else {
+                    transfer.resolve_base(self.runner, &context, &request_base)?
+                }
+            }
+        };
+        if !matches!(source, TaskSource::Origin { .. })
+            && let Err(error) = transfer.check_sensitive_tree(self.runner, base.oid(), &settings)
+        {
+            if built_local_base {
+                let _ = transfer.release_base(self.runner, task_id);
+            }
+            return Err(error);
+        }
         let reserved_branch = publish.contains(&PublishMode::Push).then(|| {
             publish_branch
                 .clone()
                 .unwrap_or_else(|| BranchName::for_task(task_id))
         });
-        let origin_base = if let TaskSource::Origin { url } = &source {
-            let oid = TransferRepo::resolve_base_oid(self.runner, &initial.context, &request.base)?;
-            GitTransport::new(self.runner).preflight_origin(url, &oid)?;
-            Some(crate::transfer_repo::BaseCommit::from_origin(oid))
-        } else {
-            None
-        };
-        let transfer =
-            TransferRepo::open_or_create(&self.paths.cache, &initial.context.common_dir)?;
-        let base = if let Some(base) = origin_base {
-            base
-        } else if request.wip {
-            transfer.build_wip_base(
-                self.runner,
-                &initial.context,
-                task_id,
-                &initial.settings,
-                &identity,
-            )?
-        } else {
-            transfer.resolve_base(self.runner, &initial.context, &request.base)?
-        };
-        if !matches!(source, TaskSource::Origin { .. })
-            && let Err(error) =
-                transfer.check_sensitive_tree(self.runner, base.oid(), &initial.settings)
-        {
-            let _ = transfer.release_base(self.runner, task_id);
-            return Err(error);
-        }
-        let composed_prompt = compose_turn_prompt(
-            task_id,
-            1,
-            request.agent,
-            base.oid(),
-            initial.context.branch.as_deref(),
-            &request.prompt,
-            false,
-        );
-        if let Err(error) = validate_prompt(&composed_prompt) {
-            let _ = transfer.release_base(self.runner, task_id);
-            return Err(error);
-        }
-
-        let policy = permission_policy(settings, request.agent);
-        let meta = TaskMeta::new(TaskMetaInput {
-            task_id,
-            run_id: request.run_id,
-            project_id: initial.context.project_id.clone(),
-            worktree_id: initial.context.worktree_id.clone(),
-            agent: request.agent,
-            model,
-            effort,
-            policy,
-            source,
-            publish,
-            publish_branch: publish_branch.clone(),
-            base_oid: base.oid().clone(),
-            limits,
-            close_policy: request.close_policy,
-            env_profile,
-            git_identity: identity,
-            title,
-            prompt: request.prompt.clone(),
-            created_at_millis: now,
-        })?;
-        let status = TaskStatus::new(
-            TaskState::Queued,
-            None,
-            None,
-            false,
-            Some(base.oid().clone()),
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-            Vec::new(),
-            now,
-        )?;
-        let pinned_worker = match &request.preference {
-            WorkerPreference::Automatic => None,
-            WorkerPreference::Pinned { worker } => Some(worker.clone()),
-        };
-        let record = LocalTaskRecord::new(
-            meta.clone(),
-            status,
-            None,
-            None,
-            None,
-            transfer.repo_id().to_owned(),
-            pinned_worker,
-            request.wait_for_capacity,
-            None,
-        )?
-        // The intent is written in the initial task-record creation, before
-        // any prompt, queue, report, or marker update can fail. Reconciliation
-        // may compensate only while this marker remains present.
-        .with_submission_intent_turn_id(turn_id)?;
-        let record_for_rollback = record.clone();
-        let reservation = match (request.run_id, reserved_branch.as_ref()) {
-            (Some(run_id), Some(branch)) => match self
-                .client_state
-                .reserve_run_publish_branch_for_task(run_id, task_id, branch.clone())
-            {
-                Ok(run) => Some(run),
+        let mut resuming = false;
+        let mut record_for_rollback =
+            if let Some(existing) = self.client_state.load_task_optional(task_id)? {
+                let existing = self.recover_existing_submit_record(existing)?;
+                self.require_matching_submit_record(
+                    &existing,
+                    &request,
+                    task_id,
+                    turn_id,
+                    base.oid(),
+                    &context.project_id,
+                    &context.worktree_id,
+                    &source,
+                    &publish,
+                    publish_branch.as_ref(),
+                    &limits,
+                    policy,
+                    request.close_policy,
+                    model.as_deref(),
+                    effort.as_deref(),
+                    env_profile.as_deref(),
+                    title.as_deref(),
+                    original_created_at,
+                )?;
+                resuming = true;
+                existing
+            } else {
+                let meta = TaskMeta::new(TaskMetaInput {
+                    task_id,
+                    run_id: request.run_id,
+                    project_id: context.project_id.clone(),
+                    worktree_id: context.worktree_id.clone(),
+                    agent: request.agent,
+                    model,
+                    effort,
+                    policy,
+                    source,
+                    publish,
+                    publish_branch: publish_branch.clone(),
+                    base_oid: base.oid().clone(),
+                    limits,
+                    close_policy: request.close_policy,
+                    env_profile,
+                    git_identity: identity,
+                    title,
+                    prompt: request.prompt.clone(),
+                    created_at_millis: created_at,
+                })?;
+                let status = TaskStatus::new(
+                    TaskState::Queued,
+                    None,
+                    None,
+                    false,
+                    Some(base.oid().clone()),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    now,
+                )?;
+                let pinned_worker = match &request.preference {
+                    WorkerPreference::Automatic => None,
+                    WorkerPreference::Pinned { worker } => Some(worker.clone()),
+                };
+                LocalTaskRecord::new(
+                    meta,
+                    status,
+                    None,
+                    None,
+                    None,
+                    transfer.repo_id().to_owned(),
+                    pinned_worker,
+                    request.wait_for_capacity,
+                    None,
+                )?
+                // The intent is written in the initial task-record creation, before
+                // any prompt, queue, report, or marker update can fail. Reconciliation
+                // may compensate only while this marker remains present.
+                .with_submission_intent_turn_id(turn_id)?
+            };
+        let composed_prompt = {
+            let branch = match frozen {
+                Some(node) => node.frozen.branch.as_deref(),
+                None => context.branch.as_deref(),
+            };
+            match self.client_state.read_turn_prompt(task_id, turn_id) {
+                Ok(existing) => {
+                    let expected = compose_turn_prompt(
+                        task_id,
+                        1,
+                        request.agent,
+                        base.oid(),
+                        branch,
+                        &request.prompt,
+                        false,
+                    );
+                    if existing != expected {
+                        let _ = transfer.release_base(self.runner, task_id);
+                        return Err(task_error(
+                            "TASK_ID_CONFLICT",
+                            "task ID is already present with different metadata",
+                        ));
+                    }
+                    existing
+                }
+                Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    compose_turn_prompt(
+                        task_id,
+                        1,
+                        request.agent,
+                        base.oid(),
+                        branch,
+                        &request.prompt,
+                        false,
+                    )
+                }
                 Err(error) => {
                     let _ = transfer.release_base(self.runner, task_id);
                     return Err(error);
                 }
-            },
-            _ => None,
-        };
-        if let Err(error) = self.client_state.create_task(record) {
-            if reservation.is_some()
-                && let (Some(run_id), Some(branch)) = (request.run_id, reserved_branch.as_ref())
-            {
-                let _ = self
-                    .client_state
-                    .release_run_publish_branch_for_task(run_id, task_id, branch);
             }
+        };
+        if let Err(error) = validate_prompt(&composed_prompt) {
             let _ = transfer.release_base(self.runner, task_id);
             return Err(error);
         }
+        let mut preserve_durable = resuming || frozen.is_some();
+        if resuming
+            && crate::dag::dag_submission_complete(&record_for_rollback)
+            && self.client_state.read_turn_prompt(task_id, turn_id).is_ok()
+            && self.client_state.queue_entry(turn_id)?.is_some()
+        {
+            if let Some(entry) = self.client_state.queue_entry(turn_id)? {
+                self.require_matching_queue_row(
+                    &entry,
+                    turn_id,
+                    &context.project_id,
+                    &context.worktree_id,
+                    &requirements,
+                    &request.preference,
+                    request.run_id,
+                )?;
+            }
+            drop(transfer);
+            let mut report = self.report_for(task_id)?;
+            report.events.push(event_task_created(&report));
+            return Ok(report);
+        }
+        let reservation = if resuming {
+            None
+        } else {
+            match (request.run_id, reserved_branch.as_ref()) {
+                (Some(run_id), Some(branch)) => {
+                    match self.client_state.reserve_run_publish_branch_for_task(
+                        run_id,
+                        task_id,
+                        branch.clone(),
+                    ) {
+                        Ok(run) => Some(run),
+                        Err(error) => {
+                            let _ = transfer.release_base(self.runner, task_id);
+                            return Err(error);
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
+        if !resuming {
+            match self.client_state.create_task(record_for_rollback.clone()) {
+                Ok(()) => {}
+                Err(error) if error.public_code() == "TASK_ID_CONFLICT" => {
+                    let existing =
+                        self.recover_existing_submit_record(self.client_state.load_task(task_id)?)?;
+                    self.require_matching_submit_record(
+                        &existing,
+                        &request,
+                        task_id,
+                        turn_id,
+                        base.oid(),
+                        &context.project_id,
+                        &context.worktree_id,
+                        record_for_rollback.meta().source(),
+                        record_for_rollback.meta().publish(),
+                        record_for_rollback.meta().publish_branch(),
+                        record_for_rollback.meta().limits(),
+                        record_for_rollback.meta().policy(),
+                        record_for_rollback.meta().close_policy(),
+                        record_for_rollback.meta().model(),
+                        record_for_rollback.meta().effort(),
+                        record_for_rollback.meta().env_profile(),
+                        Some(record_for_rollback.meta().title().as_str()),
+                        original_created_at,
+                    )?;
+                    record_for_rollback = existing;
+                    resuming = true;
+                    preserve_durable = true;
+                }
+                Err(error) => {
+                    if reservation.is_some()
+                        && let (Some(run_id), Some(branch)) =
+                            (request.run_id, reserved_branch.as_ref())
+                    {
+                        let _ = self
+                            .client_state
+                            .release_run_publish_branch_for_task(run_id, task_id, branch);
+                    }
+                    let _ = transfer.release_base(self.runner, task_id);
+                    return Err(error);
+                }
+            }
+        }
         let (mut report, queued_turn) = match (|| -> Result<(TaskReport, TurnId), WorkerError> {
             self.client_state
-                .write_task_project_path(&record_for_rollback, &initial.context.root)?;
+                .write_task_project_path(&record_for_rollback, &context.root)?;
             self.client_state
                 .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
             let run_reference = match request.run_id {
@@ -892,17 +1242,33 @@ impl<'a> TaskClient<'a> {
             let entry = QueueEntry::new(
                 turn_id,
                 self.client_state.client_id(),
-                initial.context.project_id.clone(),
-                initial.context.worktree_id.clone(),
+                context.project_id.clone(),
+                context.worktree_id.clone(),
                 command.summary()?,
-                requirements,
+                requirements.clone(),
                 request.preference.clone(),
                 QueueEntryKind::TaskTurn,
                 run_reference,
                 owner,
                 now,
             )?;
-            let entry = self.client_state.enqueue(entry)?;
+            let entry = match self.client_state.enqueue(entry) {
+                Ok(entry) => entry,
+                Err(error) if error.public_code() == "QUEUE_JOB_CONFLICT" => {
+                    let existing = self.client_state.queue_entry(turn_id)?.ok_or(error)?;
+                    self.require_matching_queue_row(
+                        &existing,
+                        turn_id,
+                        &context.project_id,
+                        &context.worktree_id,
+                        &requirements,
+                        &request.preference,
+                        request.run_id,
+                    )?;
+                    existing
+                }
+                Err(error) => return Err(error),
+            };
 
             self.client_state.submission_report_fault()?;
             let report = self.report_for(task_id)?;
@@ -910,7 +1276,9 @@ impl<'a> TaskClient<'a> {
         })() {
             Ok(report) => report,
             Err(error) => {
-                self.rollback_submission(turn_id, &record_for_rollback, &transfer);
+                if !preserve_durable {
+                    self.rollback_submission(turn_id, &record_for_rollback, &transfer);
+                }
                 return Err(error);
             }
         };
@@ -920,24 +1288,38 @@ impl<'a> TaskClient<'a> {
         // pre-handoff snapshot. Retain the complete durable submission for
         // reconciliation rather than overwriting a runner that may already
         // have adopted the published row.
-        self.client_state
-            .clear_submission_intent(record_for_rollback.without_submission_intent()?)?;
-        match self.start_runner(task_id, turn_id, request.attached, false)? {
-            RunnerStart::Started(_) => {
-                report.runner = self.client_state.runner_liveness(task_id)?;
+        let current = self.client_state.load_task(task_id)?;
+        if current.submission_intent_turn_id().is_some() {
+            self.client_state
+                .clear_submission_intent(current.without_submission_intent()?)?;
+        }
+        if !(resuming && self.submission_handoff_already_adopted(task_id, turn_id)?) {
+            match self.start_runner(task_id, turn_id, request.attached, false)? {
+                RunnerStart::Started(_) => {
+                    report.runner = self.client_state.runner_liveness(task_id)?;
+                }
+                RunnerStart::Pending => {}
+                RunnerStart::Saturated => {
+                    // Parking publishes eligibility to an independent runner. A park
+                    // error may therefore mean ownership already transferred, so
+                    // preserve durable state for reconciliation.
+                    if self
+                        .client_state
+                        .queue_entry(queued_turn)?
+                        .is_some_and(|entry| matches!(entry.state(), QueueState::Waiting { .. }))
+                    {
+                        self.client_state.park_row(queued_turn)?;
+                    }
+                }
             }
-            RunnerStart::Pending => {}
-            RunnerStart::Saturated => {
-                // Parking publishes eligibility to an independent runner. A park
-                // error may therefore mean ownership already transferred, so
-                // preserve durable state for reconciliation.
-                self.client_state.park_row(queued_turn)?;
-            }
+        } else {
+            report.runner = self.client_state.runner_liveness(task_id)?;
         }
         // The submitter no longer needs the repository after the queue row is
         // handed off.  Its shared lock would not block the attached runner,
         // but a handle that outlives its use is a handle GC has to wait for.
         drop(transfer);
+        drop(submit_guard);
         report.events.push(event_task_created(&report));
         if request.attached {
             let mut follow = stdout;
@@ -955,6 +1337,148 @@ impl<'a> TaskClient<'a> {
             report.exit_code = Some(outcome.exit_code());
         }
         Ok(report)
+    }
+
+    fn recover_existing_submit_record(
+        &self,
+        existing: LocalTaskRecord,
+    ) -> Result<LocalTaskRecord, WorkerError> {
+        let mut current = existing;
+        for _ in 0..SUBMISSION_ROLLBACK_RECOVER_ATTEMPTS {
+            if current.abandon_code() != Some(SUBMISSION_ROLLBACK_INCOMPLETE) {
+                return Ok(current);
+            }
+            self.client_state
+                .reach_concurrency_point(ClientStateConcurrencyPoint::SubmissionRollbackRecover);
+            let recovered = current.without_submission_rollback()?;
+            if self
+                .client_state
+                .update_task_if_current(&current, recovered.clone())?
+            {
+                return Ok(recovered);
+            }
+            current = self.client_state.load_task(current.meta().task_id())?;
+        }
+        if current.abandon_code() != Some(SUBMISSION_ROLLBACK_INCOMPLETE) {
+            return Ok(current);
+        }
+        Err(task_error(
+            "TASK_ID_CONFLICT",
+            "submission rollback recovery raced with a newer task record",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn require_matching_submit_record(
+        &self,
+        existing: &LocalTaskRecord,
+        request: &TaskSubmitRequest,
+        task_id: TaskId,
+        turn_id: TurnId,
+        base_oid: &crate::task::BaseOid,
+        project_id: &str,
+        worktree_id: &str,
+        source: &TaskSource,
+        publish: &[PublishMode],
+        publish_branch: Option<&crate::task::BranchName>,
+        limits: &TaskLimits,
+        policy: PermissionPolicy,
+        close_policy: ClosePolicy,
+        model: Option<&str>,
+        effort: Option<&str>,
+        env_profile: Option<&str>,
+        title: Option<&str>,
+        original_created_at: Option<u64>,
+    ) -> Result<(), WorkerError> {
+        if existing.meta().task_id() != task_id
+            || existing.meta().base_oid() != base_oid
+            || existing.meta().project_id() != project_id
+            || existing.meta().worktree_id() != worktree_id
+            || existing.meta().run_id() != request.run_id
+            || existing.meta().agent() != request.agent
+            || existing.preference() != request.preference
+            || existing.meta().source() != source
+            || existing.meta().publish() != publish
+            || existing.meta().publish_branch() != publish_branch
+            || existing.meta().limits() != limits
+            || existing.meta().policy() != policy
+            || existing.meta().close_policy() != close_policy
+            || existing.meta().model() != model
+            || existing.meta().effort() != effort
+            || existing.meta().env_profile() != env_profile
+            || title.is_some_and(|title| existing.meta().title().as_str() != title)
+            || original_created_at
+                .is_some_and(|created_at| existing.meta().created_at_millis() != created_at)
+        {
+            return Err(task_error(
+                "TASK_ID_CONFLICT",
+                "task ID is already present with different metadata",
+            ));
+        }
+        if existing
+            .submission_intent_turn_id()
+            .is_some_and(|intent| intent != turn_id)
+            || existing
+                .submission_rollback_turn_id()
+                .is_some_and(|rollback| rollback != turn_id)
+        {
+            return Err(task_error(
+                "TASK_ID_CONFLICT",
+                "task ID is already present with different metadata",
+            ));
+        }
+        let turns = self.client_state.turn_ids_for_task(task_id)?;
+        if turns.iter().any(|id| *id != turn_id) {
+            return Err(task_error(
+                "TASK_ID_CONFLICT",
+                "task ID is already present with different metadata",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn require_matching_queue_row(
+        &self,
+        existing: &QueueEntry,
+        turn_id: TurnId,
+        project_id: &str,
+        worktree_id: &str,
+        requirements: &[String],
+        preference: &WorkerPreference,
+        run_id: Option<RunId>,
+    ) -> Result<(), WorkerError> {
+        let expected_run = run_id.map(|run_id| run_id.to_string());
+        let actual_run = existing.run().map(|run| run.run_id().as_str().to_owned());
+        if existing.job_id() != turn_id
+            || existing.client_id() != self.client_state.client_id()
+            || existing.project_id() != project_id
+            || existing.worktree_id() != worktree_id
+            || existing.kind() != QueueEntryKind::TaskTurn
+            || existing.requirements() != requirements
+            || existing.preference() != preference
+            || expected_run != actual_run
+        {
+            return Err(task_error(
+                "TASK_ID_CONFLICT",
+                "task turn queue row does not match this submission",
+            ));
+        }
+        Ok(())
+    }
+
+    fn submission_handoff_already_adopted(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<bool, WorkerError> {
+        if self.client_state.runner_liveness(task_id)? != Some(RunnerState::Live) {
+            return Ok(false);
+        }
+        Ok(self
+            .client_state
+            .queue_entry(turn_id)?
+            .is_some_and(|entry| matches!(entry.state(), QueueState::Dispatching { .. })))
     }
 
     pub fn status(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
@@ -1003,7 +1527,7 @@ impl<'a> TaskClient<'a> {
             .filter(|run| filter.run_id.is_none_or(|run_id| run.run_id() == run_id))
             .collect::<Vec<_>>();
         let blocking_codes = self.client_state.task_blocking_codes(self.config)?;
-        let projection = project_task_list_with_blocking_codes(
+        let mut projection = project_task_list_with_blocking_codes(
             &records,
             &runs,
             &runner_states,
@@ -1011,6 +1535,16 @@ impl<'a> TaskClient<'a> {
             &blocking_codes,
         )
         .map_err(task_view_error)?;
+        for dag in self.client_state.list_run_dags()? {
+            if filter.run_id.is_none_or(|run_id| dag.run_id == run_id) {
+                merge_pending_into_projection(
+                    &mut projection,
+                    dag.run_id,
+                    &dag,
+                    dag.created_at_millis,
+                );
+            }
+        }
         Ok(TaskListReport {
             projection: filter_task_list(projection, filter.state, filter.outcome.as_deref()),
         })
@@ -1213,13 +1747,7 @@ impl<'a> TaskClient<'a> {
             ));
         }
         let worker = task_worker(self.config, record.status())?;
-        let project = ProjectState::load_for_task(
-            self.runner,
-            &self.current_project(Some(&record))?,
-            &[],
-            record.meta(),
-        )?;
-        require_project_match(&project, record.meta())?;
+        let project = self.load_project_for_record(&record)?;
         let transfer =
             TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
         let _remote_receipt = GitTransport::new(self.runner).fetch_result(
@@ -1342,7 +1870,9 @@ impl<'a> TaskClient<'a> {
                 ));
             }
             self.finish_waiting_cancellation_locked(task_id, &retained, &mut log)?;
-            return self.report_for(task_id);
+            let report = self.report_for(task_id)?;
+            self.advance_pending_dags()?;
+            return Ok(report);
         }
         if record.close_intent().is_none() && record.status().state() == TaskState::Queued {
             return Err(task_error(
@@ -1415,6 +1945,7 @@ impl<'a> TaskClient<'a> {
         self.release_task_base(&fenced)?;
         let mut report = self.report_for(task_id)?;
         report.warnings = warnings;
+        self.advance_pending_dags()?;
         Ok(report)
     }
 
@@ -1698,6 +2229,7 @@ impl<'a> TaskClient<'a> {
         while self.start_oldest_parked_runner(owner)? {
             report.started_runners += 1;
         }
+        self.advance_pending_dags()?;
         Ok(report)
     }
 
@@ -1978,17 +2510,26 @@ impl<'a> TaskClient<'a> {
         timeout: Option<Duration>,
     ) -> Result<WaitReport, WorkerError> {
         let started = SystemTime::now();
-        let task_ids = match selector {
-            WaitSelector::Task(task_id) => vec![task_id],
-            WaitSelector::Run(run_id) => self.client_state.load_run(run_id)?.task_ids().to_vec(),
-        };
         loop {
             self.reconcile_runners()?;
+            let (task_ids, dag_pending) = match selector {
+                WaitSelector::Task(task_id) => (vec![task_id], false),
+                WaitSelector::Run(run_id) => {
+                    let pending = self
+                        .client_state
+                        .load_run_dag(run_id)?
+                        .is_some_and(|dag| !dag_run_is_quiescent(&dag));
+                    (
+                        self.client_state.load_run(run_id)?.task_ids().to_vec(),
+                        pending,
+                    )
+                }
+            };
             let records = task_ids
                 .iter()
                 .map(|task_id| self.client_state.load_task(*task_id))
                 .collect::<Result<Vec<_>, _>>()?;
-            if self.tasks_are_quiescent(&records)? {
+            if !dag_pending && self.tasks_are_quiescent(&records)? {
                 let exit_code = if records.iter().any(|record| {
                     matches!(
                         record.status().last_outcome(),
@@ -2043,7 +2584,24 @@ pub fn preview_batch_plan(
     let state = ProjectState::load(runner, project, &[])?;
     let batch_dir = file.parent().unwrap_or_else(|| Path::new("."));
     let mut issues = Vec::new();
-    issues.extend(dependency_issues(&batch.tasks));
+    let graph: Vec<GraphNode<'_>> = batch
+        .tasks
+        .iter()
+        .map(|task| GraphNode {
+            id: task.id.as_deref(),
+            depends_on: &task.depends_on,
+            base: task.base.as_deref().unwrap_or(&batch.defaults.base),
+        })
+        .collect();
+    issues.extend(
+        validate_batch_graph(&graph)
+            .into_iter()
+            .map(|issue| PreviewIssue {
+                severity: "error",
+                kind: issue.kind,
+                message: issue.message,
+            }),
+    );
     let mut tasks = Vec::with_capacity(batch.tasks.len());
     for (index, task) in batch.tasks.iter().enumerate() {
         let files = task.files.clone();
@@ -2119,7 +2677,7 @@ pub fn preview_batch_plan(
                     )
                 }
             };
-        if !wip {
+        if !wip && parse_from_base(&base).is_none() {
             match TransferRepo::resolve_base_oid(runner, &state.context, &base) {
                 Ok(oid) => {
                     base = oid.to_string();
@@ -2157,9 +2715,9 @@ pub fn preview_batch_plan(
     Ok(BatchPreview {
         preview_version: 1,
         dag: DagPreview {
-            enforced: false,
-            status: "unsupported",
-            message: "This version can preview dependencies but cannot execute them.",
+            enforced: true,
+            status: "enforced",
+            message: "Dependencies execute when parents are Closed and Done.",
         },
         setup: setup_preview(state.settings.setup.as_ref()),
         tasks,
@@ -2176,16 +2734,25 @@ impl<'a> TaskClient<'a> {
         _stdout: &mut dyn Write,
     ) -> Result<RunReport, WorkerError> {
         let batch = load_batch_file(file)?;
-        if batch.tasks.iter().any(|task| !task.depends_on.is_empty()) {
-            return Err(task_error(
-                "BATCH_DEPENDENCIES_UNSUPPORTED",
-                "This version can preview dependencies but cannot execute them.",
-            ));
+        let graph: Vec<GraphNode<'_>> = batch
+            .tasks
+            .iter()
+            .map(|task| GraphNode {
+                id: task.id.as_deref(),
+                depends_on: &task.depends_on,
+                base: task.base.as_deref().unwrap_or(&batch.defaults.base),
+            })
+            .collect();
+        if let Some(issue) = validate_batch_graph(&graph).into_iter().next() {
+            return Err(task_error("TASK_CONFIG_INVALID", issue.message));
         }
         if batch.tasks.is_empty() {
             return Err(task_error("TASK_CONFIG_INVALID", "batch has no tasks"));
         }
         self.reconcile_runners()?;
+        if batch_has_dag_edges(&batch.defaults, &batch.tasks) {
+            return self.submit_dependent_batch(file, &batch, run_name, max_parallel);
+        }
         let max_parallel =
             resolve_batch_max_parallel(max_parallel, self.config.configured_runner_slots())?;
         let run_id = RunId::generate();
@@ -2221,6 +2788,9 @@ impl<'a> TaskClient<'a> {
                 title,
                 &mut io::sink(),
                 &mut io::sink(),
+                false,
+                None,
+                None,
             )?;
         }
         Ok(RunReport { run_id, task_ids })
@@ -2241,19 +2811,265 @@ impl<'a> TaskClient<'a> {
         Ok(request)
     }
 
+    fn submit_dependent_batch(
+        &self,
+        file: &Path,
+        batch: &BatchFile,
+        run_name: Option<String>,
+        max_parallel: Option<u32>,
+    ) -> Result<RunReport, WorkerError> {
+        if batch.tasks.iter().any(|task| task.id.is_none()) {
+            return Err(task_error(
+                "TASK_CONFIG_INVALID",
+                "DAG batches require a task id on every task",
+            ));
+        }
+        let max_parallel =
+            resolve_batch_max_parallel(max_parallel, configured_slot_count(self.config))?;
+        let run_id = RunId::generate();
+        let created = current_time_millis()?;
+        let batch_dir = file.parent().unwrap_or_else(|| Path::new("."));
+        let project = self.current_project(None)?;
+        let project_state = ProjectState::load(self.runner, &project, &[])?;
+        let identity = GitIdentity::new(DEFAULT_GIT_NAME, DEFAULT_GIT_EMAIL)?;
+        let transfer =
+            TransferRepo::open_or_create(&self.paths.cache, &project_state.context.common_dir)?;
+        let mut nodes = BTreeMap::new();
+        let mut pins = Vec::new();
+        let freeze_result = (|| -> Result<BTreeMap<String, DagNode>, WorkerError> {
+            for task in &batch.tasks {
+                let request = resolve_batch_task(
+                    self.config,
+                    &batch.defaults,
+                    task,
+                    batch_dir,
+                    &project,
+                    &project_state.settings.task,
+                )?;
+                let batch_id = task.id.clone().expect("id checked");
+                let mut depends_on = task.depends_on.clone();
+                if let Some(parent) = parse_from_base(&request.base)
+                    && !depends_on.iter().any(|dep| dep == parent)
+                {
+                    depends_on.push(parent.to_owned());
+                }
+                let task_id = TaskId::generate();
+                let turn_id = TurnId::generate();
+                let mut frozen = freeze_spec(&request, &project_state)?;
+                frozen.title = task.title.clone();
+                let base = if let Some(parent) = parse_from_base(&request.base) {
+                    DagBase::From {
+                        parent: parent.to_owned(),
+                    }
+                } else {
+                    let pin_ref = dag_pin_ref(run_id, &batch_id);
+                    let (oid, wip) = if request.wip {
+                        let commit = transfer.build_wip_base(
+                            self.runner,
+                            &project_state.context,
+                            task_id,
+                            &project_state.settings,
+                            &identity,
+                        )?;
+                        (commit.oid().clone(), true)
+                    } else {
+                        (
+                            TransferRepo::resolve_base_oid(
+                                self.runner,
+                                &project_state.context,
+                                &request.base,
+                            )?,
+                            false,
+                        )
+                    };
+                    transfer.pin_object(self.runner, &pin_ref, &oid)?;
+                    pins.push(pin_ref.clone());
+                    DagBase::Frozen { oid, pin_ref, wip }
+                };
+                nodes.insert(
+                    batch_id.clone(),
+                    DagNode {
+                        batch_id,
+                        task_id,
+                        turn_id,
+                        depends_on,
+                        base,
+                        frozen,
+                        state: DagNodeState::Waiting,
+                        bound_oid: None,
+                        bound_turn_id: None,
+                        pin_ref: None,
+                        blocked_by: None,
+                        claimed_by: None,
+                        claimed_at_millis: None,
+                    },
+                );
+            }
+            Ok(nodes)
+        })();
+        let nodes = match freeze_result {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                for pin in &pins {
+                    let _ = transfer.unpin_object(self.runner, pin);
+                }
+                return Err(error);
+            }
+        };
+        let dag = match DagRecord::new(run_id, nodes, max_parallel, run_name.clone(), created) {
+            Ok(dag) => dag,
+            Err(error) => {
+                for pin in &pins {
+                    let _ = transfer.unpin_object(self.runner, pin);
+                }
+                return Err(error);
+            }
+        };
+        let run = RunRecord::new(run_id, run_name, Vec::new(), max_parallel, created)?;
+        if let Err(error) = self.client_state.create_run_with_dag(run, dag) {
+            // DAG file may already be durable. Do not unpin a published graph
+            // because the RunRecord write failed or crashed.
+            if matches!(self.client_state.load_run_dag(run_id), Ok(None)) {
+                for pin in &pins {
+                    let _ = transfer.unpin_object(self.runner, pin);
+                }
+            }
+            return Err(error);
+        }
+        drop(transfer);
+        self.advance_pending_dags_inner(true)?;
+        let task_ids = self.client_state.load_run(run_id)?.task_ids().to_vec();
+        Ok(RunReport { run_id, task_ids })
+    }
+
+    pub fn advance_pending_dags(&self) -> Result<(), WorkerError> {
+        let entered = ADVANCING_PENDING_DAGS.with(|flag| {
+            if flag.get() {
+                false
+            } else {
+                flag.set(true);
+                true
+            }
+        });
+        if !entered {
+            return Ok(());
+        }
+        struct AdvancingGuard;
+        impl Drop for AdvancingGuard {
+            fn drop(&mut self) {
+                ADVANCING_PENDING_DAGS.with(|flag| flag.set(false));
+            }
+        }
+        let _guard = AdvancingGuard;
+        self.advance_pending_dags_inner(true)
+    }
+
+    fn advance_pending_dags_inner(&self, skip_reconcile: bool) -> Result<(), WorkerError> {
+        self.bind_ready_from_nodes()?;
+        let caller = current_process_identity()?;
+        let now = current_time_millis()?;
+        for dag in self.client_state.list_pending_dags()? {
+            while let Some(claim) = self
+                .client_state
+                .claim_next_eligible_dag_node(dag.run_id, caller, now)?
+            {
+                self.submit_prepared_dag_node(dag.run_id, &claim.node, skip_reconcile)?;
+                self.client_state.mark_dag_node_submitted(
+                    dag.run_id,
+                    &claim.batch_id,
+                    claim.node.task_id,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pins `from:` children to the parent's exact last imported turn, then
+    /// publishes the immutable DAG binding. TransferRepo is dropped before
+    /// the state write that reacquires StateLock.
+    fn bind_ready_from_nodes(&self) -> Result<(), WorkerError> {
+        for dag in self.client_state.list_pending_dags()? {
+            let candidates: Vec<(String, DagNode)> = dag
+                .nodes
+                .iter()
+                .filter(|(_, node)| {
+                    node.from_parent().is_some()
+                        && node.bound_oid.is_none()
+                        && node.state != DagNodeState::Blocked
+                })
+                .map(|(batch_id, node)| (batch_id.clone(), node.clone()))
+                .collect();
+            for (batch_id, node) in candidates {
+                let Some(parent_id) = node.from_parent() else {
+                    continue;
+                };
+                let Some(parent_node) = dag.nodes.get(parent_id) else {
+                    continue;
+                };
+                let Some(parent_record) =
+                    self.client_state.load_task_optional(parent_node.task_id)?
+                else {
+                    continue;
+                };
+                if parent_gate(&parent_record) != ParentGate::Ready {
+                    continue;
+                }
+                let Some(last) = parent_record.status().turns().last() else {
+                    continue;
+                };
+                let last_turn_id = last.turn_id();
+                let queue_busy = self
+                    .client_state
+                    .queue_entry_for_task_turn(parent_record.meta().task_id())?
+                    .is_some();
+                let journal_complete = match crate::runner_log::RunnerLog::try_open_existing(
+                    &self.paths.state,
+                    parent_record.meta().task_id(),
+                    last_turn_id,
+                )? {
+                    Some(log) => {
+                        let complete = log.completion().is_some();
+                        drop(log);
+                        complete
+                    }
+                    None => false,
+                };
+                let transfer = self.transfer_for_record(&parent_record)?;
+                let object_exists = parent_record
+                    .fetched_head()
+                    .is_some_and(|oid| transfer.has_object(oid));
+                let Some(oid) = accepted_import_oid(
+                    &parent_record,
+                    last_turn_id,
+                    queue_busy,
+                    journal_complete,
+                    object_exists,
+                ) else {
+                    drop(transfer);
+                    continue;
+                };
+                let pin_ref = dag_pin_ref(dag.run_id, &batch_id);
+                transfer.pin_object(self.runner, &pin_ref, &oid)?;
+                drop(transfer);
+                self.client_state.publish_dag_binding(
+                    dag.run_id,
+                    &batch_id,
+                    oid,
+                    last_turn_id,
+                    pin_ref,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn enqueue_followup(
         &self,
         record: &LocalTaskRecord,
         turn_id: TurnId,
         worker: String,
     ) -> Result<QueueEntry, WorkerError> {
-        let project = ProjectState::load_for_task(
-            self.runner,
-            &self.current_project(Some(record))?,
-            &[],
-            record.meta(),
-        )?;
-        require_project_match(&project, record.meta())?;
+        let project = self.load_project_for_record(record)?;
         let now = current_time_millis()?;
         let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
         let preference = WorkerPreference::Pinned { worker };
@@ -2444,13 +3260,7 @@ impl<'a> TaskClient<'a> {
     }
 
     fn transfer_for_record(&self, record: &LocalTaskRecord) -> Result<TransferRepo, WorkerError> {
-        let project = ProjectState::load_for_task(
-            self.runner,
-            &self.current_project(Some(record))?,
-            &[],
-            record.meta(),
-        )?;
-        require_project_match(&project, record.meta())?;
+        let project = self.load_project_for_record(record)?;
         TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
     }
 
@@ -2478,13 +3288,7 @@ impl<'a> TaskClient<'a> {
                     .copied()
             })
             .ok_or_else(|| task_error("TASK_INCONSISTENT", "queued task has no turn prompt"))?;
-        let project = ProjectState::load_for_task(
-            self.runner,
-            &self.current_project(Some(record))?,
-            &[],
-            record.meta(),
-        )?;
-        require_project_match(&project, record.meta())?;
+        let project = self.load_project_for_record(record)?;
         let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
         let run = record
             .meta()
@@ -2681,8 +3485,7 @@ impl<'a> TaskClient<'a> {
         &self,
         record: &LocalTaskRecord,
     ) -> Result<LocalTaskRecord, WorkerError> {
-        if record.close_intent().is_some()
-            || record.abandon_code() == Some("LOG_DRAIN_UNAVAILABLE")
+        if record.close_intent().is_some() || record.abandon_code() == Some("LOG_DRAIN_UNAVAILABLE")
         {
             return Ok(record.clone());
         }
@@ -2788,13 +3591,7 @@ impl<'a> TaskClient<'a> {
     }
 
     fn release_task_base(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
-        let project = ProjectState::load_for_task(
-            self.runner,
-            &self.current_project(Some(record))?,
-            &[],
-            record.meta(),
-        )?;
-        require_project_match(&project, record.meta())?;
+        let project = self.load_project_for_record(record)?;
         let transfer =
             TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
         transfer.release_base(self.runner, record.meta().task_id())
@@ -2826,6 +3623,23 @@ impl<'a> TaskClient<'a> {
             return Ok(project_path);
         }
         std::env::current_dir().map_err(WorkerError::Io)
+    }
+
+    fn load_project_for_record(
+        &self,
+        record: &LocalTaskRecord,
+    ) -> Result<ProjectState, WorkerError> {
+        let frozen = self.client_state.frozen_spec_for_record(record)?;
+        let project = ProjectState::load_validated_for_task(self.runner, frozen.as_ref(), || {
+            ProjectState::load_for_task(
+                self.runner,
+                &self.current_project(Some(record))?,
+                &[],
+                record.meta(),
+            )
+        })?;
+        require_project_match(&project, record.meta())?;
+        Ok(project)
     }
 
     /// `close`, `say`, and `fetch` refuse while a detached runner is still
@@ -3043,6 +3857,25 @@ fn parse_task_source(
     }
 }
 
+/// Bound `from:` children execute from the local TransferRepo cache. Origin
+/// stays the publish destination via `push_target`; frozen `requires` keep
+/// the origin host requirement. Ordinary origin tasks are unchanged.
+fn execution_source_for_bound_from(
+    source: TaskSource,
+    publish: &[PublishMode],
+) -> Result<TaskSource, WorkerError> {
+    match source {
+        TaskSource::Origin { url } => Ok(TaskSource::Local {
+            wip: false,
+            push_target: publish
+                .contains(&PublishMode::Push)
+                .then(|| PushTarget::new(url))
+                .transpose()?,
+        }),
+        local @ TaskSource::Local { .. } => Ok(local),
+    }
+}
+
 fn parse_publish_modes(values: &[String]) -> Result<Vec<PublishMode>, WorkerError> {
     if values.is_empty() {
         return Err(task_error(
@@ -3188,6 +4021,124 @@ fn permission_policy(settings: &TaskSettings, agent: AgentKind) -> PermissionPol
         Some("unattended") => PermissionPolicy::Unattended,
         _ => PermissionPolicy::Workspace,
     }
+}
+
+fn batch_has_dag_edges(defaults: &BatchDefaults, tasks: &[BatchTask]) -> bool {
+    tasks.iter().any(|task| {
+        !task.depends_on.is_empty()
+            || parse_from_base(task.base.as_deref().unwrap_or(&defaults.base)).is_some()
+    })
+}
+
+fn freeze_spec(
+    request: &TaskSubmitRequest,
+    state: &ProjectState,
+) -> Result<DagFrozenSpec, WorkerError> {
+    let settings = &state.settings.task;
+    let limits = effective_task_limits(&request.limits, settings)?;
+    let env_profile = request
+        .env_profile
+        .clone()
+        .or_else(|| settings.env_profile.clone());
+    let model = request.model.clone().or_else(|| settings.model.clone());
+    let effort = request.effort.clone().or_else(|| settings.effort.clone());
+    let publish = request
+        .publish
+        .clone()
+        .unwrap_or_else(|| settings.publish.clone());
+    let source = request
+        .source
+        .clone()
+        .unwrap_or_else(|| settings.source.clone());
+    let parsed_publish = parse_publish_modes(&publish)?;
+    let origin_url = if source == "origin" || parsed_publish.contains(&PublishMode::Push) {
+        state.origin.clone()
+    } else {
+        None
+    };
+    let parsed_source = parse_task_source(
+        &source,
+        request.wip,
+        origin_url.as_deref().unwrap_or(""),
+        parsed_publish.contains(&PublishMode::Push),
+    )?;
+    let requirements = task_requirements(
+        &state.requirements,
+        request.agent,
+        env_profile.as_deref(),
+        parsed_source.origin_requirement()?.as_deref(),
+    );
+    let permissions = match permission_policy(settings, request.agent) {
+        PermissionPolicy::Unattended => "unattended",
+        PermissionPolicy::Workspace => "workspace",
+    };
+    Ok(DagFrozenSpec {
+        prompt: request.prompt.clone(),
+        title: None,
+        agent: agent_name(request.agent).to_owned(),
+        model,
+        effort,
+        source,
+        origin_url,
+        publish,
+        publish_branch: request.publish_branch.clone(),
+        close_on: request.close_policy,
+        env_profile,
+        worker: match &request.preference {
+            WorkerPreference::Pinned { worker } => Some(worker.clone()),
+            WorkerPreference::Automatic => None,
+        },
+        wip: request.wip,
+        project_path: state.context.root.to_string_lossy().into_owned(),
+        project_id: state.context.project_id.clone(),
+        worktree_id: state.context.worktree_id.clone(),
+        timeout_millis: limits.turn.timeout_millis,
+        max_turns: limits.turn.max_turns,
+        max_budget_usd_cents: limits.turn.max_budget_usd_cents,
+        max_followups: limits.max_followups,
+        permissions: permissions.to_owned(),
+        requires: requirements,
+        include_untracked: state.settings.snapshot.include_untracked.clone(),
+        include_empty_dirs: state.settings.snapshot.include_empty_dirs.clone(),
+        allow_sensitive: state.settings.snapshot.allow_sensitive.clone(),
+        cli_includes: request.cli_includes.clone(),
+        branch: state.context.branch.clone(),
+    })
+}
+
+fn request_from_frozen_node(
+    node: &DagNode,
+    run_id: Option<RunId>,
+) -> Result<TaskSubmitRequest, WorkerError> {
+    let spec = &node.frozen;
+    Ok(TaskSubmitRequest {
+        agent: parse_agent(&spec.agent)?,
+        model: spec.model.clone(),
+        effort: spec.effort.clone(),
+        prompt: spec.prompt.clone(),
+        project: PathBuf::from(&spec.project_path),
+        base: node
+            .execution_oid()
+            .map(|oid| oid.to_string())
+            .unwrap_or_default(),
+        wip: false,
+        source: Some(spec.source.clone()),
+        publish: Some(spec.publish.clone()),
+        publish_branch: spec.publish_branch.clone(),
+        cli_includes: spec.cli_includes.clone(),
+        limits: spec.limits()?,
+        close_policy: spec.close_on,
+        env_profile: spec.env_profile.clone(),
+        preference: match &spec.worker {
+            Some(worker) => WorkerPreference::Pinned {
+                worker: worker.clone(),
+            },
+            None => WorkerPreference::Automatic,
+        },
+        wait_for_capacity: true,
+        attached: false,
+        run_id,
+    })
 }
 
 fn parse_agent(value: &str) -> Result<AgentKind, WorkerError> {
@@ -3363,114 +4314,6 @@ fn paths_overlap(left: &str, right: &str) -> bool {
         || right.starts_with(&format!("{left}/"))
 }
 
-fn dependency_issues(tasks: &[BatchTask]) -> Vec<PreviewIssue> {
-    let mut issues = Vec::new();
-    let mut ids = std::collections::BTreeMap::new();
-    for (index, task) in tasks.iter().enumerate() {
-        if let Some(id) = &task.id {
-            if let Err(message) = validate_batch_id(id) {
-                issues.push(PreviewIssue {
-                    severity: "error",
-                    kind: "invalid_id",
-                    message,
-                });
-                continue;
-            }
-            if ids.insert(id.clone(), index).is_some() {
-                issues.push(PreviewIssue {
-                    severity: "error",
-                    kind: "duplicate_id",
-                    message: format!("duplicate batch task id {id}"),
-                });
-            }
-        }
-    }
-    let mut adjacency: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for task in tasks {
-        let Some(id) = &task.id else {
-            if !task.depends_on.is_empty() {
-                issues.push(PreviewIssue {
-                    severity: "error",
-                    kind: "invalid_dependency",
-                    message: "depends_on requires a task id".into(),
-                });
-            }
-            continue;
-        };
-        for dep in &task.depends_on {
-            if !ids.contains_key(dep) {
-                issues.push(PreviewIssue {
-                    severity: "error",
-                    kind: "unknown_dependency",
-                    message: format!("task {id} depends on unknown id {dep}"),
-                });
-            }
-            adjacency.entry(id.clone()).or_default().push(dep.clone());
-        }
-    }
-    if let Some(cycle) = detect_cycle(&adjacency) {
-        issues.push(PreviewIssue {
-            severity: "error",
-            kind: "cycle",
-            message: format!("cyclic depends_on: {}", cycle.join(" -> ")),
-        });
-    }
-    issues
-}
-
-fn detect_cycle(graph: &std::collections::BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
-    #[derive(Clone, Copy)]
-    enum Color {
-        White,
-        Gray,
-        Black,
-    }
-    let mut color = std::collections::BTreeMap::new();
-    for node in graph.keys() {
-        color.insert(node.clone(), Color::White);
-    }
-    fn visit(
-        node: &str,
-        graph: &std::collections::BTreeMap<String, Vec<String>>,
-        color: &mut std::collections::BTreeMap<String, Color>,
-        stack: &mut Vec<String>,
-    ) -> Option<Vec<String>> {
-        color.insert(node.to_owned(), Color::Gray);
-        stack.push(node.to_owned());
-        if let Some(edges) = graph.get(node) {
-            for next in edges {
-                match color.get(next).copied().unwrap_or(Color::White) {
-                    Color::Gray => {
-                        let start = stack.iter().position(|item| item == next).unwrap_or(0);
-                        let mut cycle = stack[start..].to_vec();
-                        cycle.push(next.clone());
-                        return Some(cycle);
-                    }
-                    Color::White => {
-                        if let Some(cycle) = visit(next, graph, color, stack) {
-                            return Some(cycle);
-                        }
-                    }
-                    Color::Black => {}
-                }
-            }
-        }
-        stack.pop();
-        color.insert(node.to_owned(), Color::Black);
-        None
-    }
-    for node in graph.keys() {
-        if matches!(color.get(node), Some(Color::White)) {
-            let mut stack = Vec::new();
-            if let Some(cycle) = visit(node, graph, &mut color, &mut stack) {
-                return Some(cycle);
-            }
-        }
-    }
-    None
-}
-
 fn validate_batch_metadata(task: &BatchTask) -> Result<(), WorkerError> {
     if let Some(id) = &task.id {
         validate_batch_id(id).map_err(|message| task_error("TASK_CONFIG_INVALID", message))?;
@@ -3600,16 +4443,25 @@ fn validate_batch_scope(defaults: &BatchDefaults, task: &BatchTask) -> Result<()
     Ok(())
 }
 
+enum PreparedSubmitBase {
+    Ready(crate::transfer_repo::BaseCommit),
+    Resolve { wip: bool, request_base: String },
+}
+
+fn configured_slot_count(config: &Config) -> usize {
+    config.configured_runner_slots()
+}
+
 fn resolve_batch_max_parallel(
     requested: Option<u32>,
-    configured_workers: usize,
+    configured_slots: usize,
 ) -> Result<u32, WorkerError> {
     let max_parallel = match requested {
         Some(value) => value,
-        None => u32::try_from(configured_workers).map_err(|_| {
+        None => u32::try_from(configured_slots).map_err(|_| {
             task_error(
                 "TASK_CONFIG_INVALID",
-                "configured worker count is too large for batch max_parallel",
+                "configured slot count is too large for batch max_parallel",
             )
         })?,
     };
@@ -3750,13 +4602,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn batch_parallelism_defaults_to_the_configured_worker_count() {
+    fn batch_parallelism_defaults_to_the_configured_slot_count() {
         assert_eq!(resolve_batch_max_parallel(None, 3).unwrap(), 3);
         assert_eq!(resolve_batch_max_parallel(Some(2), 3).unwrap(), 2);
     }
 
     #[test]
-    fn batch_parallelism_rejects_zero_workers_or_a_zero_override() {
+    fn batch_parallelism_rejects_zero_slots_or_a_zero_override() {
         assert!(resolve_batch_max_parallel(None, 0).is_err());
         assert!(resolve_batch_max_parallel(Some(0), 3).is_err());
     }
@@ -3769,7 +4621,9 @@ mod tests {
         assert!(prompt.contains("Do the work"));
         assert!(prompt.contains("cargo test -p login"));
         assert!(prompt.contains("Declared acceptance criteria"));
-        assert!(prompt.contains("mac-worker will not treat agent-reported pass as laptop-verified"));
+        assert!(
+            prompt.contains("mac-worker will not treat agent-reported pass as laptop-verified")
+        );
     }
 
     #[test]
@@ -3785,25 +4639,22 @@ mod tests {
 
     #[test]
     fn cyclic_depends_on_is_reported_as_preview_metadata() {
-        let batch: BatchFile = toml::from_str(
-            r#"
-[[tasks]]
-id = "a"
-prompt = "a"
-depends_on = ["b"]
-
-[[tasks]]
-id = "b"
-prompt = "b"
-depends_on = ["a"]
-"#,
-        )
-        .unwrap();
-        let issues = dependency_issues(&batch.tasks);
+        let a = vec!["b".to_owned()];
+        let b = vec!["a".to_owned()];
+        let issues = validate_batch_graph(&[
+            GraphNode {
+                id: Some("a"),
+                depends_on: &a,
+                base: "HEAD",
+            },
+            GraphNode {
+                id: Some("b"),
+                depends_on: &b,
+                base: "HEAD",
+            },
+        ]);
         assert!(
-            issues
-                .iter()
-                .any(|issue| issue.kind == "cycle" && issue.severity == "error"),
+            issues.iter().any(|issue| issue.kind == "cycle"),
             "{issues:?}"
         );
     }

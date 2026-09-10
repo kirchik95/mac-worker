@@ -52,6 +52,7 @@ impl TaskListProjection {
                 closed: 0,
                 failed_like: 0,
             },
+            dag_nodes: Vec::new(),
         }
     }
 }

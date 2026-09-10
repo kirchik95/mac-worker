@@ -6,4 +6,5 @@ pub mod service;
 pub mod settings;
 pub mod source;
 pub mod task;
+pub(crate) mod tunnel;
 pub mod web;

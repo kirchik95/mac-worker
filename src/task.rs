@@ -1755,6 +1755,31 @@ impl LocalTaskRecord {
         Ok(replacement)
     }
 
+    pub fn without_submission_rollback(&self) -> Result<Self, WorkerError> {
+        let mut replacement = self.clone();
+        replacement.submission_rollback_turn_id = None;
+        if replacement.abandon_code.as_deref() == Some("SUBMISSION_ROLLBACK_INCOMPLETE") {
+            replacement.abandon_code = None;
+            if replacement.status.state() == TaskState::Abandoned {
+                replacement.status = TaskStatus::new(
+                    TaskState::Queued,
+                    None,
+                    replacement.status.worker().map(str::to_owned),
+                    replacement.status.session_present(),
+                    replacement.status.head_oid().cloned(),
+                    replacement.status.summary().map(str::to_owned),
+                    replacement.status.questions().to_vec(),
+                    replacement.status.files_changed().to_vec(),
+                    replacement.status.diff_stat().map(str::to_owned),
+                    replacement.status.turns().to_vec(),
+                    replacement.status.updated_at_millis(),
+                )?;
+            }
+        }
+        replacement.validate()?;
+        Ok(replacement)
+    }
+
     pub fn with_delivery(&self, delivery: Option<OriginDelivery>) -> Result<Self, WorkerError> {
         match delivery {
             Some(delivery) => {
@@ -1976,6 +2001,16 @@ impl RunRecord {
 
     pub fn task_ids(&self) -> &[TaskId] {
         &self.task_ids
+    }
+
+    pub fn with_appended_task_id(&self, task_id: TaskId) -> Result<Self, WorkerError> {
+        if self.task_ids.contains(&task_id) {
+            return Ok(self.clone());
+        }
+        let mut replacement = self.clone();
+        replacement.task_ids.push(task_id);
+        replacement.validate()?;
+        Ok(replacement)
     }
 
     pub fn max_parallel(&self) -> u32 {

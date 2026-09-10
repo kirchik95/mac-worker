@@ -1,8 +1,10 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    future::Future,
     io::{self, Cursor, Read, Write},
     path::PathBuf,
+    pin::Pin,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -69,6 +71,7 @@ pub mod cli;
 pub mod client_state;
 pub mod config;
 pub mod controller;
+pub mod dag;
 pub mod dashboard;
 pub mod doctor;
 pub mod error;
@@ -691,14 +694,18 @@ pub fn run_with_stdio_in_context(
         port,
         no_open,
         no_facts_refresh,
+        controller_viewer,
     } = cli.command
     {
         return run_dashboard_command(
             cli.config,
             runtime,
-            port,
-            no_open,
-            !no_facts_refresh,
+            DashboardCommandRequest {
+                port,
+                no_open,
+                refresh_stale_facts: !no_facts_refresh,
+            },
+            controller_viewer,
             stdout,
             stderr,
         );
@@ -731,46 +738,53 @@ pub fn run_with_stdio_in_context(
 fn run_dashboard_command(
     config_override: Option<PathBuf>,
     runtime: &RuntimeContext,
-    port: Option<u16>,
-    no_open: bool,
-    refresh_stale_facts: bool,
+    request: DashboardCommandRequest,
+    controller_viewer: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
         let config = std::sync::Arc::new(Config::load(&paths.config)?);
-        let client_state = std::sync::Arc::new(ClientStateStore::open(&paths.state)?);
-        let launch_directory = runtime.current_dir().ok();
-        let launcher = SystemDashboardLauncher::from_system_with_config(
-            config,
-            client_state,
-            launch_directory.as_deref(),
-            crate::dashboard::service::DashboardConfig {
-                refresh_stale_facts,
-            },
-            paths,
-        );
-        let opener = SystemBrowserOpener;
         let async_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(WorkerError::Io)?;
-        async_runtime.block_on(run_dashboard(
-            DashboardCommandRequest {
-                port,
-                no_open,
-                refresh_stale_facts,
-            },
-            &launcher,
-            &opener,
+        if controller_viewer {
+            return async_runtime.block_on(run_local_dashboard(
+                config,
+                paths,
+                runtime,
+                request,
+                viewer_shutdown_signal(),
+                stdout,
+                stderr,
+            ));
+        }
+        if config.controller.enabled {
+            return async_runtime.block_on(
+                crate::dashboard::tunnel::run_controller_dashboard_tunnel(
+                    config.as_ref(),
+                    runtime,
+                    request.port,
+                    request.no_open,
+                    !request.refresh_stale_facts,
+                    stdout,
+                    stderr,
+                ),
+            );
+        }
+        async_runtime.block_on(run_local_dashboard(
+            config,
+            paths,
+            runtime,
+            request,
             Box::pin(async {
                 let _ = tokio::signal::ctrl_c().await;
             }),
             stdout,
             stderr,
-        ))?;
-        Ok(())
+        ))
     })();
 
     match result {
@@ -780,6 +794,78 @@ fn run_dashboard_command(
             error.exit_code()
         }
     }
+}
+
+fn viewer_shutdown_signal() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async {
+        let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
+        // Independent thread, not spawn_blocking: Tokio runtime shutdown waits
+        // forever for started blocking tasks. Dropping this oneshot lets SIGINT,
+        // SIGHUP, and SIGTERM finish dashboard teardown while the pipe stays open.
+        let _stdin_thread = std::thread::Builder::new()
+            .name("dashboard-viewer-stdin".into())
+            .spawn(move || {
+                let mut buffer = [0u8; 256];
+                loop {
+                    let read = unsafe {
+                        libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len())
+                    };
+                    if read <= 0 {
+                        let _ = eof_tx.send(());
+                        return;
+                    }
+                }
+            });
+        let mut hangup =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match hangup.as_mut() {
+                    Some(signal) => {
+                        signal.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+            _ = async {
+                match terminate.as_mut() {
+                    Some(signal) => {
+                        signal.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+            _ = eof_rx => {}
+        }
+    })
+}
+
+async fn run_local_dashboard(
+    config: std::sync::Arc<Config>,
+    paths: PathLayout,
+    runtime: &RuntimeContext,
+    request: DashboardCommandRequest,
+    shutdown_signal: Pin<Box<dyn Future<Output = ()> + Send>>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    let client_state = std::sync::Arc::new(ClientStateStore::open(&paths.state)?);
+    let launch_directory = runtime.current_dir().ok();
+    let launcher = SystemDashboardLauncher::from_system_with_config(
+        config,
+        client_state,
+        launch_directory.as_deref(),
+        crate::dashboard::service::DashboardConfig {
+            refresh_stale_facts: request.refresh_stale_facts,
+        },
+        paths,
+    );
+    let opener = SystemBrowserOpener;
+    run_dashboard(request, &launcher, &opener, shutdown_signal, stdout, stderr).await?;
+    Ok(())
 }
 
 fn run_controller_command(

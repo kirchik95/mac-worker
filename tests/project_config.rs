@@ -8,20 +8,23 @@ use std::{
         ffi::OsStrExt,
         fs::{PermissionsExt, symlink},
     },
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::{
     agent::AgentKind,
     client_state::ClientStateStore,
     config::Config,
+    dag::DagNodeState,
     error::{ExitKind, WorkerError},
+    job::AdmissionObservation,
     paths::PathLayout,
     process::SystemProcessRunner,
     project_config::{ProjectSettings, ResourceClass},
     requirements::RequirementDetector,
+    scheduler::CandidateSlot,
     task_client::TaskClient,
     turn_runner::InlineRunnerExecutor,
 };
@@ -473,7 +476,7 @@ fn preview_config() -> Config {
 }
 
 #[test]
-fn batch_preview_resolves_local_head_and_reports_dag_unsupported() {
+fn batch_preview_resolves_local_head_and_reports_dag_enforced() {
     let repo = GitRepo::init();
     repo.write("src/lib.rs", b"fn main() {}\n");
     repo.commit_all("base");
@@ -501,11 +504,11 @@ acceptance = ["cargo test"]
     )
     .unwrap();
     assert!(!report.has_config_errors(), "{:?}", report.issues);
-    assert!(!report.dag.enforced);
-    assert_eq!(report.dag.status, "unsupported");
+    assert!(report.dag.enforced);
+    assert_eq!(report.dag.status, "enforced");
     assert_eq!(
         report.dag.message,
-        "This version can preview dependencies but cannot execute them."
+        "Dependencies execute when parents are Closed and Done."
     );
     assert_eq!(report.tasks[0].base, oid);
     assert_eq!(
@@ -547,10 +550,7 @@ files = ["src/lib.rs/"]
     assert!(report.has_config_errors());
     let kinds: Vec<_> = report.issues.iter().map(|issue| issue.kind).collect();
     assert!(kinds.contains(&"AGENT_UNSUPPORTED"), "{kinds:?}");
-    assert!(
-        kinds.iter().any(|kind| *kind == "TASK_CONFIG_INVALID"),
-        "{kinds:?}"
-    );
+    assert!(kinds.contains(&"TASK_CONFIG_INVALID"), "{kinds:?}");
 }
 
 #[test]
@@ -616,12 +616,14 @@ depends_on = ["missing"]
     );
     assert_eq!(exit, 1, "{}", String::from_utf8_lossy(&stderr));
     let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-    assert_eq!(report["dag"]["status"], "unsupported");
+    assert_eq!(report["dag"]["status"], "enforced");
     assert!(!home.path().join(".local/state/mac-worker").exists());
 }
 
 #[test]
-fn batch_submit_rejects_depends_on() {
+fn batch_submit_executes_depends_on() {
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+    let _cwd_lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let repo = GitRepo::init();
     repo.write("src/lib.rs", b"fn main() {}\n");
     repo.commit_all("base");
@@ -648,24 +650,66 @@ prompt = "b"
         data: state_root_path.join("data"),
     };
     let state = ClientStateStore::open(&paths.state).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .publish_admission_observation(
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                CandidateSlot::Idle,
+                vec!["darwin-arm64".into(), "agent:codex".into()],
+                Some(8 * 1024 * 1024 * 1024),
+                64 * 1024 * 1024 * 1024,
+                now,
+            )
+            .unwrap()
+            .with_local_binding(
+                "mac1".into(),
+                "~/.local/bin/worker".into(),
+                vec!["darwin-arm64".into()],
+                1,
+                Some(0),
+                now,
+            ),
+        )
+        .unwrap();
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(repo.root()).unwrap();
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _cwd = Restore(previous);
     let runner = SystemProcessRunner;
     let executor = InlineRunnerExecutor;
     let config = preview_config();
     let client = TaskClient::new(&runner, &config, &paths, &state, &executor);
-    let error = client
+    let report = client
         .batch(
             &repo.root().join("tasks.toml"),
             None,
             None,
             &mut std::io::sink(),
         )
-        .unwrap_err();
-    assert_eq!(error.public_code(), "BATCH_DEPENDENCIES_UNSUPPORTED");
+        .unwrap();
+    let dag = state
+        .load_run_dag(report.run_id())
+        .unwrap()
+        .expect("dependent batch writes a DAG");
+    assert_eq!(dag.nodes["b"].state, DagNodeState::Submitted);
+    assert_eq!(dag.nodes["a"].state, DagNodeState::Waiting);
     assert!(
-        error
-            .to_string()
-            .contains("This version can preview dependencies but cannot execute them.")
+        state
+            .load_task_optional(dag.nodes["a"].task_id)
+            .unwrap()
+            .is_none()
     );
+    assert_eq!(report.task_ids(), &[dag.nodes["b"].task_id]);
 }
 
 #[test]

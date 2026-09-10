@@ -43,19 +43,19 @@ worker task wait     --task-id <id> | --run <ID|NAME> [--timeout 30m]
 worker task say      <id> (--message TEXT | --message-file PATH) [--wait]
 worker task result   <id>          worker task fetch <id>
 worker task cancel   <id>          worker task close <id> [--discard]
-worker task reconcile              # re-own dead runners, re-queue orphaned turns; submits nothing
+worker task reconcile              # re-own dead runners, re-queue orphaned turns; may launch already-frozen eligible DAG children
 worker gc [--apply]                # preview, then reclaim old tasks, branches, mirrors on the workers
 ```
 
 Confirm the installed grammar with `worker task --help`. There is no `worker task accept` verb.
 
-`worker task batch FILE --preview` validates the file and prints the plan. It does not open client state or dispatch. `--preview` conflicts with `--wait`. `depends_on` on submit is `BATCH_DEPENDENCIES_UNSUPPORTED` until DAG execution is accepted.
+`worker task batch FILE --preview` validates the file and prints the plan (`dag.status = "enforced"`). It does not open client state or dispatch. `--preview` conflicts with `--wait`. Submit of a named graph (`depends_on` or `base = "from:<id>"`) freezes that run and launches eligible roots; invalid or cyclic graphs are `TASK_CONFIG_INVALID` and create no run. Independent batches (empty `depends_on` and no `from:`) keep today's create-run-and-submit path.
 
 `--max-parallel` is a **requested run cap**. Omitted, it defaults to `sum(worker.slots)` (each worker defaults to 1). An explicit positive value is accepted even when it is larger than that sum or than current host occupancy; extra tasks wait for a free execution slot. Zero is `TASK_CONFIG_INVALID`. The CLI does not reject “too many” relative to host capacity.
 
 `worker task logs` without `--raw` prints recognised agent events one line at a time, hides per-token noise, and folds consecutive unrecognised structured events into `event: <type>[/<subtype>] ×N` summaries (the count is omitted for one event). It keeps stderr and launch failures verbatim and prints failure lines such as `turn 1 failed: …` even when the agent wrote nothing; use `--raw` for the original log bytes.
 
-`worker task wait` returns only when all selected tasks are quiescent and their runners have released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. `TASK_BUSY` and capacity errors such as `CAPABILITY_MISSING` include their reason.
+`worker task wait` returns only when all selected tasks are quiescent and their runners have released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. `wait --run` is not complete while DAG nodes are still waiting or claimed; an empty materialized task list is not completion. After runner recovery, `worker task reconcile` also advances already-frozen eligible DAG nodes; it does not start a new operator batch. `TASK_BUSY` and capacity errors such as `CAPABILITY_MISSING` include their reason.
 
 Outcomes are recorded on the task, independent of the process exit code:
 
@@ -141,7 +141,7 @@ publish = ["fetch", "push"]
 
 The base commit must already be on the remote. The worker account needs its own Git access to that remote; SSH agent forwarding from the laptop is disabled. `--wip` cannot push (`PUBLISH_REQUIRES_COMMITTED_BASE`).
 
-A batch file groups **independent** tasks into a run with shared defaults:
+A batch file groups tasks into a run with shared defaults. Independent tasks (no `depends_on`, no `base = "from:<id>"`) still submit together:
 
 ```toml
 version = 1
@@ -158,7 +158,26 @@ prompt = "Move the billing HTTP client into packages/billing-client …"
 agent = "opencode"
 ```
 
-Preview with `worker task batch tasks.toml --preview` before dispatch.
+Named dependencies execute when each parent is **Closed and Done** (including `close_on = never`, which needs human `close` after a Done turn). Open+NeedsInput and Open+Done wait. Failed, Abandoned, Lost, or Closed without Done block descendants (`DAG_PARENT_FAILED`); they are not launched. `from:` copies that parent's current accepted imported OID on the laptop; origin `pending` does not block the bind when the local import proof is complete. Submit freezes each node's prompt, settings, and base OID; restart does not reread the batch file. List rows for not-yet-submitted nodes may show `DAG_WAITING` or `DAG_CLAIMED`.
+
+```toml
+version = 1
+agent = "codex"
+timeout = "45m"
+
+[[tasks]]
+id = "api"
+prompt_file = "tasks/api-validation.md"
+close_on = "never"
+
+[[tasks]]
+id = "tests"
+depends_on = ["api"]
+base = "from:api"
+prompt_file = "tasks/api-tests.md"
+```
+
+Preview with `worker task batch tasks.toml --preview` before dispatch. Lifecycle: [batch DAG](dag-design.md).
 
 ```toml
 [task]
@@ -179,7 +198,7 @@ lockfiles = ["Cargo.lock"]
 
 Optional `[setup]` runs in the task workspace with the same account and env-profile as the agent, before the agent starts. Absent `[setup]` keeps today's defaults. `check` proves **this** workspace is ready; a matching identity in another worktree is not skip proof. Toolchains stay user-owned.
 
-`worker task batch FILE --preview` resolves agent/model/worker, declared files, acceptance, and setup without creating tasks, opening client state, or talking to workers. This version can preview `depends_on` but cannot execute them; submit of a non-empty `depends_on` is rejected. Declared `files` are advisory overlap hints. Declared `acceptance` is copied into the agent prompt as instructions, not proven by mac-worker.
+`worker task batch FILE --preview` resolves agent/model/worker, declared files, acceptance, and setup without creating tasks, opening client state, or talking to workers. Preview reports `dag.status = "enforced"` (`Dependencies execute when parents are Closed and Done.`). Submit of `depends_on` or `base = "from:<id>"` executes that graph; independent batches stay on today's path. Declared `files` are advisory overlap hints. Declared `acceptance` is copied into the agent prompt as instructions, not proven by mac-worker.
 
 To use the exact base commit from your Git remote and push the result branch back to that remote, change these project settings:
 

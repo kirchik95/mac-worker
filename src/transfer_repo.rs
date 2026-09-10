@@ -8,6 +8,7 @@ use std::{
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         fs::OpenOptionsExt,
+        process::ExitStatusExt,
     },
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -546,18 +547,73 @@ impl TransferRepo {
         Ok(format!("refs/mac-worker/requests/{request_id}"))
     }
 
+    /// Immutable DAG freeze / from-binding ref. Same owned-graph pin engine as
+    /// [`Self::pin_frozen_source`]; the namespace is the only difference.
+    pub fn frozen_dag_ref(run_id: &str, batch_id: &str) -> Result<String, WorkerError> {
+        if !is_lower_hex(run_id, 32) {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "DAG run identity is not a lowercase UUID",
+            ));
+        }
+        if !is_dag_batch_id(batch_id) {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "DAG batch id must be a short lowercase identifier",
+            ));
+        }
+        Ok(format!("refs/mac-worker/dag/{run_id}/{batch_id}"))
+    }
+
     pub fn pin_frozen_source(
         &self,
         runner: &dyn ProcessRunner,
         request_id: &str,
         oid: &BaseOid,
     ) -> Result<String, WorkerError> {
-        self.require_frozen_commit(runner, oid)?;
-        self.materialize_owned_graph(runner, oid)?;
-        self.require_owned_frozen_commit(runner, oid)?;
         let name = Self::frozen_request_ref(request_id)?;
-        self.pin_request_ref_cas(runner, &name, oid)?;
+        self.pin_owned_commit(runner, &name, oid)?;
         Ok(name)
+    }
+
+    /// Pins a frozen or imported-parent commit under a validated request or
+    /// DAG ref. Copies the reachable graph into transfer-owned objects without
+    /// mutating live `objects/info/alternates`, then create-or-same CAS plus
+    /// object/refstorage fsync. Same OID retries succeed; a different OID
+    /// conflicts. [`Self::has_object`] is not proof of owned-graph closure.
+    pub fn pin_object(
+        &self,
+        runner: &dyn ProcessRunner,
+        name: &str,
+        oid: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        self.pin_owned_commit(runner, name, oid)
+    }
+
+    pub fn unpin_object(&self, runner: &dyn ProcessRunner, name: &str) -> Result<(), WorkerError> {
+        self.verify_alternates()?;
+        validate_owned_pin_ref(name)?;
+        if !self.has_ref(name) {
+            return Ok(());
+        }
+        self.update_ref(runner, name, None)
+    }
+
+    /// Object visibility through the transfer repository, including live
+    /// alternates. This is not owned-graph proof; use [`Self::pin_object`]
+    /// or [`Self::pin_frozen_source`] before treating a pin as durable.
+    pub fn has_object(&self, oid: &BaseOid) -> bool {
+        run_system_git(
+            Some(&self.path),
+            &[
+                OsString::from("cat-file"),
+                OsString::from("-e"),
+                OsString::from(oid.as_str()),
+            ],
+            None,
+            None,
+        )
+        .is_ok()
     }
 
     /// First-slice fixture transfer: a git bundle of one frozen commit that
@@ -729,6 +785,7 @@ impl TransferRepo {
                 "frozen reachable graph pack was empty",
             ));
         }
+        let pack_bytes = pack.stdout.len();
         self.transfer_git(
             runner,
             &[
@@ -741,14 +798,7 @@ impl TransferRepo {
             None,
             Some(pack.stdout),
         )?;
-        if self.owned_graph_complete(runner, oid)? {
-            Ok(())
-        } else {
-            Err(git_error(
-                "BASE_UNAVAILABLE",
-                "frozen graph is missing from transfer-owned objects after materialization",
-            ))
-        }
+        self.require_owned_graph_view(runner, oid, "after pack+index-pack", Some(pack_bytes))
     }
 
     fn require_owned_frozen_commit(
@@ -756,14 +806,59 @@ impl TransferRepo {
         runner: &dyn ProcessRunner,
         oid: &BaseOid,
     ) -> Result<(), WorkerError> {
-        if self.owned_graph_complete(runner, oid)? {
-            Ok(())
-        } else {
+        self.require_owned_graph_view(runner, oid, "require_owned_frozen_commit", None)
+    }
+
+    fn require_owned_graph_view(
+        &self,
+        runner: &dyn ProcessRunner,
+        oid: &BaseOid,
+        stage: &'static str,
+        pack_bytes: Option<usize>,
+    ) -> Result<(), WorkerError> {
+        self.with_owned_object_view(|isolate| {
+            let cat = git_at(
+                runner,
+                isolate,
+                &[
+                    OsString::from("cat-file"),
+                    OsString::from("-t"),
+                    OsString::from(oid.as_str()),
+                ],
+                None,
+            );
+            let rev = git_at(
+                runner,
+                isolate,
+                &[
+                    OsString::from("rev-list"),
+                    OsString::from("--objects"),
+                    OsString::from(oid.as_str()),
+                ],
+                None,
+            );
+            let cat_ok = cat
+                .as_ref()
+                .ok()
+                .is_some_and(|result| String::from_utf8_lossy(&result.stdout).trim() == "commit");
+            if cat_ok && rev.is_ok() {
+                return Ok(());
+            }
             Err(git_error(
                 "BASE_UNAVAILABLE",
-                "frozen graph is not fully present in transfer-owned objects",
+                format!(
+                    "frozen graph is not fully present in transfer-owned objects stage={stage} oid={oid} pack_bytes={pack_bytes:?} transfer={} isolate={} cwd={:?} transfer_packs={} isolate_packs={} isolate_alternates={} cat-file={} rev-list={}",
+                    self.path.display(),
+                    isolate.display(),
+                    std::env::current_dir().ok(),
+                    pack_listing(&self.path.join("objects/pack")),
+                    pack_listing(&isolate.join("objects/pack")),
+                    isolate.join("objects/info/alternates").is_file(),
+                    describe_git_outcome(&cat),
+                    describe_git_outcome(&rev),
+                ),
             ))
-        }
+        })
     }
 
     fn owned_graph_complete(
@@ -793,7 +888,16 @@ impl TransferRepo {
                         return Ok(false);
                     }
                 }
-                Err(error) if error.public_code() == "BASE_UNAVAILABLE" => return Ok(false),
+                Err(error) if error.public_code() == "BASE_UNAVAILABLE" => {
+                    if std::env::var_os("MAC_WORKER_OWNED_GRAPH_TRACE").is_some() {
+                        eprintln!(
+                            "owned-graph cat-file unavailable isolate={} cwd={:?} error={error}",
+                            isolate.display(),
+                            std::env::current_dir().ok()
+                        );
+                    }
+                    return Ok(false);
+                }
                 Err(error) => return Err(error),
             }
             match git_at(
@@ -807,7 +911,16 @@ impl TransferRepo {
                 None,
             ) {
                 Ok(_) => Ok(true),
-                Err(error) if error.public_code() == "BASE_UNAVAILABLE" => Ok(false),
+                Err(error) if error.public_code() == "BASE_UNAVAILABLE" => {
+                    if std::env::var_os("MAC_WORKER_OWNED_GRAPH_TRACE").is_some() {
+                        eprintln!(
+                            "owned-graph rev-list unavailable isolate={} cwd={:?} error={error}",
+                            isolate.display(),
+                            std::env::current_dir().ok()
+                        );
+                    }
+                    Ok(false)
+                }
                 Err(error) => Err(error),
             }
         })
@@ -941,6 +1054,20 @@ impl TransferRepo {
         );
     }
 
+    fn pin_owned_commit(
+        &self,
+        runner: &dyn ProcessRunner,
+        name: &str,
+        oid: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        self.verify_alternates()?;
+        validate_owned_pin_ref(name)?;
+        self.require_frozen_commit(runner, oid)?;
+        self.materialize_owned_graph(runner, oid)?;
+        self.require_owned_frozen_commit(runner, oid)?;
+        self.pin_request_ref_cas(runner, name, oid)
+    }
+
     fn pin_request_ref_cas(
         &self,
         runner: &dyn ProcessRunner,
@@ -972,7 +1099,7 @@ impl TransferRepo {
             Some(_) => Err(frozen_source_conflict()),
             None => Err(git_error(
                 "BASE_UNAVAILABLE",
-                "could not pin the frozen request ref",
+                "could not pin the owned commit ref",
             )),
         }
     }
@@ -1038,7 +1165,7 @@ impl TransferRepo {
                 if inspection.kind != EntryKind::RegularFile {
                     return Err(git_error(
                         "BASE_UNAVAILABLE",
-                        "frozen request ref is not a regular file",
+                        "owned pin ref is not a regular file",
                     ));
                 }
                 fsync_regular_file(&self.path.join(&relative_name))?;
@@ -1048,7 +1175,7 @@ impl TransferRepo {
                     if error.kind() == io::ErrorKind::NotFound {
                         git_error(
                             "BASE_UNAVAILABLE",
-                            "frozen request ref is missing from loose and packed storage",
+                            "owned pin ref is missing from loose and packed storage",
                         )
                     } else {
                         WorkerError::Io(error)
@@ -1064,11 +1191,16 @@ impl TransferRepo {
             }
             Err(error) => return Err(WorkerError::Io(error)),
         }
-        for dir in ["refs/mac-worker/requests", "refs/mac-worker", "refs"] {
+        let mut parent = Path::new(&relative_name);
+        while let Some(dir) = parent.parent() {
             let path = self.path.join(dir);
             if path.is_dir() {
                 fsync_directory(&path)?;
             }
+            if dir == Path::new("refs") {
+                break;
+            }
+            parent = dir;
         }
         Ok(())
     }
@@ -2456,6 +2588,38 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn is_dag_batch_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn validate_owned_pin_ref(name: &str) -> Result<(), WorkerError> {
+    if let Some(request_id) = name.strip_prefix("refs/mac-worker/requests/")
+        && !request_id.contains('/')
+        && is_lower_hex(request_id, 32)
+    {
+        return Ok(());
+    }
+    if let Some(rest) = name.strip_prefix("refs/mac-worker/dag/") {
+        let mut parts = rest.split('/');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(run_id), Some(batch_id), None)
+                if is_lower_hex(run_id, 32) && is_dag_batch_id(batch_id) =>
+            {
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    Err(git_error(
+        "BASE_UNAVAILABLE",
+        "owned pin refs must live under refs/mac-worker/requests/ or refs/mac-worker/dag/",
+    ))
+}
+
 fn is_safe_worker_ref_component(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('.')
@@ -2569,6 +2733,38 @@ fn write_alternates_atomic(info: &RootedDir, target: &Path) -> Result<(), Worker
     }
 }
 
+fn pack_listing(pack_dir: &Path) -> String {
+    match fs::read_dir(pack_dir) {
+        Ok(entries) => {
+            let mut names = entries
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let len = fs::metadata(&path).ok().map(|meta| meta.len());
+                    format!("{name}:{}", len.unwrap_or(0))
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            names.join(",")
+        }
+        Err(error) => format!("unreadable:{error}"),
+    }
+}
+
+fn describe_git_outcome(result: &Result<ProcessResult, WorkerError>) -> String {
+    match result {
+        Ok(output) => format!(
+            "ok status={:?} signal={:?} stdout={:?} stderr={:?}",
+            output.status.code(),
+            output.status.signal(),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).replace('\n', "\\n")
+        ),
+        Err(error) => error.to_string().replace('\n', "\\n"),
+    }
+}
+
 fn git_at(
     runner: &dyn ProcessRunner,
     git_dir: &Path,
@@ -2609,9 +2805,30 @@ fn git_at(
     if result.status.success() {
         Ok(result)
     } else {
+        let cwd = std::env::current_dir().ok();
+        let argv: Vec<String> = args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let stderr = String::from_utf8_lossy(&result.stderr).replace('\n', "\\n");
+        if std::env::var_os("MAC_WORKER_OWNED_GRAPH_TRACE").is_some() {
+            eprintln!(
+                "owned-graph git fail git-dir={} cwd={:?} status={:?} signal={:?} argv={argv:?} stderr={stderr}",
+                git_dir.display(),
+                cwd,
+                result.status.code(),
+                result.status.signal()
+            );
+        }
         Err(git_error(
             "BASE_UNAVAILABLE",
-            "a transfer repository Git command failed",
+            format!(
+                "a transfer repository Git command failed git-dir={} cwd={:?} status={:?} signal={:?} argv={argv:?} stderr={stderr}",
+                git_dir.display(),
+                cwd,
+                result.status.code(),
+                result.status.signal()
+            ),
         ))
     }
 }
@@ -2758,7 +2975,7 @@ fn fsync_object_store(git_dir: &Path) -> Result<(), WorkerError> {
     fsync_directory(&objects)
 }
 
-fn git_error(code: &'static str, message: &str) -> WorkerError {
+fn git_error(code: &'static str, message: impl Into<String>) -> WorkerError {
     WorkerError::Git {
         code,
         message: message.into(),
@@ -2768,7 +2985,7 @@ fn git_error(code: &'static str, message: &str) -> WorkerError {
 fn frozen_source_conflict() -> WorkerError {
     git_error(
         "FROZEN_SOURCE_CONFLICT",
-        "frozen request ref is already bound to a different commit",
+        "pin ref is already bound to a different commit",
     )
 }
 
@@ -3372,5 +3589,78 @@ mod tests {
         assert_eq!(conflicts, 1, "{outcomes:?}");
         let kept = transfer.read_ref_oid(&runner, &name).unwrap().unwrap();
         assert!(kept.as_str() == first.as_str() || kept.as_str() == second.as_str());
+    }
+
+    const DAG_RUN_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
+
+    #[test]
+    fn has_object_through_an_alternate_is_not_owned_graph_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (common, oid) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let transfer = TransferRepo::open_or_create(&temp.path().join("cache"), &common).unwrap();
+        assert!(transfer.has_object(&oid));
+        assert!(transfer.contains_commit(&runner, &oid).unwrap());
+        assert!(!transfer.owned_graph_complete(&runner, &oid).unwrap());
+        let name = TransferRepo::frozen_dag_ref(DAG_RUN_ID, "root").unwrap();
+        transfer.pin_object(&runner, &name, &oid).unwrap();
+        assert!(transfer.has_ref(&name));
+        hide_user_objects(&common);
+        assert_owned_reachable_graph(&transfer, &runner, &oid);
+    }
+
+    #[test]
+    fn dag_from_binding_pin_copies_overlapping_parent_blobs_out_of_the_alternate() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (common, first) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let second = additional_commit(&common, b"second\n");
+        let transfer = TransferRepo::open_or_create(&temp.path().join("cache"), &common).unwrap();
+        assert!(transfer.has_object(&second));
+        assert!(!transfer.owned_graph_complete(&runner, &second).unwrap());
+        let name = TransferRepo::frozen_dag_ref(DAG_RUN_ID, "child").unwrap();
+        transfer.pin_object(&runner, &name, &second).unwrap();
+        transfer.pin_object(&runner, &name, &second).unwrap();
+        assert!(transfer.path().join("objects/info/alternates").is_file());
+        hide_user_objects(&common);
+        assert_owned_reachable_graph(&transfer, &runner, &second);
+        assert_owned_reachable_graph(&transfer, &runner, &first);
+        assert!(transfer.has_ref(&name));
+    }
+
+    #[test]
+    fn dag_pin_is_create_or_same_and_rejects_a_different_oid() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (common, first) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let second = additional_commit(&common, b"second\n");
+        let transfer = TransferRepo::open_or_create(&temp.path().join("cache"), &common).unwrap();
+        let name = TransferRepo::frozen_dag_ref(DAG_RUN_ID, "root").unwrap();
+        transfer.pin_object(&runner, &name, &first).unwrap();
+        transfer.pin_object(&runner, &name, &first).unwrap();
+        let error = transfer.pin_object(&runner, &name, &second).unwrap_err();
+        assert_eq!(error.public_code(), "FROZEN_SOURCE_CONFLICT");
+        let current = transfer.read_ref_oid(&runner, &name).unwrap().unwrap();
+        assert_eq!(current.as_str(), first.as_str());
+    }
+
+    #[test]
+    fn dag_pin_rejects_refs_outside_owned_namespaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = SystemProcessRunner;
+        let (common, oid) = committed_user_repository(temp.path(), "source", b"hello\n");
+        let transfer = TransferRepo::open_or_create(&temp.path().join("cache"), &common).unwrap();
+        for name in [
+            "refs/heads/main",
+            "refs/mac-worker/other/root",
+            "refs/mac-worker/dag/not-a-uuid/root",
+            "refs/mac-worker/dag/018f0f4a6b5c7d8e9f00112233445566/BadId",
+        ] {
+            let error = transfer.pin_object(&runner, name, &oid).unwrap_err();
+            assert_eq!(error.public_code(), "BASE_UNAVAILABLE", "{name}");
+            assert!(!transfer.has_ref(name));
+        }
+        assert!(TransferRepo::frozen_dag_ref("not-a-uuid", "root").is_err());
+        assert!(TransferRepo::frozen_dag_ref(DAG_RUN_ID, "BadId").is_err());
     }
 }

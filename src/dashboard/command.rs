@@ -213,7 +213,7 @@ fn write_browser_warning(stderr: &mut dyn Write) -> Result<(), WorkerError> {
     Ok(())
 }
 
-fn validate_dashboard_url(url: &str) -> Result<(), WorkerError> {
+pub(crate) fn validate_dashboard_url(url: &str) -> Result<(), WorkerError> {
     let parsed = url::Url::parse(url).map_err(|_| invalid_dashboard_url())?;
     if parsed.scheme() == "http"
         && parsed.host_str() == Some("127.0.0.1")

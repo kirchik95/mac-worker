@@ -130,6 +130,27 @@ impl RunnerLog {
         }
     }
 
+    /// Opens an existing journal without creating one. Missing or busy
+    /// journals are `None` so DAG bind can retry without fabricating a log.
+    pub(crate) fn try_open_existing(
+        root: &Path,
+        task: TaskId,
+        turn: TurnId,
+    ) -> Result<Option<Self>, WorkerError> {
+        let dir = match directory(root, task, false) {
+            Ok(dir) => dir,
+            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let name = format!("{turn}.log");
+        if !dir.entry_exists(&name)? {
+            return Ok(None);
+        }
+        Self::try_open(root, task, turn)
+    }
+
     /// The journal flock is the finalization fence. Validate the current exact
     /// turn only after acquiring it, and retain this writer through retirement.
     pub(crate) fn current_entry(

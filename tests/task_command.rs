@@ -320,6 +320,7 @@ fn task_list_json_envelope_flattens_the_shared_projection() {
         tasks: Vec::new(),
         runs: Vec::new(),
         progress: RunProgress::from_states(std::iter::empty()),
+        dag_nodes: Vec::new(),
     };
     let value = serde_json::to_value(TaskListJson::new(PROTOCOL_VERSION, projection)).unwrap();
 

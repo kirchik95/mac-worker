@@ -8,8 +8,8 @@
 //! reads the response. Request identity is protocol version + command +
 //! canonical body, never a client-supplied digest.
 //!
-//! Dashboard transport (documented, not implemented here): managed SSH
-//! local-forward to the controller loopback HTTP service. Not RPC DTOs.
+//! Dashboard transport: managed SSH local-forward to a loopback HTTP viewer
+//! (`controller_dashboard_ssh_request`). Not RPC DTOs.
 
 pub mod envelope;
 pub mod leader;
@@ -35,7 +35,7 @@ use crate::{
     error::WorkerError,
     process::{ProcessPolicy, ProcessRequest},
     transfer::HostOperation,
-    transport::ssh_request,
+    transport::{ssh_local_forward_request, ssh_request},
 };
 
 const CONTROLLER_RPC_POLICY: ProcessPolicy = ProcessPolicy {
@@ -72,5 +72,46 @@ pub fn controller_rpc_ssh_request(
         &worker,
         HostOperation::ControllerRpc.command().into(),
         CONTROLLER_RPC_POLICY,
+    ))
+}
+
+const DASHBOARD_TUNNEL_POLICY: ProcessPolicy = ProcessPolicy {
+    stdout_limit: 64 * 1024,
+    stderr_limit: 256 * 1024,
+    deadline: Duration::from_secs(30),
+};
+
+/// Construct the SSH request for a same-port dashboard local-forward.
+/// Always emits hidden `--controller-viewer`. No remote path interpolation.
+pub fn controller_dashboard_ssh_request(
+    controller: &ControllerConfig,
+    port: u16,
+    no_facts_refresh: bool,
+) -> Result<ProcessRequest, WorkerError> {
+    if !controller.enabled {
+        return Err(WorkerError::Unavailable(
+            "CONTROLLER_UNAVAILABLE: controller is not enabled".into(),
+        ));
+    }
+    if port == 0
+        || !valid_ssh_destination(&controller.ssh)
+        || controller.remote_binary != "~/.local/bin/worker"
+    {
+        return Err(WorkerError::Unavailable(
+            "CONTROLLER_UNAVAILABLE: controller transport configuration is invalid".into(),
+        ));
+    }
+    let remote_command = if no_facts_refresh {
+        format!(
+            "~/.local/bin/worker dashboard --port {port} --no-open --no-facts-refresh --controller-viewer"
+        )
+    } else {
+        format!("~/.local/bin/worker dashboard --port {port} --no-open --controller-viewer")
+    };
+    Ok(ssh_local_forward_request(
+        &controller.ssh,
+        port,
+        remote_command,
+        DASHBOARD_TUNNEL_POLICY,
     ))
 }

@@ -61,6 +61,7 @@ fn dashboard_parses_only_the_documented_public_forms() {
             port,
             no_open,
             no_facts_refresh,
+            controller_viewer,
         } = cli.command
         else {
             panic!("dashboard arguments must select the dashboard command");
@@ -68,6 +69,7 @@ fn dashboard_parses_only_the_documented_public_forms() {
         assert_eq!(port, expected_port);
         assert_eq!(no_open, expected_no_open);
         assert_eq!(no_facts_refresh, expected_no_facts_refresh);
+        assert!(!controller_viewer);
     }
 
     for arguments in [
@@ -75,9 +77,21 @@ fn dashboard_parses_only_the_documented_public_forms() {
         vec!["worker", "dashboard", "--port", "65536"],
         vec!["worker", "dashboard", "--port", "9173", "--port", "9174"],
         vec!["worker", "dashboard", "unexpected"],
+        vec!["worker", "dashboard", "--controller-viewer=1"],
+        vec!["worker", "dashboard", "--controller-viewer", "PATH"],
     ] {
         assert!(Cli::try_parse_from(arguments).is_err());
     }
+
+    let hidden = Cli::try_parse_from(["worker", "dashboard", "--controller-viewer"])
+        .expect("hidden viewer flag is presence-only");
+    let WorkerCommand::Dashboard {
+        controller_viewer, ..
+    } = hidden.command
+    else {
+        panic!("hidden viewer flag must select the dashboard command");
+    };
+    assert!(controller_viewer);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

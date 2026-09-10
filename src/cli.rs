@@ -75,6 +75,10 @@ pub enum Command {
         /// Keep the dashboard read-only: do not refresh stale agent facts
         #[arg(long)]
         no_facts_refresh: bool,
+        /// Remote viewer mode: serve the local store and exit on stdin EOF.
+        /// Presence-only; production emitter is controller_dashboard_ssh_request.
+        #[arg(long, hide = true, action = clap::ArgAction::SetTrue, num_args = 0)]
+        controller_viewer: bool,
     },
     #[command(
         override_usage = "worker run [--worker NAME] [--no-wait] -- COMMAND",
