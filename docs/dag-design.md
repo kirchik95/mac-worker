@@ -4,7 +4,7 @@ Laptop `worker task batch` can execute named dependencies. Independent batches (
 
 Protocol 7, host layout, and origin-outbox pins are unchanged. Laptop DAG pins live in the transfer repository (`refs/mac-worker/dag/<run_id>/<batch_id>`). They are not host origin-delivery pins. GC must not drop a pin named by a waiting, claimed, or `from:`-bound node. That is logical retention of named pins, not a hardware durability claim.
 
-User CLI and laptop-agent flow: [README](../README.md), [usage](usage.md). Host occupancy: [slots](superpowers/specs/2026-09-10-slots-design.md). Origin delivery: [outbox](superpowers/specs/2026-09-10-origin-outbox.md).
+User CLI and laptop-agent flow: [README](../README.md), [usage](usage.md). Host occupancy: [slots](superpowers/specs/2026-09-10-slots-design.md). Origin delivery: [outbox](superpowers/specs/2026-09-10-origin-outbox.md). Opt-in remote controller: [usage](usage.md#remote-controller).
 
 ## Public CLI
 
@@ -14,7 +14,7 @@ worker task wait (--task-id TASK_ID | --run RUN_ID) [--timeout DURATION]
 worker task reconcile
 ```
 
-`--max-parallel` is CLI-only. It is not a batch-file or `.worker.toml` key. Omitted, it defaults to `sum(worker.slots)` (each worker defaults to 1, operator may set `1..=8`). An explicit positive value is not rejected for exceeding that sum; extra tasks wait. Zero is `TASK_CONFIG_INVALID`. `--preview` conflicts with `--wait`. Preview does not open client state or dispatch.
+`--max-parallel` is CLI-only. It is not a batch-file or `.worker.toml` key. Omitted, it defaults to `sum(worker.slots)` on the machine that owns the queue (each worker defaults to 1, operator may set `1..=8`). An explicit positive value is not rejected for exceeding that sum; extra tasks wait. Zero is `TASK_CONFIG_INVALID`. `--preview` conflicts with `--wait`. Preview does not open client state or dispatch. When `[controller] enabled = true` and the laptop omits `[[workers]]`, do not treat that empty list as a zero cap — the controller host inventory supplies the omitted default.
 
 Graph errors are `TASK_CONFIG_INVALID` and create no run, tasks, or pins.
 
@@ -78,9 +78,13 @@ Stable `task_id` and first `turn_id` are persisted on every node before `create_
 
 List rows for not-yet-submitted nodes may show `DAG_WAITING` or `DAG_CLAIMED`.
 
+## Remote controller
+
+Default laptop-owned queue is unchanged (`[controller]` missing or `enabled = false`). When enabled, the same public batch CLI and Closed+Done parent gate apply on the controller store. `--preview` stays local. `from:` binds the parent's accepted **controller** import, not a laptop `fetch` you have not run. A `close_on = never` parent still needs explicit `worker task close` before a `from:` child may run. Omitted `--max-parallel` uses the controller host `sum(worker.slots)`. Public `from:` auto-edge vs persisted DAG checks above are unchanged. `worker task wait --run` is not complete while a child is still waiting on that close.
+
 ## Technical store (implementation)
 
-Topology is laptop `ClientStateStore` file `dags/<run_id>.json` (`deny_unknown`). Node states: `waiting` | `claimed` | `submitted` | `blocked`. Claim is under StateLock with no Git/SSH held. Two reconcilers produce one claim.
+Default laptop-owned queue: topology is laptop `ClientStateStore` file `dags/<run_id>.json` (`deny_unknown`). When `[controller] enabled = true`, the same DAG files live in the **controller host** `ClientStateStore` — that host is the authoritative queue owner. Node states: `waiting` | `claimed` | `submitted` | `blocked`. Claim is under StateLock with no Git/SSH held. Two reconcilers produce one claim.
 
 Idle advance walks `dag-pending/<run_id>` (a dedicated index, not `dags/`). Markers are written before the DAG file so a crash cannot hide a live graph; they retire when every node is `submitted` or `blocked`. Existing stores get a bounded-once `dag-pending/bootstrap.json` receipt on reconcile.
 
@@ -89,6 +93,5 @@ The persisted DAG file stores the **normalized** edge list. After `from:` is fol
 ## Out of scope
 
 - Dashboard DAG graph chrome.
-- Persistent remote controller. Default laptop-owned queue is unchanged.
 - Origin outbox retry.
 - Protocol or host-layout bumps.

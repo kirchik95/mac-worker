@@ -1,7 +1,8 @@
 # Persistent controller — design
 
-Date: 2026-09-10. Owner: FLOW. **Design only; not implemented. No live setup.**
-Foundation: `bdc08d8c30ff80b0e3610fa89c8e15da37244682`. PROTOCOL_VERSION **7**.
+Date: 2026-09-10. Owner: FLOW. Operator steps (default off): [usage — Remote controller](../../usage.md#remote-controller). This file keeps locks, digests, and protocol detail.
+
+Foundation: `bdc08d8c30ff80b0e3610fa89c8e15da37244682`. PROTOCOL_VERSION **7** transports typed `TaskStatus.reported_checks`. Helpers and clients still on protocol 6 mismatch at preflight; upgrade them together.
 
 ## Rejected
 
@@ -33,14 +34,14 @@ Remote persistent controller on an **always-on host**, reached from the laptop w
 - Locks: per-method `StateLock`/`QueueLock`. Election: dedicated `controller.lock` + `ProcessIdentity` (`src/job.rs`).
 - Freeze: `ProjectState::load`, `TransferRepo::resolve_base` / `build_wip_base`, `GitTransport::preflight_origin` (`src/task_client.rs` submit). `inspect_with_pinned_project_id` only on controller checkout of transferred objects — never a MacBook path.
 - ACK: `submission_intent_turn_id`, `submit_with_ids`, `update_task_if_current`, `close_intent`.
-- Results: controller `GitTransport::fetch_result` + `TransferRepo::import_result` + `fetched_head`. Laptop fetch uses `controller-upload-pack` then user-repo `import_result`. Host outbox independent.
+- Results: controller `GitTransport::fetch_result` + `TransferRepo::import_result` + `fetched_head`. Laptop fetch uses `controller-upload-pack` then user-repo `import_result`. Host outbox independent. Controller transfer store holds one global `xfer.lock` during `prepare_source_receive` cache setup, `finish_source_receive` owned-graph/pin Git, `prepare_result_upload` pin Git, and a short bind-metadata lookup. A slow repository can delay unrelated transfer preparation/finalization. `receive_pack` / `upload_pack` streaming children do **not** call `lock_transfers` and do not hold that lock for the pack lifetime.
 - Logs: `LogChunk` / `MAX_LOG_CHUNK_BYTES`.
 
 ## Default vs opt-in
 
 No `[controller]` / `enabled=false`: today’s `run_task_command` / `run_dashboard_command` open laptop state. No store migration.
 
-`enabled=true` and SSH/rpc fail: `CONTROLLER_UNAVAILABLE`, **zero** laptop `ClientStateStore::open` for those verbs. No fallback.
+`enabled=true` and SSH/rpc fail: `CONTROLLER_UNAVAILABLE`, **zero** laptop `ClientStateStore::open` for those verbs. No fallback. `host controller-rpc` is a separate process from `worker controller run`. A missing leader is not transport failure. Keep `controller run` up for autonomous recovery, DAG readiness, and runners.
 
 `worker controller run` is invoked **on the controller host**. Not started from the MacBook as a local daemon. No launchd in this task.
 
@@ -59,11 +60,11 @@ Controller registers `ControllerProject { project_id, worktree_id, settings_sha2
 
 When enabled, **all** of: Submit, Batch, List, Status, Logs, Diff, Say, Cancel, Result, Fetch, Close, Wait, Reconcile — plus dashboard GET snapshot/detail/log and POST reply/accept.
 
-Stay on the laptop: `init`, `setup`, `doctor`, `workers`, `gc`, `run`, **job** status/logs/cancel, ENV preview (read-only, no controller tasks). Hidden `Runner` only on the controller host.
+Stay on the laptop: `init`, `setup`, `doctor`, `workers`, `gc`, `run`, **job** status/logs/cancel, ENV preview (read-only, no controller tasks). Hidden `Runner` only on the controller host. Empty laptop `[[workers]]` fails `at least one worker is required` on `setup` / `doctor` / `workers` / `run` / streaming job `logs` / `gc`. Job `status` and `cancel` do not use that inventory guard.
 
 ## ACK / restart
 
-Persist `(request_id, server payload digest, task_id, turn_id)` **before** enqueue/spawn. Request identity is **protocol version + command + canonical body** (sorted object keys), computed server-side. A client `payload_sha256` is ignored. Duplicate JSON keys are rejected before that canonicalization; `serde_json::Value` last-key-wins is not the request boundary. Same id + same digest → same ACK. Same id, different digest (including a different command with `body={}`) → `CONTROLLER_REQUEST_CONFLICT`. Death before the row: retry may allocate. After the row: resume the stored record — do **not** call `submit_with_ids` / `create_task` again. CLI exit after ACK: controller continues. Close retry resumes `close_intent` only. Frames: length-prefixed JSON, protocol **7**, 1 MiB RPC / `MAX_LOG_CHUNK_BYTES` logs; partial/EOF → `CONTROLLER_TRANSPORT`, retry same `request_id`.
+Persist `(request_id, server payload digest, task_id, turn_id)` **before** enqueue/spawn. Request identity is **protocol version + command + canonical body** (sorted object keys), computed server-side. A client `payload_sha256` is ignored. Duplicate JSON keys are rejected before that canonicalization; `serde_json::Value` last-key-wins is not the request boundary. Same id + same digest → same ACK. Same id, different digest (including a different command with `body={}`) → `CONTROLLER_REQUEST_CONFLICT`. Death before the row: retry may allocate. After the row: resume the stored record — do **not** call `submit_with_ids` / `create_task` again. CLI exit after ACK: the request remains on the controller store; ACK is not a runner start. Autonomous progress still needs `controller run`. Close retry resumes `close_intent` only. Frames: length-prefixed JSON, protocol **7**, 1 MiB RPC / `MAX_LOG_CHUNK_BYTES` logs; partial/EOF → `CONTROLLER_TRANSPORT`, retry same `request_id`.
 
 Retry handle: persist an operation envelope (`request_id`, digest, command, body) in the **laptop transport cache** (`$XDG_CACHE_HOME/mac-worker/controller`). That cache is not a second task/queue store. A second fresh CLI invocation is not automatically the same request.
 
@@ -71,7 +72,7 @@ Checkpoint 1 executor is **honestly fake**: durable publish/ACK only. It does no
 
 ## Dashboard transport
 
-Laptop `worker dashboard` uses a **managed SSH local-forward** to the controller loopback HTTP service (existing Host/Origin/CAS). Dashboard is not an RPC DTO family. Server startup/port discovery/lifetime for that forward is CP2+.
+Laptop `worker dashboard` uses a **managed SSH local-forward** to the controller loopback HTTP service (existing Host/Origin/CAS). Dashboard is not an RPC DTO family. Public flags remain `--port`, `--no-open`, `--no-facts-refresh`. The laptop command allocates loopback, waits until the forwarded URL answers, prints `http://127.0.0.1:<port>`, and holds the SSH child until SIGINT/SIGHUP/SIGTERM. Failure is `CONTROLLER_UNAVAILABLE` with no laptop-store fallback.
 
 ## DAG
 
@@ -79,4 +80,4 @@ Controller import + controller `fetched_head` is the pin descendants wait on (Cl
 
 ## Tests (later; fake SSH; no live roots)
 
-Default local regression; enabled+down → `CONTROLLER_UNAVAILABLE`; laptop parent exits after ACK and work continues; restart idempotency; same vs conflicting payload; WIP/local capture ignores later HEAD; controller import without laptop fetch, then laptop fetch same OID; forwarded dashboard CAS; two `controller run` → `CONTROLLER_LOCK_HELD`.
+Default local regression; enabled + SSH/rpc fail → `CONTROLLER_UNAVAILABLE`; laptop parent exits after ACK; restart idempotency; same vs conflicting payload; WIP/local capture ignores later HEAD; controller import without laptop fetch, then laptop fetch same OID; forwarded dashboard CAS; two `controller run` → `CONTROLLER_LOCK_HELD`.

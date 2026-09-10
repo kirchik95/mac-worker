@@ -17,13 +17,19 @@ This skill is the mechanical task loop. One task is one independent unit of work
 
 The CLI is the only interface. The skill contains no scheduling logic.
 
-**Command availability:** the release exposes `worker task …` and `worker workers --refresh`. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar; do not replace a rejected public form with direct worker access, SSH, or another tool.
+**Command availability:** the release exposes `worker task …`, `worker dashboard`, `worker controller run`, and `worker workers --refresh`. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar; do not replace a rejected public form with direct worker access, SSH, or another tool.
+
+Default dispatch is the laptop queue (`[controller]` missing or `enabled = false`). If the operator already enabled a remote controller, keep this same `worker task …` grammar — do not invent a second CLI, and do not start `worker controller run` from this skill. A controller-only laptop config may omit `[[workers]]`; commands that need a local worker list then fail with `at least one worker is required` (for example `worker workers`, `setup`, `doctor`, `run`, `gc`, and streaming `worker logs`). Public job `status` and `cancel` stay laptop-local and do not use that inventory error. Operator notes: repository `docs/usage.md` section Remote controller.
 
 ## Grammar Source
 
 Do not copy CLI flags from this file. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar.
 
-Without `--wait`, `submit`, `batch`, and `say` return as soon as the task record, the base commit in the transfer repository, and the queue row exist and a local turn runner has taken ownership of the row, or the row is parked behind the per-worker runner cap. With `--wait` the same work happens in the foreground and the command follows the turn's event log to its end. `list`, `status`, `result`, `diff`, and `logs` are read-only; `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and `reconcile` perform runner recovery first.
+Default laptop queue: without `--wait`, `submit`, `batch`, and `say` return as soon as the task record, the base commit in the transfer repository, and the queue row exist and a local turn runner has taken ownership of the row, or the row is parked behind the per-worker runner cap. With `--wait` the same work happens in the foreground and the command follows the turn's event log to its end.
+
+Enabled remote controller: without `--wait`, those commands return on a durable `host controller-rpc` ACK. That ACK means the request is persisted on the controller store. It does not mean a runner has started, or that the agent is running — enabled submit can stay queued (`park_only`) until the leader starts a runner. Keep `worker controller run` for autonomous progress. With `--wait` the CLI waits until the selected task or run is quiescent. Logs remain a separate command (`worker task logs`).
+
+`list`, `status`, `result`, `diff`, and `logs` are read-only; `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and `reconcile` perform runner recovery first.
 
 `--json` on any command emits the same typed records the dashboard consumes; `submit`, `say`, `logs -f`, and `wait` emit versioned NDJSON events, with log chunks base64-encoded as in v1.
 

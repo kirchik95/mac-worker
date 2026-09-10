@@ -168,7 +168,7 @@ Historical logs without a checkpoint remain readable without `--follow`. A nonem
 
 ## How it works
 
-By default your laptop coordinates the work (local queue, scheduler, dashboard). The selected Mac runs the agent and keeps its task workspace. This diagram shows that default flow, using a local repository as the source. A remote controller that owns the queue after the laptop disconnects is not part of this release.
+By default your laptop coordinates the work (local queue, scheduler, dashboard). The selected Mac runs the agent and keeps its task workspace. This diagram shows that default flow, using a local repository as the source. Leave `[controller]` unset, or set `enabled = false`, for this mode. An always-on remote controller is opt-in and off until you enable it; see [Remote controller](docs/usage.md#remote-controller).
 
 ```mermaid
 flowchart LR
@@ -195,7 +195,7 @@ flowchart LR
 
 `--wip` preparation now uses fewer Git operations and compares two fresh captures so concurrent edits can be detected. Dashboard detail and logs read one task directly; listing the collection still scans history.
 
-The dashboard is embedded in the CLI and listens only on loopback. It does not start or cancel tasks; it can reply and accept through the same task APIs as the CLI. The queue and task records live on the laptop; project mirrors, task worktrees and agent sessions live on the workers. Use `worker gc` to preview retained worker data that can be reclaimed.
+The dashboard is embedded in the CLI and listens only on loopback. It does not start or cancel tasks; it can reply and accept through the same task APIs as the CLI. In the default mode the queue and task records live on the laptop; project mirrors, task worktrees and agent sessions live on the workers. When `[controller] enabled = true`, the same `worker dashboard` command is a managed SSH local-forward to the controller host and does not open laptop task state. Use `worker gc` to preview retained worker data that can be reclaimed.
 
 Workers contact agent providers directly. No mac-worker cloud service or database server is required. If you prefer to get code from a Git remote or push result branches there, see the [origin and publication settings](docs/usage.md#task-lifecycle). Host slot layout: [multiple execution slots](docs/superpowers/specs/2026-09-10-slots-design.md).
 
@@ -239,7 +239,8 @@ Node.js is needed only when changing the dashboard source in `ui/`; its built as
 ## More documentation
 
 - [Prepare a Mac worker](docs/setup-macos-worker.md): SSH, agents, profiles, power settings and removal.
-- [Usage reference](docs/usage.md): tasks, follow-ups, batches, defaults, dashboard and remote commands.
+- [Usage reference](docs/usage.md): tasks, follow-ups, batches, defaults, dashboard, remote controller and remote commands.
+- [Remote controller](docs/usage.md#remote-controller): opt-in always-on queue; default remains the laptop.
 - [Batch DAG](docs/dag-design.md): named `depends_on` / `from:` lifecycle, Closed+Done parent gate, freeze, wait, and reconcile.
 - [Multiple execution slots](docs/superpowers/specs/2026-09-10-slots-design.md): host `slot_count`, occupancy, migrate, and execution scope.
 - [Durable origin outbox](docs/superpowers/specs/2026-09-10-origin-outbox.md): per-turn origin delivery, slot release, and host `--watch` / `--enable` / `--once`.

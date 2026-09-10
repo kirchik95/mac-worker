@@ -53,11 +53,13 @@ Confirm the installed grammar with `worker task --help`. There is no `worker tas
 
 `worker task batch FILE --preview` validates the file and prints the plan (`dag.status = "enforced"`). It does not open client state or dispatch. `--preview` conflicts with `--wait`. Submit of a named graph (`depends_on` or `base = "from:<id>"`) freezes that run and launches eligible roots; invalid or cyclic graphs are `TASK_CONFIG_INVALID` and create no run. Independent batches (empty `depends_on` and no `from:`) keep today's create-run-and-submit path.
 
-`--max-parallel` is a **requested run cap**. Omitted, it defaults to `sum(worker.slots)` (each worker defaults to 1). An explicit positive value is accepted even when it is larger than that sum or than current host occupancy; extra tasks wait for a free execution slot. Zero is `TASK_CONFIG_INVALID`. The CLI does not reject “too many” relative to host capacity.
+`--max-parallel` is a **requested run cap**. Omitted, it defaults to `sum(worker.slots)` on the machine that owns the queue (each worker defaults to 1). An explicit positive value is accepted even when it is larger than that sum or than current host occupancy; extra tasks wait for a free execution slot. Zero is `TASK_CONFIG_INVALID`. The CLI does not reject “too many” relative to host capacity. On a controller-only laptop config, omit the flag rather than resolving it from an empty `[[workers]]` list; see [Remote controller](#remote-controller).
 
 `worker task logs` without `--raw` prints recognised agent events one line at a time, hides per-token noise, and folds consecutive unrecognised structured events into `event: <type>[/<subtype>] ×N` summaries (the count is omitted for one event). It keeps stderr and launch failures verbatim and prints failure lines such as `turn 1 failed: …` even when the agent wrote nothing; use `--raw` for the original log bytes.
 
 `worker task wait` returns only when all selected tasks are quiescent and their runners have released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. `wait --run` is not complete while DAG nodes are still waiting or claimed; an empty materialized task list is not completion. After runner recovery, `worker task reconcile` also advances already-frozen eligible DAG nodes; it does not start a new operator batch. `TASK_BUSY` and capacity errors such as `CAPABILITY_MISSING` include their reason.
+
+`worker task reconcile` adopts, restarts, or finalizes a row only on positive proof that the previous runner exited: the pid was reused by a different process, or `Absent` was seen twice at least 750 ms apart. A single missed lookup, an ambiguous process-table read, or a transient error is unverifiable — the row is left alone, the report counts it, and `task list` shows `RUNNER_UNVERIFIABLE` only after that state has lasted 30 s. The operator path uses the same rule; it does not treat unverifiable as exited.
 
 Outcomes are recorded on the task, independent of the process exit code:
 
@@ -70,7 +72,7 @@ If a worker job or its logs vanish after acceptance, the task outcome is `failed
 
 When a replacement runner exits, its journal line distinguishes whether the worker accepted the turn. `exited: <code> …` is the pre-acceptance form: the worker did not accept that turn, so `worker task reconcile` can retry the handoff. `exited after acceptance: <code> …` means the journal already records acceptance; `worker task reconcile` resumes that turn from its committed offsets instead of submitting it again. After the post-acceptance form, inspect the worker with `worker workers --refresh`, especially if the job or its logs may have disappeared. Both lines are passed through `worker task logs` verbatim.
 
-`worker task result` / `status --json` show the outcome, summary, and any **agent-reported** checks. Those checks are claims from the worker agent, not independent verification. `worker task diff <id> --stat` lists the published change. `worker task fetch <id>` prints the remote-tracking ref (`refs/remotes/mac-worker/<worker>/task/<id>`) — the current-turn import proof on the laptop. Your working tree stays unchanged.
+`worker task result` / `status --json` show the outcome, summary, and any **agent-reported** checks (`reported_checks` on protocol 7). Those checks are claims from the worker agent, not independent verification. `worker task diff <id> --stat` lists the published change. `worker task fetch <id>` prints the remote-tracking ref (`refs/remotes/mac-worker/<worker>/task/<id>`) — the current-turn import proof on the laptop. Your working tree stays unchanged.
 
 ### Review and close
 
@@ -107,7 +109,7 @@ lockfiles = ["Cargo.lock"]
 
 Each `[[workers]]` entry defaults to `slots = 1` **per worker** (`1..=8`). That laptop value is a client **ceiling**. The Mac’s durable authority is `leases/capacity.json` `{ "slot_count": N }` on the host (hidden `worker host set-slots N`). Combined detached runner capacity is `sum(worker.slots)`, not the number of workers.
 
-Same `task_id` is serialized (`WORKSPACE_BUSY`). Distinct task IDs from one checkout may overlap when that host’s `slot_count >= 2`. Layout, migrate, and probe occupancy: [multiple execution slots](superpowers/specs/2026-09-10-slots-design.md).
+Same `task_id` is serialized (`WORKSPACE_BUSY`). Distinct task IDs from one checkout may overlap when that host’s `slot_count >= 2`. Layout, migrate, and probe occupancy: [multiple execution slots](superpowers/specs/2026-09-10-slots-design.md). Extra slots do not make Git/object transfers independent: a worker still serializes a job behind its transfer lock. On a controller, slow object verification and pinning can delay unrelated transfer preparation and finalization. The streaming pack child does not hold the global transfer lock for its lifetime.
 
 ## Origin delivery
 
@@ -235,6 +237,14 @@ listed for that string.
 `worker task wait` is also the gate before `say` and `fetch` after a busy
 turn.
 
+A host I/O failure may include `HOST_IO (stage=…, residual=…)` on that job.
+`stage` is one of `admission`, `prepare`, `launch`, `drain`, `publish`,
+`cleanup`, `lease-release`, `cancel`, `follow`. `residual` lists leftovers of
+**this job only** (`lease`, `cleanup-tree`, `job-dir`, `supervisor-lock`,
+`transfer-lock`, `session`, `workspace`). Observation errors omit a residual
+rather than guessing it is still there. This is diagnostic text on the existing
+`HOST_IO` string, not a new CLI verb.
+
 ## Dashboard
 
 <p align="center">
@@ -247,7 +257,9 @@ worker dashboard --port 8765 --no-open
 worker dashboard --no-facts-refresh   # skip stale agent-facts refresh only
 ```
 
-The dashboard listens only on loopback. It does not start or cancel tasks. It shows workers (including slot occupancy and host load), the FIFO queue, active turns, the task ledger, per-task detail (outcome, summary, agent-reported checks, changed files, fetch ref, delivery), and run history. Deep link `#/tasks/<id>` selects that card. It never shows prompts, credentials, or profile values.
+The dashboard listens only on loopback. It does not start or cancel tasks. In the default (controller-disabled) mode it serves the laptop queue. When `[controller] enabled = true`, the same command does not open laptop task state: it starts a managed SSH local-forward to the controller host’s loopback dashboard, waits until that URL answers, prints `http://127.0.0.1:<port>`, and holds the tunnel until you stop the command. `--port`, `--no-open`, and `--no-facts-refresh` still apply. Tunnel or transport failure is `CONTROLLER_UNAVAILABLE` with no laptop-store fallback.
+
+It shows workers (including slot occupancy and host load), the FIFO queue, active turns, the task ledger, per-task detail (outcome, summary, agent-reported checks, changed files, fetch ref, delivery), and run history. Deep link `#/tasks/<id>` selects that card. It never shows prompts, credentials, or profile values.
 
 `--no-facts-refresh` disables the optional fifteen-minute agent-facts refresh so Overview does not probe idle workers. It is **not** a read-only switch: Settings can still save native model/effort defaults, and task cards can still reply or accept.
 
@@ -290,7 +302,7 @@ Sidebar tokens `task`, `turn`, `mw_title`, `mw_agent`, and `mw_outcome` are publ
 
 ## Configuration
 
-`~/.config/mac-worker/config.toml` is written by `worker init` and holds one `[[workers]]` block per Mac. Two optional keys concern herdr, the terminal workspace manager the pool can report into:
+`~/.config/mac-worker/config.toml` is written by `worker init` and holds one `[[workers]]` block per Mac in the default laptop-owned mode. A controller-only laptop config may omit `[[workers]]` (see [Remote controller](#remote-controller)). Two optional keys concern herdr, the terminal workspace manager the pool can report into:
 
 ```toml
 [notifications]
@@ -305,6 +317,74 @@ herdr = false     # default false: show this worker's turns in its own herdr sid
 
 The design behind both keys is in [the herdr reporter design](superpowers/specs/2026-09-08-herdr-reporter-design.md).
 
+Optional remote controller (off unless you set it; see [Remote controller](#remote-controller)):
+
+```toml
+[controller]
+enabled = false
+# ssh = "yourname@always-on-host"
+# remote_binary = "~/.local/bin/worker"   # only this path is accepted
+```
+
+## Remote controller
+
+Opt-in. Default remains the laptop-owned queue: omit `[controller]`, or keep `enabled = false`. Confirm flags with `worker controller --help` and `worker dashboard --help`. Do not treat a missing table as a second store.
+
+Use this when an always-on Mac should keep the queue after the laptop sleeps or disconnects. The laptop still freezes the prompt and Git objects. Execution workers stay ordinary `host` helpers. There is one task store — on the controller host — not a laptop copy that silently takes over.
+
+### Enable
+
+On the **laptop** `config.toml`:
+
+```toml
+[controller]
+enabled = true
+ssh = "yourname@always-on-host"
+remote_binary = "~/.local/bin/worker"
+```
+
+`ssh` must be a valid destination (same family as a worker entry). `remote_binary` must be exactly `~/.local/bin/worker`. When this mode is on, a real SSH or `host controller-rpc` failure is `CONTROLLER_UNAVAILABLE` — not a silent return to a laptop task queue. Absence of `worker controller run` is not that outage.
+
+On the **controller host**, install the same CLI, put that host’s execution workers in **its** `config.toml`, and run:
+
+```bash
+worker controller run
+```
+
+That process takes the leader lock, resumes unfinished requests and bounded active tasks, prints `controller leader acquired`, and stays in the foreground until you stop it. Keep it running for **autonomous** progress (recovery, DAG readiness, turn runners). Laptop task commands use a separate `host controller-rpc` over SSH; that helper can accept and persist a queued submit even when the leader is not up. Do not treat a missing leader as a transport failure, and do not assume every RPC requires a live `controller run`. A second live `controller run` on the same host is `CONTROLLER_LOCK_HELD`. Restart is stop, then `worker controller run` again — it resumes the same store. This is not `launchd` and is not started from the MacBook as a local daemon.
+
+The controller host owns the worker list used for dispatch. A laptop config with `[controller] enabled = true` may omit `[[workers]]`. Laptop commands that then fail with `at least one worker is required` are `worker setup`, `worker doctor`, `worker workers`, `worker run`, streaming `worker logs`, and `worker gc`. Public job `status` and `cancel` stay laptop-local and do **not** use that inventory error. That is explicit, not empty-pool scheduling.
+
+These stay on the laptop even when the controller is enabled: `init`, `setup`, `doctor`, `workers`, `gc`, `run`, job status/logs/cancel, and `worker task batch FILE --preview`. Turn runners run on the controller host, not on the MacBook.
+
+### Submit, disconnect, reconnect
+
+Task commands use the same public grammar as today (`worker task --help`): `submit`, `batch`, `list`, `status`, `logs` (`-f` / `--raw` / `--turn`), `diff`, `say`, `cancel`, `result`, `fetch`, `close`, `wait`, `reconcile`. Confirm the installed form with `worker skills get pool-dispatch --grammar-only` rather than copying flags from a skill file.
+
+On submit the laptop freezes the prompt, project identity, settings, and base (`HEAD`, `--base`, or `--wip` / `--include`) and transfers that snapshot before the controller accepts the request. A retry of the **same original envelope** keeps that freeze; it does not recapture a later HEAD or `.worker.toml`. After accept you can close the laptop CLI. That ACK means the request is persisted on the controller store; it does **not** mean a runner or the agent has started — enabled submit can stay queued until `worker controller run` advances it. Reconnect with `status`, `logs`, `wait`, `list`, and the dashboard.
+
+Without `--wait`, `submit` / `batch` / `say` return after that accept. Autonomous progress on the controller still needs `worker controller run`. With `--wait`, the same command follows until the selected task or run is quiescent. `worker task wait --task-id` waits for one task; `worker task wait --run` waits until that run is quiescent, including DAG children that become eligible after a parent `close`.
+
+`--wip` is still opt-in local snapshot with fetch-only publication. Origin source still needs the exact remote commit. `publish = push` still cannot use a WIP base (`PUBLISH_REQUIRES_COMMITTED_BASE`).
+
+### Import is not fetch
+
+The controller imports the worker’s published result so later DAG work can proceed while the laptop is away. That import is not your working copy. `worker task fetch <id>` is the explicit laptop materialization: it prints the remote-tracking ref for you to inspect. A missing laptop branch is not an agent failure.
+
+### Batches and slots
+
+`worker task batch FILE --preview` stays local: it validates the file and does not open the controller store or dispatch.
+
+Named `depends_on` / `base = "from:<id>"` still wait for each parent to be **Closed and Done** (including `close_on = never`, which needs human `close` before a `from:` child may run). Open+NeedsInput and Open+Done wait. Failed, Abandoned, Lost, or Closed without Done block descendants (`DAG_PARENT_FAILED`). `from:` binds that parent’s accepted **controller** import, not origin `pending` and not a laptop `fetch` you have not run.
+
+`--max-parallel` remains CLI-only (not a batch-file key). Omitted, the default is the **controller host** `sum(worker.slots)`, not an empty laptop `[[workers]]` list. An explicit positive value is accepted even when it is larger than that sum; extra tasks wait. Zero is `TASK_CONFIG_INVALID`. The CLI does not reject “too many” relative to host capacity. Host occupancy is still each Mac’s `slot_count`.
+
+Controller Git object transfer uses one global lock for object verification and pinning. A slow repository can delay unrelated transfer preparation and finalization. Extra slots do not make those steps independent. The streaming pack child does not hold that lock for its lifetime.
+
+### Dashboard
+
+`worker dashboard [--port N] [--no-open] [--no-facts-refresh]` on an enabled laptop is the tunnel described in [Dashboard](#dashboard). Reply and accept still require the current card against the store the dashboard is serving.
+
 ## What the pool will and will not do
 
 - A task worktree is isolation for your repository, not a security boundary: agent turns run with the worker account's full access. Only dispatch prompts you trust, on machines you own.
@@ -313,8 +393,8 @@ The design behind both keys is in [the herdr reporter design](superpowers/specs/
 - Agent-reported checks are not independent verification. Review summary, diff, and fetch ref before you accept.
 - Workers hold a bare mirror per project, a worktree per task, agent sessions, and bounded logs. `worker gc` previews and reclaims them: idle open tasks after 7 days, result branches after 30 days or on `close --discard`.
 - The CLI adds no secrets to its own diagnostics, redacts worker paths from agent summaries, and refuses insecure profiles. Application logs can still contain whatever the agent printed.
-- `worker task reconcile` repairs task ownership after a laptop reboot. `worker setup` updates helpers; older host layouts may require the steps in [installation recovery](setup-recovery.md).
-- The laptop owns the queue in the default (controller-disabled) mode. A remote controller that keeps the queue after laptop disconnect is not in this release.
+- `worker task reconcile` repairs task ownership after a laptop reboot (or on the controller host when enabled). It waits 750 ms to confirm an `Absent` owner in that same invocation; a still-unverifiable owner is not treated as dead. `worker setup` updates helpers; older host layouts may require the steps in [installation recovery](setup-recovery.md).
+- The laptop owns the queue unless you opt in to a remote controller (`[controller] enabled = true`). That mode is off by default. Setup: [Remote controller](#remote-controller).
 
 ## Plain remote commands
 

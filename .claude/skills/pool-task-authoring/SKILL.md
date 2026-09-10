@@ -22,7 +22,7 @@ Use this skill to turn an objective into tasks that a headless coding agent can 
 - Split by ownership and dependency, not by arbitrary file count.
 - Make the final state testable by a command, an assertion, or an explicit artifact.
 
-Size limits and submit flags come from this binary, not from this file. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar.
+Size limits and submit flags come from this binary, not from this file. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar. When the laptop has `[controller] enabled = true` and omits `[[workers]]`, omit `--max-parallel` so the controller host resolves the default; do not treat the empty laptop list as a zero cap.
 
 Keep prompts under 256 KiB. Keep requested output bounded. Do not rely on an unbounded transcript.
 
