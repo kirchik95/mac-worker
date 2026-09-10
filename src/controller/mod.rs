@@ -15,6 +15,7 @@ pub mod envelope;
 pub mod leader;
 pub mod protocol;
 pub mod store;
+pub mod transfer;
 
 use std::time::Duration;
 
@@ -28,6 +29,12 @@ pub use protocol::{
 pub use store::{
     ControllerAck, ControllerFault, ControllerStore, DurableRequest, FakeControllerExecutor,
     RequestPhase, serve_rpc,
+};
+pub use transfer::{
+    CONTROLLER_TRANSFER_CACHE_DOMAIN, ControllerReceiveIdentity, ControllerResultIdentity,
+    ControllerSourceReceipt, ControllerTransfer, VerifiedResultMeta, controller_transfer_cache_id,
+    controller_transfer_git_path, frozen_result_ref, import_controller_result, result_digest,
+    source_digest,
 };
 
 use crate::{

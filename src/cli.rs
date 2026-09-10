@@ -393,6 +393,26 @@ pub enum HostCommand {
     },
     #[command(name = "controller-rpc", hide = true)]
     ControllerRpc,
+    #[command(name = "controller-receive-pack", hide = true)]
+    ControllerReceivePack {
+        token: HiddenComponent,
+        request_id: HiddenComponent,
+        fingerprint: HiddenComponent,
+        project_id: HiddenComponent,
+        worktree_id: HiddenComponent,
+        oid: HiddenComponent,
+        path: Option<HiddenComponent>,
+    },
+    #[command(name = "controller-upload-pack", hide = true)]
+    ControllerUploadPack {
+        token: HiddenComponent,
+        request_id: HiddenComponent,
+        fingerprint: HiddenComponent,
+        task_id: HiddenComponent,
+        turn_id: HiddenComponent,
+        oid: HiddenComponent,
+        path: Option<HiddenComponent>,
+    },
 }
 
 #[derive(Clone)]

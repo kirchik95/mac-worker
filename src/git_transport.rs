@@ -11,7 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::WorkerEntry,
+    config::{WorkerEntry, valid_ssh_destination},
     error::{ProcessError, WorkerError},
     host_store::{HostStore, HostStoreWritePoint},
     job::{ClientId, JobId, LeaseToken, RequestFingerprint},
@@ -19,7 +19,7 @@ use crate::{
     rooted_fs::RootedDir,
     task::{BaseOid, BranchName, TaskId},
     transfer::TransferIdentity,
-    transfer_repo::ImportReceipt,
+    transfer_repo::{GIT_ENVIRONMENT_REMOVALS, ImportReceipt, apply_isolated_git_environment},
     transport::SshTransport,
 };
 
@@ -440,6 +440,120 @@ impl<'a> GitTransport<'a> {
         let head = read_ref_head(self.runner, transfer_repo, &local_ref)?;
         Ok(ImportReceipt::new(head, local_ref))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_controller_source(
+        &self,
+        ssh_command: &str,
+        ssh_destination: &str,
+        remote_binary: &str,
+        token: &str,
+        request_id: &str,
+        fingerprint: &RequestFingerprint,
+        project_id: &str,
+        worktree_id: &str,
+        oid: &BaseOid,
+        transfer_repo: &Path,
+    ) -> Result<PushReceipt, WorkerError> {
+        validate_ssh_destination(ssh_destination)?;
+        validate_project_id(project_id)?;
+        validate_worktree_id(worktree_id)?;
+        validate_transfer_token(token)?;
+        if remote_binary != "~/.local/bin/worker" {
+            return Err(invalid_component("controller remote binary is invalid"));
+        }
+        let source_ref = crate::transfer_repo::TransferRepo::frozen_request_ref(request_id)?;
+        let receive_pack = format!(
+            "--receive-pack={remote_binary} host controller-receive-pack {token} {request_id} {fingerprint} {project_id} {worktree_id} {oid}"
+        );
+        let request = git_request(
+            transfer_repo,
+            Some(ssh_command.to_owned()),
+            vec![
+                OsString::from("push"),
+                OsString::from("--porcelain"),
+                OsString::from("--no-verify"),
+                receive_pack.into(),
+                format!("{ssh_destination}:{project_id}").into(),
+                format!("{oid}:{source_ref}").into(),
+            ],
+        );
+        let result = self.runner.run(&request).map_err(map_push_failure)?;
+        if !result.status.success() {
+            return Err(git_error(
+                "BASE_PUSH_FAILED",
+                format!(
+                    "controller source push failed: {}",
+                    last_git_diagnostic(&result.stderr, &result.stdout)
+                ),
+            ));
+        }
+        Ok(PushReceipt {
+            objects_written: parse_objects_written(&result.stdout)
+                .or_else(|| parse_objects_written(&result.stderr))
+                .unwrap_or(0),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fetch_controller_result(
+        &self,
+        ssh_command: &str,
+        ssh_destination: &str,
+        remote_binary: &str,
+        token: &str,
+        request_id: &str,
+        fingerprint: &RequestFingerprint,
+        project_id: &str,
+        task_id: TaskId,
+        turn_id: crate::task::TurnId,
+        oid: &BaseOid,
+        transfer_repo: &Path,
+    ) -> Result<FetchReceipt, WorkerError> {
+        validate_ssh_destination(ssh_destination)?;
+        validate_project_id(project_id)?;
+        validate_transfer_token(token)?;
+        if remote_binary != "~/.local/bin/worker" {
+            return Err(invalid_component("controller remote binary is invalid"));
+        }
+        let result_ref = crate::transfer_repo::TransferRepo::frozen_controller_result_ref(
+            request_id,
+            &turn_id.to_string(),
+        )?;
+        let upload_pack = format!(
+            "--upload-pack={remote_binary} host controller-upload-pack {token} {request_id} {fingerprint} {task_id} {turn_id} {oid}"
+        );
+        let request = git_request(
+            transfer_repo,
+            Some(ssh_command.to_owned()),
+            vec![
+                OsString::from("fetch"),
+                OsString::from("--quiet"),
+                OsString::from("--no-write-fetch-head"),
+                upload_pack.into(),
+                format!("{ssh_destination}:{project_id}").into(),
+                format!("+{result_ref}:{result_ref}").into(),
+            ],
+        );
+        let result = self.runner.run(&request).map_err(map_fetch_failure)?;
+        if !result.status.success() {
+            return Err(git_error(
+                "RESULT_FETCH_FAILED",
+                format!(
+                    "controller result fetch failed: {}",
+                    last_git_diagnostic(&result.stderr, &result.stdout)
+                ),
+            ));
+        }
+        let head = read_ref_head(self.runner, transfer_repo, &result_ref)?;
+        if head.as_str() != oid.as_str() {
+            return Err(git_error(
+                "RESULT_FETCH_FAILED",
+                "controller result fetch did not preserve the imported object",
+            ));
+        }
+        Ok(ImportReceipt::new(head, result_ref))
+    }
 }
 
 pub fn delivery_pin_ref(task_id: TaskId, turn_id: crate::task::TurnId) -> String {
@@ -533,9 +647,10 @@ impl GitServerExecutor for SystemGitServerExecutor {
         mirror.verify_descriptors_cloexec()?;
         let directory_fd = mirror.raw_directory_fd();
         let mut command = Command::new(executable);
+        apply_isolated_git_environment(&mut command);
         command
             .arg(".")
-            .envs(environment.iter().map(|(key, value)| (key, value)))
+            .envs(environment.iter().cloned())
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -672,16 +787,10 @@ fn git_request(
         program: GIT_PROGRAM.into(),
         args,
         environment,
-        environment_remove: vec![
-            "GIT_DIR".into(),
-            "GIT_WORK_TREE".into(),
-            "GIT_INDEX_FILE".into(),
-            "GIT_COMMON_DIR".into(),
-            "GIT_OBJECT_DIRECTORY".into(),
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES".into(),
-            "GIT_CONFIG_COUNT".into(),
-            "GIT_CONFIG_PARAMETERS".into(),
-        ],
+        environment_remove: GIT_ENVIRONMENT_REMOVALS
+            .iter()
+            .map(OsString::from)
+            .collect(),
         stdin: None,
         policy: ProcessPolicy {
             stdout_limit: GIT_OUTPUT_LIMIT,
@@ -702,17 +811,10 @@ fn origin_request(origin: String) -> ProcessRequest {
             (GIT_CONFIG_NOSYSTEM.into(), "1".into()),
             (GIT_TERMINAL_PROMPT.into(), "0".into()),
         ],
-        environment_remove: vec![
-            "GIT_DIR".into(),
-            "GIT_WORK_TREE".into(),
-            "GIT_INDEX_FILE".into(),
-            "GIT_COMMON_DIR".into(),
-            "GIT_OBJECT_DIRECTORY".into(),
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES".into(),
-            "GIT_CEILING_DIRECTORIES".into(),
-            "GIT_CONFIG_COUNT".into(),
-            "GIT_CONFIG_PARAMETERS".into(),
-        ],
+        environment_remove: GIT_ENVIRONMENT_REMOVALS
+            .iter()
+            .map(OsString::from)
+            .collect(),
         stdin: None,
         policy: ProcessPolicy {
             stdout_limit: ORIGIN_PREFLIGHT_OUTPUT_LIMIT,
@@ -1101,13 +1203,7 @@ fn parse_objects_written(bytes: &[u8]) -> Option<u64> {
 }
 
 fn validate_worker(worker: &WorkerEntry) -> Result<(), WorkerError> {
-    if worker.remote_binary != "~/.local/bin/worker"
-        || worker.ssh.is_empty()
-        || !worker
-            .ssh
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'))
-    {
+    if worker.remote_binary != "~/.local/bin/worker" || !valid_ssh_destination(&worker.ssh) {
         return Err(WorkerError::Transport {
             code: "INVALID_REQUEST",
             message: "worker transport configuration is invalid".into(),
@@ -1116,15 +1212,41 @@ fn validate_worker(worker: &WorkerEntry) -> Result<(), WorkerError> {
     Ok(())
 }
 
+fn validate_ssh_destination(value: &str) -> Result<(), WorkerError> {
+    if valid_ssh_destination(value) {
+        Ok(())
+    } else {
+        Err(invalid_component("controller SSH destination is invalid"))
+    }
+}
+
 fn validate_project_id(value: &str) -> Result<(), WorkerError> {
+    validate_lowercase_sha256(value, "project ID is not a lowercase SHA-256 component")
+}
+
+fn validate_worktree_id(value: &str) -> Result<(), WorkerError> {
+    validate_lowercase_sha256(value, "worktree ID is not a lowercase SHA-256 component")
+}
+
+fn validate_lowercase_sha256(value: &str, message: &str) -> Result<(), WorkerError> {
     if value.len() != 64
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
-        return Err(invalid_component(
-            "project ID is not a lowercase SHA-256 component",
-        ));
+        return Err(invalid_component(message));
+    }
+    Ok(())
+}
+
+fn validate_transfer_token(value: &str) -> Result<(), WorkerError> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || uuid::Uuid::try_parse(value).is_err()
+    {
+        return Err(invalid_component("controller transfer token is invalid"));
     }
     Ok(())
 }
@@ -1148,6 +1270,47 @@ fn git_error(code: &'static str, message: impl Into<String>) -> WorkerError {
     WorkerError::Git {
         code,
         message: message.into(),
+    }
+}
+
+fn last_git_diagnostic(stderr: &[u8], stdout: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = String::from_utf8_lossy(stdout);
+    let mut chosen = Vec::new();
+    for line in stderr.lines().chain(stdout.lines()) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        let interesting = line.starts_with('!')
+            || lower.contains("cannot lock")
+            || lower.contains("unable to create")
+            || lower.contains("failed to lock")
+            || lower.contains("failed to update ref")
+            || lower.contains("remote rejected")
+            || lower.contains("fatal:")
+            || lower.contains("error:")
+            || lower.contains("unpack")
+            || lower.contains("hook");
+        if !interesting {
+            continue;
+        }
+        chosen.push(line.chars().take(240).collect::<String>());
+        if chosen.len() == 8 {
+            break;
+        }
+    }
+    if chosen.is_empty() {
+        stderr
+            .lines()
+            .chain(stdout.lines())
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .map(|line| line.chars().take(240).collect())
+            .unwrap_or_else(|| "no git diagnostic".into())
+    } else {
+        chosen.join(" | ")
     }
 }
 

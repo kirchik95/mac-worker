@@ -474,6 +474,16 @@ fn execute_with_context(
         } => Err(WorkerError::Protocol(
             "host controller-rpc requires the stdio execution boundary".into(),
         )),
+        Command::Host {
+            command: HostCommand::ControllerReceivePack { .. },
+        } => Err(WorkerError::Protocol(
+            "host controller-receive-pack requires the binary stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::ControllerUploadPack { .. },
+        } => Err(WorkerError::Protocol(
+            "host controller-upload-pack requires the binary stdio execution boundary".into(),
+        )),
     }
 }
 
@@ -1979,6 +1989,60 @@ pub fn run_with_rsync_executor_in_context(
             stderr,
         );
     }
+    if let Command::Host {
+        command:
+            HostCommand::ControllerReceivePack {
+                token,
+                request_id,
+                fingerprint,
+                project_id,
+                worktree_id,
+                oid,
+                path,
+            },
+    } = cli.command
+    {
+        return run_host_controller_receive_pack(
+            cli.config,
+            runtime,
+            token,
+            request_id,
+            fingerprint,
+            project_id,
+            worktree_id,
+            oid,
+            path,
+            &SystemGitServerExecutor,
+            stderr,
+        );
+    }
+    if let Command::Host {
+        command:
+            HostCommand::ControllerUploadPack {
+                token,
+                request_id,
+                fingerprint,
+                task_id,
+                turn_id,
+                oid,
+                path,
+            },
+    } = cli.command
+    {
+        return run_host_controller_upload_pack(
+            cli.config,
+            runtime,
+            token,
+            request_id,
+            fingerprint,
+            task_id,
+            turn_id,
+            oid,
+            path,
+            &SystemGitServerExecutor,
+            stderr,
+        );
+    }
     if matches!(
         &cli.command,
         Command::Host {
@@ -3189,6 +3253,72 @@ fn run_host_upload_pack(
         let store = HostStore::open(&paths.host_state_root())?;
         let never =
             HostGitService::new(&store).upload_pack(&components, path.expose(), executor)?;
+        match never {}
+    })();
+    finish_git_server_command(result, stderr)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_host_controller_receive_pack(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    token: HiddenComponent,
+    request_id: HiddenComponent,
+    fingerprint: HiddenComponent,
+    project_id: HiddenComponent,
+    worktree_id: HiddenComponent,
+    oid: HiddenComponent,
+    path: Option<HiddenComponent>,
+    executor: &dyn GitServerExecutor,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        let transfer = crate::controller::ControllerTransfer::open(&paths.controller_state_root())?;
+        let never = transfer.receive_pack(
+            &paths.cache,
+            token.expose(),
+            request_id.expose(),
+            fingerprint.expose(),
+            project_id.expose(),
+            worktree_id.expose(),
+            oid.expose(),
+            path.as_ref().map(HiddenComponent::expose),
+            executor,
+        )?;
+        match never {}
+    })();
+    finish_git_server_command(result, stderr)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_host_controller_upload_pack(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    token: HiddenComponent,
+    request_id: HiddenComponent,
+    fingerprint: HiddenComponent,
+    task_id: HiddenComponent,
+    turn_id: HiddenComponent,
+    oid: HiddenComponent,
+    path: Option<HiddenComponent>,
+    executor: &dyn GitServerExecutor,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        let transfer = crate::controller::ControllerTransfer::open(&paths.controller_state_root())?;
+        let never = transfer.upload_pack(
+            &paths.cache,
+            token.expose(),
+            request_id.expose(),
+            fingerprint.expose(),
+            task_id.expose(),
+            turn_id.expose(),
+            oid.expose(),
+            path.as_ref().map(HiddenComponent::expose),
+            executor,
+        )?;
         match never {}
     })();
     finish_git_server_command(result, stderr)

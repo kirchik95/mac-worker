@@ -145,7 +145,9 @@ fn controller_run_is_public_and_controller_rpc_stays_hidden() {
     host_help
         .assert()
         .success()
-        .stdout(predicate::str::contains("controller-rpc").not());
+        .stdout(predicate::str::contains("controller-rpc").not())
+        .stdout(predicate::str::contains("controller-receive-pack").not())
+        .stdout(predicate::str::contains("controller-upload-pack").not());
 }
 
 #[test]

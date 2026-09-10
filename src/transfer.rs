@@ -83,6 +83,8 @@ pub enum HostOperation {
     AgentSettingsGet,
     AgentSettingsSet,
     ControllerRpc,
+    ControllerReceivePack,
+    ControllerUploadPack,
 }
 
 impl HostOperation {
@@ -113,6 +115,8 @@ impl HostOperation {
             Self::AgentSettingsGet => "~/.local/bin/worker host agent-settings-get",
             Self::AgentSettingsSet => "~/.local/bin/worker host agent-settings-set",
             Self::ControllerRpc => "~/.local/bin/worker host controller-rpc",
+            Self::ControllerReceivePack => "~/.local/bin/worker host controller-receive-pack",
+            Self::ControllerUploadPack => "~/.local/bin/worker host controller-upload-pack",
         }
     }
 }

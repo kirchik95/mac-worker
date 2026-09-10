@@ -30,7 +30,7 @@ use mac_worker::{
     process::{ProcessRequest, ProcessResult},
     protocol::{HealthStatus, PROTOCOL_VERSION},
     run_with_io_in_context,
-    task::{BaseOid, TaskId},
+    task::{BaseOid, TaskId, TurnId},
     transfer::TransferIdentity,
     transfer_repo::TransferRepo,
     transport::SshTransport,
@@ -385,6 +385,18 @@ fn receive_pack_is_keyed_by_turn_job_id_and_validates_lease_like_rsync() {
         executor.calls()[0]
             .1
             .ends_with(format!("repos/{PROJECT_ID}.git"))
+    );
+    assert!(
+        executor.calls()[0]
+            .2
+            .iter()
+            .any(|(key, value)| key == "GIT_CONFIG_GLOBAL" && value == "/dev/null")
+    );
+    assert!(
+        executor.calls()[0]
+            .2
+            .iter()
+            .any(|(key, value)| key == "GIT_CONFIG_NOSYSTEM" && value == "1")
     );
 
     let error = service
@@ -751,4 +763,93 @@ fn shared_recording_runner_can_execute_real_transfer_commands_and_keep_request_h
         .unwrap();
     assert!(!runner.requests().is_empty());
     assert!(runner.write_args().is_empty());
+}
+
+fn controller_request_id() -> String {
+    format!("{:x}", Uuid::from_u128(40).simple())
+}
+
+fn controller_token() -> String {
+    format!("{:x}", Uuid::from_u128(41).simple())
+}
+
+fn worktree_id() -> String {
+    "b".repeat(64)
+}
+
+#[test]
+fn controller_source_push_rejects_invalid_token_and_worktree_before_git() {
+    let runner = RecordingRunner::returning_success();
+    let transfer = tempfile::tempdir().unwrap();
+    let transport = GitTransport::new(&runner);
+    let fingerprint = fingerprint();
+    let oid = base_oid();
+    for token in [
+        "abc def",
+        "abc;id",
+        "$(host)",
+        "aaaa\nbbbbcccccccccccccccc",
+        " token-with-leading-space-xx",
+    ] {
+        let error = transport
+            .push_controller_source(
+                "/usr/bin/true",
+                "mac1",
+                "~/.local/bin/worker",
+                token,
+                &controller_request_id(),
+                &fingerprint,
+                PROJECT_ID,
+                &worktree_id(),
+                &oid,
+                transfer.path(),
+            )
+            .unwrap_err();
+        assert_eq!(error.public_code(), "INVALID_COMPONENT", "{token:?}");
+    }
+    let poisoned_worktree = format!("{};touch /tmp/pwned", "b".repeat(48));
+    let error = transport
+        .push_controller_source(
+            "/usr/bin/true",
+            "mac1",
+            "~/.local/bin/worker",
+            &controller_token(),
+            &controller_request_id(),
+            &fingerprint,
+            PROJECT_ID,
+            &poisoned_worktree,
+            &oid,
+            transfer.path(),
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "INVALID_COMPONENT");
+    assert!(
+        runner.requests().is_empty(),
+        "invalid token/worktree must not invoke git/SSH: {:?}",
+        runner.requests()
+    );
+}
+
+#[test]
+fn controller_result_fetch_rejects_invalid_token_before_git() {
+    let runner = RecordingRunner::returning_success();
+    let transfer = tempfile::tempdir().unwrap();
+    let transport = GitTransport::new(&runner);
+    let error = transport
+        .fetch_controller_result(
+            "/usr/bin/true",
+            "mac1",
+            "~/.local/bin/worker",
+            "abc;id",
+            &controller_request_id(),
+            &fingerprint(),
+            PROJECT_ID,
+            task_id(),
+            TurnId::new(Uuid::from_u128(32)),
+            &base_oid(),
+            transfer.path(),
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "INVALID_COMPONENT");
+    assert!(runner.requests().is_empty());
 }

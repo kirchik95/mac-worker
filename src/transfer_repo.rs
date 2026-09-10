@@ -38,7 +38,7 @@ const BLOB_BATCH_MAX_OBJECTS: usize = 64;
 const GET_MARK_LINE_BYTES: usize = 41;
 const BASE_COMMIT_MESSAGE: &str = "mac-worker: task base";
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
-const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
+pub(crate) const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -56,6 +56,12 @@ const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
     "GIT_NOGLOB_PATHSPECS",
     "GIT_ICASE_PATHSPECS",
 ];
+
+pub(crate) fn apply_isolated_git_environment(command: &mut Command) {
+    for name in GIT_ENVIRONMENT_REMOVALS {
+        command.env_remove(name);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseKind {
@@ -160,6 +166,7 @@ pub struct TransferRepo {
     path: PathBuf,
     repo_id: String,
     alternates_target: PathBuf,
+    user_alternates: bool,
     _repo_lock: Arc<File>,
 }
 
@@ -180,6 +187,7 @@ impl Clone for TransferRepo {
             path: self.path.clone(),
             repo_id: self.repo_id.clone(),
             alternates_target: self.alternates_target.clone(),
+            user_alternates: self.user_alternates,
             _repo_lock: self._repo_lock.clone(),
         }
     }
@@ -190,6 +198,7 @@ impl PartialEq for TransferRepo {
         self.path == other.path
             && self.repo_id == other.repo_id
             && self.alternates_target == other.alternates_target
+            && self.user_alternates == other.user_alternates
     }
 }
 
@@ -513,6 +522,7 @@ impl TransferRepo {
             path,
             repo_id,
             alternates_target,
+            user_alternates: true,
             _repo_lock: repo_lock,
         };
         transfer.verify_alternates()?;
@@ -527,11 +537,168 @@ impl TransferRepo {
         &self.path
     }
 
+    /// Domain-separated controller Git cache identity. FLOW and the hidden
+    /// host helpers must call this with the same `project_id` / `worktree_id`.
+    ///
+    /// `cache_id = SHA-256( CONTROLLER_TRANSFER_CACHE_DOMAIN || project_id || 0x00 || worktree_id )`
+    pub const CONTROLLER_TRANSFER_CACHE_DOMAIN: &'static [u8] =
+        b"mac-worker/controller-transfer-cache\0";
+
+    pub fn controller_transfer_cache_id(
+        project_id: &str,
+        worktree_id: &str,
+    ) -> Result<String, WorkerError> {
+        if !is_lower_hex(project_id, 64) || !is_lower_hex(worktree_id, 64) {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "controller cache identity is not a lowercase SHA-256 pair",
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(Self::CONTROLLER_TRANSFER_CACHE_DOMAIN);
+        hasher.update(project_id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(worktree_id.as_bytes());
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    pub fn controller_transfer_git_path(
+        cache_root: &Path,
+        project_id: &str,
+        worktree_id: &str,
+    ) -> Result<PathBuf, WorkerError> {
+        let cache_id = Self::controller_transfer_cache_id(project_id, worktree_id)?;
+        Ok(cache_root
+            .join("controller-transfer")
+            .join(format!("{cache_id}.git")))
+    }
+
+    /// FLOW checkout / materialization / import / reopen hook.
+    ///
+    /// Open the same Git directory hidden `controller-receive-pack` /
+    /// `controller-upload-pack` resolve from `PathLayout.cache` plus the
+    /// registered logical `project_id` and `worktree_id`. Do not call
+    /// [`TransferRepo::open_or_create`] with a laptop `common_dir` for a
+    /// controller-registered context: that would use `transfer/<physical>`
+    /// instead of `controller-transfer/<logical>`.
+    pub fn open_or_create_controller_cache(
+        cache_root: &Path,
+        project_id: &str,
+        worktree_id: &str,
+    ) -> Result<Self, WorkerError> {
+        Self::open_controller_cache_inner(cache_root, project_id, worktree_id, true)
+    }
+
+    /// Hidden-helper open. Fails closed when prepare has not created the
+    /// cache yet, or when the git directory was removed.
+    pub fn open_controller_cache(
+        cache_root: &Path,
+        project_id: &str,
+        worktree_id: &str,
+    ) -> Result<Self, WorkerError> {
+        Self::open_controller_cache_inner(cache_root, project_id, worktree_id, false)
+    }
+
+    fn open_controller_cache_inner(
+        cache_root: &Path,
+        project_id: &str,
+        worktree_id: &str,
+        create: bool,
+    ) -> Result<Self, WorkerError> {
+        let repo_id = Self::controller_transfer_cache_id(project_id, worktree_id)?;
+        let cache_root = if cache_root.is_absolute() {
+            cache_root.to_path_buf()
+        } else {
+            fs::canonicalize(cache_root).map_err(WorkerError::Io)?
+        };
+        let transfer_parent = cache_root.join("controller-transfer");
+        let path = transfer_parent.join(format!("{repo_id}.git"));
+        if !create && open_initialized_transfer_repo(&path)?.is_none() {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "controller transfer cache is missing",
+            ));
+        }
+        let transfer_ns = open_or_create_owner_only_dir(&transfer_parent)?;
+        let repo_lock = lock_transfer_repo_shared(&transfer_ns, &repo_id)?;
+        let repo_dir = match open_initialized_transfer_repo(&path)? {
+            Some(repo_dir) => repo_dir,
+            None if create => {
+                let _init_lock = lock_transfer_repo_init(&transfer_ns, &repo_id)?;
+                match open_initialized_transfer_repo(&path)? {
+                    Some(repo_dir) => repo_dir,
+                    None => {
+                        let repo_dir = open_or_create_owner_only_dir(&path)?;
+                        run_system_git(
+                            None,
+                            &[
+                                OsString::from("init"),
+                                OsString::from("--bare"),
+                                path.as_os_str().to_os_string(),
+                            ],
+                            None,
+                            None,
+                        )?;
+                        let _scratch =
+                            repo_dir.open_child_directory(&relative("scratch")?, true)?;
+                        repo_dir
+                    }
+                }
+            }
+            None => {
+                return Err(git_error(
+                    "BASE_UNAVAILABLE",
+                    "controller transfer cache is missing",
+                ));
+            }
+        };
+        chmod_owner_only(&repo_dir)?;
+        let _scratch = repo_dir.open_child_directory(&relative("scratch")?, true)?;
+        let _info = open_owner_only_subdir(&path, &["objects", "info"])?;
+        Ok(Self {
+            path: path.clone(),
+            repo_id,
+            alternates_target: path.join("objects"),
+            user_alternates: false,
+            _repo_lock: repo_lock,
+        })
+    }
+
+    pub fn frozen_controller_result_ref(
+        request_id: &str,
+        turn_id: &str,
+    ) -> Result<String, WorkerError> {
+        if !is_lower_hex(request_id, 32) || !is_lower_hex(turn_id, 32) {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "controller result pin identity is not a lowercase UUID pair",
+            ));
+        }
+        Ok(format!(
+            "refs/mac-worker/controller-results/{request_id}/{turn_id}"
+        ))
+    }
+
+    /// Immutable request/turn result pin. Does not touch
+    /// `refs/mac-worker/results/<task_id>`. Same owned-graph pin engine as
+    /// [`Self::pin_frozen_source`]; the namespace is the only difference.
+    pub fn pin_controller_result(
+        &self,
+        runner: &dyn ProcessRunner,
+        request_id: &str,
+        turn_id: &str,
+        oid: &BaseOid,
+    ) -> Result<String, WorkerError> {
+        let name = Self::frozen_controller_result_ref(request_id, turn_id)?;
+        self.pin_owned_commit(runner, &name, oid)?;
+        Ok(name)
+    }
+
     /// Cap for the first-slice control-frame bundle only. Ordinary repositories
     /// must stream through GitTransport SSH (`host receive-pack` /
-    /// `host upload-pack` today; controller-owned receive/upload helpers are
-    /// still to land). Do not raise this cap to fit a real repo, and do not
-    /// put pack bytes in the 1 MiB RPC body on the final path.
+    /// `host upload-pack`, or controller-owned `controller-receive-pack` /
+    /// `controller-upload-pack`). Do not raise this cap to fit a real repo, and
+    /// do not put pack bytes in the 1 MiB RPC body on the final path.
     pub const FROZEN_BUNDLE_MAX_BYTES: usize = 1024 * 1024;
 
     /// Immutable request-scoped source ref. `git bundle create` with a raw
@@ -576,11 +743,12 @@ impl TransferRepo {
         Ok(name)
     }
 
-    /// Pins a frozen or imported-parent commit under a validated request or
-    /// DAG ref. Copies the reachable graph into transfer-owned objects without
-    /// mutating live `objects/info/alternates`, then create-or-same CAS plus
-    /// object/refstorage fsync. Same OID retries succeed; a different OID
-    /// conflicts. [`Self::has_object`] is not proof of owned-graph closure.
+    /// Pins a frozen or imported-parent commit under a validated request, DAG,
+    /// or controller-result ref. Copies the reachable graph into transfer-owned
+    /// objects without mutating live `objects/info/alternates`, then
+    /// create-or-same CAS plus object/refstorage fsync. Same OID retries succeed;
+    /// a different OID conflicts. [`Self::has_object`] is not proof of
+    /// owned-graph closure.
     pub fn pin_object(
         &self,
         runner: &dyn ProcessRunner,
@@ -759,7 +927,7 @@ impl TransferRepo {
     /// Copy the reachable graph into this repository's own object store.
     /// Does not mutate `objects/info/alternates`; concurrent transfer users
     /// keep their live alternate.
-    fn materialize_owned_graph(
+    pub(crate) fn materialize_owned_graph(
         &self,
         runner: &dyn ProcessRunner,
         oid: &BaseOid,
@@ -801,7 +969,7 @@ impl TransferRepo {
         self.require_owned_graph_view(runner, oid, "after pack+index-pack", Some(pack_bytes))
     }
 
-    fn require_owned_frozen_commit(
+    pub(crate) fn require_owned_frozen_commit(
         &self,
         runner: &dyn ProcessRunner,
         oid: &BaseOid,
@@ -1068,7 +1236,7 @@ impl TransferRepo {
         self.pin_request_ref_cas(runner, name, oid)
     }
 
-    fn pin_request_ref_cas(
+    pub(crate) fn pin_request_ref_cas(
         &self,
         runner: &dyn ProcessRunner,
         name: &str,
@@ -1126,7 +1294,7 @@ impl TransferRepo {
         Ok(())
     }
 
-    fn read_ref_oid(
+    pub(crate) fn read_ref_oid(
         &self,
         runner: &dyn ProcessRunner,
         name: &str,
@@ -1206,6 +1374,9 @@ impl TransferRepo {
     }
 
     pub fn verify_alternates(&self) -> Result<(), WorkerError> {
+        if !self.user_alternates {
+            return Ok(());
+        }
         let root = RootedDir::open(&self.path)?;
         let mut inspection = root
             .inspect(&relative("objects/info/alternates")?)
@@ -1407,6 +1578,84 @@ impl TransferRepo {
             ],
             false,
         )?)?;
+        Ok(ImportReceipt { head, local_ref })
+    }
+
+    /// Fetch a verified request/turn pin into the user remotes namespace.
+    /// `source_ref` must already name `expected_oid` in this transfer repo.
+    pub fn import_result_from_ref(
+        &self,
+        runner: &dyn ProcessRunner,
+        user_common_dir: &Path,
+        worker: &str,
+        task_id: TaskId,
+        source_ref: &str,
+        expected_oid: &BaseOid,
+    ) -> Result<ImportReceipt, WorkerError> {
+        if self.user_alternates && repo_id_for(user_common_dir)? != self.repo_id {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "the transfer repository is bound to a different user repository",
+            ));
+        }
+        self.verify_alternates()?;
+        if !is_safe_worker_ref_component(worker) {
+            return Err(task_config("worker name is invalid"));
+        }
+        if !source_ref.starts_with("refs/mac-worker/controller-results/")
+            || source_ref.contains("..")
+            || source_ref.contains('\0')
+        {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "controller result import ref is not an immutable request/turn pin",
+            ));
+        }
+        let pinned = self.read_ref_oid(runner, source_ref)?.ok_or_else(|| {
+            git_error(
+                "BASE_UNAVAILABLE",
+                "controller result pin is missing from the transfer repository",
+            )
+        })?;
+        if pinned.as_str() != expected_oid.as_str() {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "controller result pin does not match the imported object",
+            ));
+        }
+        let local_ref = format!("refs/remotes/mac-worker/{worker}/task/{task_id}");
+        let source = format!("+{source_ref}:{local_ref}");
+        user_git(
+            runner,
+            user_common_dir,
+            &[
+                OsString::from("-c"),
+                OsString::from("gc.auto=0"),
+                OsString::from("-c"),
+                OsString::from("core.logAllRefUpdates=false"),
+                OsString::from("fetch"),
+                OsString::from("--no-write-fetch-head"),
+                self.path.as_os_str().to_os_string(),
+                OsString::from(source),
+            ],
+            false,
+        )?;
+        let head = parse_oid(&user_git(
+            runner,
+            user_common_dir,
+            &[
+                OsString::from("rev-parse"),
+                OsString::from("--verify"),
+                OsString::from(local_ref.as_str()),
+            ],
+            false,
+        )?)?;
+        if head.as_str() != expected_oid.as_str() {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "user-remote import did not preserve the controller result OID",
+            ));
+        }
         Ok(ImportReceipt { head, local_ref })
     }
 
@@ -2614,9 +2863,20 @@ fn validate_owned_pin_ref(name: &str) -> Result<(), WorkerError> {
             _ => {}
         }
     }
+    if let Some(rest) = name.strip_prefix("refs/mac-worker/controller-results/") {
+        let mut parts = rest.split('/');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(request_id), Some(turn_id), None)
+                if is_lower_hex(request_id, 32) && is_lower_hex(turn_id, 32) =>
+            {
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     Err(git_error(
         "BASE_UNAVAILABLE",
-        "owned pin refs must live under refs/mac-worker/requests/ or refs/mac-worker/dag/",
+        "owned pin refs must live under refs/mac-worker/requests/, refs/mac-worker/dag/, or refs/mac-worker/controller-results/",
     ))
 }
 
