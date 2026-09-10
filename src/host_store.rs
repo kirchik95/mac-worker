@@ -5548,7 +5548,7 @@ mod review_regression_tests {
         let root_component = root.file_name().unwrap();
         let mut digest = Sha256::new();
         digest.update(b"mac-worker-installation-v1\0");
-        digest.update((metadata.dev() as u64).to_be_bytes());
+        digest.update(metadata.dev().to_be_bytes());
         digest.update(metadata.ino().to_be_bytes());
         digest.update((root_component.as_bytes().len() as u64).to_be_bytes());
         digest.update(root_component.as_bytes());

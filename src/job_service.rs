@@ -841,7 +841,8 @@ impl<'a> JobService<'a> {
                 drop(supervisor);
                 drop(admission);
                 self.cleanup_and_release_reconciled(lease, &job, &terminal)?;
-                return cancel_response(meta, terminal);
+                let observed = observed_terminal_status(&job, terminal);
+                return cancel_response(meta, observed);
             }
             self.store
                 .validate_cancel_cleanup_marker_after(&admission, &request, &current.meta)?;
@@ -1974,13 +1975,11 @@ impl<'a> JobService<'a> {
         cleanup: Result<(), WorkerError>,
         require_cleanup: bool,
     ) -> Result<AuthoritativeJob, WorkerError> {
+        let observed = observed_terminal_status(&job, current);
         match cleanup {
-            Ok(()) => AuthoritativeJob::new(job, meta, current),
+            Ok(()) => AuthoritativeJob::new(job, meta, observed),
             Err(error) if require_cleanup => Err(error),
-            Err(_) => {
-                let observed = read_mutable_canonical_json(&job, "status.json").unwrap_or(current);
-                AuthoritativeJob::new(job, meta, observed)
-            }
+            Err(_) => AuthoritativeJob::new(job, meta, observed),
         }
     }
 
@@ -2059,7 +2058,7 @@ impl<'a> JobService<'a> {
                     );
                     return Err(error);
                 }
-                Ok(())
+                self.clear_reconciliation_cleanup_error(lease, job, terminal)
             }
             Err(error) => {
                 let _ = self.enrich_reconciliation_cleanup_error(
@@ -2070,6 +2069,48 @@ impl<'a> JobService<'a> {
                 );
                 Err(error)
             }
+        }
+    }
+
+    /// Clears a stale `cleanup_error_code` after a retried deferred cleanup
+    /// and lease release both succeed. A later status read must be able to
+    /// say the failure no longer exists; if the record moved, leave it for
+    /// the next read.
+    fn clear_reconciliation_cleanup_error(
+        &self,
+        lease: &LeaseRecord,
+        job: &RootedDir,
+        terminal: &JobStatus,
+    ) -> Result<(), WorkerError> {
+        if terminal.cleanup_error_code().is_none() {
+            return Ok(());
+        }
+        let admission = self.store.admission_lock(lease.job_id())?;
+        let supervisor = self
+            .store
+            .supervisor_lock_after(&admission, lease.job_id(), false)?;
+        let Some(mut supervisor) = supervisor else {
+            return Ok(());
+        };
+        drop(admission);
+        let (bytes, current): (Vec<u8>, JobStatus) =
+            read_mutable_canonical_json_with_bytes(job, "status.json")?;
+        if current != *terminal {
+            return Ok(());
+        }
+        let cleared = current
+            .without_cleanup_error(reconciliation_timestamp(current.updated_at_millis())?)?;
+        match self.store.replace_job_status_after(
+            &mut supervisor,
+            lease,
+            job,
+            &bytes,
+            &current,
+            &cleared,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) if is_status_changed(&error) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
@@ -2977,6 +3018,14 @@ where
         }
     }
     unreachable!("bounded mutable JSON retry always returns")
+}
+
+fn observed_terminal_status(job: &RootedDir, fallback: JobStatus) -> JobStatus {
+    read_mutable_canonical_json(job, "status.json").unwrap_or(fallback)
+}
+
+fn is_status_changed(error: &WorkerError) -> bool {
+    matches!(error, WorkerError::Protocol(message) if message.starts_with("STATUS_CHANGED:"))
 }
 
 fn read_mutable_canonical_json_with_bytes<T>(
