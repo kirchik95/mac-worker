@@ -16,7 +16,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use clap::Parser;
@@ -25,6 +25,7 @@ use mac_worker::{
     cli::Cli,
     config::WorkerEntry,
     error::WorkerError,
+    failure_receipt::{RESIDUAL_LEASE, RESIDUAL_WORKSPACE, STAGE_CLEANUP},
     host_store::{HostStore, HostStoreWritePoint, JobDisposition, SupervisorGuard},
     inputs::RelativePath,
     job::{
@@ -1909,6 +1910,20 @@ fn terminal_status_and_log_chunk_succeed_when_mutable_cleanup_still_fails() {
             "reconcile" => {
                 let error = service.reconcile_job(lease.job_id()).unwrap_err();
                 assert!(error.to_string().contains("I/O error"), "{error}");
+                let receipt = error
+                    .failure_receipt()
+                    .expect("cleanup HOST_IO carries a receipt");
+                assert_eq!(receipt.stage(), STAGE_CLEANUP);
+                assert!(receipt.residual().contains(&RESIDUAL_LEASE), "{receipt:?}");
+                // AfterCleanupIntentCommit still has this job's public workspace;
+                // the private tree sits in a shared ancestor namespace and must
+                // not be claimed as this job's cleanup-tree.
+                assert!(
+                    receipt.residual().contains(&RESIDUAL_WORKSPACE),
+                    "{receipt:?}"
+                );
+                let wire = HostControlError::new("HOST_IO", receipt.host_message()).unwrap();
+                assert_eq!(wire.error().message(), receipt.host_message());
                 assert_eq!(
                     read_job_status(&faulted, &lease).cleanup_error_code(),
                     Some("MUTABLE_CLEANUP_FAILED")
@@ -6007,6 +6022,8 @@ struct MatrixSubmitLossRunner<'a> {
     injected_losses: AtomicUsize,
     captured_success: Mutex<Option<Vec<u8>>>,
     events: Mutex<Vec<&'static str>>,
+    service_stage: Mutex<&'static str>,
+    pre_mapping: Mutex<Option<String>>,
 }
 
 impl MatrixSubmitLossRunner<'_> {
@@ -6016,6 +6033,32 @@ impl MatrixSubmitLossRunner<'_> {
 
     fn events(&self) -> Vec<&'static str> {
         self.events.lock().unwrap().clone()
+    }
+
+    fn note_pre_mapping(&self, stage: &'static str, error: &WorkerError) {
+        let mut recorded_stage = self.service_stage.lock().unwrap();
+        if *recorded_stage == "unset" {
+            *recorded_stage = stage;
+        }
+        let mut recorded = self.pre_mapping.lock().unwrap();
+        if recorded.is_none() {
+            *recorded = Some(matrix_worker_error_provenance(error));
+        }
+    }
+
+    fn append_pre_mapping(&self, extra: &str) {
+        if let Some(recorded) = self.pre_mapping.lock().unwrap().as_mut() {
+            recorded.push(' ');
+            recorded.push_str(extra);
+        }
+    }
+
+    fn service_stage(&self) -> &'static str {
+        *self.service_stage.lock().unwrap()
+    }
+
+    fn pre_mapping(&self) -> Option<String> {
+        self.pre_mapping.lock().unwrap().clone()
     }
 }
 
@@ -6066,18 +6109,74 @@ impl ProcessRunner for MatrixSubmitLossRunner<'_> {
             store: self.store.clone(),
             launches: Arc::clone(&self.launches),
         };
-        let response =
-            JobService::new(&self.store, &launcher).submit_at(self.expected.clone(), self.now)?;
-        response.validate()?;
+        let response = match JobService::new(&self.store, &launcher)
+            .submit_at(self.expected.clone(), self.now)
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.note_pre_mapping("job_service.submit_at", &error);
+                return Err(error);
+            }
+        };
+        if let Err(error) = response.validate() {
+            self.note_pre_mapping("submit_response.validate", &error);
+            return Err(error);
+        }
         assert!(
             matches!(&response, SubmitResponse::Accepted { .. }),
             "loss runner must execute the original submit, not an Existing replay"
         );
-        assert_eq!(
-            fs::read(&self.marker)?,
-            b"x",
-            "submit loss occurred before actual command execution"
-        );
+        match fs::read(&self.marker) {
+            Ok(bytes) => {
+                assert_eq!(
+                    bytes, b"x",
+                    "submit loss occurred before actual command execution"
+                );
+            }
+            Err(error) => {
+                let error = WorkerError::from(error);
+                self.note_pre_mapping("execution_marker_read", &error);
+                let status = match &response {
+                    SubmitResponse::Accepted { status, .. } => Some(("Accepted", status)),
+                    SubmitResponse::Existing { status } => Some(("Existing", status)),
+                };
+                if let Some((kind, status)) = status {
+                    self.append_pre_mapping(&format!(
+                        "submit={kind} job_state={:?} exit={:?} signal={:?} error_code={:?} stdout_bytes={:?} stderr_bytes={:?}",
+                        status.state(),
+                        status.exit_code(),
+                        status.terminating_signal(),
+                        status.error_code(),
+                        status.final_stdout_bytes(),
+                        status.final_stderr_bytes(),
+                    ));
+                }
+                if let Ok(Some(lease)) = LeaseService::new(&self.store).load() {
+                    let wall_now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+                    let remaining =
+                        wall_now.map(|now| lease.expires_at_millis().saturating_sub(now));
+                    self.append_pre_mapping(&format!(
+                        "lease_expires={} wall_now={wall_now:?} remaining_saturating={remaining:?}",
+                        lease.expires_at_millis(),
+                    ));
+                }
+                if let Ok(job_path) = self.store.job(
+                    self.expected.material().project_id(),
+                    self.expected.material().worktree_id(),
+                    self.expected.material().job_id(),
+                ) {
+                    self.append_pre_mapping(&format!(
+                        "stdout_log={:?} stderr_log={:?}",
+                        matrix_truncate_log(&job_path.join("stdout.log")),
+                        matrix_truncate_log(&job_path.join("stderr.log")),
+                    ));
+                }
+                return Err(error);
+            }
+        }
         self.events.lock().unwrap().push("real-submit-complete");
 
         if self.serialize_success {
@@ -6225,20 +6324,45 @@ fn matrix_command(marker: &Path) -> CommandSpec {
     CommandSpec::shell(format!("/usr/bin/printf x >> '{marker}'")).unwrap()
 }
 
-fn matrix_acquired_host(
+fn matrix_delayed_marker_command(marker: &Path) -> CommandSpec {
+    let marker = marker.to_string_lossy().replace('\'', "'\\\"'\\\"'");
+    CommandSpec::shell(format!("/bin/sleep 0.2; /usr/bin/printf x >> '{marker}'")).unwrap()
+}
+
+fn matrix_execution_now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock precedes the Unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("wall clock is outside u64 millis")
+}
+
+fn matrix_acquired_host_at(
     root: &Path,
     command: CommandSpec,
+    now: u64,
 ) -> (HostStore, LeaseRecord, SubmitRequest, Vec<u8>) {
     let store = HostStore::open(root).unwrap();
     let (acquire, submit, manifest) = matrix_request(command);
     let lease = match LeaseService::new(&store)
-        .acquire(&acquire, &healthy(), 1)
+        .acquire(&acquire, &healthy(), now)
         .unwrap()
     {
         LeaseAcquireResponse::Acquired { lease } => lease,
         LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
     };
     (store, lease, submit, manifest)
+}
+
+fn matrix_acquired_host(
+    root: &Path,
+    command: CommandSpec,
+) -> (HostStore, LeaseRecord, SubmitRequest, Vec<u8>) {
+    // Supervisor::wait_for_child subtracts wall-clock now from expires_at.
+    // Duration stays 30_000; only the acquire epoch is live. prepared_host
+    // still acquires at 1 so identity tests can assert expires_at=30_001.
+    matrix_acquired_host_at(root, command, matrix_execution_now_millis())
 }
 
 fn matrix_request(command: CommandSpec) -> (LeaseAcquireRequest, SubmitRequest, Vec<u8>) {
@@ -6382,7 +6506,9 @@ impl MatrixOriginalMutation<'_> {
             None => match LeaseService::new(self.store).acquire(
                 &LeaseAcquireRequest::new(self.submit.material().clone()),
                 &healthy(),
-                now,
+                // Real-execution TTL is consumed against wall clock. `now`
+                // stays the logical verify/submit job clock below.
+                matrix_execution_now_millis(),
             )? {
                 LeaseAcquireResponse::Acquired { lease } => lease,
                 LeaseAcquireResponse::ExistingAccepted { .. } => {
@@ -6627,14 +6753,65 @@ fn matrix_assert_recorded_endpoint_identity(command: &str, bytes: &[u8], submit:
     }
 }
 
+fn matrix_truncate_log(path: &Path) -> String {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let slice = &bytes[..bytes.len().min(512)];
+            String::from_utf8_lossy(slice).into_owned()
+        }
+        Err(error) => format!("<unreadable: {error}>"),
+    }
+}
+
+fn matrix_worker_error_provenance(error: &WorkerError) -> String {
+    match error {
+        WorkerError::HostIo { source, receipt } => format!(
+            "variant=HostIo public_code={} display={error} io_kind={:?} os={:?} receipt_stage={} residual={}",
+            error.public_code(),
+            source.kind(),
+            source.raw_os_error(),
+            receipt.stage(),
+            receipt.residual().join(","),
+        ),
+        WorkerError::Io(source) => format!(
+            "variant=Io public_code={} display={error} io_kind={:?} os={:?}",
+            error.public_code(),
+            source.kind(),
+            source.raw_os_error(),
+        ),
+        WorkerError::Transport { code, message } => {
+            format!("variant=Transport code={code} message={message}")
+        }
+        WorkerError::Protocol(message) => format!(
+            "variant=Protocol public_code={} message={message}",
+            error.public_code()
+        ),
+        WorkerError::Process(source) => format!(
+            "variant=Process public_code={} display={source}",
+            error.public_code()
+        ),
+        other => format!(
+            "variant={other:?} public_code={} display={error}",
+            other.public_code()
+        ),
+    }
+}
+
+struct MatrixLossRow {
+    case_index: usize,
+    boundary: usize,
+    schedule: usize,
+    now: u64,
+    serialize_success: bool,
+}
+
 fn matrix_run_submit_loss(
     endpoint: &MatrixEndpointRunner,
     store: &HostStore,
     submit: &SubmitRequest,
     launches: &Arc<AtomicUsize>,
     marker: &Path,
-    now: u64,
-    serialize_success: bool,
+    row: MatrixLossRow,
 ) -> (Result<SubmitResponse, WorkerError>, Option<Vec<u8>>) {
     let runner = MatrixSubmitLossRunner {
         endpoint,
@@ -6642,12 +6819,14 @@ fn matrix_run_submit_loss(
         expected: submit.clone(),
         launches: Arc::clone(launches),
         marker: marker.to_path_buf(),
-        now,
-        serialize_success,
+        now: row.now,
+        serialize_success: row.serialize_success,
         submit_calls: AtomicUsize::new(0),
         injected_losses: AtomicUsize::new(0),
         captured_success: Mutex::new(None),
         events: Mutex::new(Vec::new()),
+        service_stage: Mutex::new("unset"),
+        pre_mapping: Mutex::new(None),
     };
     let result = SshJsonTransport::new(&runner).request::<_, SubmitResponse>(
         &matrix_worker(),
@@ -6658,18 +6837,39 @@ fn matrix_run_submit_loss(
     let error = result
         .as_ref()
         .expect_err("submit success escaped the loss runner");
+    let context = format!(
+        "case_index={} boundary={} schedule={} serialize_success={} submit_calls={} injected_losses={} launches={} marker_exists={} events={:?} service_stage={} pre_mapping={} mapped={}",
+        row.case_index,
+        row.boundary,
+        row.schedule,
+        row.serialize_success,
+        runner.submit_calls.load(Ordering::SeqCst),
+        runner.injected_losses.load(Ordering::SeqCst),
+        runner.launches.load(Ordering::SeqCst),
+        marker.exists(),
+        runner.events(),
+        runner.service_stage(),
+        runner.pre_mapping().as_deref().unwrap_or("<none>"),
+        matrix_worker_error_provenance(error),
+    );
     match error {
         WorkerError::Transport { code, message } => {
-            assert_eq!(*code, "SSH_LAUNCH_FAILED");
-            assert_eq!(message, "failed to launch SSH control request");
+            assert_eq!(*code, "SSH_LAUNCH_FAILED", "{context}");
+            assert_eq!(message, "failed to launch SSH control request", "{context}");
         }
-        unexpected => panic!("submit loss runner returned the wrong actual error: {unexpected}"),
+        unexpected => {
+            panic!("submit loss runner returned the wrong actual error: {unexpected}; {context}")
+        }
     }
-    assert_eq!(runner.submit_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(runner.injected_losses.load(Ordering::SeqCst), 1);
+    assert_eq!(runner.submit_calls.load(Ordering::SeqCst), 1, "{context}");
+    assert_eq!(
+        runner.injected_losses.load(Ordering::SeqCst),
+        1,
+        "{context}"
+    );
     assert_eq!(
         runner.events(),
-        if serialize_success {
+        if row.serialize_success {
             vec![
                 "real-submit-complete",
                 "canonical-success-captured",
@@ -6682,10 +6882,10 @@ fn matrix_run_submit_loss(
                 "loss-injected",
             ]
         },
-        "submit loss runner crossed its boundary out of order"
+        "submit loss runner crossed its boundary out of order; {context}"
     );
     let captured = runner.captured_success();
-    assert_eq!(captured.is_some(), serialize_success);
+    assert_eq!(captured.is_some(), row.serialize_success);
     (result, captured)
 }
 
@@ -6882,6 +7082,72 @@ fn matrix_durable_snapshot(
 }
 
 #[test]
+fn synthetic_epoch_lease_does_not_record_a_delayed_marker_but_wall_epoch_does() {
+    // Real MatrixInlineLauncher / Supervisor::run_with_guard. Duration
+    // stays exactly 30_000. Sleep 0.2 only defeats the already-waitable
+    // first poll when remaining_lease_millis saturates at 0. Historic 0156
+    // terminal kind is still unknown; this does not plant a loss or accept
+    // SSH_LAUNCH_FAILED.
+    fn submit_delayed(
+        acquire_now: u64,
+    ) -> (
+        Option<Vec<u8>>,
+        LeaseRecord,
+        Result<SubmitResponse, WorkerError>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, root) = matrix_runtime(&temp);
+        let marker = temp.path().join("actual-child-marker");
+        let (store, lease, submit, manifest) =
+            matrix_acquired_host_at(&root, matrix_delayed_marker_command(&marker), acquire_now);
+        assert_eq!(submit.material().created_at_millis(), 10);
+        assert_eq!(submit.material().timeout_millis(), 30_000);
+        assert_eq!(lease.timeout_millis(), 30_000);
+        assert_eq!(lease.created_at_millis(), acquire_now);
+        assert_eq!(lease.expires_at_millis(), acquire_now + 30_000);
+        matrix_receive_before_verification(
+            &store,
+            &lease,
+            &manifest,
+            temp.path(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        RemoteSnapshotService::new(&store)
+            .verify_and_promote_at(&lease, lease.manifest_digest(), 2)
+            .unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launcher = MatrixInlineLauncher {
+            store: store.clone(),
+            launches: Arc::clone(&launches),
+        };
+        let response = JobService::new(&store, &launcher).submit_at(submit, 10);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        (fs::read(&marker).ok(), lease, response)
+    }
+
+    let (expired_marker, expired_lease, _expired_response) = submit_delayed(1);
+    assert_eq!(expired_lease.created_at_millis(), 1);
+    assert_eq!(expired_lease.expires_at_millis(), 30_001);
+    assert_eq!(expired_lease.timeout_millis(), 30_000);
+    assert_eq!(
+        expired_marker, None,
+        "expired synthetic epoch must not complete the delayed marker"
+    );
+
+    let wall = matrix_execution_now_millis();
+    let (live_marker, live_lease, live_response) = submit_delayed(wall);
+    assert_eq!(live_lease.created_at_millis(), wall);
+    assert_eq!(live_lease.expires_at_millis(), wall + 30_000);
+    assert_eq!(live_lease.timeout_millis(), 30_000);
+    live_response.expect("wall-epoch delayed marker submit");
+    assert_eq!(
+        live_marker.as_deref(),
+        Some(b"x".as_slice()),
+        "wall-epoch lease must complete the delayed marker"
+    );
+}
+
+#[test]
 fn acceptance_disconnect_matrix_100() {
     // One hundred deterministic rows exercise the six primary disconnect
     // boundaries and four channel-ordered recovery classes. Host receipt,
@@ -7037,8 +7303,13 @@ fn acceptance_disconnect_matrix_100() {
                     &submit,
                     &launches,
                     &marker,
-                    6 + boundary as u64,
-                    boundary == 5,
+                    MatrixLossRow {
+                        case_index,
+                        boundary,
+                        schedule,
+                        now: 6 + boundary as u64,
+                        serialize_success: boundary == 5,
+                    },
                 );
                 primary_submit_result = Some(lost);
                 assert_eq!(fs::read(&marker).unwrap(), b"x");
@@ -7232,7 +7503,18 @@ fn acceptance_disconnect_matrix_100() {
                     .unwrap();
                     retained_lease = Some(lease);
                     let (lost, captured) = matrix_run_submit_loss(
-                        &runner, &store, &submit, &launches, &marker, 42, false,
+                        &runner,
+                        &store,
+                        &submit,
+                        &launches,
+                        &marker,
+                        MatrixLossRow {
+                            case_index,
+                            boundary,
+                            schedule,
+                            now: 42,
+                            serialize_success: false,
+                        },
                     );
                     assert!(
                         captured.is_none(),
