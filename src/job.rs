@@ -18,6 +18,14 @@ use crate::{
     scheduler::{CandidateSlot, WorkerPreference},
 };
 
+/// On-disk JobMeta / fingerprint identity may be 6 or the current wire.
+/// Network mutation envelopes stay strictly `PROTOCOL_VERSION`.
+pub const PREVIOUS_STORED_PROTOCOL_VERSION: u32 = 6;
+
+pub fn is_stored_protocol_version(version: u32) -> bool {
+    version == PREVIOUS_STORED_PROTOCOL_VERSION || version == PROTOCOL_VERSION
+}
+
 pub const MAX_ARG_COUNT: usize = 256;
 pub const MAX_ARG_BYTES: usize = 16 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 128 * 1024;
@@ -483,16 +491,46 @@ impl RequestFingerprintMaterial {
             resource_class,
             command,
         };
-        material.validate()?;
+        material.validate_current_wire()?;
         Ok(material)
     }
 
-    pub fn validate(&self) -> Result<(), WorkerError> {
-        if self.protocol_version != PROTOCOL_VERSION {
-            return Err(protocol_error(
-                "request fingerprint has an incompatible protocol version",
-            ));
-        }
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_stored(
+        protocol_version: u32,
+        job_id: JobId,
+        client_id: ClientId,
+        lease_token: LeaseToken,
+        created_at_millis: u64,
+        worker_name: String,
+        project_id: String,
+        worktree_id: String,
+        manifest_digest: String,
+        relative_working_dir: String,
+        timeout_millis: u64,
+        resource_class: String,
+        command: CommandSpec,
+    ) -> Result<Self, WorkerError> {
+        let material = Self {
+            protocol_version,
+            job_id,
+            client_id,
+            lease_token,
+            created_at_millis,
+            worker_name,
+            project_id,
+            worktree_id,
+            manifest_digest,
+            relative_working_dir,
+            timeout_millis,
+            resource_class,
+            command,
+        };
+        material.validate_stored()?;
+        Ok(material)
+    }
+
+    fn validate_shape(&self) -> Result<(), WorkerError> {
         validate_non_nul(&self.worker_name, 128, "worker name")?;
         validate_hex_component(&self.project_id, "project ID")?;
         validate_hex_component(&self.worktree_id, "worktree ID")?;
@@ -507,6 +545,28 @@ impl RequestFingerprintMaterial {
         }
         validate_non_nul(&self.resource_class, 64, "resource class")?;
         self.command.validate()
+    }
+
+    pub fn validate_stored(&self) -> Result<(), WorkerError> {
+        if !is_stored_protocol_version(self.protocol_version) {
+            return Err(incompatible_protocol(
+                "request fingerprint has an incompatible protocol version",
+            ));
+        }
+        self.validate_shape()
+    }
+
+    pub fn validate_current_wire(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(incompatible_protocol(
+                "request fingerprint has an incompatible protocol version",
+            ));
+        }
+        self.validate_shape()
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        self.validate_stored()
     }
 
     pub fn fingerprint(&self) -> RequestFingerprint {
@@ -549,6 +609,10 @@ impl RequestFingerprintMaterial {
     }
     pub fn command(&self) -> &CommandSpec {
         &self.command
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
     }
 }
 
@@ -2675,7 +2739,7 @@ impl JobMeta {
             ));
         }
         let meta = Self {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: material.protocol_version,
             job_id: material.job_id,
             client_id: material.client_id,
             worker_name: material.worker_name.clone(),
@@ -2694,11 +2758,28 @@ impl JobMeta {
     }
 
     pub fn validate(&self) -> Result<(), WorkerError> {
-        if self.protocol_version != PROTOCOL_VERSION {
-            return Err(protocol_error(
+        self.validate_stored()
+    }
+
+    pub fn validate_stored(&self) -> Result<(), WorkerError> {
+        if !is_stored_protocol_version(self.protocol_version) {
+            return Err(incompatible_protocol(
                 "job metadata has an incompatible protocol version",
             ));
         }
+        self.validate_shape()
+    }
+
+    pub fn validate_current_wire(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(incompatible_protocol(
+                "job metadata has an incompatible protocol version",
+            ));
+        }
+        self.validate_shape()
+    }
+
+    fn validate_shape(&self) -> Result<(), WorkerError> {
         validate_hex_component(&self.project_id, "project ID")?;
         validate_hex_component(&self.worktree_id, "worktree ID")?;
         validate_hex_component(&self.manifest_digest, "manifest digest")?;
@@ -2755,6 +2836,9 @@ impl JobMeta {
     }
     pub fn resource_class(&self) -> &str {
         &self.resource_class
+    }
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
     }
 }
 
@@ -3160,7 +3244,7 @@ impl LeaseAcquireRequest {
     }
 
     pub fn validate(&self) -> Result<(), WorkerError> {
-        self.material.validate()?;
+        self.material.validate_current_wire()?;
         if self.material.fingerprint() != self.request_fingerprint {
             return Err(protocol_error(
                 "lease request fingerprint does not match its material",
@@ -5372,8 +5456,10 @@ impl JsonEvent {
                 *protocol_version
             }
         };
-        if version != PROTOCOL_VERSION {
-            return Err(protocol_error("event has an incompatible protocol version"));
+        if !is_stored_protocol_version(version) {
+            return Err(incompatible_protocol(
+                "event has an incompatible protocol version",
+            ));
         }
         Ok(())
     }
@@ -5679,6 +5765,10 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
 
 fn protocol_error(message: &str) -> WorkerError {
     WorkerError::Protocol(message.into())
+}
+
+fn incompatible_protocol(message: &str) -> WorkerError {
+    WorkerError::Protocol(format!("INCOMPATIBLE_PROTOCOL: {message}"))
 }
 
 #[cfg(test)]

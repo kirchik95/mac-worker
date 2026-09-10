@@ -1,6 +1,8 @@
 use crate::agent_facts::{AgentFacts, FACTS_TTL, HerdrFactState, HerdrFacts};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+/// Integrated release that transports typed `TaskStatus.reported_checks`.
+/// v6 helpers and clients mismatch at preflight; upgrade them together.
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const SUPERVISION_VERSION: u32 = 3;
 
 /// Spec 5.3 and 12: the `doctor` and `setup` warning for a worker whose

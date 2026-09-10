@@ -1290,6 +1290,12 @@ impl<'a> Supervisor<'a> {
             false,
         )?;
         let meta: JobMeta = read_canonical_json(&job, "meta.json")?;
+        if meta.protocol_version() != crate::protocol::PROTOCOL_VERSION {
+            return Err(protocol_code(
+                "INCOMPATIBLE_PROTOCOL",
+                "active job uses a drained protocol version; finish it on the previous helper before worker setup",
+            ));
+        }
         require_meta_matches_lease(&meta, &lease)?;
         let (mut status_bytes, mut status): (Vec<u8>, JobStatus) =
             read_canonical_json_with_bytes(&job, "status.json")?;

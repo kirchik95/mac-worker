@@ -443,7 +443,7 @@ fn turn_material_commits_prompt_through_the_digest_slot_without_v1_fields() {
     assert!(json["base_oid"].is_string());
     assert!(json.get("prompt").is_none());
     assert!(json.get("session_ref").is_none());
-    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(PROTOCOL_VERSION, 7);
     assert_eq!(SUPERVISION_VERSION, 3);
 }
 

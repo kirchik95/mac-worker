@@ -907,7 +907,7 @@ fn every_command_bearing_debug_is_content_free() {
         assert!(!rendered.contains(marker), "{rendered}");
         assert!(!rendered.contains(LEASE_TOKEN), "{rendered}");
     }
-    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(PROTOCOL_VERSION, 7);
 }
 
 #[test]

@@ -151,7 +151,8 @@ impl ExecutionPayload {
     ) -> Result<(), WorkerError> {
         lease.validate()?;
         meta.validate()?;
-        let material = RequestFingerprintMaterial::new(
+        let material = RequestFingerprintMaterial::from_stored(
+            meta.protocol_version(),
             self.job_id,
             self.client_id,
             self.lease_token,
@@ -1060,6 +1061,14 @@ impl<'a> JobService<'a> {
             read_mutable_canonical_json_with_bytes(&directory, "status.json")
                 .map_err(|_| job_state_invalid("canonical mutable job status is invalid"))?;
         validate_queryable_status(&meta, &status)?;
+        if !status.state().is_terminal()
+            && meta.protocol_version() != crate::protocol::PROTOCOL_VERSION
+        {
+            return Err(protocol_code(
+                "INCOMPATIBLE_PROTOCOL",
+                "active job uses a drained protocol version; finish it on the previous helper before worker setup",
+            ));
+        }
         if status.state().is_terminal() {
             validate_terminal_log_lengths(&directory, &status)?;
         }
@@ -3026,7 +3035,14 @@ pub(crate) fn reconstruct_submit_request(
     payload
         .validate_for_durable_job(lease, meta)
         .map_err(|_| protocol_code("JOB_ID_CONFLICT", "execution payload identity differs"))?;
-    let material = RequestFingerprintMaterial::new(
+    if meta.protocol_version() != crate::protocol::PROTOCOL_VERSION {
+        return Err(protocol_code(
+            "INCOMPATIBLE_PROTOCOL",
+            "active job uses a drained protocol version; finish it on the previous helper before worker setup",
+        ));
+    }
+    let material = RequestFingerprintMaterial::from_stored(
+        meta.protocol_version(),
         meta.job_id(),
         meta.client_id(),
         lease.lease_token(),
