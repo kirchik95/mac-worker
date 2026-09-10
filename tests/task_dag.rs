@@ -4,6 +4,7 @@ mod support;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
+    fs,
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
@@ -1567,6 +1568,153 @@ impl Drop for CurrentDirGuard {
     }
 }
 
+/// Holds `CWD_LOCK` and process cwd for a temporary Git worktree.
+///
+/// Drop restores cwd while the worktree still exists, then removes the
+/// worktree, then releases the lock. User `Drop` runs before field
+/// destructors, so cwd is taken first and the lock field is left for last.
+struct CwdLockedRepo {
+    cwd: Option<CurrentDirGuard>,
+    repo: Option<support::GitRepo>,
+    _cwd_lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl CwdLockedRepo {
+    fn enter(repo: support::GitRepo) -> Self {
+        let cwd_lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let cwd = CurrentDirGuard::enter(repo.root());
+        Self {
+            cwd: Some(cwd),
+            repo: Some(repo),
+            _cwd_lock: cwd_lock,
+        }
+    }
+
+    fn repo(&self) -> &support::GitRepo {
+        self.repo.as_ref().expect("cwd-locked repo still present")
+    }
+}
+
+impl Drop for CwdLockedRepo {
+    fn drop(&mut self) {
+        let root = self.repo.as_ref().map(|repo| repo.root().to_path_buf());
+        drop(self.cwd.take());
+        if let Some(root) = &root {
+            match std::env::current_dir() {
+                Ok(cwd) if cwd != *root && cwd.exists() => {
+                    assert!(
+                        root.exists(),
+                        "batch worktree must still exist after cwd restore"
+                    );
+                }
+                other => panic!(
+                    "cwd must be restored before deleting the batch worktree; cwd={other:?} root={}",
+                    root.display()
+                ),
+            }
+        }
+        drop(self.repo.take());
+    }
+}
+
+#[test]
+fn cwd_locked_repo_restores_cwd_while_the_worktree_still_exists() {
+    let previous = std::env::current_dir().unwrap();
+    let repo = support::GitRepo::init();
+    let root = repo.root().to_path_buf();
+    let locked = CwdLockedRepo::enter(repo);
+    assert_eq!(
+        std::env::current_dir().unwrap().canonicalize().unwrap(),
+        root.canonicalize().unwrap()
+    );
+    assert!(root.exists());
+    drop(locked);
+    assert_eq!(std::env::current_dir().unwrap(), previous);
+    assert!(!root.exists());
+}
+
+#[test]
+fn deleted_inherited_cwd_fails_owned_view_git_in_an_isolated_child() {
+    let root = tempfile::tempdir().unwrap();
+    let isolate = root.path().join("isolate.git");
+    let work = root.path().join("work");
+    let victim = root.path().join("victim");
+    fs::create_dir(&work).unwrap();
+    fs::create_dir(&victim).unwrap();
+    assert!(
+        Command::new("/usr/bin/git")
+            .args(["init", "-q", "--bare"])
+            .arg(&isolate)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut commit = Command::new("/usr/bin/git");
+    commit
+        .args([
+            "--git-dir",
+            isolate.to_str().unwrap(),
+            "--work-tree",
+            work.to_str().unwrap(),
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "base",
+        ])
+        .env("GIT_AUTHOR_NAME", "cwd-drop")
+        .env("GIT_AUTHOR_EMAIL", "cwd-drop@example.test")
+        .env("GIT_COMMITTER_NAME", "cwd-drop")
+        .env("GIT_COMMITTER_EMAIL", "cwd-drop@example.test")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    assert!(commit.status().unwrap().success());
+    let oid = String::from_utf8(
+        Command::new("/usr/bin/git")
+            .args(["--git-dir", isolate.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+
+    let parent_cwd = std::env::current_dir().unwrap();
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            r#"
+set +e
+cd "$VICTIM" || exit 90
+rmdir "$VICTIM" || exit 91
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+/usr/bin/git --git-dir="$ISOLATE" -c gc.auto=0 cat-file -t "$OID"
+echo CAT_STATUS:$?
+/usr/bin/git --git-dir="$ISOLATE" -c gc.auto=0 rev-list --objects "$OID"
+echo REV_STATUS:$?
+"#,
+        )
+        .env("VICTIM", &victim)
+        .env("ISOLATE", &isolate)
+        .env("OID", &oid)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(std::env::current_dir().unwrap(), parent_cwd);
+    assert!(
+        stdout.contains("CAT_STATUS:128") && stdout.contains("REV_STATUS:128"),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Unable to read current working directory"),
+        "stdout={stdout} stderr={stderr}"
+    );
+}
+
 fn plant_closed_done_import(
     store: &ClientStateStore,
     task_id: TaskId,
@@ -2076,20 +2224,17 @@ fn canonical_host_process<T: serde::Serialize>(value: &T) -> Result<ProcessResul
 }
 
 struct BatchHarness {
-    _cwd_lock: std::sync::MutexGuard<'static, ()>,
-    repo: support::GitRepo,
-    _cwd: CurrentDirGuard,
     _root: tempfile::TempDir,
     paths: mac_worker::paths::PathLayout,
     store: ClientStateStore,
     config: Config,
     runner: IsolatedDagRunner,
     executor: InlineRunnerExecutor,
+    worktree: CwdLockedRepo,
 }
 
 impl BatchHarness {
     fn new(tasks_toml: &[u8]) -> Self {
-        let cwd_lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let repo = support::GitRepo::init();
         repo.write("src/lib.rs", b"fn main() {}\n");
         repo.commit_all("base");
@@ -2098,18 +2243,19 @@ impl BatchHarness {
         let paths = support::task_harness::paths(root.path().canonicalize().unwrap());
         let store = ClientStateStore::open(&paths.state).unwrap();
         plant_bound_mini1_ready(&store);
-        let cwd = CurrentDirGuard::enter(repo.root());
         Self {
-            _cwd_lock: cwd_lock,
-            repo,
-            _cwd: cwd,
             _root: root,
             paths,
             store,
             config: dag_test_config(),
             runner: IsolatedDagRunner::new(),
             executor: InlineRunnerExecutor,
+            worktree: CwdLockedRepo::enter(repo),
         }
+    }
+
+    fn repo(&self) -> &support::GitRepo {
+        self.worktree.repo()
     }
 
     fn client(&self) -> TaskClient<'_> {
@@ -2156,7 +2302,7 @@ impl BatchHarness {
     fn batch(&self) -> mac_worker::task_client::RunReport {
         self.client()
             .batch(
-                &self.repo.root().join("tasks.toml"),
+                &self.repo().root().join("tasks.toml"),
                 None,
                 None,
                 &mut std::io::sink(),
@@ -2165,15 +2311,15 @@ impl BatchHarness {
     }
 
     fn head(&self) -> String {
-        String::from_utf8(self.repo.git(&["rev-parse", "HEAD"]).stdout)
+        String::from_utf8(self.repo().git(&["rev-parse", "HEAD"]).stdout)
             .unwrap()
             .trim()
             .to_owned()
     }
 
     fn commit_result(&self, contents: &[u8]) -> mac_worker::task::BaseOid {
-        self.repo.write("result.txt", contents);
-        self.repo.commit_all("imported turn");
+        self.repo().write("result.txt", contents);
+        self.repo().commit_all("imported turn");
         self.head().parse().unwrap()
     }
 }
@@ -2674,11 +2820,11 @@ fn dag_needs_input_say_second_turn_close_binds_followup_oid_not_prior_head() {
     harness.client().advance_pending_dags().unwrap();
     // Invalidate mutable settings after freeze. say/enqueue_followup, close,
     // and the follow-up TurnRunner must use frozen DAG context.
-    harness.repo.write(
+    harness.repo().write(
         ".worker.toml",
         b"[task]\nsource = \"bogus\"\nmax_followups = 101\n",
     );
-    let toml_error = ProjectSettings::load(harness.repo.root(), &[]).unwrap_err();
+    let toml_error = ProjectSettings::load(harness.repo().root(), &[]).unwrap_err();
     assert_eq!(toml_error.public_code(), "TASK_CONFIG_INVALID");
     let first_turn = harness
         .store
@@ -2900,7 +3046,7 @@ fn dag_frozen_detached_head_child_prompt_ignores_later_branch() {
     let harness = BatchHarness::new(ROOT_FROM_CHILD);
     assert!(
         harness
-            .repo
+            .repo()
             .git(&["checkout", "--detach", "HEAD"])
             .status
             .success()
@@ -2927,7 +3073,7 @@ fn dag_frozen_detached_head_child_prompt_ignores_later_branch() {
     );
     assert!(
         harness
-            .repo
+            .repo()
             .git(&["checkout", "-B", "after-freeze"])
             .status
             .success()
@@ -3085,7 +3231,7 @@ fn dag_restart_keeps_frozen_prompt_and_binds_imported_oid_not_new_head() {
     let root_turn = dag.nodes["root"].turn_id;
     let child_id = dag.nodes["child"].task_id;
     drop(dag);
-    harness.repo.write(
+    harness.repo().write(
         "tasks.toml",
         br#"
 version = 1
@@ -3100,8 +3246,10 @@ depends_on = ["root"]
 base = "from:root"
 "#,
     );
-    harness.repo.write("later.txt", b"new head after freeze\n");
-    harness.repo.commit_all("later head");
+    harness
+        .repo()
+        .write("later.txt", b"new head after freeze\n");
+    harness.repo().commit_all("later head");
     let new_head = harness.head();
     assert_ne!(new_head, original_head);
     let result = harness.commit_result(b"accepted import after restart\n");
@@ -3207,7 +3355,7 @@ fn dag_idle_pending_index_does_not_list_or_read_history_directory() {
     assert!(harness.store.list_pending_run_ids().unwrap().is_empty());
     harness.client().advance_pending_dags().unwrap();
 
-    harness.repo.write("tasks.toml", ROOT_FROM_CHILD);
+    harness.repo().write("tasks.toml", ROOT_FROM_CHILD);
     let second = harness.batch();
     assert_ne!(second.run_id(), first.run_id());
     assert_eq!(
