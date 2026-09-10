@@ -164,6 +164,22 @@ worker task close <id>
 
 `worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks. It does not submit work.
 
+## Liveness And Settlement
+
+Absence of evidence is not evidence of death. A `wait` timeout, an empty `list` poll, a task that has not changed state, or a row shown as `dispatching` under a pid you cannot see is a checkpoint, not a failure. Do not cancel, close, resubmit, or `reconcile` on a checkpoint alone.
+
+Act only on positive proof: the task status is terminal, the structured result is present, `logs` show the agent's exit, or `task list` names a blocking code such as `RUNNER_REPEATED_FAILURE:<code>`, `WAIT_BLOCKED`, or `LOG_DRAIN_UNAVAILABLE`. After three consecutive empty waits, enumerate instead of waiting blindly:
+
+```text
+worker task list --run <id> --json
+worker task list --state open --outcome needs-input --json
+worker workers --refresh
+```
+
+and act on each row's blocking code. `worker task reconcile` is the operator's reset for a parked turn; run it after reading the worker, not instead of reading it.
+
+A finished task owes exactly one decision after `fetch`: a follow-up with `say` (the same agent session continues), keeping it open for inspection, or `close` (`--discard` also deletes the session on the worker). `close` is post-settlement cleanup, never a cancellation; use `cancel` for a running turn.
+
 ## Rules
 
 - Never merge, check out, or push from this skill.
@@ -175,6 +191,8 @@ worker task close <id>
 - Never ask an agent to commit, switch branches, or push. The publisher commits the worktree changes after the turn; on Codex the sandbox keeps `.git` read-only and a commit attempt ends the turn `blocked`.
 - A task with the default `--close-on done` closes itself after a `done` turn. `close --discard` also deletes the agent's session on the worker.
 - Read the durable task outcome as well as the process exit status. A zero exit with status `blocked` is a failed turn.
+- Never restart, resubmit, or repair a turn on an unverifiable observation. Restart only on positive proof the runner or the worker job exited; otherwise keep waiting or inspect.
+- Verify the installed grammar before every dispatch: `worker task --help` and `worker task submit --help` are the source of truth, not this file.
 
 ## Exit Codes
 

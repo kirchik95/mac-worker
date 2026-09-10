@@ -54,6 +54,8 @@ Every brief should contain these parts, in this order:
 5. **Gate:** exact verification commands and the acceptance condition. If any of those commands is timing-sensitive, require a serial rerun under load.
 6. **Report:** the required final message, including changed files, tests, and any blocker or unverified claim.
 
+State ownership and acceptance explicitly: name what this task may edit and what it must leave alone, and name the observable proof of completion (a command with its expected result, an assertion, or an artifact). Ask the agent to state failure in the structured `status` field, never only in prose: `blocked` with the exact failing command beats a hopeful `done`.
+
 Do not ask the agent to commit, switch branches, or push: on Codex the sandbox keeps `.git` read-only and the attempt ends the turn `blocked`. A successful task is not complete merely because files changed: the requested behavior must be verified by the gate.
 
 The prompt preamble already tells the agent that it works in an isolated task worktree, must not switch branches or push, leaves its changes for publication, and, for Cursor and OpenCode, must end with exactly the JSON result object. Keep task-specific instructions concrete and do not put secrets in the prompt.
