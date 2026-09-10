@@ -19,6 +19,7 @@ use mac_worker::{
         AgentKind, PermissionPolicy, PromptDelivery, Question, TurnLaunch, TurnLimits, TurnParams,
         adapter_for,
     },
+    agent_facts::{AgentAuth, AgentFacts, AgentProbe, turn_auth_failure_reason},
     error::WorkerError,
     host_store::HostStore,
     job::{
@@ -27,6 +28,7 @@ use mac_worker::{
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
+    probe::ProbeCollector,
     protocol::{MemoryPressure, PROTOCOL_VERSION, SUPERVISION_VERSION},
     supervisor::{
         LaunchPlan, ProcessGroupMembership, ProcessGroupObservation, ProcessInspector,
@@ -37,7 +39,9 @@ use mac_worker::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, PushTarget, TaskId, TaskLimits,
         TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
     },
-    task_store::{TaskCancelRequest, TaskCloseRequest, TaskPrepareRequest, TaskStore},
+    task_store::{
+        SessionBinding, TaskCancelRequest, TaskCloseRequest, TaskPrepareRequest, TaskStore,
+    },
     turn::{EnvProfile, TaskTurnRequest, TurnMaterial, TurnSection},
 };
 use support::GitRepo;
@@ -131,8 +135,10 @@ impl SupervisorLauncher for CappedTurnLauncher {
     ) -> Result<LaunchCandidate, WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(process::id())?;
+        let helper = PathBuf::from(env!("CARGO_BIN_EXE_worker"));
         Supervisor::new(&self.store, &inspector)
             .with_log_caps(self.stdout_log_cap, self.stderr_log_cap)
+            .with_prepare_turn_helper(helper)
             .run_with_guard(job_id, guard)?;
         Ok(LaunchCandidate::new(identity))
     }
@@ -433,6 +439,29 @@ fn prepared_task_turn_at(
     (store, request, cancel)
 }
 
+fn plant_authenticated_codex_facts(host: &Path, collected_at_millis: u64) -> Vec<u8> {
+    let facts = AgentFacts {
+        agents: vec![
+            AgentProbe::new(
+                "codex",
+                Some("0.152.1".into()),
+                AgentAuth::Authenticated,
+                Vec::new(),
+            )
+            .unwrap(),
+        ],
+        env_profiles: Vec::new(),
+        git_identity: true,
+        collected_at_millis,
+        herdr: None,
+    };
+    let bytes = facts.canonical_bytes().unwrap();
+    let path = host.join("facts.json");
+    fs::write(&path, &bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    bytes
+}
+
 #[test]
 fn turn_material_commits_prompt_through_the_digest_slot_without_v1_fields() {
     let first = material("prompt-a");
@@ -574,6 +603,84 @@ fn authentication_failure_in_a_turn_records_an_incident_and_names_the_outcome() 
     );
     assert!(!incidents.contains("refresh token"), "{incidents}");
     assert!(!incidents.contains("Please log out"), "{incidents}");
+}
+
+#[test]
+fn existing_session_and_parsed_last_md_still_record_raw_stdout_auth_failure() {
+    let script = concat!(
+        "umask 022; ",
+        "printf '%s' ",
+        "'{\"status\":\"blocked\",\"summary\":\"could not continue\",\"questions\":[],\"files_changed\":[]}' ",
+        "> \"$MAC_WORKER_TURN_DIR/last.md\"; ",
+        "printf '%s\\n' ",
+        "'ERROR codex_login::auth::manager: Failed to refresh token: ",
+        "Your access token could not be refreshed because your refresh token was already used. ",
+        "Please log out and sign in again.'; ",
+        "exit 1",
+    );
+    let (temp, store, request, _cancel) = prepared_task_turn(script);
+    let host = temp.path().join("host");
+    let collected_at = wall_clock_millis().saturating_sub(1_000);
+    let planted = plant_authenticated_codex_facts(&host, collected_at);
+    TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
+        .bind_session(
+            PROJECT_ID,
+            task_id(),
+            SessionBinding::new(AgentKind::Codex, "sess-auth-stdout", wall_clock_millis())
+                .unwrap(),
+        )
+        .unwrap();
+    let before = wall_clock_millis();
+    let launcher = InlineTurnLauncher {
+        store: store.clone(),
+        fault: None,
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    let after = wall_clock_millis();
+    assert_eq!(
+        response.task().last_outcome(),
+        Some(&TaskOutcome::failed("agent authentication failed"))
+    );
+    let incidents = fs::read_to_string(host.join("auth-incidents.json")).unwrap();
+    assert!(incidents.contains(r#""agent":"codex""#), "{incidents}");
+    assert!(
+        incidents.contains(r#""reason":"auth failed in a turn""#),
+        "{incidents}"
+    );
+    assert!(!incidents.contains("refresh token"), "{incidents}");
+    assert_eq!(fs::read(host.join("facts.json")).unwrap(), planted);
+    let cached = ProbeCollector::cached_facts_at(&host)
+        .unwrap()
+        .expect("planted authenticated cache");
+    assert_eq!(cached.collected_at_millis, collected_at);
+    assert_eq!(cached.agents[0].auth_by_profile, Vec::new());
+    let overlaid = [before, after]
+        .into_iter()
+        .filter_map(turn_auth_failure_reason)
+        .any(|reason| cached.agents[0].auth == AgentAuth::UnknownWithReason(reason));
+    assert!(
+        overlaid,
+        "cached Codex auth should overlay the turn incident, got {:?}",
+        cached.agents[0].auth
+    );
+
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    let last_md = fs::read_to_string(job_path.join("last.md")).unwrap();
+    assert!(last_md.contains(r#""status":"blocked""#), "{last_md}");
+    assert!(!last_md.contains("refresh token"), "{last_md}");
+    let stdout = fs::read_to_string(job_path.join("stdout.log")).unwrap();
+    assert!(
+        stdout.contains("refresh token was already used"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"type\""),
+        "auth phrase must not ride a protocol candidate: {stdout}"
+    );
 }
 
 #[test]
@@ -1849,6 +1956,59 @@ fn a_cancelled_turn_does_not_record_an_auth_incident_from_the_stderr_tail() {
             .join("auth-incidents.json")
             .exists(),
         "a cancelled turn must not record an auth incident"
+    );
+}
+
+#[test]
+fn a_failed_turn_records_an_auth_incident_from_a_late_raw_stderr_tail() {
+    let script = concat!(
+        "printf '%s\\n' ",
+        "'{\"type\":\"thread.started\",\"thread_id\":\"session-stderr-auth\"}' ",
+        "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"",
+        "{\\\"status\\\":\\\"blocked\\\",\\\"summary\\\":\\\"could not continue\\\",\\\"questions\\\":[],\\\"files_changed\\\":[]}",
+        "\"}}'; ",
+        "/usr/bin/head -c 400 /dev/zero >&2; ",
+        "printf '%s\\n' ",
+        "'ERROR codex_login::auth::manager: Failed to refresh token: ",
+        "Your access token could not be refreshed because your refresh token was already used. ",
+        "Please log out and sign in again.' >&2; ",
+        "exit 1",
+    );
+    let (temp, store, request, _cancel) = prepared_task_turn(script);
+    let launcher = CappedTurnLauncher {
+        store: store.clone(),
+        stdout_log_cap: None,
+        stderr_log_cap: Some(512),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    assert_eq!(
+        response.task().last_outcome(),
+        Some(&TaskOutcome::failed("agent authentication failed"))
+    );
+    let incidents =
+        fs::read_to_string(temp.path().join("host").join("auth-incidents.json")).unwrap();
+    assert!(incidents.contains(r#""agent":"codex""#), "{incidents}");
+    assert!(
+        incidents.contains(r#""reason":"auth failed in a turn""#),
+        "{incidents}"
+    );
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    let stdout = fs::read_to_string(job_path.join("stdout.log")).unwrap();
+    assert!(
+        !stdout.contains("refresh token"),
+        "auth phrase must stay off stdout candidates: {stdout}"
+    );
+    let stderr = fs::read(job_path.join("stderr.log")).unwrap();
+    assert!(
+        stderr
+            .windows(b"refresh token was already used".len())
+            .any(|window| window == b"refresh token was already used"),
+        "late stderr auth phrase missing: {}",
+        String::from_utf8_lossy(&stderr)
     );
 }
 

@@ -380,6 +380,7 @@ async fn dropping_the_http_server_stops_background_collection() {
         log_source: Arc::new(RecordingLogs::new(job(job_id(1)))),
         task_source: Arc::new(FixtureTaskSource::default()),
         settings_source: None,
+        mutation_source: None,
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     let host = listener_host(&server);

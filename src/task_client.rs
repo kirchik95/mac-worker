@@ -24,7 +24,7 @@ use crate::{
     supervisor::{ProcessObservation, SystemProcessInspector},
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, PushTarget,
-        RunId, RunRecord, RunnerIdentity, RunnerState, TaskCloseIntent, TaskId, TaskLimits,
+        RunId, RunRecord, RunnerState, TaskCloseIntent, TaskId, TaskLimits,
         TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
         TurnSummary,
     },
@@ -3493,25 +3493,9 @@ fn append_declared_acceptance(
     prompt: String,
     acceptance: &[String],
 ) -> Result<String, WorkerError> {
-    if acceptance.is_empty() {
-        return Ok(prompt);
-    }
-    let mut lines = Vec::new();
-    for command in acceptance {
-        if command.is_empty()
-            || command.len() > MAX_BATCH_ACCEPTANCE_BYTES
-            || command.chars().any(char::is_control)
-        {
-            return Err(task_error(
-                "TASK_CONFIG_INVALID",
-                "acceptance command is empty, too long, or contains a control character",
-            ));
-        }
-        lines.push(format!("- {command}"));
-    }
     Ok(format!(
-        "{prompt}\n\nDeclared acceptance criteria (you must satisfy these; mac-worker does not verify them and does not treat later agent-reported checks as verified):\n{}\n",
-        lines.join("\n")
+        "{prompt}{}",
+        crate::agent::declared_acceptance_instructions(acceptance)?
     ))
 }
 
@@ -3753,7 +3737,7 @@ mod tests {
         assert!(prompt.contains("Do the work"));
         assert!(prompt.contains("cargo test -p login"));
         assert!(prompt.contains("Declared acceptance criteria"));
-        assert!(prompt.contains("mac-worker does not verify them"));
+        assert!(prompt.contains("mac-worker will not treat agent-reported pass as laptop-verified"));
     }
 
     #[test]

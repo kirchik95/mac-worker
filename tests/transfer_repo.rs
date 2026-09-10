@@ -70,6 +70,7 @@ fn settings_including(patterns: &[&str]) -> ProjectSettings {
             max_followups: 10,
             permissions: std::collections::BTreeMap::new(),
         },
+        setup: None,
     }
 }
 

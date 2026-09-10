@@ -956,14 +956,17 @@ impl<'a> TurnPublisher<'a> {
         };
 
         let agent_outcome = adapter.classify(exit_code, structured.status());
-        let stdout_auth = crate::agent::tail_utf8(&stream, crate::agent::AUTH_SCAN_TAIL_BYTES);
+        // Scan bounded raw stdout/stderr tails, not protocol result candidates
+        // or the last.md shortcut. A complete last.md still leaves auth
+        // phrases in the raw logs.
+        let stdout_auth = read_auth_scan_tail(turn_dir, "stdout.log")?;
         let stderr_auth = read_auth_scan_tail(turn_dir, "stderr.log")?;
         // Only Succeeded/Failed would otherwise become "agent exited N". A
         // Cancelled/TimedOut/Lost turn keeps that terminal even when the
         // stderr tail matches an auth phrase.
         let auth_failed = matches!(terminal, TurnTerminal::Succeeded | TurnTerminal::Failed)
             && matches!(agent_outcome, crate::agent::AgentOutcome::Failed { .. })
-            && adapter.output_shows_auth_failure(stdout_auth, &stderr_auth);
+            && adapter.output_shows_auth_failure(&stdout_auth, &stderr_auth);
         let outcome = if auth_failed {
             crate::auth_incidents::record_incident(
                 self.store.host_state_root(),
