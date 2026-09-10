@@ -11,8 +11,8 @@ use mac_worker::{
     project::ProjectInspector,
     rooted_fs::RootedDir,
     task::{
-        BranchName, ClosePolicy, GitIdentity, PublishMode, RunId, RunRecord, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskSource,
+        BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, RunId, RunRecord, TaskId,
+        TaskLimits, TaskMeta, TaskMetaInput, TaskSource,
     },
     transfer_repo::TransferRepo,
 };
@@ -242,12 +242,12 @@ fn origin_push_uses_the_fixed_task_ref_and_normalized_destination() {
     let mirror_root = tempfile::tempdir().unwrap();
     let mirror = RootedDir::create(&mirror_root.path().join("mirror")).unwrap();
     let runner = support::recording_runner::RecordingRunner::returning_success();
-    let task = TaskId::new(Uuid::from_u128(9));
+    let oid: BaseOid = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
     let branch: BranchName = "release-candidate".parse().unwrap();
     GitTransport::new(&runner)
         .push_origin(
             "https://user:secret@EXAMPLE.test/repo.git?token=secret",
-            task,
+            &oid,
             &branch,
             &mirror,
         )
@@ -264,7 +264,7 @@ fn origin_push_uses_the_fixed_task_ref_and_normalized_destination() {
     );
     assert!(
         args.iter()
-            .any(|arg| { arg == &format!("refs/heads/task/{task}:refs/heads/release-candidate") })
+            .any(|arg| { arg == &format!("{oid}:refs/heads/release-candidate") })
     );
     assert!(request.environment.iter().any(|(name, value)| {
         name == "GIT_SSH_COMMAND"
@@ -283,12 +283,12 @@ fn origin_push_failure_has_a_stable_code_without_remote_output() {
         stdout: Vec::new(),
         stderr: b"remote secret diagnostic\n".to_vec(),
     });
-    let task = TaskId::new(Uuid::from_u128(9));
+    let oid: BaseOid = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
     let branch: BranchName = "release-candidate".parse().unwrap();
     let error = GitTransport::new(&runner)
         .push_origin(
             "https://user:secret@EXAMPLE.test/repo.git?token=secret",
-            task,
+            &oid,
             &branch,
             &mirror,
         )

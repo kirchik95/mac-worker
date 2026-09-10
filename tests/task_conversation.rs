@@ -7,7 +7,10 @@ use std::{
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::PathBuf,
     process::ExitStatus,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -30,9 +33,9 @@ use mac_worker::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
     },
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId as TaskRunId,
-        RunRecord, RunnerIdentity, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
-        TaskSource, TaskState, TaskStatus, TurnSummary, TurnTerminal,
+        BaseOid, ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord, OriginDelivery,
+        PublishMode, RunId as TaskRunId, RunRecord, RunnerIdentity, TaskId, TaskLimits, TaskMeta,
+        TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary, TurnTerminal,
     },
     task_client::{TaskClient, TaskListFilter, WaitSelector},
     task_store::{TaskCloseRequest, TaskCloseResponse, TaskStatusResponse},
@@ -129,13 +132,29 @@ impl Drop for CurrentDirGuard {
 
 struct TaskRemoteRunner {
     status: Mutex<TaskStatus>,
+    deliveries: Mutex<Vec<mac_worker::task::OriginDelivery>>,
+    status_failures: AtomicUsize,
 }
 
 impl TaskRemoteRunner {
     fn new(status: TaskStatus) -> Self {
         Self {
             status: Mutex::new(status),
+            deliveries: Mutex::new(Vec::new()),
+            status_failures: AtomicUsize::new(0),
         }
+    }
+
+    fn set_status(&self, status: TaskStatus) {
+        *self.status.lock().unwrap() = status;
+    }
+
+    fn set_deliveries(&self, deliveries: Vec<mac_worker::task::OriginDelivery>) {
+        *self.deliveries.lock().unwrap() = deliveries;
+    }
+
+    fn fail_next_status(&self) {
+        self.status_failures.store(1, Ordering::SeqCst);
     }
 }
 
@@ -154,8 +173,17 @@ impl ProcessRunner for TaskRemoteRunner {
             .unwrap_or_default();
         match operation {
             value if value == HostOperation::TaskStatus.command() => {
+                if self.status_failures.load(Ordering::SeqCst) > 0 {
+                    self.status_failures.fetch_sub(1, Ordering::SeqCst);
+                    return Ok(ProcessResult {
+                        status: ExitStatus::from_raw(1 << 8),
+                        stdout: Vec::new(),
+                        stderr: b"transient status failure\n".to_vec(),
+                    });
+                }
                 let status = self.status.lock().unwrap().clone();
-                canonical_process(&TaskStatusResponse::new(status))
+                let deliveries = self.deliveries.lock().unwrap().clone();
+                canonical_process(&TaskStatusResponse::new(status).with_deliveries(deliveries))
             }
             value if value == HostOperation::TaskClose.command() => {
                 let close: TaskCloseRequest = decode_request(request)?;
@@ -178,7 +206,8 @@ impl ProcessRunner for TaskRemoteRunner {
                     current.updated_at_millis() + 1,
                 )?;
                 *self.status.lock().unwrap() = next.clone();
-                canonical_process(&TaskCloseResponse::new(next))
+                let deliveries = self.deliveries.lock().unwrap().clone();
+                canonical_process(&TaskCloseResponse::new(next).with_deliveries(deliveries))
             }
             value if value == HostOperation::StatusLogs.command() => Ok(ProcessResult {
                 status: ExitStatus::from_raw(2 << 8),
@@ -1866,4 +1895,227 @@ fn stale_completed_reconciler_cannot_damage_a_new_turn() {
 #[test]
 fn completed_runner_retry_fences_a_stale_reconciler() {
     finalizer_cannot_damage_a_new_turn("retry");
+}
+
+#[test]
+fn accepted_closed_task_refreshes_pending_delivery_without_reopening() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+
+    let task_id = TaskId::new(Uuid::from_u128(970));
+    let turn = job(971);
+    let record = task_record(
+        task_id,
+        turn,
+        TaskState::Open,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        None,
+    );
+    let head = record.status().head_oid().cloned().expect("fixture head");
+    let pending = OriginDelivery::new(
+        turn,
+        DeliveryState::Pending,
+        head.clone(),
+        "https://example.test/repo.git".into(),
+        "refs/heads/release-candidate".into(),
+        1,
+        1,
+        None,
+        None,
+        1,
+        1,
+    )
+    .unwrap();
+    let record = record.with_delivery(Some(pending.clone())).unwrap();
+    store.create_task(record.clone()).unwrap();
+
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    remote.set_deliveries(vec![pending.clone()]);
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let closed = client.close(task_id, false).unwrap();
+    assert_eq!(closed.status().state(), TaskState::Closed);
+    assert_eq!(closed.status().head_oid(), Some(&head));
+    assert_eq!(
+        closed.delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Pending)
+    );
+
+    let delivered = OriginDelivery::new(
+        turn,
+        DeliveryState::Delivered,
+        head.clone(),
+        pending.origin().to_owned(),
+        pending.target().to_owned(),
+        1,
+        2,
+        None,
+        None,
+        1,
+        3,
+    )
+    .unwrap();
+    let regressing = TaskStatus::new(
+        TaskState::Open,
+        Some(TaskOutcome::Done),
+        Some("mini-1".into()),
+        true,
+        Some(head.clone()),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        closed.status().turns().to_vec(),
+        closed.status().updated_at_millis() + 10,
+    )
+    .unwrap();
+    remote.set_status(regressing);
+    remote.set_deliveries(vec![delivered.clone()]);
+
+    let before_task = store.load_task(task_id).unwrap().canonical_bytes().unwrap();
+    let before_queue = format!("{:?}", store.queue_snapshot().unwrap());
+    let report = client.status(task_id).unwrap();
+    assert_eq!(report.status().state(), TaskState::Closed);
+    assert_eq!(report.status().head_oid(), Some(&head));
+    assert_eq!(
+        report.delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Delivered)
+    );
+    assert_eq!(report.deliveries().len(), 1);
+    assert_eq!(report.deliveries()[0].state(), DeliveryState::Delivered);
+    assert_eq!(
+        store.load_task(task_id).unwrap().canonical_bytes().unwrap(),
+        before_task,
+        "status must not mutate the durable task record"
+    );
+    assert_eq!(
+        format!("{:?}", store.queue_snapshot().unwrap()),
+        before_queue,
+        "status must not mutate the durable queue"
+    );
+    let persisted = store.load_task(task_id).unwrap();
+    assert_eq!(persisted.status().state(), TaskState::Closed);
+    assert_eq!(persisted.status().head_oid(), Some(&head));
+    assert_eq!(
+        persisted.delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Pending)
+    );
+}
+
+#[test]
+fn close_learns_pending_delivery_after_transient_status_failure() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+
+    let task_id = TaskId::new(Uuid::from_u128(980));
+    let turn = job(981);
+    let record = task_record(
+        task_id,
+        turn,
+        TaskState::Open,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        None,
+    );
+    let head = record.status().head_oid().cloned().expect("fixture head");
+    assert!(record.delivery().is_none());
+    store.create_task(record.clone()).unwrap();
+
+    let pending = OriginDelivery::new(
+        turn,
+        DeliveryState::Pending,
+        head.clone(),
+        "https://example.test/repo.git".into(),
+        "refs/heads/release-candidate".into(),
+        1,
+        1,
+        None,
+        None,
+        1,
+        1,
+    )
+    .unwrap();
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    remote.set_deliveries(vec![pending.clone()]);
+    remote.fail_next_status();
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let closed = client.close(task_id, false).unwrap();
+    assert_eq!(closed.status().state(), TaskState::Closed);
+    assert_eq!(closed.status().head_oid(), Some(&head));
+    assert_eq!(
+        closed.delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Pending)
+    );
+    let learned = store.load_task(task_id).unwrap();
+    assert_eq!(learned.status().state(), TaskState::Closed);
+    assert_eq!(
+        learned.delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Pending),
+        "close must persist worker delivery without a prior successful status read"
+    );
+
+    let delivered = OriginDelivery::new(
+        turn,
+        DeliveryState::Delivered,
+        head.clone(),
+        pending.origin().to_owned(),
+        pending.target().to_owned(),
+        1,
+        2,
+        None,
+        None,
+        1,
+        3,
+    )
+    .unwrap();
+    let regressing = TaskStatus::new(
+        TaskState::Open,
+        Some(TaskOutcome::Done),
+        Some("mini-1".into()),
+        true,
+        Some(head.clone()),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        closed.status().turns().to_vec(),
+        closed.status().updated_at_millis() + 10,
+    )
+    .unwrap();
+    remote.set_status(regressing);
+    remote.set_deliveries(vec![delivered]);
+
+    let before_task = store.load_task(task_id).unwrap().canonical_bytes().unwrap();
+    let before_queue = format!("{:?}", store.queue_snapshot().unwrap());
+    let report = client.status(task_id).unwrap();
+    assert_eq!(report.status().state(), TaskState::Closed);
+    assert_eq!(report.status().head_oid(), Some(&head));
+    assert_eq!(
+        report.delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Delivered)
+    );
+    assert_eq!(
+        store.load_task(task_id).unwrap().canonical_bytes().unwrap(),
+        before_task
+    );
+    assert_eq!(
+        format!("{:?}", store.queue_snapshot().unwrap()),
+        before_queue
+    );
 }

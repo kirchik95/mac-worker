@@ -2730,6 +2730,11 @@ impl<'a> Supervisor<'a> {
                     )?;
                     return Err(error);
                 }
+                let _ = crate::outbox::OriginOutbox::new(
+                    self.store,
+                    &crate::process::SystemProcessRunner,
+                )
+                .wake(&crate::outbox::SystemOutboxLauncher);
                 Ok(())
             }
             Err(error) => {

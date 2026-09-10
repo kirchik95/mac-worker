@@ -33,9 +33,9 @@ use mac_worker::{
     },
     scheduler::{CandidateSlot, WorkerPreference},
     task::{
-        ClosePolicy, GitIdentity, LocalTaskRecord, RunId, RunRecord, RunnerIdentity, RunnerState,
-        TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
-        TaskStatus, TurnId, TurnSummary,
+        ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord, OriginDelivery, RunId, RunRecord,
+        RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
+        TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
     },
     task_store::{TaskStatusRequest, TaskStatusResponse},
     task_view::{ReviewState, TaskListJson},
@@ -457,6 +457,96 @@ fn closed_task_detail_uses_local_status_without_a_remote_call() {
     );
     assert_eq!(harness.remote.task_status_calls(), 0);
     assert_eq!(harness.mutation_calls(), 0);
+}
+
+#[test]
+fn closed_task_with_pending_delivery_shows_remote_delivered_without_reopening() {
+    let harness = DashboardTaskHarness::closed_local_task();
+    let record = harness.state.load_task(harness.task_id()).unwrap();
+    let head = record.status().head_oid().cloned().expect("fixture head");
+    let turn = record.status().turns()[0].turn_id();
+    let pending = OriginDelivery::new(
+        turn,
+        DeliveryState::Pending,
+        head.clone(),
+        "https://example.test/repo.git".into(),
+        "refs/heads/release-candidate".into(),
+        1,
+        1,
+        None,
+        None,
+        1,
+        1,
+    )
+    .unwrap();
+    harness
+        .state
+        .update_task(record.with_delivery(Some(pending.clone())).unwrap())
+        .unwrap();
+    let delivered = OriginDelivery::new(
+        turn,
+        DeliveryState::Delivered,
+        head.clone(),
+        pending.origin().to_owned(),
+        pending.target().to_owned(),
+        1,
+        2,
+        None,
+        None,
+        1,
+        3,
+    )
+    .unwrap();
+    let regressing = TaskStatus::new(
+        TaskState::Open,
+        Some(TaskOutcome::Done),
+        Some("mini-1".into()),
+        true,
+        Some(head.clone()),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        harness
+            .state
+            .load_task(harness.task_id())
+            .unwrap()
+            .status()
+            .turns()
+            .to_vec(),
+        2_000,
+    )
+    .unwrap();
+    harness.remote.set_task_status(Ok(
+        TaskStatusResponse::new(regressing).with_deliveries(vec![delivered.clone()])
+    ));
+
+    let before = harness.local_state_fingerprint();
+    let detail = harness
+        .task_source()
+        .task_detail(harness.task_id())
+        .unwrap();
+    assert_eq!(detail.task.state, TaskState::Closed);
+    assert_eq!(detail.head_oid.as_ref(), Some(&head));
+    assert_eq!(
+        detail.delivery.as_ref().map(OriginDelivery::state),
+        Some(DeliveryState::Delivered)
+    );
+    assert_eq!(detail.deliveries[0].state(), DeliveryState::Delivered);
+    assert!(harness.remote.task_status_calls() >= 1);
+    assert_eq!(
+        before,
+        harness.local_state_fingerprint(),
+        "dashboard reads must not mutate local task state"
+    );
+    assert_eq!(harness.mutation_calls(), 0);
+    let persisted = harness.state.load_task(harness.task_id()).unwrap();
+    assert_eq!(persisted.status().state(), TaskState::Closed);
+    assert_eq!(persisted.status().head_oid(), Some(&head));
+    assert_eq!(
+        persisted.delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Pending)
+    );
 }
 
 #[test]

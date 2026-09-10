@@ -86,6 +86,7 @@ pub mod keychain;
 pub mod lease;
 pub mod manifest;
 pub mod onboarding;
+pub mod outbox;
 pub mod output;
 pub mod paths;
 pub mod prepare_turn;
@@ -448,6 +449,11 @@ fn execute_with_context(
             command: HostCommand::FollowTurn { .. },
         } => Err(WorkerError::Protocol(
             "host follow-turn requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::Outbox { .. },
+        } => Err(WorkerError::Protocol(
+            "host outbox requires the stdio execution boundary".into(),
         )),
     }
 }
@@ -1257,6 +1263,12 @@ fn write_task_report(
         if !report.warnings().is_empty() {
             response["warnings"] = serde_json::json!(report.warnings());
         }
+        if let Some(delivery) = report.delivery() {
+            response["delivery"] = serde_json::json!(delivery);
+        }
+        if !report.deliveries().is_empty() {
+            response["deliveries"] = serde_json::json!(report.deliveries());
+        }
         write_json_line(stdout, &response)
     } else {
         let worker = report.status().worker().unwrap_or("unassigned");
@@ -1268,6 +1280,15 @@ fn write_task_report(
         )?;
         for warning in report.warnings() {
             writeln!(stdout, "warning: {warning}")?;
+        }
+        for delivery in report.deliveries() {
+            writeln!(
+                stdout,
+                "delivery: {} turn={} {}",
+                delivery_state_name(delivery.state()),
+                delivery.turn_id(),
+                delivery.oid()
+            )?;
         }
         stdout.flush()?;
         Ok(())
@@ -1465,6 +1486,15 @@ fn task_state_name(state: crate::task::TaskState) -> &'static str {
     }
 }
 
+fn delivery_state_name(state: crate::task::DeliveryState) -> &'static str {
+    match state {
+        crate::task::DeliveryState::Pending => "pending",
+        crate::task::DeliveryState::Retrying => "retrying",
+        crate::task::DeliveryState::Delivered => "delivered",
+        crate::task::DeliveryState::Failed => "failed",
+    }
+}
+
 #[doc(hidden)]
 pub fn run_with_rsync_executor_in_context(
     cli: Cli,
@@ -1519,6 +1549,31 @@ pub fn run_with_rsync_executor_in_context(
             job_id.expose(),
             stdout,
             stderr,
+        );
+    }
+    if let Command::Host {
+        command:
+            HostCommand::Outbox {
+                watch,
+                once,
+                enable,
+                write_agent,
+                host_root,
+                wake,
+            },
+    } = &cli.command
+    {
+        return run_host_outbox(
+            cli.config,
+            runtime,
+            runner,
+            stdout,
+            *watch,
+            *once,
+            *enable,
+            write_agent.clone(),
+            host_root.clone(),
+            *wake,
         );
     }
     if matches!(
@@ -2188,6 +2243,74 @@ fn run_host_submit(
         return crate::error::ExitKind::Io as u8;
     }
     exit
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_host_outbox(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    _stdout: &mut dyn Write,
+    watch: bool,
+    once: bool,
+    enable: bool,
+    write_agent: Option<PathBuf>,
+    host_root: Option<PathBuf>,
+    wake: bool,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        if !watch && !once && !enable && write_agent.is_none() && !wake {
+            return Err(WorkerError::Protocol(
+                "host outbox requires --watch, --once, --enable, --write-agent, or --wake".into(),
+            ));
+        }
+        let root = match &host_root {
+            Some(path) if path.is_absolute() => path.clone(),
+            Some(_) => {
+                return Err(WorkerError::Protocol(
+                    "outbox host root must be an absolute path".into(),
+                ));
+            }
+            None => discover_paths(config_override, runtime)?.host_state_root(),
+        };
+        let store = HostStore::open(&root)?;
+        let outbox = crate::outbox::OriginOutbox::new(&store, runner);
+        if let Some(directory) = &write_agent {
+            let executable = std::env::current_exe().map_err(WorkerError::Io)?;
+            crate::outbox::OriginOutbox::write_launchd_plist(directory, &executable, store.root())?;
+        }
+        if enable {
+            outbox.enable_watch()?;
+        }
+        if wake {
+            let _ = outbox.wake(&crate::outbox::SystemOutboxLauncher)?;
+        } else if watch {
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            outbox.run_watch(&stop, || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                    .unwrap_or(0)
+            })?;
+        } else if once {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| {
+                    WorkerError::task("TASK_CLOCK_INVALID", "system clock precedes the Unix epoch")
+                })?
+                .as_millis();
+            let now = u64::try_from(now).map_err(|_| {
+                WorkerError::task("TASK_CLOCK_INVALID", "system clock is outside the range")
+            })?;
+            let _ = outbox.run_once(now)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => error.exit_code(),
+    }
 }
 
 fn run_host_gc(

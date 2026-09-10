@@ -1,16 +1,19 @@
 use std::{
     convert::Infallible,
     ffi::OsString,
+    fs::{self, File},
     os::unix::process::CommandExt,
     path::Path,
     process::{Command, Stdio},
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     config::WorkerEntry,
     error::{ProcessError, WorkerError},
-    host_store::HostStore,
+    host_store::{HostStore, HostStoreWritePoint},
     job::{ClientId, JobId, LeaseToken, RequestFingerprint},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     rooted_fs::RootedDir,
@@ -28,6 +31,10 @@ const GIT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const GIT_CONFIG_GLOBAL: &str = "GIT_CONFIG_GLOBAL";
 const GIT_CONFIG_NOSYSTEM: &str = "GIT_CONFIG_NOSYSTEM";
 const GIT_TERMINAL_PROMPT: &str = "GIT_TERMINAL_PROMPT";
+pub(crate) const GIT_FSYNC_COMPONENTS: &str = "objects,derived-metadata,reference";
+pub(crate) const GIT_FSYNC_METHOD: &str = "fsync";
+pub const OBJECT_STORE_SYNC_RECEIPT: &str = "mw-object-sync.json";
+const OBJECT_STORE_RECEIPT_LIMIT: u64 = 1024 * 1024;
 const ORIGIN_GIT_SSH_COMMAND: &str = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes";
 const ORIGIN_PREFLIGHT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const ORIGIN_PREFLIGHT_DEADLINE: Duration = Duration::from_secs(30);
@@ -161,20 +168,18 @@ impl<'a> GitTransport<'a> {
         }
     }
 
-    /// Publishes the durable mirror result branch to one normalized origin
-    /// branch.  The source ref is derived from the task ID and cannot be
-    /// supplied by the caller.
+    /// Publishes one exact object ID to a normalized origin branch.  The
+    /// caller supplies the pinned OID; this never resolves a mutable task
+    /// branch at retry time and never passes `--force`.
     pub fn push_origin(
         &self,
         origin: &str,
-        task_id: TaskId,
+        oid: &BaseOid,
         branch: &BranchName,
         mirror: &RootedDir,
     ) -> Result<(), WorkerError> {
-        let normalized = crate::project::normalize_origin(origin)
-            .map_err(|_| git_error("PUBLISH_FAILED", "origin URL is invalid"))?;
-        let source = format!("refs/heads/task/{task_id}");
-        let destination = format!("{source}:refs/heads/{branch}");
+        let normalized = delivery_origin(origin)?;
+        let destination = format!("{oid}:refs/heads/{branch}");
         let result = self
             .runner
             .run(&git_request(
@@ -193,6 +198,208 @@ impl<'a> GitTransport<'a> {
         } else {
             Err(git_error("PUBLISH_FAILED", "origin publication failed"))
         }
+    }
+
+    /// Reads the advertised OID of one origin branch.  Missing refs are
+    /// `None`; transport failures stay `PUBLISH_FAILED` without remote text.
+    pub fn advertise_origin_ref(
+        &self,
+        origin: &str,
+        branch: &BranchName,
+    ) -> Result<Option<BaseOid>, WorkerError> {
+        let normalized = delivery_origin(origin)?;
+        let wanted = format!("refs/heads/{branch}");
+        let result = self
+            .runner
+            .run(&origin_ref_request(normalized, &wanted))
+            .map_err(|_| git_error("PUBLISH_FAILED", "origin advertisement failed"))?;
+        if !result.status.success() {
+            return Err(git_error("PUBLISH_FAILED", "origin advertisement failed"));
+        }
+        let advertised = result.stdout.split(|byte| *byte == b'\n').find_map(|line| {
+            let line = std::str::from_utf8(line).ok()?;
+            let (oid, reference) = line.split_once('\t')?;
+            (reference == wanted).then_some(oid.trim().parse().ok())?
+        });
+        Ok(advertised)
+    }
+
+    pub fn is_ancestor(
+        &self,
+        mirror: &RootedDir,
+        ancestor: &BaseOid,
+        descendant: &BaseOid,
+    ) -> Result<bool, WorkerError> {
+        let result = self
+            .runner
+            .run(&git_request(
+                mirror.path(),
+                None,
+                vec![
+                    OsString::from("merge-base"),
+                    OsString::from("--is-ancestor"),
+                    ancestor.to_string().into(),
+                    descendant.to_string().into(),
+                ],
+            ))
+            .map_err(|_| git_error("PUBLISH_FAILED", "ancestry check failed"))?;
+        match result.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(git_error("PUBLISH_FAILED", "ancestry check failed")),
+        }
+    }
+
+    /// True when the delivery pin already names this OID. Does not pack or fsync.
+    pub fn delivery_pin_matches(
+        &self,
+        mirror: &RootedDir,
+        task_id: TaskId,
+        turn_id: crate::task::TurnId,
+        oid: &BaseOid,
+    ) -> Result<bool, WorkerError> {
+        let reference = delivery_pin_ref(task_id, turn_id);
+        let current = self
+            .runner
+            .run(&git_request(
+                mirror.path(),
+                None,
+                vec![
+                    OsString::from("rev-parse"),
+                    OsString::from("--verify"),
+                    OsString::from("--quiet"),
+                    reference.into(),
+                ],
+            ))
+            .map_err(|_| git_error("REF_UPDATE_FAILED", "delivery pin could not be read"))?;
+        if !current.status.success() {
+            return Ok(false);
+        }
+        Ok(String::from_utf8_lossy(&current.stdout).trim() == oid.as_str())
+    }
+
+    pub fn list_delivery_pins(
+        &self,
+        mirror: &RootedDir,
+        task_id: TaskId,
+    ) -> Result<Vec<(crate::task::TurnId, BaseOid)>, WorkerError> {
+        let prefix = format!("refs/mac-worker/delivery/{task_id}/");
+        let listed = self
+            .runner
+            .run(&git_request(
+                mirror.path(),
+                None,
+                vec![
+                    OsString::from("for-each-ref"),
+                    OsString::from("--format=%(objectname)%09%(refname)"),
+                    prefix.clone().into(),
+                ],
+            ))
+            .map_err(|_| git_error("REF_UPDATE_FAILED", "delivery pins could not be listed"))?;
+        if !listed.status.success() {
+            return Err(git_error(
+                "REF_UPDATE_FAILED",
+                "delivery pins could not be listed",
+            ));
+        }
+        let mut pins = Vec::new();
+        for line in String::from_utf8_lossy(&listed.stdout).lines() {
+            let Some((oid, reference)) = line.split_once('\t') else {
+                continue;
+            };
+            let Some(turn) = reference.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Ok(turn_id) = turn.parse() else {
+                continue;
+            };
+            let Ok(oid) = oid.parse() else {
+                continue;
+            };
+            pins.push((turn_id, oid));
+        }
+        Ok(pins)
+    }
+
+    /// Pins `refs/mac-worker/delivery/<task>/<turn>` to an existing commit.
+    /// Create-or-same-OID only. A one-time pack-content baseline/receipt makes
+    /// pre-policy packs durable; later pins only sync new writes. Still-loose
+    /// objects are packed and fsynced; already packed history is reused.
+    /// Same-OID retry does not enumerate or rebuild history. Then `update-ref`
+    /// and fsync of the ref. Syncing only `objects/<tip>` is not the guarantee.
+    pub fn pin_delivery_ref(
+        &self,
+        store: &HostStore,
+        mirror: &RootedDir,
+        task_id: TaskId,
+        turn_id: crate::task::TurnId,
+        oid: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        let reference = delivery_pin_ref(task_id, turn_id);
+        let kind = self
+            .runner
+            .run(&git_request(
+                mirror.path(),
+                None,
+                vec![
+                    OsString::from("cat-file"),
+                    OsString::from("-t"),
+                    oid.to_string().into(),
+                ],
+            ))
+            .map_err(|_| git_error("PUBLISH_FAILED", "delivery object is missing"))?;
+        if !kind.status.success() || String::from_utf8_lossy(&kind.stdout).trim() != "commit" {
+            return Err(git_error(
+                "PUBLISH_FAILED",
+                "delivery object is not a commit",
+            ));
+        }
+        let current = self
+            .runner
+            .run(&git_request(
+                mirror.path(),
+                None,
+                vec![
+                    OsString::from("rev-parse"),
+                    OsString::from("--verify"),
+                    OsString::from("--quiet"),
+                    reference.clone().into(),
+                ],
+            ))
+            .map_err(|_| git_error("REF_UPDATE_FAILED", "delivery pin could not be read"))?;
+        if current.status.success() {
+            let existing = String::from_utf8_lossy(&current.stdout).trim().to_owned();
+            if existing != oid.as_str() {
+                return Err(git_error(
+                    "DELIVERY_REF_CONFLICT",
+                    "delivery pin already points at a different object",
+                ));
+            }
+            ensure_object_store_durable(store, mirror)?;
+            return fsync_delivery_ref(mirror, task_id, turn_id);
+        }
+        ensure_object_store_durable(store, mirror)?;
+        let zero = "0000000000000000000000000000000000000000";
+        let updated = self
+            .runner
+            .run(&git_request(
+                mirror.path(),
+                None,
+                vec![
+                    OsString::from("update-ref"),
+                    reference.into(),
+                    oid.to_string().into(),
+                    OsString::from(zero),
+                ],
+            ))
+            .map_err(|_| git_error("REF_UPDATE_FAILED", "delivery pin could not be written"))?;
+        if !updated.status.success() {
+            return Err(git_error(
+                "REF_UPDATE_FAILED",
+                "delivery pin could not be written",
+            ));
+        }
+        fsync_delivery_ref(mirror, task_id, turn_id)
     }
 
     pub fn fetch_result(
@@ -229,6 +436,10 @@ impl<'a> GitTransport<'a> {
         let head = read_ref_head(self.runner, transfer_repo, &local_ref)?;
         Ok(ImportReceipt::new(head, local_ref))
     }
+}
+
+pub fn delivery_pin_ref(task_id: TaskId, turn_id: crate::task::TurnId) -> String {
+    format!("refs/mac-worker/delivery/{task_id}/{turn_id}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,7 +647,14 @@ fn git_request(
         OsString::from("-C"),
         transfer_repo.as_os_str().to_os_string(),
     ];
-    args.extend([OsString::from("-c"), OsString::from("gc.auto=0")]);
+    args.extend([
+        OsString::from("-c"),
+        OsString::from("gc.auto=0"),
+        OsString::from("-c"),
+        OsString::from(format!("core.fsync={GIT_FSYNC_COMPONENTS}")),
+        OsString::from("-c"),
+        OsString::from(format!("core.fsyncMethod={GIT_FSYNC_METHOD}")),
+    ]);
     args.append(&mut operation);
     let mut environment = vec![
         (GIT_CONFIG_GLOBAL.into(), "/dev/null".into()),
@@ -499,6 +717,282 @@ fn origin_request(origin: String) -> ProcessRequest {
         },
         isolate_parent_environment: false,
     }
+}
+
+fn origin_ref_request(origin: String, reference: &str) -> ProcessRequest {
+    let mut request = origin_request(origin);
+    request.args.push(OsString::from(reference));
+    request
+}
+
+fn delivery_origin(origin: &str) -> Result<String, WorkerError> {
+    if let Ok(url) = url::Url::parse(origin)
+        && url.scheme() == "file"
+    {
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(git_error("PUBLISH_FAILED", "origin URL is invalid"));
+        }
+        let path = url
+            .to_file_path()
+            .map_err(|_| git_error("PUBLISH_FAILED", "origin URL is invalid"))?;
+        if !path.is_absolute() {
+            return Err(git_error("PUBLISH_FAILED", "origin URL is invalid"));
+        }
+        return Ok(url.to_string());
+    }
+    crate::project::normalize_origin(origin)
+        .map_err(|_| git_error("PUBLISH_FAILED", "origin URL is invalid"))
+}
+
+fn ensure_object_store_durable(store: &HostStore, mirror: &RootedDir) -> Result<(), WorkerError> {
+    let current = pack_store_files(mirror)?;
+    let loaded = load_object_store_receipt(mirror)?;
+    let (known, previous_bytes, valid) = match &loaded {
+        Some((receipt, bytes))
+            if receipt.fsync == GIT_FSYNC_COMPONENTS
+                && receipt.fsync_method == GIT_FSYNC_METHOD =>
+        {
+            (receipt.packs.clone(), Some(bytes.clone()), true)
+        }
+        Some((_, bytes)) => (Vec::new(), Some(bytes.clone()), false),
+        None => (Vec::new(), None, false),
+    };
+    for name in &current {
+        if valid && known.contains(name) {
+            continue;
+        }
+        fsync_required(mirror.path().join("objects/pack").join(name))?;
+    }
+    if !valid {
+        fsync_loose_object_store(mirror)?;
+    }
+    if !valid && store.consume_fault(HostStoreWritePoint::AfterOutboxObjectBaselinePacks) {
+        return Err(git_error(
+            "REF_UPDATE_FAILED",
+            "injected object-store pack sync failure",
+        ));
+    }
+    fsync_object_store(mirror)?;
+    if valid && current == known {
+        return Ok(());
+    }
+    let receipt = ObjectStoreReceipt {
+        fsync: GIT_FSYNC_COMPONENTS.to_owned(),
+        fsync_method: GIT_FSYNC_METHOD.to_owned(),
+        packs: current,
+    };
+    publish_object_store_receipt(mirror, previous_bytes.as_deref(), &receipt)?;
+    if previous_bytes.is_none()
+        && store.consume_fault(HostStoreWritePoint::AfterOutboxObjectBaseline)
+    {
+        return Err(git_error(
+            "REF_UPDATE_FAILED",
+            "injected object-store baseline receipt failure",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ObjectStoreReceipt {
+    fsync: String,
+    fsync_method: String,
+    packs: Vec<String>,
+}
+
+fn pack_store_files(mirror: &RootedDir) -> Result<Vec<String>, WorkerError> {
+    let pack = mirror.path().join("objects/pack");
+    if !pack.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    let entries = fs::read_dir(&pack).map_err(|error| {
+        git_error(
+            "REF_UPDATE_FAILED",
+            format!("object pack directory could not be listed: {error}"),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            git_error(
+                "REF_UPDATE_FAILED",
+                format!("object pack directory could not be listed: {error}"),
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(".pack") && !name.ends_with(".idx") {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(|error| {
+            git_error(
+                "REF_UPDATE_FAILED",
+                format!("object pack entry could not be read: {error}"),
+            )
+        })?;
+        if !metadata.is_file() {
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn load_object_store_receipt(
+    mirror: &RootedDir,
+) -> Result<Option<(ObjectStoreReceipt, Vec<u8>)>, WorkerError> {
+    if !mirror
+        .entry_exists(OBJECT_STORE_SYNC_RECEIPT)
+        .map_err(|error| git_error("REF_UPDATE_FAILED", error.to_string()))?
+    {
+        return Ok(None);
+    }
+    let bytes = mirror
+        .read_private_regular(OBJECT_STORE_SYNC_RECEIPT, OBJECT_STORE_RECEIPT_LIMIT)
+        .map_err(|error| git_error("REF_UPDATE_FAILED", error.to_string()))?;
+    match serde_json::from_slice::<ObjectStoreReceipt>(&bytes) {
+        Ok(receipt) => Ok(Some((receipt, bytes))),
+        Err(_) => Ok(Some((
+            ObjectStoreReceipt {
+                fsync: String::new(),
+                fsync_method: String::new(),
+                packs: Vec::new(),
+            },
+            bytes,
+        ))),
+    }
+}
+
+fn publish_object_store_receipt(
+    mirror: &RootedDir,
+    previous: Option<&[u8]>,
+    receipt: &ObjectStoreReceipt,
+) -> Result<(), WorkerError> {
+    let bytes = serde_json::to_vec(receipt).map_err(|error| {
+        git_error(
+            "REF_UPDATE_FAILED",
+            format!("object-store receipt could not be encoded: {error}"),
+        )
+    })?;
+    if bytes.len() as u64 > OBJECT_STORE_RECEIPT_LIMIT {
+        return Err(git_error(
+            "REF_UPDATE_FAILED",
+            "object-store receipt exceeds its size limit",
+        ));
+    }
+    let result = if let Some(previous) = previous {
+        mirror.rewrite_private_regular_exact(OBJECT_STORE_SYNC_RECEIPT, previous, &bytes)
+    } else {
+        mirror.write_private_atomic_no_replace(OBJECT_STORE_SYNC_RECEIPT, &bytes)
+    };
+    result.map_err(|error| git_error("REF_UPDATE_FAILED", error.to_string()))
+}
+
+fn fsync_loose_object_store(mirror: &RootedDir) -> Result<(), WorkerError> {
+    let objects = mirror.path().join("objects");
+    if !objects.is_dir() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(&objects).map_err(|error| {
+        git_error(
+            "REF_UPDATE_FAILED",
+            format!("object store could not be listed: {error}"),
+        )
+    })?;
+    let mut fanouts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            git_error(
+                "REF_UPDATE_FAILED",
+                format!("object store could not be listed: {error}"),
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == "pack" || name == "info" {
+            continue;
+        }
+        if name.len() != 2 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let fanout = objects.join(name);
+        if !fanout.is_dir() {
+            continue;
+        }
+        let objects_in_fanout = fs::read_dir(&fanout).map_err(|error| {
+            git_error(
+                "REF_UPDATE_FAILED",
+                format!("loose object directory could not be listed: {error}"),
+            )
+        })?;
+        for object in objects_in_fanout {
+            let object = object.map_err(|error| {
+                git_error(
+                    "REF_UPDATE_FAILED",
+                    format!("loose object directory could not be listed: {error}"),
+                )
+            })?;
+            let path = object.path();
+            let metadata = object.metadata().map_err(|error| {
+                git_error(
+                    "REF_UPDATE_FAILED",
+                    format!("loose object could not be read: {error}"),
+                )
+            })?;
+            if metadata.is_file() {
+                fsync_required(&path)?;
+            }
+        }
+        fanouts.push(fanout);
+    }
+    for fanout in fanouts {
+        fsync_required(fanout)?;
+    }
+    Ok(())
+}
+
+fn fsync_object_store(mirror: &RootedDir) -> Result<(), WorkerError> {
+    let objects = mirror.path().join("objects");
+    let pack = objects.join("pack");
+    if pack.is_dir() {
+        fsync_required(&pack)?;
+    }
+    if objects.is_dir() {
+        fsync_required(&objects)?;
+    }
+    Ok(())
+}
+
+fn fsync_delivery_ref(
+    mirror: &RootedDir,
+    task_id: TaskId,
+    turn_id: crate::task::TurnId,
+) -> Result<(), WorkerError> {
+    let mut refs = mirror.path().join("refs/mac-worker/delivery");
+    fsync_required(&refs)?;
+    refs.push(task_id.to_string());
+    fsync_required(&refs)?;
+    refs.push(turn_id.to_string());
+    fsync_required(&refs)
+}
+
+fn fsync_required(path: impl AsRef<Path>) -> Result<(), WorkerError> {
+    let path = path.as_ref();
+    let file =
+        File::open(path).map_err(|error| git_error("REF_UPDATE_FAILED", error.to_string()))?;
+    file.sync_all()
+        .map_err(|error| git_error("REF_UPDATE_FAILED", error.to_string()))?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| git_error("REF_UPDATE_FAILED", error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn read_ref_head(

@@ -18,12 +18,12 @@ use crate::{
     job::LogStream,
     paths::PathLayout,
     process::{ProcessRunner, SystemProcessRunner},
-    task::{BaseOid, LocalTaskRecord, TaskId, TaskState, TaskStatus, TurnId},
+    task::{BaseOid, LocalTaskRecord, TaskId, TaskState, TurnId},
     task_client::TaskClient,
     task_store::TaskStatusRequest,
     task_view::{
         TaskDetailProjection, TaskFreshness, TaskViewError, project_task_detail,
-        project_task_list_with_blocking_codes, remote_status_refresh_allowed,
+        project_task_list_with_blocking_codes,
     },
     turn_runner::{DetachedRunnerExecutor, RunnerExecutor},
 };
@@ -83,29 +83,37 @@ impl MacWorkerTaskSource {
         })
     }
 
-    fn effective_detail_status(
+    fn effective_task_view(
         &self,
         record: &LocalTaskRecord,
-    ) -> Result<(TaskStatus, TaskFreshness), ApiError> {
-        if !remote_status_refresh_allowed(record) {
-            return Ok((record.status().clone(), TaskFreshness::Current));
+    ) -> Result<(LocalTaskRecord, TaskFreshness), ApiError> {
+        if record.close_intent().is_some() || record.retains_log_drain_unavailable() {
+            return Ok((record.clone(), TaskFreshness::Current));
         }
-        if record.retains_log_drain_unavailable() {
-            return Ok((record.status().clone(), TaskFreshness::Current));
+        if !record.needs_remote_observation() {
+            return Ok((record.clone(), TaskFreshness::Current));
         }
         let Some(worker_name) = record.status().worker() else {
-            return Ok((record.status().clone(), TaskFreshness::Current));
+            return Ok((record.clone(), TaskFreshness::Current));
         };
         let Some(worker) = self.config.worker(worker_name) else {
-            return Ok((record.status().clone(), TaskFreshness::Stale));
+            return Ok((record.clone(), TaskFreshness::Stale));
         };
         let request = TaskStatusRequest::new(record.meta().project_id(), record.meta().task_id());
         match self
             .remote
             .task_status_with_deadline(worker, &request, Duration::from_secs(30))
         {
-            Ok(response) => Ok((response.status().clone(), TaskFreshness::Current)),
-            Err(_) => Ok((record.status().clone(), TaskFreshness::Stale)),
+            Ok(response) => {
+                let observed = record
+                    .with_remote_observation(response.status(), response.deliveries())
+                    .map_err(map_local_api_error)?;
+                Ok((observed, TaskFreshness::Current))
+            }
+            Err(_) if record.needs_remote_status_refresh() => {
+                Ok((record.clone(), TaskFreshness::Stale))
+            }
+            Err(_) => Ok((record.clone(), TaskFreshness::Current)),
         }
     }
 }
@@ -117,8 +125,9 @@ impl DashboardTaskSource for MacWorkerTaskSource {
             .local_tasks
             .runner_liveness(task_id)
             .map_err(map_local_api_error)?;
-        let (status, freshness) = self.effective_detail_status(&record)?;
-        project_task_detail(&record, &status, runner, freshness).map_err(map_task_view_api_error)
+        let (view, freshness) = self.effective_task_view(&record)?;
+        project_task_detail(&view, view.status(), runner, freshness)
+            .map_err(map_task_view_api_error)
     }
 
     fn read_task_log(
@@ -183,7 +192,12 @@ pub(crate) fn collect_task_projection(
 
         let mut status = record.status().clone();
         let mut task_freshness = TaskFreshness::Current;
-        if remote_status_refresh_allowed(&record) && status.worker().is_some() {
+        let mut view = record.clone();
+        if record.close_intent().is_none()
+            && !record.retains_log_drain_unavailable()
+            && record.needs_remote_observation()
+            && status.worker().is_some()
+        {
             let remaining = deadline.saturating_sub(started.elapsed());
             let remote_status = config
                 .worker(status.worker().expect("worker presence checked"))
@@ -198,8 +212,11 @@ pub(crate) fn collect_task_projection(
                     }
                 });
             if let Some(response) = remote_status {
-                status = response.status().clone();
-            } else {
+                view = record
+                    .with_remote_observation(response.status(), response.deliveries())
+                    .map_err(map_local_error)?;
+                status = view.status().clone();
+            } else if record.needs_remote_status_refresh() {
                 task_freshness = TaskFreshness::Stale;
                 errors.push(DashboardError::new(
                     "TASK_STATUS_STALE",
@@ -208,7 +225,7 @@ pub(crate) fn collect_task_projection(
             }
         }
 
-        let effective = record.with_status(status).map_err(map_local_error)?;
+        let effective = view.with_status(status).map_err(map_local_error)?;
         effective_records.push(effective);
         freshness.insert(task_id, task_freshness);
     }

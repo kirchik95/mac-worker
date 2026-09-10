@@ -500,7 +500,13 @@ impl<'a> HostGc<'a> {
             (false, false)
         };
         let active_work = inventory.lease_uncertain
-            || self.task_has_active_work(project, &meta, &status, inventory.live_lease_job)?;
+            || self.task_has_active_work(
+                project,
+                &meta,
+                &status,
+                inventory.live_lease_job,
+                request.now_millis(),
+            )?;
         let size_bytes = bounded_tree_size(task)?;
         inventory.tasks.insert(
             identifier.to_owned(),
@@ -571,6 +577,7 @@ impl<'a> HostGc<'a> {
         meta: &TaskMeta,
         status: &TaskStatus,
         live_lease_job: Option<JobId>,
+        now_millis: u64,
     ) -> Result<bool, WorkerError> {
         for turn in status.turns() {
             if turn.terminal().is_none() {
@@ -593,10 +600,19 @@ impl<'a> HostGc<'a> {
                 return Ok(true);
             }
         }
-        Ok(false)
+        crate::outbox::OriginOutbox::new(self.store, self.runner).retains(
+            project,
+            meta.task_id(),
+            now_millis,
+        )
     }
 
-    fn task_id_has_active_work(&self, project: &str, task_id: TaskId) -> Result<bool, WorkerError> {
+    fn task_id_has_active_work(
+        &self,
+        project: &str,
+        task_id: TaskId,
+        now_millis: u64,
+    ) -> Result<bool, WorkerError> {
         let task = match self
             .store
             .open_directory(&format!("tasks/{project}/{task_id}"), false)
@@ -616,6 +632,7 @@ impl<'a> HostGc<'a> {
             LeaseService::new(self.store)
                 .load()?
                 .map(|lease| lease.job_id()),
+            now_millis,
         )
     }
 
@@ -918,7 +935,7 @@ impl<'a> HostGc<'a> {
             }
             "task" if candidate.reason() == "open task retention" => {
                 let (project, task_id) = parse_task_identifier(candidate.identifier())?;
-                if self.task_id_has_active_work(project, task_id)? {
+                if self.task_id_has_active_work(project, task_id, request.now_millis())? {
                     return Ok(false);
                 }
                 Ok(TaskStore::new(self.store, self.runner)
@@ -936,7 +953,7 @@ impl<'a> HostGc<'a> {
                 {
                     return Ok(false);
                 }
-                if self.task_id_has_active_work(project, task_id)? {
+                if self.task_id_has_active_work(project, task_id, request.now_millis())? {
                     return Ok(false);
                 }
                 let task = match self
@@ -1020,6 +1037,7 @@ impl<'a> HostGc<'a> {
                 LeaseService::new(self.store)
                     .load()?
                     .map(|lease| lease.job_id()),
+                request.now_millis(),
             )? {
                 return Ok(false);
             }
@@ -1035,6 +1053,13 @@ impl<'a> HostGc<'a> {
         for reference in [&branch, &base] {
             if git_ref_exists(self.runner, mirror.path(), reference)? {
                 delete_git_ref(self.runner, mirror.path(), reference)?;
+                removed = true;
+            }
+        }
+        let delivery_prefix = format!("refs/mac-worker/delivery/{task_id}/");
+        for reference in git_ref_names(self.runner, mirror.path())? {
+            if reference.starts_with(&delivery_prefix) {
+                delete_git_ref(self.runner, mirror.path(), &reference)?;
                 removed = true;
             }
         }

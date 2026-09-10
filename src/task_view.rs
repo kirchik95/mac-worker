@@ -7,7 +7,8 @@ use crate::{
     redaction::RedactionBoundary,
     scheduler::QueueBlockingReason,
     task::{
-        BaseOid, BranchName, ClosePolicy, LocalTaskRecord, RunId, RunProgress, RunRecord,
+        BaseOid, BranchName, ClosePolicy, LocalTaskRecord, OriginDelivery, RunId, RunProgress,
+        RunRecord,
         RunnerState, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
     },
 };
@@ -119,6 +120,10 @@ pub struct TaskListRow {
     pub active_turn_id: Option<TurnId>,
     pub close_policy: ClosePolicy,
     pub review_state: ReviewState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<OriginDelivery>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deliveries: Vec<OriginDelivery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -151,6 +156,10 @@ pub struct TaskDetailProjection {
     pub review_commands: Vec<String>,
     pub turns: Vec<TaskTurnProjection>,
     pub timeline: Vec<TaskTimelineEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<OriginDelivery>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deliveries: Vec<OriginDelivery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -424,6 +433,8 @@ pub fn project_task_detail(
         review_commands: review_commands(record, status),
         turns,
         timeline,
+        delivery: record.delivery().cloned(),
+        deliveries: record.deliveries().to_vec(),
     })
 }
 
@@ -478,6 +489,8 @@ fn task_list_row(
         active_turn_id,
         close_policy: record.meta().close_policy(),
         review_state: review_state(record, status),
+        delivery: record.delivery().cloned(),
+        deliveries: record.deliveries().to_vec(),
     })
 }
 

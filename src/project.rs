@@ -291,6 +291,27 @@ pub fn normalize_origin(origin: &str) -> Result<String, WorkerError> {
     Err(invalid_origin())
 }
 
+pub fn canonical_file_origin(origin: &str) -> Result<Option<String>, WorkerError> {
+    let Ok(url) = Url::parse(origin) else {
+        return Ok(None);
+    };
+    if url.scheme() != "file" {
+        return Ok(None);
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid_origin());
+    }
+    let path = url.to_file_path().map_err(|_| invalid_origin())?;
+    if !path.is_absolute() {
+        return Err(invalid_origin());
+    }
+    let canonical = url.to_string();
+    if canonical != origin {
+        return Err(invalid_origin());
+    }
+    Ok(Some(canonical))
+}
+
 pub fn origin_host(origin: &str) -> Result<String, WorkerError> {
     let normalized = normalize_origin(origin)?;
     if let Ok(url) = Url::parse(&normalized) {

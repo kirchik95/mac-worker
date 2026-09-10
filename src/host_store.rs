@@ -135,6 +135,10 @@ pub enum HostStoreWritePoint {
     AfterHostLayoutRefreshPublish = 62,
     AfterInstallationIdentityRefreshUnlink = 63,
     AfterInstallationIdentityRefreshPublish = 64,
+    AfterOutboxPin = 65,
+    AfterOutboxIntent = 66,
+    AfterOutboxObjectBaselinePacks = 67,
+    AfterOutboxObjectBaseline = 68,
 }
 
 impl LayoutEntry {
@@ -2079,6 +2083,10 @@ impl HostStore {
             .join(format!("{job}.json")))
     }
 
+    pub fn root(&self) -> &Path {
+        &self.inner.display_root
+    }
+
     pub fn mirror(&self, project_id: &str) -> Result<RootedDir, WorkerError> {
         self.validate_layout()?;
         validate_digest(project_id, "project ID")?;
@@ -3472,7 +3480,25 @@ fn ensure_mirror_directory(mirror: &RootedDir) -> Result<(), WorkerError> {
 }
 
 fn configure_mirror(mirror: &RootedDir) -> Result<(), WorkerError> {
-    for (key, value) in [("core.hooksPath", "hooks"), ("receive.denyDeletes", "true")] {
+    let listed = run_git_in_mirror(mirror, &["--git-dir", ".", "config", "--list", "--local"])?;
+    let mut current = std::collections::BTreeMap::new();
+    if listed.status.success() {
+        for line in String::from_utf8_lossy(&listed.stdout).lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            current.insert(key.to_ascii_lowercase(), value.to_owned());
+        }
+    }
+    for (key, value) in [
+        ("core.hooksPath", "hooks"),
+        ("receive.denyDeletes", "true"),
+        ("core.fsync", "objects,derived-metadata,reference"),
+        ("core.fsyncMethod", "fsync"),
+    ] {
+        if current.get(&key.to_ascii_lowercase()).map(String::as_str) == Some(value) {
+            continue;
+        }
         let output = run_git_in_mirror(mirror, &["--git-dir", ".", "config", key, value])?;
         if !output.status.success() {
             return Err(WorkerError::Git {

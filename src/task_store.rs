@@ -14,12 +14,13 @@ use crate::{
     git_transport::GitTransport,
     host_store::{HostStore, TransferGuard},
     job::JobId,
+    outbox::OriginOutbox,
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::PROTOCOL_VERSION,
     rooted_fs::RootedDir,
     task::{
-        BaseOid, HerdrTurnReport, TaskId, TaskMeta, TaskOutcome, TaskSource, TaskState, TaskStatus,
-        TurnSummary, TurnTerminal,
+        BaseOid, HerdrTurnReport, OriginDelivery, TaskId, TaskMeta, TaskOutcome, TaskSource,
+        TaskState, TaskStatus, TurnSummary, TurnTerminal,
     },
 };
 
@@ -456,6 +457,10 @@ impl TaskStatusRequest {
 pub struct TaskStatusResponse {
     protocol_version: u32,
     status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<OriginDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deliveries: Vec<OriginDelivery>,
 }
 
 impl TaskStatusResponse {
@@ -463,7 +468,15 @@ impl TaskStatusResponse {
         Self {
             protocol_version: PROTOCOL_VERSION,
             status,
+            delivery: None,
+            deliveries: Vec::new(),
         }
+    }
+
+    pub fn with_deliveries(mut self, deliveries: Vec<OriginDelivery>) -> Self {
+        self.delivery = deliveries.first().cloned();
+        self.deliveries = deliveries;
+        self
     }
 
     pub fn protocol_version(&self) -> u32 {
@@ -472,6 +485,14 @@ impl TaskStatusResponse {
 
     pub fn status(&self) -> &TaskStatus {
         &self.status
+    }
+
+    pub fn delivery(&self) -> Option<&OriginDelivery> {
+        self.delivery.as_ref()
+    }
+
+    pub fn deliveries(&self) -> &[OriginDelivery] {
+        &self.deliveries
     }
 }
 
@@ -594,6 +615,10 @@ pub struct TaskCloseResponse {
     status: TaskStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<OriginDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deliveries: Vec<OriginDelivery>,
 }
 
 impl TaskCloseResponse {
@@ -602,7 +627,15 @@ impl TaskCloseResponse {
             protocol_version: PROTOCOL_VERSION,
             status,
             warnings: Vec::new(),
+            delivery: None,
+            deliveries: Vec::new(),
         }
+    }
+
+    pub fn with_deliveries(mut self, deliveries: Vec<OriginDelivery>) -> Self {
+        self.delivery = deliveries.first().cloned();
+        self.deliveries = deliveries;
+        self
     }
 
     pub(crate) fn with_warnings(status: TaskStatus, warnings: Vec<String>) -> Self {
@@ -610,6 +643,8 @@ impl TaskCloseResponse {
             protocol_version: PROTOCOL_VERSION,
             status,
             warnings,
+            delivery: None,
+            deliveries: Vec::new(),
         }
     }
 
@@ -623,6 +658,14 @@ impl TaskCloseResponse {
 
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    pub fn delivery(&self) -> Option<&OriginDelivery> {
+        self.delivery.as_ref()
+    }
+
+    pub fn deliveries(&self) -> &[OriginDelivery] {
+        &self.deliveries
     }
 
     pub(crate) fn validate(&self) -> Result<(), WorkerError> {
@@ -696,9 +739,12 @@ impl<'a> TaskStore<'a> {
 
     pub fn status(&self, request: &TaskStatusRequest) -> Result<TaskStatusResponse, WorkerError> {
         request.validate()?;
-        Ok(TaskStatusResponse::new(
-            self.load_status(request.project_id(), request.task_id())?,
-        ))
+        let deliveries = OriginOutbox::new(self.store, self.runner)
+            .deliveries(request.project_id(), request.task_id())?;
+        Ok(
+            TaskStatusResponse::new(self.load_status(request.project_id(), request.task_id())?)
+                .with_deliveries(deliveries),
+        )
     }
 
     pub fn diff(&self, request: &TaskDiffRequest) -> Result<TaskDiffResponse, WorkerError> {
@@ -795,6 +841,15 @@ impl<'a> TaskStore<'a> {
         if status.state() == TaskState::Active {
             return Err(task_error("TASK_BUSY", "task has an active turn"));
         }
+        if request.discard()
+            && OriginOutbox::new(self.store, self.runner).retains(
+                request.project_id(),
+                request.task_id(),
+                now_millis()?,
+            )?
+        {
+            return Err(task_error("TASK_BUSY", "DELIVERY_PENDING"));
+        }
         let reported_to_herdr = status.turns().iter().any(|turn| turn.herdr().is_some());
 
         // Prove the discard target before changing the task. Once the
@@ -840,7 +895,9 @@ impl<'a> TaskStore<'a> {
             }
         }
         task.sync_root()?;
-        Ok(TaskCloseResponse::with_warnings(status, warnings))
+        let deliveries = OriginOutbox::new(self.store, self.runner)
+            .deliveries(request.project_id(), request.task_id())?;
+        Ok(TaskCloseResponse::with_warnings(status, warnings).with_deliveries(deliveries))
     }
 
     /// Closes an idle open task as part of retention GC.  Retention closure
@@ -1168,7 +1225,8 @@ impl<'a> TaskStore<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn finish_turn(
+    #[doc(hidden)]
+    pub fn finish_turn(
         &self,
         project_id: &str,
         task_id: TaskId,
@@ -1882,9 +1940,22 @@ fn git_request(
     if let Some(extra) = extra_environment {
         environment.push(extra);
     }
+    let mut prefixed = vec![
+        OsString::from("-c"),
+        OsString::from(format!(
+            "core.fsync={}",
+            crate::git_transport::GIT_FSYNC_COMPONENTS
+        )),
+        OsString::from("-c"),
+        OsString::from(format!(
+            "core.fsyncMethod={}",
+            crate::git_transport::GIT_FSYNC_METHOD
+        )),
+    ];
+    prefixed.extend(args);
     ProcessRequest {
         program: GIT_PROGRAM.into(),
-        args,
+        args: prefixed,
         environment,
         environment_remove,
         stdin: None,

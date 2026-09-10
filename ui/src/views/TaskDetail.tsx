@@ -21,6 +21,23 @@ import {
 
 const POLL_INTERVAL_MS = 2000
 
+function deliverySummary(detail: TaskDetailPayload): string | null {
+  const deliveries =
+    detail.deliveries && detail.deliveries.length > 0
+      ? detail.deliveries
+      : detail.delivery
+        ? [detail.delivery]
+        : detail.task.deliveries && detail.task.deliveries.length > 0
+          ? detail.task.deliveries
+          : detail.task.delivery
+            ? [detail.task.delivery]
+            : []
+  if (deliveries.length === 0) {
+    return null
+  }
+  return deliveries.map((delivery) => `${delivery.state} · ${shortId(delivery.turn_id, 8)}`).join(' · ')
+}
+
 function Fact({ icon, label, value }: { icon: IconName; label: string; value: string }) {
   return (
     <div className="min-w-0 flex-1 border-l pl-8.5 first:border-l-0 first:pl-0">
@@ -259,6 +276,7 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
 
   const { task } = detail
   const turns = detail.timeline.length > 0 ? detail.timeline : detail.turns
+  const delivery = deliverySummary(detail)
 
   return (
     <div className="space-y-5">
@@ -334,6 +352,7 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
         <Fact icon="branch" label="BRANCH" value={task.branch ?? 'not published'} />
         <Fact icon="commit" label="BASE" value={shortId(detail.base_oid, 12)} />
         <Fact icon="commit" label="HEAD" value={shortId(detail.head_oid, 12)} />
+        {delivery ? <Fact icon="branch" label="DELIVERY" value={delivery} /> : null}
       </dl>
 
       <section className="overflow-hidden rounded-[10px] border bg-card">

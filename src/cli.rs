@@ -346,6 +346,23 @@ pub enum HostCommand {
         client_id: HiddenComponent,
         path: HiddenComponent,
     },
+    #[command(name = "outbox")]
+    Outbox {
+        #[arg(long)]
+        watch: bool,
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        enable: bool,
+        #[arg(long, value_name = "DIR")]
+        write_agent: Option<PathBuf>,
+        /// Exact HostStore root. Spawned watchers must not fall back to live PathLayout.
+        #[arg(long)]
+        host_root: Option<PathBuf>,
+        /// Short-lived production launch: spawn `--watch` then exit.
+        #[arg(long, hide = true)]
+        wake: bool,
+    },
     #[command(name = "rsync-receive", trailing_var_arg = true)]
     RsyncReceive {
         job_id: HiddenComponent,

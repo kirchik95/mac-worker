@@ -1113,6 +1113,8 @@ fn fixture_detail() -> TaskDetailProjection {
             active_turn_id: Some(turn_id),
             close_policy: mac_worker::task::ClosePolicy::Done,
             review_state: mac_worker::task_view::ReviewState::NotReviewable,
+            delivery: None,
+            deliveries: Vec::new(),
         },
         project_id: "a".repeat(64),
         worktree_id: "b".repeat(64),
@@ -1143,6 +1145,8 @@ fn fixture_detail() -> TaskDetailProjection {
             ended_at_millis: turn.ended_at_millis,
             terminal: turn.terminal,
         }],
+        delivery: None,
+        deliveries: Vec::new(),
     }
 }
 

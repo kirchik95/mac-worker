@@ -4,7 +4,10 @@ mod support;
 use std::{
     ffi::OsString,
     fs,
-    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    os::unix::{
+        fs::{MetadataExt, PermissionsExt},
+        process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
     process::Command,
 };
@@ -469,6 +472,27 @@ fn mirror_hook_wins_over_global_hooks_path_and_denies_heads_and_deletions() {
         ]);
     let push = command.output().unwrap();
     assert!(!push.status.success());
+}
+
+#[test]
+fn reopening_a_configured_mirror_does_not_rewrite_local_git_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let store = HostStore::open(&host).unwrap();
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    let config_path = mirror.path().join("config");
+    let before = fs::read(&config_path).unwrap();
+    let before_meta = fs::metadata(&config_path).unwrap();
+    drop(mirror);
+    drop(store);
+
+    let store = HostStore::open(&host).unwrap();
+    let _mirror = store.mirror(PROJECT_ID).unwrap();
+    let after_meta = fs::metadata(&config_path).unwrap();
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    assert_eq!(after_meta.ino(), before_meta.ino());
+    assert_eq!(after_meta.mtime(), before_meta.mtime());
+    assert_eq!(after_meta.mtime_nsec(), before_meta.mtime_nsec());
 }
 
 #[test]

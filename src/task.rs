@@ -220,6 +220,12 @@ impl TaskSource {
 
 impl PushTarget {
     pub fn new(url: String) -> Result<Self, WorkerError> {
+        if let Some(file) = crate::project::canonical_file_origin(&url)? {
+            return Ok(Self {
+                url: file,
+                requirement: "origin:file".into(),
+            });
+        }
         let normalized = crate::project::normalize_origin(&url)
             .map_err(|_| task_config("push origin URL is invalid or not in normalized form"))?;
         if normalized != url {
@@ -379,6 +385,155 @@ impl TaskOutcome {
             other => other,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryState {
+    Pending,
+    Retrying,
+    Delivered,
+    Failed,
+}
+
+impl DeliveryState {
+    pub fn retains_objects(self) -> bool {
+        matches!(self, Self::Pending | Self::Retrying)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Delivered | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginDelivery {
+    turn_id: TurnId,
+    state: DeliveryState,
+    oid: BaseOid,
+    origin: String,
+    target: String,
+    attempt: u32,
+    next_attempt_at_millis: u64,
+    last_error: Option<String>,
+    superseded_by: Option<BaseOid>,
+    created_at_millis: u64,
+    updated_at_millis: u64,
+}
+
+impl OriginDelivery {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        turn_id: TurnId,
+        state: DeliveryState,
+        oid: BaseOid,
+        origin: String,
+        target: String,
+        attempt: u32,
+        next_attempt_at_millis: u64,
+        last_error: Option<String>,
+        superseded_by: Option<BaseOid>,
+        created_at_millis: u64,
+        updated_at_millis: u64,
+    ) -> Result<Self, WorkerError> {
+        let delivery = Self {
+            turn_id,
+            state,
+            oid,
+            origin,
+            target,
+            attempt,
+            next_attempt_at_millis,
+            last_error: last_error.map(|code| RedactionBoundary::from_env().failure_reason(&code)),
+            superseded_by,
+            created_at_millis,
+            updated_at_millis,
+        };
+        delivery.validate()?;
+        Ok(delivery)
+    }
+
+    pub fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub fn state(&self) -> DeliveryState {
+        self.state
+    }
+
+    pub fn created_at_millis(&self) -> u64 {
+        self.created_at_millis
+    }
+
+    pub fn oid(&self) -> &BaseOid {
+        &self.oid
+    }
+
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    pub fn next_attempt_at_millis(&self) -> u64 {
+        self.next_attempt_at_millis
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    pub fn superseded_by(&self) -> Option<&BaseOid> {
+        self.superseded_by.as_ref()
+    }
+
+    pub fn updated_at_millis(&self) -> u64 {
+        self.updated_at_millis
+    }
+
+    fn validate(&self) -> Result<(), WorkerError> {
+        if self.origin.is_empty() || self.origin.len() > MAX_PROMPT_BYTES {
+            return Err(task_config("delivery origin is invalid"));
+        }
+        if !self.target.starts_with("refs/heads/") || self.target.len() > MAX_IDENTITY_BYTES + 16 {
+            return Err(task_config("delivery target is invalid"));
+        }
+        if self.attempt == 0 {
+            return Err(task_config("delivery attempt must be positive"));
+        }
+        Ok(())
+    }
+}
+
+pub fn merge_origin_deliveries(
+    local: &[OriginDelivery],
+    remote: &[OriginDelivery],
+) -> Vec<OriginDelivery> {
+    let mut merged = local.to_vec();
+    for incoming in remote {
+        match merged
+            .iter_mut()
+            .find(|existing| existing.turn_id() == incoming.turn_id())
+        {
+            Some(existing) if existing.updated_at_millis() > incoming.updated_at_millis() => {}
+            Some(existing) => *existing = incoming.clone(),
+            None => merged.push(incoming.clone()),
+        }
+    }
+    merged.sort_by(|left, right| {
+        right
+            .created_at_millis()
+            .cmp(&left.created_at_millis())
+            .then(right.updated_at_millis().cmp(&left.updated_at_millis()))
+    });
+    merged
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1307,6 +1462,8 @@ pub struct LocalTaskRecord {
     submission_intent_turn_id: Option<TurnId>,
     submission_rollback_turn_id: Option<TurnId>,
     close_intent: Option<TaskCloseIntent>,
+    delivery: Option<OriginDelivery>,
+    deliveries: Vec<OriginDelivery>,
 }
 
 impl LocalTaskRecord {
@@ -1335,6 +1492,8 @@ impl LocalTaskRecord {
             submission_intent_turn_id: None,
             submission_rollback_turn_id: None,
             close_intent: None,
+            delivery: None,
+            deliveries: Vec::new(),
         };
         record.validate()?;
         Ok(record)
@@ -1404,6 +1563,47 @@ impl LocalTaskRecord {
 
     pub fn close_intent(&self) -> Option<&TaskCloseIntent> {
         self.close_intent.as_ref()
+    }
+
+    pub fn delivery(&self) -> Option<&OriginDelivery> {
+        self.deliveries.first().or(self.delivery.as_ref())
+    }
+
+    pub fn deliveries(&self) -> &[OriginDelivery] {
+        &self.deliveries
+    }
+
+    pub fn needs_remote_status_refresh(&self) -> bool {
+        matches!(self.status.state, TaskState::Active | TaskState::Open)
+    }
+
+    pub fn needs_remote_delivery_refresh(&self) -> bool {
+        matches!(self.status.state, TaskState::Closed | TaskState::Abandoned)
+            && self
+                .deliveries()
+                .iter()
+                .any(|delivery| delivery.state().retains_objects())
+    }
+
+    pub fn needs_remote_observation(&self) -> bool {
+        self.needs_remote_status_refresh() || self.needs_remote_delivery_refresh()
+    }
+
+    pub fn with_remote_observation(
+        &self,
+        remote_status: &TaskStatus,
+        remote_deliveries: &[OriginDelivery],
+    ) -> Result<Self, WorkerError> {
+        let merged = merge_origin_deliveries(self.deliveries(), remote_deliveries);
+        let next = if matches!(
+            self.status.state,
+            TaskState::Closed | TaskState::Abandoned | TaskState::Lost
+        ) {
+            self.clone()
+        } else {
+            self.with_status(remote_status.clone())?
+        };
+        next.with_deliveries(merged)
     }
 
     pub fn repo_id(&self) -> &str {
@@ -1528,6 +1728,8 @@ impl LocalTaskRecord {
         replacement.submission_intent_turn_id = self.submission_intent_turn_id;
         replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
         replacement.close_intent = self.close_intent.clone();
+        replacement.delivery = self.delivery.clone();
+        replacement.deliveries = self.deliveries.clone();
         replacement.validate()?;
         Ok(replacement)
     }
@@ -1549,6 +1751,32 @@ impl LocalTaskRecord {
     pub fn without_submission_intent(&self) -> Result<Self, WorkerError> {
         let mut replacement = self.clone();
         replacement.submission_intent_turn_id = None;
+        replacement.validate()?;
+        Ok(replacement)
+    }
+
+    pub fn with_delivery(&self, delivery: Option<OriginDelivery>) -> Result<Self, WorkerError> {
+        match delivery {
+            Some(delivery) => {
+                let merged =
+                    merge_origin_deliveries(self.deliveries(), std::slice::from_ref(&delivery));
+                self.with_deliveries(merged)
+            }
+            None => self.with_deliveries(self.deliveries().to_vec()),
+        }
+    }
+
+    pub fn with_deliveries(&self, deliveries: Vec<OriginDelivery>) -> Result<Self, WorkerError> {
+        let mut replacement = self.clone();
+        let mut deliveries = deliveries;
+        deliveries.sort_by(|left, right| {
+            right
+                .created_at_millis()
+                .cmp(&left.created_at_millis())
+                .then(right.updated_at_millis().cmp(&left.updated_at_millis()))
+        });
+        replacement.deliveries = deliveries;
+        replacement.delivery = replacement.deliveries.first().cloned();
         replacement.validate()?;
         Ok(replacement)
     }
@@ -1608,6 +1836,12 @@ impl Serialize for LocalTaskRecord {
         if self.close_intent.is_some() {
             field_count += 1;
         }
+        if self.delivery.is_some() {
+            field_count += 1;
+        }
+        if !self.deliveries.is_empty() {
+            field_count += 1;
+        }
         let mut record = serializer.serialize_struct("LocalTaskRecord", field_count)?;
         record.serialize_field("meta", &self.meta)?;
         record.serialize_field("status", &self.status)?;
@@ -1626,6 +1860,12 @@ impl Serialize for LocalTaskRecord {
         }
         if let Some(intent) = &self.close_intent {
             record.serialize_field("close_intent", intent)?;
+        }
+        if let Some(delivery) = &self.delivery {
+            record.serialize_field("delivery", delivery)?;
+        }
+        if !self.deliveries.is_empty() {
+            record.serialize_field("deliveries", &self.deliveries)?;
         }
         record.end()
     }
@@ -1651,6 +1891,10 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             submission_rollback_turn_id: Option<TurnId>,
             #[serde(default)]
             close_intent: Option<TaskCloseIntent>,
+            #[serde(default)]
+            delivery: Option<OriginDelivery>,
+            #[serde(default)]
+            deliveries: Vec<OriginDelivery>,
         }
         let wire: Wire = deserialize_unique_object(deserializer)?;
         let mut record = Self::new(
@@ -1668,6 +1912,12 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
         record.submission_intent_turn_id = wire.submission_intent_turn_id;
         record.submission_rollback_turn_id = wire.submission_rollback_turn_id;
         record.close_intent = wire.close_intent;
+        record.deliveries = if wire.deliveries.is_empty() {
+            wire.delivery.into_iter().collect()
+        } else {
+            wire.deliveries
+        };
+        record.delivery = record.deliveries.first().cloned();
         record.validate().map_err(de::Error::custom)?;
         Ok(record)
     }

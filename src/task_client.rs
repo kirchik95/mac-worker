@@ -23,14 +23,14 @@ use crate::{
     scheduler::{CandidateObservation, SchedulerPolicy, Selection, WorkerPreference},
     supervisor::{ProcessObservation, SystemProcessInspector},
     task::{
-        BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, PushTarget,
-        RunId, RunRecord, RunnerState, TaskCloseIntent, TaskId, TaskLimits,
+        BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, OriginDelivery,
+        PublishMode, PushTarget, RunId, RunRecord, RunnerState, TaskCloseIntent, TaskId, TaskLimits,
         TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
-        TurnSummary,
+        TurnSummary, merge_origin_deliveries,
     },
     task_view::{
         TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
-        filter_task_list, project_task_list_with_blocking_codes, remote_status_refresh_allowed,
+        filter_task_list, project_task_list_with_blocking_codes,
     },
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
@@ -108,6 +108,8 @@ pub struct TaskReport {
     events: Vec<serde_json::Value>,
     runner: Option<RunnerState>,
     exit_code: Option<u8>,
+    delivery: Option<OriginDelivery>,
+    deliveries: Vec<OriginDelivery>,
 }
 
 impl TaskReport {
@@ -137,6 +139,14 @@ impl TaskReport {
 
     pub fn exit_code(&self) -> Option<u8> {
         self.exit_code
+    }
+
+    pub fn delivery(&self) -> Option<&OriginDelivery> {
+        self.delivery.as_ref()
+    }
+
+    pub fn deliveries(&self) -> &[OriginDelivery] {
+        &self.deliveries
     }
 }
 
@@ -1381,7 +1391,13 @@ impl<'a> TaskClient<'a> {
             .status()
             .clone()
             .copying_reported_checks_if_empty(current.status())?;
-        let closed = current.without_close_intent()?.with_status(closed_status)?;
+        let closed = current
+            .without_close_intent()?
+            .with_status(closed_status)?
+            .with_deliveries(merge_origin_deliveries(
+                current.deliveries(),
+                response.deliveries(),
+            ))?;
         if !self.client_state.update_task_if_current(&current, closed)? {
             let after = self.client_state.load_task(task_id)?;
             if matches!(
@@ -2435,50 +2451,7 @@ impl<'a> TaskClient<'a> {
     }
 
     fn refresh_task_status(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
-        if record.retains_log_drain_unavailable() {
-            return Ok(());
-        }
-        let Some(worker_name) = record.status().worker() else {
-            return Ok(());
-        };
-        let Some(worker) = self.config.worker(worker_name) else {
-            return Ok(());
-        };
-        let Ok(response) = RemoteJobClient::new(self.runner).task_status(
-            worker,
-            &crate::task_store::TaskStatusRequest::new(
-                record.meta().project_id(),
-                record.meta().task_id(),
-            ),
-        ) else {
-            // A failed remote observation is not evidence of task loss.
-            return Ok(());
-        };
-        if let Some(pending) = pending_turn_id(record.status())
-            && record.status().state() == TaskState::Active
-            && self
-                .client_state
-                .read_turn_prompt(record.meta().task_id(), pending)
-                .is_ok()
-            && !response
-                .status()
-                .turns()
-                .last()
-                .is_some_and(|turn| turn.turn_id() == pending)
-        {
-            // A follow-up is locally active before the host accepts its
-            // task-turn job. The host still reports the previous Open turn
-            // during that interval; do not erase the pending local turn.
-            return Ok(());
-        }
-        let observed_at = response.status().updated_at_millis();
-        self.client_state.update_task_if_current(
-            record,
-            record
-                .with_status(response.status().clone())?
-                .with_status_observed_at(Some(observed_at))?,
-        )?;
-        Ok(())
+        self.persist_remote_task(record)
     }
 
     fn enqueue_missing_turn(
@@ -2678,33 +2651,86 @@ impl<'a> TaskClient<'a> {
             events: Vec::new(),
             runner: self.client_state.runner_liveness(task_id)?,
             exit_code: None,
+            delivery: record.delivery().cloned(),
+            deliveries: record.deliveries().to_vec(),
         })
     }
 
     fn report_for_readonly(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
-        let mut status = record.status().clone();
-        if remote_status_refresh_allowed(record)
-            && let Some(worker_name) = status.worker()
-            && let Some(worker) = self.config.worker(worker_name)
-            && let Ok(remote) = RemoteJobClient::new(self.runner).task_status(
-                worker,
-                &crate::task_store::TaskStatusRequest::new(
-                    record.meta().project_id(),
-                    record.meta().task_id(),
-                ),
-            )
-        {
-            status = remote.status().clone();
-        }
+        let observed = self.project_remote_task(record)?;
         Ok(TaskReport {
-            task_id: record.meta().task_id(),
-            run_id: record.meta().run_id(),
-            status,
+            task_id: observed.meta().task_id(),
+            run_id: observed.meta().run_id(),
+            status: observed.status().clone(),
             warnings: Vec::new(),
             events: Vec::new(),
-            runner: self.client_state.runner_liveness(record.meta().task_id())?,
+            runner: self
+                .client_state
+                .runner_liveness(observed.meta().task_id())?,
             exit_code: None,
+            delivery: observed.delivery().cloned(),
+            deliveries: observed.deliveries().to_vec(),
         })
+    }
+
+    fn project_remote_task(
+        &self,
+        record: &LocalTaskRecord,
+    ) -> Result<LocalTaskRecord, WorkerError> {
+        if record.close_intent().is_some() || record.retains_log_drain_unavailable() {
+            return Ok(record.clone());
+        }
+        if !record.needs_remote_observation() {
+            return Ok(record.clone());
+        }
+        let Some(worker_name) = record.status().worker() else {
+            return Ok(record.clone());
+        };
+        let Some(worker) = self.config.worker(worker_name) else {
+            return Ok(record.clone());
+        };
+        let Ok(remote) = RemoteJobClient::new(self.runner).task_status(
+            worker,
+            &crate::task_store::TaskStatusRequest::new(
+                record.meta().project_id(),
+                record.meta().task_id(),
+            ),
+        ) else {
+            return Ok(record.clone());
+        };
+        if let Some(pending) = pending_turn_id(record.status())
+            && record.status().state() == TaskState::Active
+            && self
+                .client_state
+                .read_turn_prompt(record.meta().task_id(), pending)
+                .is_ok()
+            && !remote
+                .status()
+                .turns()
+                .last()
+                .is_some_and(|turn| turn.turn_id() == pending)
+        {
+            return Ok(record.clone());
+        }
+        record.with_remote_observation(remote.status(), remote.deliveries())
+    }
+
+    fn persist_remote_task(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
+        if !record.needs_remote_status_refresh() {
+            return Ok(());
+        }
+        let projected = self.project_remote_task(record)?;
+        if projected.status() == record.status() && projected.deliveries() == record.deliveries() {
+            return Ok(());
+        }
+        let observed = if record.needs_remote_status_refresh() {
+            projected.with_status_observed_at(Some(projected.status().updated_at_millis()))?
+        } else {
+            projected
+        };
+        self.client_state
+            .update_task_if_current(record, observed)
+            .map(|_| ())
     }
 
     fn fail_handoff(

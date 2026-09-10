@@ -87,6 +87,8 @@ export interface TaskRow {
   active_turn_id: string | null
   close_policy: 'done' | 'never'
   review_state: ReviewState
+  delivery?: OriginDelivery | null
+  deliveries?: OriginDelivery[]
 }
 
 export interface RunRow {
@@ -191,6 +193,20 @@ export interface Question {
   options: string[]
 }
 
+export interface OriginDelivery {
+  turn_id: string
+  state: 'pending' | 'retrying' | 'delivered' | 'failed'
+  oid: string
+  origin: string
+  target: string
+  attempt: number
+  next_attempt_at_millis: number
+  last_error: string | null
+  superseded_by: string | null
+  created_at_millis: number
+  updated_at_millis: number
+}
+
 export interface TaskDetail {
   task: TaskRow
   project_id: string
@@ -212,6 +228,8 @@ export interface TaskDetail {
   review_commands: string[]
   turns: TurnRow[]
   timeline: TurnRow[]
+  delivery?: OriginDelivery | null
+  deliveries?: OriginDelivery[]
 }
 
 export interface ModelOption {

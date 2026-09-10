@@ -28,7 +28,9 @@ use mac_worker::{
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
+    outbox::OriginOutbox,
     probe::ProbeCollector,
+    process::SystemProcessRunner,
     protocol::{MemoryPressure, PROTOCOL_VERSION, SUPERVISION_VERSION},
     supervisor::{
         LaunchPlan, ProcessGroupMembership, ProcessGroupObservation, ProcessInspector,
@@ -36,8 +38,8 @@ use mac_worker::{
         Supervisor, SupervisorFaultPoint, SystemProcessInspector, SystemSupervisorLauncher,
     },
     task::{
-        BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, PushTarget, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+        BaseOid, BranchName, ClosePolicy, DeliveryState, GitIdentity, PublishMode, PushTarget,
+        TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
     },
     task_store::{
         SessionBinding, TaskCancelRequest, TaskCloseRequest, TaskPrepareRequest, TaskStore,
@@ -911,17 +913,15 @@ fn terminal_origin_mismatch_replay_returns_conflict_before_recovery() {
     let script = r#"printf '%s\n' '{"type":"thread.started","thread_id":"session-origin-terminal"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"finished\",\"questions\":[],\"files_changed\":[]}"}}'"#;
     let (_temp, store, request, _cancel) =
         prepared_push_task_turn(script, "ssh://127.0.0.1:1/repo.git");
-    assert!(
-        JobService::new(
-            &store,
-            &InlineTurnLauncher {
-                store: store.clone(),
-                fault: None,
-            },
-        )
-        .submit_turn(request.clone())
-        .is_err()
-    );
+    JobService::new(
+        &store,
+        &InlineTurnLauncher {
+            store: store.clone(),
+            fault: None,
+        },
+    )
+    .submit_turn(request.clone())
+    .unwrap();
 
     let job_path = store
         .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
@@ -961,16 +961,20 @@ fn failed_origin_push_keeps_task_open_and_retains_the_mirror_branch() {
         fault: None,
     };
 
-    let error = JobService::new(&store, &launcher)
+    let response = JobService::new(&store, &launcher)
         .submit_turn(request)
-        .unwrap_err();
-    assert_eq!(error.public_code(), "PUBLISH_FAILED");
+        .unwrap();
+    assert_eq!(response.task().state(), TaskState::Open);
+    assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
     let status = store.task_status(PROJECT_ID, task_id()).unwrap();
     assert_eq!(status.state(), TaskState::Open);
-    assert!(matches!(
-        status.last_outcome(),
-        Some(TaskOutcome::Failed { reason }) if reason == "PUBLISH_FAILED"
-    ));
+    assert_eq!(status.last_outcome(), Some(&TaskOutcome::Done));
+    let delivery = OriginOutbox::new(&store, &SystemProcessRunner)
+        .dto(PROJECT_ID, task_id())
+        .unwrap()
+        .expect("push publication must record a delivery intent");
+    assert_eq!(delivery.state(), DeliveryState::Pending);
+    assert_eq!(delivery.origin(), origin);
     assert!(
         store
             .task_workspace_if_present(PROJECT_ID, task_id())

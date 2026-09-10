@@ -18,13 +18,13 @@ use crate::{
         parse_prebind_session_ref, prebind_login_request, render_shell,
     },
     error::WorkerError,
-    git_transport::GitTransport,
     host_store::{HostStore, PublicationReceipt, StagedJob, StagingNonce},
     job::JobId,
     job::{
         CommandSpec, JobMeta, LeaseRecord, MAX_LOG_CHUNK_BYTES, RequestFingerprintMaterial,
         SubmitRequest, SubmitResponse,
     },
+    outbox::{DeliveryCommit, OriginOutbox},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     redaction::RedactionBoundary,
     rooted_fs::RootedDir,
@@ -1000,20 +1000,22 @@ impl<'a> TurnPublisher<'a> {
                     "turn origin target does not match the task",
                 ));
             }
-            let mirror = self
-                .store
-                .mirror_if_present(meta.project_id())?
-                .ok_or_else(|| turn_error("PUBLISH_FAILED", "project mirror is absent"))?;
+            let oid = head_oid
+                .as_ref()
+                .ok_or_else(|| turn_error("PUBLISH_FAILED", "push publication has no commit"))?;
             let branch = meta
                 .publish_branch()
                 .cloned()
                 .unwrap_or_else(|| BranchName::for_task(meta.task_id()));
-            GitTransport::new(self.runner).push_origin(
-                expected_origin,
-                meta.task_id(),
-                &branch,
-                &mirror,
-            )?;
+            OriginOutbox::new(self.store, self.runner).commit_intent(DeliveryCommit {
+                project_id: meta.project_id(),
+                task_id: meta.task_id(),
+                turn_id,
+                oid,
+                origin: expected_origin,
+                branch: &branch,
+                now_millis: now_millis()?,
+            })?;
         }
         let boundary = RedactionBoundary::from_env();
         let summary = nonempty(&boundary.summary(structured.summary()));
@@ -1164,7 +1166,16 @@ impl<'a> TurnPublisher<'a> {
             .runner
             .run(&ProcessRequest {
                 program: "/usr/bin/git".into(),
-                args,
+                args: {
+                    let mut prefixed = vec![
+                        OsString::from("-c"),
+                        OsString::from("core.fsync=objects,derived-metadata,reference"),
+                        OsString::from("-c"),
+                        OsString::from("core.fsyncMethod=fsync"),
+                    ];
+                    prefixed.extend(args);
+                    prefixed
+                },
                 environment,
                 environment_remove: [
                     "GIT_DIR",
@@ -1916,6 +1927,9 @@ fn validate_origin_url(origin: Option<&str>) -> Result<(), WorkerError> {
     let Some(origin) = origin else {
         return Ok(());
     };
+    if crate::project::canonical_file_origin(origin)?.is_some() {
+        return Ok(());
+    }
     let normalized = crate::project::normalize_origin(origin)
         .map_err(|_| turn_error("TURN_INVALID", "turn origin URL is invalid"))?;
     if normalized != origin {
