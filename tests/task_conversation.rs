@@ -23,8 +23,8 @@ use mac_worker::{
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project_state::ProjectState,
     scheduler::{
-        AffinityHints, CandidateObservation, CandidateRejection, CandidateSlot, SchedulerPolicy,
-        Selection, WorkerPreference,
+        AffinityHints, CandidateObservation, CandidateRejection, CandidateSlot,
+        QueueBlockingReason, SchedulerPolicy, Selection, WorkerPreference,
     },
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
@@ -1492,6 +1492,116 @@ fn an_active_task_turn_consumes_one_run_slot_not_two() {
             .entry()
             .job_id(),
         job(2)
+    );
+}
+
+#[test]
+fn a_follow_up_turn_does_not_count_its_own_task_against_the_run_cap() {
+    // `say` marks the task Active and enqueues a Waiting follow-up while
+    // the other tasks of a full run are still Active. Counting that task
+    // against max_parallel parks the follow-up with RUN_MAX_PARALLEL.
+    let fixture = Fixture::open();
+    cache_idle(&fixture.store, "mini-1", 10);
+    cache_idle(&fixture.store, "mini-2", 10);
+    cache_idle(&fixture.store, "mini-3", 10);
+    cache_idle(&fixture.store, "mini-4", 10);
+    let dispatcher = owner(601);
+    let follow_up_owner = owner(603);
+    let run_name = format!("{:x}", Uuid::from_u128(99).simple());
+    let run = QueueRunReference::new(QueueRunId::new(run_name).unwrap(), 3).unwrap();
+    let follow_up_task = TaskId::new(Uuid::from_u128(103));
+    let follow_up_turn = job(4);
+
+    for (task_number, turn_number, row_owner, worker, at, claim_at) in [
+        (101, 1, dispatcher, "mini-1", 10, 11),
+        (102, 2, owner(602), "mini-2", 12, 13),
+    ] {
+        fixture
+            .store
+            .enqueue(turn(
+                &fixture.store,
+                turn_number,
+                at,
+                row_owner,
+                WorkerPreference::Pinned {
+                    worker: worker.into(),
+                },
+                Some(run.clone()),
+            ))
+            .unwrap();
+        fixture
+            .store
+            .claim_next(row_owner, &[worker.into()], claim_at)
+            .unwrap()
+            .unwrap();
+        active_task(&fixture.store, task_number, job(turn_number));
+    }
+
+    active_task(&fixture.store, 103, follow_up_turn);
+    fixture
+        .store
+        .write_turn_prompt(follow_up_task, follow_up_turn, "follow-up prompt")
+        .unwrap();
+    fixture
+        .store
+        .enqueue(turn(
+            &fixture.store,
+            4,
+            14,
+            follow_up_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-3".into(),
+            },
+            Some(run.clone()),
+        ))
+        .unwrap();
+
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n\n[[workers]]\nname = \"mini-2\"\nssh = \"mac2\"\nslots = 1\n\n[[workers]]\nname = \"mini-3\"\nssh = \"mac3\"\nslots = 1\n\n[[workers]]\nname = \"mini-4\"\nssh = \"mac4\"\nslots = 1\n",
+    )
+    .unwrap();
+    let reason_for = |job_id| {
+        fixture
+            .store
+            .queue_rows_with_blocking_reasons(&config)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.entry().job_id() == job_id)
+            .unwrap()
+            .blocking_reason()
+            .cloned()
+    };
+    assert_eq!(reason_for(follow_up_turn), None);
+    assert_eq!(
+        fixture
+            .store
+            .claim_next(follow_up_owner, &["mini-3".into()], 15)
+            .unwrap()
+            .unwrap()
+            .entry()
+            .job_id(),
+        follow_up_turn
+    );
+
+    let fourth_owner = owner(604);
+    fixture
+        .store
+        .enqueue(turn(
+            &fixture.store,
+            5,
+            16,
+            fourth_owner,
+            WorkerPreference::Automatic,
+            Some(run),
+        ))
+        .unwrap();
+    assert_eq!(reason_for(job(5)), Some(QueueBlockingReason::RunCap));
+    assert!(
+        fixture
+            .store
+            .claim_next(fourth_owner, &["mini-4".into()], 17)
+            .unwrap()
+            .is_none()
     );
 }
 

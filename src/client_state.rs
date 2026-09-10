@@ -1612,27 +1612,44 @@ impl ClientStateStore {
             return Ok(true);
         };
         let tasks = self.list_tasks_locked()?;
-        let active_task_turns = tasks
-            .iter()
-            .filter(|task| {
-                task.meta()
-                    .run_id()
-                    .is_some_and(|run_id| run_id.to_string() == run.run_id().as_str())
-                    && task.status().state() == crate::task::TaskState::Active
-            })
-            .filter_map(|task| task.status().turns().last().map(|turn| turn.turn_id()))
-            .collect::<HashSet<_>>();
-        let mut active = HashSet::new();
+        // Task-turn rows carry only the turn/job ID. Map each row back to its
+        // task the same way `queue_entry_for_task_turn` does (turn directories)
+        // and through the status last-turn used to skip a Dispatching row that
+        // already consumes an Active slot. A follow-up can then exclude its
+        // own Active task instead of filling the cap against itself.
+        let mut turn_to_task = HashMap::new();
+        for task in &tasks {
+            let task_id = task.meta().task_id();
+            for turn_id in self.turn_ids_for_task(task_id)? {
+                turn_to_task.insert(turn_id, task_id);
+            }
+            for turn in task.status().turns() {
+                turn_to_task.insert(turn.turn_id(), task_id);
+            }
+        }
+        let candidate_task = turn_to_task.get(&candidate.job_id()).copied();
+        let mut occupied_tasks = HashSet::new();
+        let mut occupied_jobs = HashSet::new();
+        let mut occupy = |sibling: &QueueEntry| {
+            if sibling.kind() == QueueEntryKind::TaskTurn {
+                if let Some(task_id) = turn_to_task.get(&sibling.job_id()).copied() {
+                    if candidate_task != Some(task_id) {
+                        occupied_tasks.insert(task_id);
+                    }
+                } else if candidate.job_id() != sibling.job_id() {
+                    occupied_jobs.insert(sibling.job_id());
+                }
+            } else {
+                occupied_jobs.insert(sibling.job_id());
+            }
+        };
         for sibling in snapshot.entries().iter().filter(|entry| {
             entry
                 .run()
                 .is_some_and(|other| other.run_id() == run.run_id())
         }) {
-            if matches!(sibling.state(), QueueState::Dispatching { .. })
-                && (sibling.kind() != QueueEntryKind::TaskTurn
-                    || !active_task_turns.contains(&sibling.job_id()))
-            {
-                active.insert(sibling.job_id().to_string());
+            if matches!(sibling.state(), QueueState::Dispatching { .. }) {
+                occupy(sibling);
             }
             let name = job_file_name(sibling.job_id())?;
             if let Some(record) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? {
@@ -1646,24 +1663,27 @@ impl ClientStateStore {
                 if record.last_status().is_some_and(|status| {
                     matches!(status.state(), JobState::Accepted | JobState::Running)
                 }) {
-                    active.insert(sibling.job_id().to_string());
+                    occupy(sibling);
                 }
             }
         }
         // Task turns do not create legacy job records. Their local Active
         // status is nevertheless an accepted turn and must consume the same
-        // run slot while the queue lock is held.
+        // run slot while the queue lock is held. A follow-up is Active
+        // locally before it dispatches; that task already owns `candidate`
+        // and must not fill the cap against itself.
         for task in tasks {
             if task
                 .meta()
                 .run_id()
                 .is_some_and(|run_id| run_id.to_string() == run.run_id().as_str())
                 && task.status().state() == crate::task::TaskState::Active
+                && candidate_task != Some(task.meta().task_id())
             {
-                active.insert(task.meta().task_id().to_string());
+                occupied_tasks.insert(task.meta().task_id());
             }
         }
-        Ok(active.len() < run.max_parallel() as usize)
+        Ok(occupied_tasks.len() + occupied_jobs.len() < run.max_parallel() as usize)
     }
 
     fn queue_blocking_reason(
