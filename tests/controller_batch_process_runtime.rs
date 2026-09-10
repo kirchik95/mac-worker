@@ -704,8 +704,11 @@ fn runtime_batch_envelope_replay_after_controller_restart() {
         json_string(&ack, "request_id"),
         Some(original_request.as_str())
     );
-    assert_eq!(json_string(&ack, "run_id"), Some(first_run.as_str()));
-    assert_eq!(json_strings(&ack, "task_ids"), first_tasks);
+    let result = ack
+        .get("result")
+        .expect("batch ACK must include result; task.batch has no flattened ControllerAck");
+    assert_eq!(json_string(result, "run_id"), Some(first_run.as_str()));
+    assert_eq!(json_strings(result, "task_ids"), first_tasks);
     let reloaded = load_operation_envelope(&fixture.laptop_controller_cache(), &original_request)
         .unwrap()
         .expect("original envelope remains");
