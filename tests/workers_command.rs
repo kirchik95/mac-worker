@@ -22,7 +22,7 @@ use mac_worker::{
     cli::{Cli, Command},
     config::{Config, WorkerEntry},
     error::{ProcessError, ProcessStream, WorkerError},
-    lease::{LeaseSummary, SlotState},
+    lease::{LeaseSummary, MAX_HOST_SLOTS, SlotState},
     output::CommandOutput,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::{
@@ -341,6 +341,29 @@ fn structured_probe_json(
         value["slot_state"] = serde_json::json!("idle");
         value["active_lease"] = serde_json::Value::Null;
     }
+    serde_json::to_vec(&value).unwrap()
+}
+
+fn occupancy_probe_json(
+    configured_slots: u8,
+    busy_slots: u8,
+    slot_state: &str,
+    active_lease: bool,
+) -> Vec<u8> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(&valid_probe_json()).unwrap();
+    value["configured_slots"] = configured_slots.into();
+    value["busy_slots"] = busy_slots.into();
+    value["slot_state"] = serde_json::json!(slot_state);
+    value["active_lease"] = if active_lease {
+        serde_json::json!({
+            "job_id": "00000000000000000000000000000001",
+            "project_id": "a".repeat(64),
+            "worktree_id": "b".repeat(64),
+            "created_at_millis": 10,
+        })
+    } else {
+        serde_json::Value::Null
+    };
     serde_json::to_vec(&value).unwrap()
 }
 
@@ -749,6 +772,60 @@ fn output_larger_than_one_mib_is_reported_as_an_invalid_response() {
     assert_eq!(health.status, HealthStatus::Unavailable);
     assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
     assert!(health.error_message.is_some());
+}
+
+#[test]
+fn two_slot_probe_with_one_busy_lease_is_ready_and_has_a_free_slot() {
+    let runner = RecordingRunner::returning_json(occupancy_probe_json(2, 1, "idle", true));
+    let config = Config {
+        version: 1,
+        notifications: mac_worker::config::NotificationsConfig::default(),
+        workers: vec![worker("mini-1", "mac1", &[])],
+    };
+    let report = WorkersService::new(SshTransport::new(runner)).inspect(&config);
+    let health = &report.workers[0];
+    assert_eq!(health.status, HealthStatus::Ready, "{health:?}");
+    assert_eq!(health.error_code, None);
+    let probe = health.probe.as_ref().expect("ready probe must be retained");
+    assert_eq!(probe.configured_slots, 2);
+    assert_eq!(probe.busy_slots, 1);
+    assert_eq!(probe.slot_state, SlotState::Idle);
+    assert!(probe.active_lease.is_some());
+    assert!(probe.has_free_execution_slot());
+}
+
+#[test]
+fn two_slot_probe_full_host_stays_ready_without_a_free_slot() {
+    let runner = RecordingRunner::returning_json(occupancy_probe_json(2, 2, "busy", true));
+    let health = SshTransport::new(runner).probe(&worker("mini-1", "mac1", &[]));
+    assert_eq!(health.status, HealthStatus::Ready, "{health:?}");
+    let probe = health.probe.as_ref().expect("ready probe must be retained");
+    assert_eq!(probe.configured_slots, 2);
+    assert_eq!(probe.busy_slots, 2);
+    assert_eq!(probe.slot_state, SlotState::Busy);
+    assert!(!probe.has_free_execution_slot());
+}
+
+#[test]
+fn two_slot_probe_malformed_counts_are_rejected() {
+    let cases = [
+        occupancy_probe_json(2, 3, "idle", true),
+        occupancy_probe_json(2, 1, "busy", true),
+        occupancy_probe_json(2, 1, "idle", false),
+        occupancy_probe_json(2, 0, "idle", true),
+        occupancy_probe_json(MAX_HOST_SLOTS + 1, 0, "idle", false),
+        occupancy_probe_json(0, 0, "idle", true),
+    ];
+    for stdout in cases {
+        let health = SshTransport::new(RecordingRunner::returning_json(stdout)).probe(&worker(
+            "mini-1",
+            "mac1",
+            &[],
+        ));
+        assert_eq!(health.status, HealthStatus::Unavailable);
+        assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
+        assert!(health.probe.is_none());
+    }
 }
 
 #[test]
@@ -1281,6 +1358,8 @@ fn human_workers_output_includes_all_parsed_health_facts() {
                 capabilities: vec!["darwin-arm64".into(), "git".into()],
                 agent_facts: None,
                 facts_age_millis: None,
+                configured_slots: 0,
+                busy_slots: 0,
             }),
             missing_capabilities: Vec::new(),
             error_code: None,
@@ -1332,6 +1411,8 @@ fn human_unavailable_worker_keeps_error_missing_capabilities_and_unknown_swap_vi
                 capabilities: vec!["darwin-arm64".into()],
                 agent_facts: None,
                 facts_age_millis: None,
+                configured_slots: 0,
+                busy_slots: 0,
             }),
             missing_capabilities: vec!["docker".into(), "swift".into()],
             error_code: Some("MISSING_CAPABILITIES".into()),
@@ -1396,6 +1477,8 @@ fn workers_output_includes_profile_keyed_facts_without_values() {
                     herdr: None,
                 }),
                 facts_age_millis: Some(1_000),
+                configured_slots: 0,
+                busy_slots: 0,
             }),
             missing_capabilities: Vec::new(),
             error_code: None,
@@ -1771,6 +1854,8 @@ fn herdr_health(facts: Option<AgentFacts>, facts_age_millis: Option<u64>) -> Wor
             capabilities: vec!["darwin-arm64".into()],
             agent_facts: facts,
             facts_age_millis,
+            configured_slots: 0,
+            busy_slots: 0,
         }),
         missing_capabilities: Vec::new(),
         error_code: None,

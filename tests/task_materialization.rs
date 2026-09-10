@@ -17,7 +17,8 @@ use mac_worker::{
     error::WorkerError,
     host_store::{AdmissionGuard, HostStore, TransferGuard},
     job::{
-        ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseToken, RequestFingerprintMaterial,
+        ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseAcquireResponse,
+        LeaseRecord, LeaseToken, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
@@ -480,12 +481,21 @@ fn origin_prepare_pins_the_base_ref_and_rejects_a_conflicting_oid() {
     assert_eq!(error.public_code(), "BASE_REF_CONFLICT");
 }
 
-fn acquire_lease(store: &HostStore) {
-    let request = LeaseAcquireRequest::new(
+fn healthy_facts() -> AdmissionFacts {
+    AdmissionFacts {
+        free_disk_bytes: 100 * 1024 * 1024 * 1024,
+        total_disk_bytes: 200 * 1024 * 1024 * 1024,
+        memory_pressure: MemoryPressure::Normal,
+        swap_used_bytes: Some(0),
+    }
+}
+
+fn task_lease_request(job: JobId, token: LeaseToken, task: TaskId) -> LeaseAcquireRequest {
+    LeaseAcquireRequest::new(
         RequestFingerprintMaterial::new(
-            job_id(),
+            job,
             client_id(),
-            lease_token(),
+            token,
             100,
             "mini-1".into(),
             PROJECT_ID.into(),
@@ -497,19 +507,46 @@ fn acquire_lease(store: &HostStore) {
             CommandSpec::shell("true".into()).unwrap(),
         )
         .unwrap(),
-    );
+    )
+    .with_execution_scope(ExecutionScope::task(task))
+}
+
+fn acquire_task_lease_request(store: &HostStore, request: &LeaseAcquireRequest) -> LeaseRecord {
+    match LeaseService::new(store)
+        .acquire(request, &healthy_facts(), 100)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        other => panic!("expected acquired lease, got {other:?}"),
+    }
+}
+
+fn acquire_task_lease(store: &HostStore) -> (LeaseAcquireRequest, LeaseRecord) {
+    let request = task_lease_request(job_id(), lease_token(), task_id());
+    let lease = acquire_task_lease_request(store, &request);
+    (request, lease)
+}
+
+fn acquire_lease(store: &HostStore) {
+    let _ = acquire_task_lease(store);
+}
+
+fn retire_lease(store: &HostStore, request: &LeaseAcquireRequest, lease: &LeaseRecord) {
+    store.record_abandoned(request, 200).unwrap();
+    let receipt = store.cleanup_job_owned(lease).unwrap();
     LeaseService::new(store)
-        .acquire(
-            &request,
-            &AdmissionFacts {
-                free_disk_bytes: 100 * 1024 * 1024 * 1024,
-                total_disk_bytes: 200 * 1024 * 1024 * 1024,
-                memory_pressure: MemoryPressure::Normal,
-                swap_used_bytes: Some(0),
-            },
-            100,
-        )
+        .release_after_cleanup(lease, &receipt)
         .unwrap();
+}
+
+fn idle_task_for_close(
+    store: &HostStore,
+    request: &LeaseAcquireRequest,
+    lease: &LeaseRecord,
+    task: TaskId,
+) {
+    rewrite_status(store, task, TaskState::Open, 1);
+    retire_lease(store, request, lease);
 }
 
 #[test]
@@ -601,7 +638,7 @@ fn prepare_is_idempotent_on_retry_and_refuses_inconsistent_state() {
 #[test]
 fn resume_reuses_the_published_workspace_and_appends_one_active_turn() {
     let (_temp, store, base_oid) = store_with_mirror();
-    acquire_lease(&store);
+    let (request, lease) = acquire_task_lease(&store);
     prepare_task(&store, base_oid.clone());
     TaskStore::new(&store, &SystemProcessRunner)
         .publish_branch_into_mirror(PROJECT_ID, task_id())
@@ -615,17 +652,30 @@ fn resume_reuses_the_published_workspace_and_appends_one_active_turn() {
         .unwrap();
 
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
-    let error = TaskStore::new(&store, &SystemProcessRunner)
+    let missing_lease = TaskStore::new(&store, &SystemProcessRunner)
         .prepare_resume(
             PROJECT_ID,
             task_id(),
             JobId::new(Uuid::from_u128(11)),
             2,
-            "mini-2",
+            "mini-1",
             &base_oid,
         )
         .unwrap_err();
-    assert_eq!(error.public_code(), "TASK_TURN_CONFLICT");
+    assert_eq!(missing_lease.public_code(), "TASK_LEASE_MISMATCH");
+    let wrong_worker = TaskStore::new(&store, &SystemProcessRunner)
+        .prepare_resume(PROJECT_ID, task_id(), job_id(), 1, "mini-2", &base_oid)
+        .unwrap_err();
+    assert_eq!(wrong_worker.public_code(), "TASK_LEASE_MISMATCH");
+
+    rewrite_status(&store, task_id(), TaskState::Open, 2);
+    retire_lease(&store, &request, &lease);
+    let next = task_lease_request(
+        JobId::new(Uuid::from_u128(11)),
+        LeaseToken::new(Uuid::from_u128(31)),
+        task_id(),
+    );
+    acquire_task_lease_request(&store, &next);
     let resumed = TaskStore::new(&store, &SystemProcessRunner)
         .prepare_resume(
             PROJECT_ID,
@@ -681,7 +731,7 @@ fn diff_uses_private_index_and_bounds_escaped_output() {
 #[test]
 fn close_removes_only_workspace_and_discard_prunes_published_refs() {
     let (_temp, store, base_oid) = store_with_mirror();
-    acquire_lease(&store);
+    let (request, lease) = acquire_task_lease(&store);
     prepare_task(&store, base_oid);
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     let commit = git_status(
@@ -701,6 +751,7 @@ fn close_removes_only_workspace_and_discard_prunes_published_refs() {
     TaskStore::new(&store, &SystemProcessRunner)
         .publish_branch_into_mirror(PROJECT_ID, task_id())
         .unwrap();
+    idle_task_for_close(&store, &request, &lease, task_id());
 
     TaskStore::new(&store, &SystemProcessRunner)
         .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
@@ -748,13 +799,14 @@ fn close_removes_only_workspace_and_discard_prunes_published_refs() {
 #[test]
 fn discard_keeps_task_intact_when_the_mirror_is_missing() {
     let (_temp, store, base_oid) = store_with_mirror();
-    acquire_lease(&store);
+    let (request, lease) = acquire_task_lease(&store);
     prepare_task(&store, base_oid);
     TaskStore::new(&store, &SystemProcessRunner)
         .publish_branch_into_mirror(PROJECT_ID, task_id())
         .unwrap();
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     let mirror_path = store.mirror(PROJECT_ID).unwrap().path().to_path_buf();
+    idle_task_for_close(&store, &request, &lease, task_id());
     fs::remove_dir_all(mirror_path).unwrap();
 
     let error = TaskStore::new(&store, &SystemProcessRunner)
@@ -772,12 +824,13 @@ fn discard_keeps_task_intact_when_the_mirror_is_missing() {
 #[test]
 fn explicit_close_refreshes_the_task_retention_timestamp() {
     let (_temp, store, base_oid) = store_with_mirror();
-    acquire_lease(&store);
+    let (request, lease) = acquire_task_lease(&store);
     prepare_task(&store, base_oid);
     TaskStore::new(&store, &SystemProcessRunner)
         .publish_branch_into_mirror(PROJECT_ID, task_id())
         .unwrap();
     rewrite_status(&store, task_id(), TaskState::Open, 1);
+    retire_lease(&store, &request, &lease);
 
     TaskStore::new(&store, &SystemProcessRunner)
         .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
@@ -791,7 +844,7 @@ fn explicit_close_refreshes_the_task_retention_timestamp() {
 #[test]
 fn discard_deletes_codex_session_after_workspace_removal_with_bounded_argv() {
     let (_temp, store, base_oid) = store_with_mirror();
-    acquire_lease(&store);
+    let (request, lease) = acquire_task_lease(&store);
     prepare_task(&store, base_oid);
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     TaskStore::new(&store, &SystemProcessRunner)
@@ -804,6 +857,7 @@ fn discard_deletes_codex_session_after_workspace_removal_with_bounded_argv() {
             SessionBinding::new(AgentKind::Codex, "session-1", 200).unwrap(),
         )
         .unwrap();
+    idle_task_for_close(&store, &request, &lease, task_id());
 
     let runner = NativeDeleteRunner::new(workspace.clone(), true);
     let response = TaskStore::new(&store, &runner)
@@ -824,7 +878,7 @@ fn discard_deletes_codex_session_after_workspace_removal_with_bounded_argv() {
 #[test]
 fn discard_records_a_bounded_warning_when_native_session_deletion_fails() {
     let (_temp, store, base_oid) = store_with_mirror();
-    acquire_lease(&store);
+    let (request, lease) = acquire_task_lease(&store);
     prepare_task(&store, base_oid);
     TaskStore::new(&store, &SystemProcessRunner)
         .publish_branch_into_mirror(PROJECT_ID, task_id())
@@ -836,6 +890,7 @@ fn discard_records_a_bounded_warning_when_native_session_deletion_fails() {
             SessionBinding::new(AgentKind::Codex, "session-1", 200).unwrap(),
         )
         .unwrap();
+    idle_task_for_close(&store, &request, &lease, task_id());
 
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     let runner = NativeDeleteRunner::new(workspace, false);
@@ -853,10 +908,13 @@ fn discard_records_a_bounded_warning_when_native_session_deletion_fails() {
 #[test]
 fn discard_skips_native_deletion_when_another_task_references_the_session() {
     let (_temp, store, base_oid) = store_with_mirror();
-    acquire_lease(&store);
+    let (request, lease) = acquire_task_lease(&store);
     prepare_task(&store, base_oid.clone());
     let task_two = task_id_for(2);
     let job_two = job_id_for(11);
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    let two = task_lease_request(job_two, LeaseToken::new(Uuid::from_u128(31)), task_two);
+    acquire_task_lease_request(&store, &two);
     prepare_task_for(&store, task_two, job_two, base_oid, &SystemProcessRunner);
 
     TaskStore::new(&store, &SystemProcessRunner)
@@ -874,6 +932,7 @@ fn discard_skips_native_deletion_when_another_task_references_the_session() {
     TaskStore::new(&store, &SystemProcessRunner)
         .bind_session(PROJECT_ID, task_two, shared)
         .unwrap();
+    idle_task_for_close(&store, &request, &lease, task_id());
 
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     let runner = NativeDeleteRunner::new(workspace, true);
@@ -887,6 +946,7 @@ fn discard_skips_native_deletion_when_another_task_references_the_session() {
 #[test]
 fn discard_serializes_native_session_delete_with_a_concurrent_session_binding() {
     let (_temp, store, base_oid) = store_with_mirror();
+    let (request, lease) = acquire_task_lease(&store);
     prepare_task(&store, base_oid.clone());
     TaskStore::new(&store, &SystemProcessRunner)
         .publish_branch_into_mirror(PROJECT_ID, task_id())
@@ -897,13 +957,12 @@ fn discard_serializes_native_session_delete_with_a_concurrent_session_binding() 
         .unwrap();
 
     let task_two = task_id_for(2);
-    prepare_task_for(
-        &store,
-        task_two,
-        job_id_for(11),
-        base_oid,
-        &SystemProcessRunner,
-    );
+    let job_two = job_id_for(11);
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    let two = task_lease_request(job_two, LeaseToken::new(Uuid::from_u128(31)), task_two);
+    acquire_task_lease_request(&store, &two);
+    prepare_task_for(&store, task_two, job_two, base_oid, &SystemProcessRunner);
+    idle_task_for_close(&store, &request, &lease, task_id());
 
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     let inner = NativeDeleteRunner::new(workspace, true);
@@ -951,10 +1010,12 @@ fn discard_serializes_native_session_delete_with_a_concurrent_session_binding() 
 #[test]
 fn discard_rejects_a_late_session_binding_on_the_terminal_task() {
     let (_temp, store, base_oid) = store_with_mirror();
+    let (request, lease) = acquire_task_lease(&store);
     prepare_task(&store, base_oid);
     TaskStore::new(&store, &SystemProcessRunner)
         .publish_branch_into_mirror(PROJECT_ID, task_id())
         .unwrap();
+    idle_task_for_close(&store, &request, &lease, task_id());
     TaskStore::new(&store, &SystemProcessRunner)
         .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), true))
         .unwrap();
@@ -1120,4 +1181,141 @@ fn v6_task_close_request_is_refused_before_store_writes() {
         other => panic!("expected protocol mismatch, got {other:?}"),
     }
     assert_eq!(fs::read(&sentinel).unwrap(), b"persisted-task");
+}
+
+#[test]
+fn prepare_rejects_job_scope_and_wrong_project_before_creating_a_task() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    let other_project = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let job_scope = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            job_id(),
+            client_id(),
+            lease_token(),
+            100,
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            "c".repeat(64),
+            String::new(),
+            30_000,
+            "heavy".into(),
+            CommandSpec::shell("true".into()).unwrap(),
+        )
+        .unwrap(),
+    );
+    LeaseService::new(&store)
+        .acquire(&job_scope, &healthy_facts(), 100)
+        .unwrap();
+    {
+        let (admission, transfer) = transfer_guard(&store);
+        let error = TaskStore::new(&store, &SystemProcessRunner)
+            .prepare(&prepare_request(base_oid.clone()), &transfer)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WorkerError::Task {
+                    code: "EXECUTION_SCOPE_CONFLICT",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!store.task_dir(PROJECT_ID, task_id()).unwrap().exists());
+        drop(transfer);
+        drop(admission);
+    }
+
+    let other_job = job_id_for(11);
+    let other_token = LeaseToken::new(Uuid::from_u128(31));
+    let task_scope = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            other_job,
+            client_id(),
+            other_token,
+            100,
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            "c".repeat(64),
+            String::new(),
+            30_000,
+            "heavy".into(),
+            CommandSpec::shell("true".into()).unwrap(),
+        )
+        .unwrap(),
+    )
+    .with_execution_scope(ExecutionScope::task(task_id()));
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    LeaseService::new(&store)
+        .acquire(&task_scope, &healthy_facts(), 100)
+        .unwrap();
+    let (admission, transfer) = transfer_guard_for(&store, other_job);
+    let wrong_meta = TaskMeta::new(TaskMetaInput {
+        task_id: task_id(),
+        run_id: None,
+        project_id: other_project.into(),
+        worktree_id: WORKTREE_ID.into(),
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        policy: PermissionPolicy::Workspace,
+        source: mac_worker::task::TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid,
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+        title: None,
+        prompt: "make the requested change".into(),
+        created_at_millis: 100,
+    })
+    .unwrap();
+    let error = TaskStore::new(&store, &SystemProcessRunner)
+        .prepare(
+            &TaskPrepareRequest::new(wrong_meta, other_job, "mini-1"),
+            &transfer,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WorkerError::Task {
+                code: "EXECUTION_SCOPE_CONFLICT",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(!store.task_dir(other_project, task_id()).unwrap().exists());
+    drop(transfer);
+    drop(admission);
+}
+
+#[test]
+fn close_refuses_open_task_while_a_task_scope_lease_is_live() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    acquire_lease(&store);
+    prepare_task(&store, base_oid);
+    rewrite_status(&store, task_id(), TaskState::Open, 1);
+    let error = TaskStore::new(&store, &SystemProcessRunner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_BUSY");
+    assert!(
+        store
+            .task_workspace_if_present(PROJECT_ID, task_id())
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store.task_status(PROJECT_ID, task_id()).unwrap().state(),
+        TaskState::Open
+    );
 }

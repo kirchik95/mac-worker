@@ -23,8 +23,8 @@ use mac_worker::{
     error::WorkerError,
     host_store::HostStore,
     job::{
-        ClientId, CommandSpec, JobId, JobState, JobStatus, LeaseAcquireRequest, LeaseRecord,
-        LeaseToken, RequestFingerprintMaterial,
+        ClientId, CommandSpec, ExecutionScope, JobId, JobState, JobStatus, LeaseAcquireRequest,
+        LeaseRecord, LeaseToken, RequestFingerprintMaterial,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
@@ -386,7 +386,8 @@ fn prepared_task_turn_at(
     let projected = turn.v1_material(&seed_lease, &launch).unwrap();
     LeaseService::new(&store)
         .acquire(
-            &LeaseAcquireRequest::new(projected.clone()),
+            &LeaseAcquireRequest::new(projected.clone())
+                .with_execution_scope(ExecutionScope::task(task_id())),
             &AdmissionFacts {
                 free_disk_bytes: 100 * 1024 * 1024 * 1024,
                 total_disk_bytes: 200 * 1024 * 1024 * 1024,
@@ -431,7 +432,8 @@ fn prepared_task_turn_at(
     drop(admission);
 
     let request = mac_worker::turn::TaskTurnRequest::new_with_origin(
-        mac_worker::job::SubmitRequest::new(projected),
+        mac_worker::job::SubmitRequest::new(projected)
+            .with_execution_scope(ExecutionScope::task(task_id())),
         turn,
         prompt,
         origin_url,
@@ -1221,7 +1223,8 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
     let projected = turn.v1_material(&seed_lease, &launch).unwrap();
     LeaseService::new(&store)
         .acquire(
-            &LeaseAcquireRequest::new(projected.clone()),
+            &LeaseAcquireRequest::new(projected.clone())
+                .with_execution_scope(ExecutionScope::task(task_id())),
             &AdmissionFacts {
                 free_disk_bytes: 100 * 1024 * 1024 * 1024,
                 total_disk_bytes: 200 * 1024 * 1024 * 1024,
@@ -1272,8 +1275,12 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
     drop(transfer);
     drop(admission);
 
-    let request =
-        TaskTurnRequest::new(mac_worker::job::SubmitRequest::new(projected), turn, prompt);
+    let request = TaskTurnRequest::new(
+        mac_worker::job::SubmitRequest::new(projected)
+            .with_execution_scope(ExecutionScope::task(task_id())),
+        turn,
+        prompt,
+    );
     let faulting_launcher = InlineTurnLauncher {
         store: store.clone(),
         fault: Some(SupervisorFaultPoint::AfterTerminalStatus),
@@ -1442,7 +1449,8 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
     };
     LeaseService::new(&store)
         .acquire(
-            &LeaseAcquireRequest::new(projected.clone()),
+            &LeaseAcquireRequest::new(projected.clone())
+                .with_execution_scope(ExecutionScope::task(task_id())),
             &admission_facts,
             wall_clock_millis(),
         )
@@ -1462,7 +1470,8 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
     assert_eq!(prepared.state(), TaskState::Active);
 
     let resume_request = TaskTurnRequest::new(
-        mac_worker::job::SubmitRequest::new(projected),
+        mac_worker::job::SubmitRequest::new(projected)
+            .with_execution_scope(ExecutionScope::task(task_id())),
         resume_turn,
         resume_prompt,
     );
@@ -1544,7 +1553,8 @@ fn successful_codex_turn_without_a_bound_session_fails_publication() {
     let projected = turn.v1_material(&seed_lease, &launch).unwrap();
     LeaseService::new(&store)
         .acquire(
-            &LeaseAcquireRequest::new(projected.clone()),
+            &LeaseAcquireRequest::new(projected.clone())
+                .with_execution_scope(ExecutionScope::task(task_id())),
             &AdmissionFacts {
                 free_disk_bytes: 100 * 1024 * 1024 * 1024,
                 total_disk_bytes: 200 * 1024 * 1024 * 1024,
@@ -1595,8 +1605,12 @@ fn successful_codex_turn_without_a_bound_session_fails_publication() {
     drop(transfer);
     drop(admission);
 
-    let request =
-        TaskTurnRequest::new(mac_worker::job::SubmitRequest::new(projected), turn, prompt);
+    let request = TaskTurnRequest::new(
+        mac_worker::job::SubmitRequest::new(projected)
+            .with_execution_scope(ExecutionScope::task(task_id())),
+        turn,
+        prompt,
+    );
     let launcher = InlineTurnLauncher {
         store: store.clone(),
         fault: None,
@@ -1688,7 +1702,8 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
     let projected = turn.v1_material(&seed_lease, &launch).unwrap();
     LeaseService::new(&store)
         .acquire(
-            &LeaseAcquireRequest::new(projected.clone()),
+            &LeaseAcquireRequest::new(projected.clone())
+                .with_execution_scope(ExecutionScope::task(task_id())),
             &AdmissionFacts {
                 free_disk_bytes: 100 * 1024 * 1024 * 1024,
                 total_disk_bytes: 200 * 1024 * 1024 * 1024,
@@ -1739,8 +1754,12 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
     drop(transfer);
     drop(admission);
 
-    let request =
-        TaskTurnRequest::new(mac_worker::job::SubmitRequest::new(projected), turn, prompt);
+    let request = TaskTurnRequest::new(
+        mac_worker::job::SubmitRequest::new(projected)
+            .with_execution_scope(ExecutionScope::task(task_id())),
+        turn,
+        prompt,
+    );
     let faulting_launcher = InlineTurnLauncher {
         store: store.clone(),
         fault: Some(SupervisorFaultPoint::AfterTerminalStatus),

@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs,
     os::unix::{
         fs::{FileTypeExt, PermissionsExt, symlink},
@@ -1367,6 +1367,80 @@ fn capability_ineligible_head_blocks_no_unrelated_worker() {
         claim.entry().job_id().to_string(),
         "00000000000000000000000000000067"
     );
+}
+
+#[test]
+fn two_slot_ceiling_admits_two_dispatching_rows_on_one_worker() {
+    let fixture = open_queue();
+    let first = owner(900);
+    let second = owner(901);
+    let third = owner(902);
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000090",
+            900,
+            first,
+        ))
+        .unwrap();
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000091",
+            901,
+            second,
+        ))
+        .unwrap();
+    fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000092",
+            902,
+            third,
+        ))
+        .unwrap();
+    let mut ceilings = BTreeMap::new();
+    ceilings.insert("mini-1".into(), 2);
+    assert!(
+        fixture
+            .store
+            .claim_next_with_slot_ceilings(first, &["mini-1".into()], 910, &ceilings)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .store
+            .claim_next_with_slot_ceilings(second, &["mini-1".into()], 911, &ceilings)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .store
+            .claim_next_with_slot_ceilings(third, &["mini-1".into()], 912, &ceilings)
+            .unwrap()
+            .is_none()
+    );
+    let dispatching = fixture
+        .store
+        .queue_snapshot()
+        .unwrap()
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.state(),
+                QueueState::Dispatching {
+                    selected_worker, ..
+                } if selected_worker == "mini-1"
+            )
+        })
+        .count();
+    assert_eq!(dispatching, 2);
 }
 
 #[test]

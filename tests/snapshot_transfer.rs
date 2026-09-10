@@ -1252,7 +1252,7 @@ fn post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_tran
     let changed =
         LeaseRecord::new(&changed_material, changed_material.fingerprint(), 2, 60_002).unwrap();
     let changed_bytes = serde_json::to_vec(&changed).unwrap();
-    let live_path = root.join("leases/heavy/lease.json");
+    let live_path = root.join("leases/slots/0/lease.json");
     fs::write(&live_path, &changed_bytes).unwrap();
     release_receiver.send(()).unwrap();
     receiver.join().unwrap().unwrap();

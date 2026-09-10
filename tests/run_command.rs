@@ -2608,6 +2608,8 @@ fn ready_probe() -> ProbeResponse {
         capabilities: vec!["declared-capability".into(), "project-capability".into()],
         agent_facts: None,
         facts_age_millis: None,
+        configured_slots: 0,
+        busy_slots: 0,
     }
 }
 

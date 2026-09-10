@@ -20,8 +20,9 @@ use mac_worker::{
     error::WorkerError,
     host_store::{HostStore, HostStoreWritePoint},
     job::{
-        ClientId, CommandSpec, HostControlError, JobId, JobStatus, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseRecord, LeaseToken, RequestFingerprintMaterial,
+        ClientId, CommandSpec, ExecutionScope, HostControlError, JobId, JobStatus,
+        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
+        RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService, SlotState},
     paths::PathLayout,
@@ -341,7 +342,7 @@ fn exact_retry_compares_live_fields_to_independently_recomputed_request() {
     LeaseService::new(&store)
         .acquire(&req, &healthy(), 10)
         .unwrap();
-    let path = root.join("leases/heavy/lease.json");
+    let path = root.join("leases/slots/0/lease.json");
     let original = fs::read_to_string(&path).unwrap();
     let altered = original.replacen(
         &format!("\"project_id\":\"{}\"", "a".repeat(64)),
@@ -609,7 +610,7 @@ fn setup_container_is_isolated_from_production_probe_and_lease_acquire() {
         fs::read(paths.data.join("setup/sentinel")).unwrap(),
         b"setup-owned"
     );
-    assert!(host_root.join("leases/heavy/lease.json").is_file());
+    assert!(host_root.join("leases/slots/0/lease.json").is_file());
     let entries = fs::read_dir(&paths.data)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -686,7 +687,7 @@ fn every_lease_crash_boundary_leaves_absent_or_complete_live_state() {
                 "published state must be complete at {point:?}"
             );
             assert_eq!(
-                fs::metadata(root.join("leases/heavy/lease.json"))
+                fs::metadata(root.join("leases/slots/0/lease.json"))
                     .unwrap()
                     .permissions()
                     .mode()
@@ -706,7 +707,7 @@ fn after_cleanup_intent_commit_acquire_leftover_retries() {
     let store = HostStore::open(&root).unwrap();
     let req = request(1);
     let leftover = root
-        .join("leases")
+        .join("leases/slots")
         .join(format!(".acquire-{}", req.material().job_id()));
     fs::create_dir(&leftover).unwrap();
     fs::set_permissions(&leftover, fs::Permissions::from_mode(0o700)).unwrap();
@@ -715,7 +716,7 @@ fn after_cleanup_intent_commit_acquire_leftover_retries() {
     fs::set_permissions(&leftover_leaf, fs::Permissions::from_mode(0o600)).unwrap();
     fs::File::open(&leftover_leaf).unwrap().sync_all().unwrap();
     fs::File::open(&leftover).unwrap().sync_all().unwrap();
-    fs::File::open(root.join("leases"))
+    fs::File::open(root.join("leases/slots"))
         .unwrap()
         .sync_all()
         .unwrap();
@@ -731,7 +732,7 @@ fn after_cleanup_intent_commit_acquire_leftover_retries() {
     );
     assert_eq!(LeaseService::new(&faulted).load().unwrap(), None);
     assert!(!leftover.exists());
-    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    let namespace = root.join("leases/slots/.mac-worker-rooted-fs");
     assert_canonical_tree_delete_journal(&namespace);
     drop(faulted);
 
@@ -842,7 +843,7 @@ fn abandoned_lease_with_receipt(
 const CONCURRENCY_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn plant_leases_leftover(root: &Path, name: &str, leaf: &str, bytes: &[u8]) -> PathBuf {
-    let leftover = root.join("leases").join(name);
+    let leftover = root.join("leases/slots").join(name);
     fs::create_dir(&leftover).unwrap();
     fs::set_permissions(&leftover, fs::Permissions::from_mode(0o700)).unwrap();
     let leftover_leaf = leftover.join(leaf);
@@ -850,7 +851,7 @@ fn plant_leases_leftover(root: &Path, name: &str, leaf: &str, bytes: &[u8]) -> P
     fs::set_permissions(&leftover_leaf, fs::Permissions::from_mode(0o600)).unwrap();
     fs::File::open(&leftover_leaf).unwrap().sync_all().unwrap();
     fs::File::open(&leftover).unwrap().sync_all().unwrap();
-    fs::File::open(root.join("leases"))
+    fs::File::open(root.join("leases/slots"))
         .unwrap()
         .sync_all()
         .unwrap();
@@ -957,7 +958,7 @@ fn after_cleanup_intent_commit_release_leftover_keeps_heavy() {
             .unwrap();
     let (lease, receipt) = abandoned_lease_with_receipt(&store, 2);
     let leftover = root
-        .join("leases")
+        .join("leases/slots")
         .join(format!(".released-{}", lease.job_id()));
     fs::create_dir(&leftover).unwrap();
     fs::set_permissions(&leftover, fs::Permissions::from_mode(0o700)).unwrap();
@@ -966,7 +967,7 @@ fn after_cleanup_intent_commit_release_leftover_keeps_heavy() {
     fs::set_permissions(&leftover_leaf, fs::Permissions::from_mode(0o600)).unwrap();
     fs::File::open(&leftover_leaf).unwrap().sync_all().unwrap();
     fs::File::open(&leftover).unwrap().sync_all().unwrap();
-    fs::File::open(root.join("leases"))
+    fs::File::open(root.join("leases/slots"))
         .unwrap()
         .sync_all()
         .unwrap();
@@ -979,9 +980,9 @@ fn after_cleanup_intent_commit_release_leftover_keeps_heavy() {
         LeaseService::new(&store).load().unwrap(),
         Some(lease.clone())
     );
-    assert!(root.join("leases/heavy").is_dir());
+    assert!(root.join("leases/slots/0").is_dir());
     assert!(!leftover.exists());
-    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    let namespace = root.join("leases/slots/.mac-worker-rooted-fs");
     assert_canonical_tree_delete_journal(&namespace);
     drop(store);
 
@@ -1014,7 +1015,7 @@ fn after_cleanup_intent_commit_does_not_break_post_publish_retirement() {
             .join(format!(".released-{}", lease.job_id()))
             .exists()
     );
-    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    let namespace = root.join("leases/slots/.mac-worker-rooted-fs");
     if namespace.exists() {
         assert_eq!(fs::read_dir(&namespace).unwrap().count(), 0);
     }
@@ -1044,7 +1045,7 @@ fn two_acquirers_race_one_acquire_leftover_intent() {
     );
     assert_eq!(LeaseService::new(&faulted).load().unwrap(), None);
     assert!(!leftover.exists());
-    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    let namespace = root.join("leases/slots/.mac-worker-rooted-fs");
     assert_canonical_tree_delete_journal(&namespace);
     drop(faulted);
 
@@ -1060,9 +1061,9 @@ fn two_acquirers_race_one_acquire_leftover_intent() {
         .unwrap()
         .expect("exactly one canonical live lease");
     assert_eq!(live.job_id(), req.material().job_id());
-    assert!(root.join("leases/heavy/lease.json").is_file());
+    assert!(root.join("leases/slots/0/lease.json").is_file());
     assert!(!leftover.exists());
-    assert_no_acquire_leftovers(root.join("leases").as_path());
+    assert_no_acquire_leftovers(root.join("leases/slots").as_path());
     assert_journal_empty_or_absent(&namespace);
 
     for (label, outcome) in [("first", first_outcome), ("second", second_outcome)] {
@@ -1110,7 +1111,7 @@ fn two_job_leftovers_sharing_leases_stay_isolated() {
     );
     assert_eq!(LeaseService::new(&faulted).load().unwrap(), None);
     assert!(!leftover_a.exists());
-    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    let namespace = root.join("leases/slots/.mac-worker-rooted-fs");
     assert_canonical_tree_delete_journal(&namespace);
     assert_leftover_leaf_pin(&leftover_b, "leaf-b", &pin_b);
     let journal_pin = pin_tree(&namespace);
@@ -1182,7 +1183,7 @@ fn independent_hoststore_reopen_finishes_release_leftover() {
         "released-leaf",
         b"released-leftover",
     );
-    let heavy = root.join("leases/heavy");
+    let heavy = root.join("leases/slots/0");
     let error = LeaseService::new(&faulted)
         .release_after_cleanup(&lease, &receipt)
         .unwrap_err();
@@ -1193,7 +1194,7 @@ fn independent_hoststore_reopen_finishes_release_leftover() {
     );
     assert!(heavy.is_dir());
     assert!(!leftover.exists());
-    let namespace = root.join("leases/.mac-worker-rooted-fs");
+    let namespace = root.join("leases/slots/.mac-worker-rooted-fs");
     assert_canonical_tree_delete_journal(&namespace);
 
     let heavy_meta = fs::symlink_metadata(&heavy).unwrap();
@@ -1242,10 +1243,10 @@ fn corrupt_or_unsafe_live_lease_fails_closed_and_is_never_released() {
     LeaseService::new(&store)
         .acquire(&request(1), &healthy(), 1)
         .unwrap();
-    fs::write(root.join("leases/heavy/lease.json"), b"{}\n").unwrap();
+    fs::write(root.join("leases/slots/0/lease.json"), b"{}\n").unwrap();
 
     assert!(LeaseService::new(&store).load().is_err());
-    assert!(root.join("leases/heavy").exists());
+    assert!(root.join("leases/slots/0").exists());
 }
 
 #[test]
@@ -1256,13 +1257,13 @@ fn noncanonical_live_lease_json_fails_closed() {
     LeaseService::new(&store)
         .acquire(&request(1), &healthy(), 1)
         .unwrap();
-    let path = root.join("leases/heavy/lease.json");
+    let path = root.join("leases/slots/0/lease.json");
     let mut bytes = fs::read(&path).unwrap();
     bytes.push(b'\n');
     fs::write(&path, bytes).unwrap();
 
     assert!(LeaseService::new(&store).load().is_err());
-    assert!(root.join("leases/heavy").exists());
+    assert!(root.join("leases/slots/0").exists());
 }
 
 #[test]
@@ -1283,7 +1284,7 @@ fn abandoned_disposition_hashes_the_token_and_public_occupancy_omits_it() {
     LeaseService::new(&other)
         .acquire(&req, &healthy(), 1)
         .unwrap();
-    let private_lease = fs::read_to_string(other_root.join("leases/heavy/lease.json")).unwrap();
+    let private_lease = fs::read_to_string(other_root.join("leases/slots/0/lease.json")).unwrap();
     assert!(!private_lease.contains("cargo"));
     assert!(!private_lease.contains("test"));
     let public = serde_json::to_string(&LeaseService::new(&other).occupancy().unwrap()).unwrap();
@@ -1391,4 +1392,54 @@ fn hidden_lease_acquire_failures_are_versioned_and_capacity_typed() {
 fn raw_lease_status_and_release_are_not_cli_operations() {
     assert!(Cli::try_parse_from(["worker", "host", "lease-status"]).is_err());
     assert!(Cli::try_parse_from(["worker", "host", "lease-release"]).is_err());
+}
+
+#[test]
+fn two_distinct_jobs_publish_concurrently_on_two_slots() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("host");
+    let store = HostStore::open(&root).unwrap();
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    drop(store);
+
+    let first_req = request(31);
+    let second_req = request(32);
+    let barrier = Arc::new(Barrier::new(2));
+    let first = spawn_independent_acquire(root.clone(), first_req.clone(), Arc::clone(&barrier), 2);
+    let second = spawn_independent_acquire(root.clone(), second_req.clone(), barrier, 3);
+    let first_outcome = join_bounded(first);
+    let second_outcome = join_bounded(second);
+    assert!(
+        matches!(first_outcome, Ok(LeaseAcquireResponse::Acquired { .. })),
+        "{first_outcome:?}"
+    );
+    assert!(
+        matches!(second_outcome, Ok(LeaseAcquireResponse::Acquired { .. })),
+        "{second_outcome:?}"
+    );
+
+    let observer = HostStore::open(&root).unwrap();
+    let occupied = LeaseService::new(&observer).occupied_slots().unwrap();
+    assert_eq!(occupied.len(), 2);
+    let third = LeaseService::new(&observer)
+        .acquire(&request(33), &healthy(), 4)
+        .unwrap_err();
+    assert_eq!(third.public_code(), "CAPACITY_BUSY");
+}
+
+#[test]
+fn same_task_id_second_acquire_is_workspace_busy() {
+    let temp = tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    let task = mac_worker::task::TaskId::new(uuid::Uuid::from_u128(7));
+    let first = request(41).with_execution_scope(ExecutionScope::task(task));
+    let second = request(42).with_execution_scope(ExecutionScope::task(task));
+    LeaseService::new(&store)
+        .acquire(&first, &healthy(), 1)
+        .unwrap();
+    let error = LeaseService::new(&store)
+        .acquire(&second, &healthy(), 2)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "WORKSPACE_BUSY");
 }

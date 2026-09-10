@@ -1169,6 +1169,8 @@ fn probe(slot_state: SlotState, active_turn: Option<TurnId>) -> ProbeResponse {
         capabilities: vec!["swift".into()],
         agent_facts: None,
         facts_age_millis: None,
+        configured_slots: 0,
+        busy_slots: 0,
     }
 }
 

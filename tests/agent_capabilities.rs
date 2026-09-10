@@ -200,6 +200,8 @@ fn probe_bytes() -> Vec<u8> {
         capabilities: vec!["darwin-arm64".into()],
         agent_facts: None,
         facts_age_millis: None,
+        configured_slots: 0,
+        busy_slots: 0,
     })
     .unwrap()
 }
@@ -245,6 +247,8 @@ fn raw_health_without_origin() -> WorkerHealth {
             capabilities: vec!["darwin-arm64".into()],
             agent_facts: None,
             facts_age_millis: None,
+            configured_slots: 0,
+            busy_slots: 0,
         }),
         missing_capabilities: Vec::new(),
         error_code: None,

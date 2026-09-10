@@ -142,6 +142,8 @@ impl ProcessRunner for FleetRunner {
                     capabilities: Vec::new(),
                     agent_facts: None,
                     facts_age_millis: None,
+                    configured_slots: 0,
+                    busy_slots: 0,
                 })
                 .unwrap(),
             );

@@ -22,7 +22,7 @@ use mac_worker::{
         GitServerExecutor, GitTransport, HostGitService, ReceivePackComponents,
         UploadPackComponents,
     },
-    host_store::{HOST_LAYOUT_VERSION, HostStore},
+    host_store::{HOST_LAYOUT_VERSION, HostStore, PREVIOUS_HOST_LAYOUT_VERSION},
     job::{
         ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseToken, RequestFingerprintMaterial,
     },
@@ -536,7 +536,7 @@ fn outdated_layout_fails_closed_until_hidden_setup_migrates_it() {
     let layout = root.join("layout.json");
     let bytes = fs::read(&layout).unwrap();
     let current = format!("\"version\":{HOST_LAYOUT_VERSION}");
-    let old = "\"version\":1".to_string();
+    let old = format!("\"version\":{PREVIOUS_HOST_LAYOUT_VERSION}");
     let bytes = String::from_utf8(bytes).unwrap().replace(&current, &old);
     fs::write(&layout, bytes).unwrap();
 
@@ -584,6 +584,124 @@ fn outdated_layout_fails_closed_until_hidden_setup_migrates_it() {
         HOST_LAYOUT_VERSION
     );
     assert!(HostStore::open(&root).is_ok());
+}
+
+#[test]
+fn layout_one_cannot_jump_to_layout_three() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("data/mac-worker/host");
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
+    HostStore::open(&root).unwrap();
+    let layout = root.join("layout.json");
+    let bytes = fs::read(&layout).unwrap();
+    let current = format!("\"version\":{HOST_LAYOUT_VERSION}");
+    let old = "\"version\":1".to_string();
+    let bytes = String::from_utf8(bytes).unwrap().replace(&current, &old);
+    fs::write(&layout, bytes).unwrap();
+
+    let error = HostStore::migrate_layout(&root).unwrap_err();
+    assert_eq!(error.public_code(), "HOST_LAYOUT_OUTDATED");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&layout).unwrap()).unwrap()["version"],
+        1
+    );
+}
+
+fn plant_genuine_layout2(root: &Path, heavy: bool) {
+    let leases = root.join("leases");
+    let slots = leases.join("slots");
+    if slots.exists() {
+        fs::remove_dir_all(&slots).unwrap();
+    }
+    let capacity = leases.join("capacity.json");
+    if capacity.exists() {
+        fs::remove_file(&capacity).unwrap();
+    }
+    if heavy {
+        let heavy_dir = leases.join("heavy");
+        fs::create_dir_all(&heavy_dir).unwrap();
+        fs::set_permissions(&heavy_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(heavy_dir.join("lease.json"), b"layout2-heavy").unwrap();
+    }
+    let layout = root.join("layout.json");
+    let current = format!("\"version\":{HOST_LAYOUT_VERSION}");
+    let old = format!("\"version\":{PREVIOUS_HOST_LAYOUT_VERSION}");
+    let bytes = String::from_utf8(fs::read(&layout).unwrap())
+        .unwrap()
+        .replace(&current, &old);
+    fs::write(&layout, bytes).unwrap();
+}
+
+#[test]
+fn genuine_layout2_migrates_through_hidden_cli_and_stale_open_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("data/mac-worker/host");
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
+    HostStore::open(&root).unwrap();
+    plant_genuine_layout2(&root, false);
+    assert!(!root.join("leases/slots").exists());
+    assert!(!root.join("leases/capacity.json").exists());
+    assert!(root.join("leases/capacity.lock").is_file());
+    assert_eq!(
+        match HostStore::open(&root) {
+            Ok(_) => panic!("outdated host layout unexpectedly opened"),
+            Err(error) => error.public_code(),
+        },
+        "HOST_LAYOUT_OUTDATED"
+    );
+
+    let runtime = RuntimeContext::isolated(
+        [
+            ("XDG_CONFIG_HOME".into(), temp.path().join("config").into()),
+            ("XDG_DATA_HOME".into(), temp.path().join("data").into()),
+        ]
+        .into_iter()
+        .collect(),
+        temp.path().join("home"),
+        temp.path().to_path_buf(),
+    );
+    let cli = Cli::try_parse_from(["worker", "host", "migrate-layout"]).unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_io_in_context(
+        cli,
+        &RecordingRunner::default(),
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(root.join("layout.json")).unwrap())
+            .unwrap()["version"],
+        HOST_LAYOUT_VERSION
+    );
+    assert!(root.join("leases/slots").is_dir());
+    assert!(root.join("leases/capacity.json").is_file());
+    assert!(HostStore::open(&root).is_ok());
+}
+
+#[test]
+fn genuine_layout2_live_heavy_residue_is_refused_and_bytes_are_kept() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("data/mac-worker/host");
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
+    HostStore::open(&root).unwrap();
+    plant_genuine_layout2(&root, true);
+    let leftover = fs::read(root.join("leases/heavy/lease.json")).unwrap();
+    assert_eq!(
+        HostStore::migrate_layout(&root).unwrap_err().public_code(),
+        "HOST_UPGRADE_DRAIN_REQUIRED"
+    );
+    assert_eq!(
+        fs::read(root.join("leases/heavy/lease.json")).unwrap(),
+        leftover
+    );
+    assert!(!root.join("leases/slots").exists());
+    assert!(!root.join("leases/capacity.json").exists());
+    let layout: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("layout.json")).unwrap()).unwrap();
+    assert_eq!(layout["version"], PREVIOUS_HOST_LAYOUT_VERSION);
 }
 
 #[test]

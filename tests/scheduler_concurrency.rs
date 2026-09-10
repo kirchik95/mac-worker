@@ -2,17 +2,17 @@
 mod support;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     os::unix::process::ExitStatusExt,
     process::ExitStatus,
     sync::{
         Arc, Barrier, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::{
@@ -24,22 +24,26 @@ use mac_worker::{
     error::WorkerError,
     host_store::HostStore,
     job::{
-        AdmissionObservation, CommandSpec, HostControlError, JobId, JobMeta, JobStatus,
-        LeaseAcquireRequest, LeaseAcquireResponse, LeaseToken, LocalJobRecord, ProcessIdentity,
-        QueueEntry, QueueEntryKind, QueueRunReference, QueueState, RequestFingerprintMaterial,
-        RunId, StatusResponse, SubmitRequest, SubmitResponse,
+        AdmissionObservation, CommandSpec, FleetReconcileJobResult, FleetReconcileRequest,
+        FleetReconcileResponse, HostControlError, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseToken, LocalJobRecord, ProcessIdentity, QueueEntry,
+        QueueEntryKind, QueueRunReference, QueueState, RequestFingerprintMaterial, RunId,
+        StatusResponse, SubmitRequest, SubmitResponse,
     },
-    lease::{AdmissionFacts, LeaseService, SlotState},
+    lease::{AdmissionFacts, LeaseService},
     paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
-    run::{JobFollower, RunObserver, RunRequest, RunService, RunStage},
+    run::{JobFollower, RunObserver, RunRequest, RunService, RunStage, SchedulerRuntime},
     scheduler::{CandidateSlot, WorkerPreference},
+    scheduler_adapter::SchedulerProbeAdapter,
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        SystemProcessInspector,
     },
     transfer::HostOperation,
+    transport::{SshTransport, WorkersService},
 };
 use support::GitRepo;
 
@@ -242,6 +246,7 @@ fn host_error_process(code: &'static str, message: String) -> Result<ProcessResu
 struct ProductionLeaseRunner {
     host: HostStore,
     lease_acquires: AtomicUsize,
+    acquires: Mutex<HashMap<JobId, LeaseAcquireRequest>>,
 }
 
 impl ProductionLeaseRunner {
@@ -249,11 +254,36 @@ impl ProductionLeaseRunner {
         Self {
             host,
             lease_acquires: AtomicUsize::new(0),
+            acquires: Mutex::new(HashMap::new()),
         }
     }
 
     fn lease_acquires(&self) -> usize {
         self.lease_acquires.load(Ordering::SeqCst)
+    }
+
+    fn accepted_jobs(&self) -> HashSet<JobId> {
+        self.acquires.lock().unwrap().keys().copied().collect()
+    }
+
+    fn abandon_and_release(&self, job_id: JobId) -> Result<(), WorkerError> {
+        let request = self
+            .acquires
+            .lock()
+            .unwrap()
+            .get(&job_id)
+            .cloned()
+            .ok_or_else(|| {
+                WorkerError::Protocol(
+                    "production test runner is missing the acquire request".into(),
+                )
+            })?;
+        self.host.record_abandoned(&request, 200)?;
+        let Some(lease) = LeaseService::new(&self.host).load_for_job(job_id)? else {
+            return Ok(());
+        };
+        let receipt = self.host.cleanup_job_owned(&lease)?;
+        LeaseService::new(&self.host).release_after_cleanup(&lease, &receipt)
     }
 }
 
@@ -276,29 +306,34 @@ impl ProcessRunner for ProductionLeaseRunner {
             .and_then(|argument| argument.to_str())
             .unwrap_or_default();
         match operation {
-            "~/.local/bin/worker host probe" => canonical_process(&ProbeResponse {
-                protocol_version: PROTOCOL_VERSION,
-                supervision_version: SUPERVISION_VERSION,
-                hostname: "scheduler-test-host".into(),
-                arch: "arm64".into(),
-                os_version: "26.2".into(),
-                free_disk_bytes: 100 * 1024 * 1024 * 1024,
-                total_disk_bytes: 250 * 1024 * 1024 * 1024,
-                memory_pressure: MemoryPressure::Normal,
-                swap_used_bytes: Some(0),
-                available_memory_bytes: Some(12 * 1024 * 1024 * 1024),
-                cpu_counters: Some(CpuCounters {
-                    user_ticks: 10,
-                    system_ticks: 20,
-                    idle_ticks: 30,
-                    nice_ticks: 40,
-                }),
-                slot_state: SlotState::Idle,
-                active_lease: None,
-                capabilities: Vec::new(),
-                agent_facts: None,
-                facts_age_millis: None,
-            }),
+            "~/.local/bin/worker host probe" => {
+                let occupancy = LeaseService::new(&self.host).occupancy()?;
+                canonical_process(&ProbeResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    supervision_version: SUPERVISION_VERSION,
+                    hostname: "scheduler-test-host".into(),
+                    arch: "arm64".into(),
+                    os_version: "26.2".into(),
+                    free_disk_bytes: 100 * 1024 * 1024 * 1024,
+                    total_disk_bytes: 250 * 1024 * 1024 * 1024,
+                    memory_pressure: MemoryPressure::Normal,
+                    swap_used_bytes: Some(0),
+                    available_memory_bytes: Some(12 * 1024 * 1024 * 1024),
+                    cpu_counters: Some(CpuCounters {
+                        user_ticks: 10,
+                        system_ticks: 20,
+                        idle_ticks: 30,
+                        nice_ticks: 40,
+                    }),
+                    slot_state: occupancy.slot_state,
+                    active_lease: occupancy.active_lease,
+                    capabilities: Vec::new(),
+                    agent_facts: None,
+                    facts_age_millis: None,
+                    configured_slots: occupancy.configured_slots,
+                    busy_slots: occupancy.busy_slots,
+                })
+            }
             value if value == HostOperation::LeaseAcquire.command() => {
                 let bytes = request.stdin.as_deref().ok_or_else(|| {
                     WorkerError::Protocol(
@@ -309,13 +344,21 @@ impl ProcessRunner for ProductionLeaseRunner {
                     serde_json::from_slice(bytes).map_err(|error| {
                         WorkerError::Protocol(format!("invalid lease request: {error}"))
                     })?;
-                self.lease_acquires.fetch_add(1, Ordering::SeqCst);
                 match LeaseService::new(&self.host).acquire(
                     &acquire,
                     &healthy_admission(),
                     acquire.material().created_at_millis(),
                 ) {
-                    Ok(response) => canonical_process(&response),
+                    Ok(response) => {
+                        if matches!(response, LeaseAcquireResponse::Acquired { .. }) {
+                            let job_id = acquire.material().job_id();
+                            let mut accepted = self.acquires.lock().unwrap();
+                            if accepted.insert(job_id, acquire).is_none() {
+                                self.lease_acquires.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        canonical_process(&response)
+                    }
                     Err(WorkerError::Capacity { code, message, .. }) => {
                         host_error_process(code, message.into_owned())
                     }
@@ -357,6 +400,27 @@ impl ProcessRunner for ProductionLeaseRunner {
                     meta: Box::new(meta),
                     status: JobStatus::accepted(submit.material().created_at_millis() + 1)?,
                 })
+            }
+            value if value == HostOperation::Reconcile.command() => {
+                let bytes = request.stdin.as_deref().ok_or_else(|| {
+                    WorkerError::Protocol(
+                        "fleet reconcile request was missing in test transport".into(),
+                    )
+                })?;
+                let reconcile: FleetReconcileRequest =
+                    serde_json::from_slice(bytes).map_err(|error| {
+                        WorkerError::Protocol(format!("invalid fleet reconcile request: {error}"))
+                    })?;
+                let results = reconcile
+                    .known_job_ids()
+                    .iter()
+                    .map(|job_id| FleetReconcileJobResult::Error {
+                        job_id: *job_id,
+                        error: HostControlError::new("JOB_NOT_FOUND", "job ID is not indexed")
+                            .expect("JOB_NOT_FOUND is a valid host control error"),
+                    })
+                    .collect();
+                canonical_process(&FleetReconcileResponse::new(results).unwrap())
             }
             _ => panic!("unexpected production-path test request: {request:?}"),
         }
@@ -438,13 +502,17 @@ fn production_run_paths(temp: &tempfile::TempDir) -> PathLayout {
 }
 
 fn production_run_config() -> Config {
+    production_run_config_with_slots(1)
+}
+
+fn production_run_config_with_slots(slots: u8) -> Config {
     Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
         workers: vec![WorkerEntry {
             name: "mini-a".into(),
             ssh: "mini-a".into(),
-            slots: 1,
+            slots,
             capabilities: Vec::new(),
             remote_binary: "~/.local/bin/worker".into(),
             herdr: false,
@@ -452,16 +520,89 @@ fn production_run_config() -> Config {
     }
 }
 
+fn wait_path_diagnostics(
+    label: &str,
+    store: &ClientStateStore,
+    host: &HostStore,
+    runner: &ProductionLeaseRunner,
+    config: &Config,
+) -> String {
+    let occupancy = LeaseService::new(host).occupancy().unwrap();
+    let occupied = LeaseService::new(host).occupied_slots().unwrap();
+    let inspect = WorkersService::new(SshTransport::new(runner)).inspect(config);
+    let health = &inspect.workers[0];
+    let adapter = SchedulerProbeAdapter::observations(config, &inspect.workers)
+        .map(|facts| {
+            facts
+                .iter()
+                .map(|candidate| {
+                    format!(
+                        "ready={} slot={:?} worker={}",
+                        candidate.ready(),
+                        candidate.slot(),
+                        candidate.worker_name()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_else(|error| format!("adapter error: {error}"));
+    let queue = store
+        .queue_snapshot()
+        .unwrap()
+        .entries()
+        .iter()
+        .map(|entry| {
+            format!(
+                "job={} state={:?} owner={:?}",
+                entry.job_id(),
+                entry.state(),
+                entry.owner_opt()
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "{label}: occupancy slot={:?} configured={} busy={} active_lease={} occupied_jobs={} health={:?} error={:?}/{:?} probe_slots={:?}/{:?} probe_active={} free_slot={:?} adapter=[{adapter}] queue={queue:?}",
+        occupancy.slot_state,
+        occupancy.configured_slots,
+        occupancy.busy_slots,
+        occupancy.active_lease.is_some(),
+        occupied.len(),
+        health.status,
+        health.error_code,
+        health.error_message,
+        health.probe.as_ref().map(|probe| probe.configured_slots),
+        health.probe.as_ref().map(|probe| probe.busy_slots),
+        health
+            .probe
+            .as_ref()
+            .and_then(|probe| probe.active_lease.as_ref())
+            .is_some(),
+        health
+            .probe
+            .as_ref()
+            .map(ProbeResponse::has_free_execution_slot),
+    )
+}
+
 fn production_run_request(repo: &GitRepo) -> RunRequest {
+    production_run_request_with(repo, false, "scheduler-production-path")
+}
+
+fn production_run_request_with(
+    repo: &GitRepo,
+    wait_for_capacity: bool,
+    command: &str,
+) -> RunRequest {
     RunRequest {
         preference: WorkerPreference::Pinned {
             worker: "mini-a".into(),
         },
-        wait_for_capacity: false,
+        wait_for_capacity,
         project: repo.root().to_path_buf(),
         cli_includes: Vec::new(),
         timeout: None,
-        command: CommandSpec::argv(vec!["scheduler-production-path".into()]).unwrap(),
+        command: CommandSpec::argv(vec![command.into()]).unwrap(),
     }
 }
 
@@ -1041,6 +1182,272 @@ fn claim_lease_handoff_matrix_uses_production_run_dispatch() {
         );
     }
     assert_eq!(schedule_counts, [25, 25, 25, 25]);
+}
+
+#[test]
+fn two_slot_production_dispatch_accepts_two_jobs_and_cancel_frees_one_slot() {
+    // Break caught: config slots=2 and host capacity 2 are not both carried
+    // through RunService + production lease acquire, so a second job parks or
+    // a third still acquires, or cancelling one does not free exactly one slot.
+    let repo = production_run_repo();
+    let temp = tempfile::tempdir().unwrap();
+    let paths = production_run_paths(&temp);
+    let store = Arc::new(ClientStateStore::open(&paths.state).unwrap());
+    let host = Arc::new(HostStore::open(&paths.data.join("host")).unwrap());
+    LeaseService::new(&host).set_slot_count(2).unwrap();
+    let runner = Arc::new(ProductionLeaseRunner::new((*host).clone()));
+    let config = production_run_config_with_slots(2);
+    let start = Arc::new(Barrier::new(2));
+
+    let spawn = |command: &'static str| {
+        let run_store = Arc::clone(&store);
+        let run_runner = Arc::clone(&runner);
+        let run_paths = paths.clone();
+        let run_config = config.clone();
+        let run_request = production_run_request_with(&repo, false, command);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            let follower = SuccessfulRunFollower;
+            let service = RunService::with_follower(
+                &*run_runner,
+                &run_config,
+                &run_paths,
+                &run_store,
+                &follower,
+            );
+            service.submit_and_follow(run_request, false, &mut Vec::new(), &mut Vec::new())
+        })
+    };
+
+    let first = spawn("scheduler-two-slot-first");
+    let second = spawn("scheduler-two-slot-second");
+    let first = first
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("first production dispatch failed: {error}"));
+    let second = second
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("second production dispatch failed: {error}"));
+    assert_ne!(first.report.job_id, second.report.job_id);
+    let occupied = LeaseService::new(&host).occupied_slots().unwrap();
+    let occupied_ids: HashSet<_> = occupied.iter().map(|slot| slot.lease.job_id()).collect();
+    assert_eq!(occupied_ids.len(), 2);
+    assert_eq!(
+        runner.accepted_jobs(),
+        occupied_ids,
+        "idempotent Acquired retries must not count as extra accepted jobs"
+    );
+
+    let third =
+        RunService::with_follower(&*runner, &config, &paths, &store, &SuccessfulRunFollower)
+            .submit_and_follow(
+                production_run_request_with(&repo, false, "scheduler-two-slot-third"),
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+    assert_eq!(third.public_code(), "CAPACITY_BUSY");
+    assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
+    assert_eq!(runner.accepted_jobs().len(), 2);
+
+    runner
+        .abandon_and_release(first.report.job_id)
+        .unwrap_or_else(|error| panic!("production cancel/release failed: {error}"));
+    assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 1);
+    assert_eq!(
+        LeaseService::new(&host)
+            .load_for_job(second.report.job_id)
+            .unwrap()
+            .unwrap()
+            .job_id(),
+        second.report.job_id
+    );
+
+    let fourth =
+        RunService::with_follower(&*runner, &config, &paths, &store, &SuccessfulRunFollower)
+            .submit_and_follow(
+                production_run_request_with(&repo, false, "scheduler-two-slot-fourth"),
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap_or_else(|error| panic!("fourth production dispatch failed: {error}"));
+    assert_eq!(runner.accepted_jobs().len(), 3);
+    let occupied = LeaseService::new(&host).occupied_slots().unwrap();
+    assert_eq!(occupied.len(), 2);
+    let live: HashSet<_> = occupied.iter().map(|slot| slot.lease.job_id()).collect();
+    assert!(live.contains(&second.report.job_id));
+    assert!(live.contains(&fourth.report.job_id));
+    assert!(!live.contains(&first.report.job_id));
+}
+
+struct CapacityWaitRuntime {
+    now_millis: AtomicU64,
+    owner: ProcessIdentity,
+    waiting: Mutex<Option<mpsc::Sender<()>>>,
+    resume: Mutex<mpsc::Receiver<()>>,
+    sleeps: AtomicUsize,
+}
+
+impl CapacityWaitRuntime {
+    fn new(waiting: mpsc::Sender<()>, resume: mpsc::Receiver<()>) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock predates Unix epoch")
+            .as_millis() as u64;
+        let owner = SystemProcessInspector
+            .identity_for_pid(std::process::id())
+            .expect("waiting dispatcher must match the live client-state inspector");
+        Self {
+            now_millis: AtomicU64::new(now),
+            owner,
+            waiting: Mutex::new(Some(waiting)),
+            resume: Mutex::new(resume),
+            sleeps: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl SchedulerRuntime for CapacityWaitRuntime {
+    fn now_millis(&self) -> Result<u64, WorkerError> {
+        Ok(self.now_millis.load(Ordering::SeqCst))
+    }
+
+    fn process_identity(&self) -> Result<ProcessIdentity, WorkerError> {
+        Ok(self.owner)
+    }
+
+    fn sleep(&self, _duration: Duration) {
+        let n = self.sleeps.fetch_add(1, Ordering::SeqCst);
+        const WAIT_SLEEP_BUDGET: usize = 8;
+        if n >= WAIT_SLEEP_BUDGET {
+            panic!("waiting dispatcher exceeded {WAIT_SLEEP_BUDGET} capacity polls");
+        }
+        if let Some(waiting) = self.waiting.lock().unwrap().take() {
+            waiting
+                .send(())
+                .expect("capacity wait observer disappeared");
+            self.resume
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("capacity wait resume disappeared");
+        }
+        // Expire the cached Busy observation so the next probe sees the freed slot.
+        self.now_millis.fetch_add(3_000, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn two_slot_production_dispatch_waits_for_a_freed_slot_and_keeps_the_peer() {
+    // Break caught: wait_for_capacity=true does not observe a full two-slot
+    // host, or a freed slot lets the waiter in while dropping the live peer.
+    let repo = production_run_repo();
+    let temp = tempfile::tempdir().unwrap();
+    let paths = production_run_paths(&temp);
+    let store = Arc::new(ClientStateStore::open(&paths.state).unwrap());
+    let host = Arc::new(HostStore::open(&paths.data.join("host")).unwrap());
+    LeaseService::new(&host).set_slot_count(2).unwrap();
+    let runner = Arc::new(ProductionLeaseRunner::new((*host).clone()));
+    let config = production_run_config_with_slots(2);
+    let start = Arc::new(Barrier::new(2));
+
+    let spawn = |command: &'static str| {
+        let run_store = Arc::clone(&store);
+        let run_runner = Arc::clone(&runner);
+        let run_paths = paths.clone();
+        let run_config = config.clone();
+        let run_request = production_run_request_with(&repo, false, command);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            let follower = SuccessfulRunFollower;
+            let service = RunService::with_follower(
+                &*run_runner,
+                &run_config,
+                &run_paths,
+                &run_store,
+                &follower,
+            );
+            service.submit_and_follow(run_request, false, &mut Vec::new(), &mut Vec::new())
+        })
+    };
+
+    let first = spawn("scheduler-two-slot-wait-first");
+    let second = spawn("scheduler-two-slot-wait-second");
+    let first = first
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("first production dispatch failed: {error}"));
+    let second = second
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("second production dispatch failed: {error}"));
+    assert_ne!(first.report.job_id, second.report.job_id);
+    assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
+
+    let (waiting_tx, waiting_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let wait_store = Arc::clone(&store);
+    let wait_runner = Arc::clone(&runner);
+    let wait_paths = paths.clone();
+    let wait_config = config.clone();
+    let wait_request = production_run_request_with(&repo, true, "scheduler-two-slot-waiting-third");
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let runtime = CapacityWaitRuntime::new(waiting_tx, resume_rx);
+        let follower = SuccessfulRunFollower;
+        let result = RunService::with_follower(
+            &*wait_runner,
+            &wait_config,
+            &wait_paths,
+            &*wait_store,
+            &follower,
+        )
+        .with_scheduler_runtime(&runtime)
+        .submit_and_follow(wait_request, false, &mut Vec::new(), &mut Vec::new());
+        let _ = done_tx.send(result);
+    });
+    waiting_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("waiting third job never blocked on a full two-slot host");
+    eprintln!(
+        "{}",
+        wait_path_diagnostics("blocked", &store, &host, &runner, &config)
+    );
+    assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
+    assert_eq!(
+        LeaseService::new(&host)
+            .load_for_job(second.report.job_id)
+            .unwrap()
+            .unwrap()
+            .job_id(),
+        second.report.job_id
+    );
+
+    runner
+        .abandon_and_release(first.report.job_id)
+        .unwrap_or_else(|error| panic!("production cancel/release failed: {error}"));
+    assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 1);
+    let after_release = wait_path_diagnostics("after-release", &store, &host, &runner, &config);
+    eprintln!("{after_release}");
+    resume_tx.send(()).expect("waiting third resume failed");
+
+    let third = match done_rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(result) => result
+            .unwrap_or_else(|error| panic!("waiting third production dispatch failed: {error}")),
+        Err(_) => panic!("waiting third timed out; {after_release}"),
+    };
+    assert_ne!(third.report.job_id, second.report.job_id);
+    let occupied = LeaseService::new(&host).occupied_slots().unwrap();
+    assert_eq!(occupied.len(), 2);
+    let live: HashSet<_> = occupied.iter().map(|slot| slot.lease.job_id()).collect();
+    assert!(live.contains(&second.report.job_id));
+    assert!(live.contains(&third.report.job_id));
+    assert!(!live.contains(&first.report.job_id));
 }
 
 #[test]

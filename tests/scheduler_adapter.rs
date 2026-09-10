@@ -6,6 +6,7 @@ use mac_worker::{
     protocol::{
         CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
     },
+    scheduler::CandidateSlot,
     scheduler_adapter::SchedulerProbeAdapter,
 };
 
@@ -53,6 +54,8 @@ fn ready_health() -> WorkerHealth {
             capabilities: vec!["node".into()],
             agent_facts: None,
             facts_age_millis: None,
+            configured_slots: 0,
+            busy_slots: 0,
         }),
         missing_capabilities: Vec::new(),
         error_code: None,
@@ -200,4 +203,24 @@ fn a_turn_auth_failure_reason_is_not_an_agent_capability() {
         "{:?}",
         observations[0].capabilities()
     );
+}
+
+#[test]
+fn one_busy_slot_on_a_two_slot_probe_stays_idle_for_admission() {
+    let mut health = ready_health();
+    let probe = health.probe.as_mut().unwrap();
+    probe.slot_state = SlotState::Busy;
+    probe.configured_slots = 2;
+    probe.busy_slots = 1;
+    let facts = SchedulerProbeAdapter::observations(&config(), &[health]).unwrap();
+    assert_eq!(facts[0].slot(), CandidateSlot::Idle);
+    assert!(probe_has_free_slot());
+}
+
+fn probe_has_free_slot() -> bool {
+    let mut probe = ready_health().probe.unwrap();
+    probe.configured_slots = 2;
+    probe.busy_slots = 1;
+    probe.slot_state = SlotState::Busy;
+    probe.has_free_execution_slot()
 }

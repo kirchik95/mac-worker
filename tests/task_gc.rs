@@ -10,8 +10,8 @@ use mac_worker::{
     agent::{AgentKind, PermissionPolicy},
     host_store::{HostGc, HostStore},
     job::{
-        ClientId, CommandSpec, JobId, JobMeta, JobStatus, LeaseAcquireRequest, LeaseToken,
-        RequestFingerprintMaterial,
+        ClientId, CommandSpec, ExecutionScope, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
+        LeaseToken, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
     process::SystemProcessRunner,
@@ -47,8 +47,8 @@ fn client_id() -> ClientId {
     ClientId::new(Uuid::from_u128(20))
 }
 
-fn lease_token() -> LeaseToken {
-    LeaseToken::new(Uuid::from_u128(30))
+fn lease_token(job: JobId) -> LeaseToken {
+    LeaseToken::new(Uuid::from_u128(job.as_uuid().as_u128().wrapping_add(30)))
 }
 
 fn lease_request(job: JobId) -> LeaseAcquireRequest {
@@ -56,7 +56,7 @@ fn lease_request(job: JobId) -> LeaseAcquireRequest {
         RequestFingerprintMaterial::new(
             job,
             client_id(),
-            lease_token(),
+            lease_token(job),
             1,
             "mini-1".into(),
             PROJECT_ID.into(),
@@ -268,7 +268,19 @@ fn fixture() -> (TempDir, HostStore, GitRepo, BaseOid) {
 }
 
 fn prepare_task(store: &HostStore, task: TaskId, job: JobId, base_oid: &BaseOid) {
-    acquire_lease(store, job);
+    let request = lease_request(job).with_execution_scope(ExecutionScope::task(task));
+    LeaseService::new(store)
+        .acquire(
+            &request,
+            &AdmissionFacts {
+                free_disk_bytes: 100 * 1024 * 1024 * 1024,
+                total_disk_bytes: 200 * 1024 * 1024 * 1024,
+                memory_pressure: MemoryPressure::Normal,
+                swap_used_bytes: Some(0),
+            },
+            1,
+        )
+        .unwrap();
     let admission = store.admission_lock(job).unwrap();
     let transfer = store.transfer_lock_after(&admission, job).unwrap();
     TaskStore::new(store, &SystemProcessRunner)
@@ -383,6 +395,117 @@ fn gc_closes_idle_open_task_but_preserves_result_branch_and_metadata() {
         mirror.path(),
         &format!("refs/heads/task/{task}")
     ));
+}
+
+#[test]
+fn gc_does_not_close_an_open_task_while_its_task_scope_lease_is_live() {
+    let (_temp, store, _source, base_oid) = fixture();
+    let task = task_id(1);
+    let job = job_id(1);
+    prepare_task(&store, task, job, &base_oid);
+    rewrite_status(&store, task, TaskState::Open, 1);
+    let now = 1 + mac_worker::host_store::TASK_RETENTION_MILLIS;
+    let preview = HostGc::new(&store, &SystemProcessRunner)
+        .preview_at(now)
+        .unwrap();
+    assert!(
+        preview
+            .candidates()
+            .iter()
+            .all(|candidate| candidate.kind() != "task"
+                || candidate.reason() != "open task retention")
+    );
+    assert_eq!(
+        store.task_status(PROJECT_ID, task).unwrap().state(),
+        TaskState::Open
+    );
+    assert!(
+        store
+            .task_workspace_if_present(PROJECT_ID, task)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn gc_does_not_close_two_open_tasks_while_both_slot_leases_are_live() {
+    let (_temp, store, source, base_oid) = fixture();
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    let pushed = source.git(&[
+        "push",
+        mirror.path().to_str().unwrap(),
+        &format!("HEAD:refs/mac-worker/bases/{}", task_id(2)),
+    ]);
+    assert!(pushed.status.success());
+    prepare_task(&store, task_id(1), job_id(1), &base_oid);
+    prepare_task(&store, task_id(2), job_id(2), &base_oid);
+    rewrite_status(&store, task_id(1), TaskState::Open, 1);
+    rewrite_status(&store, task_id(2), TaskState::Open, 1);
+    assert_eq!(LeaseService::new(&store).occupied_slots().unwrap().len(), 2);
+    let now = 1 + mac_worker::host_store::TASK_RETENTION_MILLIS;
+    let preview = HostGc::new(&store, &SystemProcessRunner)
+        .preview_at(now)
+        .unwrap();
+    assert!(preview.candidates().iter().all(|candidate| {
+        candidate.kind() != "task" || candidate.reason() != "open task retention"
+    }));
+}
+
+#[test]
+fn gc_keeps_all_slot_records_when_a_slot_lease_is_unreadable() {
+    let (temp, store, source, base_oid) = fixture();
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    let pushed = source.git(&[
+        "push",
+        mirror.path().to_str().unwrap(),
+        &format!("HEAD:refs/mac-worker/bases/{}", task_id(2)),
+    ]);
+    assert!(pushed.status.success());
+    prepare_task(&store, task_id(1), job_id(1), &base_oid);
+    prepare_task(&store, task_id(2), job_id(2), &base_oid);
+    rewrite_status(&store, task_id(1), TaskState::Open, 1);
+    rewrite_status(&store, task_id(2), TaskState::Open, 1);
+    fs::write(
+        temp.path().join("host/leases/slots/0/lease.json"),
+        b"not-a-canonical-lease",
+    )
+    .unwrap();
+    let now = 1 + mac_worker::host_store::TASK_RETENTION_MILLIS;
+    let preview = HostGc::new(&store, &SystemProcessRunner)
+        .preview_at(now)
+        .unwrap();
+    assert!(
+        preview
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("lease record unreadable")),
+        "{preview:?}"
+    );
+    assert!(preview.candidates().iter().all(|candidate| {
+        candidate.kind() != "task" || candidate.reason() != "open task retention"
+    }));
+    assert_eq!(
+        store.task_status(PROJECT_ID, task_id(1)).unwrap().state(),
+        TaskState::Open
+    );
+    assert_eq!(
+        store.task_status(PROJECT_ID, task_id(2)).unwrap().state(),
+        TaskState::Open
+    );
+    assert!(
+        store
+            .task_workspace_if_present(PROJECT_ID, task_id(1))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .task_workspace_if_present(PROJECT_ID, task_id(2))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

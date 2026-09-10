@@ -56,8 +56,10 @@ use mac_worker::{
 use sha2::{Digest, Sha256};
 
 const JOB_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
+const JOB_ID_B: &str = "028f0f4a6b5c7d8e9f00112233445566";
 const CLIENT_ID: &str = "102f0f4a6b5c7d8e9f00112233445566";
 const LEASE_TOKEN: &str = "202f0f4a6b5c7d8e9f00112233445566";
+const LEASE_TOKEN_B: &str = "212f0f4a6b5c7d8e9f00112233445566";
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const MANIFEST_DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -471,6 +473,185 @@ fn cancel_fences_an_accepted_job_without_a_child_then_cleans_and_releases() {
     );
     assert_mutable_job_scopes_absent(&store, &lease);
     assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
+fn cancel_one_of_two_slots_leaves_the_other_job_token_and_workspace() {
+    // Break caught: JobService cancel of one live slot retires the peer lease,
+    // token, or mutable workspace even though slot_count=2 isolates them.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("cancel-one-slot-isolation");
+    let store = HostStore::open(&root).unwrap();
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    let (lease_a, request_a) = prepared_host_on(
+        &store,
+        JOB_ID,
+        LEASE_TOKEN,
+        10,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
+    let (lease_b, request_b) = prepared_host_on(
+        &store,
+        JOB_ID_B,
+        LEASE_TOKEN_B,
+        11,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
+    drop(store);
+    index_identityless_submit(&root, request_a);
+    index_identityless_submit(&root, request_b);
+    let store = HostStore::open(&root).unwrap();
+    let child_a = identity(90_504);
+    let status_b = JobStatus::accepted(11)
+        .unwrap()
+        .with_supervisor(identity(90_501), 12)
+        .unwrap()
+        .with_child(identity(90_502), 13)
+        .unwrap()
+        .into_running(14)
+        .unwrap();
+    let status_a = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(90_503), 12)
+        .unwrap()
+        .with_child(child_a, 13)
+        .unwrap()
+        .into_running(14)
+        .unwrap();
+    install_job_status(&store, &lease_a, &status_a, true);
+    install_job_status(&store, &lease_b, &status_b, true);
+    let before_b = mutable_job_scope_presence(&store, &lease_b);
+    let request = CancelRequest::new(
+        lease_a.job_id(),
+        lease_a.client_id(),
+        lease_a.lease_token(),
+        lease_a.request_fingerprint().clone(),
+    )
+    .unwrap();
+
+    let response = JobService::new_with_reconciliation(
+        &store,
+        &RejectLauncher,
+        Arc::new(ScriptedReconciliation::new(
+            [
+                ProcessObservation::Matching {
+                    process_group: child_a.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child_a.pid(),
+                },
+                ProcessObservation::Absent,
+            ],
+            [ProcessGroupObservation::Absent],
+        )),
+    )
+    .cancel(request)
+    .unwrap();
+
+    assert_eq!(response.status().status().state(), JobState::Cancelled);
+    assert_eq!(
+        LeaseService::new(&store)
+            .load_for_job(lease_a.job_id())
+            .unwrap(),
+        None
+    );
+    let live_b = LeaseService::new(&store)
+        .load_for_job(lease_b.job_id())
+        .unwrap()
+        .expect("peer slot lease must remain");
+    assert_eq!(live_b, lease_b);
+    assert_eq!(live_b.lease_token(), lease_b.lease_token());
+    assert_eq!(read_job_status(&store, &lease_b), status_b);
+    assert_eq!(mutable_job_scope_presence(&store, &lease_b), before_b);
+    assert_eq!(LeaseService::new(&store).occupied_slots().unwrap().len(), 1);
+}
+
+#[test]
+fn recover_one_slot_after_cancel_kill_failure_leaves_the_peer_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("recover-one-slot-isolation");
+    let store = HostStore::open(&root).unwrap();
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    let (lease_a, request_a) = prepared_host_on(
+        &store,
+        JOB_ID,
+        LEASE_TOKEN,
+        10,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
+    let (lease_b, request_b) = prepared_host_on(
+        &store,
+        JOB_ID_B,
+        LEASE_TOKEN_B,
+        11,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
+    drop(store);
+    index_identityless_submit(&root, request_a);
+    index_identityless_submit(&root, request_b);
+    let store = HostStore::open(&root).unwrap();
+    let child_a = identity(90_612);
+    let status_a = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(90_611), 11)
+        .unwrap()
+        .with_child(child_a, 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap();
+    let status_b = JobStatus::accepted(11)
+        .unwrap()
+        .with_supervisor(identity(90_621), 12)
+        .unwrap()
+        .with_child(identity(90_622), 13)
+        .unwrap()
+        .into_running(14)
+        .unwrap();
+    install_job_status(&store, &lease_a, &status_a, false);
+    install_job_status(&store, &lease_b, &status_b, false);
+    let before_b = mutable_job_scope_presence(&store, &lease_b);
+    let request = CancelRequest::new(
+        lease_a.job_id(),
+        lease_a.client_id(),
+        lease_a.lease_token(),
+        lease_a.request_fingerprint().clone(),
+    )
+    .unwrap();
+    let runtime = ScriptedReconciliation::new(
+        [
+            ProcessObservation::Matching {
+                process_group: child_a.pid(),
+            },
+            ProcessObservation::Matching {
+                process_group: child_a.pid(),
+            },
+        ],
+        [],
+    )
+    .with_signal_failure(libc::SIGKILL);
+
+    let error =
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+            .cancel(request)
+            .unwrap_err();
+    assert!(
+        error.to_string().contains("injected signal failure"),
+        "{error}"
+    );
+    assert_eq!(read_job_status(&store, &lease_a), status_a);
+    assert_eq!(
+        LeaseService::new(&store)
+            .load_for_job(lease_a.job_id())
+            .unwrap(),
+        Some(lease_a.clone())
+    );
+    let live_b = LeaseService::new(&store)
+        .load_for_job(lease_b.job_id())
+        .unwrap()
+        .expect("peer slot must survive failed cancel/recovery of the other job");
+    assert_eq!(live_b, lease_b);
+    assert_eq!(read_job_status(&store, &lease_b), status_b);
+    assert_eq!(mutable_job_scope_presence(&store, &lease_b), before_b);
 }
 
 #[test]
@@ -3725,7 +3906,7 @@ fn status_rejects_terminal_nul_and_oversized_durable_state_without_side_effects(
             ),
             (
                 "lease",
-                root.join("leases/heavy/lease.json"),
+                root.join("leases/slots/0/lease.json"),
                 "JOB_STATE_INVALID",
                 "protocol error: JOB_STATE_INVALID: live lease is invalid",
             ),
@@ -3877,11 +4058,13 @@ fn status_rejects_index_meta_lease_and_initial_status_disagreement() {
         let (store, lease, _request) = indexed_identityless_job(&root);
         match mutation {
             "lease-client" => replace_ascii_once(
-                &root.join("leases/heavy/lease.json"),
+                &root.join("leases/slots/0/lease.json"),
                 CLIENT_ID,
                 "302f0f4a6b5c7d8e9f00112233445566",
             ),
-            "corrupt-lease" => replace_bytes(&root.join("leases/heavy/lease.json"), b"{").unwrap(),
+            "corrupt-lease" => {
+                replace_bytes(&root.join("leases/slots/0/lease.json"), b"{").unwrap()
+            }
             "index-initial" => replace_ascii_once(
                 &store.job_index(lease.job_id()).unwrap(),
                 "\"updated_at_millis\":10",
@@ -4306,7 +4489,7 @@ fn terminal_accepted_submit_retry_ignores_an_unrelated_live_lease() {
         LeaseAcquireResponse::Acquired { lease } => lease,
         LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
     };
-    let unrelated_lease_bytes = fs::read(root.join("leases/heavy/lease.json")).unwrap();
+    let unrelated_lease_bytes = fs::read(root.join("leases/slots/0/lease.json")).unwrap();
 
     let retry = JobService::new(&store, &RejectLauncher)
         .submit_at(request, 12)
@@ -4320,7 +4503,7 @@ fn terminal_accepted_submit_retry_ignores_an_unrelated_live_lease() {
         Some(unrelated_lease)
     );
     assert_eq!(
-        fs::read(root.join("leases/heavy/lease.json")).unwrap(),
+        fs::read(root.join("leases/slots/0/lease.json")).unwrap(),
         unrelated_lease_bytes
     );
 }
@@ -4346,7 +4529,7 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
         LeaseAcquireResponse::Acquired { lease } => lease,
         LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
     };
-    let unrelated_lease_bytes = fs::read(unrelated_root.join("leases/heavy/lease.json")).unwrap();
+    let unrelated_lease_bytes = fs::read(unrelated_root.join("leases/slots/0/lease.json")).unwrap();
 
     let error = JobService::new(&unrelated_store, &RejectLauncher)
         .submit_at(request.clone(), 2)
@@ -4358,7 +4541,7 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
         Some(unrelated_lease)
     );
     assert_eq!(
-        fs::read(unrelated_root.join("leases/heavy/lease.json")).unwrap(),
+        fs::read(unrelated_root.join("leases/slots/0/lease.json")).unwrap(),
         unrelated_lease_bytes
     );
 
@@ -4373,7 +4556,7 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
         LeaseAcquireResponse::Acquired { lease } => lease,
         LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
     };
-    let same_job_lease_bytes = fs::read(same_job_root.join("leases/heavy/lease.json")).unwrap();
+    let same_job_lease_bytes = fs::read(same_job_root.join("leases/slots/0/lease.json")).unwrap();
     let changed = SubmitRequest::new(
         lease_request_with_identity(
             &request,
@@ -4395,7 +4578,7 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
         Some(same_job_lease)
     );
     assert_eq!(
-        fs::read(same_job_root.join("leases/heavy/lease.json")).unwrap(),
+        fs::read(same_job_root.join("leases/slots/0/lease.json")).unwrap(),
         same_job_lease_bytes
     );
 }
@@ -5541,7 +5724,7 @@ fn host_reconcile_returns_per_job_errors_for_corrupt_status_or_lease() {
                 .unwrap()
                 .join(target)
         } else {
-            paths.host_state_root().join("leases/heavy").join(target)
+            paths.host_state_root().join("leases/slots/0").join(target)
         };
         replace_bytes(&path, b"{").unwrap();
         let request = FleetReconcileRequest::new(vec![lease.job_id()]).unwrap();
@@ -7506,14 +7689,25 @@ fn prepared_host_with_command(
     command: CommandSpec,
 ) -> (HostStore, LeaseRecord, SubmitRequest) {
     let store = HostStore::open(root).unwrap();
+    let (lease, request) = prepared_host_on(&store, JOB_ID, LEASE_TOKEN, 10, command);
+    (store, lease, request)
+}
+
+fn prepared_host_on(
+    store: &HostStore,
+    job_id: &str,
+    lease_token: &str,
+    created_at_millis: u64,
+    command: CommandSpec,
+) -> (LeaseRecord, SubmitRequest) {
     let manifest = valid_manifest_bytes();
     let digest = format!("{:x}", Sha256::digest(&manifest));
     let acquire = LeaseAcquireRequest::new(
         RequestFingerprintMaterial::new(
-            JOB_ID.parse().unwrap(),
+            job_id.parse().unwrap(),
             CLIENT_ID.parse().unwrap(),
-            LEASE_TOKEN.parse().unwrap(),
-            10,
+            lease_token.parse().unwrap(),
+            created_at_millis,
             "mini-1".into(),
             PROJECT_ID.into(),
             WORKTREE_ID.into(),
@@ -7525,7 +7719,7 @@ fn prepared_host_with_command(
         )
         .unwrap(),
     );
-    let lease = match LeaseService::new(&store)
+    let lease = match LeaseService::new(store)
         .acquire(&acquire, &healthy(), 1)
         .unwrap()
     {
@@ -7556,23 +7750,28 @@ fn prepared_host_with_command(
     )
     .unwrap();
     fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
-    RemoteSnapshotService::new(&store)
+    RemoteSnapshotService::new(store)
         .verify_and_promote_at(&lease, &digest, 2)
         .unwrap();
-    (store, lease, SubmitRequest::new(acquire.material().clone()))
+    (lease, SubmitRequest::new(acquire.material().clone()))
 }
 
 fn indexed_identityless_job(root: &Path) -> (HostStore, LeaseRecord, SubmitRequest) {
     let (store, lease, request) = prepared_host(root);
     drop(store);
+    index_identityless_submit(root, request.clone());
+    (HostStore::open(root).unwrap(), lease, request)
+}
+
+fn index_identityless_submit(root: &Path, request: SubmitRequest) {
+    let job_id = request.material().job_id();
     let faulted =
         HostStore::open_with_write_fault(root, HostStoreWritePoint::AfterJobIndexParentSync)
             .unwrap();
-    let result = JobService::new(&faulted, &RejectLauncher).submit_at(request.clone(), 10);
+    let result = JobService::new(&faulted, &RejectLauncher).submit_at(request, 10);
     assert!(result.is_err());
-    assert!(faulted.job_index(lease.job_id()).unwrap().is_file());
+    assert!(faulted.job_index(job_id).unwrap().is_file());
     drop(faulted);
-    (HostStore::open(root).unwrap(), lease, request)
 }
 
 fn indexed_running_job(

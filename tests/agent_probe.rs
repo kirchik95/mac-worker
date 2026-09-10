@@ -258,6 +258,8 @@ fn health_with_facts(facts: AgentFacts) -> WorkerHealth {
             capabilities: vec!["darwin-arm64".into()],
             agent_facts: Some(facts),
             facts_age_millis: Some(0),
+            configured_slots: 0,
+            busy_slots: 0,
         }),
         missing_capabilities: Vec::new(),
         error_code: None,

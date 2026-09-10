@@ -1221,6 +1221,8 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                         herdr: None,
                     }),
                     facts_age_millis: Some(if fresh { 0 } else { FACTS_TTL + 1 }),
+                    configured_slots: 0,
+                    busy_slots: 0,
                 })
             }
             value if value == HostOperation::LeaseAcquire.command() => {
@@ -3443,6 +3445,8 @@ impl ProcessRunner for FetchFailingRunner {
                     herdr: None,
                 }),
                 facts_age_millis: Some(0),
+                configured_slots: 0,
+                busy_slots: 0,
             }),
             value if value == HostOperation::LeaseAcquire.command() => {
                 let acquire: LeaseAcquireRequest = decode_request(request)?;
@@ -6297,7 +6301,7 @@ fn submit_probes_new_ssh_destination_after_same_name_identity_change() {
     );
 }
 
-/// Config::validate requires exactly one slot; invalid local config is a
+/// Config::validate and admission require slots in 1..=MAX_HOST_SLOTS.
 /// caller error and must not SSH, even with a fresh bound cache.
 #[test]
 fn submit_rejects_invalid_slot_count_without_probing() {
@@ -6310,7 +6314,7 @@ fn submit_rejects_invalid_slot_count_without_probing() {
         .iter()
         .filter(|request| is_host_probe(request))
         .count();
-    fixture.config.workers[0].slots = 2;
+    fixture.config.workers[0].slots = 0;
     let error = TaskClient::new(
         &fixture.runner,
         &fixture.config,
@@ -6333,7 +6337,7 @@ fn submit_rejects_invalid_slot_count_without_probing() {
     .unwrap_err();
     assert!(
         matches!(error, WorkerError::Config(_)),
-        "slots != 1 must fail locally, got {error:?}"
+        "slots outside 1..=8 must fail locally, got {error:?}"
     );
     let probes_after = fixture
         .runner

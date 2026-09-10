@@ -1468,6 +1468,8 @@ fn worker_with_facts(collected_at_millis: u64, facts_age_millis: u64) -> ProbeWo
                 herdr: None,
             }),
             facts_age_millis: Some(facts_age_millis),
+            configured_slots: 0,
+            busy_slots: 0,
         }),
         missing_capabilities: Vec::new(),
         error_code: None,

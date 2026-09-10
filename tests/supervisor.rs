@@ -35,8 +35,10 @@ use mac_worker::{
 use sha2::{Digest, Sha256};
 
 const JOB_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
+const JOB_ID_B: &str = "028f0f4a6b5c7d8e9f00112233445566";
 const CLIENT_ID: &str = "102f0f4a6b5c7d8e9f00112233445566";
 const LEASE_TOKEN: &str = "202f0f4a6b5c7d8e9f00112233445566";
+const LEASE_TOKEN_B: &str = "212f0f4a6b5c7d8e9f00112233445566";
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const MANIFEST_DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -167,6 +169,80 @@ fn prepared_host_with_command_and_timeout(
         .verify_and_promote_at(&lease, &digest, now)
         .unwrap();
     (store, lease, SubmitRequest::new(request.material().clone()))
+}
+
+fn prepared_host_on(
+    store: &HostStore,
+    job_id: &str,
+    lease_token: &str,
+    created_at_millis: u64,
+    command: CommandSpec,
+) -> (LeaseRecord, SubmitRequest) {
+    let manifest = valid_manifest_bytes();
+    let digest = format!("{:x}", Sha256::digest(&manifest));
+    let request = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            job_id.parse().unwrap(),
+            CLIENT_ID.parse().unwrap(),
+            lease_token.parse().unwrap(),
+            created_at_millis,
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            digest.clone(),
+            String::new(),
+            30_000,
+            "heavy".into(),
+            command,
+        )
+        .unwrap(),
+    );
+    let lease = match LeaseService::new(store)
+        .acquire(&request, &healthy(), created_at_millis)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+    };
+    let incoming = store
+        .incoming_job(lease.job_id(), lease.lease_token())
+        .unwrap();
+    fs::create_dir_all(incoming.join("tree")).unwrap();
+    for private in [
+        incoming.parent().unwrap().parent().unwrap(),
+        incoming.parent().unwrap(),
+        incoming.as_path(),
+    ] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(incoming.join("manifest.json"), manifest).unwrap();
+    fs::write(incoming.join("tree/payload.txt"), b"payload").unwrap();
+    fs::set_permissions(
+        incoming.join("manifest.json"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(
+        incoming.join("tree/payload.txt"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
+    RemoteSnapshotService::new(store)
+        .verify_and_promote_at(&lease, &digest, created_at_millis + 1)
+        .unwrap();
+    (lease, SubmitRequest::new(request.material().clone()))
+}
+
+fn publish_unlaunched_job(root: &Path, request: SubmitRequest) {
+    let job_id = request.material().job_id();
+    let faulted =
+        HostStore::open_with_write_fault(root, HostStoreWritePoint::AfterJobIndexParentSync)
+            .unwrap();
+    let result = JobService::new(&faulted, &RejectLauncher).submit_at(request, 10);
+    assert!(result.is_err());
+    assert!(faulted.job_index(job_id).unwrap().is_file());
+    drop(faulted);
 }
 
 fn prepared_host_with_nested_cwd(
@@ -518,6 +594,8 @@ where
     serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
 }
 
+struct RejectLauncher;
+
 struct InlineSupervisorLauncher {
     store: HostStore,
 }
@@ -530,6 +608,16 @@ struct FaultingInlineSupervisorLauncher {
 struct TamperingInlineSupervisorLauncher {
     store: HostStore,
     job_path: PathBuf,
+}
+
+impl SupervisorLauncher for RejectLauncher {
+    fn launch(
+        &self,
+        _job_id: mac_worker::job::JobId,
+        _guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+        panic!("peer fixture publication must not launch a supervisor")
+    }
 }
 
 impl SupervisorLauncher for InlineSupervisorLauncher {
@@ -1379,6 +1467,94 @@ fn fresh_reopen_repairs_every_durable_job_and_index_publication_boundary_once() 
             "{label}"
         );
     }
+}
+
+#[test]
+fn recovering_one_faulted_slot_leaves_the_other_lease_workspace_and_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("slot-recovery-isolation");
+    let marker = temp.path().join("executions");
+    let command = CommandSpec::argv(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf x >> \"$1\"".into(),
+        "slot-recovery".into(),
+        marker.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let store = HostStore::open(&root).unwrap();
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    let (lease_a, request_a) = prepared_host_on(&store, JOB_ID, LEASE_TOKEN, 3, command);
+    let (lease_b, request_b) = prepared_host_on(
+        &store,
+        JOB_ID_B,
+        LEASE_TOKEN_B,
+        4,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
+    drop(store);
+    publish_unlaunched_job(&root, request_b);
+    let store = HostStore::open(&root).unwrap();
+    let workspace_b = store
+        .job(
+            lease_b.project_id(),
+            lease_b.worktree_id(),
+            lease_b.job_id(),
+        )
+        .unwrap()
+        .join("workspace");
+    assert!(workspace_b.is_dir());
+    drop(store);
+
+    let faulted = HostStore::open(&root).unwrap();
+    let launcher = FaultingInlineSupervisorLauncher {
+        store: faulted.clone(),
+        point: SupervisorFaultPoint::AfterTerminalStatus,
+    };
+    assert!(
+        JobService::new(&faulted, &launcher)
+            .submit_at(request_a.clone(), 10)
+            .is_err()
+    );
+    let live_b = LeaseService::new(&faulted)
+        .load_for_job(lease_b.job_id())
+        .unwrap()
+        .expect("peer slot lease must remain during faulted recovery");
+    assert_eq!(live_b, lease_b);
+    assert_eq!(live_b.lease_token(), lease_b.lease_token());
+    assert!(workspace_b.is_dir());
+    drop(launcher);
+    drop(faulted);
+
+    let recovered = HostStore::open(&root).unwrap();
+    let retry = InlineSupervisorLauncher {
+        store: recovered.clone(),
+    };
+    let response = JobService::new(&recovered, &retry)
+        .submit_at(request_a, 11)
+        .unwrap_or_else(|error| panic!("faulted slot was not recoverable: {error}"));
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+    // Submit of an already-supervised terminal job is Existing only. Cleanup
+    // and exact lease release are the host status / reconcile path.
+    let cleaned = JobService::new(&recovered, &RejectLauncher)
+        .status(lease_a.job_id())
+        .unwrap_or_else(|error| panic!("terminal slot status cleanup failed: {error}"));
+    assert_eq!(cleaned.status().state(), JobState::Succeeded);
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+    let live_b = LeaseService::new(&recovered)
+        .load_for_job(lease_b.job_id())
+        .unwrap()
+        .expect("peer slot lease must remain after recovery");
+    assert_eq!(live_b, lease_b);
+    assert_eq!(live_b.lease_token(), lease_b.lease_token());
+    assert!(workspace_b.is_dir());
+    assert_eq!(
+        LeaseService::new(&recovered)
+            .load_for_job(lease_a.job_id())
+            .unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -2304,7 +2480,7 @@ fn unexpected_incoming_evidence_is_preserved_and_blocks_cleanup_and_release() {
 fn lease_release_failure_preserves_terminal_outcome_and_live_lease_evidence() {
     let temp = tempfile::tempdir().unwrap();
     let host_root = temp.path().join("release-failure");
-    let lease_file = host_root.join("leases/heavy/lease.json");
+    let lease_file = host_root.join("leases/slots/0/lease.json");
     let command = CommandSpec::argv(vec![
         "/bin/sh".into(),
         "-c".into(),
@@ -2336,7 +2512,7 @@ fn lease_release_failure_preserves_terminal_outcome_and_live_lease_evidence() {
     assert_eq!(status.exit_code(), Some(0));
     assert_eq!(status.cleanup_error_code(), Some("LEASE_RELEASE_FAILED"));
     assert_eq!(fs::read(&lease_file).unwrap(), b"x");
-    assert!(host_root.join("leases/heavy").is_dir());
+    assert!(host_root.join("leases/slots/0").is_dir());
     for removed in ["workspace", "home", "tmp"] {
         assert!(!job.join(removed).exists());
     }

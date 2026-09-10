@@ -641,6 +641,8 @@ fn probe_response(agent: AgentKind) -> ProbeResponse {
             herdr: None,
         }),
         facts_age_millis: Some(0),
+        configured_slots: 0,
+        busy_slots: 0,
     }
 }
 
