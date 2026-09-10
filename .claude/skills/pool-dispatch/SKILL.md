@@ -19,7 +19,7 @@ The CLI is the only interface. The skill contains no scheduling logic.
 
 **Command availability:** the release exposes `worker task …` and `worker workers --refresh`. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar; do not replace a rejected public form with direct worker access, SSH, or another tool.
 
-## Grammar
+## Grammar Source
 
 Do not copy CLI flags from this file. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar.
 
