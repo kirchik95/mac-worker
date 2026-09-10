@@ -25,7 +25,7 @@ use mac_worker::{
     cli::Cli,
     config::WorkerEntry,
     error::WorkerError,
-    failure_receipt::{RESIDUAL_CLEANUP_TREE, RESIDUAL_LEASE, STAGE_CLEANUP, STAGE_DRAIN},
+    failure_receipt::{RESIDUAL_LEASE, RESIDUAL_WORKSPACE, STAGE_CLEANUP, STAGE_DRAIN},
     host_store::{HostStore, HostStoreWritePoint, JobDisposition, SupervisorGuard},
     inputs::RelativePath,
     job::{
@@ -1719,8 +1719,11 @@ fn terminal_status_and_log_chunk_succeed_when_mutable_cleanup_still_fails() {
                     .expect("cleanup HOST_IO carries a receipt");
                 assert_eq!(receipt.stage(), STAGE_CLEANUP);
                 assert!(receipt.residual().contains(&RESIDUAL_LEASE), "{receipt:?}");
+                // AfterCleanupIntentCommit still has this job's public workspace;
+                // the private tree sits in a shared ancestor namespace and must
+                // not be claimed as this job's cleanup-tree.
                 assert!(
-                    receipt.residual().contains(&RESIDUAL_CLEANUP_TREE),
+                    receipt.residual().contains(&RESIDUAL_WORKSPACE),
                     "{receipt:?}"
                 );
                 let wire = HostControlError::new("HOST_IO", receipt.host_message()).unwrap();

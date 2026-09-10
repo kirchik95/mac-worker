@@ -3196,6 +3196,9 @@ impl HostStore {
     }
 
     fn cleanup_tree_present(&self, lease: Option<&LeaseRecord>, job: Option<&RootedDir>) -> bool {
+        // Only this job's durable tree and incoming scope. The parent
+        // `incoming/` and `leases/` namespaces are shared, so a leftover from
+        // another job must not appear on this receipt.
         let mut present = job.is_some_and(directory_has_cleanup_residue);
         if let Some(lease) = lease {
             present |= self
@@ -3212,14 +3215,6 @@ impl HostStore {
                 .open_optional_directory(&format!("incoming/{}", lease.job_id()))
                 .ok()
                 .flatten()
-                .is_some_and(|directory| directory_has_cleanup_residue(&directory));
-            present |= self
-                .open_directory("incoming", false)
-                .ok()
-                .is_some_and(|directory| directory_has_cleanup_residue(&directory));
-            present |= self
-                .open_directory("leases", false)
-                .ok()
                 .is_some_and(|directory| directory_has_cleanup_residue(&directory));
         }
         present
@@ -4749,7 +4744,31 @@ fn require_no_private_cleanup_residue(
 }
 
 fn directory_has_cleanup_residue(directory: &RootedDir) -> bool {
-    directory.has_private_cleanup_residue().unwrap_or(false)
+    // Nested private namespace and this directory's own `remove-*`
+    // quarantines. `has_private_cleanup_residue` also looks at the parent
+    // namespace, which is shared among jobs.
+    if let Ok(path) = relative(".mac-worker-rooted-fs")
+        && let Ok(namespace) = directory.open_child_directory(&path, false)
+        && namespace
+            .list_names()
+            .ok()
+            .is_some_and(|names| !names.is_empty())
+    {
+        return true;
+    }
+    directory
+        .list_names()
+        .ok()
+        .is_some_and(|names| names.iter().any(|name| is_owned_remove_quarantine(name)))
+}
+
+fn is_owned_remove_quarantine(name: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(name) else {
+        return false;
+    };
+    name.strip_prefix("remove-").is_some_and(|value| {
+        uuid::Uuid::parse_str(value).is_ok_and(|uuid| uuid.hyphenated().to_string() == value)
+    })
 }
 
 fn directory_has_entry(directory: &RootedDir, name: &str) -> bool {
@@ -6058,5 +6077,83 @@ mod review_regression_tests {
                 .exists()
         );
         assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    }
+
+    fn plant_cleanup_residue(parent: &Path) {
+        fs::create_dir_all(parent).unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let namespace = parent.join(".mac-worker-rooted-fs");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+        let leftover = namespace.join("cleanup-303f0f4a-6b5c-4d8e-9f00-112233445566");
+        fs::create_dir(&leftover).unwrap();
+        fs::set_permissions(&leftover, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn admission_facts() -> crate::lease::AdmissionFacts {
+        crate::lease::AdmissionFacts {
+            free_disk_bytes: 200 * 1024 * 1024 * 1024,
+            total_disk_bytes: 500 * 1024 * 1024 * 1024,
+            memory_pressure: crate::protocol::MemoryPressure::Normal,
+            swap_used_bytes: Some(0),
+        }
+    }
+
+    #[test]
+    fn residual_observation_ignores_another_jobs_cleanup_tree() {
+        use crate::{
+            failure_receipt::RESIDUAL_CLEANUP_TREE, job::LeaseAcquireResponse, lease::LeaseService,
+        };
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request(94);
+        let lease = match LeaseService::new(&store)
+            .acquire(&request, &admission_facts(), 1)
+            .unwrap()
+        {
+            LeaseAcquireResponse::Acquired { lease } => lease,
+            LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+        };
+        let job_path = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        create_owner_only_job_tree(&job_path);
+
+        let other = crate::job::JobId::new(uuid::Uuid::from_u128(0xaaaa_bbbb_cccc_dddd));
+        plant_cleanup_residue(&root.join("incoming"));
+        plant_cleanup_residue(&root.join("leases"));
+        plant_cleanup_residue(&root.join("incoming").join(other.to_string()));
+        plant_cleanup_residue(job_path.parent().unwrap());
+        plant_cleanup_residue(
+            &store
+                .job(lease.project_id(), lease.worktree_id(), other)
+                .unwrap(),
+        );
+
+        let job = store
+            .open_directory(
+                &format!(
+                    "jobs/{}/{}/{}",
+                    lease.project_id(),
+                    lease.worktree_id(),
+                    lease.job_id()
+                ),
+                false,
+            )
+            .unwrap();
+        let observed = store.observe_residuals(Some(&lease), Some(&job));
+        assert!(
+            !observed.contains(&RESIDUAL_CLEANUP_TREE),
+            "another job's leftover must not appear on this receipt: {observed:?}"
+        );
+
+        plant_cleanup_residue(&job_path);
+        let observed = store.observe_residuals(Some(&lease), Some(&job));
+        assert!(
+            observed.contains(&RESIDUAL_CLEANUP_TREE),
+            "this job's own leftover must appear: {observed:?}"
+        );
     }
 }
