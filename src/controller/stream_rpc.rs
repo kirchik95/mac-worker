@@ -9,18 +9,20 @@ use serde_json::Value;
 use crate::{
     client_state::ClientStateStore,
     controller::{
+        batch::FrozenBatchBody,
         protocol::{ControllerRequest, encode_json_frame},
         read::{ControllerReadIdentity, ControllerReadReply, invalid_controller_reply},
         registry::ProjectRegistry,
         store::ControllerStore,
         transfer::{ControllerReceiveIdentity, ControllerTransfer, VerifiedResultMeta},
     },
+    dag::DagNode,
     error::WorkerError,
     job::RequestFingerprint,
     paths::PathLayout,
     prepared_submit::FrozenSubmitBody,
     process::ProcessRunner,
-    task::{BaseOid, TaskId, TurnId},
+    task::{BaseOid, TaskId, TaskState, TurnId},
 };
 
 pub fn is_transfer_command(command: &str) -> bool {
@@ -283,6 +285,14 @@ fn finish_source_reply(
     ))
 }
 
+/// Trusted logical identity resolved from the frozen original for one
+/// result export. The outer request fingerprint stays bound alongside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedFrozen {
+    project_id: String,
+    worktree_id: String,
+}
+
 fn prepare_result_reply(
     request: &ControllerRequest,
     paths: &PathLayout,
@@ -307,27 +317,133 @@ fn prepare_result_reply(
                 .into(),
         ));
     }
-    let frozen: FrozenSubmitBody =
-        serde_json::from_value(durable.body().clone()).map_err(|_| {
-            WorkerError::Protocol(
-                "CONTROLLER_TRANSPORT: bound request is not a frozen submit".into(),
-            )
-        })?;
-    if frozen.task_id != body.task_id {
+    // Typed durable resolution: the outer command decides the frozen shape.
+    // `task.submit` carries exactly one frozen task; `task.batch` carries a
+    // frozen graph whose nodes (roots and later from-parent children) each
+    // carry their own stable task identity. The trusted logical
+    // project/worktree always comes from the frozen original, and the outer
+    // request fingerprint stays bound for the immutable per-turn export.
+    // The local record below must be that same frozen task.
+    let resolved = match durable.command() {
+        "task.submit" => {
+            let frozen: FrozenSubmitBody =
+                serde_json::from_value(durable.body().clone()).map_err(|_| {
+                    WorkerError::Protocol(
+                        "CONTROLLER_TRANSPORT: bound request is not a frozen submit".into(),
+                    )
+                })?;
+            if frozen.task_id != body.task_id {
+                return Err(WorkerError::Protocol(
+                    "CONTROLLER_REQUEST_CONFLICT: bound task does not match the frozen envelope"
+                        .into(),
+                ));
+            }
+            ResolvedFrozen {
+                project_id: frozen.project_id.clone(),
+                worktree_id: frozen.worktree_id.clone(),
+            }
+        }
+        "task.batch" => {
+            let batch: FrozenBatchBody =
+                serde_json::from_value(durable.body().clone()).map_err(|_| {
+                    WorkerError::Protocol(
+                        "CONTROLLER_TRANSPORT: bound request is not a frozen batch".into(),
+                    )
+                })?;
+            let matches: Vec<(&String, &DagNode)> = batch
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.task_id == body.task_id)
+                .collect();
+            let (_, node) = match matches.as_slice() {
+                [] => {
+                    return Err(WorkerError::Protocol(
+                        "CONTROLLER_TRANSPORT: bound batch has no node for this task".into(),
+                    ));
+                }
+                [single] => *single,
+                _ => {
+                    return Err(WorkerError::Protocol(
+                        "CONTROLLER_REQUEST_CONFLICT: bound batch task identity is ambiguous"
+                            .into(),
+                    ));
+                }
+            };
+            ResolvedFrozen {
+                project_id: node.frozen.project_id.clone(),
+                worktree_id: node.frozen.worktree_id.clone(),
+            }
+        }
+        other => {
+            return Err(WorkerError::Protocol(format!(
+                "CONTROLLER_TRANSPORT: result prepare supports task.submit and task.batch only, not {other}"
+            )));
+        }
+    };
+    let client_state = ClientStateStore::open(&paths.state)?;
+    // Single immutable record load: every field below (state, turns, head,
+    // fetched head, worker) comes from this same saved snapshot. No global
+    // lock across Git; a validated terminal snapshot stays a valid export
+    // even if a peer later publishes the next turn. The bug fixed here is
+    // narrower: a stale inherited fetched_head attached to a current
+    // pending turn must never mint a receipt.
+    let record = client_state.load_task(body.task_id)?;
+    if record.meta().task_id() != body.task_id {
         return Err(WorkerError::Protocol(
-            "CONTROLLER_REQUEST_CONFLICT: bound task does not match the frozen envelope".into(),
+            "CONTROLLER_REQUEST_CONFLICT: local task does not match the frozen original".into(),
         ));
     }
-    let client_state = ClientStateStore::open(&paths.state)?;
-    let record = client_state.load_task(body.task_id)?;
-    let imported = record
-        .fetched_head()
-        .or_else(|| record.status().head_oid())
-        .cloned()
-        .ok_or_else(|| WorkerError::Git {
+    // Local record identity must match the frozen original: the trusted
+    // logical project/worktree resolved above must equal the record's own.
+    // Same fields, same saved snapshot load — no second load, no new locks.
+    if record.meta().project_id() != resolved.project_id {
+        return Err(WorkerError::Protocol(
+            "CONTROLLER_REQUEST_CONFLICT: local project does not match the frozen original"
+                .into(),
+        ));
+    }
+    if record.meta().worktree_id() != resolved.worktree_id {
+        return Err(WorkerError::Protocol(
+            "CONTROLLER_REQUEST_CONFLICT: local worktree does not match the frozen original"
+                .into(),
+        ));
+    }
+    if record.status().state() == TaskState::Abandoned {
+        return Err(WorkerError::Task {
+            code: "TASK_CLOSED",
+            message: "discarded tasks cannot be fetched".into(),
+        });
+    }
+    let current_turn = record.status().turns().last().ok_or_else(|| WorkerError::Git {
+        code: "RESULT_FETCH_FAILED",
+        message: "controller result turn is not complete yet".into(),
+    })?;
+    if current_turn.terminal().is_none() {
+        return Err(WorkerError::Git {
+            code: "RESULT_FETCH_FAILED",
+            message: "controller result turn is not complete yet".into(),
+        });
+    }
+    // Actual imported proof from the same snapshot: the fetched head must
+    // exist and equal the snapshot's current head. A bare status head is
+    // not import proof, and a stale fetched head from an older turn must
+    // not pair with a newer pending turn (both rejected above or here).
+    let head = record.status().head_oid().ok_or_else(|| WorkerError::Git {
+        code: "RESULT_FETCH_FAILED",
+        message: "controller result is not imported yet".into(),
+    })?;
+    let fetched = record.fetched_head().ok_or_else(|| WorkerError::Git {
+        code: "RESULT_FETCH_FAILED",
+        message: "controller result is not imported yet".into(),
+    })?;
+    if fetched != head {
+        return Err(WorkerError::Git {
             code: "RESULT_FETCH_FAILED",
             message: "controller result is not imported yet".into(),
-        })?;
+        });
+    }
+    let imported = fetched.clone();
+    let turn_id = current_turn.turn_id();
     let worker = record
         .status()
         .worker()
@@ -337,12 +453,6 @@ fn prepare_result_reply(
             message: "controller result has no worker identity".into(),
         })?
         .to_owned();
-    let turn_id = record
-        .status()
-        .turns()
-        .last()
-        .map(|turn| turn.turn_id())
-        .unwrap_or(frozen.turn_id);
     let fingerprint = RequestFingerprint::new(bind.fingerprint.clone()).map_err(|_| {
         WorkerError::Protocol("CONTROLLER_TRANSPORT: bound fingerprint is invalid".into())
     })?;
@@ -358,8 +468,8 @@ fn prepare_result_reply(
         runner,
         &bind.request_id,
         &fingerprint,
-        &frozen.project_id,
-        &frozen.worktree_id,
+        &resolved.project_id,
+        &resolved.worktree_id,
         &meta,
     )?;
     Ok(ControllerReadReply::from_request(

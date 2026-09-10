@@ -87,6 +87,8 @@ pub struct ControllerReconcileResult {
     replaced_runners: usize,
     started_runners: usize,
     repaired_rows: usize,
+    #[serde(default)]
+    unverifiable_rows: usize,
 }
 
 impl ControllerReconcileResult {
@@ -100,6 +102,10 @@ impl ControllerReconcileResult {
 
     pub fn repaired_rows(&self) -> usize {
         self.repaired_rows
+    }
+
+    pub fn unverifiable_rows(&self) -> usize {
+        self.unverifiable_rows
     }
 }
 
@@ -162,6 +168,7 @@ pub fn reconcile_via_controller(
         result.replaced_runners(),
         result.started_runners(),
         result.repaired_rows(),
+        result.unverifiable_rows(),
     ))
 }
 
@@ -209,6 +216,7 @@ fn reconcile_reply(
             replaced_runners: report.replaced_runners(),
             started_runners: report.started_runners(),
             repaired_rows: report.repaired_rows(),
+            unverifiable_rows: report.unverifiable_rows(),
         },
     ))
 }

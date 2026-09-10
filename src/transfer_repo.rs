@@ -1541,7 +1541,13 @@ impl TransferRepo {
         worker: &str,
         task_id: TaskId,
     ) -> Result<ImportReceipt, WorkerError> {
-        if repo_id_for(user_common_dir)? != self.repo_id {
+        // Physical binding applies only to ordinary user transfers. A
+        // logical controller cache (user_alternates == false) carries a
+        // project/worktree hash identity, never a physical repository id,
+        // so the comparison below would always fail; like
+        // `import_result_from_ref`, it is conditioned on user_alternates.
+        // Alternates verification stays mandatory for both modes.
+        if self.user_alternates && repo_id_for(user_common_dir)? != self.repo_id {
             return Err(git_error(
                 "BASE_UNAVAILABLE",
                 "the transfer repository is bound to a different user repository",

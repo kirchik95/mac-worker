@@ -4067,6 +4067,7 @@ fn stale_complete_after_steal_does_not_clear_the_new_child() {
     };
     let stolen =
         ClientStateStore::open_with_owner_inspector(&fixture.root, live_set(&[child])).unwrap();
+    stolen.note_confirmed_runner_absence(parent);
     let RunnerSlotDecision::Acquired { token: new } = stolen
         .reserve_runner_slot(turn_id, child, 1, false)
         .unwrap()
@@ -4130,6 +4131,7 @@ fn token_current_child_takes_over_dead_parent_without_a_second_spawn() {
     );
     let orphaned =
         ClientStateStore::open_with_owner_inspector(&fixture.root, live_set(&[child])).unwrap();
+    orphaned.note_confirmed_runner_absence(parent);
     assert_eq!(
         orphaned
             .take_over_reserved_slot(turn_id, token, child)

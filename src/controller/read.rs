@@ -127,6 +127,10 @@ pub struct ControllerTaskStatusResult {
     delivery: Option<OriginDelivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deliveries: Vec<OriginDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    residual: Option<Vec<String>>,
 }
 
 impl ControllerTaskStatusResult {
@@ -141,6 +145,16 @@ impl ControllerTaskStatusResult {
             exit_code: report.exit_code(),
             delivery: report.delivery().cloned(),
             deliveries: report.deliveries().to_vec(),
+            stage: report
+                .failure_receipt()
+                .map(|receipt| receipt.stage().to_owned()),
+            residual: report.failure_receipt().map(|receipt| {
+                receipt
+                    .residual()
+                    .iter()
+                    .map(|item| (*item).to_owned())
+                    .collect()
+            }),
         }
     }
 
@@ -155,6 +169,17 @@ impl ControllerTaskStatusResult {
             exit_code: self.exit_code,
             delivery: self.delivery,
             deliveries: self.deliveries,
+            failure_receipt: match self.stage.as_deref() {
+                Some(stage) => {
+                    let residual = self
+                        .residual
+                        .as_ref()
+                        .map(|items| items.iter().map(String::as_str).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    crate::failure_receipt::FailureReceipt::new(stage, &residual)
+                }
+                None => None,
+            },
         })
     }
 
@@ -337,6 +362,10 @@ pub struct ControllerTaskResult {
     status: TaskStatus,
     branch: String,
     fetch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    residual: Option<Vec<String>>,
 }
 
 impl ControllerTaskResult {
@@ -345,7 +374,23 @@ impl ControllerTaskResult {
     }
 
     pub fn into_report(self) -> TaskResultReport {
-        TaskResultReport::from_controller(self.task_id, self.status, self.branch, self.fetch)
+        TaskResultReport::from_controller(
+            self.task_id,
+            self.status,
+            self.branch,
+            self.fetch,
+            match self.stage.as_deref() {
+                Some(stage) => {
+                    let residual = self
+                        .residual
+                        .as_ref()
+                        .map(|items| items.iter().map(String::as_str).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    crate::failure_receipt::FailureReceipt::new(stage, &residual)
+                }
+                None => None,
+            },
+        )
     }
 }
 
@@ -489,6 +534,16 @@ fn result_reply(
             status: report.status().clone(),
             branch: report.branch().to_owned(),
             fetch: report.fetch_instruction().to_owned(),
+            stage: report
+                .failure_receipt()
+                .map(|receipt| receipt.stage().to_owned()),
+            residual: report.failure_receipt().map(|receipt| {
+                receipt
+                    .residual()
+                    .iter()
+                    .map(|item| (*item).to_owned())
+                    .collect()
+            }),
         },
     ))
 }
@@ -711,6 +766,7 @@ mod tests {
             exit_code: None,
             delivery,
             deliveries,
+            failure_receipt: None,
         })
     }
 
@@ -769,12 +825,58 @@ mod tests {
     }
 
     #[test]
+    fn status_result_preserves_failure_receipt_alongside_delivery() {
+        let queued = delivery(TurnId::generate(), DeliveryState::Pending, 3);
+        let receipt = crate::failure_receipt::FailureReceipt::new(
+            crate::failure_receipt::STAGE_CLEANUP,
+            &[
+                crate::failure_receipt::RESIDUAL_LEASE,
+                crate::failure_receipt::RESIDUAL_CLEANUP_TREE,
+            ],
+        )
+        .unwrap();
+        let report = TaskReport::from_controller(ControllerTaskProjection {
+            task_id: TaskId::generate(),
+            run_id: None,
+            status: fixture_status(),
+            warnings: Vec::new(),
+            events: Vec::new(),
+            runner: None,
+            exit_code: None,
+            delivery: Some(queued.clone()),
+            deliveries: vec![queued.clone()],
+            failure_receipt: Some(receipt.clone()),
+        });
+        let result = ControllerTaskStatusResult::from_report(&report);
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["delivery"]["state"], "pending");
+        assert_eq!(encoded["stage"], "cleanup");
+        assert_eq!(encoded["residual"], json!(["lease", "cleanup-tree"]));
+
+        let request = status_request(report.task_id());
+        let frame = encode_json_frame(&reply(&request, result.clone())).unwrap();
+        let decoded: ControllerReadReply<ControllerTaskStatusResult> =
+            serde_json::from_slice(decode_frame(&frame).unwrap()).unwrap();
+        let round_trip = decoded.into_result().into_report();
+        assert_eq!(round_trip.delivery(), Some(&queued));
+        assert_eq!(round_trip.failure_receipt(), Some(&receipt));
+
+        let laptop = laptop_status_json(&round_trip);
+        assert_eq!(laptop["delivery"]["state"], "pending");
+        assert_eq!(laptop["stage"], "cleanup");
+        assert_eq!(laptop["residual"], json!(["lease", "cleanup-tree"]));
+        assert_eq!(laptop["protocol_version"], WIRE_VERSION);
+    }
+
+    #[test]
     fn status_result_legacy_json_without_delivery_fields_is_empty() {
         let report = status_report(None, Vec::new());
         let encoded =
             serde_json::to_value(ControllerTaskStatusResult::from_report(&report)).unwrap();
         assert!(encoded.get("delivery").is_none());
         assert!(encoded.get("deliveries").is_none());
+        assert!(encoded.get("stage").is_none());
+        assert!(encoded.get("residual").is_none());
 
         let legacy = json!({
             "task_id": report.task_id().to_string(),
@@ -789,8 +891,11 @@ mod tests {
         let restored = parsed.into_report();
         assert!(restored.delivery().is_none());
         assert!(restored.deliveries().is_empty());
+        assert!(restored.failure_receipt().is_none());
         let laptop = laptop_status_json(&restored);
         assert!(laptop.get("delivery").is_none());
         assert!(laptop.get("deliveries").is_none());
+        assert!(laptop.get("stage").is_none());
+        assert!(laptop.get("residual").is_none());
     }
 }

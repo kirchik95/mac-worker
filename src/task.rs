@@ -1464,6 +1464,7 @@ pub struct LocalTaskRecord {
     close_intent: Option<TaskCloseIntent>,
     delivery: Option<OriginDelivery>,
     deliveries: Vec<OriginDelivery>,
+    failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
 }
 
 impl LocalTaskRecord {
@@ -1494,6 +1495,7 @@ impl LocalTaskRecord {
             close_intent: None,
             delivery: None,
             deliveries: Vec::new(),
+            failure_receipt: None,
         };
         record.validate()?;
         Ok(record)
@@ -1538,6 +1540,10 @@ impl LocalTaskRecord {
 
     pub fn abandon_code(&self) -> Option<&str> {
         self.abandon_code.as_deref()
+    }
+
+    pub fn failure_receipt(&self) -> Option<&crate::failure_receipt::FailureReceipt> {
+        self.failure_receipt.as_ref()
     }
 
     /// Local drain failure is durable evidence for the current turn. A later
@@ -1707,7 +1713,21 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             abandon_code,
         )?;
-        self.with_local_fields(replacement)
+        let mut replacement = self.with_local_fields(replacement)?;
+        if replacement.abandon_code.is_none() {
+            replacement.failure_receipt = None;
+        }
+        Ok(replacement)
+    }
+
+    pub fn with_failure_receipt(
+        &self,
+        failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
+    ) -> Result<Self, WorkerError> {
+        let mut replacement = self.clone();
+        replacement.failure_receipt = failure_receipt;
+        replacement.validate()?;
+        Ok(replacement)
     }
 
     pub fn with_close_intent(&self, intent: TaskCloseIntent) -> Result<Self, WorkerError> {
@@ -1730,6 +1750,7 @@ impl LocalTaskRecord {
         replacement.close_intent = self.close_intent.clone();
         replacement.delivery = self.delivery.clone();
         replacement.deliveries = self.deliveries.clone();
+        replacement.failure_receipt = self.failure_receipt.clone();
         replacement.validate()?;
         Ok(replacement)
     }
@@ -1867,6 +1888,9 @@ impl Serialize for LocalTaskRecord {
         if !self.deliveries.is_empty() {
             field_count += 1;
         }
+        if self.failure_receipt.is_some() {
+            field_count += 2;
+        }
         let mut record = serializer.serialize_struct("LocalTaskRecord", field_count)?;
         record.serialize_field("meta", &self.meta)?;
         record.serialize_field("status", &self.status)?;
@@ -1891,6 +1915,10 @@ impl Serialize for LocalTaskRecord {
         }
         if !self.deliveries.is_empty() {
             record.serialize_field("deliveries", &self.deliveries)?;
+        }
+        if let Some(receipt) = &self.failure_receipt {
+            record.serialize_field("failure_stage", receipt.stage())?;
+            record.serialize_field("failure_residual", &receipt.residual())?;
         }
         record.end()
     }
@@ -1920,6 +1948,10 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             delivery: Option<OriginDelivery>,
             #[serde(default)]
             deliveries: Vec<OriginDelivery>,
+            #[serde(default)]
+            failure_stage: Option<String>,
+            #[serde(default)]
+            failure_residual: Vec<String>,
         }
         let wire: Wire = deserialize_unique_object(deserializer)?;
         let mut record = Self::new(
@@ -1943,6 +1975,17 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             wire.deliveries
         };
         record.delivery = record.deliveries.first().cloned();
+        record.failure_receipt = match wire.failure_stage.as_deref() {
+            Some(stage) => {
+                let residual = wire
+                    .failure_residual
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                crate::failure_receipt::FailureReceipt::new(stage, &residual)
+            }
+            None => None,
+        };
         record.validate().map_err(de::Error::custom)?;
         Ok(record)
     }

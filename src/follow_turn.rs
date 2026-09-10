@@ -21,6 +21,7 @@ use crate::{
     RuntimeContext,
     agent::AgentKind,
     error::WorkerError,
+    failure_receipt::STAGE_FOLLOW,
     host_store::HostStore,
     job::{JobId, MAX_LOG_CHUNK_BYTES},
     job_service::{ExecutionPayload, read_canonical_json},
@@ -103,21 +104,41 @@ pub fn follow_turn_with_poll_interval(
     let mut stdout_log = LogFollower::new("stdout.log");
     let mut stderr_log = LogFollower::new("stderr.log");
     let agent = turn.agent;
+    let wrap = |error: WorkerError| {
+        let lease = crate::lease::LeaseService::new(&store)
+            .load()
+            .ok()
+            .flatten()
+            .filter(|live| live.job_id() == job_id);
+        store.attach_host_io(error, STAGE_FOLLOW, lease.as_ref(), Some(&job))
+    };
     loop {
-        stdout_log.pump(&job, &mut |lines| render_agent_log(lines, agent, out))?;
-        stderr_log.pump(&job, &mut |lines| {
-            out.write_all(lines).map_err(WorkerError::Io)
-        })?;
+        stdout_log
+            .pump(&job, &mut |lines| render_agent_log(lines, agent, out))
+            .map_err(&wrap)?;
+        stderr_log
+            .pump(&job, &mut |lines| {
+                out.write_all(lines).map_err(WorkerError::Io)
+            })
+            .map_err(&wrap)?;
         if let Some((summary, status)) = terminal_turn(&tasks, project_id, turn.task_id, job_id)? {
             // The status is written after the last log byte; drain what
             // landed between the log read above and the status read, then
             // show a trailing line the agent never terminated.
-            stdout_log.pump(&job, &mut |lines| render_agent_log(lines, agent, out))?;
-            stderr_log.pump(&job, &mut |lines| {
-                out.write_all(lines).map_err(WorkerError::Io)
-            })?;
-            stdout_log.finish(&mut |lines| render_agent_log(lines, agent, out))?;
-            stderr_log.finish(&mut |lines| out.write_all(lines).map_err(WorkerError::Io))?;
+            stdout_log
+                .pump(&job, &mut |lines| render_agent_log(lines, agent, out))
+                .map_err(&wrap)?;
+            stderr_log
+                .pump(&job, &mut |lines| {
+                    out.write_all(lines).map_err(WorkerError::Io)
+                })
+                .map_err(&wrap)?;
+            stdout_log
+                .finish(&mut |lines| render_agent_log(lines, agent, out))
+                .map_err(&wrap)?;
+            stderr_log
+                .finish(&mut |lines| out.write_all(lines).map_err(WorkerError::Io))
+                .map_err(&wrap)?;
             writeln!(out, "{}", outcome_line(&summary, &status))?;
             out.flush()?;
             break;

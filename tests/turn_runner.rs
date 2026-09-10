@@ -5236,9 +5236,9 @@ fn runner_refresh_contention(ownership_change: Option<bool>) {
     )
     .unwrap();
     let record = state.load_task(fixture.task_id).unwrap();
-    // A waiting task with a known worker is eligible for queued status refresh.
+    // An in-flight task with a known worker is eligible for Active/Open status refresh.
     let status = TaskStatus::new(
-        TaskState::Queued,
+        TaskState::Active,
         None,
         Some("mini-1".into()),
         false,
@@ -5402,6 +5402,7 @@ struct DelayedProjectionRemote<'a> {
     release_response: Mutex<mpsc::Receiver<()>>,
     cancelled: AtomicBool,
     delay_refresh: bool,
+    distinct_refresh: bool,
 }
 impl DelayedProjectionRemote<'_> {
     fn terminal(&self) -> TaskStatus {
@@ -5437,7 +5438,11 @@ impl DelayedProjectionRemote<'_> {
                 Some(meta.created_at_millis()),
                 Some(meta.created_at_millis() + 1),
             )],
-            meta.created_at_millis() + 1,
+            meta.created_at_millis()
+                + 1
+                + u64::from(
+                    self.distinct_refresh && thread::current().name() == Some("delayed-projection"),
+                ),
         )
         .unwrap()
     }
@@ -5520,6 +5525,7 @@ fn delayed_task_projection_cannot_overwrite_publication(case: ProjectionCase) {
         release_response: Mutex::new(release_rx),
         cancelled: AtomicBool::new(false),
         delay_refresh: refresh,
+        distinct_refresh: case == ProjectionCase::IdleWriteFailure,
     };
     let client = TaskClient::new(
         &remote,

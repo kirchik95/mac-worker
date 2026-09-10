@@ -376,6 +376,12 @@ impl<'a> TurnRunner<'a> {
         let public_code = error.public_code();
         let message = crate::redaction::RedactionBoundary::from_env()
             .text(&error.to_string(), EARLY_EXIT_MESSAGE_LIMIT);
+        if let Some(receipt) = error.failure_receipt()
+            && let Ok(record) = self.client_state.load_task(task_id)
+            && let Ok(updated) = record.with_failure_receipt(Some(receipt))
+        {
+            let _ = self.client_state.update_task(updated);
+        }
         log.append_bytes(
             early_exit_diagnostic_line(
                 after_acceptance,
@@ -383,6 +389,7 @@ impl<'a> TurnRunner<'a> {
                 &public_code,
                 &message,
                 &workers,
+                error.failure_receipt().as_ref(),
             )
             .as_bytes(),
         )?;
@@ -1528,6 +1535,7 @@ impl<'a> TurnRunner<'a> {
             "LOG_DRAIN_UNAVAILABLE",
             &message,
             &workers,
+            None,
         );
         let outcome = TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE");
         log.finish(
@@ -1603,7 +1611,7 @@ impl<'a> TurnRunner<'a> {
             .map(|w| w.name.as_str())
             .collect::<Vec<_>>();
         let line =
-            early_exit_diagnostic_line(false, Some("CAPACITY_BUSY"), "CAPACITY_BUSY", "", &workers);
+            early_exit_diagnostic_line(false, Some("CAPACITY_BUSY"), "CAPACITY_BUSY", "", &workers, None);
         let completion = Completion {
             outcome: TaskOutcome::failed("CAPACITY_BUSY"),
             drained: false,
@@ -2152,6 +2160,7 @@ fn early_exit_diagnostic_line(
     public_code: &str,
     message: &str,
     workers: &[&str],
+    receipt: Option<&crate::failure_receipt::FailureReceipt>,
 ) -> String {
     let prefix = if after_acceptance {
         "exited after acceptance: "
@@ -2161,6 +2170,9 @@ fn early_exit_diagnostic_line(
     let mut line = format!("{prefix}{}", blocking.unwrap_or(public_code));
     if blocking.is_some_and(|blocking| blocking != public_code) {
         line.push_str(&format!(" error={public_code}"));
+    }
+    if let Some(receipt) = receipt {
+        line.push_str(&format!(" stage={}", receipt.stage()));
     }
     if let Some(message) = early_exit_message_body(public_code, message) {
         line.push_str(&format!(" message={message}"));
@@ -2359,6 +2371,7 @@ mod tests {
                 "PROJECT_MISMATCH",
                 "PROJECT_MISMATCH: current project is not the task's project",
                 &["mini-1"],
+                None,
             ),
             "exited: WAITING_FOR_DISPATCH error=PROJECT_MISMATCH message=current project is not the task's project workers=mini-1\n"
         );
@@ -2368,12 +2381,13 @@ mod tests {
                 Some("CAPACITY_BUSY"),
                 "CAPACITY_BUSY",
                 "",
-                &["a", "b"]
+                &["a", "b"],
+                None,
             ),
             "exited: CAPACITY_BUSY workers=a,b\n"
         );
         assert_eq!(
-            early_exit_diagnostic_line(false, None, "PROJECT_MISMATCH", "PROJECT_MISMATCH: x", &[]),
+            early_exit_diagnostic_line(false, None, "PROJECT_MISMATCH", "PROJECT_MISMATCH: x", &[], None),
             "exited: PROJECT_MISMATCH message=x\n"
         );
     }
@@ -2381,7 +2395,7 @@ mod tests {
     #[test]
     fn the_early_exit_line_adds_the_message_when_it_says_more_than_the_code() {
         assert_eq!(
-            early_exit_diagnostic_line(false, None, "IO", "IO: permission denied", &["mini-1"]),
+            early_exit_diagnostic_line(false, None, "IO", "IO: permission denied", &["mini-1"], None),
             "exited: IO message=permission denied workers=mini-1\n"
         );
         assert_eq!(
@@ -2391,6 +2405,7 @@ mod tests {
                 "PROTOCOL",
                 "worker probe was empty",
                 &["mini-1"],
+                None,
             ),
             "exited: WAITING_FOR_DISPATCH error=PROTOCOL message=worker probe was empty workers=mini-1\n"
         );
@@ -2401,6 +2416,7 @@ mod tests {
                 "AGENT_EXITED",
                 "AGENT_EXITED: session prebind failed: agent exited 1",
                 &["mini-1"],
+                None,
             ),
             "exited: WAITING_FOR_DISPATCH error=AGENT_EXITED message=session prebind failed: agent exited 1 workers=mini-1\n"
         );
@@ -2410,12 +2426,13 @@ mod tests {
                 None,
                 "LEASE_IDENTITY_MISMATCH",
                 "long story",
-                &["m"]
+                &["m"],
+                None,
             ),
             "exited: LEASE_IDENTITY_MISMATCH message=long story workers=m\n"
         );
         assert_eq!(
-            early_exit_diagnostic_line(false, None, "CAPACITY_BUSY", "CAPACITY_BUSY", &["a"]),
+            early_exit_diagnostic_line(false, None, "CAPACITY_BUSY", "CAPACITY_BUSY", &["a"], None),
             "exited: CAPACITY_BUSY workers=a\n"
         );
     }
@@ -2429,6 +2446,7 @@ mod tests {
                 "PROJECT_MISMATCH",
                 "PROJECT_MISMATCH: current project is not the task's project",
                 &["mini-1"],
+                None,
             ),
             "exited after acceptance: PROJECT_MISMATCH message=current project is not the task's project workers=mini-1\n"
         );

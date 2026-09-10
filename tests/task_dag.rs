@@ -494,6 +494,7 @@ fn dag_dead_claim_is_retaken_once_by_concurrent_reconcilers() {
     store
         .create_run_with_dag(RunRecord::new(run_id, None, Vec::new(), 1, 6).unwrap(), dag)
         .unwrap();
+    store.note_confirmed_runner_absence(dead);
 
     let a = {
         let store = Arc::clone(&store);
@@ -550,6 +551,7 @@ fn dag_dead_claim_with_partial_task_is_retaken_once_keeping_same_ids() {
     store
         .create_task(intent_task(run_id, task_id, turn_id))
         .unwrap();
+    store.note_confirmed_runner_absence(dead);
 
     let a = {
         let store = Arc::clone(&store);

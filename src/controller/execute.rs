@@ -34,7 +34,7 @@ use crate::{
         transfer::{ControllerTransfer, SourceSubmitBind},
         lifecycle::{is_lifecycle_command, serve_lifecycle_command},
         task_mutations::{
-            PreparedTaskMutation, execute_task_mutation, prepare_task_mutation,
+            PreparedTaskMutation, execute_task_mutation, mutation_task_id, prepare_task_mutation,
         },
         batch::{
             BatchExecuteContext, ControllerCheckoutMap, PreparedTaskBatch, execute_task_batch,
@@ -58,6 +58,23 @@ const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const GIT_DEADLINE: Duration = Duration::from_secs(60);
 
 static DETACHED_EXECUTOR: DetachedRunnerExecutor = DetachedRunnerExecutor;
+
+// OVERLAPPING/PENDING OpenCode exclusive B: bounded selected recovery at
+// prepare. Mechanical compile helper only; not an A/B-test-green leaf.
+fn recover_selected_task_before_prepare(
+    handler: &TaskSubmitHandler<'_>,
+    task_id: crate::task::TaskId,
+) -> Result<(), WorkerError> {
+    let client = TaskClient::new(
+        handler.runner,
+        handler.config,
+        handler.paths,
+        handler.client_state,
+        &DETACHED_EXECUTOR,
+    );
+    let _ = client.reconcile_selected(&[task_id])?;
+    Ok(())
+}
 
 pub struct TaskSubmitHandler<'a> {
     runner: &'a dyn ProcessRunner,
@@ -88,21 +105,14 @@ impl ControllerCommandHandler for TaskSubmitHandler<'_> {
             "checkpoint.submit" | "task.submit" => {
                 crate::controller::default_prepare_operation(request)
             }
-            "task.say" | "task.cancel" | "task.close" => {
-                let prepared =
-                    prepare_task_mutation(request, self.client_state, now_millis()?)?;
-                let encoded = serde_json::to_value(&prepared).map_err(|_| {
-                    WorkerError::Protocol(
-                        "CONTROLLER_TRANSPORT: prepared mutation could not be encoded".into(),
-                    )
-                })?;
-                Ok(OperationMeta {
-                    task_id: Some(prepared.task_id().to_string()),
-                    turn_id: prepared.turn_id().map(|id| id.to_string()),
-                    created_at_millis: prepared.created_at_millis(),
-                    prepared: encoded,
-                })
+            // OVERLAPPING/PENDING OpenCode exclusive B: recover say/close
+            // before freezing expected; cancel stays freeze-only.
+            "task.say" | "task.close" => {
+                let task_id = mutation_task_id(request)?;
+                recover_selected_task_before_prepare(self, task_id)?;
+                self.prepare_frozen_mutation(request)
             }
+            "task.cancel" => self.prepare_frozen_mutation(request),
             "task.batch" => {
                 let transfer = ControllerTransfer::open(&self.paths.controller_state_root())?;
                 let prepared = prepare_task_batch(
@@ -136,6 +146,26 @@ impl ControllerCommandHandler for TaskSubmitHandler<'_> {
 }
 
 impl TaskSubmitHandler<'_> {
+    // OVERLAPPING/PENDING OpenCode exclusive B: former say/cancel/close
+    // freeze body. Pure encode of prepare_task_mutation; no recapture.
+    fn prepare_frozen_mutation(
+        &self,
+        request: &ControllerRequest,
+    ) -> Result<OperationMeta, WorkerError> {
+        let prepared = prepare_task_mutation(request, self.client_state, now_millis()?)?;
+        let encoded = serde_json::to_value(&prepared).map_err(|_| {
+            WorkerError::Protocol(
+                "CONTROLLER_TRANSPORT: prepared mutation could not be encoded".into(),
+            )
+        })?;
+        Ok(OperationMeta {
+            task_id: Some(prepared.task_id().to_string()),
+            turn_id: prepared.turn_id().map(|id| id.to_string()),
+            created_at_millis: prepared.created_at_millis(),
+            prepared: encoded,
+        })
+    }
+
     pub fn execute_typed(
         &self,
         record: &crate::controller::DurableRequest,
@@ -790,6 +820,7 @@ mod tests {
             allow_sensitive: Vec::new(),
             cli_includes: Vec::new(),
             branch: None,
+            wait_for_capacity: true,
         }
     }
 

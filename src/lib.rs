@@ -75,6 +75,7 @@ pub mod dag;
 pub mod dashboard;
 pub mod doctor;
 pub mod error;
+pub mod failure_receipt;
 pub mod follow_turn;
 pub mod gc;
 pub mod git_transport;
@@ -1322,15 +1323,17 @@ fn run_task_subcommand(
                         "replaced_runners": report.replaced_runners(),
                         "started_runners": report.started_runners(),
                         "repaired_rows": report.repaired_rows(),
+                        "unverifiable_rows": report.unverifiable_rows(),
                     }),
                 )?;
             } else {
                 writeln!(
                     stdout,
-                    "runners: {} replaced, {} started; task rows: {} repaired",
+                    "runners: {} replaced, {} started; task rows: {} repaired, {} unverifiable",
                     report.replaced_runners(),
                     report.started_runners(),
-                    report.repaired_rows()
+                    report.repaired_rows(),
+                    report.unverifiable_rows()
                 )?;
                 stdout.flush()?;
             }
@@ -1499,6 +1502,7 @@ pub(crate) fn write_task_report(
         if !report.deliveries().is_empty() {
             response["deliveries"] = serde_json::json!(report.deliveries());
         }
+        insert_receipt_fields(&mut response, report.failure_receipt());
         write_json_line(stdout, &response)
     } else {
         let worker = report.status().worker().unwrap_or("unassigned");
@@ -1520,6 +1524,14 @@ pub(crate) fn write_task_report(
                 delivery.oid()
             )?;
         }
+        if let Some(receipt) = report.failure_receipt() {
+            writeln!(
+                stdout,
+                "receipt: stage={} residual={}",
+                receipt.stage(),
+                receipt.residual().join(",")
+            )?;
+        }
         stdout.flush()?;
         Ok(())
     }
@@ -1538,13 +1550,22 @@ fn write_task_list_report(
     } else {
         for task in report.tasks() {
             if let Some(blocking_code) = task.blocking_code.as_deref() {
+                let blocking = if blocking_code.contains("HOST_IO") && task.stage.is_some() {
+                    format_host_io_blocking(
+                        blocking_code,
+                        task.stage.as_deref(),
+                        task.residual.as_deref(),
+                    )
+                } else {
+                    blocking_code.to_owned()
+                };
                 writeln!(
                     stdout,
                     "{}: {} ({}) blocking: {}",
                     task.task_id,
                     task_state_name(task.state),
                     task.worker.as_deref().unwrap_or("unassigned"),
-                    blocking_code
+                    blocking
                 )?;
             } else {
                 writeln!(
@@ -1567,16 +1588,15 @@ fn write_task_result_report(
     stdout: &mut dyn Write,
 ) -> Result<(), WorkerError> {
     if json {
-        write_json_line(
-            stdout,
-            &serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
-                "task_id": report.task_id().to_string(),
-                "status": report.status(),
-                "branch": report.branch(),
-                "fetch": report.fetch_instruction(),
-            }),
-        )
+        let mut value = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "task_id": report.task_id().to_string(),
+            "status": report.status(),
+            "branch": report.branch(),
+            "fetch": report.fetch_instruction(),
+        });
+        insert_receipt_fields(&mut value, report.failure_receipt());
+        write_json_line(stdout, &value)
     } else {
         writeln!(
             stdout,
@@ -1603,6 +1623,14 @@ fn write_task_result_report(
         }
         writeln!(stdout, "branch: {}", report.branch())?;
         writeln!(stdout, "fetch: {}", report.fetch_instruction())?;
+        if let Some(receipt) = report.failure_receipt() {
+            writeln!(
+                stdout,
+                "receipt: stage={} residual={}",
+                receipt.stage(),
+                receipt.residual().join(",")
+            )?;
+        }
         stdout.flush()?;
         Ok(())
     }
@@ -1687,6 +1715,29 @@ fn write_json_line<T: Serialize>(stdout: &mut dyn Write, value: &T) -> Result<()
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())
+}
+
+fn insert_receipt_fields(
+    value: &mut serde_json::Value,
+    receipt: Option<&crate::failure_receipt::FailureReceipt>,
+) {
+    let Some(receipt) = receipt else {
+        return;
+    };
+    value["stage"] = serde_json::json!(receipt.stage());
+    value["residual"] = serde_json::json!(receipt.residual());
+}
+
+fn format_host_io_blocking(
+    code: &str,
+    stage: Option<&str>,
+    residual: Option<&[String]>,
+) -> String {
+    let Some(stage) = stage else {
+        return code.to_owned();
+    };
+    let residual = residual.map(|items| items.join(",")).unwrap_or_default();
+    format!("{code} (stage={stage}, residual={residual})")
 }
 
 /// Renders questions for the human output, appending the answers an agent will
@@ -3091,13 +3142,14 @@ fn versioned_host_error(error: &WorkerError) -> HostControlError {
         return error;
     }
     let (code, message) = match error {
-        WorkerError::Capacity { code, .. } => (*code, "worker admission rejected"),
-        WorkerError::Snapshot { code, .. } => (*code, "snapshot operation failed"),
-        WorkerError::Git { code, .. } => (*code, "Git operation failed"),
-        WorkerError::Task { code, .. } => (*code, "task operation failed"),
-        WorkerError::Agent { code, .. } => (*code, "agent operation failed"),
-        WorkerError::Io(_) => ("HOST_IO", "host state operation failed"),
-        _ => ("INVALID_REQUEST", "host request was invalid"),
+        WorkerError::Capacity { code, .. } => (*code, "worker admission rejected".into()),
+        WorkerError::Snapshot { code, .. } => (*code, "snapshot operation failed".into()),
+        WorkerError::Git { code, .. } => (*code, "Git operation failed".into()),
+        WorkerError::Task { code, .. } => (*code, "task operation failed".into()),
+        WorkerError::Agent { code, .. } => (*code, "agent operation failed".into()),
+        WorkerError::HostIo { receipt, .. } => ("HOST_IO", receipt.host_message()),
+        WorkerError::Io(_) => ("HOST_IO", "host state operation failed".into()),
+        _ => ("INVALID_REQUEST", "host request was invalid".into()),
     };
     HostControlError::new(code, message).expect("fixed host error is valid")
 }
@@ -3115,6 +3167,31 @@ mod versioned_host_error_tests {
         let wire = serde_json::to_value(&error).unwrap();
         assert_eq!(wire["error"]["code"], "AGENT_EXITED");
         assert_eq!(wire["error"]["message"], "agent operation failed");
+    }
+
+    #[test]
+    fn host_io_receipts_travel_in_the_existing_message_string() {
+        let receipt = crate::failure_receipt::FailureReceipt::new(
+            crate::failure_receipt::STAGE_CLEANUP,
+            &[
+                crate::failure_receipt::RESIDUAL_LEASE,
+                crate::failure_receipt::RESIDUAL_CLEANUP_TREE,
+            ],
+        )
+        .unwrap();
+        let error = versioned_host_error(&WorkerError::HostIo {
+            source: std::io::Error::other("cleanup failed"),
+            receipt: receipt.clone(),
+        });
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(wire["error"]["code"], "HOST_IO");
+        assert_eq!(wire["error"]["message"], receipt.host_message());
+        assert!(wire["error"].get("stage").is_none());
+        assert!(wire["error"].get("residual").is_none());
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["protocol_version"],
+            crate::protocol::PROTOCOL_VERSION
+        );
     }
 }
 
@@ -3401,7 +3478,7 @@ fn public_git_server_error(error: &WorkerError) -> &'static str {
         }
         WorkerError::Task { .. } => "HOST_GIT_TASK",
         WorkerError::Git { code, .. } => code,
-        WorkerError::Io(_) => "HOST_GIT_IO",
+        WorkerError::Io(_) | WorkerError::HostIo { .. } => "HOST_GIT_IO",
         _ => "HOST_GIT_REJECTED",
     }
 }
@@ -3471,7 +3548,7 @@ fn public_rsync_receiver_error(error: &WorkerError) -> &'static str {
         WorkerError::Protocol(message) if message.starts_with("LEASE_IDENTITY_MISMATCH:") => {
             "HOST_RSYNC_LEASE"
         }
-        WorkerError::Io(_) => "HOST_RSYNC_IO",
+        WorkerError::Io(_) | WorkerError::HostIo { .. } => "HOST_RSYNC_IO",
         _ => "HOST_RSYNC_REJECTED",
     }
 }
@@ -3615,7 +3692,7 @@ fn run_enabled_controller_task(
                     source,
                     publish,
                     publish_branch,
-                    no_wait: _,
+                    no_wait,
                     wait,
                 },
         } => {
@@ -3653,8 +3730,11 @@ fn run_enabled_controller_task(
                     source,
                     publish,
                     publish_branch,
+                    wait_for_capacity: !no_wait,
                 },
             )?;
+            // OVERLAPPING/PENDING OpenCode exclusive A: `--wait` waits via
+            // controller then writes TaskReport. `--no-wait` ACK unchanged.
             if wait {
                 let task_id: crate::task::TaskId = controller_ack_id(ack.task_id())
                     .parse()
@@ -3664,14 +3744,15 @@ fn run_enabled_controller_task(
                                 .into(),
                         )
                     })?;
-                let report = crate::controller::wait_via_controller(
+                let waited = crate::controller::wait_via_controller(
                     runner,
                     &config.controller,
                     crate::controller::ControllerWaitSelector::Task(task_id),
                     None,
                 )?;
-                write_wait_report(&report, json, stdout)?;
-                return Ok(report.exit_code());
+                let report = controller_task_status(runner, config, task_id)?;
+                write_task_report(&report, json, stdout)?;
+                return Ok(waited.exit_code());
             }
             if json {
                 write_json_line(
@@ -3860,15 +3941,17 @@ fn run_enabled_controller_task(
                         "replaced_runners": report.replaced_runners(),
                         "started_runners": report.started_runners(),
                         "repaired_rows": report.repaired_rows(),
+                        "unverifiable_rows": report.unverifiable_rows(),
                     }),
                 )?;
             } else {
                 writeln!(
                     stdout,
-                    "runners: {} replaced, {} started; task rows: {} repaired",
+                    "runners: {} replaced, {} started; task rows: {} repaired, {} unverifiable",
                     report.replaced_runners(),
                     report.started_runners(),
-                    report.repaired_rows()
+                    report.repaired_rows(),
+                    report.unverifiable_rows()
                 )?;
                 stdout.flush()?;
             }
@@ -3978,6 +4061,8 @@ struct ControllerSubmitFields {
     source: Option<String>,
     publish: Vec<String>,
     publish_branch: Option<String>,
+    // OVERLAPPING/PENDING OpenCode exclusive A/no_wait freeze adapter field.
+    wait_for_capacity: bool,
 }
 
 fn freeze_and_submit_via_controller(
@@ -4003,6 +4088,7 @@ fn freeze_and_submit_via_controller(
         source,
         publish,
         publish_branch,
+        wait_for_capacity,
     } = cli;
     let probed = crate::project_state::ProjectState::load(runner, &project, &includes)?;
     let limits = crate::task_client::effective_task_limits(&limits, &probed.settings.task)?;
@@ -4079,6 +4165,7 @@ fn freeze_and_submit_via_controller(
         allow_sensitive: probed.settings.snapshot.allow_sensitive.clone(),
         cli_includes: includes,
         branch: probed.context.branch.clone(),
+        wait_for_capacity,
     };
     let payload = serde_json::to_vec(&serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,

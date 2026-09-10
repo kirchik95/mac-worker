@@ -400,6 +400,9 @@ pub fn parse_from_base(base: &str) -> Option<&str> {
         .filter(|parent| !parent.is_empty())
 }
 
+/// Observation-only Matching|Ambiguous check. First `Absent` is not live
+/// here, so this helper must not drive production occupancy: slot and DAG claim
+/// paths use `runner_identity_verdict` and occupy until `Exited`.
 pub fn claim_owner_is_live(observation: ProcessObservation) -> bool {
     matches!(
         observation,
@@ -672,6 +675,8 @@ pub fn pending_list_row(run_id: RunId, node: &DagNode, created_at_millis: u64) -
         env_profile: node.frozen.env_profile.clone(),
         state: node_list_state(node),
         blocking_code,
+        stage: None,
+        residual: None,
         last_outcome: None,
         worker: node.frozen.worker.clone(),
         branch: BranchName::for_task(node.task_id),

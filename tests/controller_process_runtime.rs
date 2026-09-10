@@ -9,7 +9,7 @@ mod controller_process;
 mod support;
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,7 @@ use mac_worker::{
     transfer_repo::TransferRepo,
     turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
 };
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -243,6 +244,55 @@ fn decode_protocol_json<T: DeserializeOwned>(stdout: &[u8], stderr: &[u8]) -> T 
             String::from_utf8_lossy(stderr)
         )
     })
+}
+
+/// Same rules as `parse_control_response`: typed JSON plus canonical bytes.
+/// Not a production helper. First-line `Value` decode is not this check.
+fn parse_like_host_control<T>(stdout: &[u8], stderr: &[u8]) -> T
+where
+    T: DeserializeOwned + Serialize,
+{
+    let mut deserializer = serde_json::Deserializer::from_slice(stdout);
+    let response = T::deserialize(&mut deserializer).unwrap_or_else(|error| {
+        panic!(
+            "host control deserialize failed ({error}); stdout={} stderr={}",
+            String::from_utf8_lossy(stdout),
+            String::from_utf8_lossy(stderr)
+        )
+    });
+    deserializer.end().unwrap_or_else(|error| {
+        panic!(
+            "host control trailing tokens ({error}); stdout={} stderr={}",
+            String::from_utf8_lossy(stdout),
+            String::from_utf8_lossy(stderr)
+        )
+    });
+    let canonical = serde_json::to_vec(&response)
+        .unwrap_or_else(|error| panic!("host control serialize failed ({error})"));
+    let with_newline = [canonical.as_slice(), b"\n"].concat();
+    assert!(
+        stdout == canonical.as_slice() || stdout == with_newline.as_slice(),
+        "host control canonical mismatch stdout={} canonical={} stderr={}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(&canonical),
+        String::from_utf8_lossy(stderr)
+    );
+    response
+}
+
+fn fakeexec_canonical<T>(fixture: &ProcessFixture, opcode: &str, stdin: &[u8]) -> T
+where
+    T: DeserializeOwned + Serialize,
+{
+    let (status, stdout, stderr) = fixture.run_fakeexec(opcode, stdin);
+    assert!(
+        status.success(),
+        "fakeexec {opcode} failed: stdout={} stderr={} journal={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr),
+        fixture.exec_journal()
+    );
+    parse_like_host_control(&stdout, &stderr)
 }
 
 fn plumbing_task_id() -> TaskId {
@@ -461,7 +511,7 @@ fn harness_fake_exec_protocol_and_descendant_git() {
     );
     assert_eq!(turn_resp.task().turns().len(), 1);
 
-    let logs: StatusLogsResponse = fakeexec_ok(
+    let logs: StatusLogsResponse = fakeexec_canonical(
         &fixture,
         "host status-logs",
         &serde_json::to_vec(&StatusLogsRequest::new(plumbing_job_id(), 0, 32, 0, 32)).unwrap(),
@@ -760,6 +810,136 @@ fn laptop_tasks_exist(root: &Path) -> bool {
     root.join("tasks").exists()
 }
 
+fn controller_task_records(fixture: &ProcessFixture) -> String {
+    let tasks_dir = fixture.controller_state().join("tasks");
+    let Ok(entries) = std::fs::read_dir(&tasks_dir) else {
+        return format!("missing {tasks_dir:?}");
+    };
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            records.push(format!(
+                "{} unparseable {}",
+                path.display(),
+                String::from_utf8_lossy(&bytes)
+            ));
+            continue;
+        };
+        records.push(format!(
+            "{} fetched_head={:?} runner={:?} last_outcome={:?} head_oid={:?} worker={:?} pinned_worker={:?}",
+            path.display(),
+            value.get("fetched_head"),
+            value.get("runner"),
+            value
+                .get("status")
+                .and_then(|status| status.get("last_outcome")),
+            value
+                .get("status")
+                .and_then(|status| status.get("head_oid")),
+            value.get("status").and_then(|status| status.get("worker")),
+            value.get("pinned_worker")
+        ));
+    }
+    if records.is_empty() {
+        format!("no task json under {tasks_dir:?}")
+    } else {
+        records.join("\n")
+    }
+}
+
+fn git_refs(git_dir: &Path) -> String {
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["--git-dir", &git_dir.to_string_lossy(), "for-each-ref"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output();
+    match output {
+        Ok(output) => format!(
+            "{} status={} stdout={} stderr={}",
+            git_dir.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => format!("{} git-for-each-ref failed: {error}", git_dir.display()),
+    }
+}
+
+fn git_has_commit(git_dir: &Path, oid: &str) -> String {
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["--git-dir", &git_dir.to_string_lossy(), "cat-file", "-t", oid])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output();
+    match output {
+        Ok(output) => format!(
+            "{} {} type={} stderr={}",
+            git_dir.display(),
+            oid,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("{} cat-file failed: {error}", git_dir.display()),
+    }
+}
+
+fn collect_git_dirs(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.join("HEAD").exists() {
+            out.push(path);
+            continue;
+        }
+        if path.is_dir() {
+            collect_git_dirs(&path, out);
+        }
+    }
+}
+
+fn walk_logs(path: &Path, out: &mut Vec<String>) {
+    if path.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            walk_logs(&entry.path(), out);
+        }
+        return;
+    }
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if name.ends_with(".log") || name.ends_with(".json") {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        out.push(format!(
+            "{} {}",
+            path.display(),
+            String::from_utf8_lossy(&bytes)
+        ));
+    }
+}
+
+fn controller_git_evidence(fixture: &ProcessFixture, result_oid: &str) -> String {
+    let mut git_dirs = vec![fixture.exec_git.clone()];
+    collect_git_dirs(&fixture.controller_xdg_cache, &mut git_dirs);
+    collect_git_dirs(&fixture.controller_xdg_data, &mut git_dirs);
+    let mut lines = Vec::new();
+    for git_dir in git_dirs {
+        lines.push(git_refs(&git_dir));
+        lines.push(git_has_commit(&git_dir, result_oid));
+    }
+    walk_logs(&fixture.controller_state().join("runners"), &mut lines);
+    lines.join("\n")
+}
+
 fn parse_json_value(stdout: &[u8]) -> Value {
     serde_json::from_slice(stdout).unwrap_or_else(|_| {
         let text = String::from_utf8_lossy(stdout);
@@ -1023,11 +1203,24 @@ fn runtime_short_lived_submit_imports_exact_result() {
     );
 
     let imported = fixture.controller_imported_oids();
-    assert_eq!(
-        imported,
-        vec![result_oid.clone()],
-        "controller imported head must be fetched_head plus controller Git, not a source OID or export token"
-    );
+    if imported != vec![result_oid.clone()] {
+        panic!(
+            "controller imported head must be fetched_head plus controller Git, not a source OID or export token\n\
+             imported={imported:?} expected={result_oid}\n\
+             wait_stdout={wait_text} wait_stderr={wait_err}\n\
+             opcodes status-logs={} status={} upload-pack={} task-status={}\n\
+             task_records={}\n\
+             git={}\n\
+             journal={}",
+            fixture.journal_opcode_count("host status-logs"),
+            fixture.journal_opcode_count("\"opcode\":\"host status\""),
+            fixture.journal_opcode_count("host upload-pack"),
+            fixture.journal_opcode_count("host task-status"),
+            controller_task_records(&fixture),
+            controller_git_evidence(&fixture, &result_oid),
+            fixture.exec_journal()
+        );
+    }
     assert!(
         !git_object_exists(&repo, &result_oid),
         "laptop Git must not hold the result commit before explicit fetch"

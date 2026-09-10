@@ -1330,7 +1330,10 @@ mod lifecycle_tests {
         assert!(stale.validate_layout().is_err());
         let error = HostStore::migrate_layout(&root).unwrap_err();
         assert_eq!(error.public_code(), "HOST_UPGRADE_DRAIN_REQUIRED");
-        assert!(error.to_string().contains("heavy"));
+        assert!(
+            error.to_string().contains("live layout-2 lease remains"),
+            "{error}"
+        );
         assert_eq!(
             fs::read(root.join("leases/heavy/lease.json")).unwrap(),
             leftover

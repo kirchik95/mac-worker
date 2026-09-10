@@ -61,6 +61,14 @@ pub struct FrozenSubmitBody {
     pub cli_includes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// OVERLAPPING/PENDING OpenCode exclusive no_wait. Mechanical field so
+    /// the envelope compiles; omitted old bodies default true.
+    #[serde(default = "default_true")]
+    pub wait_for_capacity: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,7 +155,7 @@ impl FrozenSubmitBody {
             limits,
             policy,
             requires: self.requires.clone(),
-            wait_for_capacity: true,
+            wait_for_capacity: self.wait_for_capacity,
             attached: false,
             branch: self.branch.clone(),
             include_untracked: self.include_untracked.clone(),
@@ -166,3 +174,66 @@ fn parse_frozen_agent(value: &str) -> Result<AgentKind, WorkerError> {
         _ => Err(WorkerError::task("AGENT_UNSUPPORTED", "unknown agent")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::{BaseOid, TaskId, TurnId};
+    use serde_json::json;
+
+    fn sample_oid() -> BaseOid {
+        "dddddddddddddddddddddddddddddddddddddddd".parse().unwrap()
+    }
+
+    fn sample_body_json(wait_for_capacity: Option<bool>) -> serde_json::Value {
+        let mut body = json!({
+            "task_id": "018f0f4a6b5c7d8e9f00112233445566",
+            "turn_id": "118f0f4a6b5c7d8e9f00112233445566",
+            "created_at_millis": 1,
+            "prompt": "p",
+            "agent": "codex",
+            "source": "local",
+            "publish": ["fetch"],
+            "close_on": "never",
+            "wip": true,
+            "project_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "worktree_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "base_oid": sample_oid().as_str(),
+            "timeout_millis": 1000,
+            "max_followups": 10,
+            "permissions": "workspace",
+            "requires": [],
+            "include_untracked": [],
+            "include_empty_dirs": [],
+            "allow_sensitive": [],
+            "cli_includes": [],
+        });
+        if let Some(flag) = wait_for_capacity {
+            body["wait_for_capacity"] = json!(flag);
+        }
+        body
+    }
+
+    #[test]
+    fn omitted_wait_for_capacity_defaults_true() {
+        let body: FrozenSubmitBody = serde_json::from_value(sample_body_json(None)).unwrap();
+        assert!(body.wait_for_capacity);
+        assert!(body.prepared().unwrap().wait_for_capacity);
+    }
+
+    #[test]
+    fn false_wait_for_capacity_survives_prepared_and_replay() {
+        let original = sample_body_json(Some(false));
+        let body: FrozenSubmitBody = serde_json::from_value(original.clone()).unwrap();
+        assert!(!body.wait_for_capacity);
+        let prepared = body.prepared().unwrap();
+        assert!(!prepared.wait_for_capacity);
+        let restored: FrozenSubmitBody =
+            serde_json::from_value(serde_json::to_value(&body).unwrap()).unwrap();
+        assert!(!restored.wait_for_capacity);
+        assert!(!restored.prepared().unwrap().wait_for_capacity);
+        let _task_id: TaskId = body.task_id;
+        let _turn_id: TurnId = body.turn_id;
+    }
+}
+

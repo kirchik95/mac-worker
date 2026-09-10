@@ -135,6 +135,7 @@ fn frozen_body(oid: &BaseOid) -> FrozenSubmitBody {
         allow_sensitive: Vec::new(),
         cli_includes: Vec::new(),
         branch: None,
+        wait_for_capacity: true,
     }
 }
 

@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::WorkerError,
+    failure_receipt::{STAGE_CANCEL, STAGE_CLEANUP, STAGE_DRAIN, STAGE_LEASE_RELEASE},
     host_store::{
         AdmissionGuard, HostStore, HostStoreWritePoint, JobDisposition, ResolutionIdentity,
         SupervisorGuard,
@@ -703,7 +704,14 @@ impl<'a> JobService<'a> {
         if let Some(boundary) = &self.log_read_boundary {
             boundary();
         }
-        Self::log_chunk_from(&authoritative.directory, stream, offset, limit)
+        Self::log_chunk_from(
+            self,
+            job_id,
+            &authoritative.directory,
+            stream,
+            offset,
+            limit,
+        )
     }
 
     pub fn status_logs(
@@ -721,12 +729,16 @@ impl<'a> JobService<'a> {
             boundary();
         }
         let stdout = Self::log_chunk_from(
+            self,
+            request.job_id(),
             &authoritative.directory,
             LogStream::Stdout,
             request.stdout_offset(),
             request.stdout_limit(),
         )?;
         let stderr = Self::log_chunk_from(
+            self,
+            request.job_id(),
             &authoritative.directory,
             LogStream::Stderr,
             request.stderr_offset(),
@@ -736,6 +748,8 @@ impl<'a> JobService<'a> {
     }
 
     fn log_chunk_from(
+        &self,
+        job_id: JobId,
         directory: &RootedDir,
         stream: LogStream,
         offset: u64,
@@ -758,7 +772,18 @@ impl<'a> JobService<'a> {
                         "requested log offset is beyond EOF",
                     )
                 } else {
-                    WorkerError::Io(error)
+                    let lease = self
+                        .leases
+                        .load()
+                        .ok()
+                        .flatten()
+                        .filter(|live| live.job_id() == job_id);
+                    self.store.attach_host_io(
+                        WorkerError::Io(error),
+                        STAGE_DRAIN,
+                        lease.as_ref(),
+                        Some(directory),
+                    )
                 }
             })?;
         LogChunk::new(stream, offset, bytes)
@@ -888,7 +913,12 @@ impl<'a> JobService<'a> {
             drop(admission);
             let cleanup = match payload_removal {
                 Ok(()) => self.cleanup_and_release_reconciled(lease, &job, &cancelled),
-                Err(error) => Err(WorkerError::Io(error)),
+                Err(error) => Err(self.store.attach_host_io(
+                    WorkerError::Io(error),
+                    STAGE_CANCEL,
+                    Some(lease),
+                    Some(&job),
+                )),
             };
             if let Err(error) = publication {
                 let _ = cleanup;
@@ -928,7 +958,12 @@ impl<'a> JobService<'a> {
             drop(supervisor);
             let cleanup = match payload_removal {
                 Ok(()) => self.cleanup_and_release_reconciled(lease, &job, &cancelled),
-                Err(error) => Err(WorkerError::Io(error)),
+                Err(error) => Err(self.store.attach_host_io(
+                    WorkerError::Io(error),
+                    STAGE_CANCEL,
+                    Some(lease),
+                    Some(&job),
+                )),
             };
             if let Err(error) = publication {
                 let _ = cleanup;
@@ -1847,7 +1882,12 @@ impl<'a> JobService<'a> {
                 drop(supervisor);
                 let cleanup = match payload_removal {
                     Ok(()) => self.cleanup_and_release_reconciled(&lease, &job, &current),
-                    Err(error) => Err(WorkerError::Io(error)),
+                    Err(error) => Err(self.store.attach_host_io(
+                        WorkerError::Io(error),
+                        STAGE_CLEANUP,
+                        Some(&lease),
+                        Some(&job),
+                    )),
                 };
                 // Terminal log/status reads still retry cleanup so a leftover
                 // FIFO can be drained later, but they must not fail the read.
@@ -2056,7 +2096,12 @@ impl<'a> JobService<'a> {
                         terminal,
                         "LEASE_RELEASE_FAILED",
                     );
-                    return Err(error);
+                    return Err(self.store.attach_host_io(
+                        error,
+                        STAGE_LEASE_RELEASE,
+                        Some(lease),
+                        Some(job),
+                    ));
                 }
                 self.clear_reconciliation_cleanup_error(lease, job, terminal)
             }
@@ -2067,7 +2112,9 @@ impl<'a> JobService<'a> {
                     terminal,
                     "MUTABLE_CLEANUP_FAILED",
                 );
-                Err(error)
+                Err(self
+                    .store
+                    .attach_host_io(error, STAGE_CLEANUP, Some(lease), Some(job)))
             }
         }
     }

@@ -111,6 +111,10 @@ pub struct TaskListRow {
     pub env_profile: Option<String>,
     pub state: TaskState,
     pub blocking_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual: Option<Vec<String>>,
     pub last_outcome: Option<TaskOutcome>,
     pub worker: Option<String>,
     pub branch: BranchName,
@@ -477,6 +481,16 @@ fn task_list_row(
             .map(|profile| boundary.text(profile, 128)),
         state: status.state(),
         blocking_code,
+        stage: record
+            .failure_receipt()
+            .map(|receipt| receipt.stage().to_owned()),
+        residual: record.failure_receipt().map(|receipt| {
+            receipt
+                .residual()
+                .iter()
+                .map(|item| (*item).to_owned())
+                .collect()
+        }),
         last_outcome: status
             .last_outcome()
             .map(|outcome| redact_outcome(outcome, &boundary)),

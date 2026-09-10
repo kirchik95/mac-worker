@@ -20,6 +20,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::WorkerError,
+    failure_receipt::{
+        RESIDUAL_CLEANUP_TREE, RESIDUAL_JOB_DIR, RESIDUAL_LEASE, RESIDUAL_SESSION,
+        RESIDUAL_SUPERVISOR_LOCK, RESIDUAL_TRANSFER_LOCK, RESIDUAL_WORKSPACE,
+    },
     inputs::RelativePath,
     job::{
         CancelRequest, ClientId, CommandSummary, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
@@ -3363,6 +3367,139 @@ impl HostStore {
         }
     }
 
+    /// Looks at what is actually left after a host I/O failure. Observation
+    /// errors skip that residual instead of guessing it is present.
+    pub(crate) fn observe_residuals(
+        &self,
+        lease: Option<&LeaseRecord>,
+        job: Option<&RootedDir>,
+    ) -> Vec<&'static str> {
+        let mut residual = Vec::new();
+        if lease.is_some_and(|lease| self.lease_still_loaded(lease)) {
+            residual.push(RESIDUAL_LEASE);
+        }
+        if self.cleanup_tree_present(lease, job) {
+            residual.push(RESIDUAL_CLEANUP_TREE);
+        }
+        if self.job_directory_present(lease, job) {
+            residual.push(RESIDUAL_JOB_DIR);
+        }
+        if let Some(lease) = lease
+            && self.job_lock_present(lease.job_id(), SUPERVISOR_LOCK_FILE)
+        {
+            residual.push(RESIDUAL_SUPERVISOR_LOCK);
+        }
+        if let Some(lease) = lease
+            && self.job_lock_present(lease.job_id(), TRANSFER_LOCK_FILE)
+        {
+            residual.push(RESIDUAL_TRANSFER_LOCK);
+        }
+        if self.session_present(lease, job) {
+            residual.push(RESIDUAL_SESSION);
+        }
+        if self.workspace_present(lease, job) {
+            residual.push(RESIDUAL_WORKSPACE);
+        }
+        residual
+    }
+
+    pub(crate) fn attach_host_io(
+        &self,
+        error: WorkerError,
+        stage: &'static str,
+        lease: Option<&LeaseRecord>,
+        job: Option<&RootedDir>,
+    ) -> WorkerError {
+        error.with_host_io_stage(stage, &self.observe_residuals(lease, job))
+    }
+
+    fn lease_still_loaded(&self, lease: &LeaseRecord) -> bool {
+        matches!(
+            crate::lease::LeaseService::new(self).load(),
+            Ok(Some(live)) if live.job_id() == lease.job_id()
+        )
+    }
+
+    fn cleanup_tree_present(&self, lease: Option<&LeaseRecord>, job: Option<&RootedDir>) -> bool {
+        // Only this job's durable tree and incoming scope. The parent
+        // `incoming/` and `leases/` namespaces are shared, so a leftover from
+        // another job must not appear on this receipt.
+        let mut present = job.is_some_and(directory_has_cleanup_residue);
+        if let Some(lease) = lease {
+            present |= self
+                .open_optional_directory(&format!(
+                    "jobs/{}/{}/{}",
+                    lease.project_id(),
+                    lease.worktree_id(),
+                    lease.job_id()
+                ))
+                .ok()
+                .flatten()
+                .is_some_and(|directory| directory_has_cleanup_residue(&directory));
+            present |= self
+                .open_optional_directory(&format!("incoming/{}", lease.job_id()))
+                .ok()
+                .flatten()
+                .is_some_and(|directory| directory_has_cleanup_residue(&directory));
+        }
+        present
+    }
+
+    fn job_directory_present(&self, lease: Option<&LeaseRecord>, _job: Option<&RootedDir>) -> bool {
+        // The durable `jobs/…` directory is the terminal record; a leftover
+        // job dir is the incoming scope cleanup failed to remove.
+        let Some(lease) = lease else {
+            return false;
+        };
+        self.open_optional_directory(&format!("incoming/{}", lease.job_id()))
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    fn job_lock_present(&self, job: JobId, name: &str) -> bool {
+        self.open_optional_directory(&format!("locks/jobs/{job}"))
+            .ok()
+            .flatten()
+            .is_some_and(|directory| directory_has_entry(&directory, name))
+    }
+
+    fn session_present(&self, lease: Option<&LeaseRecord>, job: Option<&RootedDir>) -> bool {
+        if job.is_some_and(|job| directory_has_entry(job, "session")) {
+            return true;
+        }
+        let Some(lease) = lease else {
+            return false;
+        };
+        self.open_optional_directory(&format!(
+            "jobs/{}/{}/{}",
+            lease.project_id(),
+            lease.worktree_id(),
+            lease.job_id()
+        ))
+        .ok()
+        .flatten()
+        .is_some_and(|directory| directory_has_entry(&directory, "session"))
+    }
+
+    fn workspace_present(&self, lease: Option<&LeaseRecord>, job: Option<&RootedDir>) -> bool {
+        if job.is_some_and(|job| directory_has_entry(job, "workspace")) {
+            return true;
+        }
+        let Some(lease) = lease else {
+            return false;
+        };
+        self.open_optional_directory(&format!(
+            "jobs/{}/{}/{}",
+            lease.project_id(),
+            lease.worktree_id(),
+            lease.job_id()
+        ))
+        .ok()
+        .flatten()
+        .is_some_and(|directory| directory_has_entry(&directory, "workspace"))
+    }
+
     fn remove_job_owned_lease_stages(
         &self,
         leases: &RootedDir,
@@ -4127,7 +4264,7 @@ fn validate_installation_identity(
 
 fn worker_error_as_io(error: WorkerError) -> std::io::Error {
     match error {
-        WorkerError::Io(error) => error,
+        WorkerError::Io(error) | WorkerError::HostIo { source: error, .. } => error,
         error => std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
     }
 }
@@ -5151,6 +5288,38 @@ fn require_no_private_cleanup_residue(
         )));
     }
     Ok(())
+}
+
+fn directory_has_cleanup_residue(directory: &RootedDir) -> bool {
+    // Nested private namespace and this directory's own `remove-*`
+    // quarantines. `has_private_cleanup_residue` also looks at the parent
+    // namespace, which is shared among jobs.
+    if let Ok(path) = relative(".mac-worker-rooted-fs")
+        && let Ok(namespace) = directory.open_child_directory(&path, false)
+        && namespace
+            .list_names()
+            .ok()
+            .is_some_and(|names| !names.is_empty())
+    {
+        return true;
+    }
+    directory
+        .list_names()
+        .ok()
+        .is_some_and(|names| names.iter().any(|name| is_owned_remove_quarantine(name)))
+}
+
+fn is_owned_remove_quarantine(name: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(name) else {
+        return false;
+    };
+    name.strip_prefix("remove-").is_some_and(|value| {
+        uuid::Uuid::parse_str(value).is_ok_and(|uuid| uuid.hyphenated().to_string() == value)
+    })
+}
+
+fn directory_has_entry(directory: &RootedDir, name: &str) -> bool {
+    directory.entry_exists(name).unwrap_or(false)
 }
 
 fn protocol_code(code: &'static str, message: &str) -> WorkerError {
@@ -6838,6 +7007,17 @@ mod review_regression_tests {
         }
     }
 
+    fn plant_cleanup_residue(parent: &Path) {
+        fs::create_dir_all(parent).unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let namespace = parent.join(".mac-worker-rooted-fs");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+        let leftover = namespace.join("cleanup-303f0f4a-6b5c-4d8e-9f00-112233445566");
+        fs::create_dir(&leftover).unwrap();
+        fs::set_permissions(&leftover, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     fn archive_terminal_v6_job(store: &HostStore, seed: u128) {
         let material = RequestFingerprintMaterial::from_stored(
             PREVIOUS_STORED_PROTOCOL_VERSION,
@@ -7080,11 +7260,13 @@ mod review_regression_tests {
         let rollback_target = target.clone();
         let rollback = thread::spawn(move || {
             HostStore::with_upgrade_fence_hold(rollback_barrier, || {
-                HostStore::complete_unverified_rollback(
-                    &rollback_root,
-                    Some(&rollback_previous),
-                    &rollback_target,
-                )
+                HostStore::with_published_layout_version(ROLLBACK_HELPER_LAYOUT_VERSION, || {
+                    HostStore::complete_unverified_rollback(
+                        &rollback_root,
+                        Some(&rollback_previous),
+                        &rollback_target,
+                    )
+                })
             })
         });
         barrier.wait();
@@ -7135,6 +7317,11 @@ mod review_regression_tests {
         let temp = tempdir().unwrap();
         let root = temp.path().join("host");
         HostStore::open(&root).unwrap();
+        let layout_path = root.join(HOST_LAYOUT_FILE);
+        let mut layout: HostLayoutIdentity =
+            serde_json::from_slice(&fs::read(&layout_path).unwrap()).unwrap();
+        layout.version = ROLLBACK_HELPER_LAYOUT_VERSION;
+        fs::write(&layout_path, serde_json::to_vec(&layout).unwrap()).unwrap();
         let previous = temp.path().join("worker.previous");
         let target = temp.path().join("worker");
         fs::write(&previous, b"previous-helper").unwrap();
@@ -7192,5 +7379,61 @@ mod review_regression_tests {
             "{error}"
         );
         assert_eq!(fs::read(&target).unwrap(), b"candidate-helper");
+    }
+
+    #[test]
+    fn residual_observation_ignores_another_jobs_cleanup_tree() {
+        use crate::failure_receipt::RESIDUAL_CLEANUP_TREE;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request(94);
+        let lease = match LeaseService::new(&store)
+            .acquire(&request, &healthy_facts(), 1)
+            .unwrap()
+        {
+            LeaseAcquireResponse::Acquired { lease } => lease,
+            LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+        };
+        let job_path = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        create_owner_only_job_tree(&job_path);
+
+        let other = crate::job::JobId::new(uuid::Uuid::from_u128(0xaaaa_bbbb_cccc_dddd));
+        plant_cleanup_residue(&root.join("incoming"));
+        plant_cleanup_residue(&root.join("leases"));
+        plant_cleanup_residue(&root.join("incoming").join(other.to_string()));
+        plant_cleanup_residue(job_path.parent().unwrap());
+        plant_cleanup_residue(
+            &store
+                .job(lease.project_id(), lease.worktree_id(), other)
+                .unwrap(),
+        );
+
+        let job = store
+            .open_directory(
+                &format!(
+                    "jobs/{}/{}/{}",
+                    lease.project_id(),
+                    lease.worktree_id(),
+                    lease.job_id()
+                ),
+                false,
+            )
+            .unwrap();
+        let observed = store.observe_residuals(Some(&lease), Some(&job));
+        assert!(
+            !observed.contains(&RESIDUAL_CLEANUP_TREE),
+            "another job's leftover must not appear on this receipt: {observed:?}"
+        );
+
+        plant_cleanup_residue(&job_path);
+        let observed = store.observe_residuals(Some(&lease), Some(&job));
+        assert!(
+            observed.contains(&RESIDUAL_CLEANUP_TREE),
+            "this job's own leftover must appear: {observed:?}"
+        );
     }
 }

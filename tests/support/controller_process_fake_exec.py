@@ -131,6 +131,51 @@ def job_status(state: str, updated_at: int, *, terminal: bool) -> dict[str, Any]
     return status
 
 
+def job_meta_wire(meta: dict[str, Any]) -> dict[str, Any]:
+    """JobMeta serde field order. Store JSON may be sort_keys=True."""
+    return {
+        "protocol_version": int(meta["protocol_version"]),
+        "job_id": meta["job_id"],
+        "client_id": meta["client_id"],
+        "worker_name": meta["worker_name"],
+        "project_id": meta["project_id"],
+        "worktree_id": meta["worktree_id"],
+        "manifest_digest": meta["manifest_digest"],
+        "request_fingerprint": meta["request_fingerprint"],
+        "command_summary": meta["command_summary"],
+        "relative_working_dir": meta.get("relative_working_dir") or "",
+        "timeout_millis": int(meta["timeout_millis"]),
+        "resource_class": meta["resource_class"],
+        "created_at_millis": int(meta["created_at_millis"]),
+    }
+
+
+def job_status_wire(status: dict[str, Any]) -> dict[str, Any]:
+    """JobStatus serde field order. Store JSON may be sort_keys=True."""
+    return {
+        "state": status["state"],
+        "updated_at_millis": int(status["updated_at_millis"]),
+        "supervisor_pid": status.get("supervisor_pid"),
+        "supervisor_start_identity": status.get("supervisor_start_identity"),
+        "child_pid": status.get("child_pid"),
+        "child_start_identity": status.get("child_start_identity"),
+        "exit_code": status.get("exit_code"),
+        "terminating_signal": status.get("terminating_signal"),
+        "final_stdout_bytes": status.get("final_stdout_bytes"),
+        "final_stderr_bytes": status.get("final_stderr_bytes"),
+        "error_code": status.get("error_code"),
+        "cleanup_error_code": status.get("cleanup_error_code"),
+    }
+
+
+def status_response_wire(meta: dict[str, Any], status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "meta": job_meta_wire(meta),
+        "status": job_status_wire(status),
+    }
+
+
 def empty_chunk(stream: str, offset: int) -> dict[str, Any]:
     return {
         "stream": stream,
@@ -665,11 +710,7 @@ def lookup_job(body: dict[str, Any], store: Store) -> tuple[dict[str, Any], dict
 
 def handle_status(body: dict[str, Any], store: Store) -> dict[str, Any]:
     meta, status = lookup_job(body, store)
-    return {
-        "protocol_version": PROTOCOL_VERSION,
-        "meta": meta,
-        "status": status,
-    }
+    return status_response_wire(meta, status)
 
 
 def handle_status_logs(body: dict[str, Any], store: Store) -> dict[str, Any]:
@@ -678,11 +719,7 @@ def handle_status_logs(body: dict[str, Any], store: Store) -> dict[str, Any]:
     stderr_off = int(body.get("stderr_offset") or 0)
     return {
         "protocol_version": PROTOCOL_VERSION,
-        "status": {
-            "protocol_version": PROTOCOL_VERSION,
-            "meta": meta,
-            "status": status,
-        },
+        "status": status_response_wire(meta, status),
         "stdout": empty_chunk("stdout", stdout_off),
         "stderr": empty_chunk("stderr", stderr_off),
     }
@@ -835,6 +872,10 @@ def main() -> int:
         record["job_id"] = material["job_id"]
     if project_id := first_str(body, "project_id"):
         record["project_id"] = project_id
+    if opcode in ("status-logs", "status"):
+        if job_id := first_str(body, "job_id"):
+            record["job_id"] = job_id
+        record["stdin"] = body
     if opcode == "refresh-facts":
         journal(journal_path, record)
         return 0
@@ -854,6 +895,8 @@ def main() -> int:
             head = first_str(task, "head_oid")
         if head:
             record["result_oid"] = head
+        if opcode in ("status-logs", "status"):
+            record["stdout"] = response
     journal(journal_path, record)
     if response is not None:
         emit(response)
