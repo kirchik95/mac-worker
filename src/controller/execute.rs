@@ -193,6 +193,13 @@ impl TaskSubmitHandler<'_> {
             serde_json::from_value(record.prepared().clone()).map_err(|_| {
                 WorkerError::Protocol("CONTROLLER_TRANSPORT: prepared batch is invalid".into())
             })?;
+        let registry = ProjectRegistry::open(&self.paths.controller_state_root())?;
+        bind_prepared_batch_nodes(
+            &registry,
+            &prepared,
+            record.request_id(),
+            record.payload_sha256(),
+        )?;
         for source in prepared.sources() {
             materialize_controller_checkout(
                 self.runner,
@@ -213,10 +220,7 @@ impl TaskSubmitHandler<'_> {
                 )
             })
             .collect();
-        let owned = OwnedCheckoutMap::from_identities(
-            &ProjectRegistry::open(&self.paths.controller_state_root())?,
-            identities,
-        )?;
+        let owned = OwnedCheckoutMap::from_identities(&registry, identities)?;
         let mut checkouts = ControllerCheckoutMap::new();
         for (project_id, worktree_id, path) in owned.iter() {
             checkouts.insert(project_id, worktree_id, path.to_path_buf());
@@ -302,6 +306,18 @@ impl TaskSubmitHandler<'_> {
         client.submit_prepared(&prepared, &checkout, true, true, &mut stdout, &mut stderr)?;
         Ok(())
     }
+}
+
+fn bind_prepared_batch_nodes(
+    registry: &ProjectRegistry,
+    prepared: &PreparedTaskBatch,
+    request_id: &str,
+    payload_sha256: &str,
+) -> Result<(), WorkerError> {
+    for node in prepared.nodes().values() {
+        registry.bind_task_request(node.task_id, request_id, payload_sha256)?;
+    }
+    Ok(())
 }
 
 fn materialize_frozen_checkout(
@@ -649,13 +665,16 @@ pub fn tick_controller_leader(
 mod tests {
     use super::*;
     use crate::agent::{AgentKind, PermissionPolicy};
+    use crate::dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState};
     use crate::task::{GitIdentity, PublishMode};
+    use std::os::unix::fs::PermissionsExt;
     use crate::{
         paths::PathLayout,
         process::SystemProcessRunner,
         project_state::ProjectState,
         task::{
-            BaseOid, ClosePolicy, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskSource, TurnId,
+            BaseOid, ClosePolicy, RunId, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskSource,
+            TurnId,
         },
         transfer_repo::TransferRepo,
     };
@@ -800,6 +819,59 @@ mod tests {
         fs::read(path.join("README")).unwrap()
     }
 
+    fn waiting_node(batch_id: &str, base: DagBase, depends_on: Vec<String>) -> DagNode {
+        DagNode {
+            batch_id: batch_id.to_owned(),
+            task_id: TaskId::generate(),
+            turn_id: TurnId::generate(),
+            depends_on,
+            base,
+            frozen: DagFrozenSpec {
+                prompt: format!("do {batch_id}"),
+                title: None,
+                agent: "codex".into(),
+                model: None,
+                effort: None,
+                source: "local".into(),
+                origin_url: None,
+                publish: vec!["fetch".into()],
+                publish_branch: None,
+                close_on: ClosePolicy::Done,
+                env_profile: None,
+                worker: None,
+                wip: false,
+                project_path: "/tmp/mac-worker-batch-bind".into(),
+                project_id: PROJECT_ID.into(),
+                worktree_id: WORKTREE_ID.into(),
+                timeout_millis: 45 * 60 * 1000,
+                max_turns: None,
+                max_budget_usd_cents: None,
+                max_followups: 10,
+                permissions: "workspace".into(),
+                requires: vec!["agent:codex".into()],
+                include_untracked: Vec::new(),
+                include_empty_dirs: Vec::new(),
+                allow_sensitive: Vec::new(),
+                cli_includes: Vec::new(),
+                branch: None,
+            },
+            state: DagNodeState::Waiting,
+            bound_oid: None,
+            bound_turn_id: None,
+            pin_ref: None,
+            blocked_by: None,
+            claimed_by: None,
+            claimed_at_millis: None,
+        }
+    }
+
+    fn owner_only(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
     #[test]
     fn frozen_checkout_retry_after_materialization_keeps_the_same_worktree() {
         let temp = tempfile::tempdir().unwrap();
@@ -915,6 +987,61 @@ mod tests {
         .unwrap();
         assert_eq!(digest.len(), 64);
         assert_ne!(digest, oid.as_str());
+    }
+
+    #[test]
+    fn prepared_batch_binds_waiting_child_nodes_to_the_outer_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = layout(temp.path());
+        owner_only(&paths.controller_state_root());
+        let registry = ProjectRegistry::open(&paths.controller_state_root()).unwrap();
+        let run_id = RunId::generate();
+        let oid = "0123456789abcdef0123456789abcdef01234567"
+            .parse::<BaseOid>()
+            .unwrap();
+        let root = waiting_node(
+            "root",
+            DagBase::Frozen {
+                oid,
+                pin_ref: format!("refs/mac-worker/dag/{run_id}/root"),
+                wip: false,
+            },
+            Vec::new(),
+        );
+        let child = waiting_node(
+            "child",
+            DagBase::From {
+                parent: "root".into(),
+            },
+            vec!["root".into()],
+        );
+        let root_id = root.task_id;
+        let child_id = child.task_id;
+        let prepared: PreparedTaskBatch = serde_json::from_value(json!({
+            "kind": "dag",
+            "run_id": run_id,
+            "requested_max_parallel": null,
+            "max_parallel": 1,
+            "created_at_millis": 1,
+            "nodes": {
+                "root": root,
+                "child": child,
+            },
+            "sources": [],
+        }))
+        .unwrap();
+        let fingerprint = "aa".repeat(32);
+        bind_prepared_batch_nodes(&registry, &prepared, REQUEST_A, &fingerprint).unwrap();
+        bind_prepared_batch_nodes(&registry, &prepared, REQUEST_A, &fingerprint).unwrap();
+        for task_id in [root_id, child_id] {
+            let bind = registry
+                .lookup_task_request(task_id)
+                .unwrap()
+                .expect("every prepared node must share the outer batch request");
+            assert_eq!(bind.request_id, REQUEST_A);
+            assert_eq!(bind.fingerprint, fingerprint);
+        }
+        assert_eq!(prepared.nodes().len(), 2);
     }
 
     fn task_meta(project_id: &str, worktree_id: &str, oid: &BaseOid) -> TaskMeta {
