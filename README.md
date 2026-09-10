@@ -241,6 +241,7 @@ Node.js is needed only when changing the dashboard source in `ui/`; its built as
 - [Prepare a Mac worker](docs/setup-macos-worker.md): SSH, agents, profiles, power settings and removal.
 - [Usage reference](docs/usage.md): tasks, follow-ups, batches, defaults, dashboard and remote commands.
 - [Multiple execution slots](docs/superpowers/specs/2026-09-10-slots-design.md): host `slot_count`, occupancy, migrate, and execution scope.
+- [Durable origin outbox](docs/superpowers/specs/2026-09-10-origin-outbox.md): per-turn origin delivery, slot release, and host `--watch` / `--enable` / `--once`.
 - [Installation recovery](docs/setup-recovery.md): retained installer state and older host layouts.
 - [Build and publish a release](docs/releasing.md): archives, checksums and Homebrew distribution.
 - [Acceptance runbook](docs/phase-five-acceptance-runbook.md) and [validation record](docs/phase-five-validation.md).

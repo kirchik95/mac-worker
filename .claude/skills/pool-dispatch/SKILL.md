@@ -99,7 +99,7 @@ worker task batch <file> --json
 
 Keep the returned run identifier and all task identifiers. `--max-parallel` does not have to be ≤ the slot sum; see Grammar.
 
-For a review loop that should stay Open after agent `done`, pass `--close-on never` (or set it in the batch / `.worker.toml`).
+For a review loop that should stay Open after agent `done`, pass `--close-on never` on submit, or `close_on` in the batch file. `.worker.toml` has no `close_on` field.
 
 ## Follow
 
@@ -143,7 +143,7 @@ For a task that reports `needs_input`, read its questions from `worker task stat
 worker task say <id> --message-file <file> --wait
 ```
 
-Do not send a message to an active turn. `say` is for the next turn. A `say` while a turn is running is `TASK_BUSY`. Public CLI `say` / `close` have no revision flags; wait until the previous runner has released ownership. Dashboard reply/accept use the current card; a stale card is rejected (`TASK_REVISION_CONFLICT`) and must not enqueue another turn. Field names: [usage](../../../docs/usage.md#dashboard).
+Do not send a message to an active turn. `say` is for the next turn. A `say` while a turn is running is `TASK_BUSY`. Public CLI `say` / `close` have no revision flags; wait until the previous runner has released ownership. Dashboard reply/accept use the current card; a stale card is rejected (`TASK_REVISION_CONFLICT`) and must not enqueue another turn.
 
 When a task reports `done`, fetch its result:
 

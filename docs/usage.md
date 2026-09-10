@@ -116,7 +116,7 @@ Host pump (hidden `worker host`, not in top-level `--help`):
 | `--enable` | Write `locks/outbox-enabled.json`. Does not start a watcher. Reboot recovery is `--enable` plus a LaunchAgent that actually starts `--watch`. |
 | `--wake` | Hidden. If a live watcher exists, no-op; else spawn `--watch` and exit. |
 
-`--once` is a one-shot pump, not a substitute for `--watch`. Do not treat a single `--once` after a crash as proof that due-registry recovery already ran; `--watch` recovers the due index on start. Standalone PERF spec (integrator lands `f6e2d4b`): `docs/superpowers/specs/2026-09-10-origin-outbox.md` when that file is in the tree.
+`--once` is a one-shot pump, not a substitute for `--watch`. Do not treat a single `--once` after a crash as proof that due-registry recovery already ran; `--watch` recovers the due index on start. Host layout of intents, pins, and the due registry: [durable origin outbox](superpowers/specs/2026-09-10-origin-outbox.md).
 
 Project defaults:
 
@@ -127,8 +127,9 @@ source = "local"            # or "origin": start from the exact commit on your G
 publish = ["fetch"]         # add "push" to also push task/<id> to origin
 timeout = "45m"
 max_followups = 10
-close_on = "done"           # or "never" for explicit review
 ```
+
+`.worker.toml` `[task]` has no `close_on` field. Set close policy with `--close-on` on submit, or `close_on` at the batch top level or on a `[[tasks]]` entry (`done` or `never`).
 
 To use the exact base commit from your Git remote and push the result branch back to that remote:
 
