@@ -3860,7 +3860,7 @@ fn run_enabled_controller_task(
                 }),
             )?;
             if wait {
-                crate::controller::wait_via_controller(
+                let waited = crate::controller::wait_via_controller(
                     runner,
                     &config.controller,
                     crate::controller::ControllerWaitSelector::Task(task_id),
@@ -3868,7 +3868,7 @@ fn run_enabled_controller_task(
                 )?;
                 let report = controller_task_status(runner, config, task_id)?;
                 write_task_report(&report, json, stdout)?;
-                Ok(report.exit_code().unwrap_or(0))
+                Ok(waited.exit_code())
             } else {
                 let report = task_report_from_controller_ack(&ack)?;
                 write_task_report(&report, json, stdout)?;
