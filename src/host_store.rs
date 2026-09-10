@@ -20,6 +20,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::WorkerError,
+    failure_receipt::{
+        RESIDUAL_CLEANUP_TREE, RESIDUAL_JOB_DIR, RESIDUAL_LEASE, RESIDUAL_SESSION,
+        RESIDUAL_SUPERVISOR_LOCK, RESIDUAL_TRANSFER_LOCK, RESIDUAL_WORKSPACE,
+    },
     inputs::RelativePath,
     job::{
         CancelRequest, ClientId, CommandSummary, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
@@ -3138,6 +3142,144 @@ impl HostStore {
         }
     }
 
+    /// Looks at what is actually left after a host I/O failure. Observation
+    /// errors skip that residual instead of guessing it is present.
+    pub(crate) fn observe_residuals(
+        &self,
+        lease: Option<&LeaseRecord>,
+        job: Option<&RootedDir>,
+    ) -> Vec<&'static str> {
+        let mut residual = Vec::new();
+        if lease.is_some_and(|lease| self.lease_still_loaded(lease)) {
+            residual.push(RESIDUAL_LEASE);
+        }
+        if self.cleanup_tree_present(lease, job) {
+            residual.push(RESIDUAL_CLEANUP_TREE);
+        }
+        if self.job_directory_present(lease, job) {
+            residual.push(RESIDUAL_JOB_DIR);
+        }
+        if let Some(lease) = lease
+            && self.job_lock_present(lease.job_id(), SUPERVISOR_LOCK_FILE)
+        {
+            residual.push(RESIDUAL_SUPERVISOR_LOCK);
+        }
+        if let Some(lease) = lease
+            && self.job_lock_present(lease.job_id(), TRANSFER_LOCK_FILE)
+        {
+            residual.push(RESIDUAL_TRANSFER_LOCK);
+        }
+        if self.session_present(lease, job) {
+            residual.push(RESIDUAL_SESSION);
+        }
+        if self.workspace_present(lease, job) {
+            residual.push(RESIDUAL_WORKSPACE);
+        }
+        residual
+    }
+
+    pub(crate) fn attach_host_io(
+        &self,
+        error: WorkerError,
+        stage: &'static str,
+        lease: Option<&LeaseRecord>,
+        job: Option<&RootedDir>,
+    ) -> WorkerError {
+        error.with_host_io_stage(stage, &self.observe_residuals(lease, job))
+    }
+
+    fn lease_still_loaded(&self, lease: &LeaseRecord) -> bool {
+        matches!(
+            crate::lease::LeaseService::new(self).load(),
+            Ok(Some(live)) if live.job_id() == lease.job_id()
+        )
+    }
+
+    fn cleanup_tree_present(&self, lease: Option<&LeaseRecord>, job: Option<&RootedDir>) -> bool {
+        let mut present = job.is_some_and(directory_has_cleanup_residue);
+        if let Some(lease) = lease {
+            present |= self
+                .open_optional_directory(&format!(
+                    "jobs/{}/{}/{}",
+                    lease.project_id(),
+                    lease.worktree_id(),
+                    lease.job_id()
+                ))
+                .ok()
+                .flatten()
+                .is_some_and(|directory| directory_has_cleanup_residue(&directory));
+            present |= self
+                .open_optional_directory(&format!("incoming/{}", lease.job_id()))
+                .ok()
+                .flatten()
+                .is_some_and(|directory| directory_has_cleanup_residue(&directory));
+            present |= self
+                .open_directory("incoming", false)
+                .ok()
+                .is_some_and(|directory| directory_has_cleanup_residue(&directory));
+            present |= self
+                .open_directory("leases", false)
+                .ok()
+                .is_some_and(|directory| directory_has_cleanup_residue(&directory));
+        }
+        present
+    }
+
+    fn job_directory_present(&self, lease: Option<&LeaseRecord>, _job: Option<&RootedDir>) -> bool {
+        // The durable `jobs/…` directory is the terminal record; a leftover
+        // job dir is the incoming scope cleanup failed to remove.
+        let Some(lease) = lease else {
+            return false;
+        };
+        self.open_optional_directory(&format!("incoming/{}", lease.job_id()))
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    fn job_lock_present(&self, job: JobId, name: &str) -> bool {
+        self.open_optional_directory(&format!("locks/jobs/{job}"))
+            .ok()
+            .flatten()
+            .is_some_and(|directory| directory_has_entry(&directory, name))
+    }
+
+    fn session_present(&self, lease: Option<&LeaseRecord>, job: Option<&RootedDir>) -> bool {
+        if job.is_some_and(|job| directory_has_entry(job, "session")) {
+            return true;
+        }
+        let Some(lease) = lease else {
+            return false;
+        };
+        self.open_optional_directory(&format!(
+            "jobs/{}/{}/{}",
+            lease.project_id(),
+            lease.worktree_id(),
+            lease.job_id()
+        ))
+        .ok()
+        .flatten()
+        .is_some_and(|directory| directory_has_entry(&directory, "session"))
+    }
+
+    fn workspace_present(&self, lease: Option<&LeaseRecord>, job: Option<&RootedDir>) -> bool {
+        if job.is_some_and(|job| directory_has_entry(job, "workspace")) {
+            return true;
+        }
+        let Some(lease) = lease else {
+            return false;
+        };
+        self.open_optional_directory(&format!(
+            "jobs/{}/{}/{}",
+            lease.project_id(),
+            lease.worktree_id(),
+            lease.job_id()
+        ))
+        .ok()
+        .flatten()
+        .is_some_and(|directory| directory_has_entry(&directory, "workspace"))
+    }
+
     fn remove_job_owned_lease_stages(
         &self,
         leases: &RootedDir,
@@ -3882,7 +4024,7 @@ fn validate_installation_identity(
 
 fn worker_error_as_io(error: WorkerError) -> std::io::Error {
     match error {
-        WorkerError::Io(error) => error,
+        WorkerError::Io(error) | WorkerError::HostIo { source: error, .. } => error,
         error => std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
     }
 }
@@ -4604,6 +4746,14 @@ fn require_no_private_cleanup_residue(
         )));
     }
     Ok(())
+}
+
+fn directory_has_cleanup_residue(directory: &RootedDir) -> bool {
+    directory.has_private_cleanup_residue().unwrap_or(false)
+}
+
+fn directory_has_entry(directory: &RootedDir, name: &str) -> bool {
+    directory.entry_exists(name).unwrap_or(false)
 }
 
 fn protocol_code(code: &'static str, message: &str) -> WorkerError {

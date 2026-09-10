@@ -23,6 +23,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::{
     account_launch::account_environment_scaffold,
     error::WorkerError,
+    failure_receipt::{STAGE_CLEANUP, STAGE_LEASE_RELEASE, STAGE_PUBLISH},
     host_store::{HostStore, JobDisposition, SupervisorGuard},
     inputs::RelativePath,
     job::{CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseRecord, ProcessIdentity},
@@ -2512,7 +2513,12 @@ impl<'a> Supervisor<'a> {
         drop(guard);
         let cleanup = match payload_removal {
             Ok(()) => self.cleanup_and_release(lease, job, terminal),
-            Err(error) => Err(WorkerError::Io(error)),
+            Err(error) => Err(self.store.attach_host_io(
+                WorkerError::Io(error),
+                STAGE_PUBLISH,
+                Some(lease),
+                Some(job),
+            )),
         };
         match publication {
             Err(error) => {
@@ -2541,13 +2547,20 @@ impl<'a> Supervisor<'a> {
                         &terminal,
                         "LEASE_RELEASE_FAILED",
                     )?;
-                    return Err(error);
+                    return Err(self.store.attach_host_io(
+                        error,
+                        STAGE_LEASE_RELEASE,
+                        Some(lease),
+                        Some(job),
+                    ));
                 }
                 clear_cleanup_error(self.store, lease, job, &terminal)
             }
             Err(error) => {
                 enrich_cleanup_error(self.store, lease, job, &terminal, "MUTABLE_CLEANUP_FAILED")?;
-                Err(error)
+                Err(self
+                    .store
+                    .attach_host_io(error, STAGE_CLEANUP, Some(lease), Some(job)))
             }
         }
     }

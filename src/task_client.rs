@@ -90,6 +90,7 @@ pub struct TaskReport {
     events: Vec<serde_json::Value>,
     runner: Option<RunnerState>,
     exit_code: Option<u8>,
+    failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
 }
 
 impl TaskReport {
@@ -119,6 +120,10 @@ impl TaskReport {
 
     pub fn exit_code(&self) -> Option<u8> {
         self.exit_code
+    }
+
+    pub fn failure_receipt(&self) -> Option<&crate::failure_receipt::FailureReceipt> {
+        self.failure_receipt.as_ref()
     }
 }
 
@@ -151,6 +156,7 @@ pub struct TaskResultReport {
     status: TaskStatus,
     branch: String,
     fetch_instruction: String,
+    failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
 }
 
 impl TaskResultReport {
@@ -168,6 +174,10 @@ impl TaskResultReport {
 
     pub fn fetch_instruction(&self) -> &str {
         &self.fetch_instruction
+    }
+
+    pub fn failure_receipt(&self) -> Option<&crate::failure_receipt::FailureReceipt> {
+        self.failure_receipt.as_ref()
     }
 }
 
@@ -1100,6 +1110,7 @@ impl<'a> TaskClient<'a> {
             status: record.status().clone(),
             branch: format!("task/{task_id}"),
             fetch_instruction: format!("worker task fetch {task_id}"),
+            failure_receipt: record.failure_receipt().cloned(),
         })
     }
 
@@ -2531,6 +2542,7 @@ impl<'a> TaskClient<'a> {
             events: Vec::new(),
             runner: self.client_state.runner_liveness(task_id)?,
             exit_code: None,
+            failure_receipt: record.failure_receipt().cloned(),
         })
     }
 
@@ -2557,6 +2569,7 @@ impl<'a> TaskClient<'a> {
             events: Vec::new(),
             runner: self.client_state.runner_liveness(record.meta().task_id())?,
             exit_code: None,
+            failure_receipt: record.failure_receipt().cloned(),
         })
     }
 

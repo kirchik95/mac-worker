@@ -1059,6 +1059,8 @@ fn fixture_detail() -> TaskDetailProjection {
             env_profile: None,
             state: TaskState::Active,
             blocking_code: None,
+            stage: None,
+            residual: None,
             last_outcome: None,
             worker: Some("mini-1".into()),
             branch: BranchName::for_task(task_id),

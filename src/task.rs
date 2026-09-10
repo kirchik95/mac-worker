@@ -1222,6 +1222,7 @@ pub struct LocalTaskRecord {
     abandon_code: Option<String>,
     submission_intent_turn_id: Option<TurnId>,
     submission_rollback_turn_id: Option<TurnId>,
+    failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
 }
 
 impl LocalTaskRecord {
@@ -1249,6 +1250,7 @@ impl LocalTaskRecord {
             abandon_code,
             submission_intent_turn_id: None,
             submission_rollback_turn_id: None,
+            failure_receipt: None,
         };
         record.validate()?;
         Ok(record)
@@ -1293,6 +1295,10 @@ impl LocalTaskRecord {
 
     pub fn abandon_code(&self) -> Option<&str> {
         self.abandon_code.as_deref()
+    }
+
+    pub fn failure_receipt(&self) -> Option<&crate::failure_receipt::FailureReceipt> {
+        self.failure_receipt.as_ref()
     }
 
     /// Local drain failure is durable evidence for the current turn. A later
@@ -1343,7 +1349,7 @@ impl LocalTaskRecord {
         // Keep fetched_head as last successful import history. Presence is not
         // proof the current turn's result was imported; follow-up recovery
         // must fetch this turn before releasing its base pin.
-        let mut replacement = Self::new(
+        let replacement = Self::new(
             self.meta.clone(),
             status,
             self.status_observed_at_millis,
@@ -1354,16 +1360,14 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             self.abandon_code.clone(),
         )?;
-        replacement.submission_intent_turn_id = self.submission_intent_turn_id;
-        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
-        Ok(replacement)
+        Ok(self.preserve_local_extras(replacement))
     }
 
     pub fn with_status_observed_at(
         &self,
         observed_at_millis: Option<u64>,
     ) -> Result<Self, WorkerError> {
-        let mut replacement = Self::new(
+        let replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             observed_at_millis,
@@ -1374,13 +1378,11 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             self.abandon_code.clone(),
         )?;
-        replacement.submission_intent_turn_id = self.submission_intent_turn_id;
-        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
-        Ok(replacement)
+        Ok(self.preserve_local_extras(replacement))
     }
 
     pub fn with_runner(&self, runner: Option<RunnerIdentity>) -> Result<Self, WorkerError> {
-        let mut replacement = Self::new(
+        let replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             self.status_observed_at_millis,
@@ -1391,13 +1393,11 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             self.abandon_code.clone(),
         )?;
-        replacement.submission_intent_turn_id = self.submission_intent_turn_id;
-        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
-        Ok(replacement)
+        Ok(self.preserve_local_extras(replacement))
     }
 
     pub fn with_fetched_head(&self, fetched_head: Option<BaseOid>) -> Result<Self, WorkerError> {
-        let mut replacement = Self::new(
+        let replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             self.status_observed_at_millis,
@@ -1408,13 +1408,11 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             self.abandon_code.clone(),
         )?;
-        replacement.submission_intent_turn_id = self.submission_intent_turn_id;
-        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
-        Ok(replacement)
+        Ok(self.preserve_local_extras(replacement))
     }
 
     pub fn with_abandon_code(&self, abandon_code: Option<String>) -> Result<Self, WorkerError> {
-        let mut replacement = Self::new(
+        let replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             self.status_observed_at_millis,
@@ -1425,9 +1423,28 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             abandon_code,
         )?;
+        let mut replacement = self.preserve_local_extras(replacement);
+        if replacement.abandon_code.is_none() {
+            replacement.failure_receipt = None;
+        }
+        Ok(replacement)
+    }
+
+    pub fn with_failure_receipt(
+        &self,
+        failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
+    ) -> Result<Self, WorkerError> {
+        let mut replacement = self.clone();
+        replacement.failure_receipt = failure_receipt;
+        replacement.validate()?;
+        Ok(replacement)
+    }
+
+    fn preserve_local_extras(&self, mut replacement: Self) -> Self {
         replacement.submission_intent_turn_id = self.submission_intent_turn_id;
         replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
-        Ok(replacement)
+        replacement.failure_receipt = self.failure_receipt.clone();
+        replacement
     }
 
     pub fn with_submission_rollback_turn_id(&self, turn_id: TurnId) -> Result<Self, WorkerError> {
@@ -1499,6 +1516,10 @@ impl Serialize for LocalTaskRecord {
         if let Some(turn_id) = self.submission_rollback_turn_id {
             record.serialize_field("submission_rollback_turn_id", &turn_id)?;
         }
+        if let Some(receipt) = &self.failure_receipt {
+            record.serialize_field("failure_stage", receipt.stage())?;
+            record.serialize_field("failure_residual", &receipt.residual())?;
+        }
         record.end()
     }
 }
@@ -1521,6 +1542,10 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             submission_intent_turn_id: Option<TurnId>,
             #[serde(default)]
             submission_rollback_turn_id: Option<TurnId>,
+            #[serde(default)]
+            failure_stage: Option<String>,
+            #[serde(default)]
+            failure_residual: Vec<String>,
         }
         let wire: Wire = deserialize_unique_object(deserializer)?;
         let mut record = Self::new(
@@ -1537,6 +1562,18 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
         .map_err(de::Error::custom)?;
         record.submission_intent_turn_id = wire.submission_intent_turn_id;
         record.submission_rollback_turn_id = wire.submission_rollback_turn_id;
+        record.failure_receipt = match wire.failure_stage.as_deref() {
+            Some(stage) => {
+                let residual = wire
+                    .failure_residual
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                crate::failure_receipt::FailureReceipt::new(stage, &residual)
+            }
+            None if wire.failure_residual.is_empty() => None,
+            None => None,
+        };
         record.validate().map_err(de::Error::custom)?;
         Ok(record)
     }

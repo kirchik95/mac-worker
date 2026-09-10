@@ -1,5 +1,7 @@
 use std::{borrow::Cow, time::Duration};
 
+use crate::failure_receipt::FailureReceipt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitKind {
     Usage = 64,
@@ -67,6 +69,14 @@ pub enum WorkerError {
     CommandExit { code: u8 },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Host I/O that already knows which stage failed and what remains.
+    /// Display stays `I/O error: …` so existing host tests keep matching;
+    /// `versioned_host_error` puts the receipt on the `HOST_IO` message.
+    #[error("I/O error: {source}")]
+    HostIo {
+        source: std::io::Error,
+        receipt: FailureReceipt,
+    },
     #[error("process error: {0}")]
     Process(#[from] ProcessError),
 }
@@ -98,7 +108,7 @@ impl WorkerError {
             Self::Protocol(_) | Self::Process(_) | Self::Snapshot { .. } | Self::Queue { .. } => {
                 ExitKind::Infrastructure
             }
-            Self::Io(_) => ExitKind::Io,
+            Self::Io(_) | Self::HostIo { .. } => ExitKind::Io,
         }
     }
 
@@ -127,7 +137,7 @@ impl WorkerError {
             Self::Unavailable(message) => coded_prefix(message).unwrap_or("UNAVAILABLE").to_owned(),
             Self::Protocol(message) => coded_prefix(message).unwrap_or("PROTOCOL").to_owned(),
             Self::CommandExit { .. } => "COMMAND_EXIT".to_owned(),
-            Self::Io(_) => "IO".to_owned(),
+            Self::Io(_) | Self::HostIo { .. } => "IO".to_owned(),
             Self::Process(_) => "PROCESS".to_owned(),
         }
     }
@@ -157,7 +167,7 @@ impl WorkerError {
             Self::Unavailable(_) => "worker unavailable".into(),
             Self::Protocol(_) => "protocol error".into(),
             Self::CommandExit { .. } => "command exited".into(),
-            Self::Io(_) => "I/O error".into(),
+            Self::Io(_) | Self::HostIo { .. } => "I/O error".into(),
             Self::Process(_) => "process error".into(),
         }
     }
@@ -191,6 +201,34 @@ impl WorkerError {
             code,
             message: Cow::Owned(message),
             public: true,
+        }
+    }
+
+    /// Attaches a stage/residual receipt to a host I/O error. Other variants
+    /// are left alone so a protocol conflict is not rewritten as `HOST_IO`.
+    pub fn with_host_io_receipt(self, receipt: FailureReceipt) -> Self {
+        match self {
+            Self::Io(source) | Self::HostIo { source, .. } => Self::HostIo { source, receipt },
+            other => other,
+        }
+    }
+
+    /// Builds a receipt from vocabulary constants and attaches it when the
+    /// error is host I/O. Invalid vocabulary leaves the error unchanged.
+    pub fn with_host_io_stage(self, stage: &'static str, residual: &[&str]) -> Self {
+        match FailureReceipt::new(stage, residual) {
+            Some(receipt) => self.with_host_io_receipt(receipt),
+            None => self,
+        }
+    }
+
+    /// Receipt carried by a host I/O error or parsed from `HOST_IO: …`.
+    /// Anything outside the grammar is `None`, never an error.
+    pub fn failure_receipt(&self) -> Option<FailureReceipt> {
+        match self {
+            Self::HostIo { receipt, .. } => Some(receipt.clone()),
+            Self::Protocol(message) => FailureReceipt::parse_protocol_message(message),
+            _ => None,
         }
     }
 }
@@ -243,6 +281,9 @@ pub(crate) fn is_stable_public_code(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ExitKind, WorkerError};
+    use crate::failure_receipt::{
+        FailureReceipt, RESIDUAL_CLEANUP_TREE, RESIDUAL_LEASE, STAGE_CLEANUP, STAGE_FOLLOW,
+    };
 
     #[test]
     fn application_errors_map_to_the_reserved_exit_kinds() {
@@ -644,6 +685,45 @@ mod tests {
             }
             .to_string(),
             "snapshot error [SNAPSHOT_WRITE_FAILED]: object store unavailable"
+        );
+    }
+
+    #[test]
+    fn a_host_io_protocol_message_round_trips_the_receipt_and_rejects_unknown_vocabulary() {
+        let receipt =
+            FailureReceipt::new(STAGE_CLEANUP, &[RESIDUAL_LEASE, RESIDUAL_CLEANUP_TREE]).unwrap();
+        let error = WorkerError::Protocol(format!("HOST_IO: {}", receipt.host_message()));
+        assert_eq!(error.public_code(), "HOST_IO");
+        assert_eq!(error.failure_receipt().as_ref(), Some(&receipt));
+
+        let wrapped = WorkerError::Io(std::io::Error::other("cleanup failed"))
+            .with_host_io_receipt(receipt.clone());
+        assert_eq!(wrapped.failure_receipt().as_ref(), Some(&receipt));
+        assert!(wrapped.to_string().contains("I/O error"));
+        assert_eq!(wrapped.public_code(), "IO");
+
+        assert_eq!(
+            WorkerError::Protocol("HOST_IO: host state operation failed".into()).failure_receipt(),
+            None
+        );
+        assert_eq!(
+            WorkerError::Protocol(
+                "HOST_IO: host state operation failed [stage=cleanup residual=fifo]".into()
+            )
+            .failure_receipt(),
+            None
+        );
+        assert_eq!(
+            WorkerError::Protocol(format!(
+                "HOST_IO: {}",
+                FailureReceipt::new(STAGE_FOLLOW, &[])
+                    .unwrap()
+                    .host_message()
+            ))
+            .failure_receipt()
+            .unwrap()
+            .stage(),
+            STAGE_FOLLOW
         );
     }
 }

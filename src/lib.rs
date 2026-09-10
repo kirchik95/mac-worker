@@ -71,6 +71,7 @@ pub mod config;
 pub mod dashboard;
 pub mod doctor;
 pub mod error;
+pub mod failure_receipt;
 pub mod follow_turn;
 pub mod gc;
 pub mod git_transport;
@@ -1186,6 +1187,7 @@ fn write_task_report(
             "events": report.events(),
             "exit_code": report.exit_code(),
         });
+        insert_receipt_fields(&mut response, report.failure_receipt());
         if !report.warnings().is_empty() {
             response["warnings"] = serde_json::json!(report.warnings());
         }
@@ -1198,6 +1200,9 @@ fn write_task_report(
             report.task_id(),
             task_state_name(report.status().state())
         )?;
+        if let Some(receipt) = report.failure_receipt() {
+            writeln!(stdout, "{}", receipt.render_with_code("HOST_IO"))?;
+        }
         for warning in report.warnings() {
             writeln!(stdout, "warning: {warning}")?;
         }
@@ -1219,13 +1224,22 @@ fn write_task_list_report(
     } else {
         for task in report.tasks() {
             if let Some(blocking_code) = task.blocking_code.as_deref() {
+                let blocking = if blocking_code.contains("HOST_IO") && task.stage.is_some() {
+                    format_blocking_with_receipt(
+                        blocking_code,
+                        task.stage.as_deref(),
+                        task.residual.as_deref(),
+                    )
+                } else {
+                    blocking_code.to_owned()
+                };
                 writeln!(
                     stdout,
                     "{}: {} ({}) blocking: {}",
                     task.task_id,
                     task_state_name(task.state),
                     task.worker.as_deref().unwrap_or("unassigned"),
-                    blocking_code
+                    blocking
                 )?;
             } else {
                 writeln!(
@@ -1248,16 +1262,17 @@ fn write_task_result_report(
     stdout: &mut dyn Write,
 ) -> Result<(), WorkerError> {
     if json {
-        write_json_line(
-            stdout,
-            &serde_json::json!({
+        write_json_line(stdout, &{
+            let mut value = serde_json::json!({
                 "protocol_version": PROTOCOL_VERSION,
                 "task_id": report.task_id().to_string(),
                 "status": report.status(),
                 "branch": report.branch(),
                 "fetch": report.fetch_instruction(),
-            }),
-        )
+            });
+            insert_receipt_fields(&mut value, report.failure_receipt());
+            value
+        })
     } else {
         writeln!(
             stdout,
@@ -1265,6 +1280,9 @@ fn write_task_result_report(
             report.task_id(),
             task_state_name(report.status().state())
         )?;
+        if let Some(receipt) = report.failure_receipt() {
+            writeln!(stdout, "{}", receipt.render_with_code("HOST_IO"))?;
+        }
         if let Some(summary) = report.status().summary() {
             writeln!(stdout, "summary: {summary}")?;
         }
@@ -1368,6 +1386,29 @@ fn write_json_line<T: Serialize>(stdout: &mut dyn Write, value: &T) -> Result<()
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())
+}
+
+fn insert_receipt_fields(
+    value: &mut serde_json::Value,
+    receipt: Option<&crate::failure_receipt::FailureReceipt>,
+) {
+    let Some(receipt) = receipt else {
+        return;
+    };
+    value["stage"] = serde_json::json!(receipt.stage());
+    value["residual"] = serde_json::json!(receipt.residual());
+}
+
+fn format_blocking_with_receipt(
+    code: &str,
+    stage: Option<&str>,
+    residual: Option<&[String]>,
+) -> String {
+    let Some(stage) = stage else {
+        return code.to_owned();
+    };
+    let residual = residual.map(|items| items.join(",")).unwrap_or_default();
+    format!("{code} (stage={stage}, residual={residual})")
 }
 
 /// Renders questions for the human output, appending the answers an agent will
@@ -2557,13 +2598,14 @@ fn versioned_host_error(error: &WorkerError) -> HostControlError {
         return error;
     }
     let (code, message) = match error {
-        WorkerError::Capacity { code, .. } => (*code, "worker admission rejected"),
-        WorkerError::Snapshot { code, .. } => (*code, "snapshot operation failed"),
-        WorkerError::Git { code, .. } => (*code, "Git operation failed"),
-        WorkerError::Task { code, .. } => (*code, "task operation failed"),
-        WorkerError::Agent { code, .. } => (*code, "agent operation failed"),
-        WorkerError::Io(_) => ("HOST_IO", "host state operation failed"),
-        _ => ("INVALID_REQUEST", "host request was invalid"),
+        WorkerError::Capacity { code, .. } => (*code, "worker admission rejected".into()),
+        WorkerError::Snapshot { code, .. } => (*code, "snapshot operation failed".into()),
+        WorkerError::Git { code, .. } => (*code, "Git operation failed".into()),
+        WorkerError::Task { code, .. } => (*code, "task operation failed".into()),
+        WorkerError::Agent { code, .. } => (*code, "agent operation failed".into()),
+        WorkerError::HostIo { receipt, .. } => ("HOST_IO", receipt.host_message()),
+        WorkerError::Io(_) => ("HOST_IO", "host state operation failed".into()),
+        _ => ("INVALID_REQUEST", "host request was invalid".into()),
     };
     HostControlError::new(code, message).expect("fixed host error is valid")
 }
@@ -2581,6 +2623,28 @@ mod versioned_host_error_tests {
         let wire = serde_json::to_value(&error).unwrap();
         assert_eq!(wire["error"]["code"], "AGENT_EXITED");
         assert_eq!(wire["error"]["message"], "agent operation failed");
+    }
+
+    #[test]
+    fn host_io_receipts_travel_in_the_existing_message_string() {
+        let receipt = crate::failure_receipt::FailureReceipt::new(
+            crate::failure_receipt::STAGE_CLEANUP,
+            &[
+                crate::failure_receipt::RESIDUAL_LEASE,
+                crate::failure_receipt::RESIDUAL_CLEANUP_TREE,
+            ],
+        )
+        .unwrap();
+        let error = versioned_host_error(&WorkerError::HostIo {
+            source: std::io::Error::other("cleanup failed"),
+            receipt: receipt.clone(),
+        });
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(wire["error"]["code"], "HOST_IO");
+        assert_eq!(wire["error"]["message"], receipt.host_message());
+        assert_eq!(error.protocol_version(), PROTOCOL_VERSION);
+        let decoded = HostControlError::new("HOST_IO", receipt.host_message()).unwrap();
+        assert_eq!(decoded.error().message(), receipt.host_message());
     }
 }
 

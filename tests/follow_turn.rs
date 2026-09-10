@@ -21,6 +21,7 @@ use std::{
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy, Question, TurnLimits},
     error::WorkerError,
+    failure_receipt::STAGE_FOLLOW,
     follow_turn::{follow_turn, follow_turn_with_poll_interval},
     host_store::HostStore,
     job::{ClientId, CommandSpec, JobId, JobStatus, LeaseToken, RequestFingerprintMaterial},
@@ -743,6 +744,20 @@ fn a_published_turn_is_still_followed_after_its_payload_was_removed() {
     expected.extend_from_slice(&codex_success_reference());
     expected.extend_from_slice(b"turn 1: done \xe2\x80\x94 ok\n");
     assert_eq!(text(&output), text(&expected));
+}
+
+#[test]
+fn a_log_read_failure_reports_stage_follow() {
+    let fixture = Fixture::new(AgentKind::Codex);
+    fs::remove_file(fixture.stdout_log()).unwrap();
+    fs::create_dir(fixture.stdout_log()).unwrap();
+    fs::set_permissions(fixture.stdout_log(), fs::Permissions::from_mode(0o700)).unwrap();
+    let error = fixture.follow_once().unwrap_err();
+    let receipt = error
+        .failure_receipt()
+        .expect("follow HOST_IO carries a receipt");
+    assert_eq!(receipt.stage(), STAGE_FOLLOW);
+    assert!(error.to_string().contains("I/O error"), "{error}");
 }
 
 #[test]

@@ -25,6 +25,7 @@ use mac_worker::{
     cli::Cli,
     config::WorkerEntry,
     error::WorkerError,
+    failure_receipt::{RESIDUAL_CLEANUP_TREE, RESIDUAL_LEASE, STAGE_CLEANUP, STAGE_DRAIN},
     host_store::{HostStore, HostStoreWritePoint, JobDisposition, SupervisorGuard},
     inputs::RelativePath,
     job::{
@@ -1713,6 +1714,17 @@ fn terminal_status_and_log_chunk_succeed_when_mutable_cleanup_still_fails() {
             "reconcile" => {
                 let error = service.reconcile_job(lease.job_id()).unwrap_err();
                 assert!(error.to_string().contains("I/O error"), "{error}");
+                let receipt = error
+                    .failure_receipt()
+                    .expect("cleanup HOST_IO carries a receipt");
+                assert_eq!(receipt.stage(), STAGE_CLEANUP);
+                assert!(receipt.residual().contains(&RESIDUAL_LEASE), "{receipt:?}");
+                assert!(
+                    receipt.residual().contains(&RESIDUAL_CLEANUP_TREE),
+                    "{receipt:?}"
+                );
+                let wire = HostControlError::new("HOST_IO", receipt.host_message()).unwrap();
+                assert_eq!(wire.error().message(), receipt.host_message());
                 assert_eq!(
                     read_job_status(&faulted, &lease).cleanup_error_code(),
                     Some("MUTABLE_CLEANUP_FAILED")
@@ -1726,6 +1738,35 @@ fn terminal_status_and_log_chunk_succeed_when_mutable_cleanup_still_fails() {
             "{caller}"
         );
     }
+}
+
+#[test]
+fn a_log_chunk_read_failure_reports_stage_drain() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("log-drain-receipt");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = HoldingRecordingLauncher {
+        launches: Arc::new(AtomicUsize::new(0)),
+        job_path: job.clone(),
+        identity: identity(51_201),
+        guard: Mutex::new(None),
+    };
+    JobService::new(&store, &launcher)
+        .status(lease.job_id())
+        .unwrap();
+    fs::set_permissions(job.join("stdout.log"), fs::Permissions::from_mode(0o644)).unwrap();
+    let error = JobService::new(&store, &launcher)
+        .read_log(lease.job_id(), LogStream::Stdout, 0, 64)
+        .unwrap_err();
+    let receipt = error
+        .failure_receipt()
+        .unwrap_or_else(|| panic!("drain HOST_IO carries a receipt, got {error}"));
+    assert_eq!(receipt.stage(), STAGE_DRAIN);
+    assert!(error.to_string().contains("I/O error"), "{error}");
+    drop(launcher.guard.lock().unwrap().take());
 }
 
 #[test]
