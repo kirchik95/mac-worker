@@ -22,10 +22,11 @@ use crate::{
     error::WorkerError,
     git_transport::GitTransport,
     job::{
-        ClientId, CommandSpec, ProcessIdentity, QueueEntry, QueueEntryKind, QueueRunReference,
-        QueueSnapshot, QueueState,
+        ClientId, CommandSpec, MAX_LOG_CHUNK_BYTES, ProcessIdentity, QueueEntry, QueueEntryKind,
+        QueueRunReference, QueueSnapshot, QueueState,
     },
     paths::PathLayout,
+    prepared_submit::PreparedSubmit,
     process::ProcessRunner,
     project::ProjectInspector,
     project_config::{SetupSettings, TaskSettings},
@@ -77,6 +78,11 @@ fn same_close_target(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> b
 }
 const WAIT_POLL: Duration = Duration::from_millis(100);
 const WAIT_MAX_POLL: Duration = Duration::from_secs(1);
+
+pub(crate) enum FrozenSubmit<'a> {
+    Dag(&'a DagNode),
+    Prepared(&'a PreparedSubmit),
+}
 
 thread_local! {
     static ADVANCING_PENDING_DAGS: Cell<bool> = const { Cell::new(false) };
@@ -202,6 +208,28 @@ impl TaskReport {
     pub fn deliveries(&self) -> &[OriginDelivery] {
         &self.deliveries
     }
+
+    pub(crate) fn from_controller(
+        task_id: TaskId,
+        run_id: Option<RunId>,
+        status: TaskStatus,
+        warnings: Vec<String>,
+        events: Vec<serde_json::Value>,
+        runner: Option<RunnerState>,
+        exit_code: Option<u8>,
+    ) -> Self {
+        Self {
+            task_id,
+            run_id,
+            status,
+            warnings,
+            events,
+            runner,
+            exit_code,
+            delivery: None,
+            deliveries: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +252,10 @@ impl TaskListReport {
 
     pub fn progress(&self) -> crate::task::RunProgress {
         self.projection.progress
+    }
+
+    pub(crate) fn from_projection(projection: TaskListProjection) -> Self {
+        Self { projection }
     }
 }
 
@@ -251,6 +283,20 @@ impl TaskResultReport {
     pub fn fetch_instruction(&self) -> &str {
         &self.fetch_instruction
     }
+
+    pub(crate) fn from_controller(
+        task_id: TaskId,
+        status: TaskStatus,
+        branch: String,
+        fetch_instruction: String,
+    ) -> Self {
+        Self {
+            task_id,
+            status,
+            branch,
+            fetch_instruction,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +317,70 @@ impl FetchReport {
 
     pub fn local_ref(&self) -> &str {
         &self.local_ref
+    }
+
+    pub(crate) fn from_imported(task_id: TaskId, head: BaseOid, local_ref: String) -> Self {
+        Self {
+            task_id,
+            head,
+            local_ref,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLogChunkReport {
+    task_id: TaskId,
+    turn_id: TurnId,
+    turn_number: u32,
+    agent: AgentKind,
+    offset: u64,
+    next_offset: u64,
+    exhausted: bool,
+    complete: bool,
+    bytes: Vec<u8>,
+    failure: Option<String>,
+}
+
+impl TaskLogChunkReport {
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub fn turn_number(&self) -> u32 {
+        self.turn_number
+    }
+
+    pub fn agent(&self) -> AgentKind {
+        self.agent
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    pub fn complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
     }
 }
 
@@ -719,6 +829,57 @@ impl<'a> TaskClient<'a> {
         )
     }
 
+    /// Thin ordinary-controller wrapper. Does not invent a `DagNode`.
+    /// Frozen create/enqueue/intent stays on the shared DAG transaction with
+    /// `run_id = None` and durable `original_created_at`.
+    pub fn submit_prepared(
+        &self,
+        prepared: &PreparedSubmit,
+        mapped_project: &Path,
+        skip_reconcile: bool,
+        park_only: bool,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> Result<TaskReport, WorkerError> {
+        if prepared.run_id.is_some() {
+            return Err(task_error(
+                "TASK_CONFIG_INVALID",
+                "ordinary controller submit must not carry a run_id",
+            ));
+        }
+        let request = TaskSubmitRequest {
+            agent: prepared.agent,
+            model: prepared.model.clone(),
+            effort: prepared.effort.clone(),
+            prompt: prepared.prompt.clone(),
+            project: mapped_project.to_path_buf(),
+            base: prepared.base_oid.as_str().to_owned(),
+            wip: prepared.wip,
+            source: Some(prepared.source.clone()),
+            publish: Some(prepared.publish.clone()),
+            publish_branch: prepared.publish_branch.clone(),
+            cli_includes: Vec::new(),
+            limits: prepared.limits.clone(),
+            close_policy: prepared.close_policy,
+            env_profile: prepared.env_profile.clone(),
+            preference: prepared.preference.clone(),
+            wait_for_capacity: prepared.wait_for_capacity,
+            attached: prepared.attached && !park_only,
+            run_id: None,
+        };
+        self.submit_with_ids(
+            request,
+            Some(prepared.task_id),
+            Some(prepared.turn_id),
+            prepared.title.clone(),
+            stdout,
+            stderr,
+            skip_reconcile,
+            Some(FrozenSubmit::Prepared(prepared)),
+            Some(prepared.created_at_millis),
+        )
+    }
+
     /// FLOW/controller entry for a claimed DAG node. Reuses the frozen
     /// `submit_with_ids` resume path on this `ClientStateStore` and TransferRepo;
     /// it does not create another queue or store. FLOW owns the non-DAG
@@ -740,7 +901,7 @@ impl<'a> TaskClient<'a> {
             &mut io::sink(),
             &mut io::sink(),
             skip_reconcile,
-            Some(node),
+            Some(FrozenSubmit::Dag(node)),
             None,
         )
     }
@@ -759,7 +920,7 @@ impl<'a> TaskClient<'a> {
         stdout: &mut dyn Write,
         _stderr: &mut dyn Write,
         skip_reconcile: bool,
-        frozen: Option<&DagNode>,
+        frozen: Option<FrozenSubmit<'_>>,
         original_created_at: Option<u64>,
     ) -> Result<TaskReport, WorkerError> {
         if !skip_reconcile {
@@ -786,16 +947,36 @@ impl<'a> TaskClient<'a> {
             task_id,
             turn_id,
             title,
-        ) = if let Some(node) = frozen {
+            controller_cache,
+        ) = match frozen {
+            Some(FrozenSubmit::Dag(node)) => {
             let spec = &node.frozen;
-            let context = ProjectInspector::new(self.runner)
-                .inspect_with_pinned_project_id(Path::new(&spec.project_path), &spec.project_id)?;
-            if context.worktree_id != spec.worktree_id {
-                return Err(task_error(
-                    "TASK_CONFIG_INVALID",
-                    "frozen DAG project identity does not match the worktree",
-                ));
-            }
+            let (context, controller_cache) = if let Some(checkout) =
+                crate::controller::registry::mapped_controller_checkout(
+                    self.paths,
+                    &spec.project_id,
+                    &spec.worktree_id,
+                )? {
+                let mut context = ProjectInspector::new(self.runner)
+                    .inspect_with_pinned_project_id(&checkout, &spec.project_id)?;
+                context.worktree_id = spec.worktree_id.clone();
+                if spec.branch.is_some() {
+                    context.branch = spec.branch.clone();
+                }
+                (context, true)
+            } else {
+                let context = ProjectInspector::new(self.runner).inspect_with_pinned_project_id(
+                    Path::new(&spec.project_path),
+                    &spec.project_id,
+                )?;
+                if context.worktree_id != spec.worktree_id {
+                    return Err(task_error(
+                        "TASK_CONFIG_INVALID",
+                        "frozen DAG project identity does not match the worktree",
+                    ));
+                }
+                (context, false)
+            };
             let limits = spec.limits()?;
             let env_profile = spec.env_profile.clone();
             let model = spec.model.clone();
@@ -880,8 +1061,92 @@ impl<'a> TaskClient<'a> {
                 node.task_id,
                 node.turn_id,
                 spec.title.clone().or(title),
+                controller_cache,
             )
-        } else {
+            }
+            Some(FrozenSubmit::Prepared(prepared)) => {
+            let mut context = ProjectInspector::new(self.runner)
+                .inspect_with_pinned_project_id(&request.project, &prepared.project_id)?;
+            context.worktree_id = prepared.worktree_id.clone();
+            if prepared.branch.is_some() {
+                context.branch = prepared.branch.clone();
+            }
+            let limits = prepared.limits.clone();
+            let env_profile = prepared.env_profile.clone();
+            let model = prepared.model.clone();
+            let effort = prepared.effort.clone();
+            let publish = parse_publish_modes(&prepared.publish)?;
+            let origin_url = prepared.origin_url.clone().unwrap_or_default();
+            let source = parse_task_source(
+                &prepared.source,
+                prepared.wip,
+                &origin_url,
+                publish.contains(&PublishMode::Push),
+            )?;
+            let publish_branch =
+                parse_publish_branch(prepared.publish_branch.as_deref(), &publish)?;
+            if prepared.wip && publish.contains(&PublishMode::Push) {
+                return Err(task_error(
+                    "PUBLISH_REQUIRES_COMMITTED_BASE",
+                    "publish push requires a committed base",
+                ));
+            }
+            let requirements = prepared.requires.clone();
+            let policy = prepared.policy;
+            let observations = self.observe_admission(&request.preference)?;
+            let affinity = self
+                .client_state
+                .affinity_hints(&context.project_id, &context.worktree_id)?;
+            if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
+                &observations,
+                &requirements,
+                &request.preference,
+                &affinity,
+            ) {
+                if let WorkerPreference::Pinned { worker } = &request.preference
+                    && let Some(missing) = rejections.iter().find_map(|rejection| match rejection {
+                        crate::scheduler::CandidateRejection::MissingCapabilities {
+                            name,
+                            missing,
+                        } if name == worker => Some(missing.as_slice()),
+                        _ => None,
+                    })
+                {
+                    return Err(capability_missing(worker, missing));
+                }
+                if !request.wait_for_capacity {
+                    return Err(capacity_busy());
+                }
+            }
+            if let TaskSource::Origin { url } = &source {
+                GitTransport::new(self.runner).preflight_origin(url, &prepared.base_oid)?;
+            }
+            let prepared_base =
+                PreparedSubmitBase::Ready(crate::transfer_repo::BaseCommit::from_pinned(
+                    prepared.base_oid.clone(),
+                    prepared.wip,
+                ));
+            let settings = ProjectState::settings_from_prepared(prepared);
+            (
+                context,
+                limits,
+                env_profile,
+                model,
+                effort,
+                publish,
+                publish_branch,
+                source,
+                requirements,
+                policy,
+                prepared_base,
+                settings,
+                prepared.task_id,
+                prepared.turn_id,
+                prepared.title.clone().or(title),
+                true,
+            )
+            }
+            None => {
             let initial = ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
             let settings = &initial.settings.task;
             let limits = effective_task_limits(&request.limits, settings)?;
@@ -977,14 +1242,24 @@ impl<'a> TaskClient<'a> {
                 task_id,
                 turn_id,
                 title,
+                false,
             )
+        }
         };
         let now = current_time_millis()?;
         let created_at = original_created_at.unwrap_or(now);
         let submit_guard = acquire_in_process_submit_guard(self.client_state.client_id(), task_id);
         self.client_state
             .reach_concurrency_point(ClientStateConcurrencyPoint::DagSubmit);
-        let transfer = TransferRepo::open_or_create(&self.paths.cache, &context.common_dir)?;
+        let transfer = if controller_cache {
+            TransferRepo::open_or_create_controller_cache(
+                &self.paths.cache,
+                &context.project_id,
+                &context.worktree_id,
+            )?
+        } else {
+            TransferRepo::open_or_create(&self.paths.cache, &context.common_dir)?
+        };
         let built_local_base = matches!(prepared_base, PreparedSubmitBase::Resolve { .. });
         let base = match prepared_base {
             PreparedSubmitBase::Ready(base) => base,
@@ -1092,7 +1367,8 @@ impl<'a> TaskClient<'a> {
             };
         let composed_prompt = {
             let branch = match frozen {
-                Some(node) => node.frozen.branch.as_deref(),
+                Some(FrozenSubmit::Dag(node)) => node.frozen.branch.as_deref(),
+                Some(FrozenSubmit::Prepared(prepared)) => prepared.branch.as_deref(),
                 None => context.branch.as_deref(),
             };
             match self.client_state.read_turn_prompt(task_id, turn_id) {
@@ -1705,12 +1981,129 @@ impl<'a> TaskClient<'a> {
         Ok(())
     }
 
+    pub fn log_chunk(
+        &self,
+        task_id: TaskId,
+        turn: Option<u32>,
+        pinned_turn_id: Option<TurnId>,
+        offset: u64,
+        limit: usize,
+        raw: bool,
+        follow: bool,
+    ) -> Result<TaskLogChunkReport, WorkerError> {
+        let record = map_absent_task_record(self.client_state.load_task(task_id))?;
+        let (turn_id, turn_number) =
+            resolve_log_turn(&record, self.client_state, task_id, turn, pinned_turn_id)?;
+        let checkpoint = crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)?;
+        let complete = checkpoint.as_ref().is_some_and(|s| s.completion.is_some());
+        let may_initialize = turn_may_initialize(&record, turn_id);
+        let failure = log_failure_overlay(&record, turn_id, checkpoint.as_ref(), raw);
+        let limit = limit.min(MAX_LOG_CHUNK_BYTES).max(1);
+        let (read, committed_len) = match &checkpoint {
+            Some(checkpoint) => {
+                let read = crate::runner_log::read_committed_range(
+                    &self.paths.state,
+                    task_id,
+                    turn_id,
+                    checkpoint,
+                    offset,
+                    limit,
+                )?;
+                (read, checkpoint.len)
+            }
+            None => match crate::runner_log::read_log_range(
+                &self.paths.state,
+                task_id,
+                turn_id,
+                offset,
+                limit,
+            ) {
+                Ok(read) => {
+                    reject_legacy_follow_without_completion(
+                        follow,
+                        may_initialize,
+                        read.is_empty(),
+                    )?;
+                    let end = offset.saturating_add(read.len() as u64);
+                    let committed_len = if read.len() < limit {
+                        end
+                    } else {
+                        end.saturating_add(1)
+                    };
+                    (read, committed_len)
+                }
+                Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    if offset == 0 {
+                        reject_missing_runner_log(
+                            follow,
+                            may_initialize,
+                            failure.as_deref(),
+                            error,
+                        )?;
+                        (Vec::new(), 0)
+                    } else {
+                        return Err(task_error(
+                            "TASK_CONFIG_INVALID",
+                            "log chunk offset is past the committed log",
+                        ));
+                    }
+                }
+                Err(WorkerError::Io(error))
+                    if crate::rooted_fs::is_log_offset_beyond_eof(&error) =>
+                {
+                    return Err(task_error(
+                        "TASK_CONFIG_INVALID",
+                        "log chunk offset is past the committed log",
+                    ));
+                }
+                Err(error) => return Err(error),
+            },
+        };
+        let end = crate::runner_log::bounded_chunk_end(
+            offset,
+            committed_len,
+            &read,
+            raw,
+            follow,
+            complete,
+        );
+        let take = usize::try_from(end.saturating_sub(offset))
+            .map_err(|_| task_error("TASK_CONFIG_INVALID", "log chunk offset is out of range"))?;
+        let slice = &read[..take.min(read.len())];
+        Ok(TaskLogChunkReport {
+            task_id,
+            turn_id,
+            turn_number,
+            agent: record.meta().agent(),
+            offset,
+            next_offset: end,
+            exhausted: if end == offset {
+                offset.saturating_add(read.len() as u64) >= committed_len
+            } else {
+                end >= committed_len
+            },
+            complete,
+            bytes: slice.to_vec(),
+            failure,
+        })
+    }
+
     pub fn diff(
         &self,
         task_id: TaskId,
         stat: bool,
         stdout: &mut dyn Write,
     ) -> Result<(), WorkerError> {
+        let text = self.diff_text(task_id, stat)?;
+        stdout.write_all(text.as_bytes())?;
+        if !text.ends_with('\n') {
+            stdout.write_all(b"\n")?;
+        }
+        stdout.flush()?;
+        Ok(())
+    }
+
+    pub fn diff_text(&self, task_id: TaskId, stat: bool) -> Result<String, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
         let worker = task_worker(self.config, record.status())?;
         let remote = RemoteJobClient::new(self.runner);
@@ -1718,12 +2111,7 @@ impl<'a> TaskClient<'a> {
             worker,
             &crate::task_store::TaskDiffRequest::new(record.meta().project_id(), task_id, stat),
         )?;
-        stdout.write_all(response.text().as_bytes())?;
-        if !response.text().ends_with('\n') {
-            stdout.write_all(b"\n")?;
-        }
-        stdout.flush()?;
-        Ok(())
+        Ok(response.text().to_owned())
     }
 
     pub fn result(&self, task_id: TaskId) -> Result<TaskResultReport, WorkerError> {
@@ -3776,14 +4164,20 @@ impl<'a> TaskClient<'a> {
         record: &LocalTaskRecord,
     ) -> Result<ProjectState, WorkerError> {
         let frozen = self.client_state.frozen_spec_for_record(record)?;
-        let project = ProjectState::load_validated_for_task(self.runner, frozen.as_ref(), || {
-            ProjectState::load_for_task(
-                self.runner,
-                &self.current_project(Some(record))?,
-                &[],
-                record.meta(),
-            )
-        })?;
+        let project = ProjectState::load_validated_for_task(
+            self.runner,
+            self.paths,
+            frozen.as_ref(),
+            || {
+                crate::controller::registry::load_registered_or_local(
+                    self.runner,
+                    self.paths,
+                    &self.current_project(Some(record))?,
+                    &[],
+                    record.meta(),
+                )
+            },
+        )?;
         require_project_match(&project, record.meta())?;
         Ok(project)
     }
@@ -3852,6 +4246,125 @@ fn select_turn(status: &TaskStatus, turn: Option<u32>) -> Result<&TurnSummary, W
                 .ok_or_else(|| task_error("TASK_LOG_NOT_FOUND", "turn log was not found"))
         },
     )
+}
+
+fn resolve_log_turn(
+    record: &LocalTaskRecord,
+    client_state: &ClientStateStore,
+    task_id: TaskId,
+    turn: Option<u32>,
+    pinned_turn_id: Option<TurnId>,
+) -> Result<(TurnId, u32), WorkerError> {
+    if let Some(pinned) = pinned_turn_id {
+        if record.status().turns().is_empty() {
+            return match client_state.turn_ids_for_task(task_id)?.as_slice() {
+                [turn_id] if *turn_id == pinned && turn.is_none_or(|number| number == 1) => {
+                    Ok((pinned, 1))
+                }
+                _ => Err(task_error("TASK_LOG_NOT_FOUND", "turn log was not found")),
+            };
+        }
+        let summary = record
+            .status()
+            .turns()
+            .iter()
+            .find(|candidate| candidate.turn_id() == pinned)
+            .ok_or_else(|| task_error("TASK_LOG_NOT_FOUND", "turn log was not found"))?;
+        if let Some(number) = turn
+            && summary.turn_number() != number
+        {
+            return Err(task_error("TASK_LOG_NOT_FOUND", "turn log was not found"));
+        }
+        return Ok((summary.turn_id(), summary.turn_number()));
+    }
+    if record.status().turns().is_empty() && turn.is_none_or(|number| number == 1) {
+        return match client_state.turn_ids_for_task(task_id)?.as_slice() {
+            [turn_id] => Ok((*turn_id, 1)),
+            _ => Err(task_error("TASK_LOG_NOT_FOUND", "task has no turn logs")),
+        };
+    }
+    let summary = select_turn(record.status(), turn)?;
+    Ok((summary.turn_id(), summary.turn_number()))
+}
+
+fn turn_may_initialize(record: &LocalTaskRecord, turn_id: TurnId) -> bool {
+    matches!(
+        record.status().state(),
+        TaskState::Queued | TaskState::Active
+    ) && record
+        .status()
+        .turns()
+        .iter()
+        .find(|turn| turn.turn_id() == turn_id)
+        .is_none_or(|turn| turn.terminal().is_none())
+}
+
+fn log_failure_overlay(
+    record: &LocalTaskRecord,
+    turn_id: TurnId,
+    checkpoint: Option<&crate::runner_log::Snapshot>,
+    raw: bool,
+) -> Option<String> {
+    if raw {
+        return None;
+    }
+    record
+        .status()
+        .turns()
+        .iter()
+        .find(|turn| turn.turn_id() == turn_id)
+        .and_then(|turn| {
+            checkpoint
+                .and_then(|snapshot| snapshot.completion.as_ref())
+                .map_or_else(
+                    || turn_failure(turn),
+                    |completion| outcome_failure(turn.turn_number(), &completion.outcome),
+                )
+        })
+}
+
+fn reject_legacy_follow_without_completion(
+    follow: bool,
+    may_initialize: bool,
+    bytes_empty: bool,
+) -> Result<(), WorkerError> {
+    if follow && (!bytes_empty || !may_initialize) {
+        return Err(task_error(
+            "LOG_COMPLETION_UNKNOWN",
+            "legacy log has no provable completion",
+        ));
+    }
+    Ok(())
+}
+
+fn map_absent_task_record(
+    result: Result<LocalTaskRecord, WorkerError>,
+) -> Result<LocalTaskRecord, WorkerError> {
+    match result {
+        Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Err(task_error(
+            "TASK_NOT_FOUND",
+            "task is not present in controller state",
+        )),
+        other => other,
+    }
+}
+
+fn reject_missing_runner_log(
+    follow: bool,
+    may_initialize: bool,
+    failure: Option<&str>,
+    error: io::Error,
+) -> Result<(), WorkerError> {
+    if follow && !may_initialize {
+        return Err(task_error(
+            "LOG_COMPLETION_UNKNOWN",
+            "legacy turn has no provable completion",
+        ));
+    }
+    if !follow && failure.is_none() {
+        return Err(WorkerError::Io(error));
+    }
+    Ok(())
 }
 
 fn turn_failure(turn: &TurnSummary) -> Option<String> {
@@ -4132,7 +4645,7 @@ fn task_requirements(
     requirements
 }
 
-fn effective_task_limits(
+pub(crate) fn effective_task_limits(
     requested: &TaskLimits,
     settings: &TaskSettings,
 ) -> Result<TaskLimits, WorkerError> {

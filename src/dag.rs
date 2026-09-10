@@ -137,7 +137,7 @@ pub struct DagRecord {
     pub nodes: BTreeMap<String, DagNode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DagNodeProjection {
     pub batch_id: String,
     pub task_id: TaskId,

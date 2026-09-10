@@ -5,9 +5,12 @@ use std::{
 };
 
 use crate::{
+    agent::PermissionPolicy,
     dag::DagFrozenSpec,
     error::WorkerError,
     inputs::{InputSelector, SelectionFailure, SelectionWarning},
+    paths::PathLayout,
+    prepared_submit::PreparedSubmit,
     process::ProcessRunner,
     project::{ProjectContext, ProjectInspector},
     project_config::{
@@ -106,6 +109,75 @@ impl ProjectState {
         })
     }
 
+    /// Controller reopen after a validated registry lookup. `checkout` must be
+    /// the registered private path (or a request worktree under it). Ordinary
+    /// local callers must keep using `load_for_task`.
+    pub fn load_for_registered_checkout(
+        runner: &dyn ProcessRunner,
+        checkout: &Path,
+        cli_includes: &[String],
+        meta: &TaskMeta,
+    ) -> Result<Self, WorkerError> {
+        let mut context = ProjectInspector::new(runner)
+            .inspect_with_pinned_project_id(checkout, meta.project_id())?;
+        context.worktree_id = meta.worktree_id().to_owned();
+        let settings = ProjectSettings::load(&context.root, cli_includes)?;
+        let detected = RequirementDetector::detect(&context.root)?;
+        let requirements = merge_project_requirements(&settings.requires, detected);
+        Ok(Self {
+            context,
+            origin: None,
+            settings,
+            requirements,
+        })
+    }
+
+    /// Frozen controller submit must not reread `.worker.toml`. Snapshot
+    /// includes, policy, and requirements come from the prepared envelope.
+    /// `setup` stays `None` so `prepare_turn` still reads setup from the
+    /// selected task workspace.
+    pub fn settings_from_prepared(prepared: &PreparedSubmit) -> ProjectSettings {
+        let agent = match prepared.agent {
+            crate::agent::AgentKind::Codex => "codex",
+            crate::agent::AgentKind::Claude => "claude",
+            crate::agent::AgentKind::Cursor => "cursor",
+            crate::agent::AgentKind::Opencode => "opencode",
+        };
+        let permission = match prepared.policy {
+            PermissionPolicy::Workspace => "workspace",
+            PermissionPolicy::Unattended => "unattended",
+        };
+        let mut permissions = BTreeMap::new();
+        permissions.insert(agent.to_owned(), permission.to_owned());
+        let timeout = Duration::from_millis(prepared.limits.turn.timeout_millis);
+        ProjectSettings {
+            requires: prepared.requires.clone(),
+            resource_class: ResourceClass::Heavy,
+            timeout,
+            snapshot: SnapshotSettings {
+                include_untracked: prepared.include_untracked.clone(),
+                include_empty_dirs: prepared.include_empty_dirs.clone(),
+                allow_sensitive: prepared.allow_sensitive.clone(),
+            },
+            artifacts: ArtifactSettings {
+                include: Vec::new(),
+                max_total_bytes: None,
+            },
+            task: TaskSettings {
+                source: prepared.source.clone(),
+                publish: prepared.publish.clone(),
+                env_profile: prepared.env_profile.clone(),
+                model: prepared.model.clone(),
+                effort: prepared.effort.clone(),
+                default_agent: agent.to_owned(),
+                timeout,
+                max_followups: prepared.limits.max_followups,
+                permissions,
+            },
+            setup: None,
+        }
+    }
+
     /// Reconstructs submit-time project settings from a DAG freeze. `setup`
     /// stays `None` so `prepare_turn` still reads setup from the selected task
     /// workspace. Callers must not reread `.worker.toml` for DAG tasks.
@@ -165,13 +237,36 @@ impl ProjectState {
     /// DAG tasks use the freeze; independent runs and tasks with no run load
     /// current project settings. `ordinary` runs only when
     /// `ClientStateStore::frozen_spec_for_record` returned `None`.
+    /// Controller DAG nodes with a validated registry mapping pin the logical
+    /// laptop worktree ID onto the registered checkout.
     pub(crate) fn load_validated_for_task(
         runner: &dyn ProcessRunner,
+        paths: &PathLayout,
         frozen: Option<&DagFrozenSpec>,
         ordinary: impl FnOnce() -> Result<Self, WorkerError>,
     ) -> Result<Self, WorkerError> {
         match frozen {
-            Some(spec) => Self::load_for_frozen_dag_task(runner, spec),
+            Some(spec) => {
+                if let Some(checkout) = crate::controller::registry::mapped_controller_checkout(
+                    paths,
+                    &spec.project_id,
+                    &spec.worktree_id,
+                )? {
+                    let mut context = ProjectInspector::new(runner)
+                        .inspect_with_pinned_project_id(&checkout, &spec.project_id)?;
+                    context.worktree_id = spec.worktree_id.clone();
+                    if spec.branch.is_some() {
+                        context.branch = spec.branch.clone();
+                    }
+                    return Ok(Self {
+                        context,
+                        origin: None,
+                        settings: Self::settings_from_frozen(spec),
+                        requirements: spec.requires.clone(),
+                    });
+                }
+                Self::load_for_frozen_dag_task(runner, spec)
+            }
             None => ordinary(),
         }
     }

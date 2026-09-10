@@ -86,6 +86,28 @@ pub fn render_agent_log(
     flush_unrecognised(&mut fold, stdout)
 }
 
+/// Drain complete newline-terminated UTF-8 from `pending`.
+///
+/// Incomplete UTF-8 and incomplete lines stay until `flush`. Callers must not
+/// pass a drained incomplete JSON line into [`render_agent_log`] until the
+/// line is whole or the log is finished.
+pub(crate) fn take_complete_log_lines(pending: &mut Vec<u8>, flush: bool) -> Vec<u8> {
+    if flush {
+        return std::mem::take(pending);
+    }
+    let valid_up_to = match std::str::from_utf8(pending) {
+        Ok(_) => pending.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    let Some(index) = pending[..valid_up_to]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+    else {
+        return Vec::new();
+    };
+    pending.drain(..index + 1).collect()
+}
+
 /// A rendered mac-worker framing line, or silence for `turn_terminal`.
 enum FramingLine {
     Print(String),

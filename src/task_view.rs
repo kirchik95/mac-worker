@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     agent::{AgentKind, PermissionPolicy, Question, ReportedCheckStatus},
@@ -19,7 +19,7 @@ const TASK_VIEW_OVERFLOW_CODE: &str = "TASK_VIEW_OVERFLOW";
 const TASK_VIEW_MISSING_TASK_CODE: &str = "TASK_VIEW_MISSING_TASK";
 const PATH_PLACEHOLDER: &str = "[path]";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewState {
     NotReviewable,
@@ -82,14 +82,14 @@ pub struct TaskReportedCheckProjection {
     pub source: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskFreshness {
     Current,
     Stale,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskListProjection {
     pub tasks: Vec<TaskListRow>,
     pub runs: Vec<TaskRunProjection>,
@@ -98,7 +98,7 @@ pub struct TaskListProjection {
     pub dag_nodes: Vec<crate::dag::DagNodeProjection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskListRow {
     pub task_id: TaskId,
     pub run_id: Option<RunId>,
@@ -122,13 +122,13 @@ pub struct TaskListRow {
     pub active_turn_id: Option<TurnId>,
     pub close_policy: ClosePolicy,
     pub review_state: ReviewState,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<OriginDelivery>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deliveries: Vec<OriginDelivery>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRunProjection {
     pub run_id: RunId,
     pub name: Option<String>,

@@ -2,7 +2,7 @@
 //!
 //! Checkpoint 1: framed RPC codec, optional `[controller]` config, dedicated
 //! leader lock, durable request envelope, and hidden `host controller-rpc`.
-//! Full TaskClient/transfer/routing follows. Fake executor only.
+//! Full TaskClient/transfer/routing follows.
 //!
 //! Stdio RPC is one-shot: the SSH client writes one frame, closes stdin, then
 //! reads the response. Request identity is protocol version + command +
@@ -12,24 +12,41 @@
 //! (`controller_dashboard_ssh_request`). Not RPC DTOs.
 
 pub mod envelope;
+pub mod execute;
 pub mod leader;
 pub mod protocol;
+pub mod read;
+pub mod registry;
 pub mod store;
+pub mod stream_client;
+pub mod stream_rpc;
 pub mod transfer;
 
 use std::time::Duration;
 
 pub use envelope::{OperationEnvelope, load_operation_envelope, persist_operation_envelope};
+pub use execute::{
+    TaskSubmitHandler, send_controller_read, send_controller_request, serve_rpc_with_runtime,
+    tick_controller_leader,
+};
 pub use leader::ControllerLeader;
 pub use protocol::{
     ControllerRequest, MAX_FRAME_BYTES, MAX_STORED_REQUEST_BYTES, canonical_request_sha256,
     decode_frame, decode_request, encode_frame, encode_json_frame, parse_request, read_frame,
     write_frame,
 };
-pub use store::{
-    ControllerAck, ControllerFault, ControllerStore, DurableRequest, FakeControllerExecutor,
-    RequestPhase, serve_rpc,
+pub use read::{
+    ControllerReadIdentity, ControllerReadReply, ControllerTaskDiffResult,
+    ControllerTaskLogsResult, ControllerTaskResult, ControllerTaskStatusResult, is_read_command,
 };
+pub use registry::{OwnedCheckoutMap, ProjectRegistry};
+pub use store::default_prepare_operation;
+pub use store::{
+    ActiveBootstrapReport, ActiveResumeConfig, ActiveResumeReport, ControllerAck,
+    ControllerCommandHandler, ControllerFault, ControllerStore, DurableRequest,
+    FakeControllerExecutor, OperationMeta, RequestPhase, serve_rpc,
+};
+pub use stream_client::{fetch_via_controller, stream_source_receive};
 pub use transfer::{
     CONTROLLER_TRANSFER_CACHE_DOMAIN, ControllerReceiveIdentity, ControllerResultIdentity,
     ControllerSourceReceipt, ControllerTransfer, VerifiedResultMeta, controller_transfer_cache_id,
@@ -56,6 +73,16 @@ const CONTROLLER_RPC_POLICY: ProcessPolicy = ProcessPolicy {
 pub fn controller_rpc_ssh_request(
     controller: &ControllerConfig,
 ) -> Result<ProcessRequest, WorkerError> {
+    Ok(ssh_request(
+        &controller_worker_entry(controller)?,
+        HostOperation::ControllerRpc.command().into(),
+        CONTROLLER_RPC_POLICY,
+    )?)
+}
+
+pub(crate) fn controller_worker_entry(
+    controller: &ControllerConfig,
+) -> Result<WorkerEntry, WorkerError> {
     if !controller.enabled {
         return Err(WorkerError::Protocol(
             "CONTROLLER_UNAVAILABLE: controller is not enabled".into(),
@@ -67,19 +94,14 @@ pub fn controller_rpc_ssh_request(
             "CONTROLLER_UNAVAILABLE: controller transport configuration is invalid".into(),
         ));
     }
-    let worker = WorkerEntry {
+    Ok(WorkerEntry {
         name: "controller".into(),
         ssh: controller.ssh.clone(),
         slots: 1,
         capabilities: Vec::new(),
         remote_binary: controller.remote_binary.clone(),
         herdr: false,
-    };
-    Ok(ssh_request(
-        &worker,
-        HostOperation::ControllerRpc.command().into(),
-        CONTROLLER_RPC_POLICY,
-    ))
+    })
 }
 
 const DASHBOARD_TUNNEL_POLICY: ProcessPolicy = ProcessPolicy {
@@ -115,10 +137,10 @@ pub fn controller_dashboard_ssh_request(
     } else {
         format!("~/.local/bin/worker dashboard --port {port} --no-open --controller-viewer")
     };
-    Ok(ssh_local_forward_request(
+    ssh_local_forward_request(
         &controller.ssh,
         port,
         remote_command,
         DASHBOARD_TUNNEL_POLICY,
-    ))
+    )
 }

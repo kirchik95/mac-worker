@@ -467,7 +467,7 @@ impl<'a> TurnRunner<'a> {
         if let Ok(project) = self.load_project_for_record(&record)
             && project.context.project_id == record.meta().project_id()
             && let Ok(transfer) =
-                TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
+                crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())
         {
             transfer.release_base(self.runner, task_id)?;
             self.client_state.record_runner(task_id, None)?;
@@ -702,8 +702,11 @@ impl<'a> TurnRunner<'a> {
             initial_record.meta().project_id(),
             initial_record.meta().worktree_id(),
         )?;
-        let transfer =
-            TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
+        let transfer = crate::controller::registry::open_transfer_repo(
+            self.paths,
+            &project,
+            initial_record.meta(),
+        )?;
         {
             if let Some(completion) = log.completion() {
                 let exit_code = turn_exit_code(&completion.outcome);
@@ -1609,7 +1612,7 @@ impl<'a> TurnRunner<'a> {
         if let Ok(project) = self.load_project_for_record(record)
             && project.context.project_id == record.meta().project_id()
             && let Ok(transfer) =
-                TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
+                crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())
         {
             transfer.release_base(self.runner, record.meta().task_id())?;
             self.client_state
@@ -1674,7 +1677,7 @@ impl<'a> TurnRunner<'a> {
         if let Ok(project) = self.load_project_for_record(record)
             && project.context.project_id == record.meta().project_id()
             && let Ok(transfer) =
-                TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)
+                crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())
         {
             transfer.release_base(self.runner, task_id)?;
             self.client_state.record_runner(task_id, None)?;
@@ -1702,14 +1705,20 @@ impl<'a> TurnRunner<'a> {
         record: &LocalTaskRecord,
     ) -> Result<ProjectState, WorkerError> {
         let frozen = self.client_state.frozen_spec_for_record(record)?;
-        let project = ProjectState::load_validated_for_task(self.runner, frozen.as_ref(), || {
-            ProjectState::load_for_task(
-                self.runner,
-                &self.task_project_path(record)?,
-                &[],
-                record.meta(),
-            )
-        })?;
+        let project = ProjectState::load_validated_for_task(
+            self.runner,
+            self.paths,
+            frozen.as_ref(),
+            || {
+                crate::controller::registry::load_registered_or_local(
+                    self.runner,
+                    self.paths,
+                    &self.task_project_path(record)?,
+                    &[],
+                    record.meta(),
+                )
+            },
+        )?;
         require_project_match(
             &project,
             record.meta().project_id(),
@@ -1811,13 +1820,19 @@ fn transfer_for_completed_turn(
         Some(path) => path,
         None => std::env::current_dir().map_err(WorkerError::Io)?,
     };
-    let project = ProjectState::load_for_task(runner, &project_path, &[], record.meta())?;
+    let project = crate::controller::registry::load_registered_or_local(
+        runner,
+        paths,
+        &project_path,
+        &[],
+        record.meta(),
+    )?;
     require_project_match(
         &project,
         record.meta().project_id(),
         record.meta().worktree_id(),
     )?;
-    let transfer = TransferRepo::open_or_create(&paths.cache, &project.context.common_dir)?;
+    let transfer = crate::controller::registry::open_transfer_repo(paths, &project, record.meta())?;
     Ok((project, transfer))
 }
 

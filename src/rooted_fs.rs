@@ -6313,15 +6313,220 @@ fn open_cleanup_record(
     Ok((file, bytes, FileIdentity::from_stat(&opened)))
 }
 
+/// One coherent policy for every cleanup-record metadata observation
+/// (before/current/rebound/opened): lookup can race unlink, so an
+/// otherwise-valid record reporting nlink == 0 is contention, never a
+/// permissions violation and never acceptance. Ordered checks:
+/// 1. Non-regular type, wrong owner, or group/other bits -> PermissionDenied.
+/// 2. nlink > 1 (hardlink) -> PermissionDenied.
+/// 3. Wrong device -> EXDEV.
+/// 4. Inexact mode or negative size -> ESTALE (existing).
+/// 5. Oversize -> EFBIG.
+/// 6. nlink == 0 on the otherwise-valid record -> ESTALE into the existing
+///    bounded retry (raw49/raw59 class). The vanished record is never read,
+///    accepted, or mutated; identity/same_file checks still fail closed.
+/// 7. Otherwise Ok.
+///
+/// Global `require_private_regular` and unrelated private-file policies are
+/// unchanged; no blanket PermissionDenied mapping exists anywhere here.
 fn require_cleanup_record_metadata(metadata: &libc::stat, expected_device: u64) -> io::Result<()> {
-    require_private_regular_on_device(metadata, expected_device)?;
+    if file_type(metadata.st_mode) != libc::S_IFREG
+        || metadata.st_uid != unsafe { libc::geteuid() }
+        || metadata.st_mode & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "host file is not an owner-only regular file",
+        ));
+    }
+    if metadata.st_nlink != 1 && metadata.st_nlink != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "host file is not an owner-only regular file",
+        ));
+    }
+    if metadata.st_dev as u64 != expected_device {
+        return Err(os_error(libc::EXDEV));
+    }
     if metadata.st_mode & 0o777 != 0o600 || metadata.st_size < 0 {
         return Err(os_error(libc::ESTALE));
     }
     if metadata.st_size as usize > CLEANUP_RECORD_MAX_BYTES {
         return Err(os_error(libc::EFBIG));
     }
+    if metadata.st_nlink == 0 {
+        return Err(os_error(libc::ESTALE));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod cleanup_record_metadata_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn owner_regular(nlink: u16, mode: u16) -> libc::stat {
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        metadata.st_dev = 7;
+        metadata.st_ino = 11;
+        metadata.st_mode = libc::S_IFREG | mode;
+        metadata.st_uid = unsafe { libc::geteuid() };
+        metadata.st_nlink = nlink;
+        metadata.st_size = 100;
+        metadata
+    }
+
+    #[test]
+    fn unlinked_opened_record_revalidates_as_contention_with_rebound_intact() {
+        // Real deterministic repro of the raw49 transition (no synthetic
+        // stat, no threads): open a private regular through the real helper,
+        // unlink its name and recreate a different record at the same name,
+        // then revalidate the retained open File.
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let root = RootedDir::create(&root_path).unwrap();
+        let device = root.identity().unwrap().device;
+        let parent = root.raw_directory_fd();
+        let name = CString::new("record.json").unwrap();
+        let before_bytes = b"intent-v1-canonical";
+        root.write_private_atomic_no_replace("record.json", before_bytes)
+            .unwrap();
+
+        let (file, bytes, identity) = open_cleanup_record(parent, &name, device, false).unwrap();
+        assert_eq!(bytes, before_bytes);
+
+        unlink_at(parent, &name, 0).unwrap();
+        let after_bytes = b"different-record";
+        root.write_private_atomic_no_replace("record.json", after_bytes)
+            .unwrap();
+
+        // Real fstat of the retained descriptor shows the unlinked inode.
+        let opened = stat_fd(file.as_raw_fd()).unwrap();
+        assert_eq!(opened.st_nlink, 0);
+
+        // Classification is ESTALE/EAGAIN (bounded retry), never
+        // PermissionDenied.
+        let error =
+            revalidate_cleanup_record_binding(parent, &name, &file, identity, device).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        let error = revalidate_cleanup_record_bytes_or_retry(
+            parent,
+            &name,
+            &file,
+            identity,
+            device,
+            before_bytes,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+
+        // Rebound bytes are preserved untouched.
+        assert_eq!(
+            std::fs::read(root_path.join("record.json")).unwrap(),
+            after_bytes
+        );
+    }
+
+    #[test]
+    fn opened_hardlinked_record_still_rejects() {
+        // nlink > 1 is never a legitimate transient: still PermissionDenied.
+        let metadata = owner_regular(2, 0o600);
+        let error = require_cleanup_record_metadata(&metadata, 7).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn opened_wrong_mode_and_uid_still_reject() {
+        let error = require_cleanup_record_metadata(&owner_regular(1, 0o640), 7).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let mut metadata = owner_regular(1, 0o600);
+        metadata.st_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+        let error = require_cleanup_record_metadata(&metadata, 7).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn device_mismatch_and_oversize_keep_their_codes() {
+        let metadata = owner_regular(1, 0o600);
+        let error = require_cleanup_record_metadata(&metadata, 8).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+        let mut metadata = owner_regular(1, 0o600);
+        metadata.st_size = CLEANUP_RECORD_MAX_BYTES as i64 + 1;
+        let error = require_cleanup_record_metadata(&metadata, 7).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EFBIG));
+    }
+
+    #[test]
+    fn clean_unlinked_snapshot_is_contention_not_permission_denied() {
+        // raw59/raw49 class, now coherent policy: an otherwise-valid record
+        // reporting nlink == 0 is a concurrently unlinked snapshot ->
+        // ESTALE (existing bounded retry), never acceptance and never
+        // PermissionDenied.
+        let metadata = owner_regular(0, 0o600);
+        let error = require_cleanup_record_metadata(&metadata, 7).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+    }
+
+    #[test]
+    fn rebound_snapshot_classification_uses_actual_kernel_stats() {
+        // Deterministic raw59 regression with real fstat results (no
+        // synthetic struct assignment): an ACTUAL stat of an opened-then-
+        // unlinked file classifies as ESTALE (bounded retry); actual
+        // hardlinked/wrong-mode snapshots still reject; the replacement
+        // file is never accepted or mutated.
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let root = RootedDir::create(&root_path).unwrap();
+        let device = root.identity().unwrap().device;
+        let parent = root.raw_directory_fd();
+        let name = CString::new("record.json").unwrap();
+        root.write_private_atomic_no_replace("record.json", b"record-bytes")
+            .unwrap();
+
+        let fd = open_regular_at(parent, &name).unwrap();
+        unlink_at(parent, &name, 0).unwrap();
+        let unlinked = stat_fd(fd.as_raw_fd()).unwrap();
+        assert_eq!(unlinked.st_nlink, 0);
+        let error = require_cleanup_record_metadata(&unlinked, device).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        drop(fd);
+
+        root.write_private_atomic_no_replace("record.json", b"record-bytes")
+            .unwrap();
+        std::fs::hard_link(root_path.join("record.json"), root_path.join("alias.json")).unwrap();
+        let linked = stat_at(parent, &name).unwrap();
+        assert_eq!(linked.st_nlink, 2);
+        let error = require_cleanup_record_metadata(&linked, device).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        std::fs::remove_file(root_path.join("alias.json")).unwrap();
+
+        std::fs::set_permissions(
+            root_path.join("record.json"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let permissive = stat_at(parent, &name).unwrap();
+        let error = require_cleanup_record_metadata(&permissive, device).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        std::fs::set_permissions(
+            root_path.join("record.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let healthy = stat_at(parent, &name).unwrap();
+        assert!(require_cleanup_record_metadata(&healthy, device).is_ok());
+        assert_eq!(
+            std::fs::read(root_path.join("record.json")).unwrap(),
+            b"record-bytes"
+        );
+    }
+
+    #[test]
+    fn healthy_record_passes_the_common_validator() {
+        let metadata = owner_regular(1, 0o600);
+        assert!(require_cleanup_record_metadata(&metadata, 7).is_ok());
+    }
 }
 
 fn revalidate_cleanup_record_binding(

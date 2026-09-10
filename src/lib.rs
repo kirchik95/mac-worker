@@ -94,6 +94,7 @@ pub mod outbox;
 pub mod output;
 pub mod paths;
 pub mod prepare_turn;
+pub mod prepared_submit;
 pub mod probe;
 pub mod process;
 pub mod project;
@@ -732,7 +733,7 @@ pub fn run_with_stdio_in_context(
             command: ControllerCommand::Run
         }
     ) {
-        return run_controller_command(cli.config, runtime, stdout, stderr);
+        return run_controller_command(cli.config, runtime, runner, stdout, stderr);
     }
     run_with_rsync_executor_in_context(
         cli,
@@ -881,15 +882,28 @@ async fn run_local_dashboard(
 fn run_controller_command(
     config_override: Option<PathBuf>,
     runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
+        let config = load_controller_process_config(&paths)?;
         let state_root = paths.controller_state_root();
         let _leader = crate::controller::ControllerLeader::acquire(&state_root)?;
         let store = crate::controller::ControllerStore::open(&state_root)?;
-        store.resume_incomplete()?;
+        let client_state = ClientStateStore::open(&paths.state)?;
+        let handler =
+            crate::controller::TaskSubmitHandler::new(runner, &config, &paths, &client_state);
+        crate::controller::tick_controller_leader(&store, &handler)?;
+        let client = TaskClient::new(
+            runner,
+            &config,
+            &paths,
+            &client_state,
+            &DETACHED_TASK_EXECUTOR,
+        );
+        client.reconcile_runners()?;
         writeln!(stdout, "controller leader acquired").map_err(WorkerError::Io)?;
         stdout.flush().map_err(WorkerError::Io)?;
         let async_runtime = tokio::runtime::Builder::new_current_thread()
@@ -897,7 +911,16 @@ fn run_controller_command(
             .build()
             .map_err(WorkerError::Io)?;
         async_runtime.block_on(async {
-            let _ = tokio::signal::ctrl_c().await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    _ = interval.tick() => {
+                        let _ = crate::controller::tick_controller_leader(&store, &handler);
+                        let _ = client.reconcile_runners();
+                    }
+                }
+            }
         });
         Ok(())
     })();
@@ -914,14 +937,18 @@ fn run_controller_command(
 fn run_host_controller_rpc(
     config_override: Option<PathBuf>,
     runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
-        crate::controller::serve_rpc(
-            &paths.controller_state_root(),
+        let config = load_controller_process_config(&paths)?;
+        crate::controller::serve_rpc_with_runtime(
+            &paths,
+            &config,
+            runner,
             stdin,
             stdout,
             crate::controller::ControllerFault::None,
@@ -993,6 +1020,18 @@ fn run_task_command(
                 stdout.flush()?;
             }
             return Ok(if report.has_config_errors() { 1 } else { 0 });
+        }
+        if config.controller.enabled {
+            return run_enabled_controller_task(
+                cli.command,
+                runner,
+                runtime,
+                &paths,
+                &config,
+                json,
+                stdout,
+                stderr,
+            );
         }
         let client_state = ClientStateStore::open(&paths.state)?;
         let command = cli.command;
@@ -1710,7 +1749,7 @@ pub fn run_with_rsync_executor_in_context(
             command: HostCommand::ControllerRpc
         }
     ) {
-        return run_host_controller_rpc(cli.config, runtime, stdin, stdout, stderr);
+        return run_host_controller_rpc(cli.config, runtime, runner, stdin, stdout, stderr);
     }
     if matches!(
         &cli.command,
@@ -3525,6 +3564,516 @@ fn run_host_snapshot_verify(
         return crate::error::ExitKind::Io as u8;
     }
     exit
+}
+
+fn load_controller_process_config(paths: &PathLayout) -> Result<Config, WorkerError> {
+    if paths.config.is_file() {
+        Config::load(&paths.config)
+    } else {
+        let config =
+            Config::parse("version = 1\n[controller]\nenabled = true\nssh = \"controller\"\n")?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+fn run_enabled_controller_task(
+    command: Command,
+    runner: &dyn ProcessRunner,
+    runtime: &RuntimeContext,
+    paths: &PathLayout,
+    config: &Config,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<u8, WorkerError> {
+    let _ = stderr;
+    match command {
+        Command::Task {
+            command:
+                TaskCommand::Submit {
+                    agent,
+                    model,
+                    effort,
+                    prompt,
+                    prompt_file,
+                    title,
+                    project,
+                    base,
+                    wip,
+                    includes,
+                    timeout,
+                    max_turns,
+                    max_budget,
+                    max_followups,
+                    close_on,
+                    env_profile,
+                    worker,
+                    source,
+                    publish,
+                    publish_branch,
+                    no_wait: _,
+                    wait,
+                },
+        } => {
+            validate_task_scope_options(source.as_deref(), &publish, publish_branch.as_deref())?;
+            let prompt = read_prompt(prompt, prompt_file)?;
+            let limits = make_task_limits(timeout, max_turns, max_budget, max_followups)?;
+            let project = project.unwrap_or(runtime.current_dir()?);
+            let task_agent = match agent.as_deref() {
+                Some(agent) => parse_task_agent(agent)?,
+                None => {
+                    let settings = crate::project_state::ProjectState::load(runner, &project, &[])?
+                        .settings
+                        .task;
+                    parse_task_agent(&settings.default_agent)?
+                }
+            };
+            let ack = freeze_and_submit_via_controller(
+                runner,
+                runtime,
+                paths,
+                config,
+                project,
+                prompt,
+                title,
+                task_agent,
+                model,
+                effort,
+                base,
+                wip,
+                includes,
+                limits,
+                parse_task_close_policy(close_on.as_deref())?,
+                env_profile,
+                worker,
+                source,
+                publish,
+                publish_branch,
+            )?;
+            if wait {
+                return Err(WorkerError::Unavailable(
+                    "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
+                ));
+            }
+            if json {
+                write_json_line(
+                    stdout,
+                    &serde_json::json!({
+                        "protocol_version": PROTOCOL_VERSION,
+                        "task_id": controller_ack_id(ack.task_id()),
+                        "turn_id": controller_ack_id(ack.turn_id()),
+                        "request_id": ack.request_id(),
+                        "status": ack.status(),
+                    }),
+                )?;
+            } else {
+                writeln!(
+                    stdout,
+                    "task {}: queued (controller)",
+                    controller_ack_id(ack.task_id())
+                )?;
+                stdout.flush()?;
+            }
+            Ok(0)
+        }
+        Command::Task {
+            command: TaskCommand::Status { task_id, full: _ },
+        } => {
+            let report = controller_task_status(runner, config, task_id)?;
+            write_task_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        Command::Task {
+            command:
+                TaskCommand::List {
+                    run,
+                    state,
+                    outcome,
+                    full,
+                },
+        } => {
+            let report = controller_task_list(runner, config, run, state, outcome, full)?;
+            write_task_list_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        Command::Task {
+            command:
+                TaskCommand::Logs {
+                    task_id,
+                    turn,
+                    follow,
+                    raw,
+                },
+        } => {
+            controller_task_logs(runner, config, task_id, turn, follow, raw, stdout)?;
+            Ok(0)
+        }
+        Command::Task {
+            command: TaskCommand::Diff { task_id, stat },
+        } => {
+            let diff = controller_task_diff(runner, config, task_id, stat)?;
+            stdout.write_all(diff.text().as_bytes())?;
+            if !diff.text().ends_with('\n') {
+                stdout.write_all(b"\n")?;
+            }
+            stdout.flush()?;
+            Ok(0)
+        }
+        Command::Task {
+            command: TaskCommand::Result { task_id },
+        } => {
+            let report = controller_task_result(runner, config, task_id)?;
+            write_task_result_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        Command::Task {
+            command: TaskCommand::Fetch { task_id },
+        } => {
+            let project = runtime.current_dir()?;
+            let report = crate::controller::fetch_via_controller(
+                runner,
+                paths,
+                &config.controller,
+                &project,
+                task_id,
+            )?;
+            write_fetch_report(&report, json, stdout)?;
+            Ok(0)
+        }
+        Command::Task {
+            command: TaskCommand::Say { .. },
+        }
+        | Command::Task {
+            command: TaskCommand::Cancel { .. },
+        }
+        | Command::Task {
+            command: TaskCommand::Close { .. },
+        }
+        | Command::Task {
+            command: TaskCommand::Wait { .. },
+        }
+        | Command::Task {
+            command: TaskCommand::Reconcile,
+        }
+        | Command::Task {
+            command: TaskCommand::Batch { .. },
+        } => Err(WorkerError::Unavailable(
+            "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
+        )),
+        _ => Err(WorkerError::Unavailable(
+            "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
+        )),
+    }
+}
+
+fn controller_ack_id(id: Option<&str>) -> &str {
+    id.unwrap_or("")
+}
+
+fn freeze_and_submit_via_controller(
+    runner: &dyn ProcessRunner,
+    _runtime: &RuntimeContext,
+    paths: &PathLayout,
+    config: &Config,
+    project: PathBuf,
+    prompt: String,
+    title: Option<String>,
+    agent: crate::agent::AgentKind,
+    model: Option<String>,
+    effort: Option<String>,
+    base: String,
+    wip: bool,
+    includes: Vec<String>,
+    limits: crate::task::TaskLimits,
+    close_on: crate::task::ClosePolicy,
+    env_profile: Option<String>,
+    worker: Option<String>,
+    source: Option<String>,
+    publish: Vec<String>,
+    publish_branch: Option<String>,
+) -> Result<crate::controller::ControllerAck, WorkerError> {
+    let probed = crate::project_state::ProjectState::load(runner, &project, &includes)?;
+    let limits = crate::task_client::effective_task_limits(&limits, &probed.settings.task)?;
+    let transfer = crate::transfer_repo::TransferRepo::open_or_create(
+        &paths.cache,
+        &probed.context.common_dir,
+    )?;
+    let identity = crate::task::GitIdentity::new("mac-worker", "mac-worker@localhost")?;
+    let task_id = crate::task::TaskId::generate();
+    let turn_id = crate::task::TurnId::generate();
+    let request_id = format!("{:x}", uuid::Uuid::new_v4().simple());
+    let captured = if wip {
+        transfer.build_wip_base(
+            runner,
+            &probed.context,
+            task_id,
+            &probed.settings,
+            &identity,
+        )?
+    } else {
+        transfer.resolve_base(runner, &probed.context, &base)?
+    };
+    let agent_name = match agent {
+        crate::agent::AgentKind::Codex => "codex",
+        crate::agent::AgentKind::Claude => "claude",
+        crate::agent::AgentKind::Cursor => "cursor",
+        crate::agent::AgentKind::Opencode => "opencode",
+    };
+    let permissions = match probed
+        .settings
+        .task
+        .permissions
+        .get(agent_name)
+        .map(String::as_str)
+    {
+        Some("unattended") => "unattended",
+        _ => "workspace",
+    };
+    let source_name = source.unwrap_or_else(|| probed.settings.task.source.clone());
+    let publish = if publish.is_empty() {
+        probed.settings.task.publish.clone()
+    } else {
+        publish
+    };
+    let body = crate::prepared_submit::FrozenSubmitBody {
+        task_id,
+        turn_id,
+        run_id: None,
+        created_at_millis: current_time_millis()?,
+        prompt,
+        title,
+        agent: agent_name.to_owned(),
+        model: model.or(probed.settings.task.model.clone()),
+        effort: effort.or(probed.settings.task.effort.clone()),
+        source: source_name,
+        origin_url: probed.origin.clone(),
+        publish,
+        publish_branch,
+        close_on,
+        env_profile: env_profile.or(probed.settings.task.env_profile.clone()),
+        worker,
+        wip,
+        project_id: probed.context.project_id.clone(),
+        worktree_id: probed.context.worktree_id.clone(),
+        base_oid: captured.oid().clone(),
+        timeout_millis: limits.turn.timeout_millis,
+        max_turns: limits.turn.max_turns,
+        max_budget_usd_cents: limits.turn.max_budget_usd_cents,
+        max_followups: limits.max_followups,
+        permissions: permissions.to_owned(),
+        requires: probed.requirements.clone(),
+        include_untracked: probed.settings.snapshot.include_untracked.clone(),
+        include_empty_dirs: probed.settings.snapshot.include_empty_dirs.clone(),
+        allow_sensitive: probed.settings.snapshot.allow_sensitive.clone(),
+        cli_includes: includes,
+        branch: probed.context.branch.clone(),
+    };
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": request_id,
+        "command": "task.submit",
+        "body": body,
+    }))
+    .map_err(|_| {
+        WorkerError::Protocol("CONTROLLER_TRANSPORT: frozen submit could not be encoded".into())
+    })?;
+    let request = crate::controller::parse_request(&payload)?;
+    crate::controller::persist_operation_envelope(&paths.controller_cache_root(), &request)?;
+    crate::controller::stream_source_receive(
+        runner,
+        &config.controller,
+        &request,
+        transfer.path(),
+        &body.project_id,
+        &body.worktree_id,
+        captured.oid(),
+    )?;
+    crate::controller::send_controller_request(runner, &config.controller, &request)
+}
+
+fn controller_read_request(
+    command: &str,
+    body: serde_json::Value,
+) -> Result<crate::controller::ControllerRequest, WorkerError> {
+    let request_id = format!("{:x}", uuid::Uuid::new_v4().simple());
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": request_id,
+        "command": command,
+        "body": body,
+    }))
+    .map_err(|_| {
+        WorkerError::Protocol(
+            "CONTROLLER_TRANSPORT: controller read request could not be encoded".into(),
+        )
+    })?;
+    crate::controller::parse_request(&payload)
+}
+
+fn controller_task_status(
+    runner: &dyn ProcessRunner,
+    config: &Config,
+    task_id: crate::task::TaskId,
+) -> Result<task_client::TaskReport, WorkerError> {
+    let request = controller_read_request(
+        "task.status",
+        serde_json::json!({ "task_id": task_id.to_string() }),
+    )?;
+    let reply = crate::controller::send_controller_read::<
+        crate::controller::ControllerTaskStatusResult,
+    >(runner, &config.controller, &request)?;
+    Ok(reply.into_result().into_report())
+}
+
+fn controller_task_list(
+    runner: &dyn ProcessRunner,
+    config: &Config,
+    run: Option<String>,
+    state: Option<String>,
+    outcome: Option<String>,
+    full: bool,
+) -> Result<task_client::TaskListReport, WorkerError> {
+    let mut body = serde_json::Map::new();
+    if let Some(run) = run {
+        body.insert("run".into(), serde_json::Value::String(run));
+    }
+    if let Some(state) = state {
+        body.insert("state".into(), serde_json::Value::String(state));
+    }
+    if let Some(outcome) = outcome {
+        body.insert("outcome".into(), serde_json::Value::String(outcome));
+    }
+    if full {
+        body.insert("full".into(), serde_json::Value::Bool(true));
+    }
+    let request = controller_read_request("task.list", serde_json::Value::Object(body))?;
+    let reply = crate::controller::send_controller_read::<crate::task_view::TaskListProjection>(
+        runner,
+        &config.controller,
+        &request,
+    )?;
+    Ok(task_client::TaskListReport::from_projection(
+        reply.into_result(),
+    ))
+}
+
+fn controller_task_logs(
+    runner: &dyn ProcessRunner,
+    config: &Config,
+    task_id: crate::task::TaskId,
+    turn: Option<u32>,
+    follow: bool,
+    raw: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    let mut offset = 0_u64;
+    let mut pending = Vec::new();
+    let mut pinned_turn_id: Option<crate::task::TurnId> = None;
+    let mut agent: Option<crate::agent::AgentKind> = None;
+    let mut reported_failure = None;
+    loop {
+        let mut body = serde_json::json!({
+            "task_id": task_id.to_string(),
+            "offset": offset,
+            "limit": crate::job::MAX_LOG_CHUNK_BYTES,
+            "raw": raw,
+            "follow": follow,
+        });
+        if let Some(turn) = turn {
+            body["turn"] = serde_json::json!(turn);
+        }
+        if let Some(turn_id) = pinned_turn_id {
+            body["turn_id"] = serde_json::json!(turn_id.to_string());
+        }
+        let request = controller_read_request("task.logs", body)?;
+        let reply = crate::controller::send_controller_read::<
+            crate::controller::ControllerTaskLogsResult,
+        >(runner, &config.controller, &request)?;
+        let chunk = reply.into_result();
+        let chunk_agent = chunk.agent()?;
+        match pinned_turn_id {
+            Some(pinned) if pinned != chunk.turn_id() => {
+                return Err(crate::controller::read::invalid_controller_reply());
+            }
+            Some(_) => {}
+            None => pinned_turn_id = Some(chunk.turn_id()),
+        }
+        match agent {
+            Some(expected) if expected != chunk_agent => {
+                return Err(crate::controller::read::invalid_controller_reply());
+            }
+            Some(_) => {}
+            None => agent = Some(chunk_agent),
+        }
+        let bytes = chunk.decode_bytes()?;
+        let finished = chunk.exhausted() && (chunk.complete() || !follow);
+        if raw {
+            stdout.write_all(&bytes)?;
+        } else {
+            pending.extend_from_slice(&bytes);
+            let renderable = crate::turn_log::take_complete_log_lines(&mut pending, finished);
+            if !renderable.is_empty() {
+                crate::turn_log::render_agent_log(
+                    &renderable,
+                    agent.expect("agent is pinned after the first logs reply"),
+                    stdout,
+                )?;
+            }
+            if chunk.failure() != reported_failure.as_deref() {
+                if let Some(line) = chunk.failure() {
+                    writeln!(stdout, "{line}")?;
+                }
+                reported_failure = chunk.failure().map(str::to_owned);
+            }
+        }
+        stdout.flush()?;
+        let progressed = chunk.next_offset() > offset;
+        offset = chunk.next_offset();
+        if finished {
+            break;
+        }
+        if follow && chunk.exhausted() && !chunk.complete() && !progressed {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    Ok(())
+}
+
+fn controller_task_diff(
+    runner: &dyn ProcessRunner,
+    config: &Config,
+    task_id: crate::task::TaskId,
+    stat: bool,
+) -> Result<crate::controller::ControllerTaskDiffResult, WorkerError> {
+    let request = controller_read_request(
+        "task.diff",
+        serde_json::json!({
+            "task_id": task_id.to_string(),
+            "stat": stat,
+        }),
+    )?;
+    let reply = crate::controller::send_controller_read::<
+        crate::controller::ControllerTaskDiffResult,
+    >(runner, &config.controller, &request)?;
+    Ok(reply.into_result())
+}
+
+fn controller_task_result(
+    runner: &dyn ProcessRunner,
+    config: &Config,
+    task_id: crate::task::TaskId,
+) -> Result<task_client::TaskResultReport, WorkerError> {
+    let request = controller_read_request(
+        "task.result",
+        serde_json::json!({ "task_id": task_id.to_string() }),
+    )?;
+    let reply = crate::controller::send_controller_read::<crate::controller::ControllerTaskResult>(
+        runner,
+        &config.controller,
+        &request,
+    )?;
+    Ok(reply.into_result().into_report())
 }
 
 fn write_error(stderr: &mut dyn Write, error: &WorkerError) {

@@ -143,7 +143,8 @@ fn remote_ok(runner: &dyn ProcessRunner, worker: &WorkerEntry, command: &str) ->
             stderr_limit: 4096,
             deadline: Duration::from_secs(15),
         },
-    );
+    )
+    .ok()?;
     runner
         .run(&request)
         .ok()

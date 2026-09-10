@@ -61,6 +61,12 @@ impl PathLayout {
     pub fn controller_cache_root(&self) -> PathBuf {
         self.cache.join("controller")
     }
+
+    /// Controller-owned checkouts for frozen logical project/worktree IDs.
+    #[must_use]
+    pub fn controller_project_root(&self) -> PathBuf {
+        self.data.join("controller-projects")
+    }
 }
 
 fn env_path(env: &BTreeMap<OsString, OsString>, key: &str) -> Option<PathBuf> {

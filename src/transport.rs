@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    ffi::{OsStr, OsString},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
@@ -8,6 +9,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(debug_assertions)]
+use std::path::{Component, Path};
 
 use crate::{
     config::{Config, WorkerEntry, valid_ssh_destination},
@@ -22,6 +26,10 @@ use crate::{
 };
 
 const SSH_PROGRAM: &str = "/usr/bin/ssh";
+/// Fixture-only. Debug/test-profile binaries honor an absolute replacement
+/// for JSON SSH hops. Release ignores this variable. Not a public config key.
+#[cfg(debug_assertions)]
+const TEST_SSH_ENV: &str = "MAC_WORKER_TEST_SSH";
 const REMOTE_PROBE_COMMAND: &str = "~/.local/bin/worker host probe";
 const MAX_PROBE_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_HOSTNAME_BYTES: usize = 253;
@@ -217,9 +225,7 @@ impl<R: ProcessRunner> SshTransport<R> {
                 message: "worker transport configuration is invalid".into(),
             });
         }
-        Ok(format!(
-            "{SSH_PROGRAM} -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
-        ))
+        git_ssh_command_line(&ssh_program()?)
     }
 
     pub fn refresh_facts(&self, worker: &WorkerEntry) -> Result<(), WorkerError> {
@@ -263,7 +269,7 @@ impl<R: ProcessRunner> SshTransport<R> {
         } else {
             HostOperation::RefreshFacts.command()
         };
-        let request = ssh_request(worker, command.into(), policy);
+        let request = ssh_request(worker, command.into(), policy)?;
         let result = self
             .runner
             .run(&request)
@@ -342,7 +348,7 @@ impl<R: ProcessRunner> SshTransport<R> {
         if deadline.is_zero() {
             return (probe_budget_exhausted(worker), None);
         }
-        let request = ssh_request(
+        let request = match ssh_request(
             worker,
             remote_command,
             ProcessPolicy {
@@ -350,7 +356,16 @@ impl<R: ProcessRunner> SshTransport<R> {
                 stderr_limit: MAX_PROBE_RESPONSE_BYTES,
                 deadline: deadline.min(MAX_PROBE_DEADLINE),
             },
-        );
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                let code = error.public_code();
+                return (
+                    unavailable(worker, &code, error.to_string(), None, Vec::new()),
+                    None,
+                );
+            }
+        };
         let result = match self.runner.run(&request) {
             Ok(result) => result,
             Err(error) => {
@@ -741,9 +756,9 @@ pub(crate) fn ssh_request(
     worker: &WorkerEntry,
     remote_command: String,
     policy: ProcessPolicy,
-) -> ProcessRequest {
-    ProcessRequest {
-        program: SSH_PROGRAM.into(),
+) -> Result<ProcessRequest, WorkerError> {
+    Ok(ProcessRequest {
+        program: ssh_program()?,
         args: vec![
             "-o".into(),
             "BatchMode=yes".into(),
@@ -762,7 +777,7 @@ pub(crate) fn ssh_request(
         stdin: None,
         policy,
         isolate_parent_environment: false,
-    }
+    })
 }
 
 /// SSH argv for a same-port local forward. Unlike [`ssh_request`], this keeps
@@ -773,10 +788,10 @@ pub(crate) fn ssh_local_forward_request(
     port: u16,
     remote_command: String,
     policy: ProcessPolicy,
-) -> ProcessRequest {
+) -> Result<ProcessRequest, WorkerError> {
     let forward = format!("127.0.0.1:{port}:127.0.0.1:{port}");
-    ProcessRequest {
-        program: SSH_PROGRAM.into(),
+    Ok(ProcessRequest {
+        program: ssh_program()?,
         args: vec![
             "-o".into(),
             "BatchMode=yes".into(),
@@ -797,7 +812,7 @@ pub(crate) fn ssh_local_forward_request(
         stdin: None,
         policy,
         isolate_parent_environment: false,
-    }
+    })
 }
 
 fn unavailable(
@@ -836,4 +851,174 @@ fn probe_aborted(worker: &WorkerEntry) -> WorkerHealth {
         None,
         Vec::new(),
     )
+}
+
+/// JSON/control SSH executable and the Git `GIT_SSH_COMMAND` program.
+///
+/// Stock path is `/usr/bin/ssh`. Debug builds may replace it when the child
+/// env sets `MAC_WORKER_TEST_SSH` to an absolute path. Release builds never
+/// read the variable. A set-but-invalid value fails closed and does not fall
+/// through to live `/usr/bin/ssh`.
+pub(crate) fn ssh_program() -> Result<OsString, WorkerError> {
+    #[cfg(debug_assertions)]
+    {
+        return ssh_program_from_override(std::env::var_os(TEST_SSH_ENV));
+    }
+    #[cfg(not(debug_assertions))]
+    Ok(OsString::from(SSH_PROGRAM))
+}
+
+pub(crate) fn ssh_program_from_override(value: Option<OsString>) -> Result<OsString, WorkerError> {
+    #[cfg(debug_assertions)]
+    {
+        match value {
+            None => Ok(OsString::from(SSH_PROGRAM)),
+            Some(value) if fixture_ssh_path_ok(&value) => Ok(value),
+            Some(_) => Err(invalid_test_ssh()),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = value;
+        Ok(OsString::from(SSH_PROGRAM))
+    }
+}
+
+#[cfg(debug_assertions)]
+fn fixture_ssh_path_ok(value: &OsStr) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        && !value.as_encoded_bytes().contains(&0)
+        && path
+            .components()
+            .all(|component| component != Component::ParentDir)
+}
+
+fn invalid_test_ssh() -> WorkerError {
+    WorkerError::Protocol(
+        "CONTROLLER_UNAVAILABLE: MAC_WORKER_TEST_SSH must be an absolute executable path".into(),
+    )
+}
+
+/// Quote an absolute SSH executable for `GIT_SSH_COMMAND` / rsync `-e`.
+/// Safe unquoted paths (`/usr/bin/ssh`) stay unquoted so stock Git command
+/// lines do not change.
+pub(crate) fn posix_shell_quote(value: &OsStr) -> Result<String, WorkerError> {
+    let Some(text) = value.to_str() else {
+        return Err(invalid_test_ssh());
+    };
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        return Ok(text.to_owned());
+    }
+    let mut quoted = String::from("'");
+    for ch in text.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    Ok(quoted)
+}
+
+pub(crate) fn git_ssh_command_line(program: &OsStr) -> Result<String, WorkerError> {
+    Ok(format!(
+        "{} -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes",
+        posix_shell_quote(program)?
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn test_ssh_override_accepts_only_absolute_paths() {
+        assert_eq!(
+            ssh_program_from_override(None).unwrap().as_os_str(),
+            "/usr/bin/ssh"
+        );
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(
+                ssh_program_from_override(Some(OsString::from("fake-ssh")))
+                    .unwrap_err()
+                    .public_code(),
+                "CONTROLLER_UNAVAILABLE"
+            );
+            assert_eq!(
+                ssh_program_from_override(Some(OsString::from("/tmp/../usr/bin/ssh")))
+                    .unwrap_err()
+                    .public_code(),
+                "CONTROLLER_UNAVAILABLE"
+            );
+            assert_eq!(
+                ssh_program_from_override(Some(OsString::from("/tmp/mac-worker-fake-ssh")))
+                    .unwrap()
+                    .as_os_str(),
+                "/tmp/mac-worker-fake-ssh"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(
+                ssh_program_from_override(Some(OsString::from("fake-ssh")))
+                    .unwrap()
+                    .as_os_str(),
+                "/usr/bin/ssh"
+            );
+            assert_eq!(
+                ssh_program_from_override(Some(OsString::from("/tmp/mac-worker-fake-ssh")))
+                    .unwrap()
+                    .as_os_str(),
+                "/usr/bin/ssh"
+            );
+        }
+    }
+
+    #[test]
+    fn git_ssh_command_quotes_paths_that_need_a_shell() {
+        assert_eq!(
+            git_ssh_command_line(OsStr::new("/usr/bin/ssh")).unwrap(),
+            "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
+        );
+        assert_eq!(
+            git_ssh_command_line(OsStr::new("/tmp/mac-worker fake-ssh")).unwrap(),
+            "'/tmp/mac-worker fake-ssh' -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
+        );
+        assert_eq!(
+            git_ssh_command_line(OsStr::new("/tmp/mac-worker's-ssh")).unwrap(),
+            "'/tmp/mac-worker'\\''s-ssh' -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
+        );
+    }
+
+    #[test]
+    fn ssh_request_program_is_stock_without_override() {
+        let worker = WorkerEntry {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            slots: 1,
+            capabilities: Vec::new(),
+            remote_binary: "~/.local/bin/worker".into(),
+            herdr: false,
+        };
+        let request = ssh_request(
+            &worker,
+            HostOperation::ControllerRpc.command().into(),
+            ProcessPolicy {
+                stdout_limit: 1024,
+                stderr_limit: 1024,
+                deadline: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(request.program, OsString::from("/usr/bin/ssh"));
+        assert_eq!(request.args[request.args.len() - 2], "mac1");
+    }
 }

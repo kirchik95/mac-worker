@@ -135,6 +135,24 @@ impl ControllerReceiveIdentity {
     pub fn expected_oid(&self) -> &BaseOid {
         &self.expected_oid
     }
+
+    pub fn from_parts(
+        token: String,
+        request_id: String,
+        fingerprint: RequestFingerprint,
+        project_id: String,
+        worktree_id: String,
+        expected_oid: BaseOid,
+    ) -> Self {
+        Self {
+            token,
+            request_id,
+            fingerprint,
+            project_id,
+            worktree_id,
+            expected_oid,
+        }
+    }
 }
 
 impl ControllerSourceReceipt {
@@ -337,6 +355,41 @@ impl ControllerTransfer {
             oid,
             token: record.token,
         })
+    }
+
+    /// Final submit binding: same outer fingerprint and nested source fields,
+    /// then finish (idempotent) so a crash between push and the finish RPC
+    /// still pins before ACK. Token is loaded from the durable record, never
+    /// from the frozen submit envelope.
+    pub fn bind_source_for_submit(
+        &self,
+        cache_root: &Path,
+        runner: &dyn ProcessRunner,
+        request_id: &str,
+        fingerprint: &RequestFingerprint,
+        project_id: &str,
+        worktree_id: &str,
+        expected_oid: &BaseOid,
+    ) -> Result<ControllerSourceReceipt, WorkerError> {
+        let identity = {
+            let _lock = self.lock_transfers()?;
+            let record = self
+                .load_source_by_request(request_id)?
+                .ok_or_else(missing_token)?;
+            let digest = source_digest(project_id, worktree_id, expected_oid)?;
+            let cache_id = controller_transfer_cache_id(project_id, worktree_id)?;
+            reuse_source(
+                &record,
+                fingerprint,
+                project_id,
+                worktree_id,
+                expected_oid,
+                &digest,
+                &cache_id,
+            )?;
+            identity_from_source(&record)?
+        };
+        self.finish_source_receive(cache_root, runner, &identity)
     }
 
     #[allow(clippy::too_many_arguments)]

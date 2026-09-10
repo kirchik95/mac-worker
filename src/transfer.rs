@@ -45,12 +45,10 @@ use crate::{
 
 pub use crate::host_store::TransferGuard;
 
-const SSH_PROGRAM: &str = "/usr/bin/ssh";
 const MAX_CONTROL_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_CONTROL_STDERR_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_DEADLINE: Duration = Duration::from_secs(30);
 const RSYNC_PROGRAM: &str = "/usr/bin/rsync";
-const RSYNC_REMOTE_SHELL: &str = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --";
 const RSYNC_POLICY: ProcessPolicy = ProcessPolicy {
     stdout_limit: 256 * 1024,
     stderr_limit: 256 * 1024,
@@ -555,6 +553,15 @@ impl<'a> HostTransferService<'a> {
     }
 }
 
+fn rsync_remote_shell() -> Result<OsString, WorkerError> {
+    let program = crate::transport::ssh_program()?;
+    Ok(format!(
+        "{} -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --",
+        crate::transport::posix_shell_quote(&program)?
+    )
+    .into())
+}
+
 impl<'a> RsyncTransport<'a> {
     pub fn new(runner: &'a dyn ProcessRunner) -> Self {
         Self { runner }
@@ -597,7 +604,7 @@ impl<'a> RsyncTransport<'a> {
                 "--no-group".into(),
                 "--stats".into(),
                 "-e".into(),
-                RSYNC_REMOTE_SHELL.into(),
+                rsync_remote_shell()?,
                 remote_command.into(),
                 OsString::from_vec(source),
                 format!("{}:incoming", worker.ssh).into(),
@@ -704,7 +711,7 @@ impl<'a> SshJsonTransport<'a> {
         let stdin = serde_json::to_vec(request)
             .map_err(|_| transport_error("INVALID_REQUEST", "control request is invalid"))?;
         let request = ProcessRequest {
-            program: SSH_PROGRAM.into(),
+            program: crate::transport::ssh_program()?,
             args: vec![
                 "-o".into(),
                 "BatchMode=yes".into(),

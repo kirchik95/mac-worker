@@ -501,6 +501,110 @@ pub(crate) fn read_committed(
     Ok(bytes)
 }
 
+/// Read a bounded committed window starting at `offset`. Does not assemble the
+/// rest of the journal; each call issues rooted range reads of at most `CHUNK`.
+pub(crate) fn read_committed_range(
+    root: &Path,
+    task: TaskId,
+    turn: TurnId,
+    snapshot: &Snapshot,
+    offset: u64,
+    limit: usize,
+) -> Result<Vec<u8>, WorkerError> {
+    if offset > snapshot.len {
+        return Err(WorkerError::task(
+            "TASK_CONFIG_INVALID",
+            "log chunk offset is past the committed log",
+        ));
+    }
+    let dir = directory(root, task, false)?;
+    let name = format!("{turn}.log");
+    if snapshot.len == 0 {
+        dir.read_private_regular_chunk(&name, 0, 0)?;
+        return Ok(Vec::new());
+    }
+    let remaining = snapshot.len - offset;
+    let want = remaining.min(u64::try_from(limit).map_err(|_| invalid())?);
+    if want == 0 {
+        return Ok(Vec::new());
+    }
+    let mut bytes = Vec::new();
+    let mut pos = offset;
+    let end = offset.checked_add(want).ok_or_else(invalid)?;
+    while pos < end {
+        let chunk_limit = usize::try_from((end - pos).min(CHUNK as u64)).map_err(|_| invalid())?;
+        let chunk = dir.read_private_regular_chunk(&name, pos, chunk_limit)?;
+        if chunk.len() != chunk_limit {
+            return Err(invalid());
+        }
+        pos = pos.checked_add(chunk.len() as u64).ok_or_else(invalid)?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// Bounded read of a turn log that has no committed snapshot yet.
+pub(crate) fn read_log_range(
+    root: &Path,
+    task: TaskId,
+    turn: TurnId,
+    offset: u64,
+    limit: usize,
+) -> Result<Vec<u8>, WorkerError> {
+    let dir = directory(root, task, false)?;
+    let name = format!("{turn}.log");
+    let mut bytes = Vec::new();
+    let mut pos = offset;
+    let mut remaining = limit;
+    while remaining > 0 {
+        let want = remaining.min(CHUNK);
+        let chunk = dir
+            .read_private_regular_chunk(&name, pos, want)
+            .map_err(WorkerError::Io)?;
+        let read = chunk.len();
+        bytes.extend_from_slice(&chunk);
+        if read < want {
+            break;
+        }
+        pos = pos.checked_add(read as u64).ok_or_else(invalid)?;
+        remaining -= read;
+    }
+    Ok(bytes)
+}
+
+/// Exclusive end offset for one bounded log chunk.
+///
+/// Line-oriented reads prefer a trailing newline. A newline-free window that
+/// still has committed bytes beyond it is a line longer than `limit` and must
+/// advance at the chunk boundary. When the read already covers the committed
+/// end and the turn is complete or the caller is not following, the entire
+/// window is flushed — including a terminal partial after the last newline —
+/// matching local `TaskClient::logs`. Follow of a still-growing short partial
+/// line waits (`end == offset`) so the caller can sleep.
+pub(crate) fn bounded_chunk_end(
+    offset: u64,
+    committed_len: u64,
+    read: &[u8],
+    raw: bool,
+    follow: bool,
+    complete: bool,
+) -> u64 {
+    let untrimmed_end = offset.saturating_add(read.len() as u64);
+    if raw {
+        return untrimmed_end;
+    }
+    if (complete || !follow) && untrimmed_end == committed_len {
+        return untrimmed_end;
+    }
+    if let Some(index) = read.iter().rposition(|byte| *byte == b'\n') {
+        return offset.saturating_add(index as u64 + 1);
+    }
+    if untrimmed_end < committed_len || complete || !follow {
+        return untrimmed_end;
+    }
+    offset
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

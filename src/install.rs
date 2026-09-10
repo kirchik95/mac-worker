@@ -51,7 +51,18 @@ impl<'a> Installer<'a> {
         let CandidatePayload { bytes, digest } = candidate;
         let id = self.installation_id.simple().to_string();
 
-        let acquire = ssh_request(worker, acquire_command(&id), control_policy());
+        let acquire = match ssh_request(worker, acquire_command(&id), control_policy()) {
+            Ok(request) => request,
+            Err(error) => {
+                return failed(
+                    worker,
+                    "INVALID_REQUEST",
+                    error.to_string(),
+                    SetupFailureKind::Unavailable,
+                    Vec::new(),
+                );
+            }
+        };
         match self.runner.run(&acquire) {
             Ok(result) if result.status.success() => {}
             Ok(result) if result.status.code() == Some(75) => {
@@ -88,7 +99,18 @@ impl<'a> Installer<'a> {
             }
         }
 
-        let mut transfer = ssh_request(worker, upload_command(&id), transfer_policy());
+        let mut transfer = match ssh_request(worker, upload_command(&id), transfer_policy()) {
+            Ok(request) => request,
+            Err(error) => {
+                return failed(
+                    worker,
+                    "INVALID_REQUEST",
+                    error.to_string(),
+                    SetupFailureKind::Unavailable,
+                    Vec::new(),
+                );
+            }
+        };
         transfer.stdin = Some(bytes);
         let transfer_failure = match self.runner.run(&transfer) {
             Ok(result) if result.status.success() => None,
@@ -112,7 +134,20 @@ impl<'a> Installer<'a> {
             return failed(worker, "TRANSFER_FAILED", message, failure_kind, warnings);
         }
 
-        let digest_request = ssh_request(worker, digest_command(&id, &digest), control_policy());
+        let digest_request =
+            match ssh_request(worker, digest_command(&id, &digest), control_policy()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let warnings = self.cleanup_warnings(worker, &id);
+                    return failed(
+                        worker,
+                        "INVALID_REQUEST",
+                        error.to_string(),
+                        SetupFailureKind::Unavailable,
+                        warnings,
+                    );
+                }
+            };
         let digest_result = match self.runner.run(&digest_request) {
             Ok(result) if result.status.success() => result,
             Ok(result) => {
@@ -161,7 +196,19 @@ impl<'a> Installer<'a> {
             }
         }
 
-        let prepare = ssh_request(worker, prepare_command(&id), control_policy());
+        let prepare = match ssh_request(worker, prepare_command(&id), control_policy()) {
+            Ok(request) => request,
+            Err(error) => {
+                let warnings = self.cleanup_warnings(worker, &id);
+                return failed(
+                    worker,
+                    "INVALID_REQUEST",
+                    error.to_string(),
+                    SetupFailureKind::Unavailable,
+                    warnings,
+                );
+            }
+        };
         if let Err(failure) = run_success(self.runner, &prepare, SetupFailureKind::Infrastructure) {
             let warnings = self.cleanup_warnings(worker, &id);
             return failed(
@@ -173,7 +220,19 @@ impl<'a> Installer<'a> {
             );
         }
 
-        let promotion = ssh_request(worker, promotion_command(&id), control_policy());
+        let promotion = match ssh_request(worker, promotion_command(&id), control_policy()) {
+            Ok(request) => request,
+            Err(error) => {
+                let warnings = self.cleanup_warnings(worker, &id);
+                return failed(
+                    worker,
+                    "INVALID_REQUEST",
+                    error.to_string(),
+                    SetupFailureKind::Unavailable,
+                    warnings,
+                );
+            }
+        };
         let promotion_result = match self.runner.run(&promotion) {
             Ok(result) if result.status.success() => PromotionResult::AcknowledgedSuccess,
             Ok(result) if matches!(result.status.code(), Some(code) if code != 255) => {
@@ -262,7 +321,18 @@ impl<'a> Installer<'a> {
         // exceed the 15 s verification probe. Warm the promoted binary under a
         // dedicated deadline so that later probe stays short; a failed warm-up
         // never decides the install on its own.
-        let warmup = ssh_request(worker, warmup_command(&id, &digest), warmup_policy());
+        let warmup = match ssh_request(worker, warmup_command(&id, &digest), warmup_policy()) {
+            Ok(request) => request,
+            Err(error) => {
+                return self.rollback_unverified_promotion(
+                    worker,
+                    &id,
+                    error.to_string(),
+                    None,
+                    SetupFailureKind::Unavailable,
+                );
+            }
+        };
         let warmup_failure = run_success(self.runner, &warmup, SetupFailureKind::Infrastructure)
             .err()
             .map(|failure| failure.message);
@@ -271,11 +341,22 @@ impl<'a> Installer<'a> {
         // ~14 s on a loaded mini; the 15 s probe deadline must not absorb
         // that. Layout migration stays a hard failure (exit 77), matching
         // the former verification script.
-        let facts_refresh = ssh_request(
+        let facts_refresh = match ssh_request(
             worker,
             facts_refresh_command(&id, &digest),
             facts_refresh_policy(),
-        );
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return self.rollback_unverified_promotion(
+                    worker,
+                    &id,
+                    error.to_string(),
+                    warmup_failure.as_deref(),
+                    SetupFailureKind::Unavailable,
+                );
+            }
+        };
         let facts_refresh_failure = match run_facts_refresh(self.runner, &facts_refresh) {
             Ok(failure) => failure,
             Err(failure) => {
@@ -415,7 +496,16 @@ impl<'a> Installer<'a> {
     }
 
     fn reconcile(&self, worker: &WorkerEntry, id: &str, digest: &str) -> Reconciliation {
-        let request = ssh_request(worker, reconciliation_command(id, digest), control_policy());
+        let request =
+            match ssh_request(worker, reconciliation_command(id, digest), control_policy()) {
+                Ok(request) => request,
+                Err(error) => {
+                    return Reconciliation::Unknown(ProcessFailure {
+                        message: error.to_string(),
+                        kind: SetupFailureKind::Unavailable,
+                    });
+                }
+            };
         let result = match self.runner.run(&request) {
             Ok(result) => result,
             Err(error) => {
@@ -446,7 +536,15 @@ impl<'a> Installer<'a> {
     }
 
     fn cleanup_warnings(&self, worker: &WorkerEntry, id: &str) -> Vec<SetupWarning> {
-        let cleanup = ssh_request(worker, cleanup_command(id), control_policy());
+        let cleanup = match ssh_request(worker, cleanup_command(id), control_policy()) {
+            Ok(request) => request,
+            Err(error) => {
+                return vec![SetupWarning {
+                    code: SetupWarningCode::CleanupFailed,
+                    message: error.to_string(),
+                }];
+            }
+        };
         self.run_cleanup(&cleanup)
     }
 
@@ -456,11 +554,19 @@ impl<'a> Installer<'a> {
         id: &str,
         digest: &str,
     ) -> Vec<SetupWarning> {
-        let cleanup = ssh_request(
+        let cleanup = match ssh_request(
             worker,
             success_cleanup_command(id, digest),
             control_policy(),
-        );
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return vec![SetupWarning {
+                    code: SetupWarningCode::CleanupFailed,
+                    message: error.to_string(),
+                }];
+            }
+        };
         self.run_cleanup(&cleanup)
     }
 
@@ -489,7 +595,21 @@ impl<'a> Installer<'a> {
         if let Some(warmup) = warmup_failure {
             message = format!("{message}; first-launch warm-up: {warmup}");
         }
-        let rollback = ssh_request(worker, rollback_command(id), control_policy());
+        let rollback = match ssh_request(worker, rollback_command(id), control_policy()) {
+            Ok(request) => request,
+            Err(error) => {
+                return failed(
+                    worker,
+                    "VERIFICATION_FAILED",
+                    message,
+                    failure_kind,
+                    vec![SetupWarning {
+                        code: SetupWarningCode::RollbackFailed,
+                        message: error.to_string(),
+                    }],
+                );
+            }
+        };
         let warnings = run_success(self.runner, &rollback, SetupFailureKind::Infrastructure)
             .err()
             .map(|failure| SetupWarning {
