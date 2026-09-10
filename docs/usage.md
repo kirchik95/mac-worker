@@ -62,6 +62,8 @@ If a worker job or its logs vanish after acceptance, the task outcome is `failed
 
 When a replacement runner exits, its journal line distinguishes whether the worker accepted the turn. `exited: <code> …` is the pre-acceptance form: the worker did not accept that turn, so `worker task reconcile` can retry the handoff. `exited after acceptance: <code> …` means the journal already records acceptance; `worker task reconcile` resumes that turn from its committed offsets instead of submitting it again. After the post-acceptance form, inspect the worker with `worker workers --refresh`, especially if the job or its logs may have disappeared. Both lines are passed through `worker task logs` verbatim.
 
+Do not ask an agent to commit. The task workspace on the worker keeps `.git` read-only for the agent's sandbox (Codex cannot write `.git/index.lock`; Cursor may succeed), and mac-worker imports the working tree as a synthetic commit when the turn ends, so a prompt that demands a commit only turns a finished task into `blocked` or a `needs_input` question. Ask for the change and the checks; commit on the laptop after `fetch`.
+
 A batch file groups independent tasks into a run with shared defaults:
 
 ```toml
