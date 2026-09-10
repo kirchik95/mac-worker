@@ -245,6 +245,10 @@ impl ProbeCollector {
     }
 
     /// Reads the facts cache without launching any agent binary.
+    ///
+    /// A current turn-auth incident is overlaid in memory so a fresh
+    /// authenticated cache cannot keep advertising that agent. The on-disk
+    /// cache and [`AgentFacts::collected_at_millis`] are not rewritten.
     pub fn cached_facts_at(host_state_root: &Path) -> Result<Option<AgentFacts>, WorkerError> {
         let Some(_store) = HostStore::open_if_present(host_state_root)? else {
             return Ok(None);
@@ -253,7 +257,13 @@ impl ProbeCollector {
         if !root.entry_exists(FACTS_FILE)? {
             return Ok(None);
         }
-        read_cached_facts(&root).map(Some)
+        let mut facts = read_cached_facts(&root)?;
+        let _ = auth_incidents::overlay_current_incidents(
+            &mut facts,
+            host_state_root,
+            current_time_millis(),
+        );
+        Ok(Some(facts))
     }
 
     fn collect_with(

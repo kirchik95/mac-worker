@@ -5,7 +5,9 @@
 //! fixed reason, and a timestamp. Nothing from the agent's output is stored.
 //! [`merge_into_facts`] overlays a current incident onto collected facts so
 //! `codex login status` still printing "Logged in" cannot keep the scheduler
-//! advertising the agent.
+//! advertising the agent. The host probe hot path applies the same overlay
+//! read-only onto cached `facts.json` so a fresh authenticated cache cannot keep
+//! advertising an agent after a turn already recorded a failure.
 //!
 //! An incident expires after [`AUTH_INCIDENT_TTL_MILLIS`] and is cleared
 //! earlier when (a) a later turn of the same agent and profile succeeds,
@@ -462,6 +464,33 @@ pub fn merge_into_facts(
         overlay_facts(facts, state);
     }
     Ok(())
+}
+
+/// Read-only overlay of current incidents onto already-collected facts.
+///
+/// Used by the host probe hot path so a turn-recorded failure is visible
+/// before the next facts refresh. Does not prune, lock-write, or change
+/// [`AgentFacts::collected_at_millis`]. Unreadable stores get
+/// [`apply_unreadable_overlay`]. Codex `auth.json` re-login is left to
+/// [`merge_into_facts`] on refresh.
+pub fn overlay_current_incidents(
+    facts: &mut AgentFacts,
+    host_state_root: &Path,
+    now_millis: u64,
+) -> Result<(), WorkerError> {
+    match load_with_bytes(host_state_root) {
+        Ok((_, mut state)) => {
+            state.incidents.retain(|incident| {
+                incident_is_current(incident, &state.successes, None, now_millis)
+            });
+            overlay_facts(facts, &state);
+            Ok(())
+        }
+        Err(error) => {
+            apply_unreadable_overlay(facts);
+            Err(error)
+        }
+    }
 }
 
 /// Replaces advertised authentication with [`AUTH_INCIDENTS_UNREADABLE_REASON`].

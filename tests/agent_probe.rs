@@ -748,6 +748,95 @@ fn refresh_facts_overlays_a_codex_turn_auth_incident_and_drops_the_capability() 
 }
 
 #[test]
+fn cached_probe_overlays_a_fresh_incident_without_refresh() {
+    let temporary = tempfile::tempdir().unwrap();
+    let host = host_root(temporary.path());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let collected_at = now.saturating_sub(1_000);
+    let planted = facts(collected_at);
+    let bytes = planted.canonical_bytes().unwrap();
+    let facts_path = host.join("facts.json");
+    fs::write(&facts_path, &bytes).unwrap();
+    fs::set_permissions(&facts_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let runner = RecordingRunner::default();
+    auth_incidents::record_incident(&host, AgentKind::Codex, None, now).unwrap();
+    assert!(runner.requests().is_empty());
+
+    let cached = ProbeCollector::cached_facts_at(&host)
+        .unwrap()
+        .expect("planted cache");
+    assert_eq!(cached.collected_at_millis, collected_at);
+    let reason = turn_auth_failure_reason(now).unwrap();
+    let codex = cached
+        .agents
+        .iter()
+        .find(|agent| agent.name == "codex")
+        .expect("codex");
+    let claude = cached
+        .agents
+        .iter()
+        .find(|agent| agent.name == "claude")
+        .expect("claude");
+    assert_eq!(codex.auth, AgentAuth::UnknownWithReason(reason));
+    assert_eq!(
+        codex.auth_by_profile,
+        vec![("agents".into(), AgentAuth::Authenticated)]
+    );
+    assert_eq!(claude.auth, AgentAuth::Unauthenticated);
+    assert_eq!(
+        claude.auth_by_profile,
+        vec![("agents".into(), AgentAuth::Authenticated)]
+    );
+    assert_eq!(fs::read(&facts_path).unwrap(), bytes);
+    assert!(runner.requests().is_empty());
+
+    let observations = SchedulerProbeAdapter::observations_at(
+        &config(),
+        &[health_with_facts(cached.clone())],
+        now,
+    )
+    .unwrap();
+    let capabilities = observations[0].capabilities();
+    assert!(
+        !capabilities
+            .iter()
+            .any(|capability| capability == "agent:codex"),
+        "{capabilities:?}"
+    );
+    assert!(
+        capabilities.contains(&"agent:codex@agents".to_owned()),
+        "{capabilities:?}"
+    );
+    assert!(
+        capabilities.contains(&"agent:claude@agents".to_owned()),
+        "{capabilities:?}"
+    );
+
+    let probe = ProbeCollector::collect_at(&host).unwrap();
+    assert_eq!(
+        probe
+            .agent_facts
+            .as_ref()
+            .map(|facts| facts.collected_at_millis),
+        Some(collected_at)
+    );
+    assert_eq!(
+        probe
+            .agent_facts
+            .as_ref()
+            .and_then(|facts| facts.agents.iter().find(|agent| agent.name == "codex"))
+            .map(|agent| agent.auth),
+        Some(AgentAuth::UnknownWithReason(reason))
+    );
+    assert_eq!(fs::read(&facts_path).unwrap(), bytes);
+    assert!(runner.requests().is_empty());
+}
+
+#[test]
 fn refresh_facts_fails_closed_when_incidents_are_unreadable() {
     let temporary = tempfile::tempdir().unwrap();
     let host = host_root(temporary.path());
