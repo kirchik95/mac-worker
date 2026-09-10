@@ -29,6 +29,8 @@
 - **One worker:** another Apple Silicon Mac with Remote Login enabled and Git installed. It needs network access to the agent provider and must stay awake while working.
 - **One coding agent on the worker**, signed in as the account you connect to. Codex is the default; the setup guide covers its installation and login.
 
+You own SDKs, language tools, agent logins, and secrets on each Mac. mac-worker does not install toolchains or copy credential profiles. Optional `[setup]` in `.worker.toml` can warm a project workspace; it never infers packages.
+
 The first supported installation path is Apple Silicon Mac → Apple Silicon Mac. Daily use has been validated on macOS 26. Intel Macs and Linux controllers are not supported by the first-run installer yet.
 
 Only run trusted tasks on machines you control: a task worktree isolates repository changes, but jobs can access the worker account's files and credentials. Agent providers receive task content according to the selected agent's settings.
@@ -111,7 +113,7 @@ In a Git repository with at least one commit:
 Send this task to the pool: create SETUP_CHECK.md containing mac-worker works. Wait for the result and show me the branch.
 ```
 
-Expect a task ID, an outcome/checks summary, and a result branch/ref to review when available. Your current working tree stays unchanged; you choose whether to merge. You can ask the same agent to follow up if the task needs input. Confirm both skills are loaded before you dispatch.
+Expect a task ID, the outcome and summary, `worker task diff` / the card’s file list, and a result ref from `worker task fetch` when a branch was published. Agent-reported checks in the result are what the worker agent claimed, not independent verification — review the diff and ref yourself before you merge. Your current working tree stays unchanged. You can ask the same agent to follow up if the task needs input (`worker task say`). Confirm both skills are loaded before you dispatch.
 
 #### Manual CLI
 
@@ -129,7 +131,7 @@ worker task result <task-id>
 worker task fetch <task-id>
 ```
 
-`result` shows the outcome and summary. `fetch` prints the remote-tracking ref to inspect with `git show` or `git diff`. Your current working tree stays unchanged; you choose whether to merge. Use the same `--agent` you checked with `init`.
+`result` shows the outcome, summary, and any agent-reported checks. `worker task diff <task-id> --stat` lists the published change. `fetch` prints the remote-tracking ref (`refs/remotes/mac-worker/…/task/<id>`) to inspect with `git show` or `git diff` — that ref is the current-turn import proof on the laptop. Your current working tree stays unchanged; you choose whether to merge. Use the same `--agent` you checked with `init`.
 
 Submit starts from HEAD by default. Pass `--base <ref>` to use another commit. Uncommitted edits stay on your laptop. To send tracked worktree changes as a temporary base:
 
@@ -140,7 +142,7 @@ worker task submit --agent codex --wip --wait \
 
 `--wip` is opt-in and needs a local source with fetch-only publication; origin source and push need a committed base. Name new files with `--include` or `snapshot.include_untracked`; unmatched non-ignored untracked files cause `UNTRACKED_INPUT`. `--include` can select ignored files, but sensitive paths still need an exact `snapshot.allow_sensitive` entry.
 
-For real coding tasks, install your project's language tools and dependencies on the worker too. Start with this small file task to check the connection and agent before running a build.
+For real coding tasks, install your project's language tools and dependencies on the worker yourself. Optional `[setup]` in `.worker.toml` can run an operator-written recipe in the task workspace; `check` only proves **this** workspace. `worker task batch FILE --preview` validates a batch without opening client state or dispatching. Start with this small file task to check the connection and agent before running a build.
 
 ### 4. Follow the work
 
@@ -150,9 +152,13 @@ worker task list
 worker workers --refresh
 ```
 
-The dashboard opens locally in your browser. To submit and return immediately, omit `--wait`.
+The dashboard opens locally in your browser (`http://127.0.0.1:<port>`, deep link `#/tasks/<id>`). It does not start or cancel tasks. From a task card you can reply or accept; those use the same `say` / `close` paths as the CLI and require the card’s current revision (state, last turn, turn count, head, `updated_at`). `--no-facts-refresh` only skips stale agent-facts refresh; it does not disable replies.
+
+To submit and return immediately, omit `--wait`.
 
 `worker task wait --task-id <task-id>` blocks until the task is quiescent and the previous runner has released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. `TASK_BUSY` and capacity errors such as `CAPABILITY_MISSING` include their reason. Then run `worker task result <task-id>` for the outcome (finished, needs input, or failed).
+
+Default `--close-on done` closes the task after an agent `done` turn. That is not human acceptance. For a review loop, submit with `--close-on never`, inspect summary/diff/ref, then `worker task close <id>` to accept or `worker task say` to follow up. `close --discard` drops the session.
 
 If a turn fails, run `worker task logs <task-id>` to see agent diagnostics and the recorded failure reason. Use `--turn N` to inspect an earlier turn, or `--raw` for the original log bytes.
 
@@ -162,13 +168,13 @@ Historical logs without a checkpoint remain readable without `--follow`. A nonem
 
 ## How it works
 
-Your laptop coordinates the work. The selected Mac runs the agent and keeps its task workspace. This diagram shows the default flow, using a local repository as the source:
+By default your laptop coordinates the work (local queue, scheduler, dashboard). The selected Mac runs the agent and keeps its task workspace. This diagram shows that default flow, using a local repository as the source. A remote controller that owns the queue after the laptop disconnects is not part of this release.
 
 ```mermaid
 flowchart LR
     laptop["Your laptop<br/><br/>Optional local agent + skills<br/>worker CLI + local queue<br/>Scheduler + task history<br/>Dashboard + Git repository"]
 
-    subgraph pool["Your Mac workers — one task turn per Mac"]
+    subgraph pool["Your Mac workers — default one concurrent turn; host may opt in to 1–8 slots"]
         selected["Selected Mac<br/><br/>Helper + project mirror<br/>Task worktree + coding agent"]
         others["Additional Macs<br/>Same worker setup"]
     end
@@ -182,16 +188,16 @@ flowchart LR
     others <-->|Agent API| provider
 ```
 
-1. **Submit.** Ask your laptop agent or run the CLI. The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with the required agent and capabilities.
+1. **Submit.** Ask your laptop agent or run the CLI. The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with a free execution slot, the required agent, and capabilities. Admission capacity is the **sum** of each worker’s `slots` (default 1, at most 8). The same `task_id` stays serialized; distinct tasks from one checkout may overlap when a host has opted into more than one slot.
 2. **Run.** Over SSH, mac-worker transfers the base commit into the worker's project mirror, prepares a separate task worktree and launches the agent under a supervisor. The agent uses the worker's own login and project tools.
-3. **Follow or reply.** The CLI and dashboard read task status and logs. If the agent needs input, `worker task say <id> --message "…"` starts another turn in the same task workspace and agent session.
-4. **Review.** The worker publishes `task/<id>`, and the laptop fetches it as a remote-tracking ref. `worker task fetch <id>` can fetch it again and prints the ref to inspect. Your current working tree stays unchanged; you decide what to merge.
+3. **Follow or reply.** The CLI and dashboard read task status and logs. If the agent needs input, `worker task say <id> --message "…"` (or a dashboard reply on that card’s current revision) starts another turn in the same task workspace and agent session.
+4. **Review.** The worker publishes `task/<id>`, and the laptop fetches it as a remote-tracking ref. `worker task fetch <id>` prints the ref to inspect. Your current working tree stays unchanged; you decide what to merge. With `publish = push`, origin delivery is a durable per-turn outbox: the execution slot is released independently of a slow remote, and a `done` turn may still show origin `pending`.
 
 `--wip` preparation now uses fewer Git operations and compares two fresh captures so concurrent edits can be detected. Dashboard detail and logs read one task directly; listing the collection still scans history.
 
-The dashboard is embedded in the CLI, listens only on loopback and does not start or cancel tasks. The queue and task records live on the laptop; project mirrors, task worktrees and agent sessions live on the workers. Use `worker gc` to preview retained worker data that can be reclaimed.
+The dashboard is embedded in the CLI and listens only on loopback. It does not start or cancel tasks; it can reply and accept through the same task APIs as the CLI. The queue and task records live on the laptop; project mirrors, task worktrees and agent sessions live on the workers. Use `worker gc` to preview retained worker data that can be reclaimed.
 
-Workers contact agent providers directly. No mac-worker cloud service or database server is required. If you prefer to get code from a Git remote or push result branches there, see the [origin and publication settings](docs/usage.md#task-lifecycle).
+Workers contact agent providers directly. No mac-worker cloud service or database server is required. If you prefer to get code from a Git remote or push result branches there, see the [origin and publication settings](docs/usage.md#task-lifecycle). Host slot layout: [multiple execution slots](docs/superpowers/specs/2026-09-10-slots-design.md).
 
 ## Add another Mac
 
@@ -199,7 +205,7 @@ Workers contact agent providers directly. No mac-worker cloud service or databas
 worker init yourname@second-mini.local --name mini-2
 ```
 
-The scheduler uses an available compatible worker. Each Mac runs one task turn at a time. Use `--worker <name>` on `task submit` to choose a machine.
+The scheduler uses an available compatible worker. Each Mac defaults to one concurrent turn; the host may opt in to `1..=8` slots. Laptop `slots` is a ceiling, not host authority. Use `--worker <name>` on `task submit` only as a diagnostic pin.
 
 ## Update or remove
 
@@ -234,6 +240,7 @@ Node.js is needed only when changing the dashboard source in `ui/`; its built as
 
 - [Prepare a Mac worker](docs/setup-macos-worker.md): SSH, agents, profiles, power settings and removal.
 - [Usage reference](docs/usage.md): tasks, follow-ups, batches, defaults, dashboard and remote commands.
+- [Multiple execution slots](docs/superpowers/specs/2026-09-10-slots-design.md): host `slot_count`, occupancy, migrate, and execution scope.
 - [Installation recovery](docs/setup-recovery.md): retained installer state and older host layouts.
 - [Build and publish a release](docs/releasing.md): archives, checksums and Homebrew distribution.
 - [Acceptance runbook](docs/phase-five-acceptance-runbook.md) and [validation record](docs/phase-five-validation.md).
