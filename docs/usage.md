@@ -106,6 +106,23 @@ The base commit must already be on the remote. The worker account needs its own 
 
 Writing good briefs is its own skill. Two Claude Code skills ship with the repository and work from any project: [`pool-task-authoring`](../.claude/skills/pool-task-authoring/SKILL.md) turns an objective into one-turn, headless-safe tasks, and [`pool-dispatch`](../.claude/skills/pool-dispatch/SKILL.md) is the mechanical submit / wait / answer / fetch loop. Say "send it to the pool" and Claude Code uses them.
 
+## When a turn fails
+
+A turn can fail instead of returning `done`, `needs_input`, or `blocked`.
+The outcome or error code is a fixed public string. Start with the command
+listed for that string.
+
+- `agent exited N`: read `worker task logs <id>`.
+- `agent authentication failed`: re-login on the worker, then run
+  `worker workers --refresh --clear-auth-incidents`.
+- `LOG_DRAIN_UNAVAILABLE`: check `worker task result <id>`; the worker's
+  job is gone and remaining stdout/stderr cannot be drained.
+- `CAPACITY_BUSY` on a pinned submit: wait, or choose another worker.
+- `TASK_BUSY` on close: wait for `worker task wait` to return, then retry.
+
+`worker task wait` is also the gate before `say` and `fetch` after a busy
+turn.
+
 ## Dashboard
 
 <p align="center">
