@@ -1559,6 +1559,20 @@ impl LocalTaskRecord {
             })
     }
 
+    /// Local result-import failure is durable evidence for the current turn.
+    /// Remote host Done must not replace that Failed outcome. A later
+    /// locally published follow-up turn is a new publication boundary.
+    pub fn retains_failed_result_publication(&self) -> bool {
+        self.status().turns().last().is_some_and(|turn| {
+            turn.terminal().is_some()
+                && matches!(
+                    turn.outcome(),
+                    Some(TaskOutcome::Failed { reason })
+                        if reason == "PUBLISH_FAILED" || reason == "RESULT_FETCH_FAILED"
+                )
+        })
+    }
+
     pub fn submission_rollback_turn_id(&self) -> Option<TurnId> {
         self.submission_rollback_turn_id
     }
@@ -1604,7 +1618,8 @@ impl LocalTaskRecord {
         let next = if matches!(
             self.status.state,
             TaskState::Closed | TaskState::Abandoned | TaskState::Lost
-        ) {
+        ) || self.retains_failed_result_publication()
+        {
             self.clone()
         } else {
             self.with_status(remote_status.clone())?
