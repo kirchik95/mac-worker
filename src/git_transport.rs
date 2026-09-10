@@ -322,11 +322,12 @@ impl<'a> GitTransport<'a> {
     }
 
     /// Pins `refs/mac-worker/delivery/<task>/<turn>` to an existing commit.
-    /// Create-or-same-OID only. A one-time pack-content baseline/receipt makes
-    /// pre-policy packs durable; later pins only sync new writes. Still-loose
-    /// objects are packed and fsynced; already packed history is reused.
-    /// Same-OID retry does not enumerate or rebuild history. Then `update-ref`
-    /// and fsync of the ref. Syncing only `objects/<tip>` is not the guarantee.
+    /// Create-or-same-OID only. A one-time object-store baseline/receipt fsyncs
+    /// pre-policy packs and loose objects once; later pins only fsync packs not
+    /// already listed on a valid receipt. Loose objects are not packed at pin
+    /// time. Same-OID retry does not enumerate or rebuild history. Then
+    /// `update-ref` and fsync of the ref. Syncing only `objects/<tip>` is not
+    /// the guarantee.
     pub fn pin_delivery_ref(
         &self,
         store: &HostStore,

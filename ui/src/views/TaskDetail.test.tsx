@@ -20,6 +20,23 @@ function reviewable(overrides: Record<string, unknown> = {}) {
   })
 }
 
+function originDelivery(overrides: Record<string, unknown> = {}) {
+  return {
+    turn_id: 'e'.repeat(32),
+    state: 'delivered',
+    oid: '0123456789abcdef0123456789abcdef01234567',
+    origin: 'https://example.test/repo.git',
+    target: 'refs/heads/release-candidate',
+    attempt: 1,
+    next_attempt_at_millis: 0,
+    last_error: null,
+    superseded_by: null,
+    created_at_millis: 1,
+    updated_at_millis: 2,
+    ...overrides,
+  }
+}
+
 function detail(overrides: Record<string, unknown> = {}) {
   return {
     task: task({ model: 'gpt-6-astra', effort: 'xhigh', state: 'closed' }),
@@ -90,6 +107,28 @@ describe('TaskDetail', () => {
     expect(await screen.findByText('Added two tests.')).toBeInTheDocument()
     expect(screen.getByText('worker task fetch aaaa')).toBeInTheDocument()
     expect(screen.getByText('src/lib.rs')).toBeInTheDocument()
+    expect(screen.queryByText('DELIVERY')).toBeNull()
+  })
+
+  it('shows origin delivery from the detail payload the host serializes', async () => {
+    const delivery = originDelivery()
+    serve(detail({ delivery, deliveries: [delivery] }))
+    render(<TaskDetail taskId="aaaa" />)
+
+    expect(await screen.findByText('DELIVERY')).toBeInTheDocument()
+    expect(screen.getByText('delivered · eeeeeeee')).toBeInTheDocument()
+  })
+
+  it('shows a pending delivery listed only in deliveries', async () => {
+    serve(
+      detail({
+        deliveries: [originDelivery({ state: 'pending', turn_id: 'f'.repeat(32) })],
+      }),
+    )
+    render(<TaskDetail taskId="aaaa" />)
+
+    expect(await screen.findByText('DELIVERY')).toBeInTheDocument()
+    expect(screen.getByText('pending · ffffffff')).toBeInTheDocument()
   })
 
   it('renders both question shapes, with the answers an agent will accept', async () => {

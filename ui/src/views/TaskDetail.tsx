@@ -27,11 +27,7 @@ function deliverySummary(detail: TaskDetailPayload): string | null {
       ? detail.deliveries
       : detail.delivery
         ? [detail.delivery]
-        : detail.task.deliveries && detail.task.deliveries.length > 0
-          ? detail.task.deliveries
-          : detail.task.delivery
-            ? [detail.task.delivery]
-            : []
+        : []
   if (deliveries.length === 0) {
     return null
   }
