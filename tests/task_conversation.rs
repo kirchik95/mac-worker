@@ -313,6 +313,79 @@ fn task_record_in_run(
     .unwrap()
 }
 
+fn active_record_with_pending_turn(
+    task_id: TaskId,
+    completed_turn: JobId,
+    pending_turn: JobId,
+    project_id: String,
+    worktree_id: String,
+    run_id: Option<TaskRunId>,
+) -> LocalTaskRecord {
+    let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id,
+        run_id,
+        project_id,
+        worktree_id,
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid: base_oid.clone(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("mac-worker", "mac-worker@example.test").unwrap(),
+        title: None,
+        prompt: "fixture task".into(),
+        created_at_millis: 1,
+    })
+    .unwrap();
+    let completed = TurnSummary::new(
+        1,
+        completed_turn,
+        Some(TurnTerminal::Succeeded),
+        Some(TaskOutcome::Unknown),
+        Some(false),
+        false,
+        Some(1),
+        Some(2),
+    );
+    let pending = TurnSummary::new(2, pending_turn, None, None, None, false, Some(3), None);
+    let status = TaskStatus::new(
+        TaskState::Active,
+        Some(TaskOutcome::Unknown),
+        Some("mini-1".into()),
+        true,
+        Some(base_oid),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        vec![completed, pending],
+        3,
+    )
+    .unwrap();
+    LocalTaskRecord::new(
+        meta,
+        status,
+        None,
+        Some(RunnerIdentity::new(owner(910))),
+        None,
+        PROJECT_ID.into(),
+        None,
+        true,
+        None,
+    )
+    .unwrap()
+}
+
 fn origin_queued_task_record(
     task_id: TaskId,
     turn_id: JobId,
@@ -771,6 +844,116 @@ fn reconcile_requeues_fetch_only_origin_task_with_pinned_origin_requirement() {
                 missing: vec!["origin:origin.example.test".into()],
             }]
     ));
+}
+
+#[test]
+fn reconcile_re_enqueues_an_unmapped_pending_turn_once() {
+    // The pending follow-up lives in task status, but only the completed
+    // turn still has a directory, so `queue_entry_for_task_turn` misses the
+    // row that phase 2 just published. Repeated reconcile must not raise
+    // QUEUE_JOB_CONFLICT, and a terminal unknown turn must not come back.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let run_id = TaskRunId::new(Uuid::from_u128(910));
+    let task_id = TaskId::new(Uuid::from_u128(910));
+    let completed_turn = job(911);
+    let pending_turn = job(912);
+    let record = active_record_with_pending_turn(
+        task_id,
+        completed_turn,
+        pending_turn,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        Some(run_id),
+    );
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+    store
+        .create_run(RunRecord::new(run_id, Some("pool-run-b".into()), vec![task_id], 3, 1).unwrap())
+        .unwrap();
+    store.create_task(record).unwrap();
+    store
+        .write_turn_prompt(task_id, completed_turn, "completed prompt")
+        .unwrap();
+    cache_idle(&store, "mini-1", 10);
+
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+    client.reconcile_runners().unwrap();
+    client.reconcile_runners().unwrap();
+
+    let entries = store
+        .queue_snapshot()
+        .unwrap()
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind() == QueueEntryKind::TaskTurn)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].job_id(), pending_turn);
+
+    let terminal_id = TaskId::new(Uuid::from_u128(913));
+    let terminal_turn = job(914);
+    let mut terminal = task_record(
+        terminal_id,
+        terminal_turn,
+        TaskState::Active,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        None,
+    );
+    let finished = TurnSummary::new(
+        1,
+        terminal_turn,
+        Some(TurnTerminal::Succeeded),
+        Some(TaskOutcome::Unknown),
+        Some(false),
+        false,
+        Some(1),
+        Some(2),
+    );
+    let finished_status = TaskStatus::new(
+        TaskState::Active,
+        Some(TaskOutcome::Unknown),
+        Some("mini-1".into()),
+        true,
+        terminal.status().head_oid().cloned(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        vec![finished],
+        3,
+    )
+    .unwrap();
+    terminal = terminal.with_status(finished_status).unwrap();
+    store.create_task(terminal).unwrap();
+    store
+        .write_turn_prompt(terminal_id, terminal_turn, "unknown outcome")
+        .unwrap();
+    client.reconcile_runners().unwrap();
+    assert!(store.queue_entry(terminal_turn).unwrap().is_none());
+
+    let wait = client
+        .wait(WaitSelector::Run(run_id), Some(Duration::from_millis(350)))
+        .unwrap_err();
+    assert_eq!(wait.public_code(), "WAIT_TIMEOUT");
+    assert_eq!(
+        store
+            .queue_snapshot()
+            .unwrap()
+            .entries()
+            .iter()
+            .filter(|entry| entry.job_id() == pending_turn)
+            .count(),
+        1
+    );
 }
 
 #[test]

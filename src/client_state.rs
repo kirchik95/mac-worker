@@ -608,6 +608,49 @@ impl ClientStateStore {
         })
     }
 
+    /// Crash recovery for a durable task whose queue row is missing. If a
+    /// row for this job ID already exists, return it instead of conflicting:
+    /// `queue_entry_for_task_turn` can miss a just-published pending turn when
+    /// that turn has no directory yet.
+    pub fn enqueue_if_absent(&self, mut entry: QueueEntry) -> Result<QueueEntry, WorkerError> {
+        entry.validate()?;
+        if entry.client_id() != self.inner.client_id {
+            return Err(queue_error(
+                "QUEUE_CLIENT_MISMATCH",
+                "queue row belongs to another client identity",
+            ));
+        }
+        if entry.queue_id().value() != 0 {
+            return Err(queue_error(
+                "QUEUE_ID_ASSIGNED",
+                "new queue row already has a sequence ID",
+            ));
+        }
+        self.update_queue(|snapshot| {
+            if let Some(existing) = snapshot
+                .entries
+                .iter()
+                .find(|existing| existing.job_id() == entry.job_id())
+            {
+                return Ok((existing.clone(), false));
+            }
+            if let Some(previous) = snapshot.entries.last()
+                && entry.enqueued_at_millis() < previous.enqueued_at_millis()
+            {
+                return Err(queue_error(
+                    "QUEUE_TIME_REGRESSION",
+                    "queue enqueue timestamp moved backwards",
+                ));
+            }
+            let assigned = snapshot.next_id;
+            let next = assigned.checked_next()?;
+            entry.assign_queue_id(assigned);
+            snapshot.next_id = next;
+            snapshot.entries.push(entry.clone());
+            Ok((entry.clone(), true))
+        })
+    }
+
     pub fn queue_snapshot(&self) -> Result<QueueSnapshot, WorkerError> {
         let _lock = QueueLock::acquire(
             self.inner.root.as_raw_fd(),

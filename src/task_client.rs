@@ -15,7 +15,8 @@ use crate::{
     error::WorkerError,
     git_transport::GitTransport,
     job::{
-        CommandSpec, ProcessIdentity, QueueEntry, QueueEntryKind, QueueRunReference, QueueState,
+        CommandSpec, ProcessIdentity, QueueEntry, QueueEntryKind, QueueRunReference, QueueSnapshot,
+        QueueState,
     },
     paths::PathLayout,
     process::ProcessRunner,
@@ -1377,30 +1378,36 @@ impl<'a> TaskClient<'a> {
 
         // A crash can occur after the task record is durable but before the
         // queue publication. Recreate only the task-turn row, retaining the
-        // original task and turn identifiers.
-        for record in self.client_state.list_tasks()? {
-            if submission_recovery_pending(&record) {
+        // original task and turn identifiers. Both recovery phases share one
+        // snapshot so they agree on which tasks look row-less; re-enqueue is
+        // idempotent if that snapshot is already stale.
+        let snapshot = self.client_state.queue_snapshot()?;
+        let records = self.client_state.list_tasks()?;
+        for record in &records {
+            if submission_recovery_pending(record) {
                 continue;
             }
             if matches!(
                 record.status().state(),
                 TaskState::Queued | TaskState::Active
-            ) && self
-                .client_state
-                .queue_entry_for_task_turn(record.meta().task_id())?
-                .is_none()
-            {
-                self.enqueue_missing_turn(&record, owner)?;
+            ) {
+                let turn_ids = self
+                    .client_state
+                    .turn_ids_for_task(record.meta().task_id())?;
+                if task_turn_in_snapshot(&snapshot, record, &turn_ids).is_none() {
+                    let _ = self.enqueue_missing_turn(record, owner)?;
+                }
             }
         }
 
-        for record in self.client_state.list_tasks()? {
-            if submission_recovery_pending(&record) {
+        for record in &records {
+            if submission_recovery_pending(record) {
                 continue;
             }
-            let queued = self
+            let turn_ids = self
                 .client_state
-                .queue_entry_for_task_turn(record.meta().task_id())?;
+                .turn_ids_for_task(record.meta().task_id())?;
+            let queued = task_turn_in_snapshot(&snapshot, record, &turn_ids);
             let Some(turn_id) = queued
                 .as_ref()
                 .map(QueueEntry::job_id)
@@ -1415,8 +1422,11 @@ impl<'a> TaskClient<'a> {
                     TaskState::Queued | TaskState::Active
                 )
             {
-                self.enqueue_missing_turn(&record, owner)?;
-                entry = self.client_state.queue_entry(turn_id)?;
+                if let Some(recovered) = self.enqueue_missing_turn(record, owner)? {
+                    entry = Some(recovered);
+                } else {
+                    entry = self.client_state.queue_entry(turn_id)?;
+                }
             }
             let Some(entry) = entry else { continue };
             if matches!(entry.state(), QueueState::Parked) {
@@ -1732,7 +1742,11 @@ impl<'a> TaskClient<'a> {
             WaitSelector::Run(run_id) => self.client_state.load_run(run_id)?.task_ids().to_vec(),
         };
         loop {
-            self.reconcile_runners()?;
+            match self.reconcile_runners() {
+                Ok(_) => {}
+                Err(error) if is_queue_job_conflict(&error) => {}
+                Err(error) => return Err(error),
+            }
             let records = task_ids
                 .iter()
                 .map(|task_id| self.client_state.load_task(*task_id))
@@ -2168,7 +2182,7 @@ impl<'a> TaskClient<'a> {
         &self,
         record: &LocalTaskRecord,
         owner: ProcessIdentity,
-    ) -> Result<QueueEntry, WorkerError> {
+    ) -> Result<Option<QueueEntry>, WorkerError> {
         if submission_recovery_pending(record) {
             return Err(task_error(
                 "TASK_SUBMISSION_RECOVERY_PENDING",
@@ -2184,6 +2198,16 @@ impl<'a> TaskClient<'a> {
                     .copied()
             })
             .ok_or_else(|| task_error("TASK_INCONSISTENT", "queued task has no turn prompt"))?;
+        if record
+            .status()
+            .turns()
+            .iter()
+            .any(|turn| turn.turn_id() == turn_id && turn.terminal().is_some())
+        {
+            // The last turn already finished locally. Re-publishing it would
+            // resurrect a row `wait` is trying to let the runner retire.
+            return Ok(None);
+        }
         let project = ProjectState::load_for_task(
             self.runner,
             &self.current_project(Some(record))?,
@@ -2208,24 +2232,26 @@ impl<'a> TaskClient<'a> {
                 worker: worker.to_owned(),
             },
         );
-        self.client_state.enqueue(QueueEntry::new(
-            turn_id,
-            self.client_state.client_id(),
-            record.meta().project_id().to_owned(),
-            record.meta().worktree_id().to_owned(),
-            command.summary()?,
-            task_requirements(
-                &project.requirements,
-                record.meta().agent(),
-                record.meta().env_profile(),
-                task_origin_requirement(record.meta()).as_deref(),
-            ),
-            preference,
-            QueueEntryKind::TaskTurn,
-            run,
-            owner,
-            current_time_millis()?,
-        )?)
+        Ok(Some(self.client_state.enqueue_if_absent(
+            QueueEntry::new(
+                turn_id,
+                self.client_state.client_id(),
+                record.meta().project_id().to_owned(),
+                record.meta().worktree_id().to_owned(),
+                command.summary()?,
+                task_requirements(
+                    &project.requirements,
+                    record.meta().agent(),
+                    record.meta().env_profile(),
+                    task_origin_requirement(record.meta()).as_deref(),
+                ),
+                preference,
+                QueueEntryKind::TaskTurn,
+                run,
+                owner,
+                current_time_millis()?,
+            )?,
+        )?))
     }
 
     fn start_runner(
@@ -2607,6 +2633,32 @@ fn pending_turn_id(status: &TaskStatus) -> Option<TurnId> {
         .last()
         .filter(|turn| turn.terminal().is_none())
         .map(TurnSummary::turn_id)
+}
+
+fn task_turn_in_snapshot(
+    snapshot: &QueueSnapshot,
+    record: &LocalTaskRecord,
+    turn_ids: &[TurnId],
+) -> Option<QueueEntry> {
+    let pending = pending_turn_id(record.status());
+    snapshot
+        .entries()
+        .iter()
+        .find(|entry| {
+            entry.kind() == QueueEntryKind::TaskTurn
+                && (turn_ids.contains(&entry.job_id()) || pending == Some(entry.job_id()))
+        })
+        .cloned()
+}
+
+fn is_queue_job_conflict(error: &WorkerError) -> bool {
+    matches!(
+        error,
+        WorkerError::Queue {
+            code: "QUEUE_JOB_CONFLICT",
+            ..
+        }
+    )
 }
 
 fn submission_recovery_turn_id(record: &LocalTaskRecord) -> Option<TurnId> {
