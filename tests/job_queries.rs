@@ -2977,6 +2977,54 @@ fn read_log_returns_bounded_binary_chunks_from_independent_fixed_streams() {
 }
 
 #[test]
+fn status_logs_returns_a_terminal_tail_and_rejects_an_offset_beyond_eof() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("status-logs-terminal-tail");
+    let (store, lease, request) = prepared_host_with_command(
+        &root,
+        CommandSpec::argv(vec!["/usr/bin/printf".into(), "endpoint-log".into()]).unwrap(),
+    );
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let service = JobService::new(&store, &launcher);
+    let submitted = service.submit_at(request, 10).unwrap();
+    let status = StatusResponse::new(
+        match &submitted {
+            SubmitResponse::Accepted { meta, .. } => (**meta).clone(),
+            SubmitResponse::Existing { .. } => unreachable!(),
+        },
+        submitted.status().clone(),
+    )
+    .unwrap();
+    let job_id = lease.job_id();
+    let stdout_len = status.status().final_stdout_bytes().unwrap();
+    let stderr_len = status.status().final_stderr_bytes().unwrap();
+
+    let combined = service
+        .status_logs(&StatusLogsRequest::new(job_id, 0, 64, 0, 64))
+        .unwrap();
+    assert_eq!(combined.status(), &status);
+    assert_eq!(combined.stdout().decoded_bytes().unwrap(), b"endpoint-log");
+    assert_eq!(combined.stderr().decoded_bytes().unwrap(), b"");
+
+    let tail = service
+        .status_logs(&StatusLogsRequest::new(
+            job_id, stdout_len, 64, stderr_len, 64,
+        ))
+        .unwrap();
+    assert_eq!(tail.status(), &status);
+    assert_eq!(tail.stdout().decoded_bytes().unwrap(), b"");
+    assert_eq!(tail.stdout().next_offset(), stdout_len);
+    assert_eq!(tail.stderr().decoded_bytes().unwrap(), b"");
+
+    let error = service
+        .status_logs(&StatusLogsRequest::new(job_id, stdout_len + 1, 64, 0, 64))
+        .unwrap_err();
+    assert_error_code(error, "LOG_OFFSET_BEYOND_EOF", "status-logs beyond EOF");
+}
+
+#[test]
 fn read_log_rejects_a_whole_job_directory_swap_and_preserves_all_evidence() {
     // Catches resolving status against one durable job directory and then
     // reopening the textual job path for the log read after that path has
