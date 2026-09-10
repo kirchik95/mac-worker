@@ -31,6 +31,7 @@ const TERM_WAIT: Duration = Duration::from_secs(2);
 pub struct IsolatedHomes {
     _root: tempfile::TempDir,
     pub laptop: PathBuf,
+    pub controller: PathBuf,
     pub fake_ssh: PathBuf,
     pub ssh_log: PathBuf,
 }
@@ -48,6 +49,9 @@ impl IsolatedHomes {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let laptop = prepare_home(&root_path.join("laptop"), controller_enabled);
+        // Direct host RPC is a controller-role child. Keep it off the laptop
+        // HOME/XDG that CLI assertions treat as laptop authority.
+        let controller = prepare_home(&root_path.join("controller"), false);
         let ssh_dir = root_path.join("ssh bin");
         fs::create_dir_all(&ssh_dir).unwrap();
         let fake_ssh = ssh_dir.join("fake'ssh hop");
@@ -61,12 +65,17 @@ impl IsolatedHomes {
             ssh_log: root_path.join("fake-ssh.ndjson"),
             _root: root,
             laptop,
+            controller,
             fake_ssh,
         }
     }
 
     pub fn paths(&self) -> PathLayout {
         PathLayout::discover(None, &xdg_env(&self.laptop), &self.laptop).unwrap()
+    }
+
+    pub fn controller_paths(&self) -> PathLayout {
+        PathLayout::discover(None, &xdg_env(&self.controller), &self.controller).unwrap()
     }
 }
 
@@ -112,13 +121,17 @@ fn xdg_env(home: &Path) -> BTreeMap<OsString, OsString> {
     ])
 }
 
-pub fn apply_private_env(command: &mut Command, homes: &IsolatedHomes, attach_fake_ssh: bool) {
+fn apply_home_xdg(command: &mut Command, home: &Path) {
     command
-        .env("HOME", &homes.laptop)
-        .env("XDG_CONFIG_HOME", homes.laptop.join(".config"))
-        .env("XDG_STATE_HOME", homes.laptop.join(".local/state"))
-        .env("XDG_CACHE_HOME", homes.laptop.join(".cache"))
-        .env("XDG_DATA_HOME", homes.laptop.join(".local/share"))
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local/share"));
+}
+
+fn strip_inherited_git_env(command: &mut Command) {
+    command
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -127,6 +140,11 @@ pub fn apply_private_env(command: &mut Command, homes: &IsolatedHomes, attach_fa
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .env_remove("GIT_SSH_COMMAND")
         .env_remove("SSH_AUTH_SOCK");
+}
+
+pub fn apply_private_env(command: &mut Command, homes: &IsolatedHomes, attach_fake_ssh: bool) {
+    apply_home_xdg(command, &homes.laptop);
+    strip_inherited_git_env(command);
     if attach_fake_ssh {
         command
             .env("MAC_WORKER_TEST_SSH", &homes.fake_ssh)
@@ -135,6 +153,13 @@ pub fn apply_private_env(command: &mut Command, homes: &IsolatedHomes, attach_fa
         command.env_remove("MAC_WORKER_TEST_SSH");
         command.env_remove("MAC_WORKER_FAIL_CLOSED_SSH_LOG");
     }
+}
+
+pub fn apply_controller_env(command: &mut Command, homes: &IsolatedHomes) {
+    apply_home_xdg(command, &homes.controller);
+    strip_inherited_git_env(command);
+    command.env_remove("MAC_WORKER_TEST_SSH");
+    command.env_remove("MAC_WORKER_FAIL_CLOSED_SSH_LOG");
 }
 
 pub struct OwnedChild {
@@ -238,15 +263,12 @@ fn take_pipe_bytes(mut pipe: impl io::Read + Send + 'static) -> thread::JoinHand
     })
 }
 
-pub fn run_worker(
-    homes: &IsolatedHomes,
+fn run_configured_worker(
+    command: &mut Command,
     args: &[&str],
-    attach_fake_ssh: bool,
     cwd: Option<&Path>,
     stdin: Option<&[u8]>,
 ) -> ChildOutput {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_worker"));
-    apply_private_env(&mut command, homes, attach_fake_ssh);
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -255,7 +277,7 @@ pub fn run_worker(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = OwnedChild::spawn(&mut command);
+    let mut child = OwnedChild::spawn(command);
     {
         let mut child_stdin = child.take_stdin();
         if let Some(bytes) = stdin {
@@ -284,8 +306,27 @@ pub fn run_worker(
     }
 }
 
+pub fn run_worker(
+    homes: &IsolatedHomes,
+    args: &[&str],
+    attach_fake_ssh: bool,
+    cwd: Option<&Path>,
+    stdin: Option<&[u8]>,
+) -> ChildOutput {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_worker"));
+    apply_private_env(&mut command, homes, attach_fake_ssh);
+    run_configured_worker(&mut command, args, cwd, stdin)
+}
+
 pub fn host_controller_rpc(homes: &IsolatedHomes, stdin: &[u8]) -> ChildOutput {
-    run_worker(homes, &["host", "controller-rpc"], false, None, Some(stdin))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_worker"));
+    apply_controller_env(&mut command, homes);
+    run_configured_worker(
+        &mut command,
+        &["host", "controller-rpc"],
+        None,
+        Some(stdin),
+    )
 }
 
 pub fn frame_json(value: &Value) -> Vec<u8> {

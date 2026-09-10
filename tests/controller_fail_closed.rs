@@ -21,9 +21,33 @@ fn assert_no_laptop_task_authority(homes: &IsolatedHomes) {
     let paths = homes.paths();
     assert!(
         !laptop_task_authority(&paths),
-        "laptop ClientStateStore task/queue/runner files must not be created; state={:?}",
-        paths.state
+        "laptop ClientStateStore task/queue/runner files must not be created; state={:?} files={:?}",
+        paths.state,
+        authority_files(&paths)
     );
+}
+
+fn authority_files(paths: &mac_worker::paths::PathLayout) -> Vec<String> {
+    let mut found = Vec::new();
+    for name in ["tasks", "queue", "runners", "turns", "runs", "dags"] {
+        let root = paths.state.join(name);
+        collect_regular_files(&root, &root, &mut found);
+    }
+    found
+}
+
+fn collect_regular_files(root: &std::path::Path, base: &std::path::Path, found: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_regular_files(&path, base, found);
+        } else if path.is_file() {
+            found.push(path.strip_prefix(base).unwrap_or(&path).display().to_string());
+        }
+    }
 }
 
 fn assert_rpc_child_typed_error(output: &harness::ChildOutput, code: &str) {
@@ -51,7 +75,7 @@ fn rpc_child_rejects_incompatible_protocol_version_before_side_effects() {
         value["protocol_version"] = json!(version);
         let output = host_controller_rpc(&homes, &frame_json(&value));
         assert_rpc_child_typed_error(&output, "INCOMPATIBLE_PROTOCOL");
-        let paths = homes.paths();
+        let paths = homes.controller_paths();
         assert!(
             controller_request_files(&paths).is_empty(),
             "incompatible protocol wrote {:?}",
@@ -72,7 +96,7 @@ fn rpc_child_rejects_oversized_frame_before_side_effects() {
         "oversize message={}",
         error.error().message()
     );
-    let paths = homes.paths();
+    let paths = homes.controller_paths();
     assert!(controller_request_files(&paths).is_empty());
     assert_no_laptop_task_authority(&homes);
 }
@@ -84,7 +108,7 @@ fn rpc_child_rejects_malformed_and_duplicate_key_requests_before_side_effects() 
     let output = host_controller_rpc(&homes, &malformed);
     assert_rpc_child_typed_error(&output, "CONTROLLER_TRANSPORT");
     assert_no_laptop_task_authority(&homes);
-    assert!(controller_request_files(&homes.paths()).is_empty());
+    assert!(controller_request_files(&homes.controller_paths()).is_empty());
 
     let duplicate = encode_frame(
         format!(
@@ -97,7 +121,7 @@ fn rpc_child_rejects_malformed_and_duplicate_key_requests_before_side_effects() 
     let output = host_controller_rpc(&homes, &duplicate);
     assert_rpc_child_typed_error(&output, "INVALID_REQUEST");
     assert_no_laptop_task_authority(&homes);
-    assert!(controller_request_files(&homes.paths()).is_empty());
+    assert!(controller_request_files(&homes.controller_paths()).is_empty());
 }
 
 #[test]
