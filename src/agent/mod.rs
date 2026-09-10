@@ -1156,9 +1156,13 @@ fn extract_json_object(text: &str) -> Option<Value> {
 }
 
 fn extract_last_json_object(text: &str) -> Option<Value> {
+    // A successful parse at `{` consumes the whole object, including nested
+    // `{...}` values. Scanning every later brace would keep the innermost
+    // object (a `questions` item) and drop a real `needs_input` result.
     let mut last = None;
+    let mut skip_until = 0;
     for (start, character) in text.char_indices() {
-        if character != '{' {
+        if start < skip_until || character != '{' {
             continue;
         }
         let mut deserializer =
@@ -1167,6 +1171,7 @@ fn extract_last_json_object(text: &str) -> Option<Value> {
             && value.is_object()
         {
             last = Some(value);
+            skip_until = start + deserializer.byte_offset();
         }
     }
     last
@@ -1197,4 +1202,92 @@ pub(super) fn strip_ansi(text: &str) -> String {
         out.push(character);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LIVE_CURSOR_NEEDS_INPUT: &str = concat!(
+        "I'll read the task prompt and follow its instructions.",
+        r#"{"status":"needs_input","summary":"Need the maintainer to choose the docs file before any writing.","files_changed":[],"questions":[{"text":"Should the new 'When a turn fails' section go into README.md (under the operator section) or into docs/usage.md next to task lifecycle?","options":["README.md (under the operator section)","docs/usage.md next to task lifecycle"]}]}"#,
+    );
+
+    fn question_with_options() -> Question {
+        Question::new(
+            "Should the new 'When a turn fails' section go into README.md (under the operator section) or into docs/usage.md next to task lifecycle?",
+            vec![
+                "README.md (under the operator section)".into(),
+                "docs/usage.md next to task lifecycle".into(),
+            ],
+        )
+    }
+
+    #[test]
+    fn last_json_object_keeps_needs_input_when_prose_abuts_a_questions_array() {
+        let result = parse_last_structured_result(LIVE_CURSOR_NEEDS_INPUT)
+            .expect("outer result object must parse");
+        assert_eq!(result.status(), ResultStatus::NeedsInput);
+        assert_eq!(
+            result.summary(),
+            "Need the maintainer to choose the docs file before any writing."
+        );
+        assert_eq!(result.questions(), &[question_with_options()]);
+        assert!(result.files_changed().is_empty());
+    }
+
+    #[test]
+    fn last_json_object_ignores_prose_before_and_after_the_result() {
+        let result = parse_last_structured_result(
+            "prefix {\"status\":\"done\",\"summary\":\"ok\",\"questions\":[],\"files_changed\":[]} trailing notes",
+        )
+        .expect("object surrounded by prose must parse");
+        assert_eq!(result.status(), ResultStatus::Done);
+        assert_eq!(result.summary(), "ok");
+        assert!(result.questions().is_empty());
+    }
+
+    #[test]
+    fn last_json_object_prefers_the_later_of_two_top_level_objects() {
+        let result = parse_last_structured_result(concat!(
+            r#"{"status":"done","summary":"first","questions":[],"files_changed":[]}"#,
+            r#"{"status":"needs_input","summary":"second","questions":[{"text":"q","options":["a","b"]}],"files_changed":[]}"#,
+        ))
+        .expect("the later top-level object must parse");
+        assert_eq!(result.status(), ResultStatus::NeedsInput);
+        assert_eq!(result.summary(), "second");
+        assert_eq!(
+            result.questions(),
+            &[Question::new("q", vec!["a".into(), "b".into()])]
+        );
+    }
+
+    #[test]
+    fn last_json_object_parses_nested_questions_when_files_changed_is_omitted() {
+        let result = parse_last_structured_result(
+            r#"{"status":"needs_input","summary":"pick","questions":[{"text":"where","options":["a","b"]}]}"#,
+        )
+        .expect("files_changed may be omitted");
+        assert_eq!(result.status(), ResultStatus::NeedsInput);
+        assert_eq!(
+            result.questions(),
+            &[Question::new("where", vec!["a".into(), "b".into()])]
+        );
+        assert!(result.files_changed().is_empty());
+    }
+
+    #[test]
+    fn trailer_block_still_wins_over_a_later_top_level_object() {
+        let text = concat!(
+            "```mac-worker-result\n",
+            r#"{"status":"done","summary":"from trailer","questions":[],"files_changed":[]}"#,
+            "\n```\n",
+            r#"{"status":"needs_input","summary":"later","questions":[{"text":"q","options":["a"]}],"files_changed":[]}"#,
+        );
+        let result = parse_trailer_result(text)
+            .or_else(|| parse_last_structured_result(text))
+            .expect("trailer must win");
+        assert_eq!(result.status(), ResultStatus::Done);
+        assert_eq!(result.summary(), "from trailer");
+    }
 }

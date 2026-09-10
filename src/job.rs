@@ -1312,6 +1312,109 @@ impl<'de> Deserialize<'de> for QueueAbandonmentProof {
     }
 }
 
+/// Consecutive post-acceptance replacement failures with the same public
+/// code after which reconcile parks the row instead of starting another runner.
+pub const REPLACEMENT_FAILURE_PARK_AFTER: u32 = 5;
+
+const REPLACEMENT_BACKOFF_SECS: [u64; 4] = [2, 10, 30, 60];
+
+/// Blocking code a parked turn reports when replacement runners keep dying
+/// after acceptance. The last public code is appended in the list/wait
+/// message so the operator can see *why* the budget exhausted.
+pub const RUNNER_REPEATED_FAILURE: &str = "RUNNER_REPEATED_FAILURE";
+
+/// Durable restart budget for a turn whose replacement runner already exited
+/// after acceptance.
+///
+/// Recorded on the queue row so a `task wait` poll (every 100 ms) cannot
+/// start a new process on every pass. Optional and serde-default so older
+/// `queue/state.json` files still parse; the wire shape is additive (the
+/// field is omitted when absent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplacementFailureBudget {
+    last_failed_at_millis: u64,
+    last_public_code: String,
+    consecutive_failures: u32,
+}
+
+impl ReplacementFailureBudget {
+    pub fn new(
+        last_failed_at_millis: u64,
+        last_public_code: String,
+        consecutive_failures: u32,
+    ) -> Result<Self, WorkerError> {
+        let budget = Self {
+            last_failed_at_millis,
+            last_public_code,
+            consecutive_failures,
+        };
+        budget.validate()?;
+        Ok(budget)
+    }
+
+    /// Fold a newly observed post-acceptance public code into this budget.
+    pub fn applying(self, public_code: &str, at_millis: u64) -> Result<Self, WorkerError> {
+        let consecutive_failures = if self.last_public_code == public_code {
+            self.consecutive_failures.saturating_add(1)
+        } else {
+            1
+        };
+        Self::new(at_millis, public_code.to_owned(), consecutive_failures)
+    }
+
+    fn validate(&self) -> Result<(), WorkerError> {
+        if self.last_failed_at_millis == 0 {
+            return Err(protocol_error(
+                "replacement failure timestamp must be positive",
+            ));
+        }
+        if self.consecutive_failures == 0 {
+            return Err(protocol_error("replacement failure count must be positive"));
+        }
+        if !crate::error::is_stable_public_code(&self.last_public_code) {
+            return Err(protocol_error(
+                "replacement failure public code is not a stable code",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn last_failed_at_millis(&self) -> u64 {
+        self.last_failed_at_millis
+    }
+
+    pub fn last_public_code(&self) -> &str {
+        &self.last_public_code
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    pub fn should_park(&self) -> bool {
+        self.consecutive_failures >= REPLACEMENT_FAILURE_PARK_AFTER
+    }
+
+    pub fn backoff_elapsed(&self, now_millis: u64) -> bool {
+        now_millis.saturating_sub(self.last_failed_at_millis) >= self.backoff_millis()
+    }
+
+    fn backoff_millis(&self) -> u64 {
+        let index = self.consecutive_failures.saturating_sub(1) as usize;
+        let secs = REPLACEMENT_BACKOFF_SECS
+            .get(index)
+            .copied()
+            .unwrap_or(REPLACEMENT_BACKOFF_SECS[REPLACEMENT_BACKOFF_SECS.len() - 1]);
+        secs.saturating_mul(1000)
+    }
+
+    /// `RUNNER_REPEATED_FAILURE` plus the last public code, for list/wait.
+    pub fn blocking_code(&self) -> String {
+        format!("{RUNNER_REPEATED_FAILURE}:{}", self.last_public_code)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueEntry {
     pub(crate) queue_id: QueueId,
@@ -1330,6 +1433,10 @@ pub struct QueueEntry {
     pub(crate) cancel_requested_at_millis: Option<u64>,
     pub(crate) enqueued_at_millis: u64,
     pub(crate) slot_reservation: Option<RunnerSlotReservation>,
+    /// Last post-acceptance replacement-runner failure. Absent on rows
+    /// whose replacement has not failed yet, and omitted from older
+    /// `queue/state.json` files (`#[serde(default)]` on the wire).
+    pub(crate) replacement_failure: Option<ReplacementFailureBudget>,
 }
 
 impl QueueEntry {
@@ -1364,6 +1471,7 @@ impl QueueEntry {
             cancel_requested_at_millis: None,
             enqueued_at_millis,
             slot_reservation: None,
+            replacement_failure: None,
         };
         entry.validate()?;
         Ok(entry)
@@ -1395,6 +1503,9 @@ impl QueueEntry {
         }
         if let Some(proof) = &self.preacceptance_abandonment_proof {
             proof.validate_against(self)?;
+        }
+        if let Some(budget) = &self.replacement_failure {
+            budget.validate()?;
         }
         if self.kind == QueueEntryKind::Batch && self.owner_opt() != Some(&self.enqueue_owner) {
             return Err(protocol_error("batch queue ownership is not replaceable"));
@@ -1480,6 +1591,10 @@ impl QueueEntry {
         self.slot_reservation
     }
 
+    pub fn replacement_failure(&self) -> Option<&ReplacementFailureBudget> {
+        self.replacement_failure.as_ref()
+    }
+
     pub(crate) fn coalesce_enqueued_at(&mut self, floor: u64) {
         if self.enqueued_at_millis < floor {
             self.enqueued_at_millis = floor;
@@ -1524,8 +1639,13 @@ impl QueueEntry {
         if self.preacceptance_abandonment_proof.is_some() {
             return Err(protocol_error("an abandoned queue row cannot be parked"));
         }
-        if !matches!(self.state, QueueState::Waiting { .. }) {
-            return Err(protocol_error("only a waiting task turn can be parked"));
+        if !matches!(
+            self.state,
+            QueueState::Waiting { .. } | QueueState::Dispatching { .. }
+        ) {
+            return Err(protocol_error(
+                "only a waiting or dispatching task turn can be parked",
+            ));
         }
         self.state = QueueState::Parked;
         self.slot_reservation = None;
@@ -1621,6 +1741,17 @@ impl QueueEntry {
         self.validate()
     }
 
+    pub(crate) fn set_replacement_failure(
+        &mut self,
+        budget: Option<ReplacementFailureBudget>,
+    ) -> Result<(), WorkerError> {
+        if let Some(budget) = &budget {
+            budget.validate()?;
+        }
+        self.replacement_failure = budget;
+        self.validate()
+    }
+
     pub(crate) fn eligible_for(&self, worker: &str, capabilities: Option<&[String]>) -> bool {
         let preference_matches = match &self.preference {
             WorkerPreference::Automatic => true,
@@ -1639,7 +1770,9 @@ impl QueueEntry {
 impl Serialize for QueueEntry {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let fields = 15 + usize::from(self.slot_reservation.is_some());
+        let fields = 15
+            + usize::from(self.slot_reservation.is_some())
+            + usize::from(self.replacement_failure.is_some());
         let mut record = serializer.serialize_struct("QueueEntry", fields)?;
         record.serialize_field("queue_id", &self.queue_id)?;
         record.serialize_field("job_id", &self.job_id)?;
@@ -1664,6 +1797,9 @@ impl Serialize for QueueEntry {
         record.serialize_field("enqueued_at_millis", &self.enqueued_at_millis)?;
         if let Some(reservation) = &self.slot_reservation {
             record.serialize_field("slot_reservation", reservation)?;
+        }
+        if let Some(failure) = &self.replacement_failure {
+            record.serialize_field("replacement_failure", failure)?;
         }
         record.end()
     }
@@ -1691,6 +1827,8 @@ impl<'de> Deserialize<'de> for QueueEntry {
             enqueued_at_millis: u64,
             #[serde(default)]
             slot_reservation: Option<RunnerSlotReservation>,
+            #[serde(default)]
+            replacement_failure: Option<ReplacementFailureBudget>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let entry = Self {
@@ -1710,6 +1848,7 @@ impl<'de> Deserialize<'de> for QueueEntry {
             cancel_requested_at_millis: wire.cancel_requested_at_millis,
             enqueued_at_millis: wire.enqueued_at_millis,
             slot_reservation: wire.slot_reservation,
+            replacement_failure: wire.replacement_failure,
         };
         entry.validate().map_err(de::Error::custom)?;
         Ok(entry)
@@ -6068,5 +6207,30 @@ mod tests {
         )
         .unwrap();
         assert!(failed_cleanup.transition(replaced).is_err());
+    }
+
+    #[test]
+    fn queue_entry_deserializes_when_replacement_failure_is_absent() {
+        let owner = ProcessIdentity::new(1, 1).unwrap();
+        let mut entry = QueueEntry::new(
+            "00000000000000000000000000000001".parse().unwrap(),
+            "00000000000000000000000000000002".parse().unwrap(),
+            "a".repeat(64),
+            "b".repeat(64),
+            CommandSummary::argv(2).unwrap(),
+            Vec::new(),
+            WorkerPreference::Automatic,
+            QueueEntryKind::TaskTurn,
+            None,
+            owner,
+            10,
+        )
+        .unwrap();
+        entry.assign_queue_id(QueueId::new(1).unwrap());
+        let value = serde_json::to_value(&entry).unwrap();
+        assert!(value.get("replacement_failure").is_none());
+        let restored: QueueEntry = serde_json::from_value(value).unwrap();
+        assert!(restored.replacement_failure().is_none());
+        assert_eq!(restored.job_id(), entry.job_id());
     }
 }

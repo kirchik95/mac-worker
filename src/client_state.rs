@@ -38,7 +38,7 @@ use crate::{
         AdmissionObservation, CachedAdmissionObservation, ClientId, JobId, JobState, JobStatus,
         LocalJobRecord, ProcessIdentity, QueueAbandonmentProof, QueueCancel, QueueClaim,
         QueueEntry, QueueEntryKind, QueueSnapshot, QueueState, RemoteUncertainty,
-        ResolveOrAbandonRequest, RunnerSlotReservation,
+        ReplacementFailureBudget, ResolveOrAbandonRequest, RunnerSlotReservation,
     },
     rooted_fs::{RootedDir, is_private_replacement_name},
     scheduler::{
@@ -664,6 +664,44 @@ impl ClientStateStore {
         })
     }
 
+    /// Crash recovery for a durable task whose queue row is missing. If a
+    /// row for this job ID already exists, return it instead of conflicting:
+    /// `queue_entry_for_task_turn` can miss a just-published pending turn when
+    /// that turn has no directory yet.
+    pub fn enqueue_if_absent(&self, mut entry: QueueEntry) -> Result<QueueEntry, WorkerError> {
+        entry.validate()?;
+        if entry.client_id() != self.inner.client_id {
+            return Err(queue_error(
+                "QUEUE_CLIENT_MISMATCH",
+                "queue row belongs to another client identity",
+            ));
+        }
+        if entry.queue_id().value() != 0 {
+            return Err(queue_error(
+                "QUEUE_ID_ASSIGNED",
+                "new queue row already has a sequence ID",
+            ));
+        }
+        self.update_queue(|snapshot| {
+            if let Some(existing) = snapshot
+                .entries
+                .iter()
+                .find(|existing| existing.job_id() == entry.job_id())
+            {
+                return Ok((existing.clone(), false));
+            }
+            if let Some(previous) = snapshot.entries.last() {
+                entry.coalesce_enqueued_at(previous.enqueued_at_millis());
+            }
+            let assigned = snapshot.next_id;
+            let next = assigned.checked_next()?;
+            entry.assign_queue_id(assigned);
+            snapshot.next_id = next;
+            snapshot.entries.push(entry.clone());
+            Ok((entry.clone(), true))
+        })
+    }
+
     /// Commits one spawn permit for `job_id` if occupancy is below `slot_limit`.
     /// Each outstanding reservation counts independently of reserver PID.
     /// Only [`RunnerSlotDecision::Acquired`] may call `executor.start`.
@@ -1142,14 +1180,21 @@ impl ClientStateStore {
         let mut codes = HashMap::new();
         for row in self.queue_rows_with_blocking_reasons(config)? {
             let entry = row.entry();
-            if entry.kind() != QueueEntryKind::TaskTurn
-                || !matches!(entry.state(), QueueState::Waiting { .. })
-            {
+            if entry.kind() != QueueEntryKind::TaskTurn {
                 continue;
             }
             let Some(task_id) = self.task_id_for_turn(entry.job_id())? else {
                 continue;
             };
+            if let Some(budget) = entry.replacement_failure()
+                && budget.should_park()
+            {
+                codes.insert(task_id, budget.blocking_code());
+                continue;
+            }
+            if !matches!(entry.state(), QueueState::Waiting { .. }) {
+                continue;
+            }
             codes.insert(
                 task_id,
                 crate::task_view::task_row_blocking_code(row.blocking_reason()),
@@ -2116,27 +2161,44 @@ impl ClientStateStore {
             return Ok(true);
         };
         let tasks = self.list_tasks_locked()?;
-        let active_task_turns = tasks
-            .iter()
-            .filter(|task| {
-                task.meta()
-                    .run_id()
-                    .is_some_and(|run_id| run_id.to_string() == run.run_id().as_str())
-                    && task.status().state() == crate::task::TaskState::Active
-            })
-            .filter_map(|task| task.status().turns().last().map(|turn| turn.turn_id()))
-            .collect::<HashSet<_>>();
-        let mut active = HashSet::new();
+        // Task-turn rows carry only the turn/job ID. Map each row back to its
+        // task the same way `queue_entry_for_task_turn` does (turn directories)
+        // and through the status last-turn used to skip a Dispatching row that
+        // already consumes an Active slot. A follow-up can then exclude its
+        // own Active task instead of filling the cap against itself.
+        let mut turn_to_task = HashMap::new();
+        for task in &tasks {
+            let task_id = task.meta().task_id();
+            for turn_id in self.turn_ids_for_task(task_id)? {
+                turn_to_task.insert(turn_id, task_id);
+            }
+            for turn in task.status().turns() {
+                turn_to_task.insert(turn.turn_id(), task_id);
+            }
+        }
+        let candidate_task = turn_to_task.get(&candidate.job_id()).copied();
+        let mut occupied_tasks = HashSet::new();
+        let mut occupied_jobs = HashSet::new();
+        let mut occupy = |sibling: &QueueEntry| {
+            if sibling.kind() == QueueEntryKind::TaskTurn {
+                if let Some(task_id) = turn_to_task.get(&sibling.job_id()).copied() {
+                    if candidate_task != Some(task_id) {
+                        occupied_tasks.insert(task_id);
+                    }
+                } else if candidate.job_id() != sibling.job_id() {
+                    occupied_jobs.insert(sibling.job_id());
+                }
+            } else {
+                occupied_jobs.insert(sibling.job_id());
+            }
+        };
         for sibling in snapshot.entries().iter().filter(|entry| {
             entry
                 .run()
                 .is_some_and(|other| other.run_id() == run.run_id())
         }) {
-            if matches!(sibling.state(), QueueState::Dispatching { .. })
-                && (sibling.kind() != QueueEntryKind::TaskTurn
-                    || !active_task_turns.contains(&sibling.job_id()))
-            {
-                active.insert(sibling.job_id().to_string());
+            if matches!(sibling.state(), QueueState::Dispatching { .. }) {
+                occupy(sibling);
             }
             let name = job_file_name(sibling.job_id())?;
             if let Some(record) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? {
@@ -2150,31 +2212,27 @@ impl ClientStateStore {
                 if record.last_status().is_some_and(|status| {
                     matches!(status.state(), JobState::Accepted | JobState::Running)
                 }) {
-                    active.insert(sibling.job_id().to_string());
+                    occupy(sibling);
                 }
             }
         }
         // Task turns do not create legacy job records. Their local Active
         // status is nevertheless an accepted turn and must consume the same
-        // run slot while the queue lock is held. The candidate's own current
-        // turn is that occupying work, not a second parallel task.
+        // run slot while the queue lock is held. A follow-up is Active
+        // locally before it dispatches; that task already owns `candidate`
+        // and must not fill the cap against itself.
         for task in tasks {
             if task
                 .meta()
                 .run_id()
                 .is_some_and(|run_id| run_id.to_string() == run.run_id().as_str())
                 && task.status().state() == crate::task::TaskState::Active
+                && candidate_task != Some(task.meta().task_id())
             {
-                if candidate.kind() == QueueEntryKind::TaskTurn
-                    && task.status().turns().last().map(|turn| turn.turn_id())
-                        == Some(candidate.job_id())
-                {
-                    continue;
-                }
-                active.insert(task.meta().task_id().to_string());
+                occupied_tasks.insert(task.meta().task_id());
             }
         }
-        Ok(active.len() < run.max_parallel() as usize)
+        Ok(occupied_tasks.len() + occupied_jobs.len() < run.max_parallel() as usize)
     }
 
     fn queue_blocking_reason(
@@ -3713,13 +3771,81 @@ impl ClientStateStore {
             let Some(entry) = snapshot
                 .entries
                 .iter_mut()
-                .filter(|entry| matches!(entry.state(), QueueState::Parked))
+                .filter(|entry| {
+                    matches!(entry.state(), QueueState::Parked)
+                        && !entry
+                            .replacement_failure()
+                            .is_some_and(ReplacementFailureBudget::should_park)
+                })
                 .min_by_key(|entry| entry.queue_id())
             else {
                 return Ok((None, false));
             };
             entry.unpark(owner)?;
             Ok((Some(entry.clone()), true))
+        })
+    }
+
+    /// Records a post-acceptance replacement-runner death on the queue row.
+    ///
+    /// Same public code increments the consecutive count; a different code
+    /// starts a new streak at 1. The count and timestamp survive process
+    /// restarts because they live on `queue/state.json`.
+    pub fn record_replacement_failure(
+        &self,
+        job_id: JobId,
+        public_code: &str,
+        at_millis: u64,
+    ) -> Result<QueueEntry, WorkerError> {
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            let budget = match entry.replacement_failure() {
+                Some(existing) => existing.clone().applying(public_code, at_millis)?,
+                None => ReplacementFailureBudget::new(at_millis, public_code.to_owned(), 1)?,
+            };
+            entry.set_replacement_failure(Some(budget))?;
+            Ok((entry.clone(), true))
+        })
+    }
+
+    /// Overwrites the restart budget. Tests plant an aged timestamp so a later
+    /// reconcile can start after backoff without sleeping; operator reconcile
+    /// passes `None` to clear it.
+    pub fn set_replacement_failure(
+        &self,
+        job_id: JobId,
+        budget: Option<ReplacementFailureBudget>,
+    ) -> Result<QueueEntry, WorkerError> {
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            entry.set_replacement_failure(budget)?;
+            Ok((entry.clone(), true))
+        })
+    }
+
+    /// Clears every task-turn restart budget and unparks rows that were parked
+    /// because the budget exhausted. An explicit `worker task reconcile` uses
+    /// this so the operator can retry once without waiting out backoff.
+    pub fn reset_replacement_failures(&self, owner: ProcessIdentity) -> Result<usize, WorkerError> {
+        owner.validate()?;
+        self.update_queue(|snapshot| {
+            let mut reset = 0usize;
+            let mut to_unpark = Vec::new();
+            for (index, entry) in snapshot.entries.iter().enumerate() {
+                if entry.kind() != QueueEntryKind::TaskTurn || entry.replacement_failure().is_none()
+                {
+                    continue;
+                }
+                to_unpark.push((index, matches!(entry.state(), QueueState::Parked)));
+            }
+            for (index, was_parked) in to_unpark {
+                snapshot.entries[index].set_replacement_failure(None)?;
+                if was_parked {
+                    snapshot.entries[index].unpark(owner)?;
+                }
+                reset += 1;
+            }
+            Ok((reset, reset > 0))
         })
     }
 

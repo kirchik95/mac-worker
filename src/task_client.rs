@@ -23,7 +23,7 @@ use crate::{
     git_transport::GitTransport,
     job::{
         ClientId, CommandSpec, ProcessIdentity, QueueEntry, QueueEntryKind, QueueRunReference,
-        QueueState,
+        QueueSnapshot, QueueState,
     },
     paths::PathLayout,
     process::ProcessRunner,
@@ -46,7 +46,7 @@ use crate::{
     transfer_repo::TransferRepo,
     turn_runner::{
         DetachedRunnerExecutor, RunnerExecutor, RunnerStart, TurnRunner,
-        start_runner_with_reservation,
+        last_post_acceptance_public_code, start_runner_with_reservation,
     },
 };
 
@@ -1950,8 +1950,24 @@ impl<'a> TaskClient<'a> {
     }
 
     pub fn reconcile_runners(&self) -> Result<ReconcileReport, WorkerError> {
+        self.reconcile_runners_inner(false)
+    }
+
+    /// Operator-driven `worker task reconcile`: clears the restart budget and
+    /// retries once instead of waiting out backoff or leaving a parked row.
+    pub fn operator_reconcile(&self) -> Result<ReconcileReport, WorkerError> {
+        self.reconcile_runners_inner(true)
+    }
+
+    fn reconcile_runners_inner(
+        &self,
+        reset_failure_budget: bool,
+    ) -> Result<ReconcileReport, WorkerError> {
         let mut report = ReconcileReport::default();
         let owner = current_process_identity()?;
+        if reset_failure_budget {
+            self.client_state.reset_replacement_failures(owner)?;
+        }
         self.client_state.recover_replacement_residue()?;
 
         // A submit can fail while compensating its locally-created state. The
@@ -2130,30 +2146,36 @@ impl<'a> TaskClient<'a> {
 
         // A crash can occur after the task record is durable but before the
         // queue publication. Recreate only the task-turn row, retaining the
-        // original task and turn identifiers.
-        for record in self.client_state.list_tasks()? {
-            if submission_recovery_pending(&record) {
+        // original task and turn identifiers. Both recovery phases share one
+        // snapshot so they agree on which tasks look row-less; re-enqueue is
+        // idempotent if that snapshot is already stale.
+        let snapshot = self.client_state.queue_snapshot()?;
+        let records = self.client_state.list_tasks()?;
+        for record in &records {
+            if submission_recovery_pending(record) {
                 continue;
             }
             if matches!(
                 record.status().state(),
                 TaskState::Queued | TaskState::Active
-            ) && self
-                .client_state
-                .queue_entry_for_task_turn(record.meta().task_id())?
-                .is_none()
-            {
-                self.enqueue_missing_turn(&record, owner)?;
+            ) {
+                let turn_ids = self
+                    .client_state
+                    .turn_ids_for_task(record.meta().task_id())?;
+                if task_turn_in_snapshot(&snapshot, record, &turn_ids).is_none() {
+                    let _ = self.enqueue_missing_turn(record, owner)?;
+                }
             }
         }
 
-        for record in self.client_state.list_tasks()? {
-            if submission_recovery_pending(&record) {
+        for record in &records {
+            if submission_recovery_pending(record) {
                 continue;
             }
-            let queued = self
+            let turn_ids = self
                 .client_state
-                .queue_entry_for_task_turn(record.meta().task_id())?;
+                .turn_ids_for_task(record.meta().task_id())?;
+            let queued = task_turn_in_snapshot(&snapshot, record, &turn_ids);
             let Some(turn_id) = queued
                 .as_ref()
                 .map(QueueEntry::job_id)
@@ -2168,10 +2190,21 @@ impl<'a> TaskClient<'a> {
                     TaskState::Queued | TaskState::Active
                 )
             {
-                self.enqueue_missing_turn(&record, owner)?;
-                entry = self.client_state.queue_entry(turn_id)?;
+                if let Some(recovered) = self.enqueue_missing_turn(record, owner)? {
+                    entry = Some(recovered);
+                } else {
+                    entry = self.client_state.queue_entry(turn_id)?;
+                }
             }
             let Some(entry) = entry else { continue };
+            if record
+                .status()
+                .turns()
+                .iter()
+                .any(|turn| turn.turn_id() == turn_id && turn.terminal().is_some())
+            {
+                continue;
+            }
             if matches!(entry.state(), QueueState::Parked) {
                 continue;
             }
@@ -2218,6 +2251,24 @@ impl<'a> TaskClient<'a> {
                     })
                 {
                     continue;
+                }
+                // An explicit operator reconcile just cleared the budget so
+                // this pass can retry. Old diagnostic lines must not rebuild
+                // it and put the row back into backoff.
+                if !reset_failure_budget {
+                    self.observe_replacement_failure(record.meta().task_id(), turn_id)?;
+                }
+                let Some(current_entry) = self.client_state.queue_entry(turn_id)? else {
+                    continue;
+                };
+                if let Some(budget) = current_entry.replacement_failure() {
+                    if budget.should_park() {
+                        self.park_repeated_replacement_failure(turn_id, record.meta().task_id())?;
+                        continue;
+                    }
+                    if !budget.backoff_elapsed(current_time_millis()?) {
+                        continue;
+                    }
                 }
                 match self.start_runner(record.meta().task_id(), turn_id, false, false)? {
                     RunnerStart::Started(_) => report.started_runners += 1,
@@ -2464,8 +2515,16 @@ impl<'a> TaskClient<'a> {
                 .retain_task_turn_cancel(turn_id, current_time_millis()?)?
             {
                 Some(entry) if !matches!(entry.state(), QueueState::Dispatching { .. }) => {
-                    self.finish_waiting_cancellation(&record, &entry)?;
-                    return self.report_for(task_id);
+                    // An accepted turn parked after repeated replacement deaths
+                    // still has a remote job. Local pre-acceptance finish would
+                    // reject its journal; cancel it on the worker instead.
+                    if !entry
+                        .replacement_failure()
+                        .is_some_and(|budget| budget.should_park())
+                    {
+                        self.finish_waiting_cancellation(&record, &entry)?;
+                        return self.report_for(task_id);
+                    }
                 }
                 Some(_) => return Err(task_error("TASK_BUSY", "task turn is being dispatched")),
                 None if entry.is_some() => {
@@ -2494,6 +2553,20 @@ impl<'a> TaskClient<'a> {
             self.client_state
                 .update_task_if_current(&record, record.with_status(status)?)?;
         }
+        if self
+            .client_state
+            .queue_entry(turn_id)?
+            .is_some_and(|entry| {
+                matches!(entry.state(), QueueState::Parked)
+                    && entry
+                        .replacement_failure()
+                        .is_some_and(|budget| budget.should_park())
+            })
+        {
+            let _ = self.client_state.record_runner(task_id, None);
+            self.client_state
+                .remove_task_turn_after_terminal(turn_id, current_process_identity()?)?;
+        }
         self.report_for(task_id)
     }
 
@@ -2511,7 +2584,11 @@ impl<'a> TaskClient<'a> {
     ) -> Result<WaitReport, WorkerError> {
         let started = SystemTime::now();
         loop {
-            self.reconcile_runners()?;
+            match self.reconcile_runners() {
+                Ok(_) => {}
+                Err(error) if is_queue_job_conflict(&error) => {}
+                Err(error) => return Err(error),
+            }
             let (task_ids, dag_pending) = match selector {
                 WaitSelector::Task(task_id) => (vec![task_id], false),
                 WaitSelector::Run(run_id) => {
@@ -2525,6 +2602,9 @@ impl<'a> TaskClient<'a> {
                     )
                 }
             };
+            if let Some(error) = self.wait_blocked_error(&task_ids)? {
+                return Err(error);
+            }
             let records = task_ids
                 .iter()
                 .map(|task_id| self.client_state.load_task(*task_id))
@@ -3272,7 +3352,7 @@ impl<'a> TaskClient<'a> {
         &self,
         record: &LocalTaskRecord,
         owner: ProcessIdentity,
-    ) -> Result<QueueEntry, WorkerError> {
+    ) -> Result<Option<QueueEntry>, WorkerError> {
         if submission_recovery_pending(record) {
             return Err(task_error(
                 "TASK_SUBMISSION_RECOVERY_PENDING",
@@ -3288,6 +3368,16 @@ impl<'a> TaskClient<'a> {
                     .copied()
             })
             .ok_or_else(|| task_error("TASK_INCONSISTENT", "queued task has no turn prompt"))?;
+        if record
+            .status()
+            .turns()
+            .iter()
+            .any(|turn| turn.turn_id() == turn_id && turn.terminal().is_some())
+        {
+            // The last turn already finished locally. Re-publishing it would
+            // resurrect a row `wait` is trying to let the runner retire.
+            return Ok(None);
+        }
         let project = self.load_project_for_record(record)?;
         let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
         let run = record
@@ -3306,24 +3396,26 @@ impl<'a> TaskClient<'a> {
                 worker: worker.to_owned(),
             },
         );
-        self.client_state.enqueue(QueueEntry::new(
-            turn_id,
-            self.client_state.client_id(),
-            record.meta().project_id().to_owned(),
-            record.meta().worktree_id().to_owned(),
-            command.summary()?,
-            task_requirements(
-                &project.requirements,
-                record.meta().agent(),
-                record.meta().env_profile(),
-                task_origin_requirement(record.meta()).as_deref(),
-            ),
-            preference,
-            QueueEntryKind::TaskTurn,
-            run,
-            owner,
-            current_time_millis()?,
-        )?)
+        Ok(Some(self.client_state.enqueue_if_absent(
+            QueueEntry::new(
+                turn_id,
+                self.client_state.client_id(),
+                record.meta().project_id().to_owned(),
+                record.meta().worktree_id().to_owned(),
+                command.summary()?,
+                task_requirements(
+                    &project.requirements,
+                    record.meta().agent(),
+                    record.meta().env_profile(),
+                    task_origin_requirement(record.meta()).as_deref(),
+                ),
+                preference,
+                QueueEntryKind::TaskTurn,
+                run,
+                owner,
+                current_time_millis()?,
+            )?,
+        )?))
     }
 
     fn start_runner(
@@ -3341,8 +3433,8 @@ impl<'a> TaskClient<'a> {
         }
         let expected = self
             .client_state
-            .queue_entry_for_task_turn(task_id)?
-            .filter(|entry| entry.job_id() == turn_id)
+            .queue_entry(turn_id)?
+            .filter(|entry| entry.kind() == QueueEntryKind::TaskTurn && entry.job_id() == turn_id)
             .ok_or_else(|| task_error("TASK_BUSY", "task turn was retired before handoff"))?;
         let caller = current_process_identity()?;
         if expected.owner_opt().is_some_and(|owner| {
@@ -3368,6 +3460,60 @@ impl<'a> TaskClient<'a> {
             slot_limit,
             exclude_reserver,
         )
+    }
+
+    /// Initializes the row's restart budget from the journal when a replacement
+    /// already wrote `exited after acceptance:` but the queue field is still
+    /// empty. The runner also writes the field; this covers tests that plant
+    /// only the diagnostic and a runner that died after the log line.
+    fn observe_replacement_failure(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<(), WorkerError> {
+        let Some(entry) = self.client_state.queue_entry(turn_id)? else {
+            return Ok(());
+        };
+        if entry.replacement_failure().is_some() {
+            return Ok(());
+        }
+        let bytes = match self.read_runner_log(task_id, turn_id) {
+            Ok(bytes) => bytes,
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(code) = last_post_acceptance_public_code(&bytes) else {
+            return Ok(());
+        };
+        self.client_state
+            .record_replacement_failure(turn_id, code, current_time_millis()?)?;
+        Ok(())
+    }
+
+    fn park_repeated_replacement_failure(
+        &self,
+        turn_id: TurnId,
+        task_id: TaskId,
+    ) -> Result<(), WorkerError> {
+        let _ = self.client_state.record_runner(task_id, None);
+        self.client_state.park_row(turn_id)?;
+        Ok(())
+    }
+
+    fn wait_blocked_error(&self, task_ids: &[TaskId]) -> Result<Option<WorkerError>, WorkerError> {
+        for task_id in task_ids {
+            let Some(entry) = self.client_state.queue_entry_for_task_turn(*task_id)? else {
+                continue;
+            };
+            if let Some(budget) = entry.replacement_failure()
+                && budget.should_park()
+            {
+                return Ok(Some(task_error("WAIT_BLOCKED", "RUNNER_REPEATED_FAILURE")));
+            }
+        }
+        Ok(None)
     }
 
     fn start_oldest_parked_runner(&self, owner: ProcessIdentity) -> Result<bool, WorkerError> {
@@ -3753,6 +3899,32 @@ fn pending_turn_id(status: &TaskStatus) -> Option<TurnId> {
         .last()
         .filter(|turn| turn.terminal().is_none())
         .map(TurnSummary::turn_id)
+}
+
+fn task_turn_in_snapshot(
+    snapshot: &QueueSnapshot,
+    record: &LocalTaskRecord,
+    turn_ids: &[TurnId],
+) -> Option<QueueEntry> {
+    let pending = pending_turn_id(record.status());
+    snapshot
+        .entries()
+        .iter()
+        .find(|entry| {
+            entry.kind() == QueueEntryKind::TaskTurn
+                && (turn_ids.contains(&entry.job_id()) || pending == Some(entry.job_id()))
+        })
+        .cloned()
+}
+
+fn is_queue_job_conflict(error: &WorkerError) -> bool {
+    matches!(
+        error,
+        WorkerError::Queue {
+            code: "QUEUE_JOB_CONFLICT",
+            ..
+        }
+    )
 }
 
 fn submission_recovery_turn_id(record: &LocalTaskRecord) -> Option<TurnId> {

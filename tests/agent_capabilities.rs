@@ -406,3 +406,32 @@ fn auth_failure_scan_matches_phrases_split_across_chunks_and_bounded_tails() {
     across.push(b"HTTP error: 401 Unauthorized");
     assert!(across.matched());
 }
+
+#[test]
+fn cursor_extracts_needs_input_when_prose_abuts_a_result_with_questions() {
+    // Captured from a live Cursor turn: the final message had no newline
+    // between the last prose sentence and the result object. Scanning every
+    // `{` kept the innermost question object and classified the turn unknown.
+    let text = concat!(
+        "I'll read the task prompt and follow its instructions.",
+        r#"{"status":"needs_input","summary":"Need the maintainer to choose the docs file before any writing.","files_changed":[],"questions":[{"text":"Should the new 'When a turn fails' section go into README.md (under the operator section) or into docs/usage.md next to task lifecycle?","options":["README.md (under the operator section)","docs/usage.md next to task lifecycle"]}]}"#,
+    );
+    let result = adapter_for(AgentKind::Cursor)
+        .extract_result("", Some(text))
+        .unwrap();
+    assert_eq!(result.status(), mac_worker::agent::ResultStatus::NeedsInput);
+    assert_eq!(
+        result.summary(),
+        "Need the maintainer to choose the docs file before any writing."
+    );
+    assert_eq!(
+        result.questions(),
+        &[mac_worker::agent::Question::new(
+            "Should the new 'When a turn fails' section go into README.md (under the operator section) or into docs/usage.md next to task lifecycle?",
+            vec![
+                "README.md (under the operator section)".into(),
+                "docs/usage.md next to task lifecycle".into(),
+            ],
+        )]
+    );
+}

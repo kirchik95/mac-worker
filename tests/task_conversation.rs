@@ -21,13 +21,14 @@ use mac_worker::{
     error::WorkerError,
     job::{
         AdmissionObservation, CommandSummary, JobId, ProcessIdentity, QueueEntry, QueueEntryKind,
-        QueueRunReference, QueueState, RunId,
+        QueueRunReference, QueueState, REPLACEMENT_FAILURE_PARK_AFTER, RUNNER_REPEATED_FAILURE,
+        ReplacementFailureBudget, RunId,
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project_state::ProjectState,
     scheduler::{
-        AffinityHints, CandidateObservation, CandidateRejection, CandidateSlot, SchedulerPolicy,
-        Selection, WorkerPreference,
+        AffinityHints, CandidateObservation, CandidateRejection, CandidateSlot,
+        QueueBlockingReason, SchedulerPolicy, Selection, WorkerPreference,
     },
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
@@ -38,7 +39,10 @@ use mac_worker::{
         TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary, TurnTerminal,
     },
     task_client::{TaskClient, TaskListFilter, WaitSelector},
-    task_store::{TaskCloseRequest, TaskCloseResponse, TaskStatusResponse},
+    task_store::{
+        TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse,
+        TaskStatusResponse,
+    },
     transfer::HostOperation,
     turn_runner::InlineRunnerExecutor,
 };
@@ -209,6 +213,25 @@ impl ProcessRunner for TaskRemoteRunner {
                 let deliveries = self.deliveries.lock().unwrap().clone();
                 canonical_process(&TaskCloseResponse::new(next).with_deliveries(deliveries))
             }
+            value if value == HostOperation::TaskCancel.command() => {
+                let _cancel: TaskCancelRequest = decode_request(request)?;
+                let current = self.status.lock().unwrap().clone();
+                let next = TaskStatus::new(
+                    TaskState::Open,
+                    Some(TaskOutcome::Cancelled),
+                    current.worker().map(str::to_owned),
+                    current.session_present(),
+                    current.head_oid().cloned(),
+                    current.summary().map(str::to_owned),
+                    current.questions().to_vec(),
+                    current.files_changed().to_vec(),
+                    current.diff_stat().map(str::to_owned),
+                    current.turns().to_vec(),
+                    current.updated_at_millis() + 1,
+                )?;
+                *self.status.lock().unwrap() = next.clone();
+                canonical_process(&TaskCancelResponse::new(next))
+            }
             value if value == HostOperation::StatusLogs.command() => Ok(ProcessResult {
                 status: ExitStatus::from_raw(2 << 8),
                 stdout: Vec::new(),
@@ -347,6 +370,79 @@ fn task_record_in_run(
     .unwrap()
 }
 
+fn active_record_with_pending_turn(
+    task_id: TaskId,
+    completed_turn: JobId,
+    pending_turn: JobId,
+    project_id: String,
+    worktree_id: String,
+    run_id: Option<TaskRunId>,
+) -> LocalTaskRecord {
+    let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id,
+        run_id,
+        project_id,
+        worktree_id,
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid: base_oid.clone(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("mac-worker", "mac-worker@example.test").unwrap(),
+        title: None,
+        prompt: "fixture task".into(),
+        created_at_millis: 1,
+    })
+    .unwrap();
+    let completed = TurnSummary::new(
+        1,
+        completed_turn,
+        Some(TurnTerminal::Succeeded),
+        Some(TaskOutcome::Unknown),
+        Some(false),
+        false,
+        Some(1),
+        Some(2),
+    );
+    let pending = TurnSummary::new(2, pending_turn, None, None, None, false, Some(3), None);
+    let status = TaskStatus::new(
+        TaskState::Active,
+        Some(TaskOutcome::Unknown),
+        Some("mini-1".into()),
+        true,
+        Some(base_oid),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        vec![completed, pending],
+        3,
+    )
+    .unwrap();
+    LocalTaskRecord::new(
+        meta,
+        status,
+        None,
+        Some(RunnerIdentity::new(owner(910))),
+        None,
+        PROJECT_ID.into(),
+        None,
+        true,
+        None,
+    )
+    .unwrap()
+}
+
 fn origin_queued_task_record(
     task_id: TaskId,
     turn_id: JobId,
@@ -440,6 +536,48 @@ fn plant_incomplete_accepted_journal(
     log.write_all(body.as_bytes()).unwrap();
     log.sync_all().unwrap();
     drop(log);
+    let checkpoint = paths
+        .state
+        .join("runners")
+        .join(task_id.to_string())
+        .join(format!("{turn_id}.checkpoint.json"));
+    std::fs::write(
+        &checkpoint,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "committed": {
+                "offsets": [0, 0],
+                "len": body.len() as u64,
+                "accepted": true,
+                "completion": null
+            },
+            "pending": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&checkpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn plant_post_acceptance_diagnostic(
+    paths: &mac_worker::paths::PathLayout,
+    store: &ClientStateStore,
+    task_id: TaskId,
+    turn_id: JobId,
+    public_code: &str,
+) {
+    plant_incomplete_accepted_journal(paths, store, task_id, turn_id);
+    let line = format!("exited after acceptance: {public_code} message=fixture workers=mini-1\n");
+    let log_path = paths
+        .state
+        .join("runners")
+        .join(task_id.to_string())
+        .join(format!("{turn_id}.log"));
+    let mut body = std::fs::read(&log_path).unwrap();
+    body.extend_from_slice(line.as_bytes());
+    std::fs::write(&log_path, &body).unwrap();
     let checkpoint = paths
         .state
         .join("runners")
@@ -805,6 +943,116 @@ fn reconcile_requeues_fetch_only_origin_task_with_pinned_origin_requirement() {
                 missing: vec!["origin:origin.example.test".into()],
             }]
     ));
+}
+
+#[test]
+fn reconcile_re_enqueues_an_unmapped_pending_turn_once() {
+    // The pending follow-up lives in task status, but only the completed
+    // turn still has a directory, so `queue_entry_for_task_turn` misses the
+    // row that phase 2 just published. Repeated reconcile must not raise
+    // QUEUE_JOB_CONFLICT, and a terminal unknown turn must not come back.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let run_id = TaskRunId::new(Uuid::from_u128(910));
+    let task_id = TaskId::new(Uuid::from_u128(910));
+    let completed_turn = job(911);
+    let pending_turn = job(912);
+    let record = active_record_with_pending_turn(
+        task_id,
+        completed_turn,
+        pending_turn,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        Some(run_id),
+    );
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+    store
+        .create_run(RunRecord::new(run_id, Some("pool-run-b".into()), vec![task_id], 3, 1).unwrap())
+        .unwrap();
+    store.create_task(record).unwrap();
+    store
+        .write_turn_prompt(task_id, completed_turn, "completed prompt")
+        .unwrap();
+    cache_idle(&store, "mini-1", 10);
+
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+    client.reconcile_runners().unwrap();
+    client.reconcile_runners().unwrap();
+
+    let entries = store
+        .queue_snapshot()
+        .unwrap()
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind() == QueueEntryKind::TaskTurn)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].job_id(), pending_turn);
+
+    let terminal_id = TaskId::new(Uuid::from_u128(913));
+    let terminal_turn = job(914);
+    let mut terminal = task_record(
+        terminal_id,
+        terminal_turn,
+        TaskState::Active,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        None,
+    );
+    let finished = TurnSummary::new(
+        1,
+        terminal_turn,
+        Some(TurnTerminal::Succeeded),
+        Some(TaskOutcome::Unknown),
+        Some(false),
+        false,
+        Some(1),
+        Some(2),
+    );
+    let finished_status = TaskStatus::new(
+        TaskState::Active,
+        Some(TaskOutcome::Unknown),
+        Some("mini-1".into()),
+        true,
+        terminal.status().head_oid().cloned(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        vec![finished],
+        3,
+    )
+    .unwrap();
+    terminal = terminal.with_status(finished_status).unwrap();
+    store.create_task(terminal).unwrap();
+    store
+        .write_turn_prompt(terminal_id, terminal_turn, "unknown outcome")
+        .unwrap();
+    client.reconcile_runners().unwrap();
+    assert!(store.queue_entry(terminal_turn).unwrap().is_none());
+
+    let wait = client
+        .wait(WaitSelector::Run(run_id), Some(Duration::from_millis(350)))
+        .unwrap_err();
+    assert_eq!(wait.public_code(), "WAIT_TIMEOUT");
+    assert_eq!(
+        store
+            .queue_snapshot()
+            .unwrap()
+            .entries()
+            .iter()
+            .filter(|entry| entry.job_id() == pending_turn)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -1530,6 +1778,116 @@ fn an_active_task_turn_consumes_one_run_slot_not_two() {
 }
 
 #[test]
+fn a_follow_up_turn_does_not_count_its_own_task_against_the_run_cap() {
+    // `say` marks the task Active and enqueues a Waiting follow-up while
+    // the other tasks of a full run are still Active. Counting that task
+    // against max_parallel parks the follow-up with RUN_MAX_PARALLEL.
+    let fixture = Fixture::open();
+    cache_idle(&fixture.store, "mini-1", 10);
+    cache_idle(&fixture.store, "mini-2", 10);
+    cache_idle(&fixture.store, "mini-3", 10);
+    cache_idle(&fixture.store, "mini-4", 10);
+    let dispatcher = owner(601);
+    let follow_up_owner = owner(603);
+    let run_name = format!("{:x}", Uuid::from_u128(99).simple());
+    let run = QueueRunReference::new(QueueRunId::new(run_name).unwrap(), 3).unwrap();
+    let follow_up_task = TaskId::new(Uuid::from_u128(103));
+    let follow_up_turn = job(4);
+
+    for (task_number, turn_number, row_owner, worker, at, claim_at) in [
+        (101, 1, dispatcher, "mini-1", 10, 11),
+        (102, 2, owner(602), "mini-2", 12, 13),
+    ] {
+        fixture
+            .store
+            .enqueue(turn(
+                &fixture.store,
+                turn_number,
+                at,
+                row_owner,
+                WorkerPreference::Pinned {
+                    worker: worker.into(),
+                },
+                Some(run.clone()),
+            ))
+            .unwrap();
+        fixture
+            .store
+            .claim_next(row_owner, &[worker.into()], claim_at)
+            .unwrap()
+            .unwrap();
+        active_task(&fixture.store, task_number, job(turn_number));
+    }
+
+    active_task(&fixture.store, 103, follow_up_turn);
+    fixture
+        .store
+        .write_turn_prompt(follow_up_task, follow_up_turn, "follow-up prompt")
+        .unwrap();
+    fixture
+        .store
+        .enqueue(turn(
+            &fixture.store,
+            4,
+            14,
+            follow_up_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-3".into(),
+            },
+            Some(run.clone()),
+        ))
+        .unwrap();
+
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n\n[[workers]]\nname = \"mini-2\"\nssh = \"mac2\"\nslots = 1\n\n[[workers]]\nname = \"mini-3\"\nssh = \"mac3\"\nslots = 1\n\n[[workers]]\nname = \"mini-4\"\nssh = \"mac4\"\nslots = 1\n",
+    )
+    .unwrap();
+    let reason_for = |job_id| {
+        fixture
+            .store
+            .queue_rows_with_blocking_reasons(&config)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.entry().job_id() == job_id)
+            .unwrap()
+            .blocking_reason()
+            .cloned()
+    };
+    assert_eq!(reason_for(follow_up_turn), None);
+    assert_eq!(
+        fixture
+            .store
+            .claim_next(follow_up_owner, &["mini-3".into()], 15)
+            .unwrap()
+            .unwrap()
+            .entry()
+            .job_id(),
+        follow_up_turn
+    );
+
+    let fourth_owner = owner(604);
+    fixture
+        .store
+        .enqueue(turn(
+            &fixture.store,
+            5,
+            16,
+            fourth_owner,
+            WorkerPreference::Automatic,
+            Some(run),
+        ))
+        .unwrap();
+    assert_eq!(reason_for(job(5)), Some(QueueBlockingReason::RunCap));
+    assert!(
+        fixture
+            .store
+            .claim_next(fourth_owner, &["mini-4".into()], 17)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn failed_local_cancellation_keeps_a_recoverable_row_until_completion() {
     use std::io::Write;
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
@@ -1895,6 +2253,277 @@ fn stale_completed_reconciler_cannot_damage_a_new_turn() {
 #[test]
 fn completed_runner_retry_fences_a_stale_reconciler() {
     finalizer_cannot_damage_a_new_turn("retry");
+}
+
+fn enqueue_dead_dispatching_turn(
+    store: &ClientStateStore,
+    paths: &mac_worker::paths::PathLayout,
+    project: &ProjectState,
+    dead_owner: ProcessIdentity,
+    task_number: u128,
+    turn_number: u128,
+    diagnostic_code: Option<&str>,
+) -> (TaskId, JobId, TaskRemoteRunner) {
+    let task_id = TaskId::new(Uuid::from_u128(task_number));
+    let turn_id = job(turn_number);
+    let record = task_record(
+        task_id,
+        turn_id,
+        TaskState::Active,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        Some(dead_owner),
+    );
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    store.create_task(record).unwrap();
+    store
+        .write_turn_prompt(task_id, turn_id, "fixture prompt")
+        .unwrap();
+    cache_idle(store, "mini-1", 10);
+    store
+        .enqueue(turn(
+            store,
+            turn_number,
+            10,
+            dead_owner,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            None,
+        ))
+        .unwrap();
+    store
+        .claim_next(dead_owner, &["mini-1".into()], 11)
+        .unwrap()
+        .unwrap();
+    match diagnostic_code {
+        Some(code) => plant_post_acceptance_diagnostic(paths, store, task_id, turn_id, code),
+        None => plant_incomplete_accepted_journal(paths, store, task_id, turn_id),
+    }
+    (task_id, turn_id, remote)
+}
+
+#[test]
+fn reconcile_backs_off_then_parks_a_turn_whose_replacement_keeps_dying_after_acceptance() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let dead_owner = owner(921);
+    let store = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        DeadOwnerInspector { dead_owner },
+    )
+    .unwrap();
+    let (task_id, turn_id, remote) = enqueue_dead_dispatching_turn(
+        &store,
+        &paths,
+        &project,
+        dead_owner,
+        921,
+        922,
+        Some("HOST_IO"),
+    );
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let first = client.reconcile_runners().unwrap();
+    assert_eq!(
+        first.started_runners(),
+        0,
+        "first replacement already failed"
+    );
+    let second = client.reconcile_runners().unwrap();
+    assert_eq!(
+        second.started_runners(),
+        0,
+        "second reconcile within backoff starts nothing"
+    );
+    let budget = store
+        .queue_entry(turn_id)
+        .unwrap()
+        .unwrap()
+        .replacement_failure()
+        .cloned()
+        .expect("journal diagnostic initializes the restart budget");
+    assert_eq!(budget.last_public_code(), "HOST_IO");
+    assert_eq!(budget.consecutive_failures(), 1);
+
+    store
+        .set_replacement_failure(
+            turn_id,
+            Some(ReplacementFailureBudget::new(1, "HOST_IO".into(), 1).unwrap()),
+        )
+        .unwrap();
+    let later = client.reconcile_runners().unwrap();
+    assert_eq!(
+        later.started_runners(),
+        1,
+        "backoff elapsed starts one runner"
+    );
+
+    store.record_runner(task_id, None).unwrap();
+    store
+        .set_replacement_failure(
+            turn_id,
+            Some(
+                ReplacementFailureBudget::new(1, "HOST_IO".into(), REPLACEMENT_FAILURE_PARK_AFTER)
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+    let parked = client.reconcile_runners().unwrap();
+    assert_eq!(parked.started_runners(), 0);
+    let entry = store.queue_entry(turn_id).unwrap().unwrap();
+    assert!(matches!(entry.state(), QueueState::Parked));
+    assert!(
+        entry
+            .replacement_failure()
+            .is_some_and(|budget| budget.should_park())
+    );
+}
+
+#[test]
+fn wait_returns_wait_blocked_when_replacement_runners_are_parked_and_list_shows_the_code() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let dead_owner = owner(923);
+    let store = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        DeadOwnerInspector { dead_owner },
+    )
+    .unwrap();
+    let (task_id, turn_id, remote) = enqueue_dead_dispatching_turn(
+        &store,
+        &paths,
+        &project,
+        dead_owner,
+        923,
+        924,
+        Some("HOST_IO"),
+    );
+    store
+        .set_replacement_failure(
+            turn_id,
+            Some(
+                ReplacementFailureBudget::new(1, "HOST_IO".into(), REPLACEMENT_FAILURE_PARK_AFTER)
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let started = std::time::Instant::now();
+    let error = client
+        .wait(WaitSelector::Task(task_id), Some(Duration::from_secs(5)))
+        .unwrap_err();
+    assert_eq!(error.public_code(), "WAIT_BLOCKED");
+    assert_eq!(error.public_message(), RUNNER_REPEATED_FAILURE);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(
+        store.queue_entry(turn_id).unwrap().unwrap().state(),
+        QueueState::Parked
+    ));
+
+    let listed = client.list(TaskListFilter::default()).unwrap();
+    let row = listed
+        .tasks()
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .expect("parked task is listed");
+    assert_eq!(
+        row.blocking_code.as_deref(),
+        Some("RUNNER_REPEATED_FAILURE:HOST_IO")
+    );
+
+    let cancelled = client.cancel(task_id).unwrap();
+    assert_eq!(
+        cancelled.status().last_outcome(),
+        Some(&TaskOutcome::Cancelled)
+    );
+}
+
+#[test]
+fn operator_reconcile_resets_the_budget_and_starts_one_runner() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let dead_owner = owner(925);
+    let store = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        DeadOwnerInspector { dead_owner },
+    )
+    .unwrap();
+    let (task_id, turn_id, remote) = enqueue_dead_dispatching_turn(
+        &store,
+        &paths,
+        &project,
+        dead_owner,
+        925,
+        926,
+        Some("HOST_IO"),
+    );
+    store
+        .set_replacement_failure(
+            turn_id,
+            Some(
+                ReplacementFailureBudget::new(1, "HOST_IO".into(), REPLACEMENT_FAILURE_PARK_AFTER)
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+    client.reconcile_runners().unwrap();
+    assert!(matches!(
+        store.queue_entry(turn_id).unwrap().unwrap().state(),
+        QueueState::Parked
+    ));
+
+    let report = client.operator_reconcile().unwrap();
+    assert_eq!(report.started_runners(), 1);
+    let entry = store.queue_entry(turn_id).unwrap().unwrap();
+    assert!(entry.replacement_failure().is_none());
+    assert!(!matches!(entry.state(), QueueState::Parked));
+    assert!(store.load_task(task_id).unwrap().runner().is_some());
+}
+
+#[test]
+fn old_queue_state_without_replacement_failure_still_loads() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("state");
+    let store = ClientStateStore::open(&root).unwrap();
+    store
+        .enqueue(turn(
+            &store,
+            1,
+            10,
+            owner(1),
+            WorkerPreference::Automatic,
+            None,
+        ))
+        .unwrap();
+    let path = root.join("queue/state.json");
+    let bytes = std::fs::read(&path).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(
+        !text.contains("replacement_failure"),
+        "absent budget must stay omitted so old files remain canonical: {text}"
+    );
+    let reopened = ClientStateStore::open(&root).unwrap();
+    let snapshot = reopened.queue_snapshot().unwrap();
+    assert!(snapshot.entries()[0].replacement_failure().is_none());
 }
 
 #[test]
