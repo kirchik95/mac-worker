@@ -673,6 +673,7 @@ impl<'a> TaskStore<'a> {
             TaskSource::Origin { url } => {
                 let mirror = self.store.mirror(meta.project_id())?;
                 GitTransport::new(self.runner).fetch_origin(url, meta.base_oid(), &mirror)?;
+                self.pin_base_ref(&mirror, task_id, meta.base_oid())?;
                 mirror
             }
             TaskSource::Local { .. } => self
@@ -1477,6 +1478,72 @@ impl<'a> TaskStore<'a> {
         let current = self.read_status(&task)?;
         let next = update(current.clone())?;
         replace_status_bytes(&task, current, next)
+    }
+
+    fn pin_base_ref(
+        &self,
+        mirror: &RootedDir,
+        task_id: TaskId,
+        base: &BaseOid,
+    ) -> Result<(), WorkerError> {
+        let reference = format!("refs/mac-worker/bases/{task_id}");
+        let current = self.read_ref(mirror, &reference)?;
+        if let Some(existing) = current {
+            if existing == base.as_str() {
+                return Ok(());
+            }
+            return Err(git_error(
+                "BASE_REF_CONFLICT",
+                "base ref already points at a different object",
+            ));
+        }
+        let result = self
+            .runner
+            .run(&git_request(
+                vec![
+                    OsString::from("--git-dir"),
+                    mirror.path().as_os_str().to_os_string(),
+                    OsString::from("update-ref"),
+                    reference.into(),
+                    base.to_string().into(),
+                ],
+                None,
+            ))
+            .map_err(|error| git_error("REF_UPDATE_FAILED", error.to_string()))?;
+        if !result.status.success() {
+            return Err(git_error(
+                "REF_UPDATE_FAILED",
+                String::from_utf8_lossy(&result.stderr).trim().to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_ref(&self, mirror: &RootedDir, reference: &str) -> Result<Option<String>, WorkerError> {
+        let result = self
+            .runner
+            .run(&git_request(
+                vec![
+                    OsString::from("--git-dir"),
+                    mirror.path().as_os_str().to_os_string(),
+                    OsString::from("rev-parse"),
+                    OsString::from("--verify"),
+                    OsString::from("--quiet"),
+                    OsString::from("--end-of-options"),
+                    reference.into(),
+                ],
+                None,
+            ))
+            .map_err(|error| git_error("REF_UPDATE_FAILED", error.to_string()))?;
+        if !result.status.success() {
+            return Ok(None);
+        }
+        let value = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
     }
 
     fn verify_base(&self, mirror: &RootedDir, base: &BaseOid) -> Result<(), WorkerError> {

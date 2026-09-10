@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ffi::{OsStr, OsString},
     fmt,
     fs::OpenOptions,
@@ -22,8 +22,8 @@ use crate::{
     host_store::{HostStore, PublicationReceipt, StagedJob, StagingNonce},
     job::JobId,
     job::{
-        CommandSpec, JobMeta, LeaseRecord, RequestFingerprintMaterial, SubmitRequest,
-        SubmitResponse,
+        CommandSpec, JobMeta, LeaseRecord, MAX_LOG_CHUNK_BYTES, RequestFingerprintMaterial,
+        SubmitRequest, SubmitResponse,
     },
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     redaction::RedactionBoundary,
@@ -39,6 +39,7 @@ use crate::{
 
 pub const LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 pub const LOG_TAIL_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_NDJSON_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_ENV_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_ENV_NAME_BYTES: usize = 128;
 const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
@@ -874,7 +875,6 @@ impl<'a> TurnPublisher<'a> {
             .last()
             .map(|turn| turn.turn_id())
             .ok_or_else(|| turn_error("PUBLISH_FAILED", "task has no turn history"))?;
-        let stream = read_text(turn_dir, "stdout.log", LOG_CAP_BYTES)?;
         let tail = read_optional_text(turn_dir, "tail.log", LOG_TAIL_BYTES as u64)?;
         // The agent writes its last message itself (Codex `-o`), with the
         // account's umask rather than owner-only mode. The turn directory is
@@ -893,7 +893,34 @@ impl<'a> TurnPublisher<'a> {
         let last_message =
             read_optional_text(turn_dir, "last.md", crate::task::MAX_PROMPT_BYTES as u64)?;
         let adapter = crate::agent::adapter_for(meta.agent());
-        let session = ensure_session_binding(self.store, meta, &stream, tail.as_deref(), adapter)?;
+        let last_parses = last_message.as_deref().is_some_and(|text| {
+            adapter
+                .extract_result("", Some(text))
+                .ok()
+                .is_some_and(|result| result.status() != crate::agent::ResultStatus::Unknown)
+        });
+        let existing_session =
+            TaskStore::new(self.store, self.runner).session(meta.project_id(), meta.task_id())?;
+        let scan = if existing_session.is_some() && last_parses {
+            StdoutScan::default()
+        } else {
+            scan_stdout_protocol(turn_dir, adapter)?
+        };
+        if (log_truncated || scan.truncated) && !last_parses {
+            return Err(turn_error(
+                "PUBLISH_FAILED",
+                "truncated protocol output cannot be published as a result",
+            ));
+        }
+        let session_ref = scan.session_ref;
+        let stream = scan.result_text;
+        let session = ensure_session_binding(
+            self.store,
+            meta,
+            existing_session,
+            session_ref.as_deref(),
+            adapter,
+        )?;
         if session.is_none() && terminal == TurnTerminal::Succeeded {
             return Err(turn_error(
                 "PUBLISH_FAILED",
@@ -1158,24 +1185,16 @@ impl<'a> TurnPublisher<'a> {
 fn ensure_session_binding(
     store: &HostStore,
     meta: &TaskMeta,
-    stream: &str,
-    tail: Option<&str>,
+    existing: Option<SessionBinding>,
+    session_ref: Option<&str>,
     adapter: &'static dyn crate::agent::AgentAdapter,
 ) -> Result<Option<SessionBinding>, WorkerError> {
     let task_store = TaskStore::new(store, &crate::process::SystemProcessRunner);
-    if let Some(binding) = task_store.session(meta.project_id(), meta.task_id())? {
+    if let Some(binding) = existing {
         return Ok(Some(binding));
     }
-    let mut session_ref = None;
-    for candidate in [stream, tail.unwrap_or_default()] {
-        let events = candidate
-            .lines()
-            .filter_map(|line| adapter.parse_event(line))
-            .collect::<Vec<_>>();
-        if let Some(found) = adapter.session_ref(&events) {
-            session_ref = Some(found);
-            break;
-        }
+    if let Some(binding) = task_store.session(meta.project_id(), meta.task_id())? {
+        return Ok(Some(binding));
     }
     let Some(session_ref) = session_ref else {
         return Ok(None);
@@ -1183,6 +1202,250 @@ fn ensure_session_binding(
     let binding = SessionBinding::new(adapter.kind(), session_ref, now_millis()?)?;
     task_store.bind_session(meta.project_id(), meta.task_id(), binding.clone())?;
     Ok(Some(binding))
+}
+
+#[derive(Default)]
+struct StdoutScan {
+    session_ref: Option<String>,
+    result_text: String,
+    truncated: bool,
+}
+
+struct ScanLimits {
+    log_cap: u64,
+    max_record: usize,
+    max_result: usize,
+}
+
+fn scan_stdout_protocol(
+    turn_dir: &RootedDir,
+    adapter: &'static dyn crate::agent::AgentAdapter,
+) -> Result<StdoutScan, WorkerError> {
+    scan_stdout_protocol_with(
+        turn_dir,
+        adapter,
+        ScanLimits {
+            log_cap: LOG_CAP_BYTES,
+            max_record: MAX_NDJSON_RECORD_BYTES,
+            max_result: crate::task::MAX_PROMPT_BYTES,
+        },
+    )
+}
+
+fn scan_stdout_protocol_with(
+    turn_dir: &RootedDir,
+    adapter: &'static dyn crate::agent::AgentAdapter,
+    limits: ScanLimits,
+) -> Result<StdoutScan, WorkerError> {
+    if !turn_dir.entry_exists("stdout.log")? {
+        return Err(turn_error(
+            "PUBLISH_FAILED",
+            "cannot read stdout.log: missing",
+        ));
+    }
+    let mut offset = 0_u64;
+    let mut pending = Vec::new();
+    let mut session_ref = None;
+    let mut candidates = CandidateBuffers::default();
+    let mut stored = 0_u64;
+    let mut truncated = false;
+    let mut discard_until_newline = false;
+    loop {
+        let chunk = turn_dir
+            .read_private_regular_chunk("stdout.log", offset, MAX_LOG_CHUNK_BYTES)
+            .map_err(|error| {
+                turn_error("PUBLISH_FAILED", format!("cannot read stdout.log: {error}"))
+            })?;
+        if chunk.is_empty() {
+            break;
+        }
+        let room = limits.log_cap.saturating_sub(stored);
+        if room == 0 {
+            truncated = true;
+            break;
+        }
+        let take = chunk
+            .len()
+            .min(usize::try_from(room).unwrap_or(chunk.len()));
+        if take < chunk.len() {
+            truncated = true;
+        }
+        pending.extend_from_slice(&chunk[..take]);
+        stored = stored.saturating_add(take as u64);
+        offset = offset.saturating_add(take as u64);
+        consume_pending_records(
+            &mut pending,
+            &mut discard_until_newline,
+            adapter,
+            &mut session_ref,
+            &mut candidates,
+            &limits,
+        );
+        if truncated && take < chunk.len() {
+            break;
+        }
+    }
+    if discard_until_newline {
+        truncated = true;
+    } else if !pending.iter().all(u8::is_ascii_whitespace) {
+        if complete_json_object(&pending).is_some() {
+            consider_protocol_record(
+                adapter,
+                &mut session_ref,
+                &mut candidates,
+                &pending,
+                limits.max_result,
+            );
+        } else {
+            truncated = true;
+        }
+    }
+    Ok(StdoutScan {
+        session_ref,
+        result_text: candidates.join(),
+        truncated,
+    })
+}
+
+pub(crate) fn take_next_complete_record(
+    pending: &mut Vec<u8>,
+    discard_until_newline: &mut bool,
+    max_record: usize,
+) -> Option<Vec<u8>> {
+    loop {
+        if *discard_until_newline {
+            if let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                pending.drain(..=newline);
+                *discard_until_newline = false;
+            } else {
+                pending.clear();
+                return None;
+            }
+            continue;
+        }
+        let Some(newline) = pending.iter().position(|byte| *byte == b'\n') else {
+            if pending.len() > max_record {
+                *discard_until_newline = true;
+                pending.clear();
+            }
+            return None;
+        };
+        if newline >= max_record {
+            pending.drain(..=newline);
+            continue;
+        }
+        return Some(pending.drain(..=newline).collect());
+    }
+}
+
+fn consume_pending_records(
+    pending: &mut Vec<u8>,
+    discard_until_newline: &mut bool,
+    adapter: &'static dyn crate::agent::AgentAdapter,
+    session_ref: &mut Option<String>,
+    candidates: &mut CandidateBuffers,
+    limits: &ScanLimits,
+) {
+    while let Some(line) =
+        take_next_complete_record(pending, discard_until_newline, limits.max_record)
+    {
+        consider_protocol_record(adapter, session_ref, candidates, &line, limits.max_result);
+    }
+}
+
+#[derive(Default)]
+struct CandidateBuffers {
+    results: VecDeque<String>,
+    result_bytes: usize,
+    others: VecDeque<String>,
+    other_bytes: usize,
+}
+
+impl CandidateBuffers {
+    fn push_result(&mut self, text: String, max: usize) {
+        push_bounded_line(&mut self.results, &mut self.result_bytes, text, max);
+    }
+
+    fn push_other(&mut self, text: String, max: usize) {
+        push_bounded_line(&mut self.others, &mut self.other_bytes, text, max);
+    }
+
+    fn join(&self) -> String {
+        let mut joined = String::new();
+        for line in self.results.iter().chain(self.others.iter()) {
+            if !joined.is_empty() {
+                joined.push('\n');
+            }
+            joined.push_str(line);
+        }
+        joined
+    }
+}
+
+fn push_bounded_line(lines: &mut VecDeque<String>, used: &mut usize, text: String, max: usize) {
+    if text.len() > max {
+        return;
+    }
+    while *used + text.len() > max {
+        let Some(oldest) = lines.pop_front() else {
+            return;
+        };
+        *used = used.saturating_sub(oldest.len());
+    }
+    *used = used.saturating_add(text.len());
+    lines.push_back(text);
+}
+
+fn consider_protocol_record(
+    adapter: &'static dyn crate::agent::AgentAdapter,
+    session_ref: &mut Option<String>,
+    candidates: &mut CandidateBuffers,
+    record: &[u8],
+    max_result: usize,
+) {
+    let text = String::from_utf8_lossy(record);
+    let text = text.trim_end_matches(['\r', '\n']);
+    if session_ref.is_none()
+        && let Some(event) = adapter.parse_event(text)
+    {
+        *session_ref = adapter.session_ref(std::slice::from_ref(&event));
+    }
+    if text.len() > max_result {
+        return;
+    }
+    match protocol_candidate_kind(text) {
+        Some(CandidateKind::ExplicitResult) => candidates.push_result(text.to_string(), max_result),
+        Some(CandidateKind::Other) => candidates.push_other(text.to_string(), max_result),
+        None => {}
+    }
+}
+
+enum CandidateKind {
+    ExplicitResult,
+    Other,
+}
+
+fn protocol_candidate_kind(text: &str) -> Option<CandidateKind> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("result") => Some(CandidateKind::ExplicitResult),
+        Some("assistant" | "item.completed" | "text") => Some(CandidateKind::Other),
+        _ => None,
+    }
+}
+
+fn complete_json_object(bytes: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(bytes).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) if value.is_object() => Some(text),
+        _ => None,
+    }
 }
 
 pub fn prebind_session(
@@ -1742,5 +2005,279 @@ mod tests {
             prebind_session(&store, &SystemProcessRunner, &request, temp.path()).unwrap_err();
 
         assert_eq!(error.public_code(), "TASK_SESSION_CONFLICT");
+    }
+
+    fn open_scan_dir() -> (tempfile::TempDir, RootedDir) {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let turn_dir = store
+            .open_task_directory(PROJECT_ID, TaskId::generate(), true)
+            .unwrap();
+        (temp, turn_dir)
+    }
+
+    fn write_stdout(turn_dir: &RootedDir, bytes: &[u8]) {
+        RootedDir::write_private_atomic_no_replace(turn_dir, "stdout.log", bytes).unwrap();
+    }
+
+    fn codex_session_line() -> &'static str {
+        "{\"type\":\"thread.started\",\"thread_id\":\"session-1\"}"
+    }
+
+    fn codex_result_record(summary: &str) -> String {
+        let inner = serde_json::json!({
+            "status": "done",
+            "summary": summary,
+            "questions": [],
+            "files_changed": [],
+        });
+        serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": inner.to_string(),
+            }
+        })
+        .to_string()
+    }
+
+    fn assert_unknown_result(adapter: &'static dyn crate::agent::AgentAdapter, scan: &StdoutScan) {
+        assert!(
+            !scan.result_text.contains("\"status\":\"done\""),
+            "truncated suffix leaked into result text: {}",
+            scan.result_text
+        );
+        assert_eq!(
+            adapter
+                .extract_result(&scan.result_text, None)
+                .unwrap()
+                .status(),
+            crate::agent::ResultStatus::Unknown
+        );
+    }
+
+    fn assert_done_result(adapter: &'static dyn crate::agent::AgentAdapter, scan: &StdoutScan) {
+        assert_eq!(
+            adapter
+                .extract_result(&scan.result_text, None)
+                .unwrap()
+                .status(),
+            crate::agent::ResultStatus::Done
+        );
+    }
+
+    #[test]
+    fn scan_stdout_protocol_does_not_treat_a_capped_incomplete_line_as_a_result() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let mut stdout = format!("{}\n", codex_session_line()).into_bytes();
+        stdout.extend(vec![b'x'; 1024]);
+        stdout.extend(b"{\"status\":\"done\"");
+        write_stdout(&turn_dir, &stdout);
+        let adapter = crate::agent::adapter_for(AgentKind::Codex);
+        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(scan.truncated);
+        assert_unknown_result(adapter, &scan);
+    }
+
+    #[test]
+    fn scan_stdout_protocol_discards_an_oversized_line_instead_of_parsing_its_suffix() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let mut stdout = format!("{}\n", codex_session_line()).into_bytes();
+        stdout.extend(vec![b'x'; MAX_NDJSON_RECORD_BYTES + 1]);
+        stdout.extend(codex_result_record("ok").as_bytes());
+        stdout.push(b'\n');
+        write_stdout(&turn_dir, &stdout);
+        let adapter = crate::agent::adapter_for(AgentKind::Codex);
+        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(!scan.truncated);
+        assert_unknown_result(adapter, &scan);
+    }
+
+    #[test]
+    fn scan_stdout_protocol_accepts_a_complete_final_json_record_without_a_newline() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let stdout = format!("{}\n{}", codex_session_line(), codex_result_record("ok"));
+        write_stdout(&turn_dir, stdout.as_bytes());
+        let adapter = crate::agent::adapter_for(AgentKind::Codex);
+        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(!scan.truncated);
+        assert_done_result(adapter, &scan);
+    }
+
+    #[test]
+    fn scan_stdout_protocol_keeps_a_unicode_result_beyond_the_display_tail() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let filler = "{\"type\":\"item.updated\",\"delta\":\"привет\"}\n";
+        let mut stdout = format!("{}\n", codex_session_line()).into_bytes();
+        while stdout.len() <= LOG_TAIL_BYTES {
+            stdout.extend_from_slice(filler.as_bytes());
+        }
+        stdout.extend_from_slice(codex_result_record("готово").as_bytes());
+        stdout.push(b'\n');
+        write_stdout(&turn_dir, &stdout);
+        let adapter = crate::agent::adapter_for(AgentKind::Codex);
+        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(!scan.truncated);
+        assert_done_result(adapter, &scan);
+        assert!(scan.result_text.contains("готово"));
+    }
+
+    #[test]
+    fn scan_stdout_protocol_keeps_a_result_larger_than_the_display_tail() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let summary = "я".repeat((LOG_TAIL_BYTES / 2) + 8);
+        assert!(summary.len() > LOG_TAIL_BYTES);
+        assert!(summary.len() < crate::task::MAX_PROMPT_BYTES);
+        let stdout = format!(
+            "{}\n{}\n",
+            codex_session_line(),
+            codex_result_record(&summary)
+        );
+        write_stdout(&turn_dir, stdout.as_bytes());
+        let adapter = crate::agent::adapter_for(AgentKind::Codex);
+        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(!scan.truncated);
+        assert_done_result(adapter, &scan);
+        assert!(scan.result_text.len() > LOG_TAIL_BYTES);
+    }
+
+    #[test]
+    fn scan_stdout_protocol_marks_truncated_when_log_cap_cuts_the_stream() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let mut stdout = format!("{}\n", codex_session_line()).into_bytes();
+        stdout.extend(vec![b'x'; 4096]);
+        stdout.push(b'\n');
+        stdout.extend(codex_result_record("ok").as_bytes());
+        stdout.push(b'\n');
+        write_stdout(&turn_dir, &stdout);
+        let adapter = crate::agent::adapter_for(AgentKind::Codex);
+        let scan = scan_stdout_protocol_with(
+            &turn_dir,
+            adapter,
+            ScanLimits {
+                log_cap: 2048,
+                max_record: MAX_NDJSON_RECORD_BYTES,
+                max_result: crate::task::MAX_PROMPT_BYTES,
+            },
+        )
+        .unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(scan.truncated);
+        assert_unknown_result(adapter, &scan);
+    }
+
+    #[test]
+    fn scan_stdout_protocol_treats_incomplete_json_at_eof_as_truncated() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let stdout = format!("{}\n{{\"status\":\"done\"", codex_session_line());
+        write_stdout(&turn_dir, stdout.as_bytes());
+        let adapter = crate::agent::adapter_for(AgentKind::Codex);
+        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(scan.truncated);
+        assert_unknown_result(adapter, &scan);
+    }
+
+    #[test]
+    fn scan_stdout_protocol_keeps_a_near_limit_record_when_later_lines_share_the_chunk() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let session = format!("{}\n", codex_session_line());
+        let result = format!("{}\n", codex_result_record("ok"));
+        let max_record = session.len() + result.len() - 2;
+        assert!(session.trim_end().len() < max_record);
+        assert!(result.trim_end().len() < max_record);
+        assert!(session.len() + result.len() > max_record);
+        write_stdout(&turn_dir, format!("{session}{result}").as_bytes());
+        let adapter = crate::agent::adapter_for(AgentKind::Codex);
+        let scan = scan_stdout_protocol_with(
+            &turn_dir,
+            adapter,
+            ScanLimits {
+                log_cap: LOG_CAP_BYTES,
+                max_record,
+                max_result: crate::task::MAX_PROMPT_BYTES,
+            },
+        )
+        .unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(!scan.truncated);
+        assert_done_result(adapter, &scan);
+    }
+
+    fn structured_payload(status: &str, summary: &str) -> String {
+        serde_json::json!({
+            "status": status,
+            "summary": summary,
+            "questions": [],
+            "files_changed": [],
+        })
+        .to_string()
+    }
+
+    fn claude_or_cursor_session_line() -> &'static str {
+        r#"{"type":"system","subtype":"init","session_id":"session-1"}"#
+    }
+
+    fn explicit_result_record(inner: &str) -> String {
+        serde_json::json!({ "type": "result", "result": inner }).to_string()
+    }
+
+    fn assistant_record(inner: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [{ "type": "text", "text": inner }] }
+        })
+        .to_string()
+    }
+
+    fn assert_result_beats_later_assistant(kind: AgentKind) {
+        let (_temp, turn_dir) = open_scan_dir();
+        let stdout = format!(
+            "{}\n{}\n{}\n",
+            claude_or_cursor_session_line(),
+            explicit_result_record(&structured_payload("done", "from-result")),
+            assistant_record(&structured_payload("blocked", "from-assistant")),
+        );
+        write_stdout(&turn_dir, stdout.as_bytes());
+        let adapter = crate::agent::adapter_for(kind);
+        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(!scan.truncated);
+        let extracted = adapter.extract_result(&scan.result_text, None).unwrap();
+        assert_eq!(extracted.status(), crate::agent::ResultStatus::Done);
+        assert!(extracted.summary().contains("from-result"));
+    }
+
+    #[test]
+    fn scan_stdout_protocol_prefers_cursor_result_records_over_later_assistants() {
+        assert_result_beats_later_assistant(AgentKind::Cursor);
+    }
+
+    #[test]
+    fn scan_stdout_protocol_prefers_claude_result_records_over_later_assistants() {
+        assert_result_beats_later_assistant(AgentKind::Claude);
+    }
+
+    #[test]
+    fn scan_stdout_protocol_skips_a_malformed_later_result_and_keeps_the_earlier_one() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let stdout = format!(
+            "{}\n{}\n{}\n",
+            claude_or_cursor_session_line(),
+            explicit_result_record(&structured_payload("done", "kept")),
+            r#"{"type":"result","result":"{"}"#,
+        );
+        write_stdout(&turn_dir, stdout.as_bytes());
+        let adapter = crate::agent::adapter_for(AgentKind::Cursor);
+        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
+        assert!(!scan.truncated);
+        let extracted = adapter.extract_result(&scan.result_text, None).unwrap();
+        assert_eq!(extracted.status(), crate::agent::ResultStatus::Done);
+        assert!(extracted.summary().contains("kept"));
     }
 }

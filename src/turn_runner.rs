@@ -931,14 +931,19 @@ impl<'a> TurnRunner<'a> {
                     )
                 } else {
                     (|| {
-                        GitTransport::new(self.runner).push_base(
-                            worker,
-                            &identity,
-                            initial_record.meta().project_id(),
-                            task_id,
-                            turn.base_oid(),
-                            transfer.path(),
-                        )?;
+                        if !matches!(
+                            initial_record.meta().source(),
+                            crate::task::TaskSource::Origin { .. }
+                        ) {
+                            GitTransport::new(self.runner).push_base(
+                                worker,
+                                &identity,
+                                initial_record.meta().project_id(),
+                                task_id,
+                                turn.base_oid(),
+                                transfer.path(),
+                            )?;
+                        }
                         remote.task_prepare(
                             worker,
                             &TaskPrepareRequest::new(

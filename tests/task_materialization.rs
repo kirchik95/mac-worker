@@ -380,6 +380,106 @@ fn origin_prepare_fetches_the_exact_base_before_workspace_creation() {
     assert!(args.iter().any(|arg| arg == base_oid.as_str()));
 }
 
+#[test]
+fn origin_prepare_pins_the_base_ref_and_rejects_a_conflicting_oid() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    acquire_lease(&store);
+    struct FetchStub;
+    impl ProcessRunner for FetchStub {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.args.iter().any(|arg| arg == "fetch")
+                && request
+                    .args
+                    .iter()
+                    .any(|arg| arg == "https://example.test/repo.git")
+            {
+                return Ok(ProcessResult {
+                    status: ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id: task_id(),
+        run_id: None,
+        project_id: PROJECT_ID.into(),
+        worktree_id: WORKTREE_ID.into(),
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        policy: PermissionPolicy::Workspace,
+        source: mac_worker::task::TaskSource::Origin {
+            url: "https://example.test/repo.git".into(),
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid: base_oid.clone(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+        title: None,
+        prompt: "prepare from origin".into(),
+        created_at_millis: 100,
+    })
+    .unwrap();
+    let request = TaskPrepareRequest::new(meta.clone(), job_id(), "mini-1");
+    {
+        let (_admission, transfer) = transfer_guard(&store);
+        TaskStore::new(&store, &FetchStub)
+            .prepare(&request, &transfer)
+            .unwrap();
+    }
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    let pin = format!("refs/mac-worker/bases/{}", task_id());
+    assert!(git_ref_exists(&mirror, &pin));
+    assert_eq!(
+        git(mirror.path(), &["rev-parse", "--verify", "--quiet", &pin]),
+        base_oid.as_str()
+    );
+    {
+        let (_admission, transfer) = transfer_guard(&store);
+        TaskStore::new(&store, &FetchStub)
+            .prepare(&request, &transfer)
+            .unwrap();
+    }
+    let other = TaskMeta::new(TaskMetaInput {
+        task_id: task_id(),
+        run_id: None,
+        project_id: PROJECT_ID.into(),
+        worktree_id: WORKTREE_ID.into(),
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        policy: PermissionPolicy::Workspace,
+        source: mac_worker::task::TaskSource::Origin {
+            url: "https://example.test/repo.git".into(),
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+        title: None,
+        prompt: "prepare from origin".into(),
+        created_at_millis: 100,
+    })
+    .unwrap();
+    let conflict_request = TaskPrepareRequest::new(other, job_id(), "mini-1");
+    let error = {
+        let (_admission, transfer) = transfer_guard(&store);
+        TaskStore::new(&store, &FetchStub)
+            .prepare(&conflict_request, &transfer)
+            .unwrap_err()
+    };
+    assert_eq!(error.public_code(), "BASE_REF_CONFLICT");
+}
+
 fn acquire_lease(store: &HostStore) {
     let request = LeaseAcquireRequest::new(
         RequestFingerprintMaterial::new(

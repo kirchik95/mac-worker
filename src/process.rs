@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     io::{self, Read, Write},
     os::unix::process::CommandExt,
@@ -61,11 +62,34 @@ pub trait ProcessRunner: Send + Sync {
     fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
         self.run(request)
     }
+
+    fn run_interruptible(
+        &self,
+        request: &ProcessRequest,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<ProcessResult, WorkerError> {
+        if should_cancel() {
+            return Err(ProcessError::Cancelled.into());
+        }
+        self.run(request)
+    }
 }
 
 impl<T: ProcessRunner + ?Sized> ProcessRunner for &T {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
         (**self).run(request)
+    }
+
+    fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        (**self).run_in_new_session(request)
+    }
+
+    fn run_interruptible(
+        &self,
+        request: &ProcessRequest,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<ProcessResult, WorkerError> {
+        (**self).run_interruptible(request, should_cancel)
     }
 }
 
@@ -74,19 +98,43 @@ pub struct SystemProcessRunner;
 
 impl ProcessRunner for SystemProcessRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-        self.run_with_session(request, false)
+        self.run_with_session(request, SessionKind::OwnProcessGroup, None)
     }
 
     fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-        self.run_with_session(request, true)
+        self.run_with_session(request, SessionKind::NewSession, None)
     }
+
+    fn run_interruptible(
+        &self,
+        request: &ProcessRequest,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<ProcessResult, WorkerError> {
+        if should_cancel() {
+            return Err(ProcessError::Cancelled.into());
+        }
+        self.run_with_session(request, SessionKind::OwnProcessGroup, Some(should_cancel))
+    }
+}
+
+/// Child session placement used by `SystemProcessRunner`.
+///
+/// PERF keeps `OwnProcessGroup` and `NewSession`. ENV adds inherited-group
+/// setup inside a recorded authority; do not collapse this back to a boolean
+/// at integration, and do not join capture threads on inherited-group failure
+/// while grandchildren can retain FDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    OwnProcessGroup,
+    NewSession,
 }
 
 impl SystemProcessRunner {
     fn run_with_session(
         &self,
         request: &ProcessRequest,
-        new_session: bool,
+        session: SessionKind,
+        should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<ProcessResult, WorkerError> {
         let mut command = Command::new(&request.program);
         if request.isolate_parent_environment {
@@ -98,8 +146,8 @@ impl SystemProcessRunner {
         for key in &request.environment_remove {
             command.env_remove(key);
         }
-        if new_session {
-            unsafe {
+        match session {
+            SessionKind::NewSession => unsafe {
                 command.pre_exec(|| {
                     if libc::setsid() == -1 {
                         Err(io::Error::last_os_error())
@@ -107,9 +155,10 @@ impl SystemProcessRunner {
                         Ok(())
                     }
                 });
+            },
+            SessionKind::OwnProcessGroup => {
+                command.process_group(0);
             }
-        } else {
-            command.process_group(0);
         }
         command
             .stdin(if request.stdin.is_some() {
@@ -178,7 +227,14 @@ impl SystemProcessRunner {
                         }
                     }
                     ProcessEvent::Captured(stream, Ok(CaptureOutcome::LimitExceeded)) => {
-                        terminate_and_reap(&mut child, process_group)?;
+                        if status.is_none() {
+                            status = child.try_wait()?;
+                        }
+                        if status.is_none() {
+                            terminate_and_reap(&mut child, process_group)?;
+                        } else {
+                            let _ = terminate_process_group(process_group);
+                        }
                         join_threads(stdout_handle, stderr_handle, stdin_handle)?;
                         let limit = match stream {
                             ProcessStream::Stdout => request.policy.stdout_limit,
@@ -204,6 +260,12 @@ impl SystemProcessRunner {
             }
             if status.is_some() && stdout.is_some() && stderr.is_some() && stdin_complete {
                 break;
+            }
+
+            if should_cancel.is_some_and(|cancel| cancel()) {
+                terminate_and_reap(&mut child, process_group)?;
+                join_threads(stdout_handle, stderr_handle, stdin_handle)?;
+                return Err(ProcessError::Cancelled.into());
             }
 
             if started.elapsed() >= request.policy.deadline {
@@ -270,6 +332,7 @@ fn spawn_capture<R: Read + Send + 'static>(
                             stream,
                             Ok(CaptureOutcome::LimitExceeded),
                         ));
+                        drain_remaining(&mut reader);
                         let _ = release_receiver.recv();
                         return;
                     }
@@ -282,6 +345,18 @@ fn spawn_capture<R: Read + Send + 'static>(
     CaptureThread {
         handle,
         limit_release,
+    }
+}
+
+fn drain_remaining<R: Read>(reader: &mut R) {
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
     }
 }
 
@@ -328,4 +403,49 @@ fn join_threads(
             .map_err(|_| io::Error::other("stdin writer thread panicked"))?;
     }
     Ok(())
+}
+
+/// Bounded rolling byte window for later fixed-phrase scanners.
+///
+/// The window size is the maximum needle length. Auth-incident can scan this
+/// without allocating a 256 MiB stderr buffer.
+#[derive(Debug)]
+pub(crate) struct RollingByteWindow {
+    bytes: VecDeque<u8>,
+    max: usize,
+}
+
+impl RollingByteWindow {
+    pub(crate) fn new(max: usize) -> Self {
+        Self {
+            bytes: VecDeque::with_capacity(max.min(8 * 1024)),
+            max: max.max(1),
+        }
+    }
+
+    pub(crate) fn extend(&mut self, incoming: &[u8]) {
+        if incoming.len() >= self.max {
+            self.bytes.clear();
+            self.bytes
+                .extend(incoming[incoming.len() - self.max..].iter().copied());
+            return;
+        }
+        let over = self
+            .bytes
+            .len()
+            .saturating_add(incoming.len())
+            .saturating_sub(self.max);
+        for _ in 0..over {
+            let _ = self.bytes.pop_front();
+        }
+        self.bytes.extend(incoming.iter().copied());
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn as_bytes(&self) -> Vec<u8> {
+        self.bytes.iter().copied().collect()
+    }
 }

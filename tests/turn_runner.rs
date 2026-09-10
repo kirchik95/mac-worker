@@ -2344,6 +2344,24 @@ fn undrainable_follow_up_still_imports_when_prior_fetched_head_is_present() {
     assert_wait_and_dashboard_keep_undrainable_failure(&remote, store, &fixture, host_success);
 }
 
+#[test]
+fn origin_source_skips_push_base_receive_pack() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new_origin_source("https://example.test/repo.git");
+    fixture.run(&mut Vec::new()).unwrap();
+    assert!(
+        !fixture.runner.requests().iter().any(|request| {
+            request.program == OsStr::new("/usr/bin/git")
+                && request.args.iter().any(|arg| arg == "push")
+                && request
+                    .args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().starts_with("--receive-pack="))
+        }),
+        "origin source must not push_base via receive-pack"
+    );
+}
+
 fn assert_remote_turn_completed(
     fixture: &AcceptedThenTerminalFixture,
     outcome: &mac_worker::turn_runner::TurnOutcomeReport,

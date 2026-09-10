@@ -1956,11 +1956,10 @@ impl<'a> Supervisor<'a> {
                 error,
             );
         }
-        let (mut child, output) = match GatedChild::spawn_turn(
+        let (mut child, output, stderr_read) = match GatedChild::spawn_turn(
             &command,
             task_workspace.raw_directory_fd(),
             prompt.as_raw_fd(),
-            stderr.as_raw_fd(),
             self.inspector,
         ) {
             Ok(child) => child,
@@ -1979,7 +1978,7 @@ impl<'a> Supervisor<'a> {
             }
         };
         drop(prompt);
-        let mut pump = match TurnOutputPump::start(
+        let stdout_pump = match TurnOutputPump::start(
             output,
             stdout,
             tail,
@@ -2003,6 +2002,32 @@ impl<'a> Supervisor<'a> {
                 abort?;
                 return result;
             }
+        };
+        let stderr_pump = match TurnStderrPump::start(stderr_read, stderr) {
+            Ok(pump) => pump,
+            Err(error) => {
+                let abort = child.abort_and_reap();
+                let mut stdout_pump = stdout_pump;
+                let pump_result = stdout_pump.stop_and_join();
+                let result = self.finish_turn_prelaunch_failure(
+                    lease,
+                    job,
+                    guard,
+                    &meta,
+                    &section,
+                    status_bytes,
+                    status,
+                    "LOG_BINDING_INVALID",
+                    error,
+                );
+                abort?;
+                let _ = pump_result;
+                return result;
+            }
+        };
+        let mut pump = TurnIoPumps {
+            stdout: stdout_pump,
+            stderr: stderr_pump,
         };
         if self.fault == Some(SupervisorFaultPoint::AfterChildReady) {
             let abort = child.abort_and_reap();
@@ -2245,9 +2270,8 @@ impl<'a> Supervisor<'a> {
         };
         drop(admission);
 
-        // The handoff guard fences cancellation while the pump is stopped and
+        // The handoff guard fences cancellation while the pumps are stopped and
         // the final log lengths are measured for terminal publication.
-        drop(stderr);
         let pump_result = pump.stop_and_join()?;
         let stderr = current_job.open_private_append("stderr.log")?;
         stderr.sync_all()?;
@@ -2378,7 +2402,7 @@ impl<'a> Supervisor<'a> {
         section: &TurnSection,
         expected_bytes: Vec<u8>,
         status: JobStatus,
-        pump: &mut TurnOutputPump,
+        pump: &mut TurnIoPumps,
         child_identity: ProcessIdentity,
         code: &str,
         original: WorkerError,
@@ -2727,20 +2751,21 @@ impl GatedChild {
         command: &PreparedCommand,
         cwd: RawFd,
         stdin: RawFd,
-        stderr: RawFd,
         inspector: &dyn ProcessInspector,
-    ) -> Result<(Self, File), WorkerError> {
+    ) -> Result<(Self, File, File), WorkerError> {
         let output = Pipe::cloexec()?;
+        let stderr = Pipe::cloexec()?;
         let result = Self::spawn_with_fds(
             command,
             cwd,
             stdin,
             output.write.as_raw_fd(),
-            stderr,
+            stderr.write.as_raw_fd(),
             inspector,
         );
         drop(output.write);
-        result.map(|child| (child, File::from(output.read)))
+        drop(stderr.write);
+        result.map(|child| (child, File::from(output.read), File::from(stderr.read)))
     }
 
     fn spawn_with_fds(
@@ -2929,6 +2954,31 @@ struct TurnPumpResult {
     log_truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StreamPumpConfig {
+    cap: u64,
+    tail: usize,
+    post_stop_drain: u64,
+    read_chunk: usize,
+}
+
+impl StreamPumpConfig {
+    fn production() -> Self {
+        Self {
+            cap: crate::turn::LOG_CAP_BYTES,
+            tail: crate::turn::LOG_TAIL_BYTES,
+            post_stop_drain: crate::turn::LOG_TAIL_BYTES as u64,
+            read_chunk: 64 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StderrPumpResult {
+    stored: u64,
+    truncated: bool,
+}
+
 struct TurnOutputPump {
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<Result<TurnPumpResult, WorkerError>>>,
@@ -2955,6 +3005,7 @@ impl TurnOutputPump {
                     &store,
                     &section,
                     &thread_stop,
+                    StreamPumpConfig::production(),
                 )
             })
             .map_err(WorkerError::Io)?;
@@ -2988,6 +3039,178 @@ impl Drop for TurnOutputPump {
     }
 }
 
+struct TurnIoPumps {
+    stdout: TurnOutputPump,
+    stderr: TurnStderrPump,
+}
+
+impl TurnIoPumps {
+    fn stop_and_join(&mut self) -> Result<TurnPumpResult, WorkerError> {
+        let stdout = self.stdout.stop_and_join();
+        let stderr = self.stderr.stop_and_join();
+        let stderr = stderr?;
+        let mut stdout = stdout?;
+        stdout.log_truncated |= stderr.truncated;
+        Ok(stdout)
+    }
+}
+
+struct TurnStderrPump {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<Result<StderrPumpResult, WorkerError>>>,
+}
+
+impl TurnStderrPump {
+    fn start(read: File, stderr: File) -> Result<Self, WorkerError> {
+        Self::start_with(read, stderr, StreamPumpConfig::production())
+    }
+
+    fn start_with(
+        read: File,
+        mut stderr: File,
+        config: StreamPumpConfig,
+    ) -> Result<Self, WorkerError> {
+        set_nonblocking(read.as_raw_fd())?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let join = std::thread::Builder::new()
+            .name("mac-worker-stderr-pump".into())
+            .spawn(move || pump_stderr_output(read, &mut stderr, &thread_stop, config))
+            .map_err(WorkerError::Io)?;
+        Ok(Self {
+            stop,
+            join: Some(join),
+        })
+    }
+
+    fn stop_and_join(&mut self) -> Result<StderrPumpResult, WorkerError> {
+        self.stop.store(true, Ordering::Release);
+        let join = self.join.take().ok_or_else(|| {
+            protocol_code("TURN_PUMP_INVALID", "turn stderr pump was joined twice")
+        })?;
+        match join.join() {
+            Ok(result) => result,
+            Err(_) => Err(protocol_code(
+                "TURN_PUMP_FAILED",
+                "turn stderr pump thread panicked",
+            )),
+        }
+    }
+}
+
+impl Drop for TurnStderrPump {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            self.stop.store(true, Ordering::Release);
+            let _ = join.join();
+        }
+    }
+}
+
+fn pump_stderr_output(
+    mut read: File,
+    stderr: &mut File,
+    stop: &AtomicBool,
+    config: StreamPumpConfig,
+) -> Result<StderrPumpResult, WorkerError> {
+    let mut stored = 0_u64;
+    let mut total = 0_u64;
+    let mut tail = crate::process::RollingByteWindow::new(config.tail.max(1));
+    let mut buffer = vec![0_u8; config.read_chunk.max(1)];
+    let mut stopping = false;
+    let mut after_stop = 0_u64;
+    loop {
+        match read.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let take = match take_post_stop_bytes(
+                    count,
+                    stopping,
+                    &mut after_stop,
+                    config.post_stop_drain,
+                ) {
+                    Some(take) => take,
+                    None => break,
+                };
+                let bytes = &buffer[..take];
+                total = total.saturating_add(take as u64);
+                tail.extend(bytes);
+                if stored < config.cap {
+                    let remaining = config.cap - stored;
+                    let write_count = (take as u64).min(remaining) as usize;
+                    if write_count > 0 {
+                        stderr
+                            .write_all(&bytes[..write_count])
+                            .map_err(WorkerError::Io)?;
+                        stored += write_count as u64;
+                    }
+                }
+                if stop.load(Ordering::Acquire) {
+                    stopping = true;
+                }
+                if stopping && after_stop >= config.post_stop_drain {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) || stopping {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+    }
+    stored = persist_capped_stderr_tail(stderr, &tail, total, stored)?;
+    stderr.sync_all().map_err(WorkerError::Io)?;
+    assert!(tail.len() <= config.tail.max(1));
+    Ok(StderrPumpResult {
+        stored,
+        truncated: total > config.cap,
+    })
+}
+
+fn persist_capped_stderr_tail(
+    stderr: &mut File,
+    tail: &crate::process::RollingByteWindow,
+    total: u64,
+    stored: u64,
+) -> Result<u64, WorkerError> {
+    if total <= stored {
+        return Ok(stored);
+    }
+    let tail_bytes = tail.as_bytes();
+    let overflow = usize::try_from(total - stored).unwrap_or(tail_bytes.len());
+    let extra = if overflow >= tail_bytes.len() {
+        tail_bytes.as_slice()
+    } else {
+        &tail_bytes[tail_bytes.len() - overflow..]
+    };
+    if !extra.is_empty() {
+        stderr.write_all(extra).map_err(WorkerError::Io)?;
+    }
+    Ok(stored.saturating_add(extra.len() as u64))
+}
+
+fn take_post_stop_bytes(
+    count: usize,
+    stopping: bool,
+    after_stop: &mut u64,
+    post_stop_drain: u64,
+) -> Option<usize> {
+    if !stopping {
+        return Some(count);
+    }
+    let remaining = post_stop_drain.saturating_sub(*after_stop);
+    if remaining == 0 {
+        return None;
+    }
+    let take = count.min(remaining as usize);
+    *after_stop = after_stop.saturating_add(take as u64);
+    Some(take)
+}
+
 fn pump_turn_output(
     mut read: File,
     stdout: &mut File,
@@ -2995,11 +3218,13 @@ fn pump_turn_output(
     store: &HostStore,
     section: &TurnSection,
     stop: &AtomicBool,
+    config: StreamPumpConfig,
 ) -> Result<TurnPumpResult, WorkerError> {
     let mut total = 0_u64;
     let mut stored = 0_u64;
-    let mut tail = VecDeque::with_capacity(crate::turn::LOG_TAIL_BYTES);
+    let mut tail = VecDeque::with_capacity(config.tail.max(1));
     let mut pending_line = Vec::new();
+    let mut discard_until_newline = false;
     let adapter = crate::agent::adapter_for(section.turn().agent());
     let mut session_bound =
         crate::task_store::TaskStore::new(store, &crate::process::SystemProcessRunner)
@@ -3007,18 +3232,29 @@ fn pump_turn_output(
             .ok()
             .flatten()
             .is_some();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; config.read_chunk.max(1)];
+    let mut stopping = false;
+    let mut after_stop = 0_u64;
 
     loop {
         match read.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
-                let bytes = &buffer[..count];
-                total = total.saturating_add(count as u64);
-                append_tail(&mut tail, bytes);
-                if stored < crate::turn::LOG_CAP_BYTES {
-                    let remaining = crate::turn::LOG_CAP_BYTES - stored;
-                    let write_count = (count as u64).min(remaining) as usize;
+                let take = match take_post_stop_bytes(
+                    count,
+                    stopping,
+                    &mut after_stop,
+                    config.post_stop_drain,
+                ) {
+                    Some(take) => take,
+                    None => break,
+                };
+                let bytes = &buffer[..take];
+                total = total.saturating_add(take as u64);
+                append_tail(&mut tail, bytes, config.tail.max(1));
+                if stored < config.cap {
+                    let remaining = config.cap - stored;
+                    let write_count = (take as u64).min(remaining) as usize;
                     if write_count > 0 {
                         stdout
                             .write_all(&bytes[..write_count])
@@ -3030,28 +3266,28 @@ fn pump_turn_output(
                     pending_line.extend_from_slice(bytes);
                     scan_turn_lines(
                         &mut pending_line,
+                        &mut discard_until_newline,
                         adapter,
                         store,
                         section,
                         &mut session_bound,
                     )?;
                 }
+                if stop.load(Ordering::Acquire) {
+                    stopping = true;
+                }
+                if stopping && after_stop >= config.post_stop_drain {
+                    break;
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if stop.load(Ordering::Acquire) {
+                if stop.load(Ordering::Acquire) || stopping {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(WorkerError::Io(error)),
-        }
-        if stop.load(Ordering::Acquire) {
-            // The supervisor already supplied the one-second post-group-
-            // absence grace. Do not wait for pipe EOF: an escaped descendant
-            // can keep writing forever. The current read has been retained,
-            // and dropping `read` below closes this end of the pipe.
-            break;
         }
     }
 
@@ -3061,25 +3297,18 @@ fn pump_turn_output(
     tail_file.write_all(&tail_bytes).map_err(WorkerError::Io)?;
     tail_file.sync_all().map_err(WorkerError::Io)?;
     Ok(TurnPumpResult {
-        stdout_bytes: stored.min(crate::turn::LOG_CAP_BYTES),
-        log_truncated: total > crate::turn::LOG_CAP_BYTES,
+        stdout_bytes: stored.min(config.cap),
+        log_truncated: total > config.cap,
     })
 }
 
-fn append_tail(tail: &mut VecDeque<u8>, bytes: &[u8]) {
-    if bytes.len() >= crate::turn::LOG_TAIL_BYTES {
+fn append_tail(tail: &mut VecDeque<u8>, bytes: &[u8], max: usize) {
+    if bytes.len() >= max {
         tail.clear();
-        tail.extend(
-            bytes[bytes.len() - crate::turn::LOG_TAIL_BYTES..]
-                .iter()
-                .copied(),
-        );
+        tail.extend(bytes[bytes.len() - max..].iter().copied());
         return;
     }
-    let over = tail
-        .len()
-        .saturating_add(bytes.len())
-        .saturating_sub(crate::turn::LOG_TAIL_BYTES);
+    let over = tail.len().saturating_add(bytes.len()).saturating_sub(max);
     for _ in 0..over {
         let _ = tail.pop_front();
     }
@@ -3088,21 +3317,22 @@ fn append_tail(tail: &mut VecDeque<u8>, bytes: &[u8]) {
 
 fn scan_turn_lines(
     pending: &mut Vec<u8>,
+    discard_until_newline: &mut bool,
     adapter: &'static dyn crate::agent::AgentAdapter,
     store: &HostStore,
     section: &TurnSection,
     session_bound: &mut bool,
 ) -> Result<(), WorkerError> {
-    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-        let line = pending.drain(..=newline).collect::<Vec<_>>();
+    while let Some(line) = crate::turn::take_next_complete_record(
+        pending,
+        discard_until_newline,
+        crate::turn::MAX_NDJSON_RECORD_BYTES,
+    ) {
         scan_one_turn_line(&line, adapter, store, section, session_bound)?;
         if *session_bound {
             pending.clear();
-            break;
+            return Ok(());
         }
-    }
-    if pending.len() > 1024 * 1024 {
-        pending.clear();
     }
     Ok(())
 }
@@ -3146,7 +3376,7 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn stop_turn_pump(pump: &mut TurnOutputPump) -> Result<TurnPumpResult, WorkerError> {
+fn stop_turn_pump(pump: &mut TurnIoPumps) -> Result<TurnPumpResult, WorkerError> {
     std::thread::sleep(Duration::from_secs(1));
     pump.stop_and_join()
 }
@@ -4101,6 +4331,120 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(500),
             "pump waited {elapsed:?} for an escaped stdout writer"
+        );
+    }
+
+    fn test_stream_pump_config() -> StreamPumpConfig {
+        StreamPumpConfig {
+            cap: 64,
+            tail: 32,
+            post_stop_drain: 256,
+            read_chunk: 32,
+        }
+    }
+
+    fn open_pipe() -> (File, File) {
+        let mut descriptors = [0; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let read = unsafe { File::from_raw_fd(descriptors[0]) };
+        let write = unsafe { File::from_raw_fd(descriptors[1]) };
+        (read, write)
+    }
+
+    #[test]
+    fn stderr_pump_keeps_the_late_tail_and_reports_truncation_after_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let (read, mut writer) = open_pipe();
+        let stderr_path = temp.path().join("stderr.log");
+        let stderr = File::create(&stderr_path).unwrap();
+        let mut pump = TurnStderrPump::start_with(read, stderr, test_stream_pump_config()).unwrap();
+        let marker = b"LATE-STDERR-FAIL";
+        writer.write_all(&[b'x'; 64]).unwrap();
+        writer.write_all(marker).unwrap();
+        drop(writer);
+
+        let result = pump.stop_and_join().unwrap();
+        assert!(result.truncated, "stderr overflow must set truncation");
+        let bytes = fs::read(&stderr_path).unwrap();
+        assert!(
+            bytes.windows(marker.len()).any(|window| window == marker),
+            "late stderr tail was dropped: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(result.stored > 64);
+    }
+
+    #[test]
+    fn stderr_pump_drains_buffered_bytes_after_stop_without_waiting_for_eof() {
+        let temp = tempfile::tempdir().unwrap();
+        let (read, mut writer) = open_pipe();
+        let stderr_path = temp.path().join("stderr.log");
+        let stderr = File::create(&stderr_path).unwrap();
+        let mut pump = TurnStderrPump::start_with(read, stderr, test_stream_pump_config()).unwrap();
+        let marker = b"LATE-STDERR-FAIL";
+        writer.write_all(&[b'x'; 64]).unwrap();
+        writer.write_all(marker).unwrap();
+
+        let started = Instant::now();
+        let result = pump.stop_and_join().unwrap();
+        let elapsed = started.elapsed();
+        drop(writer);
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "post-stop drain waited {elapsed:?} for EOF"
+        );
+        assert!(result.truncated);
+        let bytes = fs::read(&stderr_path).unwrap();
+        assert!(
+            bytes.windows(marker.len()).any(|window| window == marker),
+            "buffered stderr after cap was not drained: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn stderr_pump_stops_when_an_escaped_writer_keeps_the_pipe_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let (read, mut writer) = open_pipe();
+        let stderr = File::create(temp.path().join("stderr.log")).unwrap();
+        let mut pump = TurnStderrPump::start_with(read, stderr, test_stream_pump_config()).unwrap();
+
+        let writing = Arc::new(AtomicBool::new(true));
+        let writer_flag = Arc::clone(&writing);
+        let (started_tx, started_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let bytes = [b'x'; 64];
+            writer.write_all(&bytes).unwrap();
+            started_tx.send(()).unwrap();
+            while writer_flag.load(Ordering::Acquire) {
+                match writer.write_all(&bytes) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
+                    Err(error) => panic!("escaped stderr writer failed: {error}"),
+                }
+            }
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let writer_stop = Arc::clone(&writing);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            writer_stop.store(false, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = pump.stop_and_join();
+        let elapsed = started.elapsed();
+        writing.store(false, Ordering::Release);
+        stopper.join().unwrap();
+        writer.join().unwrap();
+
+        let result = result.unwrap();
+        assert!(result.truncated);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "pump waited {elapsed:?} for an escaped stderr writer"
         );
     }
 

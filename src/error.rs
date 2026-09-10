@@ -30,6 +30,8 @@ pub enum ProcessError {
     OutputLimitExceeded { stream: ProcessStream, limit: usize },
     #[error("process exceeded its {deadline:?} execution deadline")]
     DeadlineExceeded { deadline: Duration },
+    #[error("process was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -580,6 +582,11 @@ mod tests {
                 WorkerError::Process(super::ProcessError::DeadlineExceeded {
                     deadline: std::time::Duration::from_secs(1),
                 }),
+                "PROCESS",
+                "process error",
+            ),
+            (
+                WorkerError::Process(super::ProcessError::Cancelled),
                 "PROCESS",
                 "process error",
             ),

@@ -4,7 +4,14 @@ use mac_worker::{
     error::{ProcessError, ProcessStream, WorkerError},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
 };
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 #[allow(dead_code)]
 mod support;
@@ -75,6 +82,70 @@ fn stderr_overflow_terminates_the_child_with_a_typed_error() {
             limit: 32
         })
     ));
+}
+
+#[test]
+fn overflow_drains_the_pipe_without_waiting_out_the_deadline() {
+    // A finite writer larger than the pipe buffer blocks until the capture
+    // side drains. stderr is given a high cap so diagnostic lines cannot
+    // steal the overflow error.
+    let request = ProcessRequest {
+        program: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "dd if=/dev/zero bs=65536 count=32 2>/dev/null".into(),
+        ],
+        environment: Vec::new(),
+        environment_remove: Vec::new(),
+        stdin: None,
+        policy: policy(32, 1024 * 1024, Duration::from_secs(2)),
+        isolate_parent_environment: false,
+    };
+    let started = Instant::now();
+
+    let error = SystemProcessRunner.run(&request).unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            WorkerError::Process(ProcessError::OutputLimitExceeded {
+                stream: ProcessStream::Stdout,
+                limit: 32
+            })
+        ),
+        "{error:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn run_interruptible_cancels_an_in_flight_child() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let request = ProcessRequest {
+        program: "/bin/sleep".into(),
+        args: vec!["5".into()],
+        environment: Vec::new(),
+        environment_remove: Vec::new(),
+        stdin: None,
+        policy: policy(32, 32, Duration::from_secs(5)),
+        isolate_parent_environment: false,
+    };
+    let started = Instant::now();
+    let flag = Arc::clone(&cancel);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        flag.store(true, Ordering::SeqCst);
+    });
+
+    let error = SystemProcessRunner
+        .run_interruptible(&request, &|| cancel.load(Ordering::SeqCst))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerError::Process(ProcessError::Cancelled)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]
