@@ -152,7 +152,7 @@ worker task list
 worker workers --refresh
 ```
 
-The dashboard opens locally in your browser (`http://127.0.0.1:<port>`, deep link `#/tasks/<id>`). It does not start or cancel tasks. From a task card you can reply or accept; those use the same `say` / `close` paths as the CLI and require the card’s current revision (state, last turn, turn count, head, `updated_at`). `--no-facts-refresh` only skips stale agent-facts refresh; it does not disable replies.
+The dashboard opens locally in your browser (`http://127.0.0.1:<port>`, deep link `#/tasks/<id>`). It does not start or cancel tasks. From a task card you can reply or accept using the same `say` / `close` paths as the CLI; a stale card is rejected. `--no-facts-refresh` only skips stale agent-facts refresh; it does not disable replies. Details: [usage](docs/usage.md#dashboard).
 
 To submit and return immediately, omit `--wait`.
 
@@ -188,7 +188,7 @@ flowchart LR
     others <-->|Agent API| provider
 ```
 
-1. **Submit.** Ask your laptop agent or run the CLI. The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with a free execution slot, the required agent, and capabilities. Admission capacity is the **sum** of each worker’s `slots` (default 1, at most 8). The same `task_id` stays serialized; distinct tasks from one checkout may overlap when a host has opted into more than one slot.
+1. **Submit.** Ask your laptop agent or run the CLI. The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with a free execution slot, the required agent, and capabilities. Each worker defaults to **one** slot (`1..=8` on that Mac). Combined detached runner capacity is the **sum** of those per-worker ceilings. A batch `--max-parallel` is a requested run cap (any positive value; default is that sum) and is not rejected for exceeding host capacity — extra tasks wait. The same `task_id` stays serialized; distinct tasks from one checkout may overlap when a host has opted into more than one slot.
 2. **Run.** Over SSH, mac-worker transfers the base commit into the worker's project mirror, prepares a separate task worktree and launches the agent under a supervisor. The agent uses the worker's own login and project tools.
 3. **Follow or reply.** The CLI and dashboard read task status and logs. If the agent needs input, `worker task say <id> --message "…"` (or a dashboard reply on that card’s current revision) starts another turn in the same task workspace and agent session.
 4. **Review.** The worker publishes `task/<id>`, and the laptop fetches it as a remote-tracking ref. `worker task fetch <id>` prints the ref to inspect. Your current working tree stays unchanged; you decide what to merge. With `publish = push`, origin delivery is a durable per-turn outbox: the execution slot is released independently of a slow remote, and a `done` turn may still show origin `pending`.
@@ -205,7 +205,7 @@ Workers contact agent providers directly. No mac-worker cloud service or databas
 worker init yourname@second-mini.local --name mini-2
 ```
 
-The scheduler uses an available compatible worker. Each Mac defaults to one concurrent turn; the host may opt in to `1..=8` slots. Laptop `slots` is a ceiling, not host authority. Use `--worker <name>` on `task submit` only as a diagnostic pin.
+The scheduler uses an available compatible worker. Each Mac defaults to **one** concurrent turn (`slots = 1` per worker); that host may opt in to `1..=8`. Combined capacity is the sum of per-worker ceilings. Laptop `slots` is a client ceiling, not host authority. Use `--worker <name>` on `task submit` only as a diagnostic pin.
 
 ## Update or remove
 

@@ -41,7 +41,7 @@ worker workers [--refresh]
 worker dashboard [--port N] [--no-open] [--no-facts-refresh]
 ```
 
-There is no `worker task accept` verb. Human accept is `worker task close` after `--close-on never`. Dashboard reply/accept POST the same `say`/`close` paths with the card’s expected revision (see Follow). `--no-facts-refresh` only skips stale facts refresh.
+There is no `worker task accept` verb. Human accept is `worker task close` after `--close-on never`. Dashboard reply/accept use the same `say`/`close` paths as the CLI; a stale card is rejected. `--no-facts-refresh` only skips stale facts refresh.
 
 `submit` options:
 
@@ -67,7 +67,9 @@ There is no `worker task accept` verb. Human accept is `worker task close` after
 --wait                                   stay attached until the first turn ends
 ```
 
-Without `--wait`, `submit`, `batch`, and `say` return as soon as the task record, the base commit in the transfer repository, and the queue row exist and a local turn runner has taken ownership of the row, or the row is parked behind the runner cap (`sum` of configured `slots`, default 1). With `--wait` the same work happens in the foreground and the command follows the turn's event log to its end. `list`, `status`, `result`, `diff`, and `logs` are read-only; `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and `reconcile` perform runner recovery first. `batch --preview` validates the file and prints the plan; it does not open client state or dispatch. `depends_on` is rejected on submit until DAG execution ships.
+Without `--wait`, `submit`, `batch`, and `say` return as soon as the task record, the base commit in the transfer repository, and the queue row exist and a local turn runner has taken ownership of the row, or the row is parked behind the detached runner cap. That cap defaults to the **sum** of each worker’s `slots` (each worker defaults to 1). With `--wait` the same work happens in the foreground and the command follows the turn's event log to its end. `list`, `status`, `result`, `diff`, and `logs` are read-only; `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and `reconcile` perform runner recovery first. `batch --preview` validates the file and prints the plan; it does not open client state or dispatch. `depends_on` is rejected on submit until DAG execution ships.
+
+`--max-parallel` is a requested run cap: omitted, it defaults to that same slot sum; an explicit value may be any positive integer and is **not** rejected for exceeding host or client capacity. Extra tasks wait for a free execution slot. Host occupancy still admits at most `slot_count` live leases per Mac.
 
 `--json` on any command emits the same typed records the dashboard consumes; `submit`, `say`, `logs -f`, and `wait` emit versioned NDJSON events, with log chunks base64-encoded as in v1.
 
@@ -95,7 +97,7 @@ worker task batch <file> --preview --json
 worker task batch <file> --json
 ```
 
-Keep the returned run identifier and all task identifiers. `--max-parallel` cannot exceed the sum of worker slot ceilings.
+Keep the returned run identifier and all task identifiers. `--max-parallel` does not have to be ≤ the slot sum; see Grammar.
 
 For a review loop that should stay Open after agent `done`, pass `--close-on never` (or set it in the batch / `.worker.toml`).
 
@@ -141,7 +143,7 @@ For a task that reports `needs_input`, read its questions from `worker task stat
 worker task say <id> --message-file <file> --wait
 ```
 
-Do not send a message to an active turn. `say` is for the next turn. A `say` while a turn is running is `TASK_BUSY`. Public CLI `say` / `close` have no `--expected-*` flags; wait until the previous runner has released ownership. Dashboard reply/accept send `expected_task_id`, `expected_turn_id`, `expected_turn_count`, `expected_head_oid`, `expected_updated_at_millis`, and `expected_state` from the card; mismatch is `TASK_REVISION_CONFLICT` (HTTP 409) and must not enqueue another turn.
+Do not send a message to an active turn. `say` is for the next turn. A `say` while a turn is running is `TASK_BUSY`. Public CLI `say` / `close` have no revision flags; wait until the previous runner has released ownership. Dashboard reply/accept use the current card; a stale card is rejected (`TASK_REVISION_CONFLICT`) and must not enqueue another turn. Field names: [usage](../../../docs/usage.md#dashboard).
 
 When a task reports `done`, fetch its result:
 

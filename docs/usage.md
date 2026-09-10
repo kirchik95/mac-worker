@@ -1,17 +1,17 @@
 # Using mac-worker
 
-Start with the [quick start](../README.md#quick-start) to install the CLI and connect one Mac. This reference covers additional agents, task settings, batches, the dashboard and remote commands.
+Start with the [quick start](../README.md#quick-start) to install the CLI and connect one Mac. This reference covers agents, task settings, review, batches, capacity, origin delivery, the dashboard, and remote commands. Laptop skills live in the repository at [`.claude/skills/`](../.claude/skills/); they are a local-agent install, not a worker install.
 
 ## Agents
 
 | Agent | Flag | Login lives | Notes |
 |---|---|---|---|
-| Codex | `--agent codex` | file-based login on the worker | `--model gpt-5.6-luna --effort max` are passed through; runs in the Codex workspace sandbox |
+| Codex | `--agent codex` | file-based login on the worker | `--model` / `--effort` are passed through; runs in the Codex workspace sandbox |
 | OpenCode | `--agent opencode` | OpenCode auth store on the worker | uses the worker's default model; pick another with `--model opencode-go/<model>` |
 | Cursor | `--agent cursor --env-profile agents` | Cursor login on the worker + an env profile | needs the profile described below because Cursor keeps its login in the macOS keychain |
 | Claude Code | `--agent claude` | worker login or env profile | check with `worker init <ssh> --agent claude`; add `--env-profile` for profile credentials |
 
-Every agent gets the same contract: work only in the task worktree, do not switch branches or push, and end with a JSON result. Agents that cannot ask questions interactively return `needs_input` with the exact question; you answer with `worker task say <id> --message "…" --wait`, which starts the next turn in the same agent session.
+Honor the agent, model, and profile you configured. Do not copy credential profile contents. Every agent gets the same contract: work only in the task worktree, do not switch branches or push, and end with a JSON result. Agents that cannot ask questions interactively return `needs_input` with the exact question; you answer with `worker task say <id> --message "…" --wait`, which starts the next turn in the same agent session.
 
 ### Env profiles
 
@@ -26,6 +26,8 @@ chmod 600 ~/.config/mac-worker/env/agents.env
 
 Recognised keys include `CURSOR_API_KEY`, and the host-only `MAC_WORKER_KEYCHAIN_PASSWORD` (plus optional `MAC_WORKER_KEYCHAIN_PATH`), which mac-worker feeds to `security unlock-keychain` on stdin right before an agent that needs the login keychain runs. The two keychain values are consumed by the helper and never exported to the agent, logged, or shown anywhere. A profile that is group- or world-readable is refused.
 
+You own SDKs, language tools, agent logins, and secrets on each Mac. mac-worker does not install toolchains or copy those profiles.
+
 ## Task lifecycle
 
 <p align="center">
@@ -33,17 +35,23 @@ Recognised keys include `CURSOR_API_KEY`, and the host-only `MAC_WORKER_KEYCHAIN
 </p>
 
 ```text
-worker task submit   --agent <a> (--prompt TEXT | --prompt-file PATH) [--wait] [--model M] [--effort E]
-worker task batch    tasks.toml [--max-parallel N] [--wait] [--preview]
+worker task submit   --agent <a> (--prompt TEXT | --prompt-file PATH) [--wait] [--model M] [--effort E] [--close-on done|never]
+worker task batch    FILE [--name NAME] [--max-parallel N] [--wait | --preview]
 worker task list     [--run ID|NAME] [--state open] [--outcome needs-input]
-worker task status   <id>          worker task logs <id> [-f]     worker task diff <id> --stat
+worker task status   <id> [--full]     worker task logs <id> [-f]     worker task diff <id> --stat
 worker task wait     --task-id <id> | --run <ID|NAME> [--timeout 30m]
-worker task say      <id> --message "…" [--wait]                  # answer or steer, next turn
+worker task say      <id> (--message TEXT | --message-file PATH) [--wait]
 worker task result   <id>          worker task fetch <id>
 worker task cancel   <id>          worker task close <id> [--discard]
 worker task reconcile              # re-own dead runners, re-queue orphaned turns; submits nothing
 worker gc [--apply]                # preview, then reclaim old tasks, branches, mirrors on the workers
 ```
+
+Confirm the installed grammar with `worker task --help`. There is no `worker task accept` verb.
+
+`worker task batch FILE --preview` validates the file and prints the plan. It does not open client state or dispatch. `--preview` conflicts with `--wait`. `depends_on` on submit is `BATCH_DEPENDENCIES_UNSUPPORTED` until DAG execution is accepted.
+
+`--max-parallel` is a **requested run cap**. Omitted, it defaults to `sum(worker.slots)` (each worker defaults to 1). An explicit positive value is accepted even when it is larger than that sum or than current host occupancy; extra tasks wait for a free execution slot. Zero is `TASK_CONFIG_INVALID`. The CLI does not reject “too many” relative to host capacity.
 
 `worker task logs` without `--raw` prints recognised agent events one line at a time, hides per-token noise, and folds consecutive unrecognised structured events into `event: <type>[/<subtype>] ×N` summaries (the count is omitted for one event). It keeps stderr and launch failures verbatim and prints failure lines such as `turn 1 failed: …` even when the agent wrote nothing; use `--raw` for the original log bytes.
 
@@ -51,17 +59,92 @@ worker gc [--apply]                # preview, then reclaim old tasks, branches, 
 
 Outcomes are recorded on the task, independent of the process exit code:
 
-- `done`: the agent finished and the branch is published. Tasks close themselves by default (`--close-on done`). For a human review loop (ready for review → follow-up → accepted), submit with `--close-on never`, then `worker task say` as needed and `worker task close` when you accept. Default auto-close after `done` is not acceptance.
+- `done`: the agent finished and the branch is published. That is **not** human acceptance. Default `--close-on done` then closes the task. Origin `delivery` may still be `pending` / `retrying`. For a human review loop (ready for review → follow-up → accepted), submit with `--close-on never`, then `worker task say` as needed and `worker task close` when you accept.
 - `needs_input`: the agent has a bounded question; `say` answers it.
 - `blocked`: the agent could not finish. Read `result` and `logs`, then `say` guidance or `close --discard`.
 - `unknown`: the agent did not return a structured result; the branch is still published.
 
-A batch file groups independent tasks into a run with shared defaults:
+`worker task result` / `status --json` show the outcome, summary, and any **agent-reported** checks. Those checks are claims from the worker agent, not independent verification. `worker task diff <id> --stat` lists the published change. `worker task fetch <id>` prints the remote-tracking ref (`refs/remotes/mac-worker/<worker>/task/<id>`) — the current-turn import proof on the laptop. Your working tree stays unchanged.
+
+### Review and close
+
+Default `--close-on done` auto-closes after agent `done`. For an explicit review loop:
+
+```bash
+worker task submit --close-on never --agent <a> --prompt-file brief.md
+worker task wait --task-id <id>
+worker task result <id>
+worker task diff <id> --stat
+worker task fetch <id>
+worker task close <id>            # human accept
+# or: worker task say <id> --message-file followup.md --wait
+# or: worker task close <id> --discard
+```
+
+Public CLI `say` / `close` have no revision flags. Wait first. Dashboard reply/accept are the same operations with a current-card check ([Dashboard](#dashboard)).
+
+### Project setup
+
+Optional `[setup]` in `.worker.toml` is opt-in. Absent, behavior is unchanged. Commands are operator-written; mac-worker never infers packages.
+
+```toml
+[setup]
+timeout = "10m"
+commands = ["cargo fetch --locked"]
+check = "cargo fetch --locked --offline"
+lockfiles = ["Cargo.lock"]
+```
+
+`check` proves **this** workspace only. A matching identity in another worktree is not readiness. You own the toolchain. Profile **names** may appear in identity hashes; profile values and secrets do not.
+
+## Capacity and slots
+
+Each `[[workers]]` entry defaults to `slots = 1` **per worker** (`1..=8`). That laptop value is a client **ceiling**. The Mac’s durable authority is `leases/capacity.json` `{ "slot_count": N }` on the host (hidden `worker host set-slots N`). Combined detached runner capacity is `sum(worker.slots)`, not the number of workers.
+
+Same `task_id` is serialized (`WORKSPACE_BUSY`). Distinct task IDs from one checkout may overlap when that host’s `slot_count >= 2`. Layout, migrate, and probe occupancy: [multiple execution slots](superpowers/specs/2026-09-10-slots-design.md).
+
+## Origin delivery
+
+With `publish = push`, each turn pins a durable delivery intent **before** the execution slot is released. Agent outcome and origin state are independent: `done` plus origin `pending` is valid. `status` / dashboard **project** remote delivery without rewriting a Closed local record. Discard while delivery is `pending`/`retrying` is `TASK_BUSY` (`DELIVERY_PENDING`).
+
+Host pump (hidden `worker host`, not in top-level `--help`):
+
+| Flag | Semantics |
+|---|---|
+| `--watch` | Take `outbox.lock` or exit immediately if another pump holds it. Publish watcher identity, recover the due registry once, then loop. |
+| `--once` | Blocking one-shot pump. If the pump lock is held, `OUTBOX_BUSY`. Does not spawn `--watch`. |
+| `--enable` | Write `locks/outbox-enabled.json`. Does not start a watcher. Reboot recovery is `--enable` plus a LaunchAgent that actually starts `--watch`. |
+| `--wake` | Hidden. If a live watcher exists, no-op; else spawn `--watch` and exit. |
+
+`--once` is a one-shot pump, not a substitute for `--watch`. Do not treat a single `--once` after a crash as proof that due-registry recovery already ran; `--watch` recovers the due index on start. Standalone PERF spec (integrator lands `f6e2d4b`): `docs/superpowers/specs/2026-09-10-origin-outbox.md` when that file is in the tree.
+
+Project defaults:
+
+```toml
+[task]
+default_agent = "codex"
+source = "local"            # or "origin": start from the exact commit on your Git remote
+publish = ["fetch"]         # add "push" to also push task/<id> to origin
+timeout = "45m"
+max_followups = 10
+close_on = "done"           # or "never" for explicit review
+```
+
+To use the exact base commit from your Git remote and push the result branch back to that remote:
+
+```toml
+[task]
+source = "origin"
+publish = ["fetch", "push"]
+```
+
+The base commit must already be on the remote. The worker account needs its own Git access to that remote; SSH agent forwarding from the laptop is disabled. `--wip` cannot push (`PUBLISH_REQUIRES_COMMITTED_BASE`).
+
+A batch file groups **independent** tasks into a run with shared defaults:
 
 ```toml
 version = 1
 agent = "codex"
-model = "gpt-5.6-luna"
 timeout = "45m"
 
 [[tasks]]
@@ -74,7 +157,7 @@ prompt = "Move the billing HTTP client into packages/billing-client …"
 agent = "opencode"
 ```
 
-Project-wide defaults live in `.worker.toml` next to your code:
+Preview with `worker task batch tasks.toml --preview` before dispatch.
 
 ```toml
 [task]
@@ -118,10 +201,35 @@ Writing good briefs is its own skill. Two Claude Code skills ship with the repos
 ```bash
 worker dashboard                 # opens http://127.0.0.1:<port>
 worker dashboard --port 8765 --no-open
-worker dashboard --no-facts-refresh   # keep the dashboard read-only
+worker dashboard --no-facts-refresh   # skip stale agent-facts refresh only
 ```
 
-The dashboard is a loopback-only observer: workers with slot state and host load, the FIFO queue with blocking reasons, active turns with live logs, the task ledger with filters, per-task detail with the outcome, changed files, and the exact `worker task fetch` command, and a run history. It polls, keeps no database, never starts or cancels jobs, and never shows prompts, credentials, or profile values. While it is open it refreshes a worker's agent facts at most once per fifteen-minute TTL when they have aged out, so Overview does not degrade to `unknown` on an idle pool; `--no-facts-refresh` disables that. Its Settings view can save native model and effort defaults for future launches; that is its only other write. The JSON it renders is available at `GET /api/v1/snapshot`, `GET /api/v1/tasks/<id>`, and `GET /api/v1/tasks/<id>/turns/<turn>/logs`.
+The dashboard listens only on loopback. It does not start or cancel tasks. It shows workers (including slot occupancy and host load), the FIFO queue, active turns, the task ledger, per-task detail (outcome, summary, agent-reported checks, changed files, fetch ref, delivery), and run history. Deep link `#/tasks/<id>` selects that card. It never shows prompts, credentials, or profile values.
+
+`--no-facts-refresh` disables the optional fifteen-minute agent-facts refresh so Overview does not probe idle workers. It is **not** a read-only switch: Settings can still save native model/effort defaults, and task cards can still reply or accept.
+
+Reply and accept use the same `TaskClient::say` / `close` paths as the CLI. They require the **current card**. A stale card is rejected (`TASK_REVISION_CONFLICT`, HTTP 409) and must not enqueue another turn.
+
+```text
+POST /api/v1/tasks/{task_id}/reply
+POST /api/v1/tasks/{task_id}/accept
+```
+
+Loopback `Host` / matching `Origin`, `Content-Type: application/json`, `X-Mac-Worker-Task: 1`, body ≤ 8192 bytes. JSON:
+
+```json
+{
+  "message": "optional for reply",
+  "expected_task_id": "<canonical>",
+  "expected_turn_id": "<last turn>",
+  "expected_turn_count": 1,
+  "expected_head_oid": "<40 hex or null>",
+  "expected_updated_at_millis": 123,
+  "expected_state": "open"
+}
+```
+
+Public CLI `say` / `close` do not take these fields. Snapshot GET JSON remains at `GET /api/v1/snapshot`, `GET /api/v1/tasks/<id>`, and `GET /api/v1/tasks/<id>/turns/<turn>/logs`.
 
 The interface is a React application in `ui/`, built with Tailwind and shadcn/ui and embedded into the binary at build time, so `cargo build` needs no JavaScript toolchain.
 
@@ -148,7 +256,7 @@ herdr = true      # default true: notify this laptop's herdr when a turn ends; s
 [[workers]]
 name = "mini-1"
 ssh = "yourname@mini.local"
-slots = 1
+slots = 1         # per-worker client ceiling; default 1, max 8; combined cap is the sum
 herdr = false     # default false: show this worker's turns in its own herdr sidebar
 ```
 
@@ -158,9 +266,12 @@ The design behind both keys is in [the herdr reporter design](superpowers/specs/
 
 - A task worktree is isolation for your repository, not a security boundary: agent turns run with the worker account's full access. Only dispatch prompts you trust, on machines you own.
 - Your working tree is never modified. Results arrive as remote-tracking refs; merging is your decision.
+- You own SDKs, tools, auth, and secrets. Optional `[setup]` does not install arbitrary packages.
+- Agent-reported checks are not independent verification. Review summary, diff, and fetch ref before you accept.
 - Workers hold a bare mirror per project, a worktree per task, agent sessions, and bounded logs. `worker gc` previews and reclaims them: idle open tasks after 7 days, result branches after 30 days or on `close --discard`.
 - The CLI adds no secrets to its own diagnostics, redacts worker paths from agent summaries, and refuses insecure profiles. Application logs can still contain whatever the agent printed.
 - `worker task reconcile` repairs task ownership after a laptop reboot. `worker setup` updates helpers; older host layouts may require the steps in [installation recovery](setup-recovery.md).
+- The laptop owns the queue in the default (controller-disabled) mode. A remote controller that keeps the queue after laptop disconnect is not in this release.
 
 ## Plain remote commands
 

@@ -29,8 +29,8 @@ Size limits. Keep every task inside them:
 | `timeout` | one turn | default `45m`, max `24h` |
 | `max_turns`, `max_budget_usd` | one turn | only agents that support them; otherwise recorded as unsupported |
 | `max_followups` | one task | default `10` |
-| `max_parallel` | one run | caps how many of its tasks may be active at once; cannot exceed `sum(worker.slots)` |
-| host slots | one worker | default `1`; operator may set `1..=8`. Same `task_id` is serialized (`WORKSPACE_BUSY`). Distinct task IDs from one checkout may overlap when `slot_count >= 2`. |
+| `max_parallel` | one run | requested cap on how many of its tasks may be active at once. Default is `sum(worker.slots)`. An explicit `--max-parallel` / batch `max_parallel` may be any positive integer; it is not rejected for exceeding that sum. Extra tasks wait for host capacity. |
+| host slots | one worker | default `1` **per worker**; operator may set `1..=8` on that Mac. Combined detached runner cap is `sum(worker.slots)`. Same `task_id` is serialized (`WORKSPACE_BUSY`). Distinct task IDs from one checkout may overlap when that host’s `slot_count >= 2`. |
 | log bounds | one turn | 64 KiB chunks; event stream capped at 256 MiB with a 64 KiB tail |
 
 Keep prompts under 256 KiB. Keep requested output bounded. Do not rely on an unbounded transcript.
