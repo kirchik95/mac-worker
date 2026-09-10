@@ -164,11 +164,7 @@ impl<'a> FleetReconciler<'a> {
         let cached = self
             .client_state
             .admission_observation(&worker.name, now_millis, || {
-                let one_worker = Config {
-                    version: self.config.version,
-                    notifications: crate::config::NotificationsConfig::default(),
-                    workers: vec![worker.clone()],
-                };
+                let one_worker = self.config.with_workers(vec![worker.clone()]);
                 let health = WorkersService::new(SshTransport::new(self.remote.process_runner()))
                     .inspect(&one_worker)
                     .workers
@@ -1168,11 +1164,7 @@ impl<'a> RunService<'a> {
                 observed_at_millis,
                 || {
                     refreshed.set(true);
-                    let one_worker = Config {
-                        version: self.config.version,
-                        notifications: crate::config::NotificationsConfig::default(),
-                        workers: vec![worker.clone()],
-                    };
+                    let one_worker = self.config.with_workers(vec![worker.clone()]);
                     let report =
                         WorkersService::new(SshTransport::new(self.runner)).inspect(&one_worker);
                     let candidate =

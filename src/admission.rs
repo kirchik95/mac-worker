@@ -557,11 +557,7 @@ fn single_worker_config(
     config: &crate::config::Config,
     worker: &WorkerEntry,
 ) -> crate::config::Config {
-    crate::config::Config {
-        version: config.version,
-        notifications: crate::config::NotificationsConfig::default(),
-        workers: vec![worker.clone()],
-    }
+    config.with_workers(vec![worker.clone()])
 }
 
 fn request_budget(deadline: Instant, cap: Duration) -> Duration {
@@ -996,6 +992,7 @@ mod tests {
         crate::config::Config {
             version: 1,
             notifications: crate::config::NotificationsConfig::default(),
+            controller: crate::config::ControllerConfig::default(),
             workers,
         }
     }

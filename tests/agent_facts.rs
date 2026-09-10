@@ -627,6 +627,7 @@ fn unverified_cursor_login_reaches_facts_and_is_not_an_agent_capability() {
         &Config {
             version: 1,
             notifications: mac_worker::config::NotificationsConfig::default(),
+            controller: Default::default(),
             workers: vec![WorkerEntry {
                 name: "mini-1".into(),
                 ssh: "mac1".into(),
@@ -1501,6 +1502,7 @@ fn advertised_agent_capabilities(facts: AgentFacts) -> Vec<String> {
         &Config {
             version: 1,
             notifications: mac_worker::config::NotificationsConfig::default(),
+            controller: Default::default(),
             workers: vec![WorkerEntry {
                 name: "mini-1".into(),
                 ssh: "mac1".into(),

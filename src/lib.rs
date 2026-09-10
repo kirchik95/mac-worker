@@ -7,7 +7,7 @@ use std::{
 };
 
 use agent_settings::{AgentSettingsGetRequest, AgentSettingsSaveRequest, NativeAgentSettingsStore};
-use cli::{Cli, Command, HiddenComponent, HostCommand, TaskCommand};
+use cli::{Cli, Command, ControllerCommand, HiddenComponent, HostCommand, TaskCommand};
 use client_state::ClientStateStore;
 use config::{Config, WorkerEntry};
 use dashboard::command::{
@@ -68,6 +68,7 @@ pub mod auth_incidents;
 pub mod cli;
 pub mod client_state;
 pub mod config;
+pub mod controller;
 pub mod dashboard;
 pub mod doctor;
 pub mod error;
@@ -210,6 +211,7 @@ fn execute_with_context(
         }
         Command::Setup { hosts } => {
             let config = load_config(cli.config, runtime)?;
+            config.require_local_inventory()?;
             let selected = select_workers(&config, &hosts)?;
             let current_exe = std::env::current_exe()?;
             let workers = selected
@@ -224,6 +226,7 @@ fn execute_with_context(
         Command::Doctor { project, includes } => {
             let paths = discover_paths(cli.config, runtime)?;
             let config = Config::load(&paths.config)?;
+            config.require_local_inventory()?;
             let project = match project {
                 Some(project) => project,
                 None => runtime.current_dir()?,
@@ -262,6 +265,9 @@ fn execute_with_context(
         )),
         Command::Task { .. } => Err(WorkerError::Protocol(
             "public task commands require the stdio execution boundary".into(),
+        )),
+        Command::Controller { .. } => Err(WorkerError::Protocol(
+            "public controller commands require the stdio execution boundary".into(),
         )),
         Command::Runner { .. } => Err(WorkerError::Protocol(
             "hidden runner requires the stdio execution boundary".into(),
@@ -460,6 +466,11 @@ fn execute_with_context(
         } => Err(WorkerError::Protocol(
             "host outbox requires the stdio execution boundary".into(),
         )),
+        Command::Host {
+            command: HostCommand::ControllerRpc,
+        } => Err(WorkerError::Protocol(
+            "host controller-rpc requires the stdio execution boundary".into(),
+        )),
     }
 }
 
@@ -522,6 +533,7 @@ fn run_public_streaming_body(
     let json = cli.json;
     let paths = discover_paths(cli.config, runtime)?;
     let config = Config::load(&paths.config)?;
+    config.require_local_inventory()?;
     let client_state = ClientStateStore::open(&paths.state)?;
     let remote = RemoteJobClient::new(runner);
     let follow_runtime = SystemFollowRuntime;
@@ -697,6 +709,14 @@ pub fn run_with_stdio_in_context(
     if matches!(&cli.command, Command::Task { .. } | Command::Runner { .. }) {
         return run_task_command(cli, runner, runtime, stdout, stderr);
     }
+    if matches!(
+        &cli.command,
+        Command::Controller {
+            command: ControllerCommand::Run
+        }
+    ) {
+        return run_controller_command(cli.config, runtime, stdout, stderr);
+    }
     run_with_rsync_executor_in_context(
         cli,
         runner,
@@ -759,6 +779,71 @@ fn run_dashboard_command(
             write_error(stderr, &error);
             error.exit_code()
         }
+    }
+}
+
+fn run_controller_command(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        let state_root = paths.controller_state_root();
+        let _leader = crate::controller::ControllerLeader::acquire(&state_root)?;
+        let store = crate::controller::ControllerStore::open(&state_root)?;
+        store.resume_incomplete()?;
+        writeln!(stdout, "controller leader acquired").map_err(WorkerError::Io)?;
+        stdout.flush().map_err(WorkerError::Io)?;
+        let async_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(WorkerError::Io)?;
+        async_runtime.block_on(async {
+            let _ = tokio::signal::ctrl_c().await;
+        });
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            write_error(stderr, &error);
+            error.exit_code()
+        }
+    }
+}
+
+fn run_host_controller_rpc(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        crate::controller::serve_rpc(
+            &paths.controller_state_root(),
+            stdin,
+            stdout,
+            crate::controller::ControllerFault::None,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => 0,
+        Err(error) => match crate::controller::encode_json_frame(&versioned_host_error(&error)) {
+            Ok(frame) if stdout.write_all(&frame).is_ok() && stdout.flush().is_ok() => {
+                error.exit_code()
+            }
+            _ => {
+                write_error(stderr, &error);
+                crate::error::ExitKind::Io as u8
+            }
+        },
     }
 }
 
@@ -1526,6 +1611,14 @@ pub fn run_with_rsync_executor_in_context(
     if matches!(
         &cli.command,
         Command::Host {
+            command: HostCommand::ControllerRpc
+        }
+    ) {
+        return run_host_controller_rpc(cli.config, runtime, stdin, stdout, stderr);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
             command: HostCommand::Submit
         }
     ) {
@@ -1934,6 +2027,7 @@ fn inspect_configured_workers(
     clear_auth_incidents: bool,
 ) -> Result<WorkersInspection, WorkerError> {
     let config = load_config(config_override, runtime)?;
+    config.require_local_inventory()?;
     let transport = SshTransport::new(runner);
     let refresh = refresh.then(|| {
         config
@@ -2106,6 +2200,7 @@ fn run_gc_command(
     let result = (|| -> Result<GcFleetReport, WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
         let config = Config::load(&paths.config)?;
+        config.require_local_inventory()?;
         let client_state = ClientStateStore::open(&paths.state)?;
         let now = current_time_millis()?;
         let protected_repo_ids = protected_transfer_repo_ids(client_state.list_tasks()?);
@@ -3479,7 +3574,11 @@ mod tests {
 
     #[test]
     fn invalid_versions_and_empty_inventories_are_rejected() {
-        for contents in ["version = 2\nworkers = []", "version = 1\nworkers = []"] {
+        for contents in [
+            "version = 2\nworkers = []",
+            "version = 1\nworkers = []",
+            "version = 1",
+        ] {
             let config = Config::parse(contents).unwrap();
             assert!(matches!(config.validate(), Err(WorkerError::Config(_))));
         }

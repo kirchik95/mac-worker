@@ -2370,6 +2370,14 @@ where
     T::deserialize(Value::Object(object)).map_err(de::Error::custom)
 }
 
+/// Deserialize a JSON value, rejecting duplicate object keys instead of
+/// letting `serde_json::Value` keep the last duplicate.
+pub(crate) fn deserialize_unique_json<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Value, D::Error> {
+    UniqueValue::deserialize(deserializer).map(|UniqueValue(value)| value)
+}
+
 fn title_from_prompt(prompt: &str) -> TaskTitle {
     let line = prompt
         .lines()

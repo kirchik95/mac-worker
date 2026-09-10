@@ -45,6 +45,22 @@ impl PathLayout {
     pub fn host_state_root(&self) -> PathBuf {
         self.data.join(HOST_STATE_DIRECTORY)
     }
+
+    /// Returns the controller durable-request root. Sibling of `ClientStateStore`
+    /// so `validate_root_entries` stays closed.
+    #[must_use]
+    pub fn controller_state_root(&self) -> PathBuf {
+        self.state
+            .parent()
+            .map(|parent| parent.join("mac-worker-controller"))
+            .unwrap_or_else(|| self.data.join("controller"))
+    }
+
+    /// Laptop transport cache for controller operation envelopes. Not a task store.
+    #[must_use]
+    pub fn controller_cache_root(&self) -> PathBuf {
+        self.cache.join("controller")
+    }
 }
 
 fn env_path(env: &BTreeMap<OsString, OsString>, key: &str) -> Option<PathBuf> {
@@ -96,6 +112,14 @@ mod tests {
         assert_eq!(
             paths.data,
             PathBuf::from("/Users/tester/.local/share/mac-worker")
+        );
+        assert_eq!(
+            paths.controller_state_root(),
+            PathBuf::from("/Users/tester/.local/state/mac-worker-controller")
+        );
+        assert_eq!(
+            paths.controller_cache_root(),
+            PathBuf::from("/Users/tester/.cache/mac-worker/controller")
         );
     }
 

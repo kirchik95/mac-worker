@@ -16,6 +16,7 @@ fn config() -> Config {
     Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![WorkerEntry {
             name: "mini-1".into(),
             ssh: "mac1".into(),

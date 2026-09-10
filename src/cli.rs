@@ -112,6 +112,11 @@ pub enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    #[command(about = "Run the remote persistent controller on an always-on machine")]
+    Controller {
+        #[command(subcommand)]
+        command: ControllerCommand,
+    },
     #[command(hide = true)]
     Runner {
         task_id: HiddenComponent,
@@ -265,6 +270,12 @@ pub enum TaskCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ControllerCommand {
+    #[command(about = "Hold the controller leader lock and resume durable requests")]
+    Run,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum HostCommand {
     Probe,
     #[command(name = "gc")]
@@ -376,6 +387,8 @@ pub enum HostCommand {
         #[arg(num_args = 1.., allow_hyphen_values = true)]
         server_args: Vec<OsString>,
     },
+    #[command(name = "controller-rpc", hide = true)]
+    ControllerRpc,
 }
 
 #[derive(Clone)]

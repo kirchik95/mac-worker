@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use clap::Parser;
-use mac_worker::cli::{Cli, Command as WorkerCommand, HostCommand};
+use mac_worker::cli::{Cli, Command as WorkerCommand, ControllerCommand, HostCommand};
 use mac_worker::protocol::PROTOCOL_VERSION;
 use predicates::prelude::*;
 use std::path::PathBuf;
@@ -22,9 +22,20 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
         .stdout(predicate::str::contains("logs"))
         .stdout(predicate::str::contains("cancel"))
         .stdout(predicate::str::contains("gc"))
-        .stdout(predicate::str::contains("host").not());
+        .stdout(predicate::str::contains("controller"))
+        .stdout(predicate::str::contains("host").not())
+        .stdout(predicate::str::contains("controller-rpc").not());
 
-    for public_command in ["dashboard", "run", "status", "logs", "cancel", "task", "gc"] {
+    for public_command in [
+        "dashboard",
+        "run",
+        "status",
+        "logs",
+        "cancel",
+        "task",
+        "gc",
+        "controller",
+    ] {
         let mut command = Command::cargo_bin("worker").unwrap();
         command.args([public_command, "--help"]);
         command
@@ -101,7 +112,33 @@ fn host_follow_turn_parses_three_identifiers_and_stays_hidden() {
         .assert()
         .success()
         .stdout(predicate::str::contains("task-close"))
-        .stdout(predicate::str::contains("follow-turn").not());
+        .stdout(predicate::str::contains("follow-turn").not())
+        .stdout(predicate::str::contains("controller-rpc").not());
+}
+
+#[test]
+fn controller_run_is_public_and_controller_rpc_stays_hidden() {
+    let run = Cli::try_parse_from(["worker", "controller", "run"]).unwrap();
+    assert!(matches!(
+        run.command,
+        WorkerCommand::Controller {
+            command: ControllerCommand::Run
+        }
+    ));
+    let rpc = Cli::try_parse_from(["worker", "host", "controller-rpc"]).unwrap();
+    assert!(matches!(
+        rpc.command,
+        WorkerCommand::Host {
+            command: HostCommand::ControllerRpc
+        }
+    ));
+
+    let mut host_help = Command::cargo_bin("worker").unwrap();
+    host_help.args(["host", "--help"]);
+    host_help
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("controller-rpc").not());
 }
 
 #[test]

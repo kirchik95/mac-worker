@@ -350,6 +350,7 @@ fn config(workers: Vec<WorkerEntry>) -> Config {
     Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers,
     }
 }

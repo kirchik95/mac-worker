@@ -259,6 +259,7 @@ fn config_with_workers(count: usize) -> Config {
     Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: (1..=count)
             .map(|index| {
                 worker(
@@ -650,6 +651,7 @@ fn budgeted_requirement_inspection_keeps_inventory_first_stable_union() {
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker(
             "mini-1",
             "mac1",
@@ -780,6 +782,7 @@ fn two_slot_probe_with_one_busy_lease_is_ready_and_has_a_free_slot() {
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker("mini-1", "mac1", &[])],
     };
     let report = WorkersService::new(SshTransport::new(runner)).inspect(&config);
@@ -1129,6 +1132,7 @@ fn inventory_keeps_ready_and_failed_workers_in_config_order() {
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![
             worker("ready", "mac1", &["darwin-arm64"]),
             worker("offline", "mac2", &[]),
@@ -1207,6 +1211,7 @@ fn inspect_with_requirements_adds_project_capabilities_without_changing_inventor
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker("mini-1", "mac1", &["darwin-arm64"])],
     };
     let service = WorkersService::new(SshTransport::new(runner));
@@ -1250,6 +1255,7 @@ fn inspect_with_requirements_uses_inventory_first_stable_union_for_multiple_miss
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker(
             "mini-1",
             "mac1",

@@ -189,6 +189,7 @@ fn fleet_fixture() -> (
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker("mini-1"), worker("mini-2"), worker("mini-3")],
     };
     let ids = [job_id(1), job_id(2), job_id(3)];
@@ -560,6 +561,7 @@ fn fresh_protocol_compatible_capability_mismatch_still_repairs_known_jobs_and_cl
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker_with_capabilities("mini-2", &["gpu"])],
     };
     runner.unavailable_hosts.clear();
@@ -619,6 +621,7 @@ fn conflicting_remote_status_is_uncertain_and_not_reported_as_reconciled() {
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker("mini-1")],
     };
 
@@ -658,6 +661,7 @@ fn immutable_metadata_mismatch_is_uncertain_and_not_reported_as_reconciled() {
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker("mini-1")],
     };
 
@@ -737,6 +741,7 @@ fn terminal_recovery_matrix_is_authoritative_and_repeatable() {
         let config = Config {
             version: 1,
             notifications: mac_worker::config::NotificationsConfig::default(),
+            controller: Default::default(),
             workers: vec![worker("mini-1")],
         };
 
@@ -780,6 +785,7 @@ fn stale_admission_cache_is_refreshed_before_repairing_a_known_job() {
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker("mini-1")],
     };
     let stale = AdmissionObservation::new(
@@ -820,6 +826,7 @@ fn reconcile_timeout_retains_remote_uncertainty_and_affinity() {
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker("mini-2")],
     };
     store
@@ -875,6 +882,7 @@ fn cross_client_local_record_stops_fleet_recovery_before_remote_contact() {
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: vec![worker("mini-1")],
     };
 

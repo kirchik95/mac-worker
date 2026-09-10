@@ -16,7 +16,32 @@ pub struct Config {
     pub version: u32,
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    #[serde(default)]
     pub workers: Vec<WorkerEntry>,
+    #[serde(default)]
+    pub controller: ControllerConfig,
+}
+
+/// Laptop opt-in for a remote persistent controller reached over authenticated SSH.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ssh: String,
+    #[serde(default = "default_remote_binary")]
+    pub remote_binary: String,
+}
+
+impl Default for ControllerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ssh: String::new(),
+            remote_binary: default_remote_binary(),
+        }
+    }
 }
 
 /// Laptop-side notifications about finished turns.
@@ -80,7 +105,12 @@ impl Config {
                 self.version
             )));
         }
+
+        self.controller.validate()?;
         if self.workers.is_empty() {
+            if self.controller.enabled {
+                return Ok(());
+            }
             return Err(WorkerError::Config(
                 "at least one worker is required".into(),
             ));
@@ -145,6 +175,27 @@ impl Config {
         self.workers.iter().find(|worker| worker.name == name)
     }
 
+    /// Local `run`, `setup`, and `workers` still need the laptop inventory.
+    /// Controller-only configs omit `[[workers]]`; the controller host owns
+    /// the dispatch list.
+    pub fn require_local_inventory(&self) -> Result<(), WorkerError> {
+        if self.workers.is_empty() {
+            return Err(WorkerError::Config(
+                "at least one worker is required".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_workers(&self, workers: Vec<WorkerEntry>) -> Self {
+        Self {
+            version: self.version,
+            notifications: self.notifications.clone(),
+            workers,
+            controller: self.controller.clone(),
+        }
+    }
+
     pub fn configured_runner_slots(&self) -> usize {
         self.workers
             .iter()
@@ -157,6 +208,26 @@ impl Config {
             .iter()
             .map(|worker| (worker.name.clone(), worker.slots))
             .collect()
+    }
+}
+
+impl ControllerConfig {
+    fn validate(&self) -> Result<(), WorkerError> {
+        if self.remote_binary != REMOTE_BINARY {
+            return Err(WorkerError::Config(format!(
+                "controller must use remote_binary {REMOTE_BINARY:?}"
+            )));
+        }
+        if !self.enabled && self.ssh.is_empty() {
+            return Ok(());
+        }
+        if !valid_ssh_destination(&self.ssh) {
+            return Err(WorkerError::Config(format!(
+                "invalid controller SSH destination {:?}",
+                self.ssh
+            )));
+        }
+        Ok(())
     }
 }
 

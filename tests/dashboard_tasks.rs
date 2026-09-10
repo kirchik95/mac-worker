@@ -1130,6 +1130,7 @@ fn config_with_workers(names: &[&str]) -> Config {
     let config = Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
+        controller: Default::default(),
         workers: names
             .iter()
             .map(|name| WorkerEntry {

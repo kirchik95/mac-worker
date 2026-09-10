@@ -82,6 +82,7 @@ pub enum HostOperation {
     Reconcile,
     AgentSettingsGet,
     AgentSettingsSet,
+    ControllerRpc,
 }
 
 impl HostOperation {
@@ -111,6 +112,7 @@ impl HostOperation {
             Self::Reconcile => "~/.local/bin/worker host reconcile",
             Self::AgentSettingsGet => "~/.local/bin/worker host agent-settings-get",
             Self::AgentSettingsSet => "~/.local/bin/worker host agent-settings-set",
+            Self::ControllerRpc => "~/.local/bin/worker host controller-rpc",
         }
     }
 }
