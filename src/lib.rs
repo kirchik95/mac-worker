@@ -3996,12 +3996,14 @@ fn run_enabled_controller_task(
                 crate::controller::stream_nested_source(
                     runner,
                     &config.controller,
-                    source.request_id(),
-                    &fingerprint,
+                    crate::controller::SourceSubmitBind {
+                        request_id: source.request_id(),
+                        fingerprint: &fingerprint,
+                        project_id: source.project_id(),
+                        worktree_id: source.worktree_id(),
+                        expected_oid: source.expected_oid(),
+                    },
                     source.git_path(),
-                    source.project_id(),
-                    source.worktree_id(),
-                    source.expected_oid(),
                 )?;
             }
             let ack = crate::controller::send_controller_request(

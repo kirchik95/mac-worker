@@ -15,7 +15,7 @@ use crate::{
             ControllerResultPrepareResult, ControllerSourceFinishResult,
             ControllerSourcePrepareResult,
         },
-        transfer::{VerifiedResultMeta, import_controller_result},
+        transfer::{SourceSubmitBind, VerifiedResultMeta, import_controller_result},
     },
     error::WorkerError,
     git_transport::GitTransport,
@@ -43,12 +43,14 @@ pub fn stream_source_receive(
     stream_nested_source(
         runner,
         controller,
-        operation.request_id(),
-        &fingerprint,
+        SourceSubmitBind {
+            request_id: operation.request_id(),
+            fingerprint: &fingerprint,
+            project_id,
+            worktree_id,
+            expected_oid: oid,
+        },
         local_git,
-        project_id,
-        worktree_id,
-        oid,
     )
 }
 
@@ -58,27 +60,30 @@ pub fn stream_source_receive(
 pub fn stream_nested_source(
     runner: &dyn ProcessRunner,
     controller: &ControllerConfig,
-    request_id: &str,
-    fingerprint: &RequestFingerprint,
+    bind: SourceSubmitBind<'_>,
     local_git: &Path,
-    project_id: &str,
-    worktree_id: &str,
-    oid: &BaseOid,
 ) -> Result<(), WorkerError> {
     let prepare = transfer_request(
         "controller.transfer.source.prepare",
         json!({
-            "request_id": request_id,
-            "fingerprint": fingerprint.as_str(),
-            "project_id": project_id,
-            "worktree_id": worktree_id,
-            "expected_oid": oid.as_str(),
+            "request_id": bind.request_id,
+            "fingerprint": bind.fingerprint.as_str(),
+            "project_id": bind.project_id,
+            "worktree_id": bind.worktree_id,
+            "expected_oid": bind.expected_oid.as_str(),
         }),
     )?;
     let identity =
         send_controller_read::<ControllerSourcePrepareResult>(runner, controller, &prepare)?
             .into_result();
-    require_source_bind(&identity, request_id, fingerprint.as_str(), project_id, worktree_id, oid)?;
+    require_source_bind(
+        &identity,
+        bind.request_id,
+        bind.fingerprint.as_str(),
+        bind.project_id,
+        bind.worktree_id,
+        bind.expected_oid,
+    )?;
     let worker = controller_worker_entry(controller)?;
     let ssh = SshTransport::new(runner).git_ssh_command(&worker)?;
     GitTransport::new(runner).push_controller_source(
@@ -86,22 +91,22 @@ pub fn stream_nested_source(
         &worker.ssh,
         &worker.remote_binary,
         identity.token(),
-        request_id,
-        fingerprint,
-        project_id,
-        worktree_id,
-        oid,
+        bind.request_id,
+        bind.fingerprint,
+        bind.project_id,
+        bind.worktree_id,
+        bind.expected_oid,
         local_git,
     )?;
     let finish = transfer_request(
         "controller.transfer.source.finish",
         json!({
             "token": identity.token(),
-            "request_id": request_id,
-            "fingerprint": fingerprint.as_str(),
-            "project_id": project_id,
-            "worktree_id": worktree_id,
-            "expected_oid": oid.as_str(),
+            "request_id": bind.request_id,
+            "fingerprint": bind.fingerprint.as_str(),
+            "project_id": bind.project_id,
+            "worktree_id": bind.worktree_id,
+            "expected_oid": bind.expected_oid.as_str(),
         }),
     )?;
     let receipt =
@@ -111,8 +116,8 @@ pub fn stream_nested_source(
         receipt.request_id(),
         receipt.oid(),
         receipt.request_ref(),
-        request_id,
-        oid,
+        bind.request_id,
+        bind.expected_oid,
     )
 }
 

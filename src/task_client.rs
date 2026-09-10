@@ -2503,13 +2503,13 @@ impl<'a> TaskClient<'a> {
         // rollback marker is a stronger terminal form of that intent. Both
         // are safe to compensate only while the turn is still pre-handoff.
         for record in &selection.records {
-            if !submission_recovery_pending(&record) {
+            if !submission_recovery_pending(record) {
                 continue;
             }
-            let expected_turn_id = submission_recovery_turn_id(&record);
+            let expected_turn_id = submission_recovery_turn_id(record);
             self.client_state
                 .submission_intent_reconciliation_before_transfer_lock();
-            let Ok(transfer) = self.transfer_for_record(&record) else {
+            let Ok(transfer) = self.transfer_for_record(record) else {
                 continue;
             };
             self.client_state
@@ -2671,7 +2671,7 @@ impl<'a> TaskClient<'a> {
                 }
                 self.refresh_task_status(&self.client_state.load_task(record.meta().task_id())?)?;
             } else {
-                self.refresh_task_status(&record)?;
+                self.refresh_task_status(record)?;
             }
         }
 
@@ -4434,20 +4434,6 @@ impl<'a> TaskClient<'a> {
         )?;
         self.client_state.remove_turn_prompt(task, turn)?;
         Ok(())
-    }
-
-    fn rollback_followup(
-        &self,
-        committed_active: &LocalTaskRecord,
-        previous_open: &LocalTaskRecord,
-        task_id: TaskId,
-        turn_id: TurnId,
-    ) {
-        let _ = self.client_state.remove_queued(turn_id);
-        let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
-        let _ = self
-            .client_state
-            .update_task_if_current(committed_active, previous_open.clone());
     }
 
     fn rollback_submission(
