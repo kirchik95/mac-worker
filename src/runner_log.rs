@@ -483,6 +483,8 @@ pub(crate) fn read_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
     fn setup() -> (tempfile::TempDir, TaskId, TurnId) {
         let d = tempfile::tempdir().unwrap();
         std::fs::set_permissions(
@@ -494,8 +496,14 @@ mod tests {
     }
     #[test]
     fn pending_crash_windows_recover_without_replay() {
+        const WAIT_DEADLINE: Duration = Duration::from_secs(10);
+
         for written in [0, 2, 5] {
             let (d, t, u) = setup();
+            // Keep the fork exclusion through the recovery open: dropping the
+            // writer releases its nested guard before the journal FD is
+            // reacquired unless this outer guard remains in place.
+            let _fork_exclusion = crate::test_sync::HeldFlock::acquire();
             let mut w = RunnerLog::open(d.path(), t, u).unwrap();
             w.append_bytes(b"before").unwrap();
             let mut intent = w.journal.clone();
@@ -511,7 +519,16 @@ mod tests {
             w.file.sync_all().unwrap();
             assert_eq!(snapshot(d.path(), t, u).unwrap().unwrap().len, 6);
             drop(w);
-            let w = RunnerLog::open(d.path(), t, u).unwrap();
+            let deadline = Instant::now() + WAIT_DEADLINE;
+            let w = loop {
+                match RunnerLog::try_open(d.path(), t, u).unwrap() {
+                    Some(w) => break w,
+                    None if Instant::now() < deadline => std::thread::yield_now(),
+                    None => {
+                        panic!("journal lock did not become available within {WAIT_DEADLINE:?}")
+                    }
+                }
+            };
             assert_eq!(w.offsets(), [5, 0]);
             assert_eq!(
                 w.dir.read_private_regular(&w.name, 100).unwrap(),
