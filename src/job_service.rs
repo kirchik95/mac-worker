@@ -416,7 +416,7 @@ impl<'a> JobService<'a> {
                 let (meta, status) = self.read_exact_job(&submit, &lease)?;
                 if status.state().is_terminal() {
                     let authoritative =
-                        self.status_from_accepted_after(admission, disposition, true)?;
+                        self.status_from_accepted_after(admission, disposition, true, false)?;
                     return Ok(TaskTurnResponse::new(
                         SubmitResponse::Existing {
                             status: authoritative.response.status().clone(),
@@ -472,7 +472,8 @@ impl<'a> JobService<'a> {
                     task_status,
                 ));
             }
-            let authoritative = self.status_from_accepted_after(admission, disposition, true)?;
+            let authoritative =
+                self.status_from_accepted_after(admission, disposition, true, false)?;
             return Ok(TaskTurnResponse::new(
                 SubmitResponse::Existing {
                     status: authoritative.response.status().clone(),
@@ -673,7 +674,7 @@ impl<'a> JobService<'a> {
     }
 
     pub fn status(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
-        self.authoritative_job_with_supervisor_ensure(job_id, true)
+        self.authoritative_job_with_supervisor_ensure(job_id, true, false)
             .map(AuthoritativeJob::into_response)
     }
 
@@ -684,7 +685,7 @@ impl<'a> JobService<'a> {
         offset: u64,
         limit: u32,
     ) -> Result<LogChunk, WorkerError> {
-        let authoritative = self.authoritative_job_with_supervisor_ensure(job_id, true)?;
+        let authoritative = self.authoritative_job_with_supervisor_ensure(job_id, true, false)?;
         if let Some(boundary) = &self.log_read_boundary {
             boundary();
         }
@@ -734,7 +735,7 @@ impl<'a> JobService<'a> {
     }
 
     pub fn reconcile_job(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
-        self.authoritative_job_with_supervisor_ensure(job_id, true)
+        self.authoritative_job_with_supervisor_ensure(job_id, true, true)
             .map(AuthoritativeJob::into_response)
     }
 
@@ -1136,8 +1137,12 @@ impl<'a> JobService<'a> {
         let disposition = self.store.disposition(identity.job_id())?;
         if let Some(disposition @ JobDisposition::Accepted { .. }) = disposition {
             self.require_resolution_accepted_after(&admission, &identity, &disposition)?;
-            let authoritative =
-                self.status_from_accepted_after(admission, disposition, ensure_supervisor)?;
+            let authoritative = self.status_from_accepted_after(
+                admission,
+                disposition,
+                ensure_supervisor,
+                ensure_supervisor,
+            )?;
             require_resolution_response(&identity, &authoritative.response)?;
             return ResolveOrAbandonResponse::accepted(authoritative.into_response());
         }
@@ -1163,6 +1168,7 @@ impl<'a> JobService<'a> {
                 admission,
                 identity.job_id(),
                 ensure_supervisor,
+                ensure_supervisor,
             )?;
             require_resolution_response(&identity, &authoritative.response)?;
             return ResolveOrAbandonResponse::accepted(authoritative.into_response());
@@ -1181,8 +1187,12 @@ impl<'a> JobService<'a> {
         if let Some(disposition @ JobDisposition::Accepted { .. }) = disposition {
             self.require_resolution_accepted_after(&admission, &identity, &disposition)?;
             drop(transfer);
-            let authoritative =
-                self.status_from_accepted_after(admission, disposition, ensure_supervisor)?;
+            let authoritative = self.status_from_accepted_after(
+                admission,
+                disposition,
+                ensure_supervisor,
+                ensure_supervisor,
+            )?;
             require_resolution_response(&identity, &authoritative.response)?;
             return ResolveOrAbandonResponse::accepted(authoritative.into_response());
         }
@@ -1221,6 +1231,7 @@ impl<'a> JobService<'a> {
                 let authoritative = self.status_without_disposition_after(
                     admission,
                     identity.job_id(),
+                    ensure_supervisor,
                     ensure_supervisor,
                 )?;
                 require_resolution_response(&identity, &authoritative.response)?;
@@ -1544,6 +1555,7 @@ impl<'a> JobService<'a> {
         &self,
         job_id: JobId,
         ensure_supervisor: bool,
+        require_cleanup: bool,
     ) -> Result<AuthoritativeJob, WorkerError> {
         let admission = self.store.admission_lock(job_id)?;
         match self.store.disposition(job_id).map_err(|error| {
@@ -1558,10 +1570,20 @@ impl<'a> JobService<'a> {
                 "job ID was permanently abandoned",
             )),
             Some(disposition @ JobDisposition::Accepted { .. }) => {
-                self.status_from_accepted_after(admission, disposition, ensure_supervisor)
+                self.status_from_accepted_after(
+                    admission,
+                    disposition,
+                    ensure_supervisor,
+                    require_cleanup,
+                )
             }
             None => {
-                self.status_without_disposition_after(admission, job_id, ensure_supervisor)
+                self.status_without_disposition_after(
+                    admission,
+                    job_id,
+                    ensure_supervisor,
+                    require_cleanup,
+                )
             }
         }
     }
@@ -1571,6 +1593,7 @@ impl<'a> JobService<'a> {
         admission: AdmissionGuard,
         job_id: JobId,
         ensure_supervisor: bool,
+        require_cleanup: bool,
     ) -> Result<AuthoritativeJob, WorkerError> {
         admission.validate_for(job_id)?;
         let Some(lease) = self
@@ -1642,7 +1665,7 @@ impl<'a> JobService<'a> {
             meta.created_at_millis(),
         )?;
         drop(published);
-        self.authoritative_job_with_supervisor_ensure(job_id, ensure_supervisor)
+        self.authoritative_job_with_supervisor_ensure(job_id, ensure_supervisor, require_cleanup)
     }
 
     fn status_from_accepted_after(
@@ -1650,6 +1673,7 @@ impl<'a> JobService<'a> {
         admission: AdmissionGuard,
         disposition: JobDisposition,
         ensure_supervisor: bool,
+        require_cleanup: bool,
     ) -> Result<AuthoritativeJob, WorkerError> {
         let JobDisposition::Accepted {
             job_id,
@@ -1740,7 +1764,7 @@ impl<'a> JobService<'a> {
         if current != status {
             drop(supervisor);
             drop(admission);
-            return self.authoritative_job_with_supervisor_ensure(job_id, false);
+            return self.authoritative_job_with_supervisor_ensure(job_id, false, false);
         }
         if !identityless_accepted {
             if current.state().is_terminal() {
@@ -1793,8 +1817,17 @@ impl<'a> JobService<'a> {
                     let _ = cleanup;
                     return Err(error);
                 }
-                cleanup?;
-                return AuthoritativeJob::new(job, meta, current);
+                // Terminal log/status reads still retry cleanup so a leftover
+                // FIFO can be drained later, but they must not fail the read.
+                // Reconcile and resolution keep returning the cleanup error so
+                // the busy lease stays the operator-visible signal.
+                return Self::authoritative_after_terminal_cleanup(
+                    job,
+                    meta,
+                    current,
+                    cleanup,
+                    require_cleanup,
+                );
             }
             let supervisor_identity = current.supervisor_identity().ok_or_else(|| {
                 job_state_invalid("nonterminal supervised job has no supervisor identity")
@@ -1889,9 +1922,9 @@ impl<'a> JobService<'a> {
         )?;
         drop(admission);
         match self.launch_after_election(job_id, supervisor, &request, &lease, &verified, false) {
-            Ok(_) => self.authoritative_job_with_supervisor_ensure(job_id, false),
+            Ok(_) => self.authoritative_job_with_supervisor_ensure(job_id, false, false),
             Err(error) if matches!(&error, WorkerError::Protocol(message) if message.starts_with("SUPERVISOR_PRELAUNCH_FAILED:")) => {
-                match self.authoritative_job_with_supervisor_ensure(job_id, false) {
+                match self.authoritative_job_with_supervisor_ensure(job_id, false, false) {
                     Ok(authoritative) if authoritative.response.status() != &status => {
                         Ok(authoritative)
                     }
@@ -1900,6 +1933,23 @@ impl<'a> JobService<'a> {
                 }
             }
             Err(error) => Err(error),
+        }
+    }
+
+    fn authoritative_after_terminal_cleanup(
+        job: RootedDir,
+        meta: JobMeta,
+        current: JobStatus,
+        cleanup: Result<(), WorkerError>,
+        require_cleanup: bool,
+    ) -> Result<AuthoritativeJob, WorkerError> {
+        match cleanup {
+            Ok(()) => AuthoritativeJob::new(job, meta, current),
+            Err(error) if require_cleanup => Err(error),
+            Err(_) => {
+                let observed = read_mutable_canonical_json(&job, "status.json").unwrap_or(current);
+                AuthoritativeJob::new(job, meta, observed)
+            }
         }
     }
 
