@@ -852,26 +852,54 @@ impl<'a> TaskStore<'a> {
         // installation then session; acquire never takes session.
         let _capacity = self.store.capacity_lock()?;
         let _session_lock = self.store.session_lock()?;
-        self.close_locked(request)
+        self.close_locked(request, None)
     }
 
-    fn close_locked(&self, request: &TaskCloseRequest) -> Result<TaskCloseResponse, WorkerError> {
+    /// Close after this turn's result is already durable. Public `close`
+    /// still treats any live task-scope lease as `TASK_BUSY`; the publisher
+    /// may ignore only `own_job`'s lease, which still occupies the slot
+    /// until supervisor cleanup (pin-before-release).
+    pub(crate) fn close_after_own_terminal_turn(
+        &self,
+        request: &TaskCloseRequest,
+        own_job: JobId,
+    ) -> Result<TaskCloseResponse, WorkerError> {
+        request.validate()?;
+        if request.discard() {
+            return Err(task_error("TASK_BUSY", "own-terminal close cannot discard"));
+        }
+        let _capacity = self.store.capacity_lock()?;
+        let _session_lock = self.store.session_lock()?;
+        self.close_locked(request, Some(own_job))
+    }
+
+    fn close_locked(
+        &self,
+        request: &TaskCloseRequest,
+        own_job: Option<JobId>,
+    ) -> Result<TaskCloseResponse, WorkerError> {
         let task = self.open_existing_task(request.project_id(), request.task_id())?;
         let status = self.read_status(&task)?;
         if status.state() == TaskState::Active {
             return Err(task_error("TASK_BUSY", "task has an active turn"));
         }
-        if LeaseService::new(self.store)
-            .task_scope_is_live(request.project_id(), request.task_id())?
-        {
+        if let Some(job) = own_job {
+            let Some(last) = status.turns().last() else {
+                return Err(task_error("TASK_BUSY", "task has no turn history"));
+            };
+            if last.turn_id() != job || last.terminal().is_none() {
+                return Err(task_error(
+                    "TASK_BUSY",
+                    "own-terminal close does not match the published turn",
+                ));
+            }
+        }
+        if self.live_foreign_task_scope(request.project_id(), request.task_id(), own_job)? {
             return Err(task_error("TASK_BUSY", "task has a live execution lease"));
         }
         if request.discard()
-            && OriginOutbox::new(self.store, self.runner).retains(
-                request.project_id(),
-                request.task_id(),
-                now_millis()?,
-            )?
+            && OriginOutbox::new(self.store, self.runner)
+                .discard_blocked(request.project_id(), request.task_id())?
         {
             return Err(task_error("TASK_BUSY", "DELIVERY_PENDING"));
         }
@@ -923,6 +951,20 @@ impl<'a> TaskStore<'a> {
         let deliveries = OriginOutbox::new(self.store, self.runner)
             .deliveries(request.project_id(), request.task_id())?;
         Ok(TaskCloseResponse::with_warnings(status, warnings).with_deliveries(deliveries))
+    }
+
+    fn live_foreign_task_scope(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        except_job: Option<JobId>,
+    ) -> Result<bool, WorkerError> {
+        Ok(LeaseService::new(self.store)
+            .occupied_slots()?
+            .iter()
+            .any(|slot| {
+                slot.owns_task(project_id, task_id) && except_job != Some(slot.lease.job_id())
+            }))
     }
 
     /// Closes an idle open task as part of retention GC.  Retention closure

@@ -21,8 +21,8 @@ use mac_worker::{
     git_transport::{GitTransport, OBJECT_STORE_SYNC_RECEIPT},
     host_store::{HostGc, HostStore, HostStoreWritePoint},
     job::{
-        ClientId, CommandSpec, JobId, JobState, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseRecord, LeaseToken, RequestFingerprintMaterial, SubmitRequest,
+        ClientId, CommandSpec, ExecutionScope, JobId, JobState, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseRecord, LeaseToken, RequestFingerprintMaterial, SubmitRequest,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService, SlotState},
@@ -325,7 +325,7 @@ fn admissions() -> AdmissionFacts {
     }
 }
 
-fn lease_request(job: JobId) -> LeaseAcquireRequest {
+fn lease_request(job: JobId, task: TaskId) -> LeaseAcquireRequest {
     LeaseAcquireRequest::new(
         RequestFingerprintMaterial::new(
             job,
@@ -343,12 +343,17 @@ fn lease_request(job: JobId) -> LeaseAcquireRequest {
         )
         .unwrap(),
     )
+    .with_execution_scope(ExecutionScope::task(task))
 }
 
 fn acquire_lease(store: &HostStore, job: JobId) -> LeaseAcquireRequest {
-    let request = lease_request(job);
+    acquire_task_lease(store, job, task_id(1))
+}
+
+fn acquire_task_lease(store: &HostStore, job: JobId, task: TaskId) -> LeaseAcquireRequest {
+    let request = lease_request(job, task);
     LeaseService::new(store)
-        .acquire(&request, &admissions(), 1)
+        .acquire(&request, &admissions(), wall_clock_millis())
         .unwrap();
     request
 }
@@ -492,7 +497,7 @@ fn prepare_task(
     job: JobId,
     base_oid: &BaseOid,
 ) -> LeaseAcquireRequest {
-    let request = acquire_lease(store, job);
+    let request = acquire_task_lease(store, job, task);
     let admission = store.admission_lock(job).unwrap();
     let transfer = store.transfer_lock_after(&admission, job).unwrap();
     TaskStore::new(store, &SystemProcessRunner)
@@ -626,7 +631,8 @@ fn prepared_origin_push_turn(
     let projected = turn.v1_material(&seed_lease, &launch).unwrap();
     LeaseService::new(store)
         .acquire(
-            &LeaseAcquireRequest::new(projected.clone()),
+            &LeaseAcquireRequest::new(projected.clone())
+                .with_execution_scope(ExecutionScope::task(task_id(1))),
             &admissions(),
             wall_clock_millis(),
         )
@@ -664,7 +670,7 @@ fn prepared_origin_push_turn(
     drop(transfer);
     drop(admission);
     TaskTurnRequest::new_with_origin(
-        SubmitRequest::new(projected),
+        SubmitRequest::new(projected).with_execution_scope(ExecutionScope::task(task_id(1))),
         turn,
         prompt,
         Some(origin_url.to_owned()),
@@ -1076,6 +1082,397 @@ fn crash_after_intent_re_pins_before_push() {
         store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
         &pin
     ));
+}
+
+#[test]
+fn submit_turn_after_outbox_intent_does_not_synthesize_done() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let store = HostStore::open(&host).unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"one\n");
+    source.commit_all("one");
+    let oid: BaseOid = git(source.root(), &["rev-parse", "HEAD"]).parse().unwrap();
+    push_base(&source, &store, PROJECT_ID, task_id(1), "HEAD");
+    let (_origin_dir, origin) = origin_bare();
+    let origin_url = file_url(&origin);
+    let request = prepared_origin_push_turn(&store, &origin_url, &oid);
+    drop(store);
+    let store =
+        HostStore::open_with_write_fault(&host, HostStoreWritePoint::AfterOutboxIntent).unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(response.task().summary(), Some("finished"));
+    assert!(
+        !matches!(
+            response.task().last_outcome(),
+            Some(TaskOutcome::Failed { reason }) if reason == "PUBLISH_FAILED"
+        ),
+        "one-shot AfterOutboxIntent must repair via commit_intent, not synthesize Done or PUBLISH_FAILED"
+    );
+    let pin = OriginOutbox::delivery_refs(task_id(1), turn_id(2));
+    assert!(ref_exists(
+        store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
+        &pin
+    ));
+    assert_eq!(
+        LeaseService::new(&store).occupancy().unwrap().slot_state,
+        SlotState::Idle
+    );
+    let delivered = outbox(&store).pump_due(1).unwrap();
+    assert_eq!(delivered[0].state(), DeliveryState::Delivered);
+}
+
+#[test]
+fn submit_turn_after_outbox_pin_keeps_done_and_pending_delivery() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let store = HostStore::open(&host).unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"one\n");
+    source.commit_all("one");
+    let oid: BaseOid = git(source.root(), &["rev-parse", "HEAD"]).parse().unwrap();
+    push_base(&source, &store, PROJECT_ID, task_id(1), "HEAD");
+    let (_origin_dir, origin) = origin_bare();
+    let origin_url = file_url(&origin);
+    let request = prepared_origin_push_turn(&store, &origin_url, &oid);
+    drop(store);
+    let store =
+        HostStore::open_with_write_fault(&host, HostStoreWritePoint::AfterOutboxPin).unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(response.task().summary(), Some("finished"));
+    assert_eq!(response.task().state(), TaskState::Open);
+    let pin = OriginOutbox::delivery_refs(task_id(1), turn_id(2));
+    assert!(ref_exists(
+        store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
+        &pin
+    ));
+    let delivery = outbox(&store).dto(PROJECT_ID, task_id(1)).unwrap().unwrap();
+    assert_eq!(delivery.state(), DeliveryState::Pending);
+    assert_eq!(
+        LeaseService::new(&store).occupancy().unwrap().slot_state,
+        SlotState::Idle
+    );
+    let delivered = outbox(&store).pump_due(1).unwrap();
+    assert_eq!(delivered[0].state(), DeliveryState::Delivered);
+}
+
+#[test]
+fn submit_turn_visible_pin_before_fsync_stays_recoverable() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let store = HostStore::open(&host).unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"one\n");
+    source.commit_all("one");
+    let oid: BaseOid = git(source.root(), &["rev-parse", "HEAD"]).parse().unwrap();
+    push_base(&source, &store, PROJECT_ID, task_id(1), "HEAD");
+    let (_origin_dir, origin) = origin_bare();
+    let origin_url = file_url(&origin);
+    let request = prepared_origin_push_turn(&store, &origin_url, &oid);
+    drop(store);
+    let store = HostStore::open_with_write_faults(
+        &host,
+        HostStoreWritePoint::AfterOutboxUpdateRef,
+        HostStoreWritePoint::AfterOutboxUpdateRef,
+    )
+    .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    JobService::new(&store, &launcher)
+        .submit_turn(request.clone())
+        .unwrap_err();
+    let status = TaskStore::new(&store, &SystemProcessRunner)
+        .load_status(PROJECT_ID, task_id(1))
+        .unwrap();
+    assert_ne!(status.last_outcome(), Some(&TaskOutcome::Done));
+    assert!(
+        !matches!(
+            status.last_outcome(),
+            Some(TaskOutcome::Failed { reason }) if reason == "PUBLISH_FAILED"
+        ),
+        "visible pin before fsync must not terminalize Done or PUBLISH_FAILED, got {:?}",
+        status.last_outcome()
+    );
+    let pin = OriginOutbox::delivery_refs(task_id(1), turn_id(2));
+    assert!(
+        ref_exists(
+            store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
+            &pin
+        ),
+        "update-ref must be visible before the durability barrier fails"
+    );
+    assert_eq!(
+        LeaseService::new(&store).occupancy().unwrap().slot_state,
+        SlotState::Busy
+    );
+    assert!(
+        store
+            .job(PROJECT_ID, WORKTREE_ID, turn_id(2))
+            .unwrap()
+            .join("execution.json")
+            .is_file()
+    );
+    drop(store);
+    let store = HostStore::open(&host).unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(response.task().summary(), Some("finished"));
+    assert_eq!(
+        LeaseService::new(&store).occupancy().unwrap().slot_state,
+        SlotState::Idle
+    );
+    assert!(ref_exists(
+        store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
+        &pin
+    ));
+    let delivered = outbox(&store).pump_due(1).unwrap();
+    assert_eq!(delivered[0].state(), DeliveryState::Delivered);
+}
+
+#[test]
+fn submit_turn_visible_intent_before_parent_sync_stays_recoverable() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join("host");
+    let store = HostStore::open(&host).unwrap();
+    let source = GitRepo::init();
+    source.write("base.txt", b"one\n");
+    source.commit_all("one");
+    let oid: BaseOid = git(source.root(), &["rev-parse", "HEAD"]).parse().unwrap();
+    push_base(&source, &store, PROJECT_ID, task_id(1), "HEAD");
+    let (_origin_dir, origin) = origin_bare();
+    let origin_url = file_url(&origin);
+    let request = prepared_origin_push_turn(&store, &origin_url, &oid);
+    drop(store);
+    let store = HostStore::open_with_write_faults(
+        &host,
+        HostStoreWritePoint::AfterOutboxIntentPublish,
+        HostStoreWritePoint::AfterOutboxIntentPublish,
+    )
+    .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    JobService::new(&store, &launcher)
+        .submit_turn(request.clone())
+        .unwrap_err();
+    let status = TaskStore::new(&store, &SystemProcessRunner)
+        .load_status(PROJECT_ID, task_id(1))
+        .unwrap();
+    assert_ne!(status.last_outcome(), Some(&TaskOutcome::Done));
+    assert!(
+        !matches!(
+            status.last_outcome(),
+            Some(TaskOutcome::Failed { reason }) if reason == "PUBLISH_FAILED"
+        ),
+        "visible intent before parent sync must not terminalize Done or PUBLISH_FAILED, got {:?}",
+        status.last_outcome()
+    );
+    assert!(
+        outbox(&store)
+            .dto(PROJECT_ID, task_id(1))
+            .unwrap()
+            .is_some(),
+        "intent name is visible before delivery/task directory sync"
+    );
+    let pin = OriginOutbox::delivery_refs(task_id(1), turn_id(2));
+    assert!(
+        !ref_exists(
+            store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
+            &pin
+        ),
+        "parent-sync failure must run before pin publication"
+    );
+    assert_eq!(
+        LeaseService::new(&store).occupancy().unwrap().slot_state,
+        SlotState::Busy
+    );
+    assert!(
+        store
+            .job(PROJECT_ID, WORKTREE_ID, turn_id(2))
+            .unwrap()
+            .join("execution.json")
+            .is_file()
+    );
+    drop(store);
+    let store = HostStore::open(&host).unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(response.task().summary(), Some("finished"));
+    assert_eq!(
+        LeaseService::new(&store).occupancy().unwrap().slot_state,
+        SlotState::Idle
+    );
+    assert!(ref_exists(
+        store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
+        &pin
+    ));
+    let delivered = outbox(&store).pump_due(1).unwrap();
+    assert_eq!(delivered[0].state(), DeliveryState::Delivered);
+}
+
+#[test]
+fn identity_hit_restores_missing_due_for_a_running_watcher() {
+    let (_temp, store, _source, _origin_dir, origin, origin_url, oid) = fixture();
+    fs::write(origin.join("reject"), b"1").unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let now = Arc::new(AtomicU64::new(1));
+    let cloned = store.clone();
+    let stop_thread = stop.clone();
+    let now_thread = now.clone();
+    let join = thread::spawn(move || {
+        OriginOutbox::new(&cloned, &SystemProcessRunner)
+            .run_watch_with(&stop_thread, || now_thread.load(Ordering::SeqCst), 5)
+            .unwrap();
+    });
+    wait_until(
+        8,
+        || outbox(&store).live_watch().unwrap(),
+        || panic!("watcher did not publish liveness"),
+    );
+    let scans_after_start = task_directory_scans_for(store.root());
+    commit(&store, &origin_url, &oid, turn_id(2), 1);
+    wait_until(
+        8,
+        || {
+            outbox(&store)
+                .dto(PROJECT_ID, task_id(1))
+                .ok()
+                .flatten()
+                .is_some()
+        },
+        || panic!("intent was not committed"),
+    );
+    let due_dir = store.root().join("locks/outbox-due");
+    for entry in fs::read_dir(&due_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    commit(&store, &origin_url, &oid, turn_id(2), 2);
+    assert!(
+        due_dir
+            .join(format!("{}-{}.json", task_id(1), turn_id(2)))
+            .is_file(),
+        "identity-hit must restore the missing due key"
+    );
+    fs::remove_file(origin.join("reject")).unwrap();
+    wait_until(
+        8,
+        || {
+            outbox(&store)
+                .dto(PROJECT_ID, task_id(1))
+                .ok()
+                .flatten()
+                .is_some_and(|delivery| delivery.state() == DeliveryState::Delivered)
+        },
+        || panic!("running watcher did not deliver after identity-hit due repair"),
+    );
+    let scans_after_repair = task_directory_scans_for(store.root());
+    assert_eq!(
+        scans_after_repair, scans_after_start,
+        "idle polls must not rescan task history"
+    );
+    stop.store(true, Ordering::SeqCst);
+    join.join().unwrap();
+}
+
+#[test]
+fn close_discard_allows_failed_delivery() {
+    let (_temp, store, _source, _origin_dir, origin, origin_url, oid) = fixture();
+    fs::write(origin.join("reject"), b"1").unwrap();
+    let job = turn_id(2);
+    let request = prepare_task(&store, task_id(1), job, &oid);
+    commit(&store, &origin_url, &oid, job, 1);
+    finish_done(&store, task_id(1), job, &oid);
+    release_lease(&store, &request);
+    let mut now = 1u64;
+    let mut last = None;
+    for _ in 0..20 {
+        let results = outbox(&store).pump_due(now).unwrap();
+        if let Some(delivery) = results.into_iter().next() {
+            last = Some(delivery.clone());
+            if delivery.state() == DeliveryState::Failed {
+                break;
+            }
+        }
+        now = now.saturating_add(300_001);
+    }
+    assert_eq!(
+        last.as_ref().map(|delivery| delivery.state()),
+        Some(DeliveryState::Failed),
+        "origin reject must exhaust attempts into Failed, last={last:?}"
+    );
+    TaskStore::new(&store, &SystemProcessRunner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(1), true))
+        .unwrap();
+    assert_eq!(
+        TaskStore::new(&store, &SystemProcessRunner)
+            .load_status(PROJECT_ID, task_id(1))
+            .unwrap()
+            .state(),
+        TaskState::Abandoned
+    );
+}
+
+#[test]
+fn concurrent_pins_into_a_new_mirror_publish_both_receipts() {
+    let (_temp, store, source, _origin_dir, _origin, _origin_url, first) = fixture();
+    source.write("base.txt", b"two\n");
+    source.commit_all("two");
+    let second: BaseOid = git(source.root(), &["rev-parse", "HEAD"]).parse().unwrap();
+    push_base(&source, &store, PROJECT_ID, task_id(2), second.as_str());
+    let mirror = store.mirror_if_present(PROJECT_ID).unwrap().unwrap();
+    assert!(object_store_receipt(mirror.path()).is_none());
+    thread::scope(|scope| {
+        let store_one = store.clone();
+        let first = first.clone();
+        scope.spawn(move || {
+            let mirror = store_one.mirror_if_present(PROJECT_ID).unwrap().unwrap();
+            GitTransport::new(&SystemProcessRunner)
+                .pin_delivery_ref(&store_one, &mirror, task_id(1), turn_id(2), &first)
+                .unwrap();
+        });
+        let store_two = store.clone();
+        scope.spawn(move || {
+            let mirror = store_two.mirror_if_present(PROJECT_ID).unwrap().unwrap();
+            GitTransport::new(&SystemProcessRunner)
+                .pin_delivery_ref(&store_two, &mirror, task_id(2), turn_id(3), &second)
+                .unwrap();
+        });
+    });
+    assert!(ref_exists(
+        mirror.path(),
+        &OriginOutbox::delivery_refs(task_id(1), turn_id(2))
+    ));
+    assert!(ref_exists(
+        mirror.path(),
+        &OriginOutbox::delivery_refs(task_id(2), turn_id(3))
+    ));
+    assert!(object_store_receipt(mirror.path()).is_some());
 }
 
 #[test]

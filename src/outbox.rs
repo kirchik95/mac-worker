@@ -235,16 +235,18 @@ impl<'a> OriginOutbox<'a> {
                 ));
             }
             intent = existing;
-        } else {
-            self.write_intent(&intent, true)?;
-            if self
-                .store
-                .consume_fault(HostStoreWritePoint::AfterOutboxIntent)
-            {
-                return Err(WorkerError::Io(std::io::Error::other(
-                    "injected outbox intent failure",
-                )));
-            }
+        }
+        // Identity-hit visibility is not a durability receipt: the create
+        // write can expose the intent name and then fail delivery/task
+        // directory sync. Reestablish file + parent barriers before pin/due.
+        self.write_intent(&intent, true)?;
+        if self
+            .store
+            .consume_fault(HostStoreWritePoint::AfterOutboxIntent)
+        {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected outbox intent failure",
+            )));
         }
         let mirror = self
             .store
@@ -265,7 +267,17 @@ impl<'a> OriginOutbox<'a> {
                 "injected outbox pin failure",
             )));
         }
+        self.sync_due(&intent)?;
         intent.into_dto()
+    }
+
+    pub(crate) fn has_intent(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<bool, WorkerError> {
+        Ok(self.read_intent(project_id, task_id, turn_id)?.is_some())
     }
 
     pub fn dto(
@@ -322,13 +334,21 @@ impl<'a> OriginOutbox<'a> {
     }
 
     pub fn discard_blocked(&self, project_id: &str, task_id: TaskId) -> Result<bool, WorkerError> {
-        Ok(self
-            .load_intent_files(project_id, task_id)?
+        let files = match self.load_intent_files(project_id, task_id) {
+            Ok(files) => files,
+            Err(_) => return Ok(true),
+        };
+        if files.iter().any(|intent| intent.is_none()) {
+            return Ok(true);
+        }
+        if files
             .into_iter()
-            .any(|intent| match intent {
-                Some(intent) => intent.state.retains_objects(),
-                None => true,
-            }))
+            .flatten()
+            .any(|intent| intent.state.retains_objects())
+        {
+            return Ok(true);
+        }
+        self.has_orphaned_pin(project_id, task_id)
     }
 
     pub fn pump_due(&self, now_millis: u64) -> Result<Vec<OriginDelivery>, WorkerError> {
@@ -746,11 +766,7 @@ impl<'a> OriginOutbox<'a> {
             .store
             .mirror_if_present(&current.project_id)?
             .ok_or_else(|| WorkerError::task("PUBLISH_FAILED", "project mirror is absent"))?;
-        let git = GitTransport::new(self.runner);
-        if git.delivery_pin_matches(&mirror, current.task_id, current.turn_id, &current.oid)? {
-            return Ok(());
-        }
-        git.pin_delivery_ref(
+        GitTransport::new(self.runner).pin_delivery_ref(
             self.store,
             &mirror,
             current.task_id,
@@ -1042,6 +1058,14 @@ impl<'a> OriginOutbox<'a> {
             replace_json(&delivery, &name, &current, intent)?;
         } else {
             write_json_once(&delivery, &name, intent)?;
+        }
+        if self
+            .store
+            .consume_fault(HostStoreWritePoint::AfterOutboxIntentPublish)
+        {
+            return Err(WorkerError::Io(std::io::Error::other(
+                "injected outbox intent publication failure",
+            )));
         }
         delivery.sync_root().map_err(WorkerError::Io)?;
         task.sync_root().map_err(WorkerError::Io)?;

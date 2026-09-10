@@ -2,7 +2,7 @@ use std::{
     convert::Infallible,
     ffi::OsString,
     fs::{self, File},
-    os::unix::process::CommandExt,
+    os::unix::{io::AsRawFd, process::CommandExt},
     path::Path,
     process::{Command, Stdio},
     time::Duration,
@@ -34,6 +34,7 @@ const GIT_TERMINAL_PROMPT: &str = "GIT_TERMINAL_PROMPT";
 pub(crate) const GIT_FSYNC_COMPONENTS: &str = "objects,derived-metadata,reference";
 pub(crate) const GIT_FSYNC_METHOD: &str = "fsync";
 pub const OBJECT_STORE_SYNC_RECEIPT: &str = "mw-object-sync.json";
+const OBJECT_STORE_SYNC_LOCK: &str = "mw-object-sync.lock";
 const OBJECT_STORE_RECEIPT_LIMIT: u64 = 1024 * 1024;
 const ORIGIN_GIT_SSH_COMMAND: &str = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes";
 const ORIGIN_PREFLIGHT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
@@ -377,6 +378,7 @@ impl<'a> GitTransport<'a> {
                 ));
             }
             ensure_object_store_durable(store, mirror)?;
+            fail_after_visible_delivery_pin(store)?;
             return fsync_delivery_ref(mirror, task_id, turn_id);
         }
         ensure_object_store_durable(store, mirror)?;
@@ -400,6 +402,7 @@ impl<'a> GitTransport<'a> {
                 "delivery pin could not be written",
             ));
         }
+        fail_after_visible_delivery_pin(store)?;
         fsync_delivery_ref(mirror, task_id, turn_id)
     }
 
@@ -746,6 +749,7 @@ fn delivery_origin(origin: &str) -> Result<String, WorkerError> {
 }
 
 fn ensure_object_store_durable(store: &HostStore, mirror: &RootedDir) -> Result<(), WorkerError> {
+    let _lock = lock_object_store(mirror)?;
     let current = pack_store_files(mirror)?;
     let loaded = load_object_store_receipt(mirror)?;
     let (known, previous_bytes, valid) = match &loaded {
@@ -792,6 +796,28 @@ fn ensure_object_store_durable(store: &HostStore, mirror: &RootedDir) -> Result<
         ));
     }
     Ok(())
+}
+
+fn lock_object_store(mirror: &RootedDir) -> Result<File, WorkerError> {
+    let file = mirror
+        .open_private_lock(OBJECT_STORE_SYNC_LOCK)
+        .map_err(|error| {
+            git_error(
+                "REF_UPDATE_FAILED",
+                format!("object-store lock could not be opened: {error}"),
+            )
+        })?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(git_error(
+            "REF_UPDATE_FAILED",
+            format!(
+                "object-store lock could not be acquired: {}",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(file)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -965,6 +991,16 @@ fn fsync_object_store(mirror: &RootedDir) -> Result<(), WorkerError> {
     }
     if objects.is_dir() {
         fsync_required(&objects)?;
+    }
+    Ok(())
+}
+
+fn fail_after_visible_delivery_pin(store: &HostStore) -> Result<(), WorkerError> {
+    if store.consume_fault(HostStoreWritePoint::AfterOutboxUpdateRef) {
+        return Err(git_error(
+            "REF_UPDATE_FAILED",
+            "injected delivery pin durability failure",
+        ));
     }
     Ok(())
 }

@@ -140,6 +140,8 @@ pub enum HostStoreWritePoint {
     AfterOutboxIntent = 66,
     AfterOutboxObjectBaselinePacks = 67,
     AfterOutboxObjectBaseline = 68,
+    AfterOutboxUpdateRef = 69,
+    AfterOutboxIntentPublish = 70,
 }
 
 impl LayoutEntry {
@@ -1297,7 +1299,9 @@ impl HostStore {
                 // In-place rewrite leaves the pre-migration handle valid.
                 layout_refreshed = true;
                 refresh_host_layout(&rooted, &namespaces, point)?
-            } else if promote || !layout_present || layout_is_volume_remount(&stored, &current_layout)
+            } else if promote
+                || !layout_present
+                || layout_is_volume_remount(&stored, &current_layout)
             {
                 layout_refreshed = true;
                 refresh_host_layout(&rooted, &namespaces, point)?

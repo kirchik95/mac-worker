@@ -727,39 +727,62 @@ impl TurnTerminalHook {
                 Ok(result)
             }
             Err(error) => {
-                // Publication failure must not leave the task active. Keep
-                // the workspace for inspection and make the failure visible
-                // as the task's last outcome; the job status remains the
-                // authoritative infrastructure terminal record.
-                if let Some(turn) = status.turns().last() {
-                    let fallback = TaskOutcome::Failed {
-                        reason: "PUBLISH_FAILED".into(),
-                    };
-                    let _ = task_store.finish_turn(
-                        meta.project_id(),
-                        meta.task_id(),
-                        turn.turn_id(),
-                        terminal,
-                        fallback.clone(),
-                        false,
-                        log_truncated,
-                        status.head_oid().cloned(),
-                        None,
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                        Vec::new(),
-                        false,
-                    );
-                    report_turn_to_herdr(
-                        section,
-                        job_meta,
-                        &meta,
-                        &fallback,
-                        None,
-                        &[],
-                        &task_store,
-                    );
+                // Auto-close TASK_BUSY runs after finish_turn already wrote
+                // terminal Done. That write is idempotent, so a PUBLISH_FAILED
+                // fallback is a no-op on disk; Herdr must not report the
+                // fallback. A keyed current-turn intent, or an unreadable
+                // intent record, is recoverable and must not terminalize
+                // Failed/PUBLISH_FAILED. Pre-intent source/protocol/session
+                // failures still persist Failed/PUBLISH_FAILED.
+                let current = task_store
+                    .load_status(meta.project_id(), meta.task_id())
+                    .unwrap_or(status);
+                if let Some(turn) = current.turns().last() {
+                    if turn.terminal().is_none() {
+                        let recoverable_intent = OriginOutbox::new(store, &runner)
+                            .has_intent(meta.project_id(), meta.task_id(), turn.turn_id())
+                            .unwrap_or(true);
+                        if !recoverable_intent {
+                            let fallback = TaskOutcome::Failed {
+                                reason: "PUBLISH_FAILED".into(),
+                            };
+                            let _ = task_store.finish_turn(
+                                meta.project_id(),
+                                meta.task_id(),
+                                turn.turn_id(),
+                                terminal,
+                                fallback.clone(),
+                                false,
+                                log_truncated,
+                                current.head_oid().cloned(),
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                                Vec::new(),
+                                false,
+                            );
+                            report_turn_to_herdr(
+                                section,
+                                job_meta,
+                                &meta,
+                                &fallback,
+                                None,
+                                &[],
+                                &task_store,
+                            );
+                        }
+                    } else if let Some(outcome) = current.last_outcome() {
+                        report_turn_to_herdr(
+                            section,
+                            job_meta,
+                            &meta,
+                            outcome,
+                            current.summary(),
+                            current.questions(),
+                            &task_store,
+                        );
+                    }
                 }
                 Err(error)
             }
@@ -1007,15 +1030,20 @@ impl<'a> TurnPublisher<'a> {
                 .publish_branch()
                 .cloned()
                 .unwrap_or_else(|| BranchName::for_task(meta.task_id()));
-            OriginOutbox::new(self.store, self.runner).commit_intent(DeliveryCommit {
+            let now = now_millis()?;
+            let outbox = OriginOutbox::new(self.store, self.runner);
+            let commit = DeliveryCommit {
                 project_id: meta.project_id(),
                 task_id: meta.task_id(),
                 turn_id,
                 oid,
                 origin: expected_origin,
                 branch: &branch,
-                now_millis: now_millis()?,
-            })?;
+                now_millis: now,
+            };
+            if outbox.commit_intent(commit.clone()).is_err() {
+                outbox.commit_intent(commit)?;
+            }
         }
         let boundary = RedactionBoundary::from_env();
         let summary = nonempty(&boundary.summary(structured.summary()));
@@ -1042,11 +1070,10 @@ impl<'a> TurnPublisher<'a> {
             false,
         )?;
         if close {
-            let _ = TaskStore::new(self.store, self.runner).close(&TaskCloseRequest::new(
-                meta.project_id(),
-                meta.task_id(),
-                false,
-            ))?;
+            TaskStore::new(self.store, self.runner).close_after_own_terminal_turn(
+                &TaskCloseRequest::new(meta.project_id(), meta.task_id(), false),
+                turn_id,
+            )?;
         }
         let _ = session;
         Ok(TurnResult {

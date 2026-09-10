@@ -224,6 +224,80 @@ fn prepared_task_turn(
     mac_worker::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
+    prepared_task_turn_with_close(script, ClosePolicy::Never)
+}
+
+const AUTO_CLOSE_DONE_SCRIPT: &str = concat!(
+    "printf '%s\\n' ",
+    "'{\"type\":\"thread.started\",\"thread_id\":\"session-close-done\"}' ",
+    "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"",
+    "{\\\"status\\\":\\\"done\\\",\\\"summary\\\":\\\"closed after done\\\",\\\"questions\\\":[],\\\"files_changed\\\":[]}",
+    "\"}}'",
+);
+
+fn peer_task_id() -> TaskId {
+    TaskId::new(Uuid::from_u128(99))
+}
+
+fn admission_facts() -> AdmissionFacts {
+    AdmissionFacts {
+        free_disk_bytes: 100 * 1024 * 1024 * 1024,
+        total_disk_bytes: 200 * 1024 * 1024 * 1024,
+        memory_pressure: MemoryPressure::Normal,
+        swap_used_bytes: Some(0),
+    }
+}
+
+fn acquire_scoped_task_lease(store: &HostStore, task: TaskId, job: JobId, token: u128) {
+    let material = RequestFingerprintMaterial::new(
+        job,
+        ClientId::new(Uuid::from_u128(40)),
+        LeaseToken::new(Uuid::from_u128(token)),
+        100,
+        "test-worker".into(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        "d".repeat(64),
+        String::new(),
+        30_000,
+        "heavy".into(),
+        CommandSpec::shell("true".into()).unwrap(),
+    )
+    .unwrap();
+    match LeaseService::new(store)
+        .acquire(
+            &LeaseAcquireRequest::new(material).with_execution_scope(ExecutionScope::task(task)),
+            &admission_facts(),
+            wall_clock_millis(),
+        )
+        .unwrap()
+    {
+        mac_worker::job::LeaseAcquireResponse::Acquired { .. } => {}
+        other => panic!("expected acquired task lease, got {other:?}"),
+    }
+}
+
+fn submit_inline(store: &HostStore, request: TaskTurnRequest) -> mac_worker::task::TaskStatus {
+    let launcher = InlineTurnLauncher {
+        store: store.clone(),
+        fault: None,
+    };
+    JobService::new(store, &launcher)
+        .submit_turn(request)
+        .expect("scoped turn must publish")
+        .task()
+        .clone()
+}
+
+fn prepared_task_turn_with_close(
+    script: &str,
+    close_policy: ClosePolicy,
+) -> (
+    tempfile::TempDir,
+    HostStore,
+    mac_worker::turn::TaskTurnRequest,
+    TaskCancelRequest,
+) {
     let temp = tempdir().unwrap();
     let (store, request, cancel) = prepared_task_turn_at(
         &temp.path().join("host"),
@@ -236,6 +310,7 @@ fn prepared_task_turn(
         None,
         None,
         30_000,
+        close_policy,
     );
     (temp, store, request, cancel)
 }
@@ -261,6 +336,7 @@ fn prepared_task_turn_with_timeout(
         None,
         None,
         timeout_millis,
+        ClosePolicy::Never,
     );
     (temp, store, request, cancel)
 }
@@ -286,6 +362,7 @@ fn prepared_push_task_turn(
         Some("release-candidate".parse().unwrap()),
         Some(origin.to_owned()),
         30_000,
+        ClosePolicy::Never,
     );
     (temp, store, request, cancel)
 }
@@ -310,6 +387,7 @@ fn prepared_task_turn_at(
     publish_branch: Option<BranchName>,
     origin_url: Option<String>,
     timeout_millis: u64,
+    close_policy: ClosePolicy,
 ) -> (
     HostStore,
     mac_worker::turn::TaskTurnRequest,
@@ -412,7 +490,7 @@ fn prepared_task_turn_at(
         publish_branch,
         base_oid,
         limits: TaskLimits::new(turn_limits, 3).unwrap(),
-        close_policy: ClosePolicy::Never,
+        close_policy,
         env_profile: None,
         git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
         title: None,
@@ -630,8 +708,7 @@ fn existing_session_and_parsed_last_md_still_record_raw_stdout_auth_failure() {
         .bind_session(
             PROJECT_ID,
             task_id(),
-            SessionBinding::new(AgentKind::Codex, "sess-auth-stdout", wall_clock_millis())
-                .unwrap(),
+            SessionBinding::new(AgentKind::Codex, "sess-auth-stdout", wall_clock_millis()).unwrap(),
         )
         .unwrap();
     let before = wall_clock_millis();
@@ -2114,6 +2191,120 @@ fn truncated_stdout_without_last_md_fails_publication() {
     assert!(!job_path.join("last.md").exists());
 }
 
+#[test]
+fn scoped_close_on_done_closes_the_task_without_publish_failed() {
+    let (_temp, store, request, cancel) =
+        prepared_task_turn_with_close(AUTO_CLOSE_DONE_SCRIPT, ClosePolicy::Done);
+    let status = submit_inline(&store, request);
+    assert_eq!(status.state(), TaskState::Closed);
+    assert_eq!(status.last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(status.summary(), Some("closed after done"));
+    assert!(status.head_oid().is_some());
+    assert_eq!(status.turns()[0].outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(status.turns()[0].herdr(), None);
+    assert!(
+        store
+            .task_workspace_if_present(PROJECT_ID, task_id())
+            .unwrap()
+            .is_none(),
+        "auto-close must remove the workspace"
+    );
+    assert!(
+        LeaseService::new(&store)
+            .occupied_slots()
+            .unwrap()
+            .is_empty(),
+        "own task-scope lease must be released after supervisor cleanup"
+    );
+    let job_status: JobStatus = serde_json::from_slice(
+        &fs::read(
+            store
+                .job(PROJECT_ID, WORKTREE_ID, cancel.turn_id())
+                .unwrap()
+                .join("status.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(job_status.state().is_terminal());
+    assert_ne!(job_status.error_code(), Some("PUBLISH_FAILED"));
+}
+
+#[test]
+fn scoped_close_on_never_stays_open_done() {
+    let (_temp, store, request, _cancel) =
+        prepared_task_turn_with_close(AUTO_CLOSE_DONE_SCRIPT, ClosePolicy::Never);
+    let status = submit_inline(&store, request);
+    assert_eq!(status.state(), TaskState::Open);
+    assert_eq!(status.last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(status.summary(), Some("closed after done"));
+    assert!(
+        store
+            .task_workspace_if_present(PROJECT_ID, task_id())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        LeaseService::new(&store)
+            .occupied_slots()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn scoped_close_on_done_leaves_a_peer_task_lease_untouched() {
+    let temp = tempdir().unwrap();
+    let host = temp.path().join("host");
+    let store = HostStore::open(&host).unwrap();
+    LeaseService::new(&store).set_slot_count(2).unwrap();
+    let peer_job = JobId::new(Uuid::from_u128(99));
+    acquire_scoped_task_lease(&store, peer_task_id(), peer_job, 50);
+    let (store, request, _cancel) = prepared_task_turn_at(
+        &host,
+        AUTO_CLOSE_DONE_SCRIPT,
+        TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        vec![PublishMode::Fetch],
+        None,
+        None,
+        30_000,
+        ClosePolicy::Done,
+    );
+    let status = submit_inline(&store, request);
+    assert_eq!(status.state(), TaskState::Closed);
+    assert_eq!(status.last_outcome(), Some(&TaskOutcome::Done));
+    let occupied = LeaseService::new(&store).occupied_slots().unwrap();
+    assert_eq!(occupied.len(), 1);
+    assert!(occupied[0].owns_task(PROJECT_ID, peer_task_id()));
+    assert_eq!(occupied[0].lease.job_id(), peer_job);
+}
+
+#[test]
+fn public_close_stays_busy_while_a_foreign_task_scope_is_live() {
+    let (_temp, store, request, _cancel) =
+        prepared_task_turn_with_close(AUTO_CLOSE_DONE_SCRIPT, ClosePolicy::Never);
+    let status = submit_inline(&store, request);
+    assert_eq!(status.state(), TaskState::Open);
+    acquire_scoped_task_lease(&store, task_id(), JobId::new(Uuid::from_u128(77)), 51);
+    let error = TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_BUSY");
+    assert_eq!(
+        store.task_status(PROJECT_ID, task_id()).unwrap().state(),
+        TaskState::Open
+    );
+    assert!(
+        store
+            .task_workspace_if_present(PROJECT_ID, task_id())
+            .unwrap()
+            .is_some()
+    );
+}
+
 // --- herdr reporter hooks -------------------------------------------------
 //
 // The reporter reads the worker account's HOME to find herdr's socket, so
@@ -2605,6 +2796,7 @@ fn supervisor_death_during_setup_does_not_start_a_second_heavy_job() {
         None,
         None,
         30_000,
+        ClosePolicy::Never,
     );
     write_workspace_setup(&store, SETUP_SLEEP_RECIPE);
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();

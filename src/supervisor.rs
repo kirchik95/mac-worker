@@ -2687,7 +2687,15 @@ impl<'a> Supervisor<'a> {
                 log_truncated,
             )
             .map(|_| ());
-        let payload_removal = if job.entry_exists("execution.json")? {
+        let unfinished_publication = publication.is_err()
+            && crate::task_store::TaskStore::new(self.store, &crate::process::SystemProcessRunner)
+                .load_status(section.project_id(), section.turn().task_id())
+                .ok()
+                .and_then(|status| status.turns().last().cloned())
+                .is_some_and(|turn| turn.turn_id() == meta.job_id() && turn.terminal().is_none());
+        let payload_removal = if unfinished_publication {
+            Ok(())
+        } else if job.entry_exists("execution.json")? {
             self.store
                 .remove_owned_regular_committed(job, "execution.json")
         } else {
@@ -2695,8 +2703,12 @@ impl<'a> Supervisor<'a> {
         };
         // The guard must be retained while publication runs: releasing the
         // job slot before the task branch is imported would expose a second
-        // turn to another worker.
+        // turn to another worker. Post-intent, pre-pin faults keep the
+        // payload and lease so recovery can finish the pin.
         drop(guard);
+        if unfinished_publication {
+            return publication;
+        }
         let cleanup = match payload_removal {
             Ok(()) => self.cleanup_and_release(lease, job, terminal),
             Err(error) => Err(WorkerError::Io(error)),
