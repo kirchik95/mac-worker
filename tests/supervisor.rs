@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::{
@@ -83,6 +83,15 @@ fn valid_manifest_bytes() -> Vec<u8> {
     .into_bytes()
 }
 
+fn wall_clock_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock precedes the Unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("system clock is outside the supported range")
+}
+
 fn prepared_host(root: &Path) -> (HostStore, LeaseRecord, SubmitRequest) {
     prepared_host_with_command(
         root,
@@ -122,8 +131,9 @@ fn prepared_host_with_command_and_timeout(
         )
         .unwrap(),
     );
+    let now = wall_clock_millis();
     let lease = match LeaseService::new(&store)
-        .acquire(&request, &healthy(), 1)
+        .acquire(&request, &healthy(), now)
         .unwrap()
     {
         LeaseAcquireResponse::Acquired { lease } => lease,
@@ -154,7 +164,7 @@ fn prepared_host_with_command_and_timeout(
     .unwrap();
     fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
     RemoteSnapshotService::new(&store)
-        .verify_and_promote_at(&lease, &digest, 2)
+        .verify_and_promote_at(&lease, &digest, now)
         .unwrap();
     (store, lease, SubmitRequest::new(request.material().clone()))
 }
@@ -201,8 +211,9 @@ fn prepared_host_with_nested_cwd(
         )
         .unwrap(),
     );
+    let now = wall_clock_millis();
     let lease = match LeaseService::new(&store)
-        .acquire(&request, &healthy(), 1)
+        .acquire(&request, &healthy(), now)
         .unwrap()
     {
         LeaseAcquireResponse::Acquired { lease } => lease,
@@ -244,7 +255,7 @@ fn prepared_host_with_nested_cwd(
     .unwrap();
     fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
     RemoteSnapshotService::new(&store)
-        .verify_and_promote_at(&lease, &digest, 2)
+        .verify_and_promote_at(&lease, &digest, now)
         .unwrap();
     (store, lease, SubmitRequest::new(request.material().clone()))
 }
@@ -284,8 +295,9 @@ fn prepared_host_with_empty_nested_cwd(
         )
         .unwrap(),
     );
+    let now = wall_clock_millis();
     let lease = match LeaseService::new(&store)
-        .acquire(&request, &healthy(), 1)
+        .acquire(&request, &healthy(), now)
         .unwrap()
     {
         LeaseAcquireResponse::Acquired { lease } => lease,
@@ -315,7 +327,7 @@ fn prepared_host_with_empty_nested_cwd(
     .unwrap();
     fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
     RemoteSnapshotService::new(&store)
-        .verify_and_promote_at(&lease, &digest, 2)
+        .verify_and_promote_at(&lease, &digest, now)
         .unwrap();
     (store, lease, SubmitRequest::new(request.material().clone()))
 }
@@ -2006,9 +2018,17 @@ fn argv_at_the_two_hundred_fifty_six_boundary_executes_every_unique_metacharacte
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
+    let now = wall_clock_millis();
+    assert!(
+        lease.expires_at_millis() > now,
+        "argv-256 real-execution lease must still have remaining wall-clock budget: created_at={} expires_at={} now={}",
+        lease.created_at_millis(),
+        lease.expires_at_millis(),
+        now
+    );
 
     let response = JobService::new(&store, &launcher)
-        .submit_at(request, 10)
+        .submit_at(request, now)
         .unwrap();
 
     assert_eq!(response.status().state(), JobState::Succeeded);
