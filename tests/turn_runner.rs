@@ -63,7 +63,10 @@ use mac_worker::{
     transfer::HostOperation,
     transfer_repo::TransferRepo,
     turn::{TaskTurnRequest, TaskTurnResponse},
-    turn_runner::{DetachedRunnerExecutor, InlineRunnerExecutor, RunnerExecutor, TurnRunner},
+    turn_runner::{
+        DetachedRunnerExecutor, InlineRunnerExecutor, RunnerExecutor, RunnerStart, TurnRunner,
+        start_runner_with_reservation,
+    },
 };
 
 static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
@@ -1385,6 +1388,44 @@ fn successful_submission_reports_the_handed_off_runner() {
         fixture.state.runner_liveness(fixture.task_id).unwrap()
     );
     assert_eq!(fixture.reported_runner, Some(RunnerState::Live));
+}
+
+#[test]
+fn submit_completes_handoff_after_bind_records_the_child() {
+    // Break caught: start_runner_with_reservation compared the pre-bind queue
+    // row to the bound row, so TaskClient submit always got TASK_BUSY after a
+    // successful executor.start and never recorded task.runner. Primitive
+    // reserve tests plant a status turn and miss both that comparison and the
+    // queued-empty-turns holder after adoption.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let entry = fixture.state.queue_entry(fixture.turn_id).unwrap().unwrap();
+    assert!(
+        entry.slot_reservation().is_none(),
+        "complete must clear the token after the bound child is recorded"
+    );
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(
+        record
+            .runner()
+            .map(|runner| runner.process_identity().pid()),
+        Some(process::id())
+    );
+    assert_eq!(fixture.reported_runner, Some(RunnerState::Live));
+    let second = start_runner_with_reservation(
+        &fixture.state,
+        &fixture.executor,
+        &fixture.paths,
+        fixture.task_id,
+        fixture.turn_id,
+        8,
+        false,
+    )
+    .unwrap();
+    assert!(
+        matches!(second, RunnerStart::Pending),
+        "same-turn live owner must not spawn again after adoption: {second:?}"
+    );
 }
 
 #[test]

@@ -772,7 +772,11 @@ fn run_task_command(
             .with_herdr_notifier(notifier.clone());
 
         match command {
-            Command::Runner { task_id, turn_id } => {
+            Command::Runner {
+                task_id,
+                turn_id,
+                slot_token,
+            } => {
                 let task_id = task_id
                     .expose()
                     .parse::<crate::task::TaskId>()
@@ -781,8 +785,18 @@ fn run_task_command(
                     .expose()
                     .parse::<crate::task::TurnId>()
                     .map_err(|_| WorkerError::Protocol("invalid runner turn ID".into()))?;
+                let slot_token = slot_token
+                    .as_ref()
+                    .map(|token| {
+                        token
+                            .expose()
+                            .parse::<uuid::Uuid>()
+                            .map_err(|_| WorkerError::Protocol("invalid runner slot token".into()))
+                    })
+                    .transpose()?;
                 let outcome = TurnRunner::new(runner, &config, &paths, &client_state, executor)
                     .with_notifier(notifier)
+                    .with_slot_token(slot_token)
                     .run_detached(task_id, turn_id)?;
                 Ok(outcome.exit_code())
             }

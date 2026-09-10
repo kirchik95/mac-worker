@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
     io::{self, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -25,8 +24,8 @@ use crate::{
     supervisor::{ProcessObservation, SystemProcessInspector},
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, PushTarget,
-        RunId, RunRecord, RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
-        TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
+        RunId, RunRecord, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
+        TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
     },
     task_view::{
         TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
@@ -34,7 +33,10 @@ use crate::{
     },
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
-    turn_runner::{DetachedRunnerExecutor, RunnerExecutor, TurnRunner, adopt_row_with_retry},
+    turn_runner::{
+        DetachedRunnerExecutor, RunnerExecutor, RunnerStart, TurnRunner,
+        start_runner_with_reservation,
+    },
 };
 
 const TASK_COMMAND: &str = "task-turn";
@@ -760,51 +762,48 @@ impl<'a> TaskClient<'a> {
             let _ = transfer.release_base(self.runner, task_id);
             return Err(error);
         }
-        let (mut report, should_start, queued_turn) =
-            match (|| -> Result<(TaskReport, bool, TurnId), WorkerError> {
-                self.client_state
-                    .write_task_project_path(&record_for_rollback, &initial.context.root)?;
-                self.client_state
-                    .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
-                let run_reference = match request.run_id {
-                    Some(run_id) => {
-                        let run = self.client_state.load_run(run_id)?;
-                        Some(QueueRunReference::new(
-                            crate::job::RunId::new(run_id.to_string())?,
-                            run.max_parallel(),
-                        )?)
-                    }
-                    None => None,
-                };
-                let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
-                let owner = current_process_identity()?;
-                let entry = QueueEntry::new(
-                    turn_id,
-                    self.client_state.client_id(),
-                    initial.context.project_id.clone(),
-                    initial.context.worktree_id.clone(),
-                    command.summary()?,
-                    requirements,
-                    request.preference.clone(),
-                    QueueEntryKind::TaskTurn,
-                    run_reference,
-                    owner,
-                    now,
-                )?;
-                let entry = self.client_state.enqueue(entry)?;
-
-                let should_start =
-                    request.attached || self.live_runner_count()? < self.config.workers.len();
-                self.client_state.submission_report_fault()?;
-                let report = self.report_for(task_id)?;
-                Ok((report, should_start, entry.job_id()))
-            })() {
-                Ok(report) => report,
-                Err(error) => {
-                    self.rollback_submission(turn_id, &record_for_rollback, &transfer);
-                    return Err(error);
+        let (mut report, queued_turn) = match (|| -> Result<(TaskReport, TurnId), WorkerError> {
+            self.client_state
+                .write_task_project_path(&record_for_rollback, &initial.context.root)?;
+            self.client_state
+                .write_turn_prompt(task_id, turn_id, &composed_prompt)?;
+            let run_reference = match request.run_id {
+                Some(run_id) => {
+                    let run = self.client_state.load_run(run_id)?;
+                    Some(QueueRunReference::new(
+                        crate::job::RunId::new(run_id.to_string())?,
+                        run.max_parallel(),
+                    )?)
                 }
+                None => None,
             };
+            let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
+            let owner = current_process_identity()?;
+            let entry = QueueEntry::new(
+                turn_id,
+                self.client_state.client_id(),
+                initial.context.project_id.clone(),
+                initial.context.worktree_id.clone(),
+                command.summary()?,
+                requirements,
+                request.preference.clone(),
+                QueueEntryKind::TaskTurn,
+                run_reference,
+                owner,
+                now,
+            )?;
+            let entry = self.client_state.enqueue(entry)?;
+
+            self.client_state.submission_report_fault()?;
+            let report = self.report_for(task_id)?;
+            Ok((report, entry.job_id()))
+        })() {
+            Ok(report) => report,
+            Err(error) => {
+                self.rollback_submission(turn_id, &record_for_rollback, &transfer);
+                return Err(error);
+            }
+        };
         // Intent clearance is the submission handoff boundary. Its atomic
         // replacement can publish the clear before the final directory sync
         // reports an error, so this caller cannot safely compensate from its
@@ -813,18 +812,17 @@ impl<'a> TaskClient<'a> {
         // have adopted the published row.
         self.client_state
             .clear_submission_intent(record_for_rollback.without_submission_intent()?)?;
-        if !should_start {
-            // Parking publishes eligibility to an independent runner. A park
-            // error may therefore mean ownership already transferred, so
-            // preserve durable state for reconciliation.
-            self.client_state.park_row(queued_turn)?;
-        }
-        if should_start {
-            // A detached child may claim the row as soon as it is started.
-            // Once that hand-off is attempted, retain the complete durable
-            // submission for reconciliation instead of compensating it away.
-            self.start_runner(task_id, turn_id)?;
-            report.runner = self.client_state.runner_liveness(task_id)?;
+        match self.start_runner(task_id, turn_id, request.attached, false)? {
+            RunnerStart::Started(_) => {
+                report.runner = self.client_state.runner_liveness(task_id)?;
+            }
+            RunnerStart::Pending => {}
+            RunnerStart::Saturated => {
+                // Parking publishes eligibility to an independent runner. A park
+                // error may therefore mean ownership already transferred, so
+                // preserve durable state for reconciliation.
+                self.client_state.park_row(queued_turn)?;
+            }
         }
         // The submitter no longer needs the repository after the queue row is
         // handed off.  Its shared lock would not block the attached runner,
@@ -1466,17 +1464,14 @@ impl<'a> TaskClient<'a> {
                 {
                     continue;
                 }
-                if self.live_runner_count()? < self.config.workers.len() {
-                    self.start_runner(record.meta().task_id(), turn_id)?;
-                    report.started_runners += 1;
+                match self.start_runner(record.meta().task_id(), turn_id, false, false)? {
+                    RunnerStart::Started(_) => report.started_runners += 1,
+                    RunnerStart::Pending | RunnerStart::Saturated => {}
                 }
             }
         }
 
-        while self.live_runner_count()? < self.config.workers.len() {
-            if !self.start_oldest_parked_runner(owner)? {
-                break;
-            }
+        while self.start_oldest_parked_runner(owner)? {
             report.started_runners += 1;
         }
         Ok(report)
@@ -1588,20 +1583,21 @@ impl<'a> TaskClient<'a> {
                 return Err(error);
             }
         };
-        let should_start = attached || self.live_runner_count()? < self.config.workers.len();
-        if should_start {
-            if let Err(error) = self.start_runner(task_id, turn_id) {
+        match self.start_runner(task_id, turn_id, attached, false) {
+            Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => {}
+            Ok(RunnerStart::Saturated) => {
+                if let Err(error) = self.client_state.park_row(entry.job_id()) {
+                    self.rollback_followup(&record, task_id, turn_id);
+                    return Err(error);
+                }
+            }
+            Err(error) => {
                 return Err(self.fail_handoff(
                     task_id,
                     turn_id,
                     self.transfer_for_record(&record)?,
                     error,
                 ));
-            }
-        } else {
-            if let Err(error) = self.client_state.park_row(entry.job_id()) {
-                self.rollback_followup(&record, task_id, turn_id);
-                return Err(error);
             }
         }
         let mut report = self.report_for(task_id)?;
@@ -2232,7 +2228,9 @@ impl<'a> TaskClient<'a> {
         &self,
         task_id: TaskId,
         turn_id: TurnId,
-    ) -> Result<RunnerIdentity, WorkerError> {
+        attached: bool,
+        exclude_reserver: bool,
+    ) -> Result<RunnerStart, WorkerError> {
         if self.task_has_submission_recovery_pending(task_id)? {
             return Err(task_error(
                 "TASK_SUBMISSION_RECOVERY_PENDING",
@@ -2244,11 +2242,6 @@ impl<'a> TaskClient<'a> {
             .queue_entry_for_task_turn(task_id)?
             .filter(|entry| entry.job_id() == turn_id)
             .ok_or_else(|| task_error("TASK_BUSY", "task turn was retired before handoff"))?;
-        let identity = self.executor.start(self.paths, task_id, turn_id)?;
-        let log = crate::runner_log::RunnerLog::open(&self.paths.state, task_id, turn_id)?;
-        if log.current_entry(self.client_state)?.as_ref() != Some(&expected) {
-            return Err(task_error("TASK_BUSY", "task turn changed during handoff"));
-        }
         let caller = current_process_identity()?;
         if expected.owner_opt().is_some_and(|owner| {
             *owner != caller
@@ -2257,23 +2250,22 @@ impl<'a> TaskClient<'a> {
                     ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
                 )
         }) {
-            return Err(task_error(
-                "TASK_BUSY",
-                "task turn has a live handoff owner",
-            ));
+            return Ok(RunnerStart::Pending);
         }
-        self.client_state
-            .record_runner(task_id, Some(identity.clone()))?;
-        if let Err(error) =
-            adopt_row_with_retry(self.client_state, turn_id, identity.process_identity())
-        {
-            // The runner record and queue owner are one hand-off.  If the
-            // queue row disappeared or was concurrently claimed, do not
-            // leave reconciliation believing a live runner owns it.
-            let _ = self.client_state.record_runner(task_id, None);
-            return Err(error);
-        }
-        Ok(identity)
+        let slot_limit = if attached {
+            usize::MAX
+        } else {
+            self.config.workers.len()
+        };
+        start_runner_with_reservation(
+            self.client_state,
+            self.executor,
+            self.paths,
+            task_id,
+            turn_id,
+            slot_limit,
+            exclude_reserver,
+        )
     }
 
     fn start_oldest_parked_runner(&self, owner: ProcessIdentity) -> Result<bool, WorkerError> {
@@ -2290,18 +2282,27 @@ impl<'a> TaskClient<'a> {
             self.client_state.park_row(entry.job_id())?;
             return Ok(false);
         }
-        if let Err(error) = self.start_runner(task_id, entry.job_id()) {
-            if let Ok(record) = self.client_state.load_task(task_id)
-                && let Ok(transfer) = self.transfer_for_record(&record)
-            {
-                return Err(self.fail_handoff(task_id, entry.job_id(), transfer, error));
+        // Reconcile is not a finishing runner replacing its own slot.
+        // exclude_reserver belongs only to TurnRunner::start_next_parked.
+        match self.start_runner(task_id, entry.job_id(), false, false) {
+            Ok(RunnerStart::Started(_)) => Ok(true),
+            Ok(RunnerStart::Pending) => Ok(false),
+            Ok(RunnerStart::Saturated) => {
+                self.client_state.park_row(entry.job_id())?;
+                Ok(false)
             }
-            return Err(task_error(
-                "RUNNER_HANDOFF_FAILED",
-                format!("runner handoff failed: {error}"),
-            ));
+            Err(error) => {
+                if let Ok(record) = self.client_state.load_task(task_id)
+                    && let Ok(transfer) = self.transfer_for_record(&record)
+                {
+                    return Err(self.fail_handoff(task_id, entry.job_id(), transfer, error));
+                }
+                Err(task_error(
+                    "RUNNER_HANDOFF_FAILED",
+                    format!("runner handoff failed: {error}"),
+                ))
+            }
         }
-        Ok(true)
     }
 
     fn task_has_submission_recovery_pending(&self, task_id: TaskId) -> Result<bool, WorkerError> {
@@ -2444,31 +2445,6 @@ impl<'a> TaskClient<'a> {
         let transfer =
             TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
         transfer.release_base(self.runner, record.meta().task_id())
-    }
-
-    fn live_runner_count(&self) -> Result<usize, WorkerError> {
-        let mut identities = BTreeSet::new();
-        for task in self.client_state.list_tasks()? {
-            if task.status().state().is_terminal()
-                && self
-                    .client_state
-                    .queue_entry_for_task_turn(task.meta().task_id())?
-                    .is_none()
-            {
-                continue;
-            }
-            let Some(runner) = task.runner() else {
-                continue;
-            };
-            let identity = runner.process_identity();
-            if matches!(
-                self.client_state.process_observation(identity),
-                ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
-            ) {
-                identities.insert((identity.pid(), identity.start_time_micros()));
-            }
-        }
-        Ok(identities.len())
     }
 
     fn observe_admission(

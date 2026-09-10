@@ -17,7 +17,10 @@ use std::{
 };
 
 use mac_worker::{
-    client_state::{ClientStateStore, ClientStateWritePoint},
+    agent::{AgentKind, PermissionPolicy},
+    client_state::{
+        ClientStateStore, ClientStateWritePoint, ReservedSlotTakeover, RunnerSlotDecision,
+    },
     config::{Config, WorkerEntry},
     error::{ProcessError, WorkerError},
     job::{
@@ -32,8 +35,13 @@ use mac_worker::{
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
     },
+    task::{
+        ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId, TaskLimits,
+        TaskMeta, TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
+    },
     transfer::{PreacceptanceAbandonmentReceipt, RemoteJobClient, ResolutionRuntime},
 };
+use uuid::Uuid;
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OTHER_PROJECT_ID: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
@@ -83,6 +91,127 @@ fn open_queue() -> QueueFixture {
     open_queue_with_owner_inspector(FixedOwnerInspector {
         observation: ProcessObservation::Matching { process_group: 1 },
     })
+}
+
+#[derive(Clone)]
+struct LiveSetInspector {
+    live: std::collections::BTreeSet<(u32, u64)>,
+}
+
+impl ProcessInspector for LiveSetInspector {
+    fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+        ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7)
+    }
+
+    fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+        if self
+            .live
+            .contains(&(expected.pid(), expected.start_time_micros()))
+        {
+            ProcessObservation::Matching {
+                process_group: expected.pid(),
+            }
+        } else {
+            ProcessObservation::Absent
+        }
+    }
+
+    fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
+        ProcessGroupObservation::Ambiguous
+    }
+
+    fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
+        ProcessGroupMembership::Ambiguous
+    }
+}
+
+fn live_set(identities: &[ProcessIdentity]) -> LiveSetInspector {
+    LiveSetInspector {
+        live: identities
+            .iter()
+            .map(|identity| (identity.pid(), identity.start_time_micros()))
+            .collect(),
+    }
+}
+
+fn plant_task_turn(
+    store: &ClientStateStore,
+    number: u128,
+    enqueue_owner: ProcessIdentity,
+    runner: Option<ProcessIdentity>,
+) -> (TaskId, TurnId) {
+    let task_id = TaskId::new(Uuid::from_u128(number));
+    let turn_id = TurnId::new(Uuid::from_u128(number + 1_000));
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id,
+        run_id: None,
+        project_id: PROJECT_ID.into(),
+        worktree_id: WORKTREE_ID.into(),
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        policy: PermissionPolicy::Workspace,
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid: "a".repeat(40).parse().unwrap(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("Fixture", "fixture@example.test").unwrap(),
+        title: None,
+        prompt: "private prompt".into(),
+        created_at_millis: number as u64,
+    })
+    .unwrap();
+    let status = TaskStatus::new(
+        TaskState::Active,
+        None,
+        None,
+        false,
+        Some(meta.base_oid().clone()),
+        None,
+        vec![],
+        vec![],
+        None,
+        vec![TurnSummary::new(
+            1, turn_id, None, None, None, false, None, None,
+        )],
+        number as u64,
+    )
+    .unwrap();
+    store
+        .create_task(
+            LocalTaskRecord::new(
+                meta,
+                status,
+                None,
+                runner.map(RunnerIdentity::new),
+                None,
+                "c".repeat(64),
+                None,
+                true,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    store
+        .enqueue(queued_with(
+            store,
+            &turn_id.to_string(),
+            number as u64,
+            enqueue_owner,
+            WorkerPreference::Automatic,
+            Vec::new(),
+            QueueEntryKind::TaskTurn,
+            None,
+        ))
+        .unwrap();
+    (task_id, turn_id)
 }
 
 fn open_queue_with_owner_inspector<I>(inspector: I) -> QueueFixture
@@ -841,8 +970,8 @@ fn malformed_noncanonical_duplicate_job_and_sequence_state_fails_closed() {
 
 #[test]
 fn duplicate_enqueue_and_backwards_time_do_not_mutate_fifo_state() {
-    // Break caught: enqueue aliases an existing job or lets caller time reorder
-    // the durable FIFO sequence.
+    // Break caught: enqueue aliases an existing job, or inverted caller clocks
+    // reorder FIFO / fail closed instead of coalescing under QueueLock.
     let fixture = open_queue();
     let first = queued(
         &fixture.store,
@@ -850,23 +979,33 @@ fn duplicate_enqueue_and_backwards_time_do_not_mutate_fifo_state() {
         30,
         owner(30),
     );
-    fixture.store.enqueue(first.clone()).unwrap();
+    let first = fixture.store.enqueue(first.clone()).unwrap();
     assert_eq!(
-        fixture.store.enqueue(first).unwrap_err().public_code(),
-        "QUEUE_JOB_CONFLICT"
-    );
-    assert!(
         fixture
             .store
             .enqueue(queued(
                 &fixture.store,
-                "00000000000000000000000000000007",
-                29,
-                owner(31),
+                "00000000000000000000000000000006",
+                30,
+                owner(30),
             ))
-            .is_err()
+            .unwrap_err()
+            .public_code(),
+        "QUEUE_JOB_CONFLICT"
     );
-    assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 1);
+    let second = fixture
+        .store
+        .enqueue(queued(
+            &fixture.store,
+            "00000000000000000000000000000007",
+            29,
+            owner(31),
+        ))
+        .unwrap();
+    assert_eq!(first.enqueued_at_millis(), 30);
+    assert_eq!(second.enqueued_at_millis(), 30);
+    assert!(second.queue_id().value() > first.queue_id().value());
+    assert_eq!(fixture.store.queue_snapshot().unwrap().entries().len(), 2);
 }
 
 #[test]
@@ -3686,4 +3825,313 @@ fn cancelled_waiting_row_does_not_block_fifo_after_dispatch_reversion() {
         claim.entry().job_id().to_string(),
         "00000000000000000000000000000095"
     );
+}
+
+#[test]
+fn same_job_after_adoption_does_not_spawn_again() {
+    // Break caught: clearing slot_reservation after complete let cap>=2
+    // acquire another spawn for the same live turn.
+    let fixture = open_queue();
+    let parent = owner(700);
+    let child = owner(701);
+    let (task_id, turn_id) = plant_task_turn(&fixture.store, 700, parent, None);
+    let RunnerSlotDecision::Acquired { token } = fixture
+        .store
+        .reserve_runner_slot(turn_id, parent, 2, false)
+        .unwrap()
+    else {
+        panic!("expected acquire");
+    };
+    fixture
+        .store
+        .complete_runner_spawn(task_id, turn_id, token, child)
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .queue_entry(turn_id)
+            .unwrap()
+            .unwrap()
+            .slot_reservation()
+            .is_none()
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .reserve_runner_slot(turn_id, parent, 2, false)
+            .unwrap(),
+        RunnerSlotDecision::Pending { .. }
+    ));
+}
+
+#[test]
+fn recovered_dispatch_owner_without_token_or_runner_may_acquire() {
+    // Break caught: reconcile adopt_row onto the current process made
+    // acting_queue_holder Some, so reserve returned Pending/Saturated even
+    // though that PID is the controller, not a live runner or handoff token.
+    let fixture = open_queue();
+    let controller = owner(730);
+    let (_task_id, turn_id) = plant_task_turn(&fixture.store, 730, controller, None);
+    fixture
+        .store
+        .claim_next(controller, &["mini-1".into()], 731)
+        .unwrap()
+        .unwrap();
+    fixture.store.adopt_row(turn_id, controller).unwrap();
+    assert!(
+        fixture
+            .store
+            .queue_entry(turn_id)
+            .unwrap()
+            .unwrap()
+            .slot_reservation()
+            .is_none()
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .reserve_runner_slot(turn_id, controller, 1, false)
+            .unwrap(),
+        RunnerSlotDecision::Acquired { .. }
+    ));
+}
+
+#[test]
+fn exclude_reserver_still_counts_that_pid_reservations_against_cap() {
+    // Break caught: exclude_reserver dropped every reservation sharing the
+    // finishing PID, so a parked handoff over-admitted against cap=1.
+    let fixture = open_queue();
+    let finishing = owner(710);
+    let (_task_a, turn_a) = plant_task_turn(&fixture.store, 710, finishing, Some(finishing));
+    let (_task_b, turn_b) = plant_task_turn(&fixture.store, 711, finishing, None);
+    let (_task_c, turn_c) = plant_task_turn(&fixture.store, 712, finishing, None);
+    assert!(matches!(
+        fixture
+            .store
+            .reserve_runner_slot(turn_b, finishing, 2, false)
+            .unwrap(),
+        RunnerSlotDecision::Acquired { .. }
+    ));
+    let _ = turn_a;
+    assert!(
+        matches!(
+            fixture
+                .store
+                .reserve_runner_slot(turn_c, finishing, 1, true)
+                .unwrap(),
+            RunnerSlotDecision::Saturated
+        ),
+        "outstanding reservation must occupy the only slot after excluding the finishing runner"
+    );
+}
+
+#[test]
+fn queue_publish_before_runner_record_does_not_free_the_slot() {
+    // Break caught: complete published a cleared reservation, then crashed
+    // before task.runner, so occupancy under-counted the live child.
+    let fixture = open_queue();
+    let parent = owner(720);
+    let child = owner(721);
+    let (task_id, turn_id) = plant_task_turn(&fixture.store, 720, parent, None);
+    let extra = plant_task_turn(&fixture.store, 721, parent, None).1;
+    let RunnerSlotDecision::Acquired { token } = fixture
+        .store
+        .reserve_runner_slot(turn_id, parent, 2, false)
+        .unwrap()
+    else {
+        panic!("expected acquire");
+    };
+    fixture
+        .store
+        .inject_write_failure_once(ClientStateWritePoint::AfterPublish);
+    assert!(
+        fixture
+            .store
+            .complete_runner_spawn(task_id, turn_id, token, child)
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .queue_entry(turn_id)
+            .unwrap()
+            .unwrap()
+            .slot_reservation()
+            .is_some(),
+        "reservation must remain until runner persistence succeeds"
+    );
+    assert!(
+        fixture.store.live_runner_slot_count().unwrap() >= 1,
+        "handoff crash must not drop occupancy"
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .reserve_runner_slot(extra, parent, 1, false)
+            .unwrap(),
+        RunnerSlotDecision::Saturated
+    ));
+}
+
+#[test]
+fn stale_complete_after_steal_does_not_clear_the_new_child() {
+    // Break caught: complete error cleanup recorded runner=None and erased
+    // the child that stole the slot.
+    let parent = owner(730);
+    let child = owner(731);
+    let fixture = open_queue_with_owner_inspector(live_set(&[parent, child]));
+    let (task_id, turn_id) = plant_task_turn(&fixture.store, 730, parent, None);
+    let RunnerSlotDecision::Acquired { token: old } = fixture
+        .store
+        .reserve_runner_slot(turn_id, parent, 1, false)
+        .unwrap()
+    else {
+        panic!("expected acquire");
+    };
+    let stolen =
+        ClientStateStore::open_with_owner_inspector(&fixture.root, live_set(&[child])).unwrap();
+    let RunnerSlotDecision::Acquired { token: new } = stolen
+        .reserve_runner_slot(turn_id, child, 1, false)
+        .unwrap()
+    else {
+        panic!("dead parent must steal with a new token");
+    };
+    assert_ne!(old, new);
+    stolen
+        .complete_runner_spawn(task_id, turn_id, new, child)
+        .unwrap();
+    assert_eq!(
+        stolen
+            .complete_runner_spawn(task_id, turn_id, old, parent)
+            .unwrap_err()
+            .public_code(),
+        "QUEUE_SLOT_TOKEN_MISMATCH"
+    );
+    assert_eq!(
+        stolen
+            .load_task(task_id)
+            .unwrap()
+            .runner()
+            .unwrap()
+            .process_identity(),
+        child
+    );
+}
+
+#[test]
+fn token_current_child_takes_over_dead_parent_without_a_second_spawn() {
+    // Break caught: the original child waited for adoption until timeout
+    // while reconcile stole and spawned a duplicate.
+    let parent = owner(740);
+    let child = owner(741);
+    let fixture = open_queue_with_owner_inspector(live_set(&[parent, child]));
+    let (_task_id, turn_id) = plant_task_turn(&fixture.store, 740, parent, None);
+    let RunnerSlotDecision::Acquired { token } = fixture
+        .store
+        .reserve_runner_slot(turn_id, parent, 1, false)
+        .unwrap()
+    else {
+        panic!("expected acquire");
+    };
+    fixture
+        .store
+        .bind_runner_slot_child(turn_id, token, child)
+        .unwrap();
+    fixture
+        .store
+        .release_runner_slot(turn_id, token, parent)
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .queue_entry(turn_id)
+            .unwrap()
+            .unwrap()
+            .slot_reservation()
+            .is_some(),
+        "bound child reservation must survive parent release"
+    );
+    let orphaned =
+        ClientStateStore::open_with_owner_inspector(&fixture.root, live_set(&[child])).unwrap();
+    assert_eq!(
+        orphaned
+            .take_over_reserved_slot(turn_id, token, child)
+            .unwrap(),
+        ReservedSlotTakeover::Ready
+    );
+    assert_eq!(
+        orphaned
+            .queue_entry(turn_id)
+            .unwrap()
+            .unwrap()
+            .owner_opt()
+            .copied(),
+        Some(child)
+    );
+    assert!(matches!(
+        orphaned
+            .reserve_runner_slot(turn_id, child, 1, false)
+            .unwrap(),
+        RunnerSlotDecision::Pending { .. }
+    ));
+}
+
+#[test]
+fn released_then_reused_job_rejects_the_old_token() {
+    let fixture = open_queue();
+    let reserver = owner(750);
+    let child = owner(751);
+    let (task_id, turn_id) = plant_task_turn(&fixture.store, 750, reserver, None);
+    let other = plant_task_turn(&fixture.store, 751, reserver, None).1;
+    let RunnerSlotDecision::Acquired { token: old } = fixture
+        .store
+        .reserve_runner_slot(turn_id, reserver, 2, false)
+        .unwrap()
+    else {
+        panic!("expected acquire");
+    };
+    fixture
+        .store
+        .release_runner_slot(turn_id, old, reserver)
+        .unwrap();
+    let RunnerSlotDecision::Acquired { token: other_token } = fixture
+        .store
+        .reserve_runner_slot(other, reserver, 1, false)
+        .unwrap()
+    else {
+        panic!("expected acquire");
+    };
+    fixture
+        .store
+        .release_runner_slot(other, other_token, reserver)
+        .unwrap();
+    fixture.store.remove_queued(other).unwrap();
+    let RunnerSlotDecision::Acquired { token: new } = fixture
+        .store
+        .reserve_runner_slot(turn_id, reserver, 1, false)
+        .unwrap()
+    else {
+        panic!("expected acquire");
+    };
+    assert_ne!(old, new);
+    assert_eq!(
+        fixture
+            .store
+            .complete_runner_spawn(task_id, turn_id, old, child)
+            .unwrap_err()
+            .public_code(),
+        "QUEUE_SLOT_TOKEN_MISMATCH"
+    );
+}
+
+#[test]
+fn old_queue_snapshot_without_slot_reservation_deserializes() {
+    let fixture = open_queue();
+    let owner = owner(760);
+    plant_task_turn(&fixture.store, 760, owner, None);
+    let bytes = fs::read(fixture.root.join("queue/state.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(value["entries"][0].get("slot_reservation").is_none());
+    let snapshot: QueueSnapshot = serde_json::from_value(value).unwrap();
+    assert!(snapshot.entries()[0].slot_reservation().is_none());
 }

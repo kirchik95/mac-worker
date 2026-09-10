@@ -116,6 +116,8 @@ pub enum Command {
     Runner {
         task_id: HiddenComponent,
         turn_id: HiddenComponent,
+        #[arg(long = "slot-token", hide = true)]
+        slot_token: Option<HiddenComponent>,
     },
     #[command(hide = true)]
     Host {

@@ -33,7 +33,7 @@ use crate::{
         AdmissionObservation, CachedAdmissionObservation, ClientId, JobId, JobState, JobStatus,
         LocalJobRecord, ProcessIdentity, QueueAbandonmentProof, QueueCancel, QueueClaim,
         QueueEntry, QueueEntryKind, QueueSnapshot, QueueState, RemoteUncertainty,
-        ResolveOrAbandonRequest,
+        ResolveOrAbandonRequest, RunnerSlotReservation,
     },
     rooted_fs::{RootedDir, is_private_replacement_name},
     scheduler::{
@@ -132,6 +132,7 @@ pub enum ClientStateConcurrencyPoint {
     ObservationRefreshPublication,
     TaskReplacementPreExchange,
     RunnerLogContention,
+    RunnerSlotReservation,
 }
 
 /// Ordinary task updates may skip a durable exchange when the complete
@@ -172,6 +173,21 @@ pub(crate) enum ObservationRelation {
     RemoteAdvances,
     CurrentAtLeastRemote,
     Conflict,
+}
+
+/// Outcome of a spawn-slot reservation. Only [`Self::Acquired`] may spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerSlotDecision {
+    Acquired { token: Uuid },
+    Pending { token: Uuid },
+    Saturated,
+}
+
+/// Token-current child recovery after the parent dies before adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedSlotTakeover {
+    Ready,
+    WaitingForLiveOwner,
 }
 
 /// One durable queue row plus its advisory, cache-derived blocking reason.
@@ -409,6 +425,18 @@ impl ClientStateStore {
         )
     }
 
+    #[doc(hidden)]
+    pub fn open_with_owner_inspector_and_concurrency_hook<I>(
+        state_root: &Path,
+        inspector: I,
+        hook: Arc<dyn ClientStateConcurrencyHook>,
+    ) -> Result<Self, WorkerError>
+    where
+        I: ProcessInspector + 'static,
+    {
+        Self::open_inner(state_root, None, None, Arc::new(inspector), Some(hook))
+    }
+
     fn open_inner(
         state_root: &Path,
         initial_fault: Option<ClientStateWritePoint>,
@@ -591,13 +619,8 @@ impl ClientStateStore {
                     "job ID is already present in the queue",
                 ));
             }
-            if let Some(previous) = snapshot.entries.last()
-                && entry.enqueued_at_millis() < previous.enqueued_at_millis()
-            {
-                return Err(queue_error(
-                    "QUEUE_TIME_REGRESSION",
-                    "queue enqueue timestamp moved backwards",
-                ));
+            if let Some(previous) = snapshot.entries.last() {
+                entry.coalesce_enqueued_at(previous.enqueued_at_millis());
             }
             let assigned = snapshot.next_id;
             let next = assigned.checked_next()?;
@@ -606,6 +629,406 @@ impl ClientStateStore {
             snapshot.entries.push(entry.clone());
             Ok((entry.clone(), true))
         })
+    }
+
+    /// Commits one spawn permit for `job_id` if occupancy is below `slot_limit`.
+    /// Each outstanding reservation counts independently of reserver PID.
+    /// Only [`RunnerSlotDecision::Acquired`] may call `executor.start`.
+    pub fn reserve_runner_slot(
+        &self,
+        job_id: JobId,
+        reserver: ProcessIdentity,
+        slot_limit: usize,
+        exclude_reserver: bool,
+    ) -> Result<RunnerSlotDecision, WorkerError> {
+        reserver.validate()?;
+        self.update_queue(|snapshot| {
+            let tasks = self.list_tasks_locked()?;
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.job_id() == job_id)
+                .ok_or_else(|| queue_error("QUEUE_NOT_FOUND", "queue row was not found"))?;
+            if entry.kind() != QueueEntryKind::TaskTurn {
+                return Err(queue_error(
+                    "QUEUE_KIND_CONFLICT",
+                    "runner slots apply only to task turns",
+                ));
+            }
+            let existing = entry.slot_reservation();
+            let runner_holder = self.live_runner_for_current_turn(&tasks, job_id);
+            let foreign_queue_holder = self
+                .acting_queue_holder(entry)
+                .filter(|holder| *holder != reserver);
+            if let Some(reservation) = existing {
+                let reserver_live = self.observation_counts_as_slot(reservation.reserver());
+                let child_live = reservation
+                    .child()
+                    .is_some_and(|child| self.observation_counts_as_slot(child));
+                if runner_holder.is_some()
+                    || foreign_queue_holder.is_some()
+                    || reserver_live
+                    || child_live
+                {
+                    return Ok((
+                        RunnerSlotDecision::Pending {
+                            token: reservation.token(),
+                        },
+                        false,
+                    ));
+                }
+                // Dead reserver, no live bound child, no live same-turn holder:
+                // steal with a fresh token.
+            } else if runner_holder.is_some() || foreign_queue_holder.is_some() {
+                // Same-turn Pending without a reservation still requires a
+                // live task.runner or a different live queue owner. Reconcile
+                // may adopt_row onto this process first; that Dispatching
+                // owner is the controller, not a runner. The log fence in
+                // reconcile / start_runner_with_reservation proved the
+                // previous owner dead.
+                return Ok((RunnerSlotDecision::Pending { token: Uuid::nil() }, false));
+            } else {
+                let exclude = exclude_reserver.then_some(reserver);
+                let occupied = self.occupied_runner_slots_locked(
+                    snapshot,
+                    &tasks,
+                    exclude,
+                    Some((job_id, reserver)),
+                )?;
+                if occupied >= slot_limit {
+                    return Ok((RunnerSlotDecision::Saturated, false));
+                }
+            }
+            let token = Uuid::new_v4();
+            let reservation = RunnerSlotReservation::new(reserver, token)?;
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            entry.set_slot_reservation(Some(reservation))?;
+            self.reach_concurrency_point(ClientStateConcurrencyPoint::RunnerSlotReservation);
+            Ok((RunnerSlotDecision::Acquired { token }, true))
+        })
+    }
+
+    pub fn release_runner_slot(
+        &self,
+        job_id: JobId,
+        token: Uuid,
+        reserver: ProcessIdentity,
+    ) -> Result<QueueEntry, WorkerError> {
+        reserver.validate()?;
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            match entry.slot_reservation() {
+                Some(reservation)
+                    if reservation.token() == token
+                        && reservation.reserver() == reserver
+                        && reservation.child().is_none() =>
+                {
+                    entry.set_slot_reservation(None)?;
+                    Ok((entry.clone(), true))
+                }
+                Some(_) => Ok((entry.clone(), false)),
+                None => Ok((entry.clone(), false)),
+            }
+        })
+    }
+
+    /// Records the spawned child on the exact reservation token so steal and
+    /// occupancy have handoff evidence before `task.runner` is durable.
+    pub fn bind_runner_slot_child(
+        &self,
+        job_id: JobId,
+        token: Uuid,
+        child: ProcessIdentity,
+    ) -> Result<QueueEntry, WorkerError> {
+        child.validate()?;
+        if token.is_nil() {
+            return Err(queue_error(
+                "QUEUE_SLOT_TOKEN_MISMATCH",
+                "runner slot token is no longer current",
+            ));
+        }
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            match entry.slot_reservation() {
+                Some(reservation) if reservation.token() == token => {
+                    entry.set_slot_reservation(Some(reservation.with_child(child)?))?;
+                    Ok((entry.clone(), true))
+                }
+                _ => Err(queue_error(
+                    "QUEUE_SLOT_TOKEN_MISMATCH",
+                    "runner slot token is no longer current",
+                )),
+            }
+        })
+    }
+
+    /// Token-current child adopts a waiting row whose parent/reserver is dead.
+    pub fn take_over_reserved_slot(
+        &self,
+        job_id: JobId,
+        token: Uuid,
+        child: ProcessIdentity,
+    ) -> Result<ReservedSlotTakeover, WorkerError> {
+        child.validate()?;
+        if token.is_nil() {
+            return Err(queue_error(
+                "QUEUE_SLOT_TOKEN_MISMATCH",
+                "runner slot token is no longer current",
+            ));
+        }
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            match entry.slot_reservation() {
+                Some(reservation) if reservation.token() == token => {
+                    if let Some(bound) = reservation.child()
+                        && bound != child
+                        && self.observation_counts_as_slot(bound)
+                    {
+                        return Err(queue_error(
+                            "QUEUE_SLOT_TOKEN_MISMATCH",
+                            "runner slot token is no longer current",
+                        ));
+                    }
+                    match entry.owner_opt() {
+                        Some(owner) if *owner == child => Ok((ReservedSlotTakeover::Ready, false)),
+                        Some(owner) if self.observation_counts_as_slot(*owner) => {
+                            Ok((ReservedSlotTakeover::WaitingForLiveOwner, false))
+                        }
+                        Some(_) => {
+                            entry.adopt(child)?;
+                            Ok((ReservedSlotTakeover::Ready, true))
+                        }
+                        None => Err(queue_error(
+                            "QUEUE_SLOT_TOKEN_MISMATCH",
+                            "runner slot token is no longer current",
+                        )),
+                    }
+                }
+                None if entry.owner_opt() == Some(&child) => {
+                    Ok((ReservedSlotTakeover::Ready, false))
+                }
+                _ => Err(queue_error(
+                    "QUEUE_SLOT_TOKEN_MISMATCH",
+                    "runner slot token is no longer current",
+                )),
+            }
+        })
+    }
+
+    pub fn complete_runner_spawn(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        token: Uuid,
+        child: ProcessIdentity,
+    ) -> Result<QueueEntry, WorkerError> {
+        child.validate()?;
+        if token.is_nil() {
+            return Err(queue_error(
+                "QUEUE_SLOT_TOKEN_MISMATCH",
+                "runner slot token is no longer current",
+            ));
+        }
+        let _lock = QueueLock::acquire(
+            self.inner.root.as_raw_fd(),
+            self.inner.queue.as_raw_fd(),
+            &self.inner.sync_counts,
+        )?;
+        let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        {
+            let entry = find_queue_entry_mut(&mut snapshot, turn_id)?;
+            match entry.slot_reservation() {
+                Some(reservation) if reservation.token() == token => {
+                    if let Some(bound) = reservation.child()
+                        && bound != child
+                    {
+                        return Err(queue_error(
+                            "QUEUE_SLOT_TOKEN_MISMATCH",
+                            "runner slot token is no longer current",
+                        ));
+                    }
+                }
+                None if entry.owner_opt() == Some(&child) => {}
+                _ => {
+                    return Err(queue_error(
+                        "QUEUE_SLOT_TOKEN_MISMATCH",
+                        "runner slot token is no longer current",
+                    ));
+                }
+            }
+            if entry.owner_opt() != Some(&child) {
+                entry.adopt(child)?;
+            }
+            if let Some(reservation) = entry.slot_reservation() {
+                entry.set_slot_reservation(Some(reservation.with_child(child)?))?;
+            }
+        }
+        snapshot.validate()?;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        self.reach_concurrency_point(ClientStateConcurrencyPoint::QueuePublication);
+        publish_queue_snapshot(self, &snapshot, identity)?;
+        let record = self.load_task(task_id)?;
+        self.update_task_locked_before_final_sync(
+            record.with_runner(Some(RunnerIdentity::new(child)))?,
+            || Ok(()),
+            IdenticalTaskWrite::Replace,
+        )?;
+        let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        let entry = find_queue_entry_mut(&mut snapshot, turn_id)?;
+        match entry.slot_reservation() {
+            Some(reservation) if reservation.token() == token => {
+                entry.set_slot_reservation(None)?;
+            }
+            None if entry.owner_opt() == Some(&child) => {}
+            _ => {
+                return Err(queue_error(
+                    "QUEUE_SLOT_TOKEN_MISMATCH",
+                    "runner slot token is no longer current",
+                ));
+            }
+        }
+        snapshot.validate()?;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        publish_queue_snapshot(self, &snapshot, identity)?;
+        Ok(snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.job_id() == turn_id)
+            .cloned()
+            .expect("completed spawn row remains"))
+    }
+
+    pub fn live_runner_slot_count(&self) -> Result<usize, WorkerError> {
+        let _lock = QueueLock::acquire(
+            self.inner.root.as_raw_fd(),
+            self.inner.queue.as_raw_fd(),
+            &self.inner.sync_counts,
+        )?;
+        let snapshot = read_queue_snapshot(self.inner.queue.as_raw_fd())?.0;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        let tasks = self.list_tasks_locked()?;
+        self.occupied_runner_slots_locked(&snapshot, &tasks, None, None)
+    }
+
+    fn occupied_runner_slots_locked(
+        &self,
+        snapshot: &QueueSnapshot,
+        tasks: &[LocalTaskRecord],
+        exclude: Option<ProcessIdentity>,
+        reserving: Option<(JobId, ProcessIdentity)>,
+    ) -> Result<usize, WorkerError> {
+        let mut holder_ids = BTreeSet::new();
+        for task in tasks {
+            let Some(runner) = task.runner() else {
+                continue;
+            };
+            let identity = runner.process_identity();
+            if exclude == Some(identity) {
+                continue;
+            }
+            if self.observation_counts_as_slot(identity) {
+                holder_ids.insert((identity.pid(), identity.start_time_micros()));
+            }
+        }
+        let mut extra = 0usize;
+        for entry in snapshot.entries() {
+            if entry.kind() != QueueEntryKind::TaskTurn {
+                continue;
+            }
+            if let Some(holder) = self.acting_queue_holder(entry) {
+                let recovered_controller = reserving.is_some_and(|(job_id, reserver)| {
+                    entry.job_id() == job_id
+                        && holder == reserver
+                        && entry.slot_reservation().is_none()
+                        && self.live_runner_for_current_turn(tasks, job_id).is_none()
+                });
+                if exclude != Some(holder) && !recovered_controller {
+                    holder_ids.insert((holder.pid(), holder.start_time_micros()));
+                }
+            }
+            if entry.slot_reservation().is_some() {
+                extra += 1;
+            }
+        }
+        Ok(holder_ids.len() + extra)
+    }
+
+    fn acting_queue_holder(&self, entry: &QueueEntry) -> Option<ProcessIdentity> {
+        match entry.state() {
+            QueueState::Dispatching { dispatch_owner, .. }
+                if self.observation_counts_as_slot(*dispatch_owner) =>
+            {
+                Some(*dispatch_owner)
+            }
+            QueueState::Waiting { owner }
+                if *owner != *entry.enqueue_owner() && self.observation_counts_as_slot(*owner) =>
+            {
+                Some(*owner)
+            }
+            _ => None,
+        }
+    }
+
+    fn live_runner_for_current_turn(
+        &self,
+        tasks: &[LocalTaskRecord],
+        turn_id: JobId,
+    ) -> Option<ProcessIdentity> {
+        for task in tasks {
+            let Some(runner) = task.runner() else {
+                continue;
+            };
+            let identity = runner.process_identity();
+            if !self.observation_counts_as_slot(identity) {
+                continue;
+            }
+            if self.task_holds_current_turn(task, turn_id) {
+                return Some(identity);
+            }
+        }
+        None
+    }
+
+    /// Current-turn identity is `status.turns().last()` when present. A
+    /// queued submit has no turn on status yet; use the intent field or an
+    /// exact `turns/<task>/<turn>` locator, never `turn_ids_for_task`.
+    fn task_holds_current_turn(&self, task: &LocalTaskRecord, turn_id: JobId) -> bool {
+        if let Some(current) = task.status().turns().last() {
+            return current.turn_id() == turn_id && current.terminal().is_none();
+        }
+        task.submission_intent_turn_id() == Some(turn_id)
+            || self.task_turn_locator_exists(task.meta().task_id(), turn_id)
+    }
+
+    fn task_turn_locator_exists(&self, task_id: TaskId, turn_id: TurnId) -> bool {
+        let Ok(turns) = self.turns_dir() else {
+            return true;
+        };
+        let Ok(task_path) = relative_path(&task_id.to_string()) else {
+            return true;
+        };
+        let task_dir = match turns.open_child_directory(&task_path, false) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        let Ok(turn_path) = relative_path(&turn_id.to_string()) else {
+            return true;
+        };
+        match task_dir.open_child_directory(&turn_path, false) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(_) => true,
+        }
+    }
+
+    fn observation_counts_as_slot(&self, identity: ProcessIdentity) -> bool {
+        matches!(
+            self.inner.owner_inspector.observe(identity),
+            ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
+        )
     }
 
     pub fn queue_snapshot(&self) -> Result<QueueSnapshot, WorkerError> {

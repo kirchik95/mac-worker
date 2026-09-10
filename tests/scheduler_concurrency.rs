@@ -16,7 +16,10 @@ use std::{
 };
 
 use mac_worker::{
-    client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore},
+    client_state::{
+        ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
+        RunnerSlotDecision,
+    },
     config::{Config, WorkerEntry},
     error::WorkerError,
     host_store::HostStore,
@@ -33,6 +36,9 @@ use mac_worker::{
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     run::{JobFollower, RunObserver, RunRequest, RunService, RunStage},
     scheduler::{CandidateSlot, WorkerPreference},
+    supervisor::{
+        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    },
     transfer::HostOperation,
 };
 use support::GitRepo;
@@ -138,6 +144,79 @@ fn gated_store(
     });
     let store = Arc::new(ClientStateStore::open_with_concurrency_hook(&root, hook).unwrap());
     (directory, store, entered_rx, release_tx)
+}
+
+#[derive(Clone, Copy)]
+struct LiveOwners;
+
+impl ProcessInspector for LiveOwners {
+    fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+        ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7)
+    }
+
+    fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+        ProcessObservation::Matching {
+            process_group: expected.pid(),
+        }
+    }
+
+    fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
+        ProcessGroupObservation::Ambiguous
+    }
+
+    fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
+        ProcessGroupMembership::Ambiguous
+    }
+}
+
+fn gated_live_store(
+    point: ClientStateConcurrencyPoint,
+) -> (
+    tempfile::TempDir,
+    Arc<ClientStateStore>,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap().join("state");
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let hook = Arc::new(OneShotGate {
+        point,
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        used: AtomicBool::new(false),
+    });
+    let store = Arc::new(
+        ClientStateStore::open_with_owner_inspector_and_concurrency_hook(&root, LiveOwners, hook)
+            .unwrap(),
+    );
+    (directory, store, entered_rx, release_tx)
+}
+
+fn queued_at(
+    store: &ClientStateStore,
+    id: u128,
+    owner: ProcessIdentity,
+    enqueued_at_millis: u64,
+) -> QueueEntry {
+    QueueEntry::new(
+        JobId::new(uuid::Uuid::from_u128(id)),
+        store.client_id(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        CommandSpec::argv(vec!["safe-command-summary-only".into()])
+            .unwrap()
+            .summary()
+            .unwrap(),
+        Vec::new(),
+        WorkerPreference::Automatic,
+        QueueEntryKind::TaskTurn,
+        None,
+        owner,
+        enqueued_at_millis,
+    )
+    .unwrap()
 }
 
 const PRODUCTION_RSYNC_STATS: &[u8] = b"Number of files: 2\nNumber of files transferred: 1\nTotal file size: 8 B\nTotal transferred file size: 8 B\nUnmatched data: 8 B\nMatched data: 0 B\nFile list size: 64 B\nTotal sent: 128 B\nTotal received: 32 B\n\nsent 128 bytes  received 32 bytes  1000 bytes/sec\ntotal size is 8  speedup is 0.05\n";
@@ -1163,4 +1242,135 @@ fn run_cap_and_observation_refresh_are_atomic_under_competing_dispatchers() {
             "schedule {schedule} publishes canonical bytes"
         );
     }
+}
+
+#[test]
+fn same_reserver_two_jobs_cap_one_grants_exactly_one_acquired() {
+    // Break caught: unique-PID occupancy collapsed two outstanding spawns
+    // from one TaskClient into a single slot.
+    let (_directory, store, entered, release) =
+        gated_live_store(ClientStateConcurrencyPoint::RunnerSlotReservation);
+    let reserver = owner(7);
+    let first = store
+        .enqueue(queued(
+            &store,
+            1,
+            reserver,
+            WorkerPreference::Automatic,
+            None,
+        ))
+        .unwrap();
+    let second = store
+        .enqueue(queued(
+            &store,
+            2,
+            reserver,
+            WorkerPreference::Automatic,
+            None,
+        ))
+        .unwrap();
+    let first_store = Arc::clone(&store);
+    let first_job = first.job_id();
+    let first_thread =
+        thread::spawn(move || first_store.reserve_runner_slot(first_job, reserver, 1, false));
+    entered.recv().unwrap();
+    let second_store = Arc::clone(&store);
+    let second_job = second.job_id();
+    let second_thread =
+        thread::spawn(move || second_store.reserve_runner_slot(second_job, reserver, 1, false));
+    release.send(()).unwrap();
+    let decisions = [
+        first_thread.join().unwrap().unwrap(),
+        second_thread.join().unwrap().unwrap(),
+    ];
+    let acquired = decisions
+        .iter()
+        .filter(|decision| matches!(decision, RunnerSlotDecision::Acquired { .. }))
+        .count();
+    let saturated = decisions
+        .iter()
+        .filter(|decision| matches!(decision, RunnerSlotDecision::Saturated))
+        .count();
+    assert_eq!(acquired, 1, "{decisions:?}");
+    assert_eq!(saturated, 1, "{decisions:?}");
+    assert_eq!(store.live_runner_slot_count().unwrap(), 1);
+}
+
+#[test]
+fn same_reserver_same_job_starts_executor_once() {
+    // Break caught: idempotent "return the existing generation" let two threads
+    // with the same ProcessIdentity both call executor.start.
+    let (_directory, store, entered, release) =
+        gated_live_store(ClientStateConcurrencyPoint::RunnerSlotReservation);
+    let reserver = owner(8);
+    let entry = store
+        .enqueue(queued(
+            &store,
+            3,
+            reserver,
+            WorkerPreference::Automatic,
+            None,
+        ))
+        .unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let first_store = Arc::clone(&store);
+    let first_starts = Arc::clone(&starts);
+    let job = entry.job_id();
+    let first = thread::spawn(move || {
+        let decision = first_store
+            .reserve_runner_slot(job, reserver, 1, false)
+            .unwrap();
+        if matches!(decision, RunnerSlotDecision::Acquired { .. }) {
+            first_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        decision
+    });
+    entered.recv().unwrap();
+    let second_store = Arc::clone(&store);
+    let second_starts = Arc::clone(&starts);
+    let second = thread::spawn(move || {
+        let decision = second_store
+            .reserve_runner_slot(job, reserver, 1, false)
+            .unwrap();
+        if matches!(decision, RunnerSlotDecision::Acquired { .. }) {
+            second_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        decision
+    });
+    release.send(()).unwrap();
+    let decisions = [first.join().unwrap(), second.join().unwrap()];
+    let acquired = decisions
+        .iter()
+        .filter(|decision| matches!(decision, RunnerSlotDecision::Acquired { .. }))
+        .count();
+    let pending = decisions
+        .iter()
+        .filter(|decision| matches!(decision, RunnerSlotDecision::Pending { .. }))
+        .count();
+    assert_eq!(acquired, 1, "{decisions:?}");
+    assert_eq!(pending, 1, "{decisions:?}");
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "{decisions:?}");
+}
+
+#[test]
+fn concurrent_enqueue_coalesces_inverted_clocks() {
+    // Break caught: a later enqueue with an earlier wall clock failed snapshot
+    // validation / QUEUE_TIME_REGRESSION instead of taking max(caller, last).
+    let (_directory, store, entered, release) =
+        gated_store(ClientStateConcurrencyPoint::QueuePublication);
+    let first_owner = owner(30);
+    let second_owner = owner(31);
+    let first_store = Arc::clone(&store);
+    let first =
+        thread::spawn(move || first_store.enqueue(queued_at(&first_store, 40, first_owner, 200)));
+    entered.recv().unwrap();
+    let second_store = Arc::clone(&store);
+    let second =
+        thread::spawn(move || second_store.enqueue(queued_at(&second_store, 41, second_owner, 50)));
+    release.send(()).unwrap();
+    let first = first.join().unwrap().unwrap();
+    let second = second.join().unwrap().unwrap();
+    assert_eq!(first.enqueued_at_millis(), 200);
+    assert_eq!(second.enqueued_at_millis(), 200);
+    assert!(second.queue_id().value() > first.queue_id().value());
 }

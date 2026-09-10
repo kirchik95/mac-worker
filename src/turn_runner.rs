@@ -11,9 +11,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use uuid::Uuid;
+
 use crate::{
     agent::{TurnParams, adapter_for, render_shell},
-    client_state::ClientStateStore,
+    client_state::{ClientStateStore, ReservedSlotTakeover, RunnerSlotDecision},
     config::{Config, WorkerEntry},
     error::WorkerError,
     git_transport::GitTransport,
@@ -60,6 +62,27 @@ pub trait RunnerExecutor: Send + Sync {
         task_id: TaskId,
         turn_id: TurnId,
     ) -> Result<RunnerIdentity, WorkerError>;
+
+    /// Production detached spawn may carry the reservation token. Default
+    /// implementations ignore it and call [`Self::start`].
+    fn start_with_slot(
+        &self,
+        paths: &PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+        slot_token: Option<Uuid>,
+    ) -> Result<RunnerIdentity, WorkerError> {
+        let _ = slot_token;
+        self.start(paths, task_id, turn_id)
+    }
+}
+
+/// Outcome of a reserved spawn attempt. Only [`Self::Started`] ran `executor.start`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerStart {
+    Started(RunnerIdentity),
+    Pending,
+    Saturated,
 }
 
 /// Test/attached executor.  The current process owns the queue row and the
@@ -91,6 +114,16 @@ impl RunnerExecutor for DetachedRunnerExecutor {
         task_id: TaskId,
         turn_id: TurnId,
     ) -> Result<RunnerIdentity, WorkerError> {
+        self.start_with_slot(paths, task_id, turn_id, None)
+    }
+
+    fn start_with_slot(
+        &self,
+        paths: &PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+        slot_token: Option<Uuid>,
+    ) -> Result<RunnerIdentity, WorkerError> {
         // Use the same rooted, locked initialization as the child. Never follow
         // a substituted log or chmod an existing target through a pathname.
         let _state = ClientStateStore::open(&paths.state)?;
@@ -103,7 +136,11 @@ impl RunnerExecutor for DetachedRunnerExecutor {
         command
             .arg("runner")
             .arg(task_id.to_string())
-            .arg(turn_id.to_string())
+            .arg(turn_id.to_string());
+        if let Some(token) = slot_token {
+            command.arg("--slot-token").arg(token.to_string());
+        }
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -160,6 +197,7 @@ pub struct TurnRunner<'a> {
     /// operator turned notifications off or nobody injected a session.
     pub(crate) notifier: Option<crate::herdr::HerdrSocket>,
     adoption_wait: Duration,
+    slot_token: Option<Uuid>,
 }
 
 impl<'a> TurnRunner<'a> {
@@ -187,7 +225,15 @@ impl<'a> TurnRunner<'a> {
             executor,
             notifier: None,
             adoption_wait: ADOPTION_WAIT,
+            slot_token: None,
         }
+    }
+
+    /// Hidden detached children refuse claim/adopt unless the row still holds
+    /// this exact spawn-attempt token.
+    pub fn with_slot_token(mut self, token: Option<Uuid>) -> Self {
+        self.slot_token = token;
+        self
     }
 
     /// Notify this herdr session when a turn ends.  Nothing reads the
@@ -345,33 +391,28 @@ impl<'a> TurnRunner<'a> {
             .ok_or_else(|| {
                 task_error("TASK_INCONSISTENT", "parked task turn has no task record")
             })?;
-        let identity = match self.executor.start(self.paths, task_id, entry.job_id()) {
-            Ok(identity) => identity,
+        match start_runner_with_reservation(
+            self.client_state,
+            self.executor,
+            self.paths,
+            task_id,
+            entry.job_id(),
+            self.config.workers.len(),
+            true,
+        ) {
+            Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => Ok(()),
+            Ok(RunnerStart::Saturated) => {
+                self.client_state.park_row(entry.job_id())?;
+                Ok(())
+            }
             Err(error) => {
                 self.abandon_handoff_failure(task_id, entry.job_id(), owner)?;
-                return Err(task_error(
+                Err(task_error(
                     "RUNNER_HANDOFF_FAILED",
                     format!("runner handoff failed: {error}"),
-                ));
+                ))
             }
-        };
-        let log = LogWriter::open(&self.paths.state, task_id, entry.job_id())?;
-        if log.current_entry(self.client_state)?.as_ref() != Some(&entry) {
-            return Err(task_error("TASK_BUSY", "task turn changed during handoff"));
         }
-        self.client_state
-            .record_runner(task_id, Some(identity.clone()))?;
-        if let Err(error) = adopt_row_with_retry(
-            self.client_state,
-            entry.job_id(),
-            identity.process_identity(),
-        ) {
-            let _ = self.client_state.record_runner(task_id, None);
-            drop(log);
-            self.abandon_handoff_failure(task_id, entry.job_id(), owner)?;
-            return Err(error);
-        }
-        Ok(())
     }
 
     fn abandon_handoff_failure(
@@ -443,7 +484,7 @@ impl<'a> TurnRunner<'a> {
         let adoption_deadline = Instant::now() + self.adoption_wait;
         loop {
             let record = self.client_state.load_task(task_id)?;
-            let entry = self
+            let mut entry = self
                 .client_state
                 .queue_entry(turn_id)?
                 .ok_or_else(|| task_error("TASK_QUEUE_MISSING", "task turn is not queued"))?;
@@ -452,6 +493,28 @@ impl<'a> TurnRunner<'a> {
                     "TASK_QUEUE_KIND",
                     "queue row is not a task turn",
                 ));
+            }
+            if let Some(expected) = self.slot_token {
+                match self
+                    .client_state
+                    .take_over_reserved_slot(turn_id, expected, runner_owner)?
+                {
+                    ReservedSlotTakeover::Ready => {
+                        entry = self.client_state.queue_entry(turn_id)?.ok_or_else(|| {
+                            task_error("TASK_QUEUE_MISSING", "task turn is not queued")
+                        })?;
+                    }
+                    ReservedSlotTakeover::WaitingForLiveOwner => {
+                        if Instant::now() >= adoption_deadline {
+                            return Err(queue_error(
+                                "QUEUE_SLOT_TOKEN_MISMATCH",
+                                "runner slot token is no longer current",
+                            ));
+                        }
+                        std::thread::sleep(WAIT_POLL);
+                        continue;
+                    }
+                }
             }
             if crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)?
                 .is_some_and(|s| s.completion.is_some())
@@ -1808,9 +1871,82 @@ fn undrainable_failure_status(
     )
 }
 
+/// Reserve a spawn permit, start only on [`RunnerSlotDecision::Acquired`], then
+/// adopt the child and clear that token. `Pending` and `Saturated` never spawn.
+pub fn start_runner_with_reservation(
+    client_state: &ClientStateStore,
+    executor: &dyn RunnerExecutor,
+    paths: &PathLayout,
+    task_id: TaskId,
+    turn_id: TurnId,
+    slot_limit: usize,
+    exclude_reserver: bool,
+) -> Result<RunnerStart, WorkerError> {
+    let reserver = current_process_identity()?;
+    match client_state.reserve_runner_slot(turn_id, reserver, slot_limit, exclude_reserver)? {
+        RunnerSlotDecision::Saturated => Ok(RunnerStart::Saturated),
+        RunnerSlotDecision::Pending { .. } => Ok(RunnerStart::Pending),
+        RunnerSlotDecision::Acquired { token } => {
+            let expected = client_state
+                .queue_entry(turn_id)?
+                .ok_or_else(|| task_error("TASK_BUSY", "task turn was retired before handoff"))?;
+            match executor.start_with_slot(paths, task_id, turn_id, Some(token)) {
+                Ok(identity) => {
+                    let child = identity.process_identity();
+                    if let Err(error) = client_state.bind_runner_slot_child(turn_id, token, child) {
+                        let _ = client_state.release_runner_slot(turn_id, token, reserver);
+                        return Err(error);
+                    }
+                    let expected = match token_fenced_row_after_bind(expected, token, child) {
+                        Ok(expected) => expected,
+                        Err(error) => {
+                            let _ = client_state.release_runner_slot(turn_id, token, reserver);
+                            return Err(error);
+                        }
+                    };
+                    let log = LogWriter::open(&paths.state, task_id, turn_id)?;
+                    if log.current_entry(client_state)?.as_ref() != Some(&expected) {
+                        let _ = client_state.release_runner_slot(turn_id, token, reserver);
+                        return Err(task_error("TASK_BUSY", "task turn changed during handoff"));
+                    }
+                    match client_state.complete_runner_spawn(task_id, turn_id, token, child) {
+                        Ok(_) => Ok(RunnerStart::Started(identity)),
+                        Err(error) => {
+                            let _ = client_state.release_runner_slot(turn_id, token, reserver);
+                            Err(error)
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = client_state.release_runner_slot(turn_id, token, reserver);
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+/// Bind is the only mutation allowed between reserve and complete. Compare
+/// against the pre-spawn row with this token's child attached, not the
+/// unbound snapshot.
+fn token_fenced_row_after_bind(
+    mut expected: crate::job::QueueEntry,
+    token: Uuid,
+    child: ProcessIdentity,
+) -> Result<crate::job::QueueEntry, WorkerError> {
+    match expected.slot_reservation() {
+        Some(reservation) if reservation.token() == token => {
+            expected.set_slot_reservation(Some(reservation.with_child(child)?))?;
+            Ok(expected)
+        }
+        _ => Err(task_error("TASK_BUSY", "task turn changed during handoff")),
+    }
+}
+
 /// Transfer a waiting or dispatching task row to the process that will
 /// execute it. A detached child can start before its parent reaches this
 /// write, so the child-side claim path waits for its own identity to appear.
+#[allow(dead_code)]
 pub(crate) fn adopt_row_with_retry(
     client_state: &ClientStateStore,
     turn_id: TurnId,

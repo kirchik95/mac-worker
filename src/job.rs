@@ -645,6 +645,84 @@ impl ProcessIdentity {
     }
 }
 
+/// One outstanding spawn permit. The token is unique per spawn attempt and is
+/// never reused after release, steal, or completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunnerSlotReservation {
+    reserver: ProcessIdentity,
+    token: Uuid,
+    child: Option<ProcessIdentity>,
+}
+
+impl RunnerSlotReservation {
+    pub fn new(reserver: ProcessIdentity, token: Uuid) -> Result<Self, WorkerError> {
+        reserver.validate()?;
+        if token.is_nil() {
+            return Err(protocol_error(
+                "runner slot token must be unique and non-nil",
+            ));
+        }
+        Ok(Self {
+            reserver,
+            token,
+            child: None,
+        })
+    }
+
+    pub fn with_child(self, child: ProcessIdentity) -> Result<Self, WorkerError> {
+        child.validate()?;
+        Ok(Self {
+            child: Some(child),
+            ..self
+        })
+    }
+
+    pub fn reserver(self) -> ProcessIdentity {
+        self.reserver
+    }
+
+    pub fn token(self) -> Uuid {
+        self.token
+    }
+
+    pub fn child(self) -> Option<ProcessIdentity> {
+        self.child
+    }
+}
+
+impl Serialize for RunnerSlotReservation {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let fields = 2 + usize::from(self.child.is_some());
+        let mut record = serializer.serialize_struct("RunnerSlotReservation", fields)?;
+        record.serialize_field("reserver", &self.reserver)?;
+        record.serialize_field("token", &self.token.to_string())?;
+        if let Some(child) = &self.child {
+            record.serialize_field("child", child)?;
+        }
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RunnerSlotReservation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            reserver: ProcessIdentity,
+            token: String,
+            #[serde(default)]
+            child: Option<ProcessIdentity>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let token = Uuid::parse_str(&wire.token).map_err(de::Error::custom)?;
+        let mut reservation = Self::new(wire.reserver, token).map_err(de::Error::custom)?;
+        if let Some(child) = wire.child {
+            reservation = reservation.with_child(child).map_err(de::Error::custom)?;
+        }
+        Ok(reservation)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QueueId(u64);
 
@@ -1183,6 +1261,7 @@ pub struct QueueEntry {
     pub(crate) preacceptance_abandonment_proof: Option<QueueAbandonmentProof>,
     pub(crate) cancel_requested_at_millis: Option<u64>,
     pub(crate) enqueued_at_millis: u64,
+    pub(crate) slot_reservation: Option<RunnerSlotReservation>,
 }
 
 impl QueueEntry {
@@ -1216,6 +1295,7 @@ impl QueueEntry {
             preacceptance_abandonment_proof: None,
             cancel_requested_at_millis: None,
             enqueued_at_millis,
+            slot_reservation: None,
         };
         entry.validate()?;
         Ok(entry)
@@ -1241,6 +1321,9 @@ impl QueueEntry {
             return Err(protocol_error(
                 "queue cancellation timestamp predates enqueue timestamp",
             ));
+        }
+        if let Some(reserved) = self.slot_reservation {
+            RunnerSlotReservation::new(reserved.reserver, reserved.token)?;
         }
         if let Some(proof) = &self.preacceptance_abandonment_proof {
             proof.validate_against(self)?;
@@ -1325,6 +1408,27 @@ impl QueueEntry {
         self.enqueued_at_millis
     }
 
+    pub fn slot_reservation(&self) -> Option<RunnerSlotReservation> {
+        self.slot_reservation
+    }
+
+    pub(crate) fn coalesce_enqueued_at(&mut self, floor: u64) {
+        if self.enqueued_at_millis < floor {
+            self.enqueued_at_millis = floor;
+        }
+    }
+
+    pub(crate) fn set_slot_reservation(
+        &mut self,
+        reservation: Option<RunnerSlotReservation>,
+    ) -> Result<(), WorkerError> {
+        if let Some(reservation) = reservation {
+            RunnerSlotReservation::new(reservation.reserver, reservation.token)?;
+        }
+        self.slot_reservation = reservation;
+        self.validate()
+    }
+
     pub(crate) fn assign_queue_id(&mut self, queue_id: QueueId) {
         self.queue_id = queue_id;
     }
@@ -1356,6 +1460,7 @@ impl QueueEntry {
             return Err(protocol_error("only a waiting task turn can be parked"));
         }
         self.state = QueueState::Parked;
+        self.slot_reservation = None;
         self.validate()
     }
 
@@ -1466,7 +1571,8 @@ impl QueueEntry {
 impl Serialize for QueueEntry {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("QueueEntry", 15)?;
+        let fields = 15 + usize::from(self.slot_reservation.is_some());
+        let mut record = serializer.serialize_struct("QueueEntry", fields)?;
         record.serialize_field("queue_id", &self.queue_id)?;
         record.serialize_field("job_id", &self.job_id)?;
         record.serialize_field("client_id", &self.client_id)?;
@@ -1488,6 +1594,9 @@ impl Serialize for QueueEntry {
             &self.cancel_requested_at_millis,
         )?;
         record.serialize_field("enqueued_at_millis", &self.enqueued_at_millis)?;
+        if let Some(reservation) = &self.slot_reservation {
+            record.serialize_field("slot_reservation", reservation)?;
+        }
         record.end()
     }
 }
@@ -1512,6 +1621,8 @@ impl<'de> Deserialize<'de> for QueueEntry {
             preacceptance_abandonment_proof: Option<QueueAbandonmentProof>,
             cancel_requested_at_millis: Option<u64>,
             enqueued_at_millis: u64,
+            #[serde(default)]
+            slot_reservation: Option<RunnerSlotReservation>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let entry = Self {
@@ -1530,6 +1641,7 @@ impl<'de> Deserialize<'de> for QueueEntry {
             preacceptance_abandonment_proof: wire.preacceptance_abandonment_proof,
             cancel_requested_at_millis: wire.cancel_requested_at_millis,
             enqueued_at_millis: wire.enqueued_at_millis,
+            slot_reservation: wire.slot_reservation,
         };
         entry.validate().map_err(de::Error::custom)?;
         Ok(entry)
