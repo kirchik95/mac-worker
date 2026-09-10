@@ -1167,6 +1167,10 @@ impl ClientStateStore {
         })
     }
 
+    /// Recovers a batch Dispatching row only when its owner is
+    /// [`RunnerLivenessVerdict::Exited`]. Occupancy (`owner_is_live_or_ambiguous`)
+    /// uses the same verdict, so an unconfirmed `Absent` keeps occupying the
+    /// slot until a second look (or `Reused`) proves death.
     pub fn recover_dead_dispatches(&self) -> Result<Vec<JobId>, WorkerError> {
         self.update_queue(|snapshot| {
             let mut recovered = Vec::new();
@@ -1183,10 +1187,7 @@ impl ClientStateStore {
                     continue;
                 };
                 let dispatch_owner = *dispatch_owner;
-                if matches!(
-                    self.inner.owner_inspector.observe(dispatch_owner),
-                    ProcessObservation::Absent | ProcessObservation::Reused
-                ) {
+                if self.runner_identity_verdict(dispatch_owner) == RunnerLivenessVerdict::Exited {
                     let job_id = snapshot.entries[index].job_id();
                     if snapshot.entries[index]
                         .preacceptance_abandonment_proof()

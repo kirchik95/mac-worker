@@ -2061,6 +2061,7 @@ fn dead_batch_recovery_retires_persisted_abandonment_instead_of_reclaiming_it() 
             .recorded_by(),
         &dispatcher
     );
+    reopened.note_confirmed_runner_absence(dispatcher);
     assert_eq!(
         reopened.recover_dead_dispatches().unwrap(),
         vec![row.job_id()]
@@ -2168,6 +2169,9 @@ fn dead_batch_dispatch_is_first_persisted_waiting_and_pid_reuse_is_dead() {
             .unwrap()
             .unwrap();
 
+        if observation == ProcessObservation::Absent {
+            fixture.store.note_confirmed_runner_absence(dispatcher);
+        }
         assert_eq!(
             fixture.store.recover_dead_dispatches().unwrap(),
             vec![row.job_id()]
@@ -2199,6 +2203,15 @@ fn dead_batch_recovery_reverts_statusless_publication_and_frees_the_reservation(
         .create_job(local_record(&fixture.store, row.job_id(), "mini-1", None))
         .unwrap();
 
+    assert!(
+        fixture.store.recover_dead_dispatches().unwrap().is_empty(),
+        "a single unconfirmed Absent must not free the reservation"
+    );
+    assert!(matches!(
+        fixture.store.queue_snapshot().unwrap().entries()[0].state(),
+        QueueState::Dispatching { .. }
+    ));
+    fixture.store.note_confirmed_runner_absence(dispatcher);
     assert_eq!(
         fixture.store.recover_dead_dispatches().unwrap(),
         vec![row.job_id()]
@@ -2270,6 +2283,7 @@ fn dead_batch_recovery_preserves_bound_remote_evidence_and_uncertainty() {
             .unwrap();
         let before = fixture.store.queue_snapshot().unwrap();
 
+        fixture.store.note_confirmed_runner_absence(dispatcher);
         assert!(fixture.store.recover_dead_dispatches().unwrap().is_empty());
         assert_eq!(fixture.store.queue_snapshot().unwrap(), before);
     }
@@ -2299,6 +2313,7 @@ fn dead_batch_recovery_retires_a_bound_terminal_record() {
         ))
         .unwrap();
 
+    fixture.store.note_confirmed_runner_absence(dispatcher);
     assert_eq!(
         fixture.store.recover_dead_dispatches().unwrap(),
         vec![row.job_id()]
@@ -2335,6 +2350,7 @@ fn dead_batch_recovery_fails_closed_on_a_mismatched_local_record() {
         .unwrap();
     let before = fixture.store.queue_snapshot().unwrap();
 
+    fixture.store.note_confirmed_runner_absence(dispatcher);
     let error = fixture.store.recover_dead_dispatches().unwrap_err();
     assert!(matches!(
         error,
@@ -2348,11 +2364,12 @@ fn dead_batch_recovery_fails_closed_on_a_mismatched_local_record() {
 
 #[test]
 fn live_or_ambiguous_owner_is_never_recovered_as_abandoned() {
-    // Break caught: uncertainty is interpreted as death and mutates a row still
-    // owned by a possibly live dispatcher.
+    // Break caught: uncertainty or a single Absent is interpreted as death and
+    // mutates a row still owned by a possibly live dispatcher.
     for observation in [
         ProcessObservation::Matching { process_group: 1 },
         ProcessObservation::Ambiguous,
+        ProcessObservation::Absent,
     ] {
         let fixture = open_queue_with_owner_inspector(FixedOwnerInspector { observation });
         let dispatcher = owner(490);

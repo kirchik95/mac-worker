@@ -75,6 +75,13 @@ fn remote_status_failure_keeps_a_stale_row_and_dead_runner() {
     let harness = DashboardTaskHarness::active_local_task()
         .with_runner_liveness(Some(RunnerState::Dead))
         .with_remote_failure("SSH_UNAVAILABLE");
+    let runner = mac_worker::job::ProcessIdentity::new(2_000_000_000, 1).unwrap();
+    assert_eq!(
+        harness.state.runner_liveness(harness.task_id()).unwrap(),
+        Some(RunnerState::Live),
+        "a single unconfirmed Absent is not death"
+    );
+    harness.state.note_confirmed_runner_absence(runner);
     let snapshot = harness.snapshot().unwrap();
     let row = snapshot
         .task_view
