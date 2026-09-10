@@ -1,9 +1,9 @@
 use std::fs;
 
 use mac_worker::agent::{
-    AgentEvent, AgentKind, AgentOutcome, PROMPT_POINTER, PermissionPolicy, PromptDelivery,
-    Question, RESULT_SCHEMA_JSON, ResultStatus, TurnLaunch, TurnLimits, TurnParams, adapter_for,
-    render_shell,
+    AgentEvent, AgentKind, AgentOutcome, MAX_DECLARED_ACCEPTANCE, PROMPT_POINTER, PermissionPolicy,
+    PromptDelivery, Question, RESULT_SCHEMA_JSON, ResultStatus, TurnLaunch, TurnLimits, TurnParams,
+    adapter_for, declared_acceptance_instructions, render_shell,
 };
 use uuid::Uuid;
 
@@ -484,7 +484,10 @@ fn result_schema_json_has_exactly_the_declared_keys() {
         .cloned()
         .collect();
     keys.sort();
-    assert_eq!(keys, ["files_changed", "questions", "status", "summary"]);
+    assert_eq!(
+        keys,
+        ["checks", "files_changed", "questions", "status", "summary"]
+    );
 }
 
 #[test]
@@ -511,6 +514,32 @@ fn result_schema_json_is_strict_structured_output_compatible() {
     assert_eq!(
         value["additionalProperties"],
         serde_json::Value::Bool(false)
+    );
+}
+
+#[test]
+fn declared_acceptance_instructions_are_a_pure_formatter() {
+    assert_eq!(declared_acceptance_instructions(&[]).unwrap(), "");
+    let text =
+        declared_acceptance_instructions(&["cargo test --lib".into(), "npm test".into()]).unwrap();
+    assert!(text.contains("instructed checks"));
+    assert!(text.contains("- cargo test --lib"));
+    assert!(text.contains("- npm test"));
+    assert!(!text.contains("laptop-verified by mac-worker"));
+    let too_many: Vec<String> = (0..=MAX_DECLARED_ACCEPTANCE)
+        .map(|index| format!("item {index}"))
+        .collect();
+    assert_eq!(
+        declared_acceptance_instructions(&too_many)
+            .unwrap_err()
+            .public_code(),
+        "TASK_CONFIG_INVALID"
+    );
+    assert_eq!(
+        declared_acceptance_instructions(&["bad\nline".into()])
+            .unwrap_err()
+            .public_code(),
+        "TASK_CONFIG_INVALID"
     );
 }
 

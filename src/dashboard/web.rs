@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 
@@ -21,7 +21,7 @@ use crate::{
         model::{ApiError, DashboardError, DashboardJob, DashboardLogChunk},
         service::{Clock, CollectorHandle, DashboardDataSource, DashboardService, MonotonicClock},
         settings::DashboardSettingsSource,
-        task::DashboardTaskSource,
+        task::{DashboardTaskMutationSource, DashboardTaskSource, TaskMutationRequest},
     },
     job::{JobId, LogStream},
     task::{TaskId, TurnId},
@@ -29,6 +29,7 @@ use crate::{
 
 const MAX_LOG_LIMIT: u32 = 65_536;
 const MAX_SETTINGS_REQUEST_BYTES: usize = 8_192;
+const MAX_TASK_MUTATION_REQUEST_BYTES: usize = 8_192;
 // `style-src` admits inline styles because the component library the dashboard
 // UI is built from sets them on elements it positions. Scripts stay first-party
 // only, and the page still renders every remote string as text.
@@ -56,6 +57,7 @@ pub struct DashboardHttpState<S, C, M> {
     pub log_source: Arc<dyn DashboardLogSource>,
     pub task_source: Arc<dyn DashboardTaskSource>,
     pub settings_source: Option<Arc<dyn DashboardSettingsSource>>,
+    pub mutation_source: Option<Arc<dyn DashboardTaskMutationSource>>,
 }
 
 pub struct DashboardHttpServer {
@@ -166,6 +168,11 @@ where
             get(task_log_chunk::<S, C, M>),
         )
         .route("/api/v1/tasks/{task_id}", get(task_detail::<S, C, M>))
+        .route("/api/v1/tasks/{task_id}/reply", post(task_reply::<S, C, M>))
+        .route(
+            "/api/v1/tasks/{task_id}/accept",
+            post(task_accept::<S, C, M>),
+        )
         .route("/api/v1/jobs/{job_id}", get(job_detail::<S, C, M>))
         .route("/api/v1/jobs/{job_id}/logs", get(log_chunk::<S, C, M>))
         .route(
@@ -379,6 +386,127 @@ where
             "native settings are unavailable on this worker",
         )),
     }
+}
+
+async fn task_reply<S, C, M>(
+    State(state): State<AppState<S, C, M>>,
+    Path(raw_task_id): Path<String>,
+    request: Request,
+) -> Response
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
+    task_mutation(state, raw_task_id, request, MutationKind::Reply).await
+}
+
+async fn task_accept<S, C, M>(
+    State(state): State<AppState<S, C, M>>,
+    Path(raw_task_id): Path<String>,
+    request: Request,
+) -> Response
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
+    task_mutation(state, raw_task_id, request, MutationKind::Accept).await
+}
+
+enum MutationKind {
+    Reply,
+    Accept,
+}
+
+async fn task_mutation<S, C, M>(
+    state: AppState<S, C, M>,
+    raw_task_id: String,
+    request: Request,
+    kind: MutationKind,
+) -> Response
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
+    let Some(source) = state.dashboard.mutation_source.clone() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::new(
+                "TASK_MUTATION_UNAVAILABLE",
+                "task mutations are unavailable on this dashboard",
+            ),
+        );
+    };
+    let task_id = match parse_task_id(&raw_task_id) {
+        Ok(task_id) => task_id,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
+    };
+    if !request_has_task_headers(&request, &state.expected_host) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            ApiError::new(
+                "TASK_REQUEST_INVALID",
+                "task action requires same-origin JSON and the task header",
+            ),
+        );
+    }
+    let body = match to_bytes(request.into_body(), MAX_TASK_MUTATION_REQUEST_BYTES + 1).await {
+        Ok(body) if body.len() <= MAX_TASK_MUTATION_REQUEST_BYTES => body,
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ApiError::new("TASK_REQUEST_INVALID", "task request exceeds 8192 bytes"),
+            );
+        }
+    };
+    let mutation: TaskMutationRequest = match serde_json::from_slice(&body) {
+        Ok(mutation) => mutation,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ApiError::new("TASK_REQUEST_INVALID", "task request was invalid"),
+            );
+        }
+    };
+    match tokio::task::spawn_blocking(move || match kind {
+        MutationKind::Reply => source.reply(task_id, &mutation),
+        MutationKind::Accept => source.accept(task_id, &mutation),
+    })
+    .await
+    {
+        Ok(Ok(detail)) => api_json(StatusCode::OK, detail),
+        Ok(Err(error)) => task_mutation_error(error),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::new(
+                "DASHBOARD_TASK_HANDLER_FAILED",
+                "dashboard task mutation failed",
+            ),
+        ),
+    }
+}
+
+fn request_has_task_headers(request: &Request, expected_host: &str) -> bool {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+    let custom_header = request
+        .headers()
+        .get("x-mac-worker-task")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "1");
+    let expected_origin = format!("http://{expected_host}");
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected_origin);
+    content_type && custom_header && origin
 }
 
 fn request_has_settings_headers(request: &Request, expected_host: &str) -> bool {
@@ -599,6 +727,19 @@ fn task_source_error(error: ApiError) -> Response {
         ),
     };
     api_error(status, ApiError::new(error.code, message))
+}
+
+fn task_mutation_error(error: ApiError) -> Response {
+    let status = match error.code.as_str() {
+        "TASK_REVISION_CONFLICT" | "TASK_BUSY" | "TASK_CLOSED" | "FOLLOWUP_LIMIT" => {
+            StatusCode::CONFLICT
+        }
+        "TASK_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "TASK_REQUEST_INVALID" | "TASK_CONFIG_INVALID" => StatusCode::BAD_REQUEST,
+        "TASK_MUTATION_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    api_error(status, error)
 }
 
 fn api_error_from_dashboard(error: DashboardError) -> ApiError {

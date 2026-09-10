@@ -1,4 +1,4 @@
-import type { Snapshot } from '@/lib/api'
+import type { ReviewState, Snapshot } from '@/lib/api'
 
 /**
  * The snapshot the Paper artboard is drawn from. It exists so every state the
@@ -56,6 +56,8 @@ export function exampleSnapshot(now = Date.now()): Snapshot {
         created_at_millis: started - 5_000,
         updated_at_millis: started,
         active_turn_id: 'turn-0fc80d46',
+        close_policy: 'done' as const,
+        review_state: 'not_reviewable' as const,
       },
       {
         task_id: 'a1b2c3d400000000000000000000beef',
@@ -78,6 +80,8 @@ export function exampleSnapshot(now = Date.now()): Snapshot {
         created_at_millis: now - 120_000,
         updated_at_millis: now - 120_000,
         active_turn_id: null,
+        close_policy: 'done' as const,
+        review_state: 'not_reviewable' as const,
       },
       ...(['Flaky billing spec', 'Extract billing client', 'Rewrite the retry policy'] as const).map(
         (title, index) => ({
@@ -101,6 +105,10 @@ export function exampleSnapshot(now = Date.now()): Snapshot {
           created_at_millis: now - 3_600_000,
           updated_at_millis: now - 600_000,
           active_turn_id: null,
+          close_policy: 'done' as const,
+          review_state: (index === 0
+            ? 'waiting_on_you'
+            : 'ready_for_follow_up') as ReviewState,
         }),
       ),
       {
@@ -124,6 +132,8 @@ export function exampleSnapshot(now = Date.now()): Snapshot {
         created_at_millis: now - 7_200_000,
         updated_at_millis: now - 5_400_000,
         active_turn_id: null,
+        close_policy: 'done' as const,
+        review_state: 'closed_after_done' as const,
       },
     ],
     workers: [

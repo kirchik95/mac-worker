@@ -47,19 +47,80 @@ function Stat({ value, label, accent }: { value: string; label: string; accent?:
   )
 }
 
+const TASK_ID = /^[0-9a-f]{32}$/
+
+export type TaskHash =
+  | { status: 'none' }
+  | { status: 'task'; id: string }
+  | { status: 'invalid' }
+
+/** Hash deep links are `#/tasks/<lowercase simple UUID>`. Decode failures stay off the detail pane. */
+export function parseTaskHash(hash: string): TaskHash {
+  const match = hash.match(/^#\/tasks\/([^/]*)$/)
+  if (!match) return { status: 'none' }
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(match[1])
+  } catch {
+    return { status: 'invalid' }
+  }
+  if (!TASK_ID.test(decoded)) return { status: 'invalid' }
+  return { status: 'task', id: decoded }
+}
+
 export default function App() {
   const { snapshot, error, offline, example } = useSnapshot()
-  const [selectedTask, setSelectedTask] = useState<string | null>(null)
-  const [view, setView] = useState('overview')
+  const [selectedTask, setSelectedTask] = useState<string | null>(() => {
+    const parsed = parseTaskHash(window.location.hash)
+    return parsed.status === 'task' ? parsed.id : null
+  })
+  const [invalidTaskLink, setInvalidTaskLink] = useState(
+    () => parseTaskHash(window.location.hash).status === 'invalid',
+  )
+  const [view, setView] = useState(() =>
+    parseTaskHash(window.location.hash).status === 'none' ? 'overview' : 'tasks',
+  )
 
   const busy = snapshot?.workers.filter((worker) => worker.slot.state !== 'idle').length ?? 0
   const capacity =
     snapshot?.workers.reduce((total, worker) => total + worker.slot.capacity, 0) ?? 0
   const attention = snapshot ? attentionCount(snapshot) : 0
+  const collectionStale = snapshot?.collection.freshness === 'stale'
 
   useEffect(() => {
     document.title = documentTitle(attention)
   }, [attention])
+
+  useEffect(() => {
+    const apply = () => {
+      const parsed = parseTaskHash(window.location.hash)
+      if (parsed.status === 'task') {
+        setSelectedTask(parsed.id)
+        setInvalidTaskLink(false)
+        setView('tasks')
+        return
+      }
+      setSelectedTask(null)
+      setInvalidTaskLink(parsed.status === 'invalid')
+      if (parsed.status === 'invalid') setView('tasks')
+    }
+    window.addEventListener('hashchange', apply)
+    return () => window.removeEventListener('hashchange', apply)
+  }, [])
+
+  const selectTask = (id: string | null) => {
+    setInvalidTaskLink(false)
+    setSelectedTask(id)
+    if (id) {
+      const next = `#/tasks/${id}`
+      if (window.location.hash !== next) window.location.hash = next
+      setView('tasks')
+      return
+    }
+    if (window.location.hash.startsWith('#/tasks/')) {
+      window.history.pushState(null, '', `${window.location.pathname}${window.location.search}`)
+    }
+  }
 
   return (
     <Tabs value={view} onValueChange={(next) => setView(next ?? 'overview')} className="flex min-h-screen flex-col gap-0 bg-background text-foreground">
@@ -77,12 +138,11 @@ export default function App() {
           ))}
         </TabsList>
         <div className="ml-auto flex items-center gap-2">
-          <span
-            className={`size-1.5 rounded-full ${offline ? 'bg-destructive' : 'bg-primary'}`}
+            <span className={`size-1.5 rounded-full ${offline || collectionStale ? 'bg-destructive' : 'bg-primary'}`}
             aria-hidden="true"
           />
-          <span className={`font-mono text-xs ${offline ? 'text-destructive' : 'text-muted-foreground'}`}>
-            {offline ? 'LAST SNAPSHOT' : 'SNAPSHOT'}{' '}
+          <span className={`font-mono text-xs ${offline || collectionStale ? 'text-destructive' : 'text-muted-foreground'}`}>
+            {offline ? 'LAST SNAPSHOT' : collectionStale ? 'STALE SNAPSHOT' : 'SNAPSHOT'}{' '}
             {snapshot ? clockTime(snapshot.generated_at_millis) : '--:--:--'}
           </span>
         </div>
@@ -113,10 +173,13 @@ export default function App() {
             </TabsContent>
 
             <TabsContent value="tasks">
+              {invalidTaskLink ? (
+                <p className="mb-5 text-sm text-destructive">That task link is not valid.</p>
+              ) : null}
               {selectedTask ? (
-                <TaskDetail taskId={selectedTask} onBack={() => setSelectedTask(null)} />
+                <TaskDetail taskId={selectedTask} onBack={() => selectTask(null)} />
               ) : (
-                <Tasks snapshot={snapshot} onSelect={setSelectedTask} />
+                <Tasks snapshot={snapshot} onSelect={selectTask} />
               )}
             </TabsContent>
 
@@ -146,7 +209,7 @@ export default function App() {
                 : offline
                   ? 'Last known snapshot · '
                   : ''}
-            Local observation · read only
+            Local observation
           </span>
           <span>mac-worker</span>
         </div>

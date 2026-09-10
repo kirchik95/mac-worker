@@ -33,7 +33,10 @@ export function useTurnLog(
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const finalized = useRef(false)
   const liveRef = useRef(live)
-  liveRef.current = live
+
+  useEffect(() => {
+    liveRef.current = live
+  }, [live])
 
   useEffect(() => {
     const identityGeneration = generation.current + 1
@@ -74,6 +77,8 @@ export function useTurnLog(
       if (tail) setLog((current) => ({ ...current, text: current.text + tail }))
     }
 
+    let failDelay = POLL_INTERVAL_MS
+
     const scheduleRead = (delay: number) => {
       if (generation.current !== identityGeneration || finalized.current) return
       retryTimer.current = setTimeout(() => {
@@ -84,12 +89,14 @@ export function useTurnLog(
 
     const handleOutcome = (outcome: ReadOutcome) => {
       if (generation.current !== identityGeneration) return
+      if (outcome !== 'failed') failDelay = POLL_INTERVAL_MS
       if (liveRef.current) {
         scheduleRead(POLL_INTERVAL_MS)
       } else if (outcome === 'advanced') {
         startRead()
       } else if (outcome === 'failed') {
-        scheduleRead(POLL_INTERVAL_MS)
+        scheduleRead(failDelay)
+        failDelay = Math.min(failDelay * 2, 8_000)
       } else {
         finalizeDecoder()
       }

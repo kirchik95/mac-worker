@@ -170,4 +170,40 @@ describe('useSnapshot', () => {
     })
     expect(fetchMock.mock.calls.length).toBe(started)
   })
+
+  it('treats a pending snapshot as loading, not offline', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({ error: { code: 'DASHBOARD_SNAPSHOT_PENDING', message: 'pending' } }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    const { result } = renderHook(() => useSnapshot())
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    expect(result.current.offline).toBe(false)
+    expect(result.current.snapshot).toBeNull()
+    expect(result.current.error).toBeNull()
+  })
+
+  it('keeps generated_at_millis when the collection is stale on HTTP 200', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () =>
+          snapshot({
+            generated_at_millis: 3_000,
+            collection: { freshness: 'stale', errors: [] },
+          }),
+      }),
+    )
+    const { result } = renderHook(() => useSnapshot())
+    await waitFor(() => expect(result.current.snapshot).not.toBeNull())
+    expect(result.current.offline).toBe(false)
+    expect(result.current.snapshot?.collection.freshness).toBe('stale')
+    expect(result.current.snapshot?.generated_at_millis).toBe(3_000)
+  })
 })

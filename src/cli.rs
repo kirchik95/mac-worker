@@ -288,6 +288,15 @@ pub enum HostCommand {
     SnapshotVerify,
     #[command(name = "migrate-layout")]
     MigrateLayout,
+    #[command(name = "complete-protocol-upgrade")]
+    CompleteProtocolUpgrade {
+        target: HiddenComponent,
+    },
+    #[command(name = "complete-unverified-rollback")]
+    CompleteUnverifiedRollback {
+        target: HiddenComponent,
+        previous: Option<HiddenComponent>,
+    },
     #[command(name = "refresh-facts")]
     RefreshFacts {
         /// Print per-step collection durations on stderr after writing facts

@@ -56,6 +56,8 @@ export function task(overrides: Partial<TaskRow> = {}): TaskRow {
     created_at_millis: 1_000,
     updated_at_millis: 2_000,
     active_turn_id: null,
+    close_policy: 'done',
+    review_state: 'not_reviewable',
     ...overrides,
   }
 }

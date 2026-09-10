@@ -1182,6 +1182,7 @@ impl<'a> TaskStore<'a> {
         questions: Vec<Question>,
         files_changed: Vec<String>,
         diff_stat: Option<String>,
+        reported_checks: Vec<crate::agent::ReportedCheck>,
         close: bool,
     ) -> Result<TaskStatus, WorkerError> {
         let task = self.open_existing_task(project_id, task_id)?;
@@ -1243,7 +1244,8 @@ impl<'a> TaskStore<'a> {
             diff_stat.or_else(|| current.diff_stat().map(str::to_owned)),
             turns,
             ended_at,
-        )?;
+        )?
+        .with_reported_checks(reported_checks)?;
         replace_status_bytes(&task, current, next)
     }
 
@@ -1313,6 +1315,7 @@ impl<'a> TaskStore<'a> {
             Vec::new(),
             Vec::new(),
             None,
+            Vec::new(),
             false,
         )?;
         Ok(true)
@@ -1976,7 +1979,8 @@ fn replace_status_record_at(
         current.diff_stat().map(str::to_owned),
         current.turns().to_vec(),
         updated_at_millis,
-    )?;
+    )?
+    .copying_reported_checks(&current)?;
     replace_status_bytes(directory, current, next.clone())?;
     Ok(next)
 }

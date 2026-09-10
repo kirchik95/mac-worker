@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf};
 
-use crate::agent::Question;
+use crate::agent::{Question, ReportedCheck};
 
 pub const MAX_SUMMARY_BYTES: usize = 4 * 1024;
 pub const MAX_QUESTION_BYTES: usize = 1024;
@@ -147,6 +147,24 @@ impl RedactionBoundary {
             .into_iter()
             .map(|item| self.changed_file(item.as_ref()))
             .take(MAX_CHANGED_FILE_COUNT)
+            .collect()
+    }
+
+    pub fn reported_checks<I>(&self, items: I) -> Vec<ReportedCheck>
+    where
+        I: IntoIterator<Item = ReportedCheck>,
+    {
+        items
+            .into_iter()
+            .map(|check| {
+                ReportedCheck::new(
+                    self.text(check.name(), crate::agent::MAX_CHECK_NAME_BYTES),
+                    self.text(check.command(), crate::agent::MAX_CHECK_COMMAND_BYTES),
+                    check.status(),
+                    self.text(check.detail(), crate::agent::MAX_CHECK_DETAIL_BYTES),
+                )
+            })
+            .take(crate::agent::MAX_REPORTED_CHECKS)
             .collect()
     }
 

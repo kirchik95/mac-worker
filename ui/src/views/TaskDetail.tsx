@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { CommandList } from '@/components/CommandList'
 import { Icon, type IconName } from '@/components/Icon'
@@ -7,10 +7,15 @@ import { TurnLogPanel } from '@/components/TurnLogPanel'
 import { duration, humanize, relativeTime, shortId } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
+  acceptTask,
+  ApiError,
   fetchTaskDetail,
   questionOptions,
   questionText,
+  replyToTask,
+  type ReportedCheck,
   type TaskDetail as TaskDetailPayload,
+  type TaskMutation,
   type TurnRow,
 } from '@/lib/api'
 
@@ -42,6 +47,26 @@ function fileIcon(path: string): IconName {
   if (/\.(md|txt|rst|adoc)$/.test(path)) return 'fileText'
   if (/\.[a-z0-9]+$/i.test(path)) return 'fileCode'
   return 'file'
+}
+
+function checkMark(status: ReportedCheck['status']): string {
+  if (status === 'pass') return 'PASS'
+  if (status === 'fail') return 'FAIL'
+  if (status === 'error') return 'ERROR'
+  return 'NOT RUN'
+}
+
+function mutationBody(detail: TaskDetailPayload, message?: string): TaskMutation {
+  const turns = detail.timeline.length > 0 ? detail.timeline : detail.turns
+  return {
+    message,
+    expected_task_id: detail.task.task_id,
+    expected_turn_id: turns.at(-1)?.turn_id ?? null,
+    expected_turn_count: detail.task.turn_count,
+    expected_head_oid: detail.head_oid,
+    expected_updated_at_millis: detail.task.updated_at_millis,
+    expected_state: detail.task.state,
+  }
 }
 
 function turnSpan(turn: TurnRow): string {
@@ -112,16 +137,35 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
   const [detail, setDetail] = useState<TaskDetailPayload | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [openTurn, setOpenTurn] = useState<string | null>(null)
+  const [draft, setDraft] = useState('')
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const mutationGeneration = useRef(0)
+  const mutationController = useRef<AbortController | null>(null)
+  const mutationInFlight = useRef(false)
+  const detailEpoch = useRef(0)
+  const pollController = useRef<AbortController | null>(null)
+  const resumePoll = useRef<() => void>(() => {})
 
   useEffect(() => {
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | null = null
-    const controller = new AbortController()
+    mutationGeneration.current += 1
+    mutationController.current?.abort()
+    mutationController.current = null
+    mutationInFlight.current = false
+    detailEpoch.current += 1
+    pollController.current?.abort()
+    pollController.current = null
     setDetail(null)
     setError(null)
+    setActionError(null)
+    setDraft('')
+    setBusy(false)
+    setOpenTurn(null)
 
     const schedule = () => {
-      if (cancelled) return
+      if (cancelled || timer !== null) return
       timer = setTimeout(() => {
         timer = null
         void poll()
@@ -129,26 +173,86 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
     }
 
     const poll = async () => {
+      if (cancelled) return
+      if (mutationInFlight.current) {
+        schedule()
+        return
+      }
+      pollController.current?.abort()
+      const controller = new AbortController()
+      pollController.current = controller
+      const epoch = detailEpoch.current
       try {
         const payload = await fetchTaskDetail(taskId, controller.signal)
-        if (!cancelled) {
+        if (
+          !cancelled &&
+          !controller.signal.aborted &&
+          detailEpoch.current === epoch &&
+          !mutationInFlight.current
+        ) {
           setDetail(payload)
           setError(null)
         }
       } catch (cause) {
-        if (cancelled || controller.signal.aborted) return
-        setError(cause instanceof Error ? cause.message : String(cause))
+        if (
+          !cancelled &&
+          !controller.signal.aborted &&
+          detailEpoch.current === epoch
+        ) {
+          setError(cause instanceof Error ? cause.message : String(cause))
+        }
       }
-      if (!cancelled) schedule()
+      if (!cancelled && pollController.current === controller) schedule()
     }
 
+    resumePoll.current = schedule
     void poll()
     return () => {
       cancelled = true
-      controller.abort()
+      resumePoll.current = () => {}
+      pollController.current?.abort()
+      pollController.current = null
+      mutationController.current?.abort()
+      mutationController.current = null
       if (timer !== null) clearTimeout(timer)
     }
   }, [taskId])
+
+  const runMutation = async (kind: 'reply' | 'accept', message?: string) => {
+    if (!detail || mutationInFlight.current) return
+    const generation = mutationGeneration.current
+    mutationController.current?.abort()
+    const controller = new AbortController()
+    mutationController.current = controller
+    mutationInFlight.current = true
+    detailEpoch.current += 1
+    pollController.current?.abort()
+    pollController.current = null
+    setBusy(true)
+    setActionError(null)
+    try {
+      const next =
+        kind === 'reply'
+          ? await replyToTask(taskId, mutationBody(detail, message), controller.signal)
+          : await acceptTask(taskId, mutationBody(detail), controller.signal)
+      if (mutationGeneration.current !== generation || controller.signal.aborted) return
+      detailEpoch.current += 1
+      setDetail(next)
+      if (kind === 'reply') setDraft('')
+    } catch (cause) {
+      if (controller.signal.aborted || mutationGeneration.current !== generation) return
+      setActionError(cause instanceof ApiError ? cause.message : String(cause))
+    } finally {
+      if (
+        mutationGeneration.current === generation &&
+        mutationController.current === controller
+      ) {
+        mutationInFlight.current = false
+        setBusy(false)
+        resumePoll.current()
+      }
+    }
+  }
 
   if (error && detail == null) return <p className="text-sm text-destructive">{error}</p>
   if (!detail) return <p className="text-sm text-muted-foreground">Loading task…</p>
@@ -259,12 +363,14 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
                     {questionOptions(question).length > 0 ? (
                       <div className="flex flex-wrap gap-2">
                         {questionOptions(question).map((option) => (
-                          <span
+                          <button
                             key={option}
+                            type="button"
+                            onClick={() => setDraft(option)}
                             className="rounded-full border border-observatory-highlight-line bg-observatory-highlight px-3 py-1.5 font-mono text-xs text-primary"
                           >
                             {option}
-                          </span>
+                          </button>
                         ))}
                       </div>
                     ) : (
@@ -276,6 +382,37 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
                 ))}
               </div>
             ) : null}
+
+            {detail.reported_checks.length > 0 ? (
+              <div className="space-y-2">
+                <p className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.06em] text-observatory-hollow">
+                  <Icon name="shield" size={12} />
+                  AGENT REPORTED
+                </p>
+                <ul className="space-y-2">
+                  {detail.reported_checks.map((check) => (
+                    <li key={`${check.name}:${check.command}`} className="space-y-1">
+                      <div className="flex flex-wrap items-baseline gap-2">
+                        <span className="font-mono text-[11px] tracking-[0.06em] text-observatory-hollow">
+                          {checkMark(check.status)}
+                        </span>
+                        <span className="text-sm">{check.name}</span>
+                      </div>
+                      {check.command ? (
+                        <p className="font-mono text-[11px] text-muted-foreground">{check.command}</p>
+                      ) : null}
+                      {check.detail ? (
+                        <p className="text-xs text-muted-foreground">{check.detail}</p>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <p className="font-mono text-[11px] tracking-[0.06em] text-observatory-hollow">
+                AGENT REPORTED · not reported
+              </p>
+            )}
           </div>
 
           <div className="w-full max-w-101 shrink-0 space-y-3.5 px-5.5 py-5">
@@ -306,6 +443,58 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
         </div>
       </section>
 
+      {['waiting_on_you', 'ready_for_review', 'ready_for_follow_up', 'close_pending'].includes(
+        detail.review_state,
+      ) ? (
+        <section className="space-y-3 rounded-[10px] border bg-card px-5.5 py-5">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+            <Head icon="reply" label="REVIEW" />
+            <span className="ml-auto font-mono text-[11px] tracking-[0.04em] text-observatory-hollow uppercase">
+              {detail.review_state.replaceAll('_', ' ')}
+            </span>
+          </div>
+          {detail.review_state === 'close_pending' ? (
+            <p className="text-sm text-muted-foreground">
+              Close is in progress on this task. Retry when you are ready; it will not double-close.
+            </p>
+          ) : (
+            <textarea
+              aria-label="Follow-up"
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              rows={3}
+              className="w-full resize-y rounded-md border bg-background px-3 py-2 text-sm"
+            />
+          )}
+          {actionError ? <p className="text-sm text-destructive">{actionError}</p> : null}
+          <div className="flex flex-wrap gap-2">
+            {detail.review_state !== 'close_pending' ? (
+              <button
+                type="button"
+                disabled={busy || draft.trim() === ''}
+                aria-busy={busy}
+                onClick={() => void runMutation('reply', draft)}
+                className="rounded-md border px-3.5 py-1.5 font-mono text-xs disabled:opacity-50"
+              >
+                Reply
+              </button>
+            ) : null}
+            {detail.review_state === 'ready_for_review' ||
+            detail.review_state === 'close_pending' ? (
+              <button
+                type="button"
+                disabled={busy}
+                aria-busy={busy}
+                onClick={() => void runMutation('accept')}
+                className="rounded-md border border-observatory-highlight-line bg-observatory-highlight px-3.5 py-1.5 font-mono text-xs text-primary disabled:opacity-50"
+              >
+                {detail.review_state === 'close_pending' ? 'Retry accept' : 'Accept'}
+              </button>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
+
       <section className="space-y-3">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
           <Head icon="terminal" label="TAKE IT LOCALLY" />
@@ -318,7 +507,11 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
           ) : null}
         </div>
         <CommandList
-          commands={[detail.fetch_command, `worker task diff ${task.task_id} --stat`]}
+          commands={
+            detail.review_commands.length > 0
+              ? detail.review_commands
+              : [detail.fetch_command, `worker task diff ${task.task_id} --stat`]
+          }
         />
       </section>
 

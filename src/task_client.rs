@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLimits, result_instruction},
-    client_state::ClientStateStore,
+    client_state::{ClientStateConcurrencyPoint, ClientStateStore},
     config::{Config, WorkerEntry},
     error::WorkerError,
     git_transport::GitTransport,
@@ -24,12 +24,13 @@ use crate::{
     supervisor::{ProcessObservation, SystemProcessInspector},
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, PushTarget,
-        RunId, RunRecord, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
-        TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
+        RunId, RunRecord, RunnerIdentity, RunnerState, TaskCloseIntent, TaskId, TaskLimits,
+        TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
+        TurnSummary,
     },
     task_view::{
         TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
-        filter_task_list, project_task_list_with_blocking_codes,
+        filter_task_list, project_task_list_with_blocking_codes, remote_status_refresh_allowed,
     },
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
@@ -44,6 +45,25 @@ const TASK_CAPABILITY_PREFIX: &str = "agent:";
 const DEFAULT_GIT_NAME: &str = "mac-worker";
 const DEFAULT_GIT_EMAIL: &str = "mac-worker@localhost";
 const SUBMISSION_ROLLBACK_INCOMPLETE: &str = "SUBMISSION_ROLLBACK_INCOMPLETE";
+const CLOSE_IN_PROGRESS: &str = "task close is in progress";
+
+fn operator_revision_matches(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> bool {
+    current.meta().task_id() == expected.meta().task_id()
+        && current.status().state() == expected.status().state()
+        && current.status().updated_at_millis() == expected.status().updated_at_millis()
+        && current.status().head_oid() == expected.status().head_oid()
+        && current.status().turns().len() == expected.status().turns().len()
+        && current.status().turns().last().map(TurnSummary::turn_id)
+            == expected.status().turns().last().map(TurnSummary::turn_id)
+}
+
+fn same_close_target(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> bool {
+    current.meta().task_id() == expected.meta().task_id()
+        && current.status().head_oid() == expected.status().head_oid()
+        && current.status().turns().len() == expected.status().turns().len()
+        && current.status().turns().last().map(TurnSummary::turn_id)
+            == expected.status().turns().last().map(TurnSummary::turn_id)
+}
 const WAIT_POLL: Duration = Duration::from_millis(100);
 const WAIT_MAX_POLL: Duration = Duration::from_secs(1);
 
@@ -1174,6 +1194,8 @@ impl<'a> TaskClient<'a> {
 
     pub fn fetch(&self, task_id: TaskId) -> Result<FetchReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
+        self.client_state
+            .reach_concurrency_point(ClientStateConcurrencyPoint::AfterTaskFetchLoad);
         if record.status().state() == TaskState::Abandoned {
             return Err(task_error(
                 "TASK_CLOSED",
@@ -1203,8 +1225,9 @@ impl<'a> TaskClient<'a> {
             worker.name.as_str(),
             task_id,
         )?;
-        let replacement = record.with_fetched_head(Some(imported.head().clone()))?;
-        self.client_state.update_task(replacement)?;
+        let _ = self
+            .client_state
+            .update_fetched_head_for_current_turn(&record, imported.head().clone())?;
         Ok(FetchReport {
             task_id,
             head: imported.head().clone(),
@@ -1215,16 +1238,62 @@ impl<'a> TaskClient<'a> {
     pub fn close(&self, task_id: TaskId, discard: bool) -> Result<TaskReport, WorkerError> {
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
-        if let Some(reason) = self.operator_busy_reason(task_id, &record)? {
+        self.close_from_expected(&record, discard)
+    }
+
+    /// Closes against a caller-supplied expected snapshot. Dashboard mutations
+    /// pass the revision they already validated; CLI `close` loads after
+    /// reconcile and then uses this path.
+    pub fn close_from_expected(
+        &self,
+        expected: &LocalTaskRecord,
+        discard: bool,
+    ) -> Result<TaskReport, WorkerError> {
+        let task_id = expected.meta().task_id();
+        let record = self.client_state.load_task(task_id)?;
+        if matches!(
+            record.status().state(),
+            TaskState::Closed | TaskState::Abandoned
+        ) {
+            if same_close_target(&record, expected)
+                && record
+                    .close_intent()
+                    .is_none_or(|intent| intent.matches_record(&record))
+            {
+                let _ = self.release_task_base(&record);
+                return self.report_for(task_id);
+            }
+            return Err(task_error("TASK_CLOSED", "task is terminal"));
+        }
+        if record.status().state() == TaskState::Lost {
+            return Err(task_error("TASK_CLOSED", "task is terminal"));
+        }
+        if !operator_revision_matches(&record, expected) {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before close",
+            ));
+        }
+        if let Some(reason) = self.operator_busy_reason(task_id, &record)?
+            && !(record.close_intent().is_some() && reason == CLOSE_IN_PROGRESS)
+        {
             return Err(task_error("TASK_BUSY", reason));
         }
-        if let Some(entry) = self.client_state.queue_entry_for_task_turn(task_id)? {
+        if record.close_intent().is_none()
+            && let Some(entry) = self.client_state.queue_entry_for_task_turn(task_id)?
+        {
             let mut log =
                 crate::runner_log::RunnerLog::open(&self.paths.state, task_id, entry.job_id())?;
             if log.current_entry(self.client_state)?.as_ref() != Some(&entry) {
                 return Err(task_error("TASK_BUSY", "task turn changed before close"));
             }
             let record = self.client_state.load_task(task_id)?;
+            if !operator_revision_matches(&record, expected) {
+                return Err(task_error(
+                    "TASK_REVISION_CONFLICT",
+                    "task changed before close",
+                ));
+            }
             let retained = self
                 .client_state
                 .retain_task_turn_cancel(entry.job_id(), current_time_millis()?)?
@@ -1248,30 +1317,86 @@ impl<'a> TaskClient<'a> {
                 record.status().diff_stat().map(str::to_owned),
                 record.status().turns().to_vec(),
                 current_time_millis()?,
-            )?;
-            self.client_state.update_task(
-                record
-                    .with_status(status)?
-                    .with_abandon_code(discard.then_some("TASK_CLOSED".to_owned()))?,
-            )?;
+            )?
+            .copying_reported_checks(record.status())?;
+            let closed = record
+                .with_status(status)?
+                .with_abandon_code(discard.then_some("TASK_CLOSED".to_owned()))?;
+            if !self
+                .client_state
+                .update_task_if_current(&record, closed.clone())?
+            {
+                return Err(task_error(
+                    "TASK_REVISION_CONFLICT",
+                    "task changed before close",
+                ));
+            }
             self.finish_waiting_cancellation_locked(task_id, &retained, &mut log)?;
             return self.report_for(task_id);
         }
-        if record.status().state() == TaskState::Queued {
+        if record.close_intent().is_none() && record.status().state() == TaskState::Queued {
             return Err(task_error(
                 "TASK_INCONSISTENT",
                 "queued task has no queue turn",
             ));
         }
-        let worker = task_worker(self.config, record.status())?;
+        let fenced = if record.close_intent().is_some() {
+            record
+        } else {
+            if expected.status().state() != TaskState::Open {
+                return Err(task_error("TASK_BUSY", "task is not ready to close"));
+            }
+            let intent = TaskCloseIntent::from_record(expected, discard)?;
+            let fenced = expected.with_close_intent(intent)?;
+            if !self
+                .client_state
+                .update_task_if_current(expected, fenced.clone())?
+            {
+                return Err(task_error(
+                    "TASK_REVISION_CONFLICT",
+                    "task changed before close",
+                ));
+            }
+            fenced
+        };
+        let discard = fenced
+            .close_intent()
+            .map(TaskCloseIntent::discard)
+            .unwrap_or(discard);
+        let worker = task_worker(self.config, fenced.status())?;
         let response = RemoteJobClient::new(self.runner).task_close(
             worker,
-            &crate::task_store::TaskCloseRequest::new(record.meta().project_id(), task_id, discard),
+            &crate::task_store::TaskCloseRequest::new(fenced.meta().project_id(), task_id, discard),
         )?;
         let warnings = response.warnings().to_vec();
-        self.client_state
-            .update_task(record.with_status(response.status().clone())?)?;
-        self.release_task_base(&record)?;
+        let current = self.client_state.load_task(task_id)?;
+        if matches!(
+            current.status().state(),
+            TaskState::Closed | TaskState::Abandoned
+        ) {
+            let _ = self.release_task_base(&current);
+            return self.report_for(task_id);
+        }
+        let closed_status = response
+            .status()
+            .clone()
+            .copying_reported_checks_if_empty(current.status())?;
+        let closed = current.without_close_intent()?.with_status(closed_status)?;
+        if !self.client_state.update_task_if_current(&current, closed)? {
+            let after = self.client_state.load_task(task_id)?;
+            if matches!(
+                after.status().state(),
+                TaskState::Closed | TaskState::Abandoned
+            ) {
+                let _ = self.release_task_base(&after);
+                return self.report_for(task_id);
+            }
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before close completed",
+            ));
+        }
+        self.release_task_base(&fenced)?;
         let mut report = self.report_for(task_id)?;
         report.warnings = warnings;
         Ok(report)
@@ -1424,6 +1549,9 @@ impl<'a> TaskClient<'a> {
             if submission_recovery_pending(&record) {
                 continue;
             }
+            if record.close_intent().is_some() {
+                continue;
+            }
             if matches!(
                 record.status().state(),
                 TaskState::Closed | TaskState::Abandoned | TaskState::Lost
@@ -1563,10 +1691,31 @@ impl<'a> TaskClient<'a> {
         message: String,
         attached: bool,
         stdout: &mut dyn Write,
-        _stderr: &mut dyn Write,
+        stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
+        self.say_from_expected(&record, message, attached, stdout, stderr)
+    }
+
+    /// Follows up against a caller-supplied expected snapshot. Dashboard reply
+    /// passes the revision it already validated so a later reload cannot win.
+    pub fn say_from_expected(
+        &self,
+        expected: &LocalTaskRecord,
+        message: String,
+        attached: bool,
+        stdout: &mut dyn Write,
+        _stderr: &mut dyn Write,
+    ) -> Result<TaskReport, WorkerError> {
+        let task_id = expected.meta().task_id();
+        let current = self.client_state.load_task(task_id)?;
+        if !operator_revision_matches(&current, expected) {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before follow-up",
+            ));
+        }
         if self
             .client_state
             .queue_entry_for_task_turn(task_id)?
@@ -1579,7 +1728,10 @@ impl<'a> TaskClient<'a> {
             // is gone so expected-record CAS in the finalizer stays valid.
             return Err(task_error("TASK_BUSY", "previous turn is still finalizing"));
         }
-        match record.status().state() {
+        if expected.close_intent().is_some() || current.close_intent().is_some() {
+            return Err(task_error("TASK_BUSY", CLOSE_IN_PROGRESS));
+        }
+        match expected.status().state() {
             TaskState::Active => return Err(task_error("TASK_BUSY", "task has an active turn")),
             TaskState::Closed | TaskState::Abandoned | TaskState::Lost => {
                 return Err(task_error("TASK_CLOSED", "task is terminal"));
@@ -1589,28 +1741,28 @@ impl<'a> TaskClient<'a> {
             }
             TaskState::Open => {}
         }
-        let followups = record.status().turns().len().saturating_sub(1) as u32;
-        if followups >= record.meta().limits().max_followups {
+        let followups = expected.status().turns().len().saturating_sub(1) as u32;
+        if followups >= expected.meta().limits().max_followups {
             return Err(task_error(
                 "FOLLOWUP_LIMIT",
                 "task follow-up limit has been reached",
             ));
         }
-        let worker = task_worker(self.config, record.status())?.name.clone();
+        let worker = task_worker(self.config, expected.status())?.name.clone();
         let turn_id = TurnId::generate();
-        let turn_number = u32::try_from(record.status().turns().len())
+        let turn_number = u32::try_from(expected.status().turns().len())
             .ok()
             .and_then(|turns| turns.checked_add(1))
             .ok_or_else(|| task_error("TASK_INCONSISTENT", "turn history is too long"))?;
-        let base_oid = record
+        let base_oid = expected
             .status()
             .head_oid()
             .cloned()
-            .unwrap_or_else(|| record.meta().base_oid().clone());
+            .unwrap_or_else(|| expected.meta().base_oid().clone());
         let composed_prompt = compose_turn_prompt(
             task_id,
             turn_number,
-            record.meta().agent(),
+            expected.meta().agent(),
             &base_oid,
             None,
             &message,
@@ -1631,15 +1783,15 @@ impl<'a> TaskClient<'a> {
         );
         let active = TaskStatus::new(
             TaskState::Active,
-            record.status().last_outcome().cloned(),
+            expected.status().last_outcome().cloned(),
             Some(worker.clone()),
             true,
             Some(base_oid),
-            record.status().summary().map(str::to_owned),
-            record.status().questions().to_vec(),
-            record.status().files_changed().to_vec(),
-            record.status().diff_stat().map(str::to_owned),
-            record
+            expected.status().summary().map(str::to_owned),
+            expected.status().questions().to_vec(),
+            expected.status().files_changed().to_vec(),
+            expected.status().diff_stat().map(str::to_owned),
+            expected
                 .status()
                 .turns()
                 .iter()
@@ -1647,19 +1799,26 @@ impl<'a> TaskClient<'a> {
                 .chain([pending])
                 .collect(),
             current_time_millis()?,
-        )?;
-        let active_record = record
+        )?
+        .copying_reported_checks(expected.status())?;
+        let active_record = expected
             .with_status(active)?
             .with_runner(None)?
             .with_abandon_code(None)?;
-        if let Err(error) = self.client_state.update_task(active_record) {
+        if !self
+            .client_state
+            .update_task_if_current(expected, active_record.clone())?
+        {
             let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
-            return Err(error);
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before follow-up",
+            ));
         }
-        let entry = match self.enqueue_followup(&record, turn_id, worker) {
+        let entry = match self.enqueue_followup(expected, turn_id, worker) {
             Ok(entry) => entry,
             Err(error) => {
-                self.rollback_followup(&record, task_id, turn_id);
+                self.rollback_followup(&active_record, expected, task_id, turn_id);
                 return Err(error);
             }
         };
@@ -1667,7 +1826,7 @@ impl<'a> TaskClient<'a> {
             Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => {}
             Ok(RunnerStart::Saturated) => {
                 if let Err(error) = self.client_state.park_row(entry.job_id()) {
-                    self.rollback_followup(&record, task_id, turn_id);
+                    self.rollback_followup(&active_record, expected, task_id, turn_id);
                     return Err(error);
                 }
             }
@@ -1675,7 +1834,7 @@ impl<'a> TaskClient<'a> {
                 return Err(self.fail_handoff(
                     task_id,
                     turn_id,
-                    self.transfer_for_record(&record)?,
+                    self.transfer_for_record(expected)?,
                     error,
                 ));
             }
@@ -2167,10 +2326,18 @@ impl<'a> TaskClient<'a> {
         Ok(())
     }
 
-    fn rollback_followup(&self, record: &LocalTaskRecord, task_id: TaskId, turn_id: TurnId) {
+    fn rollback_followup(
+        &self,
+        committed_active: &LocalTaskRecord,
+        previous_open: &LocalTaskRecord,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) {
         let _ = self.client_state.remove_queued(turn_id);
         let _ = self.client_state.remove_turn_prompt(task_id, turn_id);
-        let _ = self.client_state.update_task(record.clone());
+        let _ = self
+            .client_state
+            .update_task_if_current(committed_active, previous_open.clone());
     }
 
     fn rollback_submission(
@@ -2516,7 +2683,7 @@ impl<'a> TaskClient<'a> {
 
     fn report_for_readonly(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
         let mut status = record.status().clone();
-        if matches!(status.state(), TaskState::Active | TaskState::Open)
+        if remote_status_refresh_allowed(record)
             && let Some(worker_name) = status.worker()
             && let Some(worker) = self.config.worker(worker_name)
             && let Ok(remote) = RemoteJobClient::new(self.runner).task_status(
@@ -2637,6 +2804,9 @@ impl<'a> TaskClient<'a> {
         task_id: TaskId,
         record: &LocalTaskRecord,
     ) -> Result<Option<&'static str>, WorkerError> {
+        if record.close_intent().is_some() {
+            return Ok(Some(CLOSE_IN_PROGRESS));
+        }
         if record.status().state() == TaskState::Active {
             return Ok(Some("task has an active turn"));
         }
@@ -2770,7 +2940,8 @@ fn abandoned_status(status: &TaskStatus, reason: &str) -> Result<TaskStatus, Wor
         status.diff_stat().map(str::to_owned),
         status.turns().to_vec(),
         current_time_millis()?,
-    )
+    )?
+    .copying_reported_checks(status)
 }
 
 fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerError> {
@@ -2809,7 +2980,8 @@ fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerEr
         status.diff_stat().map(str::to_owned),
         turns,
         ended_at,
-    )
+    )?
+    .copying_reported_checks(status)
 }
 
 fn parse_task_source(

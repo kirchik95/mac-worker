@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::Deserialize;
+
 use crate::{
     client_state::ClientStateStore,
     config::{Config, WorkerEntry},
@@ -14,12 +16,16 @@ use crate::{
     },
     error::WorkerError,
     job::LogStream,
-    task::{LocalTaskRecord, TaskId, TaskState, TaskStatus, TurnId},
+    paths::PathLayout,
+    process::{ProcessRunner, SystemProcessRunner},
+    task::{BaseOid, LocalTaskRecord, TaskId, TaskState, TaskStatus, TurnId},
+    task_client::TaskClient,
     task_store::TaskStatusRequest,
     task_view::{
         TaskDetailProjection, TaskFreshness, TaskViewError, project_task_detail,
-        project_task_list_with_blocking_codes,
+        project_task_list_with_blocking_codes, remote_status_refresh_allowed,
     },
+    turn_runner::{DetachedRunnerExecutor, RunnerExecutor},
 };
 
 pub const MAX_TASK_LOG_LIMIT: u32 = 65_536;
@@ -81,7 +87,7 @@ impl MacWorkerTaskSource {
         &self,
         record: &LocalTaskRecord,
     ) -> Result<(TaskStatus, TaskFreshness), ApiError> {
-        if !matches!(record.status().state(), TaskState::Active | TaskState::Open) {
+        if !remote_status_refresh_allowed(record) {
             return Ok((record.status().clone(), TaskFreshness::Current));
         }
         if record.retains_log_drain_unavailable() {
@@ -177,15 +183,7 @@ pub(crate) fn collect_task_projection(
 
         let mut status = record.status().clone();
         let mut task_freshness = TaskFreshness::Current;
-        if record.retains_log_drain_unavailable() {
-            let effective = record.with_status(status).map_err(map_local_error)?;
-            effective_records.push(effective);
-            freshness.insert(task_id, task_freshness);
-            continue;
-        }
-        if matches!(status.state(), TaskState::Active | TaskState::Open)
-            && status.worker().is_some()
-        {
+        if remote_status_refresh_allowed(&record) && status.worker().is_some() {
             let remaining = deadline.saturating_sub(started.elapsed());
             let remote_status = config
                 .worker(status.worker().expect("worker presence checked"))
@@ -258,4 +256,176 @@ fn dashboard_api_error(error: DashboardError) -> ApiError {
 
 fn map_task_view_api_error(error: TaskViewError) -> ApiError {
     dashboard_api_error(map_task_view_error(error))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskMutationRequest {
+    #[serde(default)]
+    pub message: Option<String>,
+    pub expected_task_id: TaskId,
+    pub expected_turn_id: Option<TurnId>,
+    pub expected_turn_count: u32,
+    pub expected_head_oid: Option<BaseOid>,
+    pub expected_updated_at_millis: u64,
+    pub expected_state: TaskState,
+}
+
+pub trait DashboardTaskMutationSource: Send + Sync + 'static {
+    fn reply(
+        &self,
+        task_id: TaskId,
+        request: &TaskMutationRequest,
+    ) -> Result<TaskDetailProjection, ApiError>;
+    fn accept(
+        &self,
+        task_id: TaskId,
+        request: &TaskMutationRequest,
+    ) -> Result<TaskDetailProjection, ApiError>;
+}
+
+pub struct MacWorkerTaskMutationSource {
+    config: Arc<Config>,
+    local_tasks: Arc<ClientStateStore>,
+    paths: PathLayout,
+    runner: Arc<dyn ProcessRunner>,
+    executor: Arc<dyn RunnerExecutor>,
+    after_expected_check: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl MacWorkerTaskMutationSource {
+    pub fn new(config: Arc<Config>, local_tasks: Arc<ClientStateStore>, paths: PathLayout) -> Self {
+        Self {
+            config,
+            local_tasks,
+            paths,
+            runner: Arc::new(SystemProcessRunner),
+            executor: Arc::new(DetachedRunnerExecutor),
+            after_expected_check: None,
+        }
+    }
+
+    pub fn with_process_runner(mut self, runner: Arc<dyn ProcessRunner>) -> Self {
+        self.runner = runner;
+        self
+    }
+
+    pub fn with_executor(mut self, executor: Arc<dyn RunnerExecutor>) -> Self {
+        self.executor = executor;
+        self
+    }
+
+    pub fn with_after_expected_check(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.after_expected_check = Some(hook);
+        self
+    }
+
+    fn client(&self) -> TaskClient<'_> {
+        TaskClient::new(
+            self.runner.as_ref(),
+            self.config.as_ref(),
+            &self.paths,
+            self.local_tasks.as_ref(),
+            self.executor.as_ref(),
+        )
+    }
+
+    fn load_matching(
+        &self,
+        task_id: TaskId,
+        request: &TaskMutationRequest,
+    ) -> Result<LocalTaskRecord, ApiError> {
+        if request.expected_task_id != task_id {
+            return Err(ApiError::new(
+                "TASK_REVISION_CONFLICT",
+                "task changed before this action",
+            ));
+        }
+        let record = self
+            .local_tasks
+            .load_task_optional(task_id)
+            .map_err(map_local_api_error)?
+            .ok_or_else(|| ApiError::new("TASK_NOT_FOUND", "task is not present in local state"))?;
+        if !expected_status_matches(&record, request) {
+            return Err(ApiError::new(
+                "TASK_REVISION_CONFLICT",
+                "task changed before this action",
+            ));
+        }
+        Ok(record)
+    }
+
+    fn after_expected_check(&self) {
+        if let Some(hook) = &self.after_expected_check {
+            hook();
+        }
+    }
+
+    fn project(&self, task_id: TaskId) -> Result<TaskDetailProjection, ApiError> {
+        let record = self
+            .local_tasks
+            .load_task_optional(task_id)
+            .map_err(map_local_api_error)?
+            .ok_or_else(|| ApiError::new("TASK_NOT_FOUND", "task is not present in local state"))?;
+        let runner = self
+            .local_tasks
+            .runner_liveness(task_id)
+            .map_err(map_local_api_error)?;
+        project_task_detail(&record, record.status(), runner, TaskFreshness::Current)
+            .map_err(map_task_view_api_error)
+    }
+}
+
+fn expected_status_matches(record: &LocalTaskRecord, expected: &TaskMutationRequest) -> bool {
+    let status = record.status();
+    let last_turn = status.turns().last().map(|turn| turn.turn_id());
+    let turn_count = u32::try_from(status.turns().len()).ok();
+    last_turn == expected.expected_turn_id
+        && turn_count == Some(expected.expected_turn_count)
+        && status.head_oid() == expected.expected_head_oid.as_ref()
+        && status.updated_at_millis() == expected.expected_updated_at_millis
+        && status.state() == expected.expected_state
+}
+
+impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
+    fn reply(
+        &self,
+        task_id: TaskId,
+        request: &TaskMutationRequest,
+    ) -> Result<TaskDetailProjection, ApiError> {
+        let expected = self.load_matching(task_id, request)?;
+        let message = request
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .ok_or_else(|| ApiError::new("TASK_REQUEST_INVALID", "reply requires a message"))?
+            .to_owned();
+        self.after_expected_check();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        self.client()
+            .say_from_expected(&expected, message, false, &mut stdout, &mut stderr)
+            .map_err(map_mutation_error)?;
+        self.project(task_id)
+    }
+
+    fn accept(
+        &self,
+        task_id: TaskId,
+        request: &TaskMutationRequest,
+    ) -> Result<TaskDetailProjection, ApiError> {
+        let expected = self.load_matching(task_id, request)?;
+        self.after_expected_check();
+        self.client()
+            .close_from_expected(&expected, false)
+            .map_err(map_mutation_error)?;
+        self.project(task_id)
+    }
+}
+
+fn map_mutation_error(error: WorkerError) -> ApiError {
+    let code = error.public_code();
+    let message = error.public_message();
+    ApiError::new(code, message)
 }

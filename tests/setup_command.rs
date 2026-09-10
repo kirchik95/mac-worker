@@ -31,7 +31,24 @@ use tempfile::tempdir;
 use uuid::Uuid;
 
 const INSTALLATION_ID: &str = "00112233445566778899aabbccddeeff";
-const CANDIDATE_DIGEST: &str = "04802bb988238c79cc29d0a1c8ded9bbc728ad5e5bbec2aeaf548d913b0ba1c2";
+const CANDIDATE_BYTES: &[u8] = concat!(
+    "#!/bin/sh\n",
+    "if [ \"$1\" = host ] && [ \"$2\" = complete-protocol-upgrade ]; then\n",
+    "  /bin/mv \"$0\" \"$3\"\n",
+    "  exit $?\n",
+    "fi\n",
+    "if [ \"$1\" = host ] && [ \"$2\" = complete-unverified-rollback ]; then\n",
+    "  if [ -n \"$4\" ]; then\n",
+    "    /bin/mv \"$4\" \"$3\"\n",
+    "    exit $?\n",
+    "  fi\n",
+    "  /bin/rm -f \"$3\"\n",
+    "  exit $?\n",
+    "fi\n",
+    "exit 0\n"
+)
+.as_bytes();
+const CANDIDATE_DIGEST: &str = "306135cb221abbb5a44247360fe2caef4db945fab12d58c29f134658ae318716";
 
 #[derive(Clone)]
 struct RecordingRunner {
@@ -225,6 +242,35 @@ fn setup_refreshes_agent_facts_after_warmup_and_before_the_verification_probe() 
 }
 
 #[test]
+fn setup_promotes_through_complete_protocol_upgrade_not_a_post_drain_mv() {
+    let commands = generated_setup_commands();
+    assert!(
+        commands.promotion.contains(
+            "\"$transaction/worker.new\" host complete-protocol-upgrade \"$worker_path\""
+        ),
+        "promotion must invoke the candidate fence: {}",
+        commands.promotion
+    );
+    assert!(
+        !commands.promotion.contains("/bin/mv "),
+        "promotion must not shell-mv the helper: {}",
+        commands.promotion
+    );
+    assert!(
+        commands
+            .rollback
+            .contains("\"$worker_path\" host complete-unverified-rollback \"$worker_path\""),
+        "rollback must invoke the unverified-rollback fence: {}",
+        commands.rollback
+    );
+    assert!(
+        !commands.rollback.contains("/bin/mv "),
+        "rollback must not shell-mv the previous helper: {}",
+        commands.rollback
+    );
+}
+
+#[test]
 fn setup_warms_the_promoted_helper_with_version_before_the_verification_probe() {
     // Gatekeeper's first-launch assessment must not share the 15 s probe
     // deadline used later by `worker workers`. `--version` is the cheap
@@ -303,7 +349,7 @@ fn worker() -> WorkerEntry {
 fn executable_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempdir().unwrap();
     let current_exe = directory.path().join("worker");
-    fs::write(&current_exe, b"test worker").unwrap();
+    fs::write(&current_exe, CANDIDATE_BYTES).unwrap();
     fs::set_permissions(&current_exe, fs::Permissions::from_mode(0o755)).unwrap();
     (directory, current_exe)
 }
@@ -534,7 +580,8 @@ fn promoted_fixture(home: &Path, previous: Option<&[u8]>) -> (PathBuf, PathBuf, 
     fs::create_dir_all(&lock).unwrap();
     fs::create_dir_all(&transaction).unwrap();
     let active = bin.join("worker");
-    fs::write(&active, b"test worker").unwrap();
+    fs::write(&active, CANDIDATE_BYTES).unwrap();
+    fs::set_permissions(&active, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(lock.join("owner"), format!("{INSTALLATION_ID}\n")).unwrap();
     fs::write(
         transaction.join("candidate.sha256"),
@@ -637,7 +684,7 @@ fn generated_upload_writes_exact_stdin_bytes_only_after_validating_the_acquired_
             .success()
     );
 
-    assert_upload_request_shape(&commands.upload, b"test worker");
+    assert_upload_request_shape(&commands.upload, CANDIDATE_BYTES);
     let output = run_remote_request(&commands.upload, &home);
 
     assert!(output.status.success(), "{:?}", output.stderr);
@@ -645,7 +692,7 @@ fn generated_upload_writes_exact_stdin_bytes_only_after_validating_the_acquired_
         .join(".local/share/mac-worker/setup")
         .join(INSTALLATION_ID);
     let staged = transaction.join("worker.new");
-    assert_eq!(fs::read(&staged).unwrap(), b"test worker");
+    assert_eq!(fs::read(&staged).unwrap(), CANDIDATE_BYTES);
     assert_eq!(
         fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
         0o600
@@ -676,7 +723,7 @@ fn generated_upload_rejects_a_swapped_transaction_symlink_without_touching_its_t
     fs::rename(&transaction, home.join("retained-transaction")).unwrap();
     symlink(&outside, &transaction).unwrap();
 
-    assert_upload_request_shape(&commands.upload, b"test worker");
+    assert_upload_request_shape(&commands.upload, CANDIDATE_BYTES);
     let output = run_remote_request(&commands.upload, &home);
 
     assert!(!output.status.success());
@@ -708,7 +755,7 @@ fn candidate_path_change_after_preflight_cannot_split_upload_bytes_from_the_expe
         b"candidate changed after preflight read"
     );
     let requests = inner.requests();
-    assert_upload_request_shape(&requests[2], b"test worker");
+    assert_upload_request_shape(&requests[2], CANDIDATE_BYTES);
     let home = directory.path().join("home");
     fs::create_dir(&home).unwrap();
     assert!(
@@ -752,7 +799,7 @@ fn generated_locked_context_rejects_owner_with_terminal_nul_and_preserves_acquir
     assert_eq!(fs::read(&active).unwrap(), b"active helper unchanged");
     assert_eq!(
         fs::read(transaction.join("worker.new")).unwrap(),
-        b"test worker"
+        CANDIDATE_BYTES
     );
     assert_eq!(fs::read(transaction.join("state")).unwrap(), b"acquired\n");
     assert!(!transaction.join("candidate.sha256").exists());
@@ -794,7 +841,7 @@ fn generated_locked_context_rejects_non_lf_exact_state_bytes_before_mutation() {
         );
         assert_eq!(
             fs::read(transaction.join("worker.new")).unwrap(),
-            b"test worker"
+            CANDIDATE_BYTES
         );
         assert!(!transaction.join("candidate.sha256").exists());
     }
@@ -838,7 +885,7 @@ fn generated_canonical_hex_reader_rejects_digest_with_terminal_nul_and_preserves
     );
     assert_eq!(
         fs::read(transaction.join("worker.new")).unwrap(),
-        b"test worker"
+        CANDIDATE_BYTES
     );
     assert_eq!(fs::read(transaction.join("state")).unwrap(), b"staged\n");
     assert!(!transaction.join("worker.previous").exists());
@@ -865,7 +912,7 @@ fn generated_setup_phases_complete_and_cleanup_only_owned_evidence() {
         .join(INSTALLATION_ID);
     let active = home.join(".local/bin/worker");
     fs::write(&active, b"previous worker").unwrap();
-    fs::write(transaction.join("worker.new"), b"test worker").unwrap();
+    fs::write(transaction.join("worker.new"), CANDIDATE_BYTES).unwrap();
 
     let digest = run_remote_command(&commands.digest, &home);
     assert!(digest.status.success());
@@ -889,7 +936,7 @@ fn generated_setup_phases_complete_and_cleanup_only_owned_evidence() {
             .success()
     );
 
-    assert_eq!(fs::read(&active).unwrap(), b"test worker");
+    assert_eq!(fs::read(&active).unwrap(), CANDIDATE_BYTES);
     assert!(!transaction.exists());
     assert!(
         !home
@@ -979,7 +1026,7 @@ fn generated_rollback_restores_the_owned_backup_and_releases_evidence() {
         .join(INSTALLATION_ID);
     let active = home.join(".local/bin/worker");
     fs::write(&active, b"previous worker").unwrap();
-    fs::write(transaction.join("worker.new"), b"test worker").unwrap();
+    fs::write(transaction.join("worker.new"), CANDIDATE_BYTES).unwrap();
     assert!(run_remote_command(&commands.digest, &home).status.success());
     assert!(
         run_remote_command(&commands.prepare, &home)
@@ -1022,7 +1069,7 @@ fn generated_rollback_removes_a_failed_first_install_and_releases_evidence() {
         .join(".local/share/mac-worker/setup")
         .join(INSTALLATION_ID);
     let active = home.join(".local/bin/worker");
-    fs::write(transaction.join("worker.new"), b"test worker").unwrap();
+    fs::write(transaction.join("worker.new"), CANDIDATE_BYTES).unwrap();
     assert!(run_remote_command(&commands.digest, &home).status.success());
     assert!(
         run_remote_command(&commands.prepare, &home)
@@ -1064,7 +1111,7 @@ fn generated_promotion_rejects_a_swapped_symlinked_bin_without_touching_its_targ
     symlink(&outside, home.join(".local/bin")).unwrap();
     fs::write(outside.join("worker"), b"outside worker").unwrap();
     fs::write(lock.join("owner"), format!("{INSTALLATION_ID}\n")).unwrap();
-    fs::write(transaction.join("worker.new"), b"test worker").unwrap();
+    fs::write(transaction.join("worker.new"), CANDIDATE_BYTES).unwrap();
     fs::write(
         transaction.join("candidate.sha256"),
         format!("{CANDIDATE_DIGEST}\n"),
@@ -1084,7 +1131,7 @@ fn generated_promotion_rejects_a_swapped_symlinked_bin_without_touching_its_targ
     assert_eq!(fs::read(outside.join("worker")).unwrap(), b"outside worker");
     assert_eq!(
         fs::read(transaction.join("worker.new")).unwrap(),
-        b"test worker"
+        CANDIDATE_BYTES
     );
     assert_eq!(fs::read(transaction.join("state")).unwrap(), b"prepared\n");
 }
@@ -1100,13 +1147,13 @@ fn generated_rollback_rejects_a_swapped_symlinked_bin_without_touching_its_targe
     let (_active, lock, transaction) = promoted_fixture(&home, Some(b"previous worker"));
     fs::rename(home.join(".local/bin"), home.join("original-bin")).unwrap();
     fs::create_dir(&outside).unwrap();
-    fs::write(outside.join("worker"), b"test worker").unwrap();
+    fs::write(outside.join("worker"), CANDIDATE_BYTES).unwrap();
     symlink(&outside, home.join(".local/bin")).unwrap();
 
     let output = run_remote_command(&commands.rollback, &home);
 
     assert!(!output.status.success());
-    assert_eq!(fs::read(outside.join("worker")).unwrap(), b"test worker");
+    assert_eq!(fs::read(outside.join("worker")).unwrap(), CANDIDATE_BYTES);
     assert_eq!(
         fs::read(transaction.join("worker.previous")).unwrap(),
         b"previous worker"
@@ -1177,7 +1224,7 @@ fn generated_cleanup_rejects_every_unexpected_direct_entry_before_mutation() {
             "cleanup accepted {kind:?} entry {name:?} in {}",
             root.display()
         );
-        assert_eq!(fs::read(&active).unwrap(), b"test worker");
+        assert_eq!(fs::read(&active).unwrap(), CANDIDATE_BYTES);
         assert!(lock.join("owner").is_file());
         assert!(transaction.join("candidate.sha256").is_file());
         assert!(transaction.join("no-previous").is_file());
@@ -1219,7 +1266,7 @@ fn generated_rollback_rejects_every_unexpected_direct_entry_before_mutation() {
             "rollback accepted {kind:?} entry {name:?} in {}",
             root.display()
         );
-        assert_eq!(fs::read(&active).unwrap(), b"test worker");
+        assert_eq!(fs::read(&active).unwrap(), CANDIDATE_BYTES);
         assert!(lock.join("owner").is_file());
         assert!(transaction.join("candidate.sha256").is_file());
         assert!(transaction.join("worker.previous").is_file());
@@ -1258,7 +1305,7 @@ fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv
         }
     );
     assert_ssh_request_shape(&requests[1], control_policy());
-    assert_upload_request_shape(&requests[2], b"test worker");
+    assert_upload_request_shape(&requests[2], CANDIDATE_BYTES);
     for request in [&requests[3], &requests[4], &requests[5], &requests[6]] {
         assert_ssh_request_shape(request, control_policy());
     }

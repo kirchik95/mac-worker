@@ -51,7 +51,7 @@ worker gc [--apply]                # preview, then reclaim old tasks, branches, 
 
 Outcomes are recorded on the task, independent of the process exit code:
 
-- `done`: the agent finished and the branch is published. Tasks close themselves by default (`--close-on done`).
+- `done`: the agent finished and the branch is published. Tasks close themselves by default (`--close-on done`). For a human review loop (ready for review → follow-up → accepted), submit with `--close-on never`, then `worker task say` as needed and `worker task close` when you accept. Default auto-close after `done` is not acceptance.
 - `needs_input`: the agent has a bounded question; `say` answers it.
 - `blocked`: the agent could not finish. Read `result` and `logs`, then `say` guidance or `close --discard`.
 - `unknown`: the agent did not return a structured result; the branch is still published.

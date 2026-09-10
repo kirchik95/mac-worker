@@ -3,12 +3,12 @@ use std::{collections::HashMap, fmt};
 use serde::Serialize;
 
 use crate::{
-    agent::{AgentKind, PermissionPolicy, Question},
+    agent::{AgentKind, PermissionPolicy, Question, ReportedCheckStatus},
     redaction::RedactionBoundary,
     scheduler::QueueBlockingReason,
     task::{
-        BaseOid, BranchName, LocalTaskRecord, RunId, RunProgress, RunRecord, RunnerState, TaskId,
-        TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        BaseOid, BranchName, ClosePolicy, LocalTaskRecord, RunId, RunProgress, RunRecord,
+        RunnerState, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
     },
 };
 
@@ -17,6 +17,69 @@ const MAX_WORKER_NAME_CHARS: usize = 128;
 const TASK_VIEW_OVERFLOW_CODE: &str = "TASK_VIEW_OVERFLOW";
 const TASK_VIEW_MISSING_TASK_CODE: &str = "TASK_VIEW_MISSING_TASK";
 const PATH_PLACEHOLDER: &str = "[path]";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewState {
+    NotReviewable,
+    WaitingOnYou,
+    ReadyForReview,
+    ReadyForFollowUp,
+    ClosePending,
+    Accepted,
+    ClosedAfterDone,
+    Closed,
+}
+
+/// Remote task-status overlay is a read-only projection. Skip it while a
+/// local close fence is unresolved, and while a local drain diagnostic must
+/// remain visible. Extra local-only guards AND onto this predicate so CLI
+/// `status`/`list` and the dashboard cannot drift.
+pub fn remote_status_refresh_allowed(record: &LocalTaskRecord) -> bool {
+    record.close_intent().is_none()
+        && matches!(record.status().state(), TaskState::Active | TaskState::Open)
+        && record.abandon_code() != Some("LOG_DRAIN_UNAVAILABLE")
+}
+
+pub fn review_state(record: &LocalTaskRecord, status: &TaskStatus) -> ReviewState {
+    // Unresolved local fence wins over any projected overlay, including a
+    // remote Closed status observed after a lost close response.
+    if record.close_intent().is_some() {
+        return ReviewState::ClosePending;
+    }
+    match status.state() {
+        TaskState::Queued | TaskState::Active => ReviewState::NotReviewable,
+        TaskState::Open => match status.last_outcome() {
+            Some(TaskOutcome::NeedsInput) => ReviewState::WaitingOnYou,
+            Some(TaskOutcome::Done) => ReviewState::ReadyForReview,
+            Some(_) => ReviewState::ReadyForFollowUp,
+            None => ReviewState::ReadyForFollowUp,
+        },
+        TaskState::Closed => {
+            if record.meta().close_policy() == ClosePolicy::Never
+                && matches!(status.last_outcome(), Some(TaskOutcome::Done))
+            {
+                ReviewState::Accepted
+            } else if record.meta().close_policy() == ClosePolicy::Done
+                && matches!(status.last_outcome(), Some(TaskOutcome::Done))
+            {
+                ReviewState::ClosedAfterDone
+            } else {
+                ReviewState::Closed
+            }
+        }
+        TaskState::Abandoned | TaskState::Lost => ReviewState::Closed,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskReportedCheckProjection {
+    pub name: String,
+    pub command: String,
+    pub status: ReportedCheckStatus,
+    pub detail: String,
+    pub source: &'static str,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +117,8 @@ pub struct TaskListRow {
     pub created_at_millis: u64,
     pub updated_at_millis: u64,
     pub active_turn_id: Option<TurnId>,
+    pub close_policy: ClosePolicy,
+    pub review_state: ReviewState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -78,6 +143,12 @@ pub struct TaskDetailProjection {
     pub files_changed: Vec<String>,
     pub diff_stat: Option<String>,
     pub fetch_command: String,
+    pub review_state: ReviewState,
+    pub close_policy: ClosePolicy,
+    pub reported_checks: Vec<TaskReportedCheckProjection>,
+    pub fetched_head: Option<BaseOid>,
+    pub fetched_ref: Option<String>,
+    pub review_commands: Vec<String>,
     pub turns: Vec<TaskTurnProjection>,
     pub timeline: Vec<TaskTimelineEvent>,
 }
@@ -330,6 +401,27 @@ pub fn project_task_detail(
             .diff_stat()
             .map(|diff_stat| boundary.diff_stat(diff_stat)),
         fetch_command: format!("worker task fetch {}", record.meta().task_id()),
+        review_state: review_state(record, status),
+        close_policy: record.meta().close_policy(),
+        reported_checks: status
+            .reported_checks()
+            .iter()
+            .map(|check| TaskReportedCheckProjection {
+                name: boundary.text(check.name(), crate::agent::MAX_CHECK_NAME_BYTES),
+                command: boundary.text(check.command(), crate::agent::MAX_CHECK_COMMAND_BYTES),
+                status: check.status(),
+                detail: boundary.text(check.detail(), crate::agent::MAX_CHECK_DETAIL_BYTES),
+                source: check.source(),
+            })
+            .collect(),
+        fetched_head: record.fetched_head().cloned(),
+        fetched_ref: status.worker().map(|worker| {
+            format!(
+                "refs/remotes/mac-worker/{worker}/task/{}",
+                record.meta().task_id()
+            )
+        }),
+        review_commands: review_commands(record, status),
         turns,
         timeline,
     })
@@ -384,6 +476,8 @@ fn task_list_row(
         created_at_millis: record.meta().created_at_millis(),
         updated_at_millis: status.updated_at_millis(),
         active_turn_id,
+        close_policy: record.meta().close_policy(),
+        review_state: review_state(record, status),
     })
 }
 
@@ -408,6 +502,19 @@ pub fn task_row_blocking_code(reason: Option<&QueueBlockingReason>) -> String {
         Some(QueueBlockingReason::RunCap) => "RUN_MAX_PARALLEL".to_owned(),
         Some(QueueBlockingReason::NoEligibleWorker) | None => "WAITING_FOR_DISPATCH".to_owned(),
     }
+}
+
+fn review_commands(record: &LocalTaskRecord, status: &TaskStatus) -> Vec<String> {
+    let task_id = record.meta().task_id();
+    let mut commands = vec![format!("worker task fetch {task_id}")];
+    if let Some(worker) = status.worker() {
+        let fetched_ref = format!("refs/remotes/mac-worker/{worker}/task/{task_id}");
+        commands.push(format!("git rev-parse {fetched_ref}"));
+        if record.fetched_head().is_some() {
+            commands.push(format!("git log -1 --oneline {fetched_ref}"));
+        }
+    }
+    commands
 }
 
 fn project_turn(turn: &TurnSummary, boundary: &RedactionBoundary) -> TaskTurnProjection {

@@ -748,6 +748,7 @@ impl TurnTerminalHook {
                         Vec::new(),
                         Vec::new(),
                         None,
+                        Vec::new(),
                         false,
                     );
                     report_turn_to_herdr(
@@ -1032,6 +1033,7 @@ impl<'a> TurnPublisher<'a> {
                 files_changed.clone()
             },
             diff_stat.clone(),
+            structured.checks().to_vec(),
             false,
         )?;
         if close {

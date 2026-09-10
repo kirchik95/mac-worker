@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-import { fetchSnapshot, type Snapshot } from '@/lib/api'
+import { fetchSnapshot, SnapshotPendingError, type Snapshot } from '@/lib/api'
 import { exampleSnapshot } from '@/lib/exampleSnapshot'
 
 const POLL_INTERVAL_MS = 2000
@@ -50,12 +50,21 @@ export function useSnapshot(): SnapshotState {
         setState({ snapshot, error: null, offline: false, example: false })
       } catch (error) {
         if (cancelled || controller.signal.aborted) return
-        setState({
-          snapshot: latest.current,
-          error: error instanceof Error ? error.message : String(error),
-          offline: true,
-          example: false,
-        })
+        if (error instanceof SnapshotPendingError) {
+          setState((current) => ({
+            snapshot: current.snapshot,
+            error: null,
+            offline: false,
+            example: false,
+          }))
+        } else {
+          setState({
+            snapshot: latest.current,
+            error: error instanceof Error ? error.message : String(error),
+            offline: true,
+            example: false,
+          })
+        }
       }
       if (!cancelled) schedule()
     }

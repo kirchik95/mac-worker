@@ -15,10 +15,14 @@ use crate::{
             DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource,
             MacWorkerLogSource, SystemDashboardRemoteReader, SystemDashboardWorkerReader,
         },
-        task::{DashboardTaskSource, MacWorkerTaskSource},
+        task::{
+            DashboardTaskMutationSource, DashboardTaskSource, MacWorkerTaskMutationSource,
+            MacWorkerTaskSource,
+        },
         web::{DashboardHttpServer, DashboardHttpState},
     },
     error::WorkerError,
+    paths::PathLayout,
     process::{ProcessRunner, SystemProcessRunner},
     project_config::ProjectSettings,
 };
@@ -61,20 +65,26 @@ pub struct SystemDashboardLauncher {
 }
 
 impl SystemDashboardLauncher {
-    pub fn from_system(config: Arc<Config>, local_jobs: Arc<ClientStateStore>) -> Self {
-        Self::from_system_for_directory(config, local_jobs, None)
+    pub fn from_system(
+        config: Arc<Config>,
+        local_jobs: Arc<ClientStateStore>,
+        paths: PathLayout,
+    ) -> Self {
+        Self::from_system_for_directory(config, local_jobs, None, paths)
     }
 
     pub fn from_system_for_directory(
         config: Arc<Config>,
         local_jobs: Arc<ClientStateStore>,
         launch_directory: Option<&Path>,
+        paths: PathLayout,
     ) -> Self {
         Self::from_system_with_config(
             config,
             local_jobs,
             launch_directory,
             DashboardConfig::default(),
+            paths,
         )
     }
 
@@ -83,6 +93,7 @@ impl SystemDashboardLauncher {
         local_jobs: Arc<ClientStateStore>,
         launch_directory: Option<&Path>,
         dashboard_config: DashboardConfig,
+        paths: PathLayout,
     ) -> Self {
         let runner: Arc<dyn ProcessRunner> = Arc::new(SystemProcessRunner);
         let workers: Arc<dyn DashboardWorkerReader> =
@@ -108,6 +119,9 @@ impl SystemDashboardLauncher {
             Arc::clone(&local_jobs),
             Arc::clone(&remote),
         ));
+        let mutation_source: Arc<dyn DashboardTaskMutationSource> = Arc::new(
+            MacWorkerTaskMutationSource::new(Arc::clone(&config), Arc::clone(&local_jobs), paths),
+        );
         let log_source = Arc::new(MacWorkerLogSource::new(config, local_jobs, remote));
         Self {
             state: Arc::new(DashboardHttpState {
@@ -121,6 +135,7 @@ impl SystemDashboardLauncher {
                 log_source,
                 task_source,
                 settings_source: Some(settings_source),
+                mutation_source: Some(mutation_source),
             }),
         }
     }

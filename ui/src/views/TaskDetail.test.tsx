@@ -5,6 +5,21 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MALICIOUS, task } from '@/test/fixtures'
 import { TaskDetail } from './TaskDetail'
 
+function reviewable(overrides: Record<string, unknown> = {}) {
+  return detail({
+    review_state: 'ready_for_review',
+    close_policy: 'never',
+    summary: 'Ready for review',
+    task: task({
+      state: 'open',
+      last_outcome: { kind: 'done' },
+      close_policy: 'never',
+      review_state: 'ready_for_review',
+    }),
+    ...overrides,
+  })
+}
+
 function detail(overrides: Record<string, unknown> = {}) {
   return {
     task: task({ model: 'gpt-6-astra', effort: 'xhigh', state: 'closed' }),
@@ -18,6 +33,12 @@ function detail(overrides: Record<string, unknown> = {}) {
     files_changed: ['src/lib.rs'],
     diff_stat: '1 file changed',
     fetch_command: 'worker task fetch aaaa',
+    review_state: 'closed',
+    close_policy: 'done',
+    reported_checks: [],
+    fetched_head: null,
+    fetched_ref: null,
+    review_commands: ['worker task fetch aaaa'],
     turns: [],
     timeline: [],
     ...overrides,
@@ -452,5 +473,229 @@ describe('TaskDetail', () => {
       await vi.advanceTimersByTimeAsync(6000)
     })
     expect(fetchMock.mock.calls.length).toBe(started)
+  })
+
+  it('keeps the typed follow-up when a reply is rejected', async () => {
+    const reviewable = detail({
+      review_state: 'ready_for_review',
+      close_policy: 'never',
+      reported_checks: [
+        {
+          name: 'unit',
+          command: 'cargo test',
+          status: 'pass',
+          detail: 'agent ran tests',
+          source: 'agent_reported',
+        },
+      ],
+      task: task({
+        state: 'open',
+        last_outcome: { kind: 'done' },
+        close_policy: 'never',
+        review_state: 'ready_for_review',
+      }),
+    })
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => reviewable })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        json: async () => ({
+          error: { code: 'TASK_REVISION_CONFLICT', message: 'task changed before this action' },
+        }),
+      })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<TaskDetail taskId="aaaa" />)
+
+    expect(await screen.findByText('AGENT REPORTED')).toBeInTheDocument()
+    expect(screen.getByText('unit')).toBeInTheDocument()
+    const box = screen.getByLabelText('Follow-up')
+    fireEvent.change(box, { target: { value: 'please add tests' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Reply' }))
+    expect(await screen.findByText('task changed before this action')).toBeInTheDocument()
+    expect(screen.getByLabelText('Follow-up')).toHaveValue('please add tests')
+  })
+
+  it('posts a reply only once while the first request is in flight', async () => {
+    const pendingReply = deferred<ReturnType<typeof jsonResponse>>()
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return pendingReply.promise
+      return Promise.resolve(jsonResponse(reviewable()))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<TaskDetail taskId="aaaa" />)
+
+    expect(await screen.findByRole('button', { name: 'Reply' })).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Follow-up'), { target: { value: 'please add tests' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Reply' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reply' }))
+
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1)
+
+    await act(async () => {
+      pendingReply.resolve(jsonResponse(reviewable({ summary: 'Follow-up sent', review_state: 'not_reviewable' })))
+    })
+    expect(await screen.findByText('Follow-up sent')).toBeInTheDocument()
+  })
+
+  it('aborts an in-flight reply and does not apply it after a task switch', async () => {
+    const pendingReply = deferred<ReturnType<typeof jsonResponse>>()
+    let replySignal: AbortSignal | undefined
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        replySignal = init.signal ?? undefined
+        return pendingReply.promise
+      }
+      if (String(url).includes('task-b')) {
+        return Promise.resolve(jsonResponse(reviewable({ summary: 'Task B summary' })))
+      }
+      return Promise.resolve(jsonResponse(reviewable({ summary: 'Task A summary' })))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { rerender } = render(<TaskDetail taskId="task-a" />)
+    expect(await screen.findByText('Task A summary')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Follow-up'), { target: { value: 'from A' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Reply' }))
+    expect(replySignal?.aborted).toBe(false)
+
+    rerender(<TaskDetail taskId="task-b" />)
+    expect(replySignal?.aborted).toBe(true)
+    expect(await screen.findByText('Task B summary')).toBeInTheDocument()
+    expect(screen.getByLabelText('Follow-up')).toHaveValue('')
+
+    await act(async () => {
+      pendingReply.resolve(jsonResponse(reviewable({ summary: 'Late reply from A' })))
+    })
+    expect(screen.queryByText('Late reply from A')).not.toBeInTheDocument()
+    expect(screen.queryByText('from A')).not.toBeInTheDocument()
+    expect(screen.getByText('Task B summary')).toBeInTheDocument()
+  })
+
+  it('aborts an in-flight accept and does not apply it after a task switch', async () => {
+    const pendingAccept = deferred<ReturnType<typeof jsonResponse>>()
+    let acceptSignal: AbortSignal | undefined
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        acceptSignal = init.signal ?? undefined
+        return pendingAccept.promise
+      }
+      if (String(url).includes('task-b')) {
+        return Promise.resolve(jsonResponse(reviewable({ summary: 'Other task' })))
+      }
+      return Promise.resolve(jsonResponse(reviewable({ summary: 'Accept this' })))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { rerender } = render(<TaskDetail taskId="task-a" />)
+    expect(await screen.findByRole('button', { name: 'Accept' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Accept' }))
+    expect(acceptSignal?.aborted).toBe(false)
+
+    rerender(<TaskDetail taskId="task-b" />)
+    expect(acceptSignal?.aborted).toBe(true)
+    expect(await screen.findByText('Other task')).toBeInTheDocument()
+
+    await act(async () => {
+      pendingAccept.resolve(
+        jsonResponse(
+          reviewable({
+            summary: 'Late accept from A',
+            review_state: 'accepted',
+          }),
+        ),
+      )
+    })
+    expect(screen.queryByText('Late accept from A')).not.toBeInTheDocument()
+    expect(screen.getByText('Other task')).toBeInTheDocument()
+  })
+
+  it('does not let a pre-reply GET replace a successful reply', async () => {
+    const staleGet = deferred<ReturnType<typeof jsonResponse>>()
+    let detailGets = 0
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return Promise.resolve(
+          jsonResponse(reviewable({ summary: 'Reply applied', review_state: 'waiting_on_you' })),
+        )
+      }
+      detailGets += 1
+      if (detailGets === 1) {
+        return Promise.resolve(jsonResponse(reviewable({ summary: 'Before reply' })))
+      }
+      if (detailGets === 2) return staleGet.promise
+      return Promise.resolve(
+        jsonResponse(reviewable({ summary: 'Later poll', review_state: 'waiting_on_you' })),
+      )
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    render(<TaskDetail taskId="aaaa" />)
+
+    expect(await screen.findByText('Before reply')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Follow-up'), { target: { value: 'please add tests' } })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000)
+    })
+    expect(detailGets).toBe(2)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reply' }))
+    expect(await screen.findByText('Reply applied')).toBeInTheDocument()
+
+    await act(async () => {
+      staleGet.resolve(jsonResponse(reviewable({ summary: 'Stale GET after reply' })))
+    })
+    expect(screen.queryByText('Stale GET after reply')).not.toBeInTheDocument()
+    expect(screen.getByText('Reply applied')).toBeInTheDocument()
+    expect(screen.getByLabelText('Follow-up')).toHaveValue('')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000)
+    })
+    expect(await screen.findByText('Later poll')).toBeInTheDocument()
+  })
+
+  it('does not let a pre-accept GET replace a successful accept', async () => {
+    const staleGet = deferred<ReturnType<typeof jsonResponse>>()
+    let detailGets = 0
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return Promise.resolve(
+          jsonResponse(reviewable({ summary: 'Accept applied', review_state: 'accepted' })),
+        )
+      }
+      detailGets += 1
+      if (detailGets === 1) {
+        return Promise.resolve(jsonResponse(reviewable({ summary: 'Before accept' })))
+      }
+      if (detailGets === 2) return staleGet.promise
+      return Promise.resolve(
+        jsonResponse(reviewable({ summary: 'Later accept poll', review_state: 'accepted' })),
+      )
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    render(<TaskDetail taskId="aaaa" />)
+
+    expect(await screen.findByText('Before accept')).toBeInTheDocument()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000)
+    })
+    expect(detailGets).toBe(2)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Accept' }))
+    expect(await screen.findByText('Accept applied')).toBeInTheDocument()
+
+    await act(async () => {
+      staleGet.resolve(jsonResponse(reviewable({ summary: 'Stale GET after accept' })))
+    })
+    expect(screen.queryByText('Stale GET after accept')).not.toBeInTheDocument()
+    expect(screen.getByText('Accept applied')).toBeInTheDocument()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000)
+    })
+    expect(await screen.findByText('Later accept poll')).toBeInTheDocument()
   })
 })

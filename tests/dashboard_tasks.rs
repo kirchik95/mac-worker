@@ -38,7 +38,7 @@ use mac_worker::{
         TaskStatus, TurnId, TurnSummary,
     },
     task_store::{TaskStatusRequest, TaskStatusResponse},
-    task_view::TaskListJson,
+    task_view::{ReviewState, TaskListJson},
 };
 use uuid::Uuid;
 
@@ -68,6 +68,60 @@ fn active_remote_task_status_overrides_local_status_without_a_write() {
     assert_eq!(row.freshness, mac_worker::task_view::TaskFreshness::Current);
     assert_eq!(before, harness.local_state_fingerprint());
     assert_eq!(harness.mutation_calls(), 0);
+}
+
+#[test]
+fn close_intent_skips_remote_refresh_on_snapshot_and_detail() {
+    let harness = DashboardTaskHarness::open_with_close_intent()
+        .with_remote_status(TaskState::Closed, Some(TaskOutcome::Done));
+    let before = harness.local_state_fingerprint();
+    let snapshot = harness.snapshot().unwrap();
+    let row = snapshot
+        .task_view
+        .tasks
+        .iter()
+        .find(|row| row.task_id == harness.task_id())
+        .unwrap();
+
+    assert_eq!(row.state, TaskState::Open);
+    assert_eq!(row.review_state, ReviewState::ClosePending);
+    assert_ne!(row.review_state, ReviewState::Accepted);
+    assert_eq!(harness.task_status_calls(), 0);
+    assert_eq!(before, harness.local_state_fingerprint());
+
+    let detail = harness
+        .task_source()
+        .task_detail(harness.task_id())
+        .unwrap();
+    assert_eq!(detail.task.state, TaskState::Open);
+    assert_eq!(detail.review_state, ReviewState::ClosePending);
+    assert_ne!(detail.review_state, ReviewState::Accepted);
+    assert_eq!(harness.task_status_calls(), 0);
+}
+
+#[test]
+fn log_drain_unavailable_skips_remote_refresh_on_snapshot_and_detail() {
+    let harness = DashboardTaskHarness::open_with_log_drain_unavailable()
+        .with_remote_status(TaskState::Closed, Some(TaskOutcome::Done));
+    let before = harness.local_state_fingerprint();
+    let snapshot = harness.snapshot().unwrap();
+    let row = snapshot
+        .task_view
+        .tasks
+        .iter()
+        .find(|row| row.task_id == harness.task_id())
+        .unwrap();
+
+    assert_eq!(row.state, TaskState::Open);
+    assert_eq!(harness.task_status_calls(), 0);
+    assert_eq!(before, harness.local_state_fingerprint());
+
+    let detail = harness
+        .task_source()
+        .task_detail(harness.task_id())
+        .unwrap();
+    assert_eq!(detail.task.state, TaskState::Open);
+    assert_eq!(harness.task_status_calls(), 0);
 }
 
 #[test]
@@ -532,6 +586,43 @@ impl DashboardTaskHarness {
         )
     }
 
+    fn open_with_close_intent() -> Self {
+        let harness = Self::local_task(
+            TaskState::Open,
+            Some("mini-1"),
+            Some(turn_id(1)),
+            false,
+            None,
+        );
+        let record = harness.state.load_task(harness.task_id).unwrap();
+        let intent = mac_worker::task::TaskCloseIntent::from_record(&record, false).unwrap();
+        harness
+            .state
+            .update_task(record.with_close_intent(intent).unwrap())
+            .unwrap();
+        harness
+    }
+
+    fn open_with_log_drain_unavailable() -> Self {
+        let harness = Self::local_task(
+            TaskState::Open,
+            Some("mini-1"),
+            Some(turn_id(1)),
+            false,
+            None,
+        );
+        let record = harness.state.load_task(harness.task_id).unwrap();
+        harness
+            .state
+            .update_task(
+                record
+                    .with_abandon_code(Some("LOG_DRAIN_UNAVAILABLE".into()))
+                    .unwrap(),
+            )
+            .unwrap();
+        harness
+    }
+
     fn active_local_task_with_hook(hook: Arc<dyn ClientStateConcurrencyHook>) -> Self {
         Self::local_task(
             TaskState::Active,
@@ -678,6 +769,10 @@ impl DashboardTaskHarness {
 
     fn mutation_calls(&self) -> usize {
         self.remote.mutation_calls()
+    }
+
+    fn task_status_calls(&self) -> usize {
+        self.remote.task_status_calls()
     }
 
     fn snapshot(&self) -> Result<DashboardSnapshot, DashboardError> {

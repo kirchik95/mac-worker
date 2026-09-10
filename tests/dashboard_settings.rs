@@ -187,6 +187,7 @@ async fn server(settings: Arc<SettingsFixture>) -> (DashboardHttpServer, Arc<Set
         log_source: Arc::new(EmptyLogs),
         task_source: Arc::new(EmptyTasks),
         settings_source: Some(settings.clone()),
+        mutation_source: None,
     });
     (
         DashboardHttpServer::bind(None, state).await.unwrap(),

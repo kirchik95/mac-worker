@@ -370,6 +370,16 @@ fn execute_with_context(
             "host migrate-layout requires the stdio execution boundary".into(),
         )),
         Command::Host {
+            command: HostCommand::CompleteProtocolUpgrade { .. },
+        } => Err(WorkerError::Protocol(
+            "host complete-protocol-upgrade requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
+            command: HostCommand::CompleteUnverifiedRollback { .. },
+        } => Err(WorkerError::Protocol(
+            "host complete-unverified-rollback requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
             command: HostCommand::RefreshFacts { .. },
         } => Err(WorkerError::Protocol(
             "host refresh-facts requires the stdio execution boundary".into(),
@@ -708,6 +718,7 @@ fn run_dashboard_command(
             crate::dashboard::service::DashboardConfig {
                 refresh_stale_facts,
             },
+            paths,
         );
         let opener = SystemBrowserOpener;
         let async_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1645,6 +1656,24 @@ pub fn run_with_rsync_executor_in_context(
         }
     ) {
         return run_host_migrate_layout(cli.config, runtime, stderr);
+    }
+    if let Command::Host {
+        command: HostCommand::CompleteProtocolUpgrade { target },
+    } = &cli.command
+    {
+        return run_host_complete_protocol_upgrade(cli.config, runtime, target, stderr);
+    }
+    if let Command::Host {
+        command: HostCommand::CompleteUnverifiedRollback { target, previous },
+    } = &cli.command
+    {
+        return run_host_complete_unverified_rollback(
+            cli.config,
+            runtime,
+            target,
+            previous.as_ref(),
+            stderr,
+        );
     }
     if let Command::Host {
         command:
@@ -2696,6 +2725,49 @@ fn run_host_migrate_layout(
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
         HostStore::migrate_layout(&paths.host_state_root())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            write_error(stderr, &error);
+            error.exit_code()
+        }
+    }
+}
+
+fn run_host_complete_protocol_upgrade(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    target: &HiddenComponent,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        let from = std::env::current_exe().map_err(WorkerError::Io)?;
+        let to = PathBuf::from(target.expose());
+        HostStore::complete_protocol_upgrade(&paths.host_state_root(), &from, &to)
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            write_error(stderr, &error);
+            error.exit_code()
+        }
+    }
+}
+
+fn run_host_complete_unverified_rollback(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    target: &HiddenComponent,
+    previous: Option<&HiddenComponent>,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<(), WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        let to = PathBuf::from(target.expose());
+        let previous = previous.map(|value| PathBuf::from(value.expose()));
+        HostStore::complete_unverified_rollback(&paths.host_state_root(), previous.as_deref(), &to)
     })();
     match result {
         Ok(()) => 0,

@@ -22,7 +22,7 @@ use mac_worker::{
         service::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
         },
-        task::DashboardTaskSource,
+        task::{DashboardTaskMutationSource, DashboardTaskSource, TaskMutationRequest},
         web::{DashboardHttpServer, DashboardHttpState, DashboardLogSource},
     },
     job::{JobId, LogStream},
@@ -273,6 +273,7 @@ async fn http_fixture_preserves_mixed_freshness_fifo_terminal_cursors_and_read_o
         log_source: logs,
         task_source: Arc::new(FixtureTaskSource::default()),
         settings_source: None,
+        mutation_source: None,
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     let host = listener_host(&server);
@@ -333,6 +334,7 @@ async fn two_http_clients_share_one_in_flight_snapshot_refresh() {
         log_source: Arc::new(RecordingLogs::new(job(job_id(1)))),
         task_source: Arc::new(FixtureTaskSource::default()),
         settings_source: None,
+        mutation_source: None,
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     let host = listener_host(&server);
@@ -404,6 +406,7 @@ async fn started_server_with_task_source(
         log_source: logs.clone(),
         task_source,
         settings_source: None,
+        mutation_source: None,
     });
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     (server, logs)
@@ -1107,6 +1110,8 @@ fn fixture_detail() -> TaskDetailProjection {
             created_at_millis: 900,
             updated_at_millis: 1_500,
             active_turn_id: Some(turn_id),
+            close_policy: mac_worker::task::ClosePolicy::Done,
+            review_state: mac_worker::task_view::ReviewState::NotReviewable,
         },
         project_id: "a".repeat(64),
         worktree_id: "b".repeat(64),
@@ -1122,6 +1127,12 @@ fn fixture_detail() -> TaskDetailProjection {
         files_changed: vec!["src/login.rs".into()],
         diff_stat: Some("1 file changed".into()),
         fetch_command: format!("worker task fetch {task_id}"),
+        review_state: mac_worker::task_view::ReviewState::NotReviewable,
+        close_policy: mac_worker::task::ClosePolicy::Done,
+        reported_checks: Vec::new(),
+        fetched_head: None,
+        fetched_ref: None,
+        review_commands: vec![format!("worker task fetch {task_id}")],
         turns: vec![turn.clone()],
         timeline: vec![TaskTimelineEvent {
             turn_number: turn.turn_number,
@@ -1171,4 +1182,153 @@ fn terminal_job(job_id: JobId) -> DashboardJob {
 
 fn job_id(value: u128) -> JobId {
     format!("{value:032x}").parse().unwrap()
+}
+
+#[derive(Default)]
+struct FixtureMutationSource {
+    calls: AtomicUsize,
+    last_kind: Mutex<Option<String>>,
+    fail_with: Mutex<Option<ApiError>>,
+}
+
+impl DashboardTaskMutationSource for FixtureMutationSource {
+    fn reply(
+        &self,
+        _task_id: TaskId,
+        request: &TaskMutationRequest,
+    ) -> Result<TaskDetailProjection, ApiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_kind.lock().unwrap() = Some(format!("reply:{}", request.expected_turn_count));
+        if let Some(error) = self.fail_with.lock().unwrap().clone() {
+            return Err(error);
+        }
+        Ok(fixture_detail())
+    }
+
+    fn accept(
+        &self,
+        _task_id: TaskId,
+        request: &TaskMutationRequest,
+    ) -> Result<TaskDetailProjection, ApiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_kind.lock().unwrap() = Some(format!("accept:{}", request.expected_turn_count));
+        if let Some(error) = self.fail_with.lock().unwrap().clone() {
+            return Err(error);
+        }
+        Ok(fixture_detail())
+    }
+}
+
+fn mutation_body() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "message": "please add tests",
+        "expected_task_id": fixture_task_id(),
+        "expected_turn_id": fixture_turn_id(),
+        "expected_turn_count": 1,
+        "expected_head_oid": null,
+        "expected_updated_at_millis": 1500,
+        "expected_state": "open"
+    }))
+    .unwrap()
+}
+
+fn post_task(address: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> HttpResponse {
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut request = format!("POST {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    let mut wire = request.into_bytes();
+    wire.extend_from_slice(body);
+    stream.write_all(&wire).unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    HttpResponse::parse(raw)
+}
+
+async fn started_server_with_mutation(
+    mutations: Arc<FixtureMutationSource>,
+) -> DashboardHttpServer {
+    let source = FakeSource;
+    let service = Arc::new(DashboardService::new(source, FixedClock, FixedMonotonic));
+    let logs = Arc::new(RecordingLogs::new(job(job_id(1))));
+    let state = Arc::new(DashboardHttpState {
+        service,
+        log_source: logs,
+        task_source: Arc::new(FixtureTaskSource::default()),
+        settings_source: None,
+        mutation_source: Some(mutations),
+    });
+    DashboardHttpServer::bind(None, state).await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_and_accept_require_task_headers_and_honor_revision() {
+    let mutations = Arc::new(FixtureMutationSource::default());
+    let server = started_server_with_mutation(Arc::clone(&mutations)).await;
+    let address = listener_host(&server);
+    let path = format!("/api/v1/tasks/{}/reply", fixture_task_id());
+    let body = mutation_body();
+    let origin = format!("http://{address}");
+
+    let unprotected = post_task(
+        &address,
+        &path,
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    assert_eq!(unprotected.status, 400);
+    assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
+
+    let headers = [
+        ("Content-Type", "application/json"),
+        ("Origin", origin.as_str()),
+        ("X-Mac-Worker-Task", "1"),
+    ];
+    *mutations.fail_with.lock().unwrap() = Some(ApiError::new(
+        "TASK_REVISION_CONFLICT",
+        "task changed before this action",
+    ));
+    let stale = post_task(&address, &path, &headers, &body);
+    assert_eq!(stale.status, 409);
+    assert_eq!(mutations.calls.load(Ordering::SeqCst), 1);
+
+    *mutations.fail_with.lock().unwrap() = None;
+    let accepted = post_task(
+        &address,
+        &format!("/api/v1/tasks/{}/accept", fixture_task_id()),
+        &headers,
+        &body,
+    );
+    assert_eq!(accepted.status, 200);
+    assert_eq!(
+        mutations.last_kind.lock().unwrap().as_deref(),
+        Some("accept:1")
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_without_mutation_source_is_unavailable() {
+    let (server, _logs) = started_server().await;
+    let address = listener_host(&server);
+    let origin = format!("http://{address}");
+    let headers = [
+        ("Content-Type", "application/json"),
+        ("Origin", origin.as_str()),
+        ("X-Mac-Worker-Task", "1"),
+    ];
+    let response = post_task(
+        &address,
+        &format!("/api/v1/tasks/{}/reply", fixture_task_id()),
+        &headers,
+        &mutation_body(),
+    );
+    assert_eq!(response.status, 503);
+    server.shutdown().await.unwrap();
 }

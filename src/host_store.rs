@@ -37,6 +37,9 @@ pub use crate::gc::{
 
 const MAX_HOST_FILE_BYTES: u64 = 1024 * 1024;
 pub const HOST_LAYOUT_VERSION: u32 = 2;
+/// Layout version a restored previous helper can still `open()`. Literal **2**,
+/// not `HOST_LAYOUT_VERSION`: SCHED keeps this at 2 when the live layout is 3.
+pub const ROLLBACK_HELPER_LAYOUT_VERSION: u32 = 2;
 pub type StagingNonce = [u8; 16];
 const PREVIOUS_HOST_LAYOUT_VERSION: u32 = 1;
 const HOST_INSTALLATION_VERSION: u32 = 1;
@@ -870,9 +873,38 @@ struct CleanupMarker {
     terminal_or_abandoned: bool,
 }
 
+enum UpgradeFenceOp {
+    Promote {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Rollback {
+        previous: Option<PathBuf>,
+        to: PathBuf,
+    },
+}
+
+#[cfg(test)]
+thread_local! {
+    static UPGRADE_FENCE_HOLD: std::cell::RefCell<Option<std::sync::Arc<std::sync::Barrier>>> =
+        const { std::cell::RefCell::new(None) };
+    static PUBLISHED_LAYOUT_VERSION_OVERRIDE: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn published_layout_version() -> u32 {
+    #[cfg(test)]
+    {
+        if let Some(version) = PUBLISHED_LAYOUT_VERSION_OVERRIDE.with(|slot| slot.get()) {
+            return version;
+        }
+    }
+    HOST_LAYOUT_VERSION
+}
+
 impl HostStore {
     pub fn open(root: &Path) -> Result<Self, WorkerError> {
-        Self::open_inner(root, None, true, false)?
+        Self::open_inner(root, None, true, false, None)?
             .ok_or_else(|| WorkerError::Protocol("host installation was not initialized".into()))
     }
 
@@ -881,15 +913,86 @@ impl HostStore {
     }
 
     pub(crate) fn open_if_present(root: &Path) -> Result<Option<Self>, WorkerError> {
-        Self::open_inner(root, None, false, false)
+        Self::open_inner(root, None, false, false, None)
     }
 
     /// Migrate an initialized v1 host root to the current layout. This is
     /// intentionally separate from `open`: normal host operations fail closed
     /// until the setup flow invokes this command.
     pub fn migrate_layout(root: &Path) -> Result<(), WorkerError> {
-        let _ = Self::open_inner(root, None, false, true)?;
+        let _ = Self::open_inner(root, None, false, true, None)?;
         Ok(())
+    }
+
+    /// Inspect layout-2 live work, replace `promote_from` with `promote_to`, and
+    /// rewrite layout while holding the existing `open_inner` construction lock.
+    /// Does not call `migrate_layout` (no second flock).
+    pub fn complete_protocol_upgrade(
+        root: &Path,
+        promote_from: &Path,
+        promote_to: &Path,
+    ) -> Result<(), WorkerError> {
+        let _ = Self::open_inner(
+            root,
+            None,
+            true,
+            true,
+            Some(UpgradeFenceOp::Promote {
+                from: promote_from.to_path_buf(),
+                to: promote_to.to_path_buf(),
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Restore `previous` onto `promote_to` only if inventory is drain-clean and
+    /// the layout the previous helper would `open()` equals
+    /// [`ROLLBACK_HELPER_LAYOUT_VERSION`]. On first initialization that is the
+    /// layout that would be published; on an existing root it is `layout.json`.
+    /// Incompatible initialize keeps the promoted helper and still first-publishes
+    /// current layout under it. Never rewrites an existing layout.
+    pub fn complete_unverified_rollback(
+        root: &Path,
+        previous: Option<&Path>,
+        promote_to: &Path,
+    ) -> Result<(), WorkerError> {
+        let _ = Self::open_inner(
+            root,
+            None,
+            true,
+            false,
+            Some(UpgradeFenceOp::Rollback {
+                previous: previous.map(Path::to_path_buf),
+                to: promote_to.to_path_buf(),
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Two-phase barrier for tests: the fenced thread waits once after the
+    /// construction lock is held and before helper rename/restore, then waits
+    /// again until the test releases the critical section.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn with_upgrade_fence_hold<T>(
+        barrier: std::sync::Arc<std::sync::Barrier>,
+        op: impl FnOnce() -> T,
+    ) -> T {
+        UPGRADE_FENCE_HOLD.with(|slot| *slot.borrow_mut() = Some(barrier));
+        let result = op();
+        UPGRADE_FENCE_HOLD.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
+    /// Combined SCHED fixture: pretend first-publish would write this layout
+    /// version. Production uses `HOST_LAYOUT_VERSION`.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn with_published_layout_version<T>(version: u32, op: impl FnOnce() -> T) -> T {
+        PUBLISHED_LAYOUT_VERSION_OVERRIDE.with(|slot| slot.set(Some(version)));
+        let result = op();
+        PUBLISHED_LAYOUT_VERSION_OVERRIDE.with(|slot| slot.set(None));
+        result
     }
 
     #[doc(hidden)]
@@ -897,7 +1000,7 @@ impl HostStore {
         root: &Path,
         point: HostStoreWritePoint,
     ) -> Result<Self, WorkerError> {
-        Self::open_inner(root, Some(point), true, false)?
+        Self::open_inner(root, Some(point), true, false, None)?
             .ok_or_else(|| WorkerError::Protocol("host installation was not initialized".into()))
     }
 
@@ -920,6 +1023,7 @@ impl HostStore {
         point: Option<HostStoreWritePoint>,
         create: bool,
         migrate: bool,
+        fence: Option<UpgradeFenceOp>,
     ) -> Result<Option<Self>, WorkerError> {
         if !root.is_absolute() {
             return Err(WorkerError::Protocol(
@@ -1068,13 +1172,15 @@ impl HostStore {
         let needs_migration = stored_layout
             .as_ref()
             .is_some_and(|stored| stored.version != HOST_LAYOUT_VERSION);
-        if needs_migration && !migrate {
+        let allow_outdated = migrate || fence.is_some();
+        if needs_migration && !allow_outdated {
             return Err(host_layout_outdated());
         }
         if needs_migration
             && stored_layout
                 .as_ref()
                 .is_some_and(|stored| stored.version != PREVIOUS_HOST_LAYOUT_VERSION)
+            && !matches!(fence, Some(UpgradeFenceOp::Rollback { .. }))
         {
             return Err(host_layout_outdated());
         }
@@ -1085,6 +1191,52 @@ impl HostStore {
         }
         let namespaces = open_host_namespaces(&rooted, root_device, initialize || needs_migration)?;
         inject_open_fault(point, HostStoreWritePoint::AfterHostNamespaces)?;
+        if (migrate || fence.is_some()) && !initialize {
+            match inspect_protocol_upgrade_namespaces(&namespaces) {
+                Ok(()) => {}
+                Err(_) if matches!(fence, Some(UpgradeFenceOp::Rollback { .. })) => {
+                    drop(installation_lock);
+                    return Err(upgrade_rollback_unsafe(
+                        "host work remains; the promoted helper is kept",
+                    ));
+                }
+                Err(error) => {
+                    drop(installation_lock);
+                    return Err(error);
+                }
+            }
+        }
+        if fence.is_some() {
+            wait_upgrade_fence_hold();
+        }
+        let mut refuse_rollback_keep_promoted = false;
+        if let Some(UpgradeFenceOp::Rollback { previous, to }) = &fence {
+            let compatible = if initialize {
+                published_layout_version() == ROLLBACK_HELPER_LAYOUT_VERSION
+            } else {
+                stored_layout.as_ref().map(|stored| stored.version)
+                    == Some(ROLLBACK_HELPER_LAYOUT_VERSION)
+            };
+            if !compatible {
+                if initialize {
+                    refuse_rollback_keep_promoted = true;
+                } else {
+                    drop(installation_lock);
+                    return Err(upgrade_rollback_unsafe(
+                        "layout version is not proven compatible with the previous helper; the promoted helper is kept",
+                    ));
+                }
+            } else if initialize {
+                restore_helper_binary(previous.as_deref(), to)?;
+            } else {
+                restore_helper_binary(previous.as_deref(), to)?;
+                drop(installation_lock);
+                return Ok(None);
+            }
+        }
+        if let Some(UpgradeFenceOp::Promote { from, to }) = &fence {
+            promote_helper_binary(from, to)?;
+        }
         let leases = namespaces
             .get("leases")
             .expect("owned leases namespace was inserted");
@@ -1099,6 +1251,7 @@ impl HostStore {
         if !initialize && !parent.entry_exists(&names.identity)? {
             complete_legacy_identity_reanchor(&parent, &names, lock_identity)?;
         }
+        let promote = matches!(fence, Some(UpgradeFenceOp::Promote { .. }));
         let mut layout_refreshed = layout_refresh_present;
         let layout = if initialize {
             let stored = publish_host_layout(&rooted, &namespaces)?;
@@ -1112,7 +1265,10 @@ impl HostStore {
             } else {
                 stored.clone()
             };
-            if needs_migration {
+            if promote || !layout_present || layout_is_volume_remount(&stored, &current_layout) {
+                layout_refreshed = true;
+                refresh_host_layout(&rooted, &namespaces, point)?
+            } else if needs_migration {
                 let layout_file_identity = rooted.private_entry_identity(HOST_LAYOUT_FILE)?;
                 let current_layout = build_host_layout(&rooted, &namespaces, layout_file_identity)?;
                 let replacement = serde_json::to_vec(&current_layout).map_err(|error| {
@@ -1125,9 +1281,6 @@ impl HostStore {
                 })?;
                 rooted.rewrite_private_regular_exact(HOST_LAYOUT_FILE, &expected, &replacement)?;
                 current_layout
-            } else if !layout_present || layout_is_volume_remount(&stored, &current_layout) {
-                layout_refreshed = true;
-                refresh_host_layout(&rooted, &namespaces, point)?
             } else {
                 validate_host_layout(&stored, &current_layout)?;
                 remove_private_if_present(&rooted, HOST_LAYOUT_REFRESH_NAME)?;
@@ -1173,7 +1326,6 @@ impl HostStore {
                 rooted.validate_private_entry(name)?;
             }
         }
-        drop(installation_lock);
         let store = Self {
             inner: Arc::new(HostStoreInner {
                 display_root: root.to_path_buf(),
@@ -1189,7 +1341,13 @@ impl HostStore {
                 secondary_fault: AtomicU8::new(0),
             }),
         };
+        drop(installation_lock);
         store.validate_layout()?;
+        if refuse_rollback_keep_promoted {
+            return Err(upgrade_rollback_unsafe(
+                "current layout is not proven compatible with the previous helper; the promoted helper is kept",
+            ));
+        }
         Ok(Some(store))
     }
 
@@ -2012,8 +2170,35 @@ impl HostStore {
         &self,
         operation: impl FnOnce() -> Result<T, WorkerError>,
     ) -> Result<T, WorkerError> {
+        self.with_installation_lock(operation)
+    }
+
+    /// Test and host-command wrapper around the parent-anchored installation
+    /// lock. Same domain as admission and `migrate_layout`; not a new mutex.
+    #[doc(hidden)]
+    pub fn with_installation_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, WorkerError>,
+    ) -> Result<T, WorkerError> {
         let _guard = InstallationGuard::acquire(&self.inner)?;
         operation()
+    }
+
+    /// Fail closed while any in-flight host work remains. Must be used by
+    /// setup/migrate before replacing a helper or rewriting layout.
+    pub fn require_protocol_upgrade_drain(&self) -> Result<(), WorkerError> {
+        self.with_installation_lock(|| self.inspect_protocol_upgrade_locked())
+    }
+
+    pub fn require_protocol_upgrade_drain_at(root: &Path) -> Result<(), WorkerError> {
+        match Self::open_if_present(root)? {
+            Some(store) => store.require_protocol_upgrade_drain(),
+            None => Ok(()),
+        }
+    }
+
+    fn inspect_protocol_upgrade_locked(&self) -> Result<(), WorkerError> {
+        inspect_protocol_upgrade_namespaces(&self.inner.namespaces)
     }
 
     pub(crate) fn session_lock(&self) -> Result<SessionGuard, WorkerError> {
@@ -4610,6 +4795,333 @@ fn protocol_code(code: &'static str, message: &str) -> WorkerError {
     WorkerError::Protocol(format!("{code}: {message}"))
 }
 
+fn upgrade_drain_required(message: &str) -> WorkerError {
+    protocol_code("HOST_UPGRADE_DRAIN_REQUIRED", message)
+}
+
+fn upgrade_rollback_unsafe(message: &str) -> WorkerError {
+    protocol_code("HOST_UPGRADE_ROLLBACK_UNSAFE", message)
+}
+
+fn utf8_inventory_name(raw: &[u8], label: &str) -> Result<String, WorkerError> {
+    std::str::from_utf8(raw)
+        .map(str::to_owned)
+        .map_err(|_| upgrade_drain_required(&format!("{label} inventory is not UTF-8")))
+}
+
+fn is_private_namespace(name: &str) -> bool {
+    name == ".mac-worker-rooted-fs"
+}
+
+fn inventory_names(directory: &RootedDir, label: &str) -> Result<Vec<String>, WorkerError> {
+    directory
+        .list_names()?
+        .into_iter()
+        .map(|raw| utf8_inventory_name(&raw, label))
+        .collect()
+}
+
+fn inspect_protocol_upgrade_namespaces(
+    namespaces: &BTreeMap<&'static str, RootedDir>,
+) -> Result<(), WorkerError> {
+    let leases = namespaces
+        .get("leases")
+        .ok_or_else(|| upgrade_drain_required("leases namespace is missing"))?;
+    let incoming = namespaces
+        .get("incoming")
+        .ok_or_else(|| upgrade_drain_required("incoming namespace is missing"))?;
+    let jobs = namespaces
+        .get("jobs")
+        .ok_or_else(|| upgrade_drain_required("jobs namespace is missing"))?;
+    let index = namespaces
+        .get("job-index")
+        .ok_or_else(|| upgrade_drain_required("job-index namespace is missing"))?;
+    if leases.has_private_cleanup_residue()?
+        || incoming.has_private_cleanup_residue()?
+        || jobs.has_private_cleanup_residue()?
+        || index.has_private_cleanup_residue()?
+    {
+        return Err(upgrade_drain_required(
+            "private cleanup residue remains in an upgrade-scoped namespace",
+        ));
+    }
+    inspect_upgrade_leases(leases)?;
+    inspect_upgrade_incoming(incoming)?;
+    inspect_upgrade_jobs(jobs)?;
+    inspect_upgrade_job_index(index, jobs)
+}
+
+fn inspect_upgrade_leases(leases: &RootedDir) -> Result<(), WorkerError> {
+    for name in inventory_names(leases, "lease")? {
+        if is_private_namespace(&name) {
+            continue;
+        }
+        match name.as_str() {
+            "capacity.lock" | "capacity.json" => {}
+            "slots" => inspect_layout3_slots(leases)?,
+            "heavy" => {
+                return Err(upgrade_drain_required(
+                    "live layout-2 lease remains; drain it on the previous helper",
+                ));
+            }
+            _ => {
+                return Err(upgrade_drain_required(&format!(
+                    "lease inventory contains incomplete or unknown entry {name}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_layout3_slots(leases: &RootedDir) -> Result<(), WorkerError> {
+    let slots = leases
+        .open_child_directory(&relative("slots")?, false)
+        .map_err(|_| upgrade_drain_required("leases/slots is unreadable"))?;
+    if slots.has_private_cleanup_residue()? {
+        return Err(upgrade_drain_required(
+            "private cleanup residue remains in leases/slots",
+        ));
+    }
+    for name in inventory_names(&slots, "lease slot")? {
+        if is_private_namespace(&name) {
+            continue;
+        }
+        if name.starts_with('.') {
+            return Err(upgrade_drain_required(&format!(
+                "lease slot inventory contains incomplete entry {name}"
+            )));
+        }
+        let slot = slots
+            .open_child_directory(&relative(&name)?, false)
+            .map_err(|_| upgrade_drain_required("lease slot directory is unreadable"))?;
+        for child in inventory_names(&slot, "lease slot entry")? {
+            if is_private_namespace(&child) {
+                continue;
+            }
+            return Err(upgrade_drain_required(&format!(
+                "live or partial layout-3 slot {name}/{child} remains"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn inspect_upgrade_incoming(incoming: &RootedDir) -> Result<(), WorkerError> {
+    for name in inventory_names(incoming, "incoming")? {
+        if is_private_namespace(&name) {
+            continue;
+        }
+        return Err(upgrade_drain_required(&format!(
+            "incoming transfer {name} remains; drain it on the previous helper"
+        )));
+    }
+    Ok(())
+}
+
+fn inspect_upgrade_jobs(jobs: &RootedDir) -> Result<(), WorkerError> {
+    for project in inventory_names(jobs, "job project")? {
+        if is_private_namespace(&project) {
+            continue;
+        }
+        if project.starts_with('.') {
+            return Err(upgrade_drain_required(&format!(
+                "job inventory contains incomplete project {project}"
+            )));
+        }
+        let project_dir = jobs
+            .open_child_directory(&relative(&project)?, false)
+            .map_err(|_| upgrade_drain_required("job project directory is unreadable"))?;
+        for worktree in inventory_names(&project_dir, "job worktree")? {
+            if is_private_namespace(&worktree) {
+                continue;
+            }
+            if worktree.starts_with('.') {
+                return Err(upgrade_drain_required(&format!(
+                    "job inventory contains incomplete worktree {worktree}"
+                )));
+            }
+            let worktree_dir = project_dir
+                .open_child_directory(&relative(&worktree)?, false)
+                .map_err(|_| upgrade_drain_required("job worktree directory is unreadable"))?;
+            for job_name in inventory_names(&worktree_dir, "job directory")? {
+                if is_private_namespace(&job_name) {
+                    continue;
+                }
+                if job_name.starts_with('.') {
+                    return Err(upgrade_drain_required(&format!(
+                        "job inventory contains incomplete job {job_name}"
+                    )));
+                }
+                let job_id = job_name.parse::<JobId>().map_err(|_| {
+                    upgrade_drain_required("job inventory contains an invalid job identity")
+                })?;
+                let job = worktree_dir
+                    .open_child_directory(&relative(&job_id.to_string())?, false)
+                    .map_err(|_| upgrade_drain_required("job directory is unreadable"))?;
+                inspect_upgrade_job_directory(&job)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_upgrade_job_directory(job: &RootedDir) -> Result<(), WorkerError> {
+    let meta: JobMeta = read_json_strict_at(job, "meta.json")
+        .map_err(|_| upgrade_drain_required("job metadata is unreadable or noncanonical"))?;
+    let status: JobStatus = read_json_strict_at(job, "status.json")
+        .map_err(|_| upgrade_drain_required("job status is unreadable or noncanonical"))?;
+    if !status.state().is_terminal() {
+        return Err(upgrade_drain_required(&format!(
+            "non-terminal job {} (protocol {}) remains; drain it on the previous helper",
+            meta.job_id(),
+            meta.protocol_version()
+        )));
+    }
+    for mutable in ["workspace", "home", "tmp", "execution.json"] {
+        if job.entry_exists(mutable)? {
+            return Err(upgrade_drain_required(&format!(
+                "job {} retains mutable execution evidence {mutable}",
+                meta.job_id()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn inspect_upgrade_job_index(index: &RootedDir, jobs: &RootedDir) -> Result<(), WorkerError> {
+    for name in inventory_names(index, "job index")? {
+        if is_private_namespace(&name) {
+            continue;
+        }
+        if name.starts_with(".accept-") {
+            return Err(upgrade_drain_required(&format!(
+                "accepted-index staging residue {name} remains"
+            )));
+        }
+        if name.starts_with('.') {
+            return Err(upgrade_drain_required(&format!(
+                "job-index contains incomplete entry {name}"
+            )));
+        }
+        let Some(job_id) = name
+            .strip_suffix(".json")
+            .and_then(|value| value.parse::<JobId>().ok())
+        else {
+            return Err(upgrade_drain_required(
+                "job-index contains an invalid job identity",
+            ));
+        };
+        let disposition: JobDisposition = read_json_strict_at(index, &name).map_err(|_| {
+            upgrade_drain_required("job-index record is unreadable or noncanonical")
+        })?;
+        disposition
+            .validate()
+            .map_err(|_| upgrade_drain_required("job-index record is noncanonical"))?;
+        match &disposition {
+            JobDisposition::Abandoned {
+                job_id: indexed, ..
+            } => {
+                if *indexed != job_id {
+                    return Err(upgrade_drain_required(
+                        "abandoned index identity does not match its filename",
+                    ));
+                }
+            }
+            JobDisposition::Accepted {
+                job_id: indexed,
+                client_id,
+                project_id,
+                worktree_id,
+                request_fingerprint,
+                ..
+            } => {
+                if *indexed != job_id {
+                    return Err(upgrade_drain_required(
+                        "accepted index identity does not match its filename",
+                    ));
+                }
+                let job = jobs
+                    .open_child_directory(
+                        &relative(&format!("{project_id}/{worktree_id}/{job_id}"))?,
+                        false,
+                    )
+                    .map_err(|_| {
+                        upgrade_drain_required(
+                            "accepted index is missing its canonical job directory",
+                        )
+                    })?;
+                let meta: JobMeta = read_json_strict_at(&job, "meta.json").map_err(|_| {
+                    upgrade_drain_required("accepted job metadata is unreadable or noncanonical")
+                })?;
+                let status: JobStatus = read_json_strict_at(&job, "status.json").map_err(|_| {
+                    upgrade_drain_required("accepted job status is unreadable or noncanonical")
+                })?;
+                if meta.job_id() != job_id
+                    || meta.client_id() != *client_id
+                    || meta.project_id() != project_id
+                    || meta.worktree_id() != worktree_id
+                    || meta.request_fingerprint() != request_fingerprint
+                {
+                    return Err(upgrade_drain_required(
+                        "accepted index does not match its canonical job identity",
+                    ));
+                }
+                if !status.state().is_terminal() {
+                    return Err(upgrade_drain_required(&format!(
+                        "accepted job {job_id} is not terminal; drain it on the previous helper"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn promote_helper_binary(from: &Path, to: &Path) -> Result<(), WorkerError> {
+    if !from.is_absolute() || !to.is_absolute() {
+        return Err(WorkerError::Protocol(
+            "upgrade helper paths must be absolute".into(),
+        ));
+    }
+    std::fs::rename(from, to).map_err(WorkerError::Io)
+}
+
+fn restore_helper_binary(previous: Option<&Path>, to: &Path) -> Result<(), WorkerError> {
+    if !to.is_absolute() {
+        return Err(WorkerError::Protocol(
+            "upgrade helper paths must be absolute".into(),
+        ));
+    }
+    match previous {
+        Some(previous) => {
+            if !previous.is_absolute() {
+                return Err(WorkerError::Protocol(
+                    "upgrade helper paths must be absolute".into(),
+                ));
+            }
+            std::fs::rename(previous, to).map_err(WorkerError::Io)
+        }
+        None => match std::fs::remove_file(to) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WorkerError::Io(error)),
+        },
+    }
+}
+
+fn wait_upgrade_fence_hold() {
+    #[cfg(test)]
+    {
+        UPGRADE_FENCE_HOLD.with(|slot| {
+            if let Some(barrier) = slot.borrow().clone() {
+                barrier.wait();
+                barrier.wait();
+            }
+        });
+    }
+}
+
 fn hex_16(bytes: [u8; 16]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -4618,14 +5130,18 @@ fn hex_16(bytes: [u8; 16]) -> String {
 mod review_regression_tests {
     use super::*;
     use crate::job::{
-        ClientId, CommandSpec, LeaseToken, ProcessIdentity, RequestFingerprintMaterial,
+        ClientId, CommandSpec, JobMeta, LeaseAcquireResponse, LeaseToken,
+        PREVIOUS_STORED_PROTOCOL_VERSION, ProcessIdentity, RequestFingerprintMaterial,
     };
+    use crate::lease::{AdmissionFacts, LeaseService};
+    use crate::protocol::MemoryPressure;
     use std::{
         fs,
         os::unix::{
             ffi::OsStrExt,
             fs::{MetadataExt, PermissionsExt},
         },
+        path::{Path, PathBuf},
         sync::{Arc, Barrier, mpsc},
         thread,
         time::Duration,
@@ -5908,5 +6424,390 @@ mod review_regression_tests {
                 .exists()
         );
         assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    }
+
+    fn helper_pair(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+        let from = dir.join(format!("{name}.new"));
+        let to = dir.join(name);
+        fs::write(&from, b"candidate-helper").unwrap();
+        fs::write(&to, b"previous-helper").unwrap();
+        (from, to)
+    }
+
+    fn layout_and_identity_inodes(parent: &Path, root: &Path) -> (u64, u64) {
+        let layout = fs::symlink_metadata(root.join(HOST_LAYOUT_FILE))
+            .unwrap()
+            .ino();
+        let identity = installation_entries(parent)
+            .into_iter()
+            .find(|path| path.extension().is_some_and(|value| value == "json"))
+            .expect("installation identity");
+        (layout, fs::symlink_metadata(&identity).unwrap().ino())
+    }
+
+    fn healthy_facts() -> AdmissionFacts {
+        AdmissionFacts {
+            free_disk_bytes: 200 * 1024 * 1024 * 1024,
+            total_disk_bytes: 500 * 1024 * 1024 * 1024,
+            memory_pressure: MemoryPressure::Normal,
+            swap_used_bytes: Some(0),
+        }
+    }
+
+    fn archive_terminal_v6_job(store: &HostStore, seed: u128) {
+        let material = RequestFingerprintMaterial::from_stored(
+            PREVIOUS_STORED_PROTOCOL_VERSION,
+            JobId::new(uuid::Uuid::from_u128(seed)),
+            ClientId::new(uuid::Uuid::from_u128(seed + 10_000)),
+            LeaseToken::new(uuid::Uuid::from_u128(seed + 20_000)),
+            2,
+            "mini-1".into(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            String::new(),
+            60_000,
+            "heavy".into(),
+            CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
+        )
+        .unwrap();
+        let job_dir = store
+            .open_directory(
+                &format!(
+                    "jobs/{}/{}/{}",
+                    material.project_id(),
+                    material.worktree_id(),
+                    material.job_id()
+                ),
+                true,
+            )
+            .unwrap();
+        let meta = JobMeta::new(&material, material.fingerprint()).unwrap();
+        job_dir
+            .write_new_private_file("meta.json", &serde_json::to_vec(&meta).unwrap())
+            .unwrap();
+        job_dir
+            .write_new_private_file(
+                "status.json",
+                &serde_json::to_vec(&JobStatus::succeeded(10, 0, 0).unwrap()).unwrap(),
+            )
+            .unwrap();
+        store
+            .write_new_disposition(&JobDisposition::Accepted {
+                job_id: material.job_id(),
+                client_id: material.client_id(),
+                project_id: material.project_id().into(),
+                worktree_id: material.worktree_id().into(),
+                request_fingerprint: material.fingerprint(),
+                status: JobStatus::accepted(10).unwrap(),
+                recorded_at_millis: 10,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn terminal_v6_accepted_index_is_idle_protocol_upgrade() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        archive_terminal_v6_job(&store, 300);
+        drop(store);
+        let (from, to) = helper_pair(temp.path(), "worker");
+        let before = layout_and_identity_inodes(temp.path(), &root);
+        HostStore::complete_protocol_upgrade(&root, &from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(&to).unwrap(), b"candidate-helper");
+        let after = layout_and_identity_inodes(temp.path(), &root);
+        assert_ne!(before.0, after.0, "layout inode must change");
+        assert_ne!(before.1, after.1, "installation identity inode must change");
+        HostStore::open(&root).unwrap();
+        HostStore::migrate_layout(&root).unwrap();
+    }
+
+    #[test]
+    fn live_lease_blocks_protocol_upgrade_before_rename() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request(301);
+        match LeaseService::new(&store)
+            .acquire(&request, &healthy_facts(), 1)
+            .unwrap()
+        {
+            LeaseAcquireResponse::Acquired { .. } => {}
+            LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+        }
+        drop(store);
+        let (from, to) = helper_pair(temp.path(), "worker");
+        let error = HostStore::complete_protocol_upgrade(&root, &from, &to).unwrap_err();
+        assert!(
+            error.to_string().contains("HOST_UPGRADE_DRAIN_REQUIRED"),
+            "{error}"
+        );
+        assert!(from.exists(), "candidate must remain when drain fails");
+        assert_eq!(fs::read(&to).unwrap(), b"previous-helper");
+    }
+
+    #[test]
+    fn incoming_and_accept_residue_block_protocol_upgrade() {
+        for residue in ["incoming", "accept"] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let store = HostStore::open(&root).unwrap();
+            if residue == "incoming" {
+                store
+                    .open_directory("incoming", false)
+                    .unwrap()
+                    .write_new_private_file(".partial", b"xfer")
+                    .unwrap();
+            } else {
+                store
+                    .open_directory("job-index", false)
+                    .unwrap()
+                    .write_new_private_file(".accept-deadbeef.json", b"{}")
+                    .unwrap();
+            }
+            drop(store);
+            let (from, to) = helper_pair(temp.path(), "worker");
+            let error = HostStore::complete_protocol_upgrade(&root, &from, &to).unwrap_err();
+            assert!(
+                error.to_string().contains("HOST_UPGRADE_DRAIN_REQUIRED"),
+                "{residue}: {error}"
+            );
+            assert!(from.exists(), "{residue}");
+        }
+    }
+
+    #[test]
+    fn nonterminal_accepted_job_blocks_protocol_upgrade() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request(302);
+        let material = request.material();
+        let job_dir = store
+            .open_directory(
+                &format!(
+                    "jobs/{}/{}/{}",
+                    material.project_id(),
+                    material.worktree_id(),
+                    material.job_id()
+                ),
+                true,
+            )
+            .unwrap();
+        let meta = JobMeta::new(material, request.request_fingerprint().clone()).unwrap();
+        job_dir
+            .write_new_private_file("meta.json", &serde_json::to_vec(&meta).unwrap())
+            .unwrap();
+        job_dir
+            .write_new_private_file(
+                "status.json",
+                &serde_json::to_vec(&JobStatus::accepted(10).unwrap()).unwrap(),
+            )
+            .unwrap();
+        store
+            .write_new_disposition(&JobDisposition::Accepted {
+                job_id: material.job_id(),
+                client_id: material.client_id(),
+                project_id: material.project_id().into(),
+                worktree_id: material.worktree_id().into(),
+                request_fingerprint: request.request_fingerprint().clone(),
+                status: JobStatus::accepted(10).unwrap(),
+                recorded_at_millis: 10,
+            })
+            .unwrap();
+        drop(store);
+        let (from, to) = helper_pair(temp.path(), "worker");
+        let error = HostStore::complete_protocol_upgrade(&root, &from, &to).unwrap_err();
+        assert!(
+            error.to_string().contains("HOST_UPGRADE_DRAIN_REQUIRED"),
+            "{error}"
+        );
+        assert!(from.exists());
+    }
+
+    #[test]
+    fn stale_handle_fails_acquire_after_protocol_upgrade() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let (from, to) = helper_pair(temp.path(), "worker");
+        let job = request(303).material().job_id();
+        let held = store.admission_lock(job).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let upgrade_root = root.clone();
+        let upgrade_barrier = barrier.clone();
+        let upgrade = thread::spawn(move || {
+            HostStore::with_upgrade_fence_hold(upgrade_barrier, || {
+                HostStore::complete_protocol_upgrade(&upgrade_root, &from, &to)
+            })
+        });
+        drop(held);
+        barrier.wait();
+        let acquire_store = store.clone();
+        let acquire = thread::spawn(move || {
+            LeaseService::new(&acquire_store).acquire(&request(304), &healthy_facts(), 1)
+        });
+        barrier.wait();
+        upgrade.join().unwrap().unwrap();
+        let error = acquire.join().unwrap().unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("canonical host layout record changed")
+                || message.contains("canonical host installation record changed")
+                || message.contains("Stale")
+                || message.contains("stale"),
+            "{message}"
+        );
+        let fresh = HostStore::open(&root).unwrap();
+        match LeaseService::new(&fresh)
+            .acquire(&request(304), &healthy_facts(), 1)
+            .unwrap()
+        {
+            LeaseAcquireResponse::Acquired { .. } => {}
+            LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn absent_root_protocol_upgrade_initializes_under_the_construction_lock() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let (from, to) = helper_pair(temp.path(), "worker");
+        HostStore::complete_protocol_upgrade(&root, &from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(&to).unwrap(), b"candidate-helper");
+        HostStore::open(&root).unwrap();
+    }
+
+    #[test]
+    fn absent_root_unverified_rollback_fences_first_admission() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let previous = temp.path().join("worker.previous");
+        let target = temp.path().join("worker");
+        fs::write(&previous, b"previous-helper").unwrap();
+        fs::write(&target, b"candidate-helper").unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let rollback_root = root.clone();
+        let rollback_barrier = barrier.clone();
+        let rollback_previous = previous.clone();
+        let rollback_target = target.clone();
+        let rollback = thread::spawn(move || {
+            HostStore::with_upgrade_fence_hold(rollback_barrier, || {
+                HostStore::complete_unverified_rollback(
+                    &rollback_root,
+                    Some(&rollback_previous),
+                    &rollback_target,
+                )
+            })
+        });
+        barrier.wait();
+        let open_root = root.clone();
+        let opener = thread::spawn(move || HostStore::open(&open_root));
+        barrier.wait();
+        rollback.join().unwrap().unwrap();
+        let store = opener.join().unwrap().unwrap();
+        assert!(!previous.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"previous-helper");
+        match LeaseService::new(&store)
+            .acquire(&request(306), &healthy_facts(), 1)
+            .unwrap()
+        {
+            LeaseAcquireResponse::Acquired { .. } => {}
+            LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn absent_root_rollback_refuses_layout3_previous2_and_keeps_new_helper() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let previous = temp.path().join("worker.previous");
+        let target = temp.path().join("worker");
+        fs::write(&previous, b"previous-helper").unwrap();
+        fs::write(&target, b"candidate-helper").unwrap();
+        // Combined SCHED case: live publish would be layout 3 while previous
+        // helper still only opens 2. FLOW still writes HOST_LAYOUT_VERSION (2);
+        // the override is only the compatibility check.
+        let error = HostStore::with_published_layout_version(3, || {
+            HostStore::complete_unverified_rollback(&root, Some(&previous), &target)
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("HOST_UPGRADE_ROLLBACK_UNSAFE"),
+            "{error}"
+        );
+        assert!(previous.exists(), "previous helper must remain");
+        assert_eq!(fs::read(&target).unwrap(), b"candidate-helper");
+        let layout: HostLayoutIdentity =
+            serde_json::from_slice(&fs::read(root.join(HOST_LAYOUT_FILE)).unwrap()).unwrap();
+        assert_eq!(layout.version, HOST_LAYOUT_VERSION);
+        HostStore::open(&root).unwrap();
+    }
+
+    #[test]
+    fn unverified_rollback_restores_previous_when_drain_clean() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        HostStore::open(&root).unwrap();
+        let previous = temp.path().join("worker.previous");
+        let target = temp.path().join("worker");
+        fs::write(&previous, b"previous-helper").unwrap();
+        fs::write(&target, b"candidate-helper").unwrap();
+        HostStore::complete_unverified_rollback(&root, Some(&previous), &target).unwrap();
+        assert!(!previous.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"previous-helper");
+    }
+
+    #[test]
+    fn unverified_rollback_keeps_new_helper_when_work_remains() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        match LeaseService::new(&store)
+            .acquire(&request(305), &healthy_facts(), 1)
+            .unwrap()
+        {
+            LeaseAcquireResponse::Acquired { .. } => {}
+            LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
+        }
+        drop(store);
+        let previous = temp.path().join("worker.previous");
+        let target = temp.path().join("worker");
+        fs::write(&previous, b"previous-helper").unwrap();
+        fs::write(&target, b"candidate-helper").unwrap();
+        let error =
+            HostStore::complete_unverified_rollback(&root, Some(&previous), &target).unwrap_err();
+        assert!(
+            error.to_string().contains("HOST_UPGRADE_ROLLBACK_UNSAFE"),
+            "{error}"
+        );
+        assert!(previous.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"candidate-helper");
+    }
+
+    #[test]
+    fn unverified_rollback_keeps_new_helper_when_layout_is_not_rollback_version() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        HostStore::open(&root).unwrap();
+        let layout_path = root.join(HOST_LAYOUT_FILE);
+        let mut layout: HostLayoutIdentity =
+            serde_json::from_slice(&fs::read(&layout_path).unwrap()).unwrap();
+        layout.version = 99;
+        fs::write(&layout_path, serde_json::to_vec(&layout).unwrap()).unwrap();
+        let previous = temp.path().join("worker.previous");
+        let target = temp.path().join("worker");
+        fs::write(&previous, b"previous-helper").unwrap();
+        fs::write(&target, b"candidate-helper").unwrap();
+        let error =
+            HostStore::complete_unverified_rollback(&root, Some(&previous), &target).unwrap_err();
+        assert!(
+            error.to_string().contains("HOST_UPGRADE_ROLLBACK_UNSAFE"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"candidate-helper");
     }
 }

@@ -236,6 +236,7 @@ impl DashboardLauncher for RecordingLauncher {
                 log_source: logs,
                 task_source,
                 settings_source: None,
+                mutation_source: None,
             });
             let server = DashboardHttpServer::bind(Some(0), state)
                 .await

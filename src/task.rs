@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    agent::{AgentKind, AgentOutcome, PermissionPolicy, Question, TurnLimits},
+    agent::{AgentKind, AgentOutcome, PermissionPolicy, Question, ReportedCheck, TurnLimits},
     error::WorkerError,
     job::{JobId, ProcessIdentity},
     redaction::RedactionBoundary,
@@ -1036,6 +1036,7 @@ pub struct TaskStatus {
     diff_stat: Option<String>,
     turns: Vec<TurnSummary>,
     updated_at_millis: u64,
+    reported_checks: Vec<ReportedCheck>,
 }
 
 impl TaskStatus {
@@ -1069,6 +1070,7 @@ impl TaskStatus {
                 .map(|turn| turn.redact(&boundary))
                 .collect(),
             updated_at_millis,
+            reported_checks: Vec::new(),
         };
         status.validate()?;
         Ok(status)
@@ -1118,6 +1120,29 @@ impl TaskStatus {
         &self.turns
     }
 
+    pub fn reported_checks(&self) -> &[ReportedCheck] {
+        &self.reported_checks
+    }
+
+    pub fn with_reported_checks(mut self, checks: Vec<ReportedCheck>) -> Result<Self, WorkerError> {
+        let boundary = RedactionBoundary::from_env();
+        self.reported_checks = boundary.reported_checks(checks);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn copying_reported_checks(self, from: &TaskStatus) -> Result<Self, WorkerError> {
+        self.with_reported_checks(from.reported_checks().to_vec())
+    }
+
+    pub fn copying_reported_checks_if_empty(self, from: &TaskStatus) -> Result<Self, WorkerError> {
+        if self.reported_checks.is_empty() {
+            self.copying_reported_checks(from)
+        } else {
+            Ok(self)
+        }
+    }
+
     fn validate(&self) -> Result<(), WorkerError> {
         if let Some(worker) = &self.worker {
             validate_pinned_worker(worker)?;
@@ -1135,7 +1160,12 @@ impl TaskStatus {
 impl Serialize for TaskStatus {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("TaskStatus", 11)?;
+        let field_count = if self.reported_checks.is_empty() {
+            11
+        } else {
+            12
+        };
+        let mut record = serializer.serialize_struct("TaskStatus", field_count)?;
         record.serialize_field("state", &self.state)?;
         record.serialize_field("last_outcome", &self.last_outcome)?;
         record.serialize_field("worker", &self.worker)?;
@@ -1147,6 +1177,9 @@ impl Serialize for TaskStatus {
         record.serialize_field("diff_stat", &self.diff_stat)?;
         record.serialize_field("turns", &self.turns)?;
         record.serialize_field("updated_at_millis", &self.updated_at_millis)?;
+        if !self.reported_checks.is_empty() {
+            record.serialize_field("reported_checks", &self.reported_checks)?;
+        }
         record.end()
     }
 }
@@ -1167,6 +1200,8 @@ impl<'de> Deserialize<'de> for TaskStatus {
             diff_stat: Option<String>,
             turns: Vec<TurnSummary>,
             updated_at_millis: u64,
+            #[serde(default)]
+            reported_checks: Vec<ReportedCheck>,
         }
         let wire: Wire = deserialize_unique_object(deserializer)?;
         Self::new(
@@ -1182,6 +1217,7 @@ impl<'de> Deserialize<'de> for TaskStatus {
             wire.turns,
             wire.updated_at_millis,
         )
+        .and_then(|status| status.with_reported_checks(wire.reported_checks))
         .map_err(de::Error::custom)
     }
 }
@@ -1208,6 +1244,54 @@ pub enum RunnerState {
     Exited,
 }
 
+/// Durable close fence. Local state stays `Open` until the remote close is
+/// acknowledged; omitted from JSON when unset so legacy records round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCloseIntent {
+    discard: bool,
+    last_turn_id: Option<TurnId>,
+    turn_count: u32,
+    head_oid: Option<BaseOid>,
+}
+
+impl TaskCloseIntent {
+    pub fn from_record(record: &LocalTaskRecord, discard: bool) -> Result<Self, WorkerError> {
+        let turns = record.status().turns();
+        let turn_count = u32::try_from(turns.len())
+            .map_err(|_| task_config("close intent turn count is out of range"))?;
+        Ok(Self {
+            discard,
+            last_turn_id: turns.last().map(TurnSummary::turn_id),
+            turn_count,
+            head_oid: record.status().head_oid().cloned(),
+        })
+    }
+
+    pub fn discard(&self) -> bool {
+        self.discard
+    }
+
+    pub fn last_turn_id(&self) -> Option<TurnId> {
+        self.last_turn_id
+    }
+
+    pub fn turn_count(&self) -> u32 {
+        self.turn_count
+    }
+
+    pub fn head_oid(&self) -> Option<&BaseOid> {
+        self.head_oid.as_ref()
+    }
+
+    pub fn matches_record(&self, record: &LocalTaskRecord) -> bool {
+        let turns = record.status().turns();
+        self.last_turn_id == turns.last().map(TurnSummary::turn_id)
+            && usize::try_from(self.turn_count).ok() == Some(turns.len())
+            && self.head_oid.as_ref() == record.status().head_oid()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalTaskRecord {
     meta: TaskMeta,
@@ -1222,6 +1306,7 @@ pub struct LocalTaskRecord {
     abandon_code: Option<String>,
     submission_intent_turn_id: Option<TurnId>,
     submission_rollback_turn_id: Option<TurnId>,
+    close_intent: Option<TaskCloseIntent>,
 }
 
 impl LocalTaskRecord {
@@ -1249,6 +1334,7 @@ impl LocalTaskRecord {
             abandon_code,
             submission_intent_turn_id: None,
             submission_rollback_turn_id: None,
+            close_intent: None,
         };
         record.validate()?;
         Ok(record)
@@ -1316,6 +1402,10 @@ impl LocalTaskRecord {
         self.submission_intent_turn_id
     }
 
+    pub fn close_intent(&self) -> Option<&TaskCloseIntent> {
+        self.close_intent.as_ref()
+    }
+
     pub fn repo_id(&self) -> &str {
         &self.repo_id
     }
@@ -1343,7 +1433,7 @@ impl LocalTaskRecord {
         // Keep fetched_head as last successful import history. Presence is not
         // proof the current turn's result was imported; follow-up recovery
         // must fetch this turn before releasing its base pin.
-        let mut replacement = Self::new(
+        let replacement = Self::new(
             self.meta.clone(),
             status,
             self.status_observed_at_millis,
@@ -1354,16 +1444,14 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             self.abandon_code.clone(),
         )?;
-        replacement.submission_intent_turn_id = self.submission_intent_turn_id;
-        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
-        Ok(replacement)
+        self.with_local_fields(replacement)
     }
 
     pub fn with_status_observed_at(
         &self,
         observed_at_millis: Option<u64>,
     ) -> Result<Self, WorkerError> {
-        let mut replacement = Self::new(
+        let replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             observed_at_millis,
@@ -1374,13 +1462,11 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             self.abandon_code.clone(),
         )?;
-        replacement.submission_intent_turn_id = self.submission_intent_turn_id;
-        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
-        Ok(replacement)
+        self.with_local_fields(replacement)
     }
 
     pub fn with_runner(&self, runner: Option<RunnerIdentity>) -> Result<Self, WorkerError> {
-        let mut replacement = Self::new(
+        let replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             self.status_observed_at_millis,
@@ -1391,13 +1477,11 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             self.abandon_code.clone(),
         )?;
-        replacement.submission_intent_turn_id = self.submission_intent_turn_id;
-        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
-        Ok(replacement)
+        self.with_local_fields(replacement)
     }
 
     pub fn with_fetched_head(&self, fetched_head: Option<BaseOid>) -> Result<Self, WorkerError> {
-        let mut replacement = Self::new(
+        let replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             self.status_observed_at_millis,
@@ -1408,13 +1492,11 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             self.abandon_code.clone(),
         )?;
-        replacement.submission_intent_turn_id = self.submission_intent_turn_id;
-        replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
-        Ok(replacement)
+        self.with_local_fields(replacement)
     }
 
     pub fn with_abandon_code(&self, abandon_code: Option<String>) -> Result<Self, WorkerError> {
-        let mut replacement = Self::new(
+        let replacement = Self::new(
             self.meta.clone(),
             self.status.clone(),
             self.status_observed_at_millis,
@@ -1425,8 +1507,28 @@ impl LocalTaskRecord {
             self.wait_for_capacity,
             abandon_code,
         )?;
+        self.with_local_fields(replacement)
+    }
+
+    pub fn with_close_intent(&self, intent: TaskCloseIntent) -> Result<Self, WorkerError> {
+        let mut replacement = self.clone();
+        replacement.close_intent = Some(intent);
+        replacement.validate()?;
+        Ok(replacement)
+    }
+
+    pub fn without_close_intent(&self) -> Result<Self, WorkerError> {
+        let mut replacement = self.clone();
+        replacement.close_intent = None;
+        replacement.validate()?;
+        Ok(replacement)
+    }
+
+    fn with_local_fields(&self, mut replacement: Self) -> Result<Self, WorkerError> {
         replacement.submission_intent_turn_id = self.submission_intent_turn_id;
         replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
+        replacement.close_intent = self.close_intent.clone();
+        replacement.validate()?;
         Ok(replacement)
     }
 
@@ -1476,6 +1578,19 @@ impl LocalTaskRecord {
                 "submission intent and rollback marker turn identifiers differ",
             ));
         }
+        if let Some(intent) = &self.close_intent {
+            if self.status.state != TaskState::Open {
+                return Err(task_config("close intent requires an open task"));
+            }
+            if self.submission_intent_turn_id.is_some()
+                || self.submission_rollback_turn_id.is_some()
+            {
+                return Err(task_config(
+                    "close intent cannot overlap submission recovery",
+                ));
+            }
+            let _ = intent;
+        }
         Ok(())
     }
 }
@@ -1483,7 +1598,17 @@ impl LocalTaskRecord {
 impl Serialize for LocalTaskRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("LocalTaskRecord", 11)?;
+        let mut field_count = 9;
+        if self.submission_intent_turn_id.is_some() {
+            field_count += 1;
+        }
+        if self.submission_rollback_turn_id.is_some() {
+            field_count += 1;
+        }
+        if self.close_intent.is_some() {
+            field_count += 1;
+        }
+        let mut record = serializer.serialize_struct("LocalTaskRecord", field_count)?;
         record.serialize_field("meta", &self.meta)?;
         record.serialize_field("status", &self.status)?;
         record.serialize_field("status_observed_at_millis", &self.status_observed_at_millis)?;
@@ -1498,6 +1623,9 @@ impl Serialize for LocalTaskRecord {
         }
         if let Some(turn_id) = self.submission_rollback_turn_id {
             record.serialize_field("submission_rollback_turn_id", &turn_id)?;
+        }
+        if let Some(intent) = &self.close_intent {
+            record.serialize_field("close_intent", intent)?;
         }
         record.end()
     }
@@ -1521,6 +1649,8 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             submission_intent_turn_id: Option<TurnId>,
             #[serde(default)]
             submission_rollback_turn_id: Option<TurnId>,
+            #[serde(default)]
+            close_intent: Option<TaskCloseIntent>,
         }
         let wire: Wire = deserialize_unique_object(deserializer)?;
         let mut record = Self::new(
@@ -1537,6 +1667,7 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
         .map_err(de::Error::custom)?;
         record.submission_intent_turn_id = wire.submission_intent_turn_id;
         record.submission_rollback_turn_id = wire.submission_rollback_turn_id;
+        record.close_intent = wire.close_intent;
         record.validate().map_err(de::Error::custom)?;
         Ok(record)
     }

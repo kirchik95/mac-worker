@@ -3,6 +3,25 @@
 export type Freshness = 'current' | 'stale' | 'unknown'
 export type WorkerHealth = 'ready' | 'busy' | 'unavailable' | string
 export type TaskState = 'queued' | 'active' | 'open' | 'closed' | 'abandoned' | 'lost'
+export type ReviewState =
+  | 'not_reviewable'
+  | 'waiting_on_you'
+  | 'ready_for_review'
+  | 'ready_for_follow_up'
+  | 'close_pending'
+  | 'accepted'
+  | 'closed_after_done'
+  | 'closed'
+
+export type CheckStatus = 'pass' | 'fail' | 'not_run' | 'error'
+
+export interface ReportedCheck {
+  name: string
+  command: string
+  status: CheckStatus
+  detail: string
+  source: 'agent_reported' | string
+}
 export type AgentAuth = 'authenticated' | 'unauthenticated' | 'unknown'
 
 /** Matches DashboardError in src/dashboard/model.rs: `{ "code", "message" }`. */
@@ -66,6 +85,8 @@ export interface TaskRow {
   created_at_millis: number
   updated_at_millis: number
   active_turn_id: string | null
+  close_policy: 'done' | 'never'
+  review_state: ReviewState
 }
 
 export interface RunRow {
@@ -123,15 +144,31 @@ export interface Snapshot {
 
 export class ApiError extends Error {
   readonly status: number
+  readonly code: string | null
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code: string | null = null) {
     super(message)
     this.status = status
+    this.code = code
+  }
+}
+
+export class SnapshotPendingError extends Error {
+  constructor() {
+    super('DASHBOARD_SNAPSHOT_PENDING')
   }
 }
 
 export async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(path, { cache: 'no-store', signal })
+  if (response.status === 503) {
+    const payload: unknown = await response.json().catch(() => null)
+    const code =
+      payload && typeof payload === 'object' && 'error' in payload
+        ? (payload as { error?: { code?: unknown } }).error?.code
+        : null
+    if (code === 'DASHBOARD_SNAPSHOT_PENDING') throw new SnapshotPendingError()
+  }
   if (!response.ok) throw new ApiError(response.status, `${path} responded ${response.status}`)
   return (await response.json()) as T
 }
@@ -167,6 +204,12 @@ export interface TaskDetail {
   files_changed: string[]
   diff_stat: string | null
   fetch_command: string
+  review_state: ReviewState
+  close_policy: 'done' | 'never'
+  reported_checks: ReportedCheck[]
+  fetched_head: string | null
+  fetched_ref: string | null
+  review_commands: string[]
   turns: TurnRow[]
   timeline: TurnRow[]
 }
@@ -206,6 +249,52 @@ export interface SaveSettings {
 
 export const fetchTaskDetail = (taskId: string, signal?: AbortSignal) =>
   getJson<TaskDetail>(`/api/v1/tasks/${encodeURIComponent(taskId)}`, signal)
+
+export interface TaskMutation {
+  message?: string
+  expected_task_id: string
+  expected_turn_id: string | null
+  expected_turn_count: number
+  expected_head_oid: string | null
+  expected_updated_at_millis: number
+  expected_state: TaskState
+}
+
+async function postTaskMutation(
+  path: string,
+  body: TaskMutation,
+  signal?: AbortSignal,
+): Promise<TaskDetail> {
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-mac-worker-task': '1',
+    },
+    body: JSON.stringify(body),
+    signal,
+  })
+  const payload: unknown = await response.json().catch(() => null)
+  if (!response.ok) {
+    const error =
+      payload && typeof payload === 'object' && 'error' in payload
+        ? (payload as { error?: { code?: unknown; message?: unknown } }).error
+        : null
+    const code = typeof error?.code === 'string' ? error.code : null
+    const message =
+      typeof error?.message === 'string'
+        ? error.message
+        : `save responded ${response.status}`
+    throw new ApiError(response.status, message, code)
+  }
+  return payload as TaskDetail
+}
+
+export const replyToTask = (taskId: string, body: TaskMutation, signal?: AbortSignal) =>
+  postTaskMutation(`/api/v1/tasks/${encodeURIComponent(taskId)}/reply`, body, signal)
+
+export const acceptTask = (taskId: string, body: TaskMutation, signal?: AbortSignal) =>
+  postTaskMutation(`/api/v1/tasks/${encodeURIComponent(taskId)}/accept`, body, signal)
 
 export const fetchAgentSettings = (worker: string, signal?: AbortSignal) =>
   getJson<AgentSettings>(`/api/v1/workers/${encodeURIComponent(worker)}/agent-settings`, signal)

@@ -889,6 +889,50 @@ fn protocol_mismatch_is_reported_as_unavailable() {
 }
 
 #[test]
+fn protocol_six_helper_is_an_explicit_mismatch_before_jobs() {
+    // New laptop → old helper: probe mismatch is the preflight. The transport
+    // must not issue task/lease host commands after a v6 advertisement.
+    let mut response: serde_json::Value = serde_json::from_slice(&valid_probe_json()).unwrap();
+    response["protocol_version"] = serde_json::json!(6);
+    let runner = RecordingRunner::returning_json(serde_json::to_vec(&response).unwrap());
+    let health = SshTransport::new(runner.clone()).probe(&worker("mini-1", "mac1", &[]));
+
+    assert_eq!(health.status, HealthStatus::Unavailable);
+    assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
+    assert!(
+        health
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("protocol version"))
+    );
+    assert_eq!(
+        health.probe.as_ref().map(|probe| probe.protocol_version),
+        Some(6)
+    );
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 1, "mismatch must stop at the probe request");
+    let probe_command = requests[0]
+        .args
+        .last()
+        .and_then(|argument| argument.to_str())
+        .unwrap_or_default();
+    assert_eq!(probe_command, "~/.local/bin/worker host probe");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.args.iter().any(|argument| {
+                argument.to_str().is_some_and(|value| {
+                    value.contains("task-status")
+                        || value.contains("task-close")
+                        || value.contains("lease")
+                        || value.contains("submit")
+                })
+            })),
+        "v6 probe mismatch must not issue task or lease host commands"
+    );
+}
+
+#[test]
 fn protocol_two_missing_occupancy_is_an_explicit_version_mismatch() {
     let response = br#"{"protocol_version":2,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":0,"capabilities":[]}"#.to_vec();
     let health = SshTransport::new(RecordingRunner::returning_json(response)).probe(&worker(

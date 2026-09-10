@@ -831,7 +831,7 @@ resolve_locked_context || exit 76
 verify_prepared_state || exit 77
 printf '%s\n' promoting > "$transaction/state"
 /bin/chmod 0755 "$transaction/worker.new"
-/bin/mv "$transaction/worker.new" "$worker_path"
+"$transaction/worker.new" host complete-protocol-upgrade "$worker_path" || exit 77
 printf '%s\n' promoted > "$transaction/state""#;
 
 const RECONCILIATION_BODY: &str = r#"resolve_locked_context || exit 76
@@ -998,9 +998,10 @@ verify_rollback_state || exit 77
 resolve_locked_context || exit 76
 verify_rollback_state || exit 77
 if [ "$rollback_previous" -eq 1 ]; then
-    /bin/mv "$transaction/worker.previous" "$worker_path"
+    "$worker_path" host complete-unverified-rollback "$worker_path" \
+        "$transaction/worker.previous" || exit 77
 else
-    /bin/rm -f "$worker_path"
+    "$worker_path" host complete-unverified-rollback "$worker_path" || exit 77
 fi
 printf '%s\n' rolled_back > "$transaction/state"
 resolve_locked_context || exit 76

@@ -14,7 +14,7 @@ use claude::ClaudeAdapter;
 use codex::CodexAdapter;
 use cursor::CursorAdapter;
 use opencode::OpencodeAdapter;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) use cursor::LOGIN_UNVERIFIED_REASON;
@@ -28,14 +28,14 @@ pub const MAX_SUMMARY_BYTES: usize = 512;
 /// `required` lists every property and `additionalProperties` is false, so
 /// optional fields are required-but-possibly-empty arrays; the parser still
 /// defaults them when an agent omits them.
-pub const RESULT_SCHEMA_JSON: &str = r#"{"type":"object","properties":{"status":{"enum":["done","needs_input","blocked"]},"summary":{"type":"string"},"questions":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"required":["text","options"],"additionalProperties":false}},"files_changed":{"type":"array","items":{"type":"string"}}},"required":["status","summary","questions","files_changed"],"additionalProperties":false}"#;
+pub const RESULT_SCHEMA_JSON: &str = r#"{"type":"object","properties":{"status":{"enum":["done","needs_input","blocked"]},"summary":{"type":"string"},"questions":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"required":["text","options"],"additionalProperties":false}},"files_changed":{"type":"array","items":{"type":"string"}},"checks":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"status":{"enum":["pass","fail","not_run","error"]},"detail":{"type":"string"}},"required":["name","command","status","detail"],"additionalProperties":false}}},"required":["status","summary","questions","files_changed","checks"],"additionalProperties":false}"#;
 pub const TURN_DIR_ENV: &str = "MAC_WORKER_TURN_DIR";
 pub const SCHEMA_FILE_NAME: &str = "result.schema.json";
 pub const LAST_MESSAGE_FILE_NAME: &str = "last.md";
 pub const PROMPT_FILE_NAME: &str = "prompt.md";
 pub const PROMPT_POINTER: &str = "Read the task from $MAC_WORKER_TURN_DIR/prompt.md and follow it.";
-pub const OPENCODE_RESULT_INSTRUCTION: &str = "OpenCode: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence or add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", and array \"questions\" whose items are objects with string \"text\" and string-array \"options\"; use an empty \"options\" array for an open question.";
-pub const CURSOR_RESULT_INSTRUCTION: &str = "Cursor: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence, do not render it as Markdown, and do not add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", and array \"questions\" whose items are objects with string \"text\" and string-array \"options\"; use an empty \"options\" array for an open question.";
+pub const OPENCODE_RESULT_INSTRUCTION: &str = "OpenCode: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence or add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", array \"questions\" whose items are objects with string \"text\" and string-array \"options\" (empty \"options\" for an open question), and array \"checks\" of objects with string \"name\", \"command\", \"detail\" and \"status\" one of pass/fail/not_run/error. Use an empty \"checks\" array if you did not run tests. mac-worker will not treat a reported pass as laptop-verified.";
+pub const CURSOR_RESULT_INSTRUCTION: &str = "Cursor: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence, do not render it as Markdown, and do not add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", array \"questions\" whose items are objects with string \"text\" and string-array \"options\" (empty \"options\" for an open question), and array \"checks\" of objects with string \"name\", \"command\", \"detail\" and \"status\" one of pass/fail/not_run/error. Use an empty \"checks\" array if you did not run tests. mac-worker will not treat a reported pass as laptop-verified.";
 
 const SCHEMA_PLACEHOLDER: &str = "{schema}";
 const LAST_MESSAGE_PLACEHOLDER: &str = "{last_message}";
@@ -76,6 +76,47 @@ pub fn result_instruction(agent: AgentKind) -> Option<&'static str> {
         AgentKind::Cursor => Some(CURSOR_RESULT_INSTRUCTION),
         AgentKind::Codex | AgentKind::Claude => None,
     }
+}
+
+/// Max declared-acceptance lines ENV may pass into the composed prompt.
+pub const MAX_DECLARED_ACCEPTANCE: usize = 16;
+/// Max bytes per declared-acceptance line.
+pub const MAX_DECLARED_ACCEPTANCE_BYTES: usize = 256;
+
+/// Pure formatter for ENV-owned prompt composition.
+///
+/// FLOW owns this function and the bound. ENV is the only caller that inserts
+/// the returned text into `compose_turn_prompt`. Empty input yields an empty
+/// string. These lines are instructed criteria, not mac-worker-verified checks.
+pub fn declared_acceptance_instructions(acceptance: &[String]) -> Result<String, WorkerError> {
+    if acceptance.len() > MAX_DECLARED_ACCEPTANCE {
+        return Err(WorkerError::Task {
+            code: "TASK_CONFIG_INVALID",
+            message: "declared acceptance exceeds 16 items".into(),
+        });
+    }
+    if acceptance.is_empty() {
+        return Ok(String::new());
+    }
+    let mut lines = vec![
+        "Declared acceptance criteria (instructed checks; mac-worker will not treat agent-reported pass as laptop-verified):"
+            .to_owned(),
+    ];
+    for item in acceptance {
+        if item.len() > MAX_DECLARED_ACCEPTANCE_BYTES
+            || item.trim().is_empty()
+            || item.chars().any(char::is_control)
+        {
+            return Err(WorkerError::Task {
+                code: "TASK_CONFIG_INVALID",
+                message:
+                    "declared acceptance item is empty, too long, or contains a control character"
+                        .into(),
+            });
+        }
+        lines.push(format!("- {item}"));
+    }
+    Ok(format!("\n\n{}\n", lines.join("\n")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,12 +368,88 @@ impl<'de> serde::Deserialize<'de> for Question {
     }
 }
 
+pub const MAX_REPORTED_CHECKS: usize = 32;
+pub const MAX_CHECK_NAME_BYTES: usize = 128;
+pub const MAX_CHECK_COMMAND_BYTES: usize = 256;
+pub const MAX_CHECK_DETAIL_BYTES: usize = 1024;
+pub const AGENT_REPORTED_CHECK_SOURCE: &str = "agent_reported";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportedCheckStatus {
+    Pass,
+    Fail,
+    NotRun,
+    Error,
+}
+
+impl ReportedCheckStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::NotRun => "not_run",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// A check the agent claimed it ran. mac-worker stores and displays it as
+/// agent-reported only; a `pass` is never laptop-verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportedCheck {
+    name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    command: String,
+    status: ReportedCheckStatus,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    detail: String,
+}
+
+impl ReportedCheck {
+    pub fn new(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        status: ReportedCheckStatus,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            command: command.into(),
+            status,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub fn status(&self) -> ReportedCheckStatus {
+        self.status
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    pub fn source(&self) -> &'static str {
+        AGENT_REPORTED_CHECK_SOURCE
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredResult {
     status: ResultStatus,
     summary: String,
     questions: Vec<Question>,
     files_changed: Vec<String>,
+    checks: Vec<ReportedCheck>,
 }
 
 impl StructuredResult {
@@ -352,12 +469,17 @@ impl StructuredResult {
         &self.files_changed
     }
 
+    pub fn checks(&self) -> &[ReportedCheck] {
+        &self.checks
+    }
+
     fn unknown() -> Self {
         Self {
             status: ResultStatus::Unknown,
             summary: String::new(),
             questions: Vec::new(),
             files_changed: Vec::new(),
+            checks: Vec::new(),
         }
     }
 }
@@ -998,6 +1120,8 @@ fn parse_structured_result_value(value: Value) -> Option<StructuredResult> {
         questions: Vec<Question>,
         #[serde(default)]
         files_changed: Vec<String>,
+        #[serde(default)]
+        checks: Vec<ReportedCheck>,
     }
 
     let wire = serde_json::from_value::<Wire>(value).ok()?;
@@ -1011,6 +1135,7 @@ fn parse_structured_result_value(value: Value) -> Option<StructuredResult> {
         summary: wire.summary,
         questions: wire.questions,
         files_changed: wire.files_changed,
+        checks: wire.checks.into_iter().take(MAX_REPORTED_CHECKS).collect(),
     })
 }
 

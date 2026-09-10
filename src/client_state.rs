@@ -42,7 +42,8 @@ use crate::{
     },
     supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
     task::{
-        BranchName, LocalTaskRecord, RunId, RunRecord, RunnerIdentity, RunnerState, TaskId, TurnId,
+        BaseOid, BranchName, LocalTaskRecord, RunId, RunRecord, RunnerIdentity, RunnerState,
+        TaskId, TurnId, TurnSummary,
     },
     transfer::PreacceptanceAbandonmentReceipt,
 };
@@ -133,6 +134,7 @@ pub enum ClientStateConcurrencyPoint {
     TaskReplacementPreExchange,
     RunnerLogContention,
     RunnerSlotReservation,
+    AfterTaskFetchLoad,
 }
 
 /// Ordinary task updates may skip a durable exchange when the complete
@@ -1962,7 +1964,7 @@ impl ClientStateStore {
         Ok(result)
     }
 
-    fn reach_concurrency_point(&self, point: ClientStateConcurrencyPoint) {
+    pub(crate) fn reach_concurrency_point(&self, point: ClientStateConcurrencyPoint) {
         if let Some(hook) = &self.inner.concurrency_hook {
             hook.reach(point);
         }
@@ -2456,7 +2458,7 @@ impl ClientStateStore {
     /// Publish a remote projection only if the complete task snapshot used by
     /// that request is still current. Equality includes turn history, runner
     /// ownership and publication metadata; a stale response cannot restore them.
-    pub(crate) fn update_task_if_current(
+    pub fn update_task_if_current(
         &self,
         expected: &LocalTaskRecord,
         replacement: LocalTaskRecord,
@@ -2486,6 +2488,28 @@ impl ClientStateStore {
     {
         self.replace_task_locked_if_current(replacement, before_final_sync, None, identical)
             .map(|_| ())
+    }
+
+    /// Persist imported result evidence onto whatever the store currently
+    /// holds for this task, but only while the last turn is still the turn
+    /// that was fetched. A concurrent close fence or Closed record is kept;
+    /// an old-turn import is not attached after a newer follow-up.
+    pub fn update_fetched_head_for_current_turn(
+        &self,
+        fetched_for: &LocalTaskRecord,
+        head: BaseOid,
+    ) -> Result<bool, WorkerError> {
+        let task_id = fetched_for.meta().task_id();
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let tasks = self.tasks_dir()?;
+        let name = task_file_name(task_id)?;
+        let current = read_task_from_dir(&tasks, &name, task_id)?;
+        if !same_result_turn(&current, fetched_for) {
+            return Ok(false);
+        }
+        let replacement = current.with_fetched_head(Some(head))?;
+        self.update_task_locked_before_final_sync(replacement, || Ok(()), IdenticalTaskWrite::Skip)
+            .map(|()| true)
     }
 
     fn replace_task_locked_if_current<F>(
@@ -4299,6 +4323,17 @@ fn run_file_name(run_id: RunId) -> Result<String, WorkerError> {
 fn relative_path(value: &str) -> Result<crate::inputs::RelativePath, WorkerError> {
     crate::inputs::RelativePath::parse(value.as_bytes())
         .map_err(|_| invalid_state("state path is not a safe relative path"))
+}
+
+fn same_result_turn(current: &LocalTaskRecord, fetched_for: &LocalTaskRecord) -> bool {
+    current.meta().task_id() == fetched_for.meta().task_id()
+        && current.status().turns().len() == fetched_for.status().turns().len()
+        && current.status().turns().last().map(TurnSummary::turn_id)
+            == fetched_for
+                .status()
+                .turns()
+                .last()
+                .map(TurnSummary::turn_id)
 }
 
 fn task_record_bytes(record: &LocalTaskRecord) -> Result<Vec<u8>, WorkerError> {
