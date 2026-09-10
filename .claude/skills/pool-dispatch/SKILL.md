@@ -17,53 +17,11 @@ This skill is the mechanical task loop. One task is one independent unit of work
 
 The CLI is the only interface. The skill contains no scheduling logic.
 
-**Command availability:** the release exposes `worker task …` and `worker workers --refresh`. Verify the exact installed grammar with `worker task --help` and the relevant subcommand help before dispatching; do not replace a rejected public form with direct worker access, SSH, or another tool.
+**Command availability:** the release exposes `worker task …` and `worker workers --refresh`. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar; do not replace a rejected public form with direct worker access, SSH, or another tool.
 
 ## Grammar
 
-Exact public grammar in the current release. The execution-core scope restrictions below still apply.
-
-```text
-worker task submit [options] (--prompt TEXT | --prompt-file PATH) [--title TEXT]
-worker task batch FILE [--name NAME] [--max-parallel N] [--wait]
-worker task list [--run RUN_ID] [--state STATE] [--outcome KIND] [--full]
-worker task status TASK_ID [--full]
-worker task logs [-f] TASK_ID [--turn N] [--raw]
-worker task diff TASK_ID [--stat]
-worker task say TASK_ID (--message TEXT | --message-file PATH) [--wait]
-worker task cancel TASK_ID
-worker task result TASK_ID
-worker task fetch TASK_ID
-worker task close TASK_ID [--discard]
-worker task wait (--task-id TASK_ID | --run RUN_ID) [--timeout DURATION]
-worker task reconcile     # re-own dead runners and re-enqueue orphaned tasks without submitting anything
-worker workers [--refresh]
-worker dashboard [--port N] [--no-open]   # read-only observer on loopback with the tasks-and-runs view
-```
-
-`submit` options:
-
-```text
---agent codex|claude|cursor|opencode     optional; defaults from [task].default_agent
---model ID                               optional, agent-specific; default from [task].model
---effort LEVEL                           optional reasoning effort; default from [task].effort
---project PATH                           default: current worktree
---base REF                               default: HEAD
---wip                                    include uncommitted changes as a temporary base commit
---include PATTERN                        untracked inputs for --wip, same policy as v1
---source local|origin                    default from .worker.toml, else local
---publish fetch|push                     one CLI value; default from .worker.toml, else fetch
---publish-branch NAME                    origin branch name used only by publish = push
---timeout DURATION                       per turn; default 45m; max 24h
---max-turns N                            agent-internal turn cap where supported
---max-budget CENTS                       where supported
---max-followups N                        follow-up turns allowed after the first; default 10
---close-on done|never                    default done
---env-profile NAME                       overrides .worker.toml
---worker NAME                            diagnostic pin, never a raw SSH destination
---no-wait                                CAPACITY_BUSY instead of queueing
---wait                                   stay attached until the first turn ends
-```
+Do not copy CLI flags from this file. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar.
 
 Without `--wait`, `submit`, `batch`, and `say` return as soon as the task record, the base commit in the transfer repository, and the queue row exist and a local turn runner has taken ownership of the row, or the row is parked behind the per-worker runner cap. With `--wait` the same work happens in the foreground and the command follows the turn's event log to its end. `list`, `status`, `result`, `diff`, and `logs` are read-only; `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and `reconcile` perform runner recovery first.
 
@@ -71,7 +29,7 @@ Without `--wait`, `submit`, `batch`, and `say` return as soon as the task record
 
 The current release accepts `source = local|origin` and `publish = fetch|push`; `--publish-branch` is valid only with `push`, and a `--wip` base cannot push (`PUBLISH_REQUIRES_COMMITTED_BASE`). Agents on this pool:
 
-- `codex`: pass `--model gpt-6-astra --effort xhigh` (the pool default; the workers' own Codex configuration is set to the same values). The effort reaches Codex as `-c model_reasoning_effort="xhigh"`; without the flag the worker's own Codex configuration decides. Only Codex reads it — the other agents ignore it.
+- `codex`: Codex with the configured defaults; pass `--model`/`--effort` only when the task needs a different one; see `worker skills get pool-dispatch` for the effective values. Only Codex reads `--effort` — the other agents ignore it.
 - `opencode`: no model flag uses the worker's default (OpenCode Zen, Muse Spark 1.3, free); OpenCode Go models are `--model opencode-go/<model>`.
 - `cursor`: always `--env-profile agents`; that worker-side profile carries the Cursor login and the login-keychain unlock. Never read or copy it.
 - `claude`: deferred on the workers by operator decision; do not submit it until the operator enables it.
@@ -192,7 +150,7 @@ A finished task owes exactly one decision after `fetch`: a follow-up with `say` 
 - A task with the default `--close-on done` closes itself after a `done` turn. `close --discard` also deletes the agent's session on the worker.
 - Read the durable task outcome as well as the process exit status. A zero exit with status `blocked` is a failed turn.
 - Never restart, resubmit, or repair a turn on an unverifiable observation. Restart only on positive proof the runner or the worker job exited; otherwise keep waiting or inspect.
-- Verify the installed grammar before every dispatch: `worker task --help` and `worker task submit --help` are the source of truth, not this file.
+- Verify the installed grammar before every dispatch: `worker skills get pool-dispatch --grammar-only` and `worker task submit --help` are the source of truth, not this file.
 
 ## Exit Codes
 

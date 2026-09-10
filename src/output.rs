@@ -8,6 +8,10 @@ pub enum CommandOutput {
     Probe(crate::protocol::ProbeResponse),
     Status(crate::run::StatusReport),
     Cancel(crate::run::CancelReport),
+    /// Laptop-only Markdown or name list. Not a host/task wire type.
+    Plain {
+        text: String,
+    },
 }
 
 impl CommandOutput {
@@ -60,6 +64,7 @@ impl CommandOutput {
                 probe.hostname, probe.arch, probe.os_version, probe.protocol_version
             ),
             Self::Status(report) => render_status_report(report),
+            Self::Plain { text } => text.clone(),
             Self::Cancel(report) => match report {
                 crate::run::CancelReport::QueuedCancelled { job_id } => {
                     format!("job {job_id} cancelled while queued")

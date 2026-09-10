@@ -22,9 +22,19 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
         .stdout(predicate::str::contains("logs"))
         .stdout(predicate::str::contains("cancel"))
         .stdout(predicate::str::contains("gc"))
+        .stdout(predicate::str::contains("skills"))
         .stdout(predicate::str::contains("host").not());
 
-    for public_command in ["dashboard", "run", "status", "logs", "cancel", "task", "gc"] {
+    for public_command in [
+        "dashboard",
+        "run",
+        "status",
+        "logs",
+        "cancel",
+        "task",
+        "gc",
+        "skills",
+    ] {
         let mut command = Command::cargo_bin("worker").unwrap();
         command.args([public_command, "--help"]);
         command
@@ -116,6 +126,33 @@ fn task_help_exposes_lifecycle_commands_and_keeps_runner_hidden() {
         .stdout(predicate::str::contains("say"))
         .stdout(predicate::str::contains("reconcile"))
         .stdout(predicate::str::contains("runner").not());
+}
+
+#[test]
+fn skills_help_exposes_list_and_get() {
+    let mut root = Command::cargo_bin("worker").unwrap();
+    root.arg("--help");
+    root.assert()
+        .success()
+        .stdout(predicate::str::contains("skills"));
+
+    let mut skills = Command::cargo_bin("worker").unwrap();
+    skills.args(["skills", "--help"]);
+    skills
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: worker skills"))
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("get"));
+
+    let mut get = Command::cargo_bin("worker").unwrap();
+    get.args(["skills", "get", "--help"]);
+    get.assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: worker skills get"))
+        .stdout(predicate::str::contains("--grammar-only"))
+        .stdout(predicate::str::contains("pool-dispatch"))
+        .stdout(predicate::str::contains("pool-task-authoring"));
 }
 
 #[test]

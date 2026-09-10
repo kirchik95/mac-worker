@@ -22,16 +22,7 @@ Use this skill to turn an objective into tasks that a headless coding agent can 
 - Split by ownership and dependency, not by arbitrary file count.
 - Make the final state testable by a command, an assertion, or an explicit artifact.
 
-Size limits from the spec. Keep every task inside them:
-
-| Limit | Scope | Value |
-|---|---|---|
-| `timeout` | one turn | default `45m`, max `24h` |
-| `max_turns`, `max_budget_usd` | one turn | only agents that support them; otherwise recorded as unsupported |
-| `max_followups` | one task | default `10` |
-| `max_parallel` | one run | caps how many of its tasks may be active at once |
-| `slots = 1` | one worker | one turn at a time |
-| log bounds | one turn | 64 KiB chunks; event stream capped at 256 MiB with a 64 KiB tail |
+Size limits and submit flags come from this binary, not from this file. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar.
 
 Keep prompts under 256 KiB. Keep requested output bounded. Do not rely on an unbounded transcript.
 
@@ -85,7 +76,7 @@ If the turn fails, inspect the structured result and logs before authoring a fol
 
 | Work type | Agent |
 |---|---|
-| Rust implementation, Rust tests, builds, or work needing shell judgement | Codex, `--model gpt-6-astra --effort xhigh` |
+| Rust implementation, Rust tests, builds, or work needing shell judgement | Codex with the configured defaults; pass `--model`/`--effort` only when the task needs a different one; see `worker skills get pool-dispatch` for the effective values |
 | TypeScript or frontend implementation | Cursor, `--env-profile agents` |
 | Second opinion or documentation | OpenCode, default Zen model or `--model opencode-go/<model>` |
 | Claude Code on workers | Deferred by the operator for now |

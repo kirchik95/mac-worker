@@ -81,7 +81,7 @@ Ask the coding agent on this MacBook to send work to the pool. Direct CLI remain
 
 The laptop agent prepares independent briefs and dispatches them; a configured agent on the worker executes. They need not be the same agent or provider. Install the skills on the laptop, not on every worker. The local agent must be able to run `worker` from the project.
 
-Use [pool-task-authoring](.claude/skills/pool-task-authoring/SKILL.md) to prepare independent briefs and [pool-dispatch](.claude/skills/pool-dispatch/SKILL.md) to submit, wait, follow up, and fetch the result. Copy them into the personal directory for the agent you use across projects on this MacBook:
+Use [pool-task-authoring](.claude/skills/pool-task-authoring/SKILL.md) to prepare independent briefs and [pool-dispatch](.claude/skills/pool-dispatch/SKILL.md) to submit, wait, follow up, and fetch the result. Copy them into the personal directory for the agent you use across projects on this MacBook. `worker skills get pool-dispatch` prints the version-matched guide plus the live CLI grammar from this binary.
 
 | Local coding agent | Personal skills directory | Docs |
 | --- | --- | --- |
@@ -90,7 +90,7 @@ Use [pool-task-authoring](.claude/skills/pool-task-authoring/SKILL.md) to prepar
 | Cursor | `~/.cursor/skills` | [Skills](https://cursor.com/docs/skills) |
 | OpenCode | `~/.config/opencode/skills` | [Skills](https://opencode.ai/docs/skills) |
 
-These are personal directories for local agent sessions, not web or cloud chats. The templates contain the maintainer's pool defaults — model choices, Cursor's `agents` profile, and deferred Claude worker routing — and should be adapted for your configured pool.
+These are personal directories for local agent sessions, not web or cloud chats. Cursor's `agents` profile and deferred Claude worker routing in the templates should be adapted for your configured pool; model and effort defaults come from `worker skills get`, not from the copied files.
 
 Ask your local agent to install the skills:
 

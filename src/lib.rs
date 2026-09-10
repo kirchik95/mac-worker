@@ -102,6 +102,7 @@ pub mod run;
 pub(crate) mod runner_log;
 pub mod scheduler;
 pub mod scheduler_adapter;
+pub mod skills;
 pub mod snapshot;
 pub mod supervisor;
 pub mod task;
@@ -260,6 +261,9 @@ fn execute_with_context(
         Command::Task { .. } => Err(WorkerError::Protocol(
             "public task commands require the stdio execution boundary".into(),
         )),
+        Command::Skills { command } => Ok(CommandOutput::Plain {
+            text: skills::execute(command, &runtime.current_dir()?)?,
+        }),
         Command::Runner { .. } => Err(WorkerError::Protocol(
             "hidden runner requires the stdio execution boundary".into(),
         )),

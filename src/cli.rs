@@ -112,6 +112,11 @@ pub enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    #[command(about = "Print version-matched operator skill guides")]
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
     #[command(hide = true)]
     Runner {
         task_id: HiddenComponent,
@@ -261,6 +266,21 @@ pub enum TaskCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum SkillsCommand {
+    #[command(about = "List bundled skill guide names")]
+    List,
+    #[command(about = "Print a bundled skill guide with the live CLI grammar")]
+    Get {
+        /// Bundled skill name
+        #[arg(value_parser = ["pool-dispatch", "pool-task-authoring"])]
+        name: String,
+        /// Print only the generated Grammar section
+        #[arg(long)]
+        grammar_only: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum HostCommand {
     Probe,
     #[command(name = "gc")]
@@ -403,5 +423,56 @@ fn supported_duration(value: &str) -> Result<Duration, String> {
         Err("timeout must be greater than zero and at most 24h".into())
     } else {
         Ok(duration)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command, SkillsCommand};
+
+    #[test]
+    fn skills_list_and_get_parse_the_public_forms() {
+        let list = Cli::try_parse_from(["worker", "skills", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Command::Skills {
+                command: SkillsCommand::List
+            }
+        ));
+
+        let get = Cli::try_parse_from(["worker", "skills", "get", "pool-dispatch"]).unwrap();
+        let Command::Skills {
+            command: SkillsCommand::Get { name, grammar_only },
+        } = get.command
+        else {
+            panic!("expected skills get");
+        };
+        assert_eq!(name, "pool-dispatch");
+        assert!(!grammar_only);
+
+        let grammar_only = Cli::try_parse_from([
+            "worker",
+            "skills",
+            "get",
+            "pool-task-authoring",
+            "--grammar-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            grammar_only.command,
+            Command::Skills {
+                command: SkillsCommand::Get {
+                    grammar_only: true,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn skills_get_rejects_an_unknown_name() {
+        assert!(Cli::try_parse_from(["worker", "skills", "get", "not-a-skill"]).is_err());
     }
 }
