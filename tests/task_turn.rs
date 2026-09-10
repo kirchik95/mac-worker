@@ -509,6 +509,38 @@ fn authentication_failure_in_a_turn_records_an_incident_and_names_the_outcome() 
 }
 
 #[test]
+fn a_successful_turn_still_publishes_when_the_incident_store_is_corrupt() {
+    let script = concat!(
+        "printf '%s\\n' ",
+        "'{\"type\":\"thread.started\",\"thread_id\":\"session-ok\"}' ",
+        "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"",
+        "{\\\"status\\\":\\\"done\\\",\\\"summary\\\":\\\"ok\\\",\\\"questions\\\":[],\\\"files_changed\\\":[]}",
+        "\"}}'",
+    );
+    let (temp, store, request, cancel) = prepared_task_turn(script);
+    let incidents = temp.path().join("host").join("auth-incidents.json");
+    fs::write(&incidents, b"{not-canonical").unwrap();
+    fs::set_permissions(&incidents, fs::Permissions::from_mode(0o600)).unwrap();
+    let launcher = InlineTurnLauncher {
+        store: store.clone(),
+        fault: None,
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(fs::read(&incidents).unwrap(), b"{not-canonical");
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, cancel.turn_id())
+        .unwrap();
+    let supervisor = fs::read_to_string(job_path.join("supervisor.log")).unwrap();
+    assert!(
+        supervisor.contains("auth success not recorded: PROTOCOL"),
+        "{supervisor}"
+    );
+}
+
+#[test]
 fn a_non_auth_agent_exit_does_not_record_an_incident() {
     let (temp, store, request, _cancel) = prepared_task_turn("printf 'boom\\n'; exit 1");
     let launcher = InlineTurnLauncher {
@@ -1656,6 +1688,88 @@ fn cancelling_a_running_turn_hands_off_before_deadline_and_publishes_cancelled()
     )
     .unwrap();
     assert_eq!(job_status.state(), JobState::Cancelled);
+}
+
+#[test]
+fn a_cancelled_turn_does_not_record_an_auth_incident_from_the_stderr_tail() {
+    let script = concat!(
+        "printf '%s\\n' ",
+        "'ERROR codex_login::auth::manager: Failed to refresh token: ",
+        "Your access token could not be refreshed because your refresh token was already used. ",
+        "Please log out and sign in again.' >&2; ",
+        "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"session-cancel\"}'; ",
+        "sleep 8; ",
+        "printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"done\\\",\\\"summary\\\":\\\"natural\\\",\\\"questions\\\":[],\\\"files_changed\\\":[]}\"}}'",
+    );
+    let (temp, store, request, cancel_request) = prepared_task_turn(script);
+    let submit_store = store.clone();
+    let submit_request = request.clone();
+    let submit = thread::spawn(move || {
+        let launcher = InlineTurnLauncher {
+            store: submit_store.clone(),
+            fault: None,
+        };
+        JobService::new(&submit_store, &launcher).submit_turn(submit_request)
+    });
+
+    let running_deadline = Instant::now() + Duration::from_secs(5);
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, cancel_request.turn_id())
+        .unwrap();
+    loop {
+        let running = fs::read(job_path.join("status.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<JobStatus>(&bytes).ok())
+            .is_some_and(|status| {
+                status.state() == JobState::Running && status.child_identity().is_some()
+            });
+        if running {
+            break;
+        }
+        if Instant::now() >= running_deadline {
+            let _ = submit.join();
+            panic!("inline supervisor did not publish Running before the deadline");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let cancel_store = store.clone();
+    let cancel = thread::spawn(move || {
+        let launcher = InlineTurnLauncher {
+            store: cancel_store.clone(),
+            fault: None,
+        };
+        JobService::new_with_reconciliation(
+            &cancel_store,
+            &launcher,
+            Arc::new(FastReconciliationRuntime {
+                clock: Mutex::new(Duration::ZERO),
+            }),
+        )
+        .cancel_task(cancel_request)
+    });
+    let cancel_result = cancel.join().expect("cancellation thread panicked");
+    let submit_result = submit.join().expect("submit thread panicked");
+    let cancelled =
+        cancel_result.unwrap_or_else(|error| panic!("turn cancellation failed: {error}"));
+    let submitted = submit_result.unwrap_or_else(|error| panic!("turn runner failed: {error}"));
+
+    assert_eq!(
+        cancelled.status().last_outcome(),
+        Some(&TaskOutcome::Cancelled)
+    );
+    assert_eq!(
+        submitted.task().last_outcome(),
+        Some(&TaskOutcome::Cancelled)
+    );
+    assert!(
+        !temp
+            .path()
+            .join("host")
+            .join("auth-incidents.json")
+            .exists(),
+        "a cancelled turn must not record an auth incident"
+    );
 }
 
 #[test]

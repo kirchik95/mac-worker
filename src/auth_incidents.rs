@@ -112,14 +112,20 @@ fn valid_profile(profile: Option<&str>) -> bool {
     }
 }
 
-fn load_with_bytes(host_state_root: &Path) -> Result<(Vec<u8>, AuthIncidentStore), WorkerError> {
+fn load_raw_bytes(host_state_root: &Path) -> Result<Vec<u8>, WorkerError> {
     let root = RootedDir::open(host_state_root).map_err(WorkerError::Io)?;
     if !root.entry_exists(AUTH_INCIDENTS_FILE)? {
+        return Ok(Vec::new());
+    }
+    root.read_private_regular(AUTH_INCIDENTS_FILE, MAX_INCIDENTS_BYTES)
+        .map_err(WorkerError::Io)
+}
+
+fn load_with_bytes(host_state_root: &Path) -> Result<(Vec<u8>, AuthIncidentStore), WorkerError> {
+    let bytes = load_raw_bytes(host_state_root)?;
+    if bytes.is_empty() {
         return Ok((Vec::new(), AuthIncidentStore::default()));
     }
-    let bytes = root
-        .read_private_regular(AUTH_INCIDENTS_FILE, MAX_INCIDENTS_BYTES)
-        .map_err(WorkerError::Io)?;
     let store: AuthIncidentStore = serde_json::from_slice(&bytes)
         .map_err(|_| protocol("cached auth incidents are invalid"))?;
     store.validate()?;
@@ -434,11 +440,30 @@ pub fn record_success(
 }
 
 /// Operator-requested clearance used by `refresh-facts --clear-auth-incidents`.
+///
+/// Unlike other writers this does not require a canonical store: a corrupt
+/// file is exactly the state the operator is asking to throw away. The
+/// rooted lock still covers the publish; only the parse/validate step is
+/// skipped.
 pub fn clear_all(host_state_root: &Path) -> Result<(), WorkerError> {
-    mutate(host_state_root, |state| {
-        *state = AuthIncidentStore::default();
-        Ok(())
-    })
+    run_before_lock_hook();
+    let _threads = INCIDENT_THREADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock = IncidentLock::acquire(host_state_root)?;
+    let empty = AuthIncidentStore::default();
+    for _ in 0..INCIDENTS_WRITE_RETRIES {
+        let expected = load_raw_bytes(host_state_root)?;
+        run_before_publish_hook();
+        match commit(host_state_root, &expected, &empty)? {
+            Commit::Done => {
+                lock.validate()?;
+                return Ok(());
+            }
+            Commit::Retry => continue,
+        }
+    }
+    Err(WorkerError::Io(io::Error::from_raw_os_error(libc::EAGAIN)))
 }
 
 /// Overlays current incidents onto collected facts and prunes the store.
@@ -580,7 +605,8 @@ pub fn set_before_publish_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 }
 
-/// Opt this thread into mutate test hooks. Other tests must not pause.
+/// Enables every mutate test hook on this thread (`before_lock`, `after_load`,
+/// and `before_publish`). Other tests must not pause.
 #[doc(hidden)]
 pub fn enable_after_load_hook_on_this_thread() {
     MUTATE_HOOKS_ENABLED.set(true);
@@ -684,5 +710,22 @@ mod tests {
         let metadata = std::fs::metadata(host.join(AUTH_INCIDENTS_LOCK_FILE)).unwrap();
         assert!(metadata.is_file());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn clear_all_replaces_unparsable_bytes() {
+        let (_temp, host) = host_root();
+        let path = host.join(AUTH_INCIDENTS_FILE);
+        std::fs::write(&path, b"{not-canonical").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        clear_all(&host).unwrap();
+        let stored = std::fs::read(&path).unwrap();
+        let decoded: AuthIncidentStore = serde_json::from_slice(&stored).unwrap();
+        assert!(decoded.incidents.is_empty());
+        assert!(decoded.successes.is_empty());
+        assert_eq!(
+            stored,
+            serde_json::to_vec(&AuthIncidentStore::default()).unwrap()
+        );
     }
 }

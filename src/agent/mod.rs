@@ -548,10 +548,12 @@ pub fn tail_utf8(value: &str, tail: usize) -> &str {
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
-        || needle.is_empty()
 }
 
 impl AuthProbe {

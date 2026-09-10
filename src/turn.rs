@@ -3,7 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     fs::OpenOptions,
-    io::Read,
+    io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
 };
@@ -917,7 +917,11 @@ impl<'a> TurnPublisher<'a> {
         let agent_outcome = adapter.classify(exit_code, structured.status());
         let stdout_auth = crate::agent::tail_utf8(&stream, crate::agent::AUTH_SCAN_TAIL_BYTES);
         let stderr_auth = read_auth_scan_tail(turn_dir, "stderr.log")?;
-        let auth_failed = matches!(agent_outcome, crate::agent::AgentOutcome::Failed { .. })
+        // Only Succeeded/Failed would otherwise become "agent exited N". A
+        // Cancelled/TimedOut/Lost turn keeps that terminal even when the
+        // stderr tail matches an auth phrase.
+        let auth_failed = matches!(terminal, TurnTerminal::Succeeded | TurnTerminal::Failed)
+            && matches!(agent_outcome, crate::agent::AgentOutcome::Failed { .. })
             && adapter.output_shows_auth_failure(stdout_auth, &stderr_auth);
         let outcome = if auth_failed {
             crate::auth_incidents::record_incident(
@@ -929,13 +933,15 @@ impl<'a> TurnPublisher<'a> {
             TaskOutcome::failed(crate::auth_incidents::AGENT_AUTHENTICATION_FAILED)
         } else {
             let outcome = TaskOutcome::from_turn(terminal, Some(agent_outcome));
-            if terminal == TurnTerminal::Succeeded {
-                crate::auth_incidents::record_success(
+            if terminal == TurnTerminal::Succeeded
+                && let Err(error) = crate::auth_incidents::record_success(
                     self.store.host_state_root(),
                     meta.agent(),
                     meta.env_profile(),
                     now_millis()?,
-                )?;
+                )
+            {
+                note_unrecorded_auth_success(turn_dir, &error);
             }
             outcome
         };
@@ -1278,6 +1284,42 @@ fn read_auth_scan_tail(dir: &RootedDir, name: &str) -> Result<String, WorkerErro
         .read_private_regular_tail(name, crate::agent::AUTH_SCAN_TAIL_BYTES)
         .map_err(|error| turn_error("PUBLISH_FAILED", format!("cannot read {name}: {error}")))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `record_incident` stays fatal: a failed turn stays failed and a broken
+/// store is visible as `PUBLISH_FAILED`. `record_success` is not: a turn
+/// that already succeeded must not fail publication because
+/// `auth-incidents.json` is unreadable or non-canonical. Keep the turn's
+/// outcome and append one code-only line to `supervisor.log` when that
+/// diagnostic file can be opened or created. Never extend `stderr.log`:
+/// its length is already bound into terminal job status.
+fn note_unrecorded_auth_success(turn_dir: &RootedDir, error: &WorkerError) {
+    let line = format!("auth success not recorded: {}\n", error.public_code());
+    if line.len() as u64 > crate::supervisor::MAX_SUPERVISOR_LOG_BYTES {
+        return;
+    }
+    let mut file = match turn_dir.open_private_append("supervisor.log") {
+        Ok(file) => file,
+        Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
+            match turn_dir.write_new_private_file("supervisor.log", &[]) {
+                Ok(file) => file,
+                Err(_) => return,
+            }
+        }
+        Err(_) => return,
+    };
+    let Ok(current) = turn_dir.validate_private_append_binding("supervisor.log", &file) else {
+        return;
+    };
+    let Some(end) = current.checked_add(line.len() as u64) else {
+        return;
+    };
+    if end > crate::supervisor::MAX_SUPERVISOR_LOG_BYTES {
+        return;
+    }
+    if file.write_all(line.as_bytes()).is_ok() && file.sync_all().is_ok() {
+        let _ = turn_dir.sync_root();
+    }
 }
 
 fn bound_string(value: &str) -> String {

@@ -30,6 +30,7 @@ use mac_worker::{
     error::{ProcessError, WorkerError},
     host_store::HostStore,
     lease::SlotState,
+    probe::ProbeCollector,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
         HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
@@ -1820,6 +1821,26 @@ fn unreadable_incident_store_is_conservative_and_observable() {
             .any(|capability| capability.starts_with("agent:codex")
                 || capability.starts_with("agent:cursor")),
         "{capabilities:?}"
+    );
+}
+
+#[test]
+fn clear_all_recovers_a_corrupt_store_so_refresh_can_advertise() {
+    let home = tempfile::tempdir().unwrap();
+    let (_temp, host) = host_state();
+    write_corrupt_incidents(&host);
+    auth_incidents::clear_all(&host).unwrap();
+    let facts = ProbeCollector::refresh_facts_at(
+        &host,
+        home.path(),
+        &FakeProcessRunner::new(Scenario::AllAgents),
+    )
+    .unwrap();
+    assert_eq!(agent_named(&facts, "codex").auth, AgentAuth::Authenticated);
+    assert!(
+        advertised_agent_capabilities(facts)
+            .iter()
+            .any(|capability| capability == "agent:codex")
     );
 }
 
