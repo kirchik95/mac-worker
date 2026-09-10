@@ -5,6 +5,9 @@ use uuid::Uuid;
 use super::*;
 use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLimits},
+    supervisor::{
+        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    },
     task::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId, TaskLimits,
         TaskMeta, TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnSummary,
@@ -151,5 +154,147 @@ fn matching_cas_still_persists_a_changed_runner() {
     assert_eq!(
         store.load_task(original.meta().task_id()).unwrap(),
         replacement
+    );
+}
+
+struct ScriptedInspector {
+    sequence: std::sync::Mutex<std::collections::VecDeque<ProcessObservation>>,
+    exhausted: ProcessObservation,
+}
+
+impl ScriptedInspector {
+    fn new(
+        sequence: impl IntoIterator<Item = ProcessObservation>,
+        exhausted: ProcessObservation,
+    ) -> Self {
+        Self {
+            sequence: std::sync::Mutex::new(sequence.into_iter().collect()),
+            exhausted,
+        }
+    }
+}
+
+impl ProcessInspector for ScriptedInspector {
+    fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+        ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7)
+    }
+
+    fn observe(&self, _expected: ProcessIdentity) -> ProcessObservation {
+        self.sequence
+            .lock()
+            .expect("scripted inspector mutex poisoned")
+            .pop_front()
+            .unwrap_or(self.exhausted)
+    }
+
+    fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
+        ProcessGroupObservation::Ambiguous
+    }
+
+    fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
+        ProcessGroupMembership::Ambiguous
+    }
+}
+
+fn identity() -> ProcessIdentity {
+    ProcessIdentity::new(42, 1_700_000_000_001).expect("fixture process")
+}
+
+fn open_with_script(
+    sequence: impl IntoIterator<Item = ProcessObservation>,
+    exhausted: ProcessObservation,
+) -> (tempfile::TempDir, ClientStateStore, ProcessIdentity) {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().canonicalize().unwrap().join("state");
+    let store = ClientStateStore::open_with_owner_inspector(
+        &state_path,
+        ScriptedInspector::new(sequence, exhausted),
+    )
+    .unwrap();
+    (dir, store, identity())
+}
+
+#[test]
+fn runner_identity_verdict_treats_matching_as_live() {
+    let (_dir, store, identity) =
+        open_with_script([], ProcessObservation::Matching { process_group: 42 });
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Live
+    );
+}
+
+#[test]
+fn runner_identity_verdict_treats_reused_as_exited_immediately() {
+    let (_dir, store, identity) = open_with_script([], ProcessObservation::Reused);
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Exited
+    );
+}
+
+#[test]
+fn runner_identity_verdict_keeps_a_single_absent_unverifiable() {
+    let (_dir, store, identity) = open_with_script([], ProcessObservation::Absent);
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Unverifiable
+    );
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Unverifiable
+    );
+}
+
+#[test]
+fn runner_identity_verdict_confirms_absent_after_the_window() {
+    let (_dir, store, identity) = open_with_script([], ProcessObservation::Absent);
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Unverifiable
+    );
+    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Exited
+    );
+}
+
+#[test]
+fn runner_identity_verdict_clears_absence_when_the_pid_matches_again() {
+    let (_dir, store, identity) = open_with_script(
+        [
+            ProcessObservation::Absent,
+            ProcessObservation::Matching { process_group: 42 },
+            ProcessObservation::Absent,
+        ],
+        ProcessObservation::Absent,
+    );
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Unverifiable
+    );
+    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Live
+    );
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Unverifiable
+    );
+}
+
+#[test]
+fn runner_identity_verdict_treats_ambiguous_as_unverifiable() {
+    let (_dir, store, identity) = open_with_script([], ProcessObservation::Ambiguous);
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Unverifiable
+    );
+    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
+    assert_eq!(
+        store.runner_identity_verdict(identity),
+        RunnerLivenessVerdict::Unverifiable
     );
 }

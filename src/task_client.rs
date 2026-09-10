@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLimits, result_instruction},
-    client_state::ClientStateStore,
+    client_state::{ClientStateStore, RUNNER_ABSENCE_CONFIRMATION, RunnerLivenessVerdict},
     config::{Config, WorkerEntry},
     error::WorkerError,
     git_transport::GitTransport,
@@ -23,7 +23,7 @@ use crate::{
     project_config::TaskSettings,
     project_state::ProjectState,
     scheduler::{CandidateObservation, SchedulerPolicy, Selection, WorkerPreference},
-    supervisor::{ProcessObservation, SystemProcessInspector},
+    supervisor::SystemProcessInspector,
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, PushTarget,
         RunId, RunRecord, RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
@@ -197,6 +197,7 @@ pub struct ReconcileReport {
     replaced_runners: usize,
     started_runners: usize,
     repaired_rows: usize,
+    unverifiable_rows: usize,
 }
 
 impl ReconcileReport {
@@ -210,6 +211,10 @@ impl ReconcileReport {
 
     pub fn repaired_rows(&self) -> usize {
         self.repaired_rows
+    }
+
+    pub fn unverifiable_rows(&self) -> usize {
+        self.unverifiable_rows
     }
 }
 
@@ -1209,6 +1214,13 @@ impl<'a> TaskClient<'a> {
 
     /// Operator-driven `worker task reconcile`: clears the restart budget and
     /// retries once instead of waiting out backoff or leaving a parked row.
+    ///
+    /// Absence of evidence is not death. This path adopts, restarts, or
+    /// finalizes a row only on a positive [`RunnerLivenessVerdict::Exited`]
+    /// (a confirmed `Absent` after [`RUNNER_ABSENCE_CONFIRMATION`], or an
+    /// immediate `Reused`). An `Unverifiable` owner is left alone. When this
+    /// invocation sees an unconfirmed `Absent`, it waits the confirmation
+    /// window so a second look in the same pass can prove `Exited`.
     pub fn operator_reconcile(&self) -> Result<ReconcileReport, WorkerError> {
         self.reconcile_runners_inner(true)
     }
@@ -1223,6 +1235,9 @@ impl<'a> TaskClient<'a> {
             self.client_state.reset_replacement_failures(owner)?;
         }
         self.client_state.recover_replacement_residue()?;
+        if reset_failure_budget {
+            self.wait_to_confirm_absent_owners(owner)?;
+        }
 
         // A submit can fail while compensating its locally-created state. The
         // pre-handoff intent is durable from initial task creation; the
@@ -1285,11 +1300,9 @@ impl<'a> TaskClient<'a> {
         }
 
         // A task-turn row is owned by its runner in both waiting and
-        // dispatching states.  A dead owner is normally adopted so the next
-        // runner can resume the accepted turn or retry the pre-acceptance
-        // handoff. A dispatching row whose journal proves completion is handed
-        // to the shared finalizer: journal completion is not proof that local
-        // Failed status, this-turn import, or pin release finished.
+        // dispatching states. Adopt, restart, or finalize only on positive
+        // proof that the owner `Exited`. Unverifiable lookups are counted and
+        // left alone.
         for entry in self.client_state.queue_snapshot()?.entries().iter() {
             if entry.kind() != QueueEntryKind::TaskTurn
                 || matches!(entry.state(), QueueState::Parked)
@@ -1310,50 +1323,49 @@ impl<'a> TaskClient<'a> {
             let Some(row_owner) = entry.owner_opt().copied() else {
                 continue;
             };
-            if row_owner != owner
-                && matches!(
-                    self.client_state.process_observation(row_owner),
-                    ProcessObservation::Absent | ProcessObservation::Reused
-                )
-            {
-                let Some(task_id) = self.client_state.task_id_for_turn(entry.job_id())? else {
+            if row_owner == owner {
+                continue;
+            }
+            match self.client_state.runner_identity_verdict(row_owner) {
+                RunnerLivenessVerdict::Live => continue,
+                RunnerLivenessVerdict::Unverifiable => {
+                    report.unverifiable_rows += 1;
                     continue;
-                };
-                let Some(log) = crate::runner_log::RunnerLog::try_open(
-                    &self.paths.state,
+                }
+                RunnerLivenessVerdict::Exited => {}
+            }
+            let Some(task_id) = self.client_state.task_id_for_turn(entry.job_id())? else {
+                continue;
+            };
+            let Some(log) =
+                crate::runner_log::RunnerLog::try_open(&self.paths.state, task_id, entry.job_id())?
+            else {
+                continue;
+            };
+            let Some(current) = log.current_entry(self.client_state)? else {
+                continue;
+            };
+            if current != *entry
+                || self.client_state.runner_identity_verdict(row_owner)
+                    != RunnerLivenessVerdict::Exited
+            {
+                continue;
+            }
+            self.client_state.adopt_row(entry.job_id(), owner)?;
+            if matches!(entry.state(), QueueState::Dispatching { .. })
+                && let Some(completion) = log.completion()
+            {
+                crate::turn_runner::finalize_completed_turn(
+                    self.client_state,
+                    self.runner,
+                    self.config,
+                    self.paths,
                     task_id,
                     entry.job_id(),
-                )?
-                else {
-                    continue;
-                };
-                let Some(current) = log.current_entry(self.client_state)? else {
-                    continue;
-                };
-                if current != *entry
-                    || !matches!(
-                        self.client_state.process_observation(row_owner),
-                        ProcessObservation::Absent | ProcessObservation::Reused
-                    )
-                {
-                    continue;
-                }
-                self.client_state.adopt_row(entry.job_id(), owner)?;
-                if matches!(entry.state(), QueueState::Dispatching { .. })
-                    && let Some(completion) = log.completion()
-                {
-                    crate::turn_runner::finalize_completed_turn(
-                        self.client_state,
-                        self.runner,
-                        self.config,
-                        self.paths,
-                        task_id,
-                        entry.job_id(),
-                        owner,
-                        completion,
-                    )?;
-                    report.repaired_rows += 1;
-                }
+                    owner,
+                    completion,
+                )?;
+                report.repaired_rows += 1;
             }
         }
 
@@ -1487,10 +1499,8 @@ impl<'a> TaskClient<'a> {
                 if matches!(current_entry.state(), QueueState::Parked)
                     || current_entry.owner_opt().is_some_and(|row_owner| {
                         *row_owner != owner
-                            && matches!(
-                                self.client_state.process_observation(*row_owner),
-                                ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
-                            )
+                            && self.client_state.runner_identity_verdict(*row_owner)
+                                != RunnerLivenessVerdict::Exited
                     })
                 {
                     continue;
@@ -1527,6 +1537,31 @@ impl<'a> TaskClient<'a> {
             report.started_runners += 1;
         }
         Ok(report)
+    }
+
+    fn wait_to_confirm_absent_owners(&self, owner: ProcessIdentity) -> Result<(), WorkerError> {
+        let mut saw_unconfirmed = false;
+        for entry in self.client_state.queue_snapshot()?.entries() {
+            if entry.kind() != QueueEntryKind::TaskTurn {
+                continue;
+            }
+            let Some(row_owner) = entry.owner_opt().copied() else {
+                continue;
+            };
+            if row_owner == owner {
+                continue;
+            }
+            if self.client_state.runner_identity_verdict(row_owner)
+                == RunnerLivenessVerdict::Unverifiable
+                && self.client_state.absence_unconfirmed(row_owner)
+            {
+                saw_unconfirmed = true;
+            }
+        }
+        if saw_unconfirmed {
+            std::thread::sleep(RUNNER_ABSENCE_CONFIRMATION);
+        }
+        Ok(())
     }
 
     pub fn say(
@@ -2340,10 +2375,8 @@ impl<'a> TaskClient<'a> {
         let caller = current_process_identity()?;
         if expected.owner_opt().is_some_and(|owner| {
             *owner != caller
-                && matches!(
-                    self.client_state.process_observation(*owner),
-                    ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
-                )
+                && self.client_state.runner_identity_verdict(*owner)
+                    != RunnerLivenessVerdict::Exited
         }) {
             return Err(task_error(
                 "TASK_BUSY",
@@ -2603,10 +2636,8 @@ impl<'a> TaskClient<'a> {
                 continue;
             };
             let identity = runner.process_identity();
-            if matches!(
-                self.client_state.process_observation(identity),
-                ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
-            ) {
+            if self.client_state.runner_identity_verdict(identity) != RunnerLivenessVerdict::Exited
+            {
                 identities.insert((identity.pid(), identity.start_time_micros()));
             }
         }

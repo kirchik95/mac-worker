@@ -1016,15 +1016,17 @@ fn run_task_subcommand(
                         "replaced_runners": report.replaced_runners(),
                         "started_runners": report.started_runners(),
                         "repaired_rows": report.repaired_rows(),
+                        "unverifiable_rows": report.unverifiable_rows(),
                     }),
                 )?;
             } else {
                 writeln!(
                     stdout,
-                    "runners: {} replaced, {} started; task rows: {} repaired",
+                    "runners: {} replaced, {} started; task rows: {} repaired, {} unverifiable",
                     report.replaced_runners(),
                     report.started_runners(),
-                    report.repaired_rows()
+                    report.repaired_rows(),
+                    report.unverifiable_rows()
                 )?;
                 stdout.flush()?;
             }

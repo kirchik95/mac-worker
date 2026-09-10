@@ -62,6 +62,8 @@ If a worker job or its logs vanish after acceptance, the task outcome is `failed
 
 When a replacement runner exits, its journal line distinguishes whether the worker accepted the turn. `exited: <code> …` is the pre-acceptance form: the worker did not accept that turn, so `worker task reconcile` can retry the handoff. `exited after acceptance: <code> …` means the journal already records acceptance; `worker task reconcile` resumes that turn from its committed offsets instead of submitting it again. After the post-acceptance form, inspect the worker with `worker workers --refresh`, especially if the job or its logs may have disappeared. Both lines are passed through `worker task logs` verbatim.
 
+`worker task reconcile` adopts, restarts, or finalizes a row only on positive proof that the previous runner exited: the pid was reused by a different process, or `Absent` was seen twice at least 750 ms apart. A single missed lookup, an ambiguous process-table read, or a transient error is unverifiable — the row is left alone, the report counts it, and `task list` shows `RUNNER_UNVERIFIABLE` only after that state has lasted 30 s. The operator path uses the same rule; it does not treat unverifiable as exited.
+
 Do not ask an agent to commit. The task workspace on the worker keeps `.git` read-only for the agent's sandbox (Codex cannot write `.git/index.lock`; Cursor may succeed), and mac-worker imports the working tree as a synthetic commit when the turn ends, so a prompt that demands a commit only turns a finished task into `blocked` or a `needs_input` question. Ask for the change and the checks; commit on the laptop after `fetch`.
 
 A batch file groups independent tasks into a run with shared defaults:
@@ -176,7 +178,7 @@ The design behind both keys is in [the herdr reporter design](superpowers/specs/
 - Your working tree is never modified. Results arrive as remote-tracking refs; merging is your decision.
 - Workers hold a bare mirror per project, a worktree per task, agent sessions, and bounded logs. `worker gc` previews and reclaims them: idle open tasks after 7 days, result branches after 30 days or on `close --discard`.
 - The CLI adds no secrets to its own diagnostics, redacts worker paths from agent summaries, and refuses insecure profiles. Application logs can still contain whatever the agent printed.
-- `worker task reconcile` repairs task ownership after a laptop reboot. `worker setup` updates helpers; older host layouts may require the steps in [installation recovery](setup-recovery.md).
+- `worker task reconcile` repairs task ownership after a laptop reboot. It waits 750 ms to confirm an `Absent` owner in that same invocation; a still-unverifiable owner is not treated as dead. `worker setup` updates helpers; older host layouts may require the steps in [installation recovery](setup-recovery.md).
 
 ## Plain remote commands
 

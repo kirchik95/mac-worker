@@ -2,6 +2,7 @@
 mod support;
 
 use std::{
+    collections::VecDeque,
     ffi::OsStr,
     io::Write,
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
@@ -13,13 +14,13 @@ use std::{
 
 use mac_worker::{
     agent::{AgentKind, Question},
-    client_state::ClientStateStore,
+    client_state::{ClientStateStore, RUNNER_ABSENCE_CONFIRMATION, RUNNER_UNVERIFIABLE_AFTER},
     config::Config,
     error::WorkerError,
     job::{
         AdmissionObservation, CommandSummary, JobId, ProcessIdentity, QueueEntry, QueueEntryKind,
         QueueRunReference, QueueState, REPLACEMENT_FAILURE_PARK_AFTER, RUNNER_REPEATED_FAILURE,
-        ReplacementFailureBudget, RunId,
+        RUNNER_UNVERIFIABLE, ReplacementFailureBudget, RunId,
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project_state::ProjectState,
@@ -32,8 +33,8 @@ use mac_worker::{
     },
     task::{
         BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId as TaskRunId,
-        RunRecord, RunnerIdentity, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
-        TaskSource, TaskState, TaskStatus, TurnSummary, TurnTerminal,
+        RunRecord, RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
+        TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary, TurnTerminal,
     },
     task_client::{TaskClient, TaskListFilter, WaitSelector},
     task_store::{
@@ -102,6 +103,53 @@ impl ProcessInspector for DeadOwnerInspector {
                 process_group: expected.pid(),
             }
         }
+    }
+
+    fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
+        ProcessGroupObservation::Ambiguous
+    }
+
+    fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
+        ProcessGroupMembership::Ambiguous
+    }
+}
+
+struct ScriptedOwnerInspector {
+    target: ProcessIdentity,
+    sequence: Mutex<VecDeque<ProcessObservation>>,
+    exhausted: ProcessObservation,
+}
+
+impl ScriptedOwnerInspector {
+    fn new(
+        target: ProcessIdentity,
+        sequence: impl IntoIterator<Item = ProcessObservation>,
+        exhausted: ProcessObservation,
+    ) -> Self {
+        Self {
+            target,
+            sequence: Mutex::new(sequence.into_iter().collect()),
+            exhausted,
+        }
+    }
+}
+
+impl ProcessInspector for ScriptedOwnerInspector {
+    fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+        ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7)
+    }
+
+    fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+        if expected != self.target {
+            return ProcessObservation::Matching {
+                process_group: expected.pid(),
+            };
+        }
+        self.sequence
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(self.exhausted)
     }
 
     fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
@@ -1047,6 +1095,7 @@ fn reconcile_removes_dead_dispatching_terminal_task_turn_before_close() {
         DeadOwnerInspector { dead_owner },
     )
     .unwrap();
+    store.note_confirmed_runner_absence(dead_owner);
     store.create_task(record).unwrap();
     store
         .write_turn_prompt(task_id, turn_id, "fixture prompt")
@@ -1124,6 +1173,7 @@ fn reconcile_still_starts_a_runner_for_a_dead_dispatching_turn_that_is_not_termi
         DeadOwnerInspector { dead_owner },
     )
     .unwrap();
+    store.note_confirmed_runner_absence(dead_owner);
     store.create_task(record).unwrap();
     store
         .write_turn_prompt(task_id, turn_id, "fixture prompt")
@@ -1195,6 +1245,7 @@ fn reconcile_leaves_dispatching_task_turn_with_live_owner_untouched() {
         DeadOwnerInspector { dead_owner },
     )
     .unwrap();
+    store.note_confirmed_runner_absence(dead_owner);
     store.create_task(record).unwrap();
     store
         .write_turn_prompt(task_id, turn_id, "fixture prompt")
@@ -1254,6 +1305,7 @@ fn wait_does_not_return_while_a_finished_turn_is_still_dispatching() {
         DeadOwnerInspector { dead_owner },
     )
     .unwrap();
+    store.note_confirmed_runner_absence(dead_owner);
     store.create_task(record).unwrap();
     store
         .write_turn_prompt(task_id, turn_id, "fixture prompt")
@@ -1340,6 +1392,7 @@ fn reconcile_replaces_a_dead_runner_for_an_active_task_turn() {
         DeadOwnerInspector { dead_owner },
     )
     .unwrap();
+    store.note_confirmed_runner_absence(dead_owner);
     store.create_task(record).unwrap();
     store
         .write_turn_prompt(task_id, turn_id, "fixture prompt")
@@ -2032,6 +2085,7 @@ fn finalizer_cannot_damage_a_new_turn(mode: &str) {
         resume: Arc::new(Mutex::new(resume_observe_rx)),
     };
     let store = ClientStateStore::open_with_owner_inspector(&paths.state, inspector).unwrap();
+    store.note_confirmed_runner_absence(old_owner);
     let record = task_record(
         task,
         turn_id,
@@ -2284,6 +2338,7 @@ fn reconcile_backs_off_then_parks_a_turn_whose_replacement_keeps_dying_after_acc
         DeadOwnerInspector { dead_owner },
     )
     .unwrap();
+    store.note_confirmed_runner_absence(dead_owner);
     let (task_id, turn_id, remote) = enqueue_dead_dispatching_turn(
         &store,
         &paths,
@@ -2366,6 +2421,7 @@ fn wait_returns_wait_blocked_when_replacement_runners_are_parked_and_list_shows_
         DeadOwnerInspector { dead_owner },
     )
     .unwrap();
+    store.note_confirmed_runner_absence(dead_owner);
     let (task_id, turn_id, remote) = enqueue_dead_dispatching_turn(
         &store,
         &paths,
@@ -2431,6 +2487,7 @@ fn operator_reconcile_resets_the_budget_and_starts_one_runner() {
         DeadOwnerInspector { dead_owner },
     )
     .unwrap();
+    store.note_confirmed_runner_absence(dead_owner);
     let (task_id, turn_id, remote) = enqueue_dead_dispatching_turn(
         &store,
         &paths,
@@ -2490,4 +2547,167 @@ fn old_queue_state_without_replacement_failure_still_loads() {
     let reopened = ClientStateStore::open(&root).unwrap();
     let snapshot = reopened.queue_snapshot().unwrap();
     assert!(snapshot.entries()[0].replacement_failure().is_none());
+}
+
+fn matching_observation(pid: u32) -> ProcessObservation {
+    ProcessObservation::Matching { process_group: pid }
+}
+
+#[test]
+fn reconcile_does_not_adopt_a_runner_observed_absent_once_then_matching() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let dead_owner = owner(931);
+    let store = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        ScriptedOwnerInspector::new(
+            dead_owner,
+            [ProcessObservation::Absent],
+            matching_observation(dead_owner.pid()),
+        ),
+    )
+    .unwrap();
+    let (_task_id, turn_id, remote) =
+        enqueue_dead_dispatching_turn(&store, &paths, &project, dead_owner, 931, 932, None);
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let report = client.reconcile_runners().unwrap();
+    assert_eq!(report.unverifiable_rows(), 1);
+    assert_eq!(report.replaced_runners(), 0);
+    assert_eq!(report.started_runners(), 0);
+    assert_eq!(report.repaired_rows(), 0);
+    assert_eq!(
+        store.queue_entry(turn_id).unwrap().unwrap().owner_opt(),
+        Some(&dead_owner)
+    );
+}
+
+#[test]
+fn reconcile_adopts_after_absent_is_confirmed_across_the_window() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let dead_owner = owner(933);
+    let store = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        DeadOwnerInspector { dead_owner },
+    )
+    .unwrap();
+    let (_task_id, turn_id, remote) =
+        enqueue_dead_dispatching_turn(&store, &paths, &project, dead_owner, 933, 934, None);
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let first = client.reconcile_runners().unwrap();
+    assert_eq!(first.unverifiable_rows(), 1);
+    assert_eq!(first.replaced_runners(), 0);
+    assert_eq!(first.started_runners(), 0);
+    assert_eq!(
+        store.queue_entry(turn_id).unwrap().unwrap().owner_opt(),
+        Some(&dead_owner)
+    );
+
+    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
+    let second = client.reconcile_runners().unwrap();
+    assert_eq!(second.replaced_runners(), 1);
+    assert_eq!(second.started_runners(), 1);
+    assert_ne!(
+        store.queue_entry(turn_id).unwrap().unwrap().owner_opt(),
+        Some(&dead_owner)
+    );
+}
+
+#[test]
+fn reconcile_adopts_a_reused_pid_immediately() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let dead_owner = owner(935);
+    let store = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        ScriptedOwnerInspector::new(
+            dead_owner,
+            [ProcessObservation::Reused],
+            ProcessObservation::Reused,
+        ),
+    )
+    .unwrap();
+    let (_task_id, turn_id, remote) =
+        enqueue_dead_dispatching_turn(&store, &paths, &project, dead_owner, 935, 936, None);
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let report = client.reconcile_runners().unwrap();
+    assert_eq!(report.unverifiable_rows(), 0);
+    assert_eq!(report.replaced_runners(), 1);
+    assert_eq!(report.started_runners(), 1);
+    assert_ne!(
+        store.queue_entry(turn_id).unwrap().unwrap().owner_opt(),
+        Some(&dead_owner)
+    );
+}
+
+#[test]
+fn ambiguous_owner_never_restarts_and_lists_runner_unverifiable_after_30s() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let dead_owner = owner(937);
+    let store = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        ScriptedOwnerInspector::new(dead_owner, [], ProcessObservation::Ambiguous),
+    )
+    .unwrap();
+    let (task_id, turn_id, remote) =
+        enqueue_dead_dispatching_turn(&store, &paths, &project, dead_owner, 937, 938, None);
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let first = client.reconcile_runners().unwrap();
+    assert_eq!(first.unverifiable_rows(), 1);
+    assert_eq!(first.replaced_runners(), 0);
+    assert_eq!(first.started_runners(), 0);
+    let listed = client.list(TaskListFilter::default()).unwrap();
+    let row = listed
+        .tasks()
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .expect("active task is listed");
+    assert_eq!(row.runner, Some(RunnerState::Live));
+    assert_eq!(row.blocking_code, None);
+
+    store.advance_liveness_clock(RUNNER_UNVERIFIABLE_AFTER);
+    let listed = client.list(TaskListFilter::default()).unwrap();
+    let row = listed
+        .tasks()
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .expect("active task is listed");
+    assert_eq!(row.blocking_code.as_deref(), Some(RUNNER_UNVERIFIABLE));
+    assert_eq!(row.runner, Some(RunnerState::Live));
+
+    let later = client.reconcile_runners().unwrap();
+    assert_eq!(later.replaced_runners(), 0);
+    assert_eq!(later.started_runners(), 0);
+    let operator = client.operator_reconcile().unwrap();
+    assert_eq!(operator.replaced_runners(), 0);
+    assert_eq!(operator.started_runners(), 0);
+    assert_eq!(
+        store.queue_entry(turn_id).unwrap().unwrap().owner_opt(),
+        Some(&dead_owner)
+    );
 }

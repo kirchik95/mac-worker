@@ -1177,6 +1177,11 @@ const REPLACEMENT_BACKOFF_SECS: [u64; 4] = [2, 10, 30, 60];
 /// message so the operator can see *why* the budget exhausted.
 pub const RUNNER_REPEATED_FAILURE: &str = "RUNNER_REPEATED_FAILURE";
 
+/// Blocking code for a row whose owner has been unverifiable for 30 s.
+/// Absence of evidence is not death; this is an operator signal, not a
+/// restart trigger.
+pub const RUNNER_UNVERIFIABLE: &str = "RUNNER_UNVERIFIABLE";
+
 /// Durable restart budget for a turn whose replacement runner already exited
 /// after acceptance.
 ///

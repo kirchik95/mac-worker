@@ -728,6 +728,7 @@ fn adopt_dead_owner_and_reconcile<R: ProcessRunner>(
         DeadOwnerInspector { dead_owner },
     )
     .unwrap();
+    store.note_confirmed_runner_absence(dead_owner);
     let report = TaskClient::new(
         remote,
         &fixture.config,
@@ -2703,6 +2704,7 @@ fn interrupted_legacy_reassignment_recovers_from_an_unrelated_working_directory(
         },
     )
     .unwrap();
+    resumed_state.note_confirmed_runner_absence(crashed_owner);
     let recovery = TaskClient::new(
         &fixture.runner,
         &fixture.config,
@@ -3871,6 +3873,7 @@ fn reconciliation_excludes_retired_pending_rollback_turn_before_dead_owner_adopt
         DeadOwnerInspector { dead_owner },
     )
     .unwrap();
+    restarted.note_confirmed_runner_absence(dead_owner);
     restarted.inject_write_failure_once(ClientStateWritePoint::BeforeTaskReport);
     TaskClient::new(&runner, &config, &paths, &restarted, &executor)
         .reconcile_runners()
@@ -4261,6 +4264,7 @@ fn intent_clear_fsync_failure_does_not_restore_a_stale_submission_snapshot_after
             DeadOwnerInspector { dead_owner },
         )
         .unwrap();
+        reconciler.note_confirmed_runner_absence(dead_owner);
         TaskClient::new(&runner, &config, &paths, &reconciler, &executor)
             .reconcile_runners()
             .unwrap();

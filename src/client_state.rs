@@ -70,6 +70,43 @@ const TURNS_NAME: &CStr = c"turns";
 const RUNNERS_NAME: &CStr = c"runners";
 pub(crate) const OBSERVATION_TTL_MILLIS: u64 = 2_000;
 
+/// Second `Absent` must be at least this old before absence is `Exited`.
+pub const RUNNER_ABSENCE_CONFIRMATION: Duration = Duration::from_millis(750);
+
+/// `task list` shows `RUNNER_UNVERIFIABLE` only after this long without proof.
+pub const RUNNER_UNVERIFIABLE_AFTER: Duration = Duration::from_secs(30);
+
+/// Liveness of a runner identity (pid + start identity).
+///
+/// Absence of evidence is not death. Restart, adopt, or finalize only on
+/// positive proof (`Exited`); otherwise wait and inspect.
+///
+/// * `Live` — the pid still matches the recorded start identity.
+/// * `Exited` — the pid is gone and the start identity cannot match, confirmed
+///   by a second `Absent` at least [`RUNNER_ABSENCE_CONFIRMATION`] later in
+///   this process, or the pid was `Reused` by a different start identity.
+/// * `Unverifiable` — `Ambiguous`, a transient lookup error, or a single
+///   `Absent` that has not been confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerLivenessVerdict {
+    Live,
+    Exited,
+    Unverifiable,
+}
+
+fn identity_key(identity: ProcessIdentity) -> (u32, u64) {
+    (identity.pid(), identity.start_time_micros())
+}
+
+#[derive(Default)]
+struct RunnerLivenessTracking {
+    /// First `Absent` for this identity in this process.
+    absence_first_seen: HashMap<(u32, u64), Instant>,
+    /// First time this identity was `Unverifiable` in this process.
+    unverifiable_since: HashMap<(u32, u64), Instant>,
+    clock_offset: Duration,
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientStateWritePoint {
@@ -223,6 +260,7 @@ struct ClientStateInner {
     task_replacement_after_exchange_failure: AtomicU8,
     sync_counts: Arc<SyncCounters>,
     cleanup_pause: Mutex<Option<Arc<CleanupPauseState>>>,
+    liveness: Mutex<RunnerLivenessTracking>,
 }
 
 struct CleanupPauseState {
@@ -558,6 +596,7 @@ impl ClientStateStore {
                 task_replacement_after_exchange_failure: AtomicU8::new(0),
                 sync_counts,
                 cleanup_pause: Mutex::new(None),
+                liveness: Mutex::new(RunnerLivenessTracking::default()),
             }),
         })
     }
@@ -739,6 +778,13 @@ impl ClientStateStore {
                 && budget.should_park()
             {
                 codes.insert(task_id, budget.blocking_code());
+                continue;
+            }
+            if let Some(row_owner) = entry.owner_opt().copied()
+                && self.runner_identity_verdict(row_owner) == RunnerLivenessVerdict::Unverifiable
+                && self.unverifiable_elapsed(row_owner) >= RUNNER_UNVERIFIABLE_AFTER
+            {
+                codes.insert(task_id, crate::job::RUNNER_UNVERIFIABLE.to_owned());
                 continue;
             }
             if !matches!(entry.state(), QueueState::Waiting { .. }) {
@@ -1641,16 +1687,16 @@ impl ClientStateStore {
         self.reach_concurrency_point(ClientStateConcurrencyPoint::RunnerLogContention);
     }
 
+    /// True when this owner still occupies the row: it is this process, or
+    /// it has not been proven [`RunnerLivenessVerdict::Exited`]. Unconfirmed
+    /// absence must not free the row for another claim.
     fn owner_is_live_or_ambiguous(
         &self,
         row_owner: &ProcessIdentity,
         caller: ProcessIdentity,
     ) -> bool {
         *row_owner == caller
-            || matches!(
-                self.inner.owner_inspector.observe(*row_owner),
-                ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
-            )
+            || self.runner_identity_verdict(*row_owner) != RunnerLivenessVerdict::Exited
     }
 
     fn run_has_capacity(
@@ -2347,15 +2393,13 @@ impl ClientStateStore {
             return Ok(None);
         };
         Ok(Some(
-            match self
-                .inner
-                .owner_inspector
-                .observe(runner.process_identity())
-            {
-                ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous => {
+            match self.runner_identity_verdict(runner.process_identity()) {
+                // Unverifiable is not death: list/status keep showing Live so a
+                // transient missed lookup does not look like a crashed runner.
+                RunnerLivenessVerdict::Live | RunnerLivenessVerdict::Unverifiable => {
                     RunnerState::Live
                 }
-                ProcessObservation::Absent | ProcessObservation::Reused => RunnerState::Dead,
+                RunnerLivenessVerdict::Exited => RunnerState::Dead,
             },
         ))
     }
@@ -2365,6 +2409,120 @@ impl ClientStateStore {
     /// normal runner views share one process authority.
     pub fn process_observation(&self, identity: ProcessIdentity) -> ProcessObservation {
         self.inner.owner_inspector.observe(identity)
+    }
+
+    /// Verdict for a runner identity: restart only on positive proof.
+    ///
+    /// First-seen `Absent` times live in this process so `task wait`'s 100 ms
+    /// polls can confirm across passes without a queue-schema change. A single
+    /// operator `reconcile` invocation observes once, waits
+    /// [`RUNNER_ABSENCE_CONFIRMATION`] when absence is still unconfirmed, and
+    /// observes again in the same pass.
+    pub fn runner_identity_verdict(&self, identity: ProcessIdentity) -> RunnerLivenessVerdict {
+        let observation = self.inner.owner_inspector.observe(identity);
+        let mut tracking = self
+            .inner
+            .liveness
+            .lock()
+            .expect("liveness tracking mutex poisoned");
+        let now = Instant::now() + tracking.clock_offset;
+        let key = identity_key(identity);
+        match observation {
+            ProcessObservation::Matching { .. } => {
+                tracking.absence_first_seen.remove(&key);
+                tracking.unverifiable_since.remove(&key);
+                RunnerLivenessVerdict::Live
+            }
+            ProcessObservation::Reused => {
+                tracking.absence_first_seen.remove(&key);
+                tracking.unverifiable_since.remove(&key);
+                RunnerLivenessVerdict::Exited
+            }
+            ProcessObservation::Ambiguous => {
+                tracking.unverifiable_since.entry(key).or_insert(now);
+                tracking.absence_first_seen.remove(&key);
+                RunnerLivenessVerdict::Unverifiable
+            }
+            ProcessObservation::Absent => {
+                tracking.unverifiable_since.entry(key).or_insert(now);
+                match tracking.absence_first_seen.get(&key).copied() {
+                    None => {
+                        tracking.absence_first_seen.insert(key, now);
+                        RunnerLivenessVerdict::Unverifiable
+                    }
+                    Some(first)
+                        if now.saturating_duration_since(first) >= RUNNER_ABSENCE_CONFIRMATION =>
+                    {
+                        // Keep first-seen so later looks in this pass stay Exited.
+                        RunnerLivenessVerdict::Exited
+                    }
+                    Some(_) => RunnerLivenessVerdict::Unverifiable,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn absence_unconfirmed(&self, identity: ProcessIdentity) -> bool {
+        let tracking = self
+            .inner
+            .liveness
+            .lock()
+            .expect("liveness tracking mutex poisoned");
+        let Some(first) = tracking
+            .absence_first_seen
+            .get(&identity_key(identity))
+            .copied()
+        else {
+            return false;
+        };
+        let now = Instant::now() + tracking.clock_offset;
+        now.saturating_duration_since(first) < RUNNER_ABSENCE_CONFIRMATION
+    }
+
+    pub(crate) fn unverifiable_elapsed(&self, identity: ProcessIdentity) -> Duration {
+        let tracking = self
+            .inner
+            .liveness
+            .lock()
+            .expect("liveness tracking mutex poisoned");
+        let Some(since) = tracking
+            .unverifiable_since
+            .get(&identity_key(identity))
+            .copied()
+        else {
+            return Duration::ZERO;
+        };
+        (Instant::now() + tracking.clock_offset).saturating_duration_since(since)
+    }
+
+    /// Treat a prior `Absent` as already older than the confirmation window.
+    /// Existing dead-owner fixtures return `Absent` consistently; they
+    /// still prove adoption, replacement, and finalization once absence is
+    /// confirmed.
+    #[doc(hidden)]
+    pub fn note_confirmed_runner_absence(&self, identity: ProcessIdentity) {
+        let mut tracking = self
+            .inner
+            .liveness
+            .lock()
+            .expect("liveness tracking mutex poisoned");
+        let now = Instant::now() + tracking.clock_offset;
+        let first = now.checked_sub(RUNNER_ABSENCE_CONFIRMATION).unwrap_or(now);
+        tracking
+            .absence_first_seen
+            .insert(identity_key(identity), first);
+    }
+
+    /// Advances the in-process liveness clock. Used to span
+    /// [`RUNNER_ABSENCE_CONFIRMATION`] and [`RUNNER_UNVERIFIABLE_AFTER`]
+    /// without sleeping in tests.
+    #[doc(hidden)]
+    pub fn advance_liveness_clock(&self, duration: Duration) {
+        self.inner
+            .liveness
+            .lock()
+            .expect("liveness tracking mutex poisoned")
+            .clock_offset += duration;
     }
 
     pub fn create_run(&self, record: RunRecord) -> Result<(), WorkerError> {
