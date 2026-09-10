@@ -57,6 +57,34 @@ impl ProcessRunner for RecordingRunner {
 
         if program == "/bin/zsh" && args.first().map(String::as_str) == Some("-lc") {
             let shell = args.last().map(String::as_str).unwrap_or_default();
+            if shell == "git config --global --get user.name"
+                || shell == "git config --global --get user.email"
+            {
+                assert!(
+                    request.isolate_parent_environment,
+                    "git identity must use the isolated account-home helper"
+                );
+                let home = request
+                    .environment
+                    .iter()
+                    .find(|(name, _)| name == "HOME")
+                    .map(|(_, value)| value.as_os_str());
+                assert!(
+                    home.is_some_and(|value| !value.is_empty()),
+                    "git identity must set account HOME: {:?}",
+                    request.environment
+                );
+                let stdout = if shell.ends_with("user.name") {
+                    b"Worker Account\n".to_vec()
+                } else {
+                    b"worker@example.test\n".to_vec()
+                };
+                return Ok(ProcessResult {
+                    status: exit_status(0),
+                    stdout,
+                    stderr: Vec::new(),
+                });
+            }
             // The herdr lookups prefix the command with a PATH extension for
             // `~/.local/bin`; the command proper follows the last `; `.
             let shell = shell
@@ -88,16 +116,6 @@ impl ProcessRunner for RecordingRunner {
         }
 
         let stdout = match (program.as_ref(), args.as_slice()) {
-            ("zsh", [shell, command])
-                if shell == "-lc" && command == "git config --global --get user.name" =>
-            {
-                b"Worker Account\n".to_vec()
-            }
-            ("zsh", [shell, command])
-                if shell == "-lc" && command == "git config --global --get user.email" =>
-            {
-                b"worker@example.test\n".to_vec()
-            }
             ("/usr/bin/ssh", _)
                 if args
                     .last()
@@ -271,6 +289,31 @@ fn refresh_is_the_only_agent_collection_path_and_persists_no_profile_values() {
         AgentAuth::Authenticated
     );
     assert!(facts.git_identity);
+    let git_identity_requests: Vec<_> = runner
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request.program == "/bin/zsh"
+                && request.args.first().is_some_and(|flag| flag == "-lc")
+                && request.args.last().is_some_and(|command| {
+                    command
+                        .to_string_lossy()
+                        .starts_with("git config --global --get ")
+                })
+        })
+        .collect();
+    assert_eq!(git_identity_requests.len(), 2, "{git_identity_requests:?}");
+    for request in &git_identity_requests {
+        assert!(request.isolate_parent_environment);
+        assert_eq!(
+            request
+                .environment
+                .iter()
+                .find(|(name, _)| name == "HOME")
+                .map(|(_, value)| value.as_os_str()),
+            Some(home.as_os_str())
+        );
+    }
     assert_eq!(
         facts.env_profiles,
         vec![
