@@ -51,6 +51,8 @@ leases/slots/<id>/lease.json        # id is 0..slot_count-1 while occupied
 leases/slots/<id>/scope.json        # ExecutionScope; required on a live slot
 ```
 
+Installed layout 3 **requires** a readable `leases/capacity.json`. Missing or invalid capacity is `HOST_SLOT_CAPACITY_INVALID` (fail closed). Default `{ "slot_count": 1 }` is written only by new-host initialization and validated 2→3 `promote_slot_directories`. Slot directory names must be canonical decimal (`0`…`7`, not `00` or `08`). A live lease must have `slot_id < slot_count` (`HOST_SLOT_ID_INVALID` otherwise). Empty leftover directories at `slot_id >= slot_count` after a shrink are ignored; they are not occupancy.
+
 `PREVIOUS_HOST_LAYOUT_VERSION = 2`. Layout 1 cannot jump to 3. New installs write `capacity.json` and `leases/slots/`. `LeaseRecord` JSON is unchanged; the slot id is the directory name. `LeaseToken` remains generation fencing. `JobMeta` and request-fingerprint bytes are unchanged.
 
 `ROLLBACK_HELPER_LAYOUT_VERSION` stays **2**. After a successful 2→3 rewrite, restoring a layout-2 helper is `HOST_UPGRADE_ROLLBACK_UNSAFE`.

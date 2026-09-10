@@ -570,16 +570,31 @@ fn upgrade_drain_required(message: &str) -> WorkerError {
 
 fn read_slot_count(leases: &RootedDir) -> Result<u8, WorkerError> {
     if !leases.entry_exists(CAPACITY_FILE)? {
-        return Ok(1);
+        return Err(protocol_code(
+            "HOST_SLOT_CAPACITY_INVALID",
+            "leases/capacity.json is missing",
+        ));
     }
     let bytes = leases.read_private_regular(CAPACITY_FILE, 4096)?;
     let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-    let record = HostSlotCapacity::deserialize(&mut deserializer)
-        .map_err(|error| WorkerError::Protocol(format!("invalid host JSON: {error}")))?;
-    deserializer
-        .end()
-        .map_err(|error| WorkerError::Protocol(format!("trailing host JSON data: {error}")))?;
-    validate_slot_count(record.slot_count)?;
+    let record = HostSlotCapacity::deserialize(&mut deserializer).map_err(|error| {
+        protocol_code(
+            "HOST_SLOT_CAPACITY_INVALID",
+            &format!("leases/capacity.json is invalid: {error}"),
+        )
+    })?;
+    deserializer.end().map_err(|error| {
+        protocol_code(
+            "HOST_SLOT_CAPACITY_INVALID",
+            &format!("leases/capacity.json has trailing data: {error}"),
+        )
+    })?;
+    validate_slot_count(record.slot_count).map_err(|_| {
+        protocol_code(
+            "HOST_SLOT_CAPACITY_INVALID",
+            "leases/capacity.json slot_count is out of range",
+        )
+    })?;
     Ok(record.slot_count)
 }
 
@@ -621,6 +636,7 @@ pub fn promote_slot_directories(leases: &RootedDir) -> Result<(), WorkerError> {
 
 fn load_all_from_store(store: &HostStore) -> Result<Vec<OccupiedSlot>, WorkerError> {
     let leases = store.open_directory("leases", false)?;
+    let slot_count = read_slot_count(&leases)?;
     let slots = match leases.open_child_directory(&relative(SLOTS_DIR)?, false) {
         Ok(slots) => slots,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -635,9 +651,7 @@ fn load_all_from_store(store: &HostStore) -> Result<Vec<OccupiedSlot>, WorkerErr
         if name.starts_with('.') {
             continue;
         }
-        let slot_id: u8 = name
-            .parse()
-            .map_err(|_| WorkerError::Protocol("slot directory name is not a slot id".into()))?;
+        let slot_id = parse_canonical_slot_id(name)?;
         let directory = slots.open_child_directory(&relative(name)?, false)?;
         if !directory.entry_exists("lease.json")? {
             if slot_directory_is_idle(&directory)? {
@@ -645,6 +659,12 @@ fn load_all_from_store(store: &HostStore) -> Result<Vec<OccupiedSlot>, WorkerErr
             }
             return Err(WorkerError::Protocol(
                 "slot directory is missing a canonical lease record".into(),
+            ));
+        }
+        if slot_id >= slot_count {
+            return Err(protocol_code(
+                "HOST_SLOT_ID_INVALID",
+                "a live lease occupies a slot outside stored capacity",
             ));
         }
         occupied.push(OccupiedSlot {
@@ -655,6 +675,28 @@ fn load_all_from_store(store: &HostStore) -> Result<Vec<OccupiedSlot>, WorkerErr
     }
     occupied.sort_by_key(|slot| slot.slot_id);
     Ok(occupied)
+}
+
+fn parse_canonical_slot_id(name: &str) -> Result<u8, WorkerError> {
+    let slot_id: u8 = name.parse().map_err(|_| {
+        protocol_code(
+            "HOST_SLOT_ID_INVALID",
+            "slot directory name is not a slot id",
+        )
+    })?;
+    if name != slot_id.to_string() {
+        return Err(protocol_code(
+            "HOST_SLOT_ID_INVALID",
+            "slot directory name is not canonical",
+        ));
+    }
+    if slot_id >= MAX_HOST_SLOTS {
+        return Err(protocol_code(
+            "HOST_SLOT_ID_INVALID",
+            "slot directory name exceeds the host slot bound",
+        ));
+    }
+    Ok(slot_id)
 }
 
 fn injected() -> WorkerError {
@@ -1084,6 +1126,158 @@ mod lifecycle_tests {
             .unwrap();
         service.set_slot_count(1).unwrap();
         assert_eq!(service.slot_count().unwrap(), 1);
+    }
+
+    fn occupy_only_slot_one<'a>(
+        service: &LeaseService<'a>,
+        store: &HostStore,
+    ) -> (LeaseAcquireRequest, OccupiedSlot) {
+        service.set_slot_count(2).unwrap();
+        let first_req = request(1);
+        let second_req = request(2);
+        let first = acquire(service, &first_req);
+        acquire(service, &second_req);
+        store.record_abandoned(&first_req, 2).unwrap();
+        let receipt = store.cleanup_job_owned(&first).unwrap();
+        service.release_after_cleanup(&first, &receipt).unwrap();
+        let occupied = service.occupied_slots().unwrap();
+        assert_eq!(occupied.len(), 1);
+        assert_eq!(occupied[0].slot_id, 1);
+        (second_req, occupied.into_iter().next().unwrap())
+    }
+
+    fn assert_no_slot_zero_lease(root: &Path) {
+        assert!(
+            !root.join("leases/slots/0/lease.json").exists(),
+            "missing/invalid capacity must not publish a new slot 0 lease"
+        );
+        assert!(root.join("leases/slots/1/lease.json").is_file());
+    }
+
+    #[test]
+    fn new_host_defaults_to_one_slot() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        assert_eq!(service.slot_count().unwrap(), 1);
+        assert_eq!(
+            fs::read(root.join("leases/capacity.json")).unwrap(),
+            serde_json::to_vec(&HostSlotCapacity { slot_count: 1 }).unwrap()
+        );
+        acquire(&service, &request(1));
+        assert_eq!(service.occupied_slots().unwrap()[0].slot_id, 0);
+    }
+
+    #[test]
+    fn missing_capacity_on_installed_layout3_refuses_acquire_and_probe() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        occupy_only_slot_one(&service, &store);
+        fs::remove_file(root.join("leases/capacity.json")).unwrap();
+
+        let error = service.occupancy().unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID");
+        let error = service.slot_count().unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID");
+        let error = service.acquire(&request(3), &healthy(), 1).unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID");
+        assert_no_slot_zero_lease(&root);
+    }
+
+    #[test]
+    fn corrupt_capacity_on_installed_layout3_refuses_acquire_and_probe() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        occupy_only_slot_one(&service, &store);
+        private_file(root.join("leases/capacity.json").as_path(), b"{not-json");
+
+        let error = service.occupancy().unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID");
+        let error = service.acquire(&request(3), &healthy(), 1).unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID");
+        assert_no_slot_zero_lease(&root);
+    }
+
+    #[test]
+    fn live_slot_outside_stored_capacity_is_rejected() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        occupy_only_slot_one(&service, &store);
+        private_file(
+            root.join("leases/capacity.json").as_path(),
+            &serde_json::to_vec(&HostSlotCapacity { slot_count: 1 }).unwrap(),
+        );
+
+        let error = service.occupied_slots().unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID");
+        let error = service.acquire(&request(3), &healthy(), 1).unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID");
+        assert_no_slot_zero_lease(&root);
+    }
+
+    #[test]
+    fn noncanonical_slot_directory_name_is_rejected() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        acquire(&service, &request(1));
+        fs::rename(root.join("leases/slots/0"), root.join("leases/slots/00")).unwrap();
+
+        let error = service.occupied_slots().unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID");
+        let error = service.acquire(&request(2), &healthy(), 1).unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID");
+        assert!(!root.join("leases/slots/0/lease.json").exists());
+        assert!(root.join("leases/slots/00/lease.json").is_file());
+    }
+
+    #[test]
+    fn noncanonical_leading_zero_alias_for_high_slot_is_rejected() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        occupy_only_slot_one(&service, &store);
+        fs::rename(root.join("leases/slots/1"), root.join("leases/slots/08")).unwrap();
+
+        let error = service.occupied_slots().unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID");
+        let error = service.acquire(&request(3), &healthy(), 1).unwrap_err();
+        assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID");
+        assert!(!root.join("leases/slots/0/lease.json").exists());
+        assert!(root.join("leases/slots/08/lease.json").is_file());
+    }
+
+    #[test]
+    fn shrink_ignores_idle_leftover_high_slot_directory() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        service.set_slot_count(2).unwrap();
+        service.set_slot_count(1).unwrap();
+        let leases = store.open_directory("leases", false).unwrap();
+        let slots = leases
+            .open_child_directory(&relative(SLOTS_DIR).unwrap(), false)
+            .unwrap();
+        slots.create_new_child_directory("1").unwrap();
+
+        acquire(&service, &request(1));
+        let occupied = service.occupied_slots().unwrap();
+        assert_eq!(occupied.len(), 1);
+        assert_eq!(occupied[0].slot_id, 0);
+        assert_eq!(service.slot_count().unwrap(), 1);
+        let occupancy = service.occupancy().unwrap();
+        assert_eq!(occupancy.configured_slots, 1);
+        assert_eq!(occupancy.busy_slots, 1);
     }
 
     fn plant_layout2(root: &Path, heavy_bytes: Option<&[u8]>) {
