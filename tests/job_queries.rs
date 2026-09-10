@@ -1,10 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    ffi::{OsStr, OsString},
+    ffi::{CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Cursor, Write as _},
     os::fd::AsRawFd,
     os::unix::{
+        ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
         process::ExitStatusExt,
     },
@@ -1521,10 +1522,14 @@ fn after_cleanup_intent_commit_whole_incoming_job_terminal_retries() {
     let faulted =
         HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
             .unwrap();
-    let error = JobService::new(&faulted, &RejectLauncher)
+    let pending = JobService::new(&faulted, &RejectLauncher)
         .status(lease.job_id())
-        .unwrap_err();
-    assert!(error.to_string().contains("I/O error"), "{error}");
+        .unwrap();
+    assert_eq!(pending.status().state(), status.state());
+    assert_eq!(
+        pending.status().cleanup_error_code(),
+        Some("MUTABLE_CLEANUP_FAILED")
+    );
     assert_eq!(
         LeaseService::new(&faulted).load().unwrap(),
         Some(lease.clone())
@@ -1545,6 +1550,104 @@ fn after_cleanup_intent_commit_whole_incoming_job_terminal_retries() {
     assert_eq!(LeaseService::new(&reopened).load().unwrap(), None);
     assert!(!incoming_job.exists());
     assert_journal_empty_or_absent(&incoming_namespace);
+}
+
+#[test]
+fn terminal_cleanup_removes_a_fifo_left_in_tmp() {
+    // Catches the live Codex residue: a named pipe under tmp makes mutable
+    // cleanup return EINVAL, so the lease stays held forever.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("fifo-tmp");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(97_001), 11)
+        .unwrap()
+        .with_child(identity(97_002), 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap()
+        .into_succeeded(14, 0, 0)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let nested = job.join("tmp/.tmpNbuUJ3");
+    fs::create_dir_all(&nested).unwrap();
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+    create_fifo(&nested.join("command-ready.fifo"));
+
+    let response = JobService::new(&store, &RejectLauncher)
+        .status(lease.job_id())
+        .unwrap();
+
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert_eq!(response.status().cleanup_error_code(), None);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert_mutable_job_scopes_absent(&store, &lease);
+}
+
+#[test]
+fn terminal_status_and_log_chunk_succeed_when_mutable_cleanup_still_fails() {
+    // Catches log_chunk/status going through supervisor-ensure cleanup and
+    // turning a leftover FIFO (or any injected cleanup fault) into HOST_IO, so
+    // the laptop can never drain an already-terminal turn.
+    for caller in ["status", "log_chunk", "reconcile"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(format!("terminal-cleanup-{caller}"));
+        let (store, lease, _request) = indexed_identityless_job(&root);
+        let status = JobStatus::accepted(10)
+            .unwrap()
+            .with_supervisor(identity(97_101), 11)
+            .unwrap()
+            .with_child(identity(97_102), 12)
+            .unwrap()
+            .into_running(13)
+            .unwrap()
+            .into_succeeded(14, 0, 0)
+            .unwrap();
+        install_job_status(&store, &lease, &status, true);
+        drop(store);
+        let faulted =
+            HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+                .unwrap();
+        let service = JobService::new(&faulted, &RejectLauncher);
+        match caller {
+            "status" => {
+                let response = service.status(lease.job_id()).unwrap();
+                assert_eq!(response.status().state(), JobState::Succeeded);
+                assert_eq!(
+                    response.status().cleanup_error_code(),
+                    Some("MUTABLE_CLEANUP_FAILED")
+                );
+            }
+            "log_chunk" => {
+                let chunk = service
+                    .read_log(lease.job_id(), LogStream::Stdout, 0, 64)
+                    .unwrap();
+                assert_eq!(chunk.decoded_bytes().unwrap(), b"");
+                assert_eq!(
+                    read_job_status(&faulted, &lease).cleanup_error_code(),
+                    Some("MUTABLE_CLEANUP_FAILED")
+                );
+            }
+            "reconcile" => {
+                let error = service.reconcile_job(lease.job_id()).unwrap_err();
+                assert!(error.to_string().contains("I/O error"), "{error}");
+                assert_eq!(
+                    read_job_status(&faulted, &lease).cleanup_error_code(),
+                    Some("MUTABLE_CLEANUP_FAILED")
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            LeaseService::new(&faulted).load().unwrap(),
+            Some(lease),
+            "{caller}"
+        );
+    }
 }
 
 #[test]
@@ -4994,7 +5097,7 @@ fn assert_primary_error_survives_uncontended_typed_enrichment_failure(
         &RejectLauncher,
         Arc::new(ScriptedReconciliation::new([], [])),
     )
-    .status(lease.job_id())
+    .reconcile_job(lease.job_id())
     .unwrap_err();
 
     assert!(
@@ -5089,7 +5192,7 @@ fn lease_retirement_failure_happens_after_exact_mutable_cleanup_and_retains_the_
         &RejectLauncher,
         Arc::new(ScriptedReconciliation::new([], [])),
     )
-    .status(lease.job_id())
+    .reconcile_job(lease.job_id())
     .unwrap_err();
 
     assert!(error.to_string().contains("lease retirement"), "{error}");
@@ -7446,6 +7549,12 @@ fn unindexed_identityless_job(root: &Path) -> (HostStore, LeaseRecord, SubmitReq
     );
     drop(faulted);
     (HostStore::open(root).unwrap(), lease, request)
+}
+
+fn create_fifo(path: &Path) {
+    let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `name` is a live NUL-terminated pathname for this call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
 }
 
 fn install_job_status(

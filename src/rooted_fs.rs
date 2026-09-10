@@ -10733,7 +10733,10 @@ fn make_directory_read_only(directory: RawFd) -> io::Result<()> {
                 make_directory_read_only(child.as_raw_fd())?;
             }
             libc::S_IFREG => make_regular_read_only_with_hook(directory, &name, &metadata, || {})?,
-            libc::S_IFLNK => {}
+            // Sealing is about published snapshot content. A FIFO, socket, or
+            // device cannot carry that content, and opening a FIFO to chmod it
+            // can block forever, so these leaves are skipped like symlinks.
+            libc::S_IFLNK | libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK => {}
             _ => return Err(invalid_type_error()),
         }
     }
@@ -10770,6 +10773,21 @@ fn make_regular_read_only_with_hook(
     chmod_fd(file.as_raw_fd(), mode)
 }
 
+// Named pipes, sockets, and device nodes are unlinked like regular files.
+// Opening them can block (FIFO) or expose ambient device state, so cleanup
+// never opens a non-regular leaf.
+fn is_unlinkable_cleanup_leaf(kind: libc::mode_t) -> bool {
+    matches!(
+        kind,
+        libc::S_IFREG
+            | libc::S_IFLNK
+            | libc::S_IFIFO
+            | libc::S_IFSOCK
+            | libc::S_IFCHR
+            | libc::S_IFBLK
+    )
+}
+
 // `directory` must already be inside a validated OperationDirectory. Caller
 // pathnames are never passed to this destructive recursion.
 fn remove_private_directory_contents(directory: RawFd) -> io::Result<()> {
@@ -10783,7 +10801,7 @@ fn remove_private_directory_contents(directory: RawFd) -> io::Result<()> {
                 remove_private_directory_contents(child.as_raw_fd())?;
                 unlink_at(directory, &name, libc::AT_REMOVEDIR)?;
             }
-            libc::S_IFREG | libc::S_IFLNK => unlink_at(directory, &name, 0)?,
+            kind if is_unlinkable_cleanup_leaf(kind) => unlink_at(directory, &name, 0)?,
             _ => return Err(invalid_type_error()),
         }
     }
@@ -10804,7 +10822,7 @@ fn remove_acquired_directory_contents(directory: RawFd) -> io::Result<()> {
                 unlink_at(directory, &name, libc::AT_REMOVEDIR)?;
                 injected_cleanup_after_removal_result()?;
             }
-            libc::S_IFREG | libc::S_IFLNK => {
+            kind if is_unlinkable_cleanup_leaf(kind) => {
                 unlink_at(directory, &name, 0)?;
                 injected_cleanup_after_removal_result()?;
             }
@@ -11515,12 +11533,14 @@ fn current_errno() -> libc::c_int {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use std::{
+        ffi::CString,
         fs,
         io::{Read, Write},
         os::{
             fd::{AsRawFd, FromRawFd},
             unix::ffi::OsStrExt,
-            unix::fs::{MetadataExt, PermissionsExt, symlink},
+            unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
+            unix::net::UnixListener,
         },
         path::{Path, PathBuf},
         time::Duration,
@@ -12419,6 +12439,84 @@ mod tests {
             .unwrap();
         assert!(fs::read_dir(quarantine).unwrap().count() >= 1);
         fs::remove_dir_all(&namespace_path).unwrap();
+    }
+
+    #[test]
+    fn cleanup_removes_fifo_and_socket_leaves_without_opening_them() {
+        // Catches treating named pipes and sockets as invalid cleanup types.
+        // Codex's shell tool leaves `.tmpXXXXXX/command-ready.fifo`; opening a
+        // FIFO can block, so cleanup must unlink those leaves like files.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root_path.join("regular"), b"owned\n").unwrap();
+        let nested = root_path.join(".tmpNbuUJ3");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        create_fifo(&nested.join("command-ready.fifo"));
+        let listener = UnixListener::bind(root_path.join("agent.sock")).unwrap();
+        drop(listener);
+
+        RootedDir::open(&root_path)
+            .unwrap()
+            .remove_owned_tree()
+            .unwrap();
+
+        assert!(!root_path.exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn make_read_only_skips_fifo_and_socket_leaves() {
+        // Sealing is about published snapshot content. A FIFO cannot carry
+        // that content, and opening it to chmod would block, so it is skipped
+        // like a symlink rather than failing the seal.
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("value"), b"published\n").unwrap();
+        create_fifo(&root_path.join("command-ready.fifo"));
+        let listener = UnixListener::bind(root_path.join("agent.sock")).unwrap();
+        drop(listener);
+        let root = RootedDir::open(&root_path).unwrap();
+
+        root.make_read_only().unwrap();
+
+        assert_eq!(
+            fs::metadata(&root_path).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(
+            fs::metadata(root_path.join("value"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+        assert!(
+            fs::symlink_metadata(root_path.join("command-ready.fifo"))
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        root.remove_owned_tree().unwrap();
+        assert!(!root_path.exists());
+    }
+
+    fn create_fifo(path: &Path) {
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a live NUL-terminated pathname for this call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
     }
 
     #[test]
