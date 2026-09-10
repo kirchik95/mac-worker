@@ -307,9 +307,10 @@ fn runtime_enabled_controller_say_wait_close_and_fetch() {
         !looks_like_error_event(&logs_stdout),
         "task logs writes runner bytes, not an error event; stdout={logs_text}"
     );
-    assert!(
-        logs_text.trim().is_empty(),
-        "existing fakeexec status-logs chunks are empty; logs must not invent identity text; stdout={logs_text}"
+    assert_eq!(
+        logs_text.as_ref(),
+        "accepted by mini-1\n",
+        "task logs renders runner turn_accepted as accepted by <inventory worker> (src/turn_log.rs); fakeexec status-logs chunks stay empty so no agent stream is added; stdout={logs_text:?}"
     );
     assert_no_laptop_authority(&fixture);
 
