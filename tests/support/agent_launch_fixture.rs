@@ -46,8 +46,8 @@ pub fn empty_base_path() -> &'static str {
 }
 
 /// Documented synthetic Git identity for the production `collect_git_identity` path.
-/// Production still uses ambient HOME for those probes; the real-shell fixture must not
-/// source the developer account's login files when refresh_facts runs through it.
+/// Production uses the isolated account login environment; ambient HOME must not
+/// supply Git identity for refresh_facts.
 const FIXTURE_GIT_IDENTITY_NAME: &str = "Fixture User";
 const FIXTURE_GIT_IDENTITY_EMAIL: &str = "fixture@example.test";
 
@@ -144,18 +144,18 @@ impl FixtureLayout {
 pub struct DiagnosticProcessRunner;
 
 fn is_git_identity_probe(request: &ProcessRequest) -> bool {
-    if request.isolate_parent_environment {
+    if !request.isolate_parent_environment {
         return false;
     }
     let program = request.program.to_string_lossy();
-    if program != "zsh" && program != "/bin/zsh" {
+    if program != "/bin/zsh" {
         return false;
     }
     let Some(shell) = request.args.last().and_then(|arg| arg.to_str()) else {
         return false;
     };
     request.args.first().map(|arg| arg.as_os_str()) == Some("-lc".as_ref())
-        && shell.starts_with("git config --get user.")
+        && shell.starts_with("git config --global --get user.")
 }
 
 fn shell_command(request: &ProcessRequest) -> Option<&str> {
@@ -278,12 +278,18 @@ pub fn prebind_status_auth(
 
 pub fn run_launch_plan_cursor_auth(plan: &LaunchPlan) -> AgentAuth {
     let _guard = shell_fixture_lock();
-    let mut args = plan.args().to_vec();
-    if args.first().map(String::as_str) == Some(plan.program()) {
-        args.remove(0);
-    }
+    let (program, args) = match plan.prepare_turn_agent_args() {
+        Some(agent) => (agent[0].clone(), agent[1..].to_vec()),
+        None => {
+            let mut args = plan.args().to_vec();
+            if args.first().map(String::as_str) == Some(plan.program()) {
+                args.remove(0);
+            }
+            (plan.program().to_owned(), args)
+        }
+    };
     let request = ProcessRequest {
-        program: plan.program().into(),
+        program: program.into(),
         args: args.into_iter().map(Into::into).collect(),
         environment: plan.env().to_vec(),
         environment_remove: Vec::new(),

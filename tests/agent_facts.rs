@@ -157,16 +157,15 @@ impl ProcessRunner for FakeProcessRunner {
             };
         }
 
-        if program == "zsh" && args == ["-lc", "git config --get user.name"] {
-            return Ok(success(b"Submitter\n"));
-        }
-        if program == "zsh" && args == ["-lc", "git config --get user.email"] {
-            return Ok(success(b"submitter@example.test\n"));
-        }
-
         if program == "/bin/zsh" && args.first().map(String::as_str) == Some("-lc") {
             assert!(request.isolate_parent_environment);
             let shell = args.last().map(String::as_str).unwrap_or_default();
+            if shell == "git config --global --get user.name" {
+                return Ok(success(b"Submitter\n"));
+            }
+            if shell == "git config --global --get user.email" {
+                return Ok(success(b"submitter@example.test\n"));
+            }
             // The herdr lookups extend PATH with `~/.local/bin` before the
             // command proper, which follows the last `; `.
             let (prefix, shell) = match shell.rsplit_once("; ") {
@@ -898,18 +897,18 @@ fn account_login_shell_requests_use_isolation_and_profile_entries() {
 }
 
 #[test]
-fn five_agents_and_one_profile_drop_from_21_login_shells_to_13() {
+fn five_agents_and_one_profile_use_fifteen_login_shells() {
     // Four adapters plus herdr, one secure profile that does not set PATH,
-    // ZDOTDIR, HOME, or SHELL. Before: each adapter ran locate, version, auth,
-    // profile locate, and profile auth (20) plus herdr locate (1) = 21. After:
-    // locate+version, auth, and profile auth (12) plus herdr locate+version
-    // (1) = 13. Reused profile resolution emits no locate/version timing line.
+    // ZDOTDIR, HOME, or SHELL. Adapter probes: locate+version, auth, and
+    // profile auth (12) plus herdr locate+version (1) = 13. Git identity
+    // adds two account-login `git config --global --get` probes. Reused
+    // profile resolution emits no locate/version timing line.
     let runner = FakeProcessRunner::new(Scenario::AllAgents);
     let _ = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
     let shells = account_login_shells(&runner);
     assert_eq!(
         shells.len(),
-        13,
+        15,
         "account login shells: {:?}",
         shells.iter().map(shell_command).collect::<Vec<_>>()
     );

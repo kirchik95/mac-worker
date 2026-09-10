@@ -63,12 +63,15 @@ pub trait ProcessRunner: Send + Sync {
         self.run(request)
     }
 
+    /// Runs `request` while polling `should_stop`. The default implementation
+    /// checks once before `run` and cannot interrupt a child that is already
+    /// executing; `SystemProcessRunner` monitors the live process group.
     fn run_interruptible(
         &self,
         request: &ProcessRequest,
-        should_cancel: &dyn Fn() -> bool,
+        should_stop: &dyn Fn() -> bool,
     ) -> Result<ProcessResult, WorkerError> {
-        if should_cancel() {
+        if should_stop() {
             return Err(ProcessError::Cancelled.into());
         }
         self.run(request)
@@ -87,46 +90,64 @@ impl<T: ProcessRunner + ?Sized> ProcessRunner for &T {
     fn run_interruptible(
         &self,
         request: &ProcessRequest,
-        should_cancel: &dyn Fn() -> bool,
+        should_stop: &dyn Fn() -> bool,
     ) -> Result<ProcessResult, WorkerError> {
-        (**self).run_interruptible(request, should_cancel)
+        (**self).run_interruptible(request, should_stop)
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemProcessRunner;
 
+/// Runs children in the caller's process group so a recorded `killpg` of the
+/// gated turn child also reaps setup descendants. Local timeout/cap/cancel
+/// kills only the spawned PID and does not join capture threads: grandchildren
+/// may keep pipe FDs, and joining would wait until they exit. The caller must
+/// `_exit` the recorded child so supervisor group cleanup finishes the reap.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InheritProcessGroupRunner;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    Inherit,
+    NewProcessGroup,
+    NewSession,
+}
+
 impl ProcessRunner for SystemProcessRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-        self.run_with_session(request, SessionKind::OwnProcessGroup, None)
+        self.run_with_session(request, SessionKind::NewProcessGroup, &|| false)
     }
 
     fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-        self.run_with_session(request, SessionKind::NewSession, None)
+        self.run_with_session(request, SessionKind::NewSession, &|| false)
     }
 
     fn run_interruptible(
         &self,
         request: &ProcessRequest,
-        should_cancel: &dyn Fn() -> bool,
+        should_stop: &dyn Fn() -> bool,
     ) -> Result<ProcessResult, WorkerError> {
-        if should_cancel() {
-            return Err(ProcessError::Cancelled.into());
-        }
-        self.run_with_session(request, SessionKind::OwnProcessGroup, Some(should_cancel))
+        self.run_with_session(request, SessionKind::NewProcessGroup, should_stop)
     }
 }
 
-/// Child session placement used by `SystemProcessRunner`.
-///
-/// PERF keeps `OwnProcessGroup` and `NewSession`. ENV adds inherited-group
-/// setup inside a recorded authority; do not collapse this back to a boolean
-/// at integration, and do not join capture threads on inherited-group failure
-/// while grandchildren can retain FDs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionKind {
-    OwnProcessGroup,
-    NewSession,
+impl ProcessRunner for InheritProcessGroupRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        SystemProcessRunner.run_with_session(request, SessionKind::Inherit, &|| false)
+    }
+
+    fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        SystemProcessRunner.run_with_session(request, SessionKind::NewSession, &|| false)
+    }
+
+    fn run_interruptible(
+        &self,
+        request: &ProcessRequest,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<ProcessResult, WorkerError> {
+        SystemProcessRunner.run_with_session(request, SessionKind::Inherit, should_stop)
+    }
 }
 
 impl SystemProcessRunner {
@@ -134,7 +155,7 @@ impl SystemProcessRunner {
         &self,
         request: &ProcessRequest,
         session: SessionKind,
-        should_cancel: Option<&dyn Fn() -> bool>,
+        should_stop: &dyn Fn() -> bool,
     ) -> Result<ProcessResult, WorkerError> {
         let mut command = Command::new(&request.program);
         if request.isolate_parent_environment {
@@ -156,9 +177,10 @@ impl SystemProcessRunner {
                     }
                 });
             },
-            SessionKind::OwnProcessGroup => {
+            SessionKind::NewProcessGroup => {
                 command.process_group(0);
             }
+            SessionKind::Inherit => {}
         }
         command
             .stdin(if request.stdin.is_some() {
@@ -170,7 +192,12 @@ impl SystemProcessRunner {
             .stderr(Stdio::piped());
 
         let mut child = command.spawn()?;
-        let process_group = child.id() as libc::pid_t;
+        let process_group = match session {
+            SessionKind::Inherit => None,
+            SessionKind::NewProcessGroup | SessionKind::NewSession => {
+                Some(child.id() as libc::pid_t)
+            }
+        };
         let stdout = child
             .stdout
             .take()
@@ -227,15 +254,13 @@ impl SystemProcessRunner {
                         }
                     }
                     ProcessEvent::Captured(stream, Ok(CaptureOutcome::LimitExceeded)) => {
-                        if status.is_none() {
-                            status = child.try_wait()?;
-                        }
-                        if status.is_none() {
-                            terminate_and_reap(&mut child, process_group)?;
-                        } else {
-                            let _ = terminate_process_group(process_group);
-                        }
-                        join_threads(stdout_handle, stderr_handle, stdin_handle)?;
+                        terminate_child(&mut child, process_group)?;
+                        finish_terminated_child(
+                            stdout_handle,
+                            stderr_handle,
+                            stdin_handle,
+                            session,
+                        )?;
                         let limit = match stream {
                             ProcessStream::Stdout => request.policy.stdout_limit,
                             ProcessStream::Stderr => request.policy.stderr_limit,
@@ -243,8 +268,13 @@ impl SystemProcessRunner {
                         return Err(ProcessError::OutputLimitExceeded { stream, limit }.into());
                     }
                     ProcessEvent::Captured(_, Err(error)) => {
-                        terminate_and_reap(&mut child, process_group)?;
-                        join_threads(stdout_handle, stderr_handle, stdin_handle)?;
+                        terminate_child(&mut child, process_group)?;
+                        finish_terminated_child(
+                            stdout_handle,
+                            stderr_handle,
+                            stdin_handle,
+                            session,
+                        )?;
                         return Err(error.into());
                     }
                     ProcessEvent::Stdin(Err(error)) => {
@@ -262,15 +292,15 @@ impl SystemProcessRunner {
                 break;
             }
 
-            if should_cancel.is_some_and(|cancel| cancel()) {
-                terminate_and_reap(&mut child, process_group)?;
-                join_threads(stdout_handle, stderr_handle, stdin_handle)?;
+            if should_stop() {
+                terminate_child(&mut child, process_group)?;
+                finish_terminated_child(stdout_handle, stderr_handle, stdin_handle, session)?;
                 return Err(ProcessError::Cancelled.into());
             }
 
             if started.elapsed() >= request.policy.deadline {
-                terminate_and_reap(&mut child, process_group)?;
-                join_threads(stdout_handle, stderr_handle, stdin_handle)?;
+                terminate_child(&mut child, process_group)?;
+                finish_terminated_child(stdout_handle, stderr_handle, stdin_handle, session)?;
                 return Err(ProcessError::DeadlineExceeded {
                     deadline: request.policy.deadline,
                 }
@@ -332,6 +362,9 @@ fn spawn_capture<R: Read + Send + 'static>(
                             stream,
                             Ok(CaptureOutcome::LimitExceeded),
                         ));
+                        // PERF drain is bounded on the new-group path because
+                        // terminate/reap makes EOF. Inherit setup does not join
+                        // these threads while grandchildren can retain FDs.
                         drain_remaining(&mut reader);
                         let _ = release_receiver.recv();
                         return;
@@ -348,6 +381,7 @@ fn spawn_capture<R: Read + Send + 'static>(
     }
 }
 
+
 fn drain_remaining<R: Read>(reader: &mut R) {
     let mut buffer = [0_u8; 8 * 1024];
     loop {
@@ -360,8 +394,49 @@ fn drain_remaining<R: Read>(reader: &mut R) {
     }
 }
 
-fn terminate_and_reap(child: &mut Child, process_group: libc::pid_t) -> io::Result<()> {
-    terminate_process_group(process_group)?;
+fn finish_terminated_child(
+    stdout: CaptureThread,
+    stderr: CaptureThread,
+    stdin: Option<thread::JoinHandle<()>>,
+    session: SessionKind,
+) -> io::Result<()> {
+    if session == SessionKind::Inherit {
+        // ENV setup runs inside the recorded gated child's group. Local
+        // timeout/cap/cancel must not killpg that group (it would suicide the
+        // exec'd helper) and must not join capture threads: grandchildren can
+        // keep pipe FDs, and joining would wait until they exit. Forget the
+        // handles and `_exit` the helper so supervisor `killpg` finishes reap.
+        // PERF's bounded drain_remaining belongs only on the new-group path
+        // below, where termination already makes EOF bounded.
+        abandon_capture_threads(stdout, stderr, stdin);
+        Ok(())
+    } else {
+        join_threads(stdout, stderr, stdin)
+    }
+}
+
+fn abandon_capture_threads(
+    stdout: CaptureThread,
+    stderr: CaptureThread,
+    stdin: Option<thread::JoinHandle<()>>,
+) {
+    let _ = stdout.limit_release.send(());
+    let _ = stderr.limit_release.send(());
+    std::mem::forget(stdout.handle);
+    std::mem::forget(stderr.handle);
+    if let Some(stdin) = stdin {
+        std::mem::forget(stdin);
+    }
+}
+
+fn terminate_child(child: &mut Child, process_group: Option<libc::pid_t>) -> io::Result<()> {
+    if let Some(process_group) = process_group {
+        terminate_process_group(process_group)?;
+    } else if let Err(error) = child.kill()
+        && error.raw_os_error() != Some(libc::ESRCH)
+    {
+        return Err(error);
+    }
     child.wait().map(|_| ())
 }
 
@@ -405,6 +480,7 @@ fn join_threads(
     Ok(())
 }
 
+
 /// Bounded rolling byte window for later fixed-phrase scanners.
 ///
 /// The window size is the maximum needle length. Auth-incident can scan this
@@ -447,5 +523,145 @@ impl RollingByteWindow {
 
     pub(crate) fn as_bytes(&self) -> Vec<u8> {
         self.bytes.iter().copied().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ProcessStream;
+    use std::time::{Duration, Instant};
+
+    fn policy() -> ProcessPolicy {
+        ProcessPolicy {
+            stdout_limit: 4096,
+            stderr_limit: 4096,
+            deadline: Duration::from_secs(2),
+        }
+    }
+
+    fn pgid_request() -> ProcessRequest {
+        ProcessRequest {
+            program: OsString::from("/bin/sh"),
+            args: vec![OsString::from("-c"), OsString::from("ps -o pgid= -p $$")],
+            environment: Vec::new(),
+            environment_remove: Vec::new(),
+            stdin: None,
+            policy: policy(),
+            isolate_parent_environment: false,
+        }
+    }
+
+    fn parsed_pgid(stdout: &[u8]) -> i32 {
+        String::from_utf8_lossy(stdout)
+            .split_whitespace()
+            .next()
+            .expect("pgid")
+            .parse()
+            .expect("numeric pgid")
+    }
+
+    #[test]
+    fn inherit_process_group_runner_keeps_the_caller_group() {
+        let result = InheritProcessGroupRunner.run(&pgid_request()).unwrap();
+        assert!(result.status.success());
+        let child_pgid = parsed_pgid(&result.stdout);
+        let caller_pgid = unsafe { libc::getpgid(0) };
+        assert_eq!(child_pgid, caller_pgid);
+    }
+
+    #[test]
+    fn system_process_runner_starts_a_new_group() {
+        let result = SystemProcessRunner.run(&pgid_request()).unwrap();
+        assert!(result.status.success());
+        let child_pgid = parsed_pgid(&result.stdout);
+        let caller_pgid = unsafe { libc::getpgid(0) };
+        assert_ne!(child_pgid, caller_pgid);
+    }
+
+    fn grandchild_pipe_request(
+        policy: ProcessPolicy,
+        command: &str,
+    ) -> (tempfile::TempDir, ProcessRequest) {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("grandchild.pid");
+        let script = format!(
+            "PATH=/bin:/usr/bin /bin/sleep 60 & printf $! > {}; {command}",
+            pid_file.display()
+        );
+        let request = ProcessRequest {
+            program: OsString::from("/bin/sh"),
+            args: vec![OsString::from("-c"), OsString::from(script)],
+            environment: Vec::new(),
+            environment_remove: Vec::new(),
+            stdin: None,
+            policy,
+            isolate_parent_environment: false,
+        };
+        (temp, request)
+    }
+
+    fn kill_recorded_grandchild(temp: &tempfile::TempDir) {
+        let path = temp.path().join("grandchild.pid");
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Ok(pid) = String::from_utf8_lossy(&bytes)
+                .trim()
+                .parse::<libc::pid_t>()
+        {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    #[test]
+    fn inherit_deadline_returns_without_joining_grandchild_pipe_holders() {
+        let (temp, request) = grandchild_pipe_request(
+            ProcessPolicy {
+                stdout_limit: 4096,
+                stderr_limit: 4096,
+                deadline: Duration::from_millis(150),
+            },
+            "wait",
+        );
+        let started = Instant::now();
+        let error = InheritProcessGroupRunner.run(&request).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "inherit deadline waited {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            error,
+            WorkerError::Process(ProcessError::DeadlineExceeded { .. })
+        ));
+        kill_recorded_grandchild(&temp);
+    }
+
+    #[test]
+    fn inherit_output_cap_returns_without_joining_grandchild_pipe_holders() {
+        let (temp, request) = grandchild_pipe_request(
+            ProcessPolicy {
+                stdout_limit: 32,
+                stderr_limit: 4096,
+                deadline: Duration::from_secs(5),
+            },
+            "while :; do printf 0123456789; done",
+        );
+        let started = Instant::now();
+        let error = InheritProcessGroupRunner.run(&request).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "inherit cap waited {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            error,
+            WorkerError::Process(ProcessError::OutputLimitExceeded {
+                stream: ProcessStream::Stdout,
+                limit: 32
+            })
+        ));
+        kill_recorded_grandchild(&temp);
     }
 }

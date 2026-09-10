@@ -311,8 +311,17 @@ fn launch_plan_and_prebind_share_login_shell_boundary() {
     fixture.install_home_cursor(PROFILE_GOOD);
     fixture.write_profile_env(PROFILE_NAME, &format!("CURSOR_API_KEY={PROFILE_GOOD}\n"));
     let plan = cursor_status_launch_plan(&fixture, PROFILE_NAME);
-    assert_eq!(plan.program(), "/bin/zsh");
-    assert_eq!(plan.args()[1], "-lc");
+    let shell = render_prebind_shell(&["cursor-agent".into(), "status".into()]).unwrap();
+    assert_eq!(
+        plan.program(),
+        std::env::current_exe().unwrap().to_str().unwrap()
+    );
+    assert_eq!(plan.args()[1], mac_worker::prepare_turn::ARG);
+    assert_eq!(plan.args()[2], "--");
+    assert_eq!(
+        plan.prepare_turn_agent_args().map(ToOwned::to_owned),
+        Some(vec!["/bin/zsh".into(), "-lc".into(), shell])
+    );
     assert!(
         plan.env()
             .iter()

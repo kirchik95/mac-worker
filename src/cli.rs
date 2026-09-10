@@ -194,6 +194,8 @@ pub enum TaskCommand {
         max_parallel: Option<u32>,
         #[arg(long)]
         wait: bool,
+        #[arg(long, conflicts_with = "wait")]
+        preview: bool,
     },
     List {
         #[arg(long, value_name = "ID|NAME", value_parser = non_empty_text)]

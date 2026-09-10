@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLimits, result_instruction},
@@ -18,7 +18,7 @@ use crate::{
     },
     paths::PathLayout,
     process::ProcessRunner,
-    project_config::TaskSettings,
+    project_config::{SetupSettings, TaskSettings},
     project_state::ProjectState,
     scheduler::{CandidateObservation, SchedulerPolicy, Selection, WorkerPreference},
     supervisor::{ProcessObservation, SystemProcessInspector},
@@ -478,6 +478,86 @@ pub struct BatchTask {
     pub publish: Option<Vec<String>>,
     #[serde(default)]
     pub publish_branch: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+}
+
+const MAX_BATCH_ID_BYTES: usize = 64;
+const MAX_BATCH_FILES: usize = 32;
+const MAX_BATCH_ACCEPTANCE: usize = 16;
+const MAX_BATCH_ACCEPTANCE_BYTES: usize = 512;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BatchPreview {
+    pub preview_version: u32,
+    pub dag: DagPreview,
+    pub setup: SetupPreview,
+    pub tasks: Vec<TaskPreview>,
+    pub issues: Vec<PreviewIssue>,
+}
+
+impl BatchPreview {
+    pub fn has_config_errors(&self) -> bool {
+        self.issues.iter().any(|issue| issue.severity == "error")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DagPreview {
+    pub enforced: bool,
+    pub status: &'static str,
+    pub message: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SetupPreview {
+    pub present: bool,
+    pub timeout: Option<String>,
+    pub commands: Vec<String>,
+    pub check: Option<String>,
+    pub lockfiles: Vec<String>,
+    pub inputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TaskPreview {
+    pub index: usize,
+    pub id: String,
+    pub title: Option<String>,
+    pub agent: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub base: String,
+    pub wip: bool,
+    pub source: String,
+    pub publish: Vec<String>,
+    pub worker: Option<String>,
+    pub env_profile: Option<String>,
+    pub depends_on: Vec<String>,
+    pub files: Vec<String>,
+    pub acceptance: Vec<String>,
+    pub acceptance_role: &'static str,
+    pub setup_required: bool,
+    pub overlaps: Vec<PreviewOverlap>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PreviewOverlap {
+    pub with: usize,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PreviewIssue {
+    pub severity: &'static str,
+    pub kind: &'static str,
+    pub message: String,
 }
 
 pub struct TaskClient<'a> {
@@ -1766,6 +1846,153 @@ impl<'a> TaskClient<'a> {
         }
     }
 
+    pub fn preview_batch(&self, file: &Path) -> Result<BatchPreview, WorkerError> {
+        preview_batch_plan(
+            self.runner,
+            self.config,
+            file,
+            &std::env::current_dir().map_err(WorkerError::Io)?,
+        )
+    }
+}
+
+/// Resolves a batch file the same way submit does, without opening client
+/// state or talking to workers.
+pub fn preview_batch_plan(
+    runner: &dyn ProcessRunner,
+    config: &Config,
+    file: &Path,
+    project: &Path,
+) -> Result<BatchPreview, WorkerError> {
+    let batch = load_batch_file(file)?;
+    let state = ProjectState::load(runner, project, &[])?;
+    let batch_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let mut issues = Vec::new();
+    issues.extend(dependency_issues(&batch.tasks));
+    let mut tasks = Vec::with_capacity(batch.tasks.len());
+    for (index, task) in batch.tasks.iter().enumerate() {
+        let files = task.files.clone();
+        let mut overlaps = Vec::new();
+        for (other_index, other) in batch.tasks.iter().enumerate() {
+            if other_index <= index {
+                continue;
+            }
+            let paths = overlapping_paths(&files, &other.files);
+            if !paths.is_empty() {
+                overlaps.push(PreviewOverlap {
+                    with: other_index,
+                    paths,
+                });
+            }
+        }
+        let resolved = resolve_batch_task(
+            config,
+            &batch.defaults,
+            task,
+            batch_dir,
+            project,
+            &state.settings.task,
+        );
+        let (agent, model, effort, mut base, wip, source, publish, worker, env_profile) =
+            match &resolved {
+                Ok(request) => (
+                    agent_name(request.agent).to_owned(),
+                    request.model.clone(),
+                    request.effort.clone(),
+                    request.base.clone(),
+                    request.wip,
+                    request
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| batch.defaults.source.clone()),
+                    request
+                        .publish
+                        .clone()
+                        .unwrap_or_else(|| batch.defaults.publish.clone()),
+                    match &request.preference {
+                        WorkerPreference::Pinned { worker } => Some(worker.clone()),
+                        WorkerPreference::Automatic => None,
+                    },
+                    request.env_profile.clone(),
+                ),
+                Err(error) => {
+                    issues.push(preview_issue_from_error(index, error));
+                    (
+                        task.agent
+                            .clone()
+                            .unwrap_or_else(|| batch.defaults.agent.clone()),
+                        task.model.clone().or_else(|| batch.defaults.model.clone()),
+                        task.effort
+                            .clone()
+                            .or_else(|| batch.defaults.effort.clone()),
+                        task.base
+                            .clone()
+                            .unwrap_or_else(|| batch.defaults.base.clone()),
+                        task.wip.unwrap_or(batch.defaults.wip),
+                        task.source
+                            .clone()
+                            .unwrap_or_else(|| batch.defaults.source.clone()),
+                        task.publish
+                            .clone()
+                            .unwrap_or_else(|| batch.defaults.publish.clone()),
+                        task.worker
+                            .clone()
+                            .or_else(|| batch.defaults.worker.clone()),
+                        task.env_profile
+                            .clone()
+                            .or_else(|| batch.defaults.env_profile.clone()),
+                    )
+                }
+            };
+        if !wip {
+            match TransferRepo::resolve_base_oid(runner, &state.context, &base) {
+                Ok(oid) => {
+                    base = oid.to_string();
+                    if source == "origin" {
+                        base.push_str(" (origin validation remains for submit)");
+                    }
+                }
+                Err(_) if source == "origin" => {
+                    base = format!("{base} (origin validation remains for submit)");
+                }
+                Err(error) => issues.push(preview_issue_from_error(index, &error)),
+            }
+        }
+        tasks.push(TaskPreview {
+            index,
+            id: task_preview_id(task, index),
+            title: task.title.clone(),
+            agent,
+            model,
+            effort,
+            base,
+            wip,
+            source,
+            publish,
+            worker,
+            env_profile,
+            depends_on: task.depends_on.clone(),
+            files,
+            acceptance: task.acceptance.clone(),
+            acceptance_role: "declared_agent_instruction",
+            setup_required: state.settings.setup.is_some(),
+            overlaps,
+        });
+    }
+    Ok(BatchPreview {
+        preview_version: 1,
+        dag: DagPreview {
+            enforced: false,
+            status: "unsupported",
+            message: "This version can preview dependencies but cannot execute them.",
+        },
+        setup: setup_preview(state.settings.setup.as_ref()),
+        tasks,
+        issues,
+    })
+}
+
+impl<'a> TaskClient<'a> {
     pub fn batch(
         &self,
         file: &Path,
@@ -1773,23 +2000,14 @@ impl<'a> TaskClient<'a> {
         max_parallel: Option<u32>,
         _stdout: &mut dyn Write,
     ) -> Result<RunReport, WorkerError> {
-        self.reconcile_runners()?;
-        let contents = std::fs::read_to_string(file).map_err(WorkerError::Io)?;
-        let batch: BatchFile = toml::from_str(&contents).map_err(|error| {
-            task_error(
-                "TASK_CONFIG_INVALID",
-                format!("invalid batch file: {error}"),
-            )
-        })?;
-        if batch.version != 1 {
+        let batch = load_batch_file(file)?;
+        if batch.tasks.iter().any(|task| !task.depends_on.is_empty()) {
             return Err(task_error(
-                "TASK_CONFIG_INVALID",
-                format!("unsupported batch version {}; expected 1", batch.version),
+                "BATCH_DEPENDENCIES_UNSUPPORTED",
+                "This version can preview dependencies but cannot execute them.",
             ));
         }
-        if batch.tasks.is_empty() {
-            return Err(task_error("TASK_CONFIG_INVALID", "batch has no tasks"));
-        }
+        self.reconcile_runners()?;
         let max_parallel = resolve_batch_max_parallel(max_parallel, self.config.workers.len())?;
         let run_id = RunId::generate();
         let created = current_time_millis()?;
@@ -1837,75 +2055,11 @@ impl<'a> TaskClient<'a> {
         project: &Path,
         run_id: RunId,
     ) -> Result<TaskSubmitRequest, WorkerError> {
-        validate_batch_scope(defaults, task)?;
-        let agent = parse_agent(task.agent.as_deref().unwrap_or(&defaults.agent))?;
-        validate_task_agent(agent)?;
-        let timeout = task
-            .timeout
-            .as_deref()
-            .or(defaults.timeout.as_deref())
-            .map(humantime::parse_duration)
-            .transpose()
-            .map_err(|_| task_error("TASK_CONFIG_INVALID", "batch timeout is invalid"))?;
-        let default_limits = TaskLimits::default();
-        let timeout_millis = timeout
-            .map(|timeout| {
-                timeout
-                    .as_millis()
-                    .try_into()
-                    .map_err(|_| task_error("TASK_CONFIG_INVALID", "batch timeout is too large"))
-            })
-            .transpose()?
-            .unwrap_or(default_limits.turn.timeout_millis);
-        let limits = TaskLimits::new(
-            TurnLimits::new(
-                timeout_millis,
-                task.max_turns.or(defaults.max_turns),
-                task.max_budget_usd_cents.or(defaults.max_budget_usd_cents),
-            )
-            .map_err(WorkerError::from)?,
-            task.max_followups
-                .or(defaults.max_followups)
-                .unwrap_or(default_limits.max_followups),
-        )?;
-        Ok(TaskSubmitRequest {
-            agent,
-            model: task.model.clone().or_else(|| defaults.model.clone()),
-            effort: task.effort.clone().or_else(|| defaults.effort.clone()),
-            prompt: read_batch_prompt(task, batch_dir)?,
-            project: project.to_path_buf(),
-            base: task.base.clone().unwrap_or_else(|| defaults.base.clone()),
-            wip: task.wip.unwrap_or(defaults.wip),
-            source: task
-                .source
-                .clone()
-                .or_else(|| Some(defaults.source.clone())),
-            publish: Some(
-                task.publish
-                    .clone()
-                    .unwrap_or_else(|| defaults.publish.clone()),
-            ),
-            publish_branch: task
-                .publish_branch
-                .clone()
-                .or_else(|| defaults.publish_branch.clone()),
-            cli_includes: Vec::new(),
-            limits,
-            close_policy: parse_close_policy(
-                task.close_on.as_deref().or(defaults.close_on.as_deref()),
-            )?,
-            env_profile: task
-                .env_profile
-                .clone()
-                .or_else(|| defaults.env_profile.clone()),
-            preference: match task.worker.clone().or_else(|| defaults.worker.clone()) {
-                Some(worker) => WorkerPreference::Pinned { worker },
-                None => WorkerPreference::Automatic,
-            },
-            wait_for_capacity: true,
-            attached: false,
-            run_id: Some(run_id),
-        })
+        let settings = ProjectState::load(self.runner, project, &[])?.settings.task;
+        let mut request =
+            resolve_batch_task(self.config, defaults, task, batch_dir, project, &settings)?;
+        request.run_id = Some(run_id);
+        Ok(request)
     }
 
     fn enqueue_followup(
@@ -2842,6 +2996,353 @@ fn parse_agent(value: &str) -> Result<AgentKind, WorkerError> {
     }
 }
 
+fn load_batch_file(file: &Path) -> Result<BatchFile, WorkerError> {
+    let contents = std::fs::read_to_string(file).map_err(WorkerError::Io)?;
+    let batch: BatchFile = toml::from_str(&contents).map_err(|error| {
+        task_error(
+            "TASK_CONFIG_INVALID",
+            format!("invalid batch file: {error}"),
+        )
+    })?;
+    if batch.version != 1 {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            format!("unsupported batch version {}; expected 1", batch.version),
+        ));
+    }
+    if batch.tasks.is_empty() {
+        return Err(task_error("TASK_CONFIG_INVALID", "batch has no tasks"));
+    }
+    Ok(batch)
+}
+
+fn resolve_batch_task(
+    config: &Config,
+    defaults: &BatchDefaults,
+    task: &BatchTask,
+    batch_dir: &Path,
+    project: &Path,
+    settings: &TaskSettings,
+) -> Result<TaskSubmitRequest, WorkerError> {
+    validate_batch_scope(defaults, task)?;
+    validate_batch_metadata(task)?;
+    let agent = parse_agent(task.agent.as_deref().unwrap_or(&defaults.agent))?;
+    validate_task_agent(agent)?;
+    let timeout = task
+        .timeout
+        .as_deref()
+        .or(defaults.timeout.as_deref())
+        .map(humantime::parse_duration)
+        .transpose()
+        .map_err(|_| task_error("TASK_CONFIG_INVALID", "batch timeout is invalid"))?;
+    let default_limits = TaskLimits::default();
+    let timeout_millis = timeout
+        .map(|timeout| {
+            timeout
+                .as_millis()
+                .try_into()
+                .map_err(|_| task_error("TASK_CONFIG_INVALID", "batch timeout is too large"))
+        })
+        .transpose()?
+        .unwrap_or(default_limits.turn.timeout_millis);
+    let limits = TaskLimits::new(
+        TurnLimits::new(
+            timeout_millis,
+            task.max_turns.or(defaults.max_turns),
+            task.max_budget_usd_cents.or(defaults.max_budget_usd_cents),
+        )
+        .map_err(WorkerError::from)?,
+        task.max_followups
+            .or(defaults.max_followups)
+            .unwrap_or(default_limits.max_followups),
+    )?;
+    let request = TaskSubmitRequest {
+        agent,
+        model: task.model.clone().or_else(|| defaults.model.clone()),
+        effort: task.effort.clone().or_else(|| defaults.effort.clone()),
+        prompt: append_declared_acceptance(read_batch_prompt(task, batch_dir)?, &task.acceptance)?,
+        project: project.to_path_buf(),
+        base: task.base.clone().unwrap_or_else(|| defaults.base.clone()),
+        wip: task.wip.unwrap_or(defaults.wip),
+        source: task
+            .source
+            .clone()
+            .or_else(|| Some(defaults.source.clone())),
+        publish: Some(
+            task.publish
+                .clone()
+                .unwrap_or_else(|| defaults.publish.clone()),
+        ),
+        publish_branch: task
+            .publish_branch
+            .clone()
+            .or_else(|| defaults.publish_branch.clone()),
+        cli_includes: Vec::new(),
+        limits,
+        close_policy: parse_close_policy(
+            task.close_on.as_deref().or(defaults.close_on.as_deref()),
+        )?,
+        env_profile: task
+            .env_profile
+            .clone()
+            .or_else(|| defaults.env_profile.clone()),
+        preference: match task.worker.clone().or_else(|| defaults.worker.clone()) {
+            Some(worker) => WorkerPreference::Pinned { worker },
+            None => WorkerPreference::Automatic,
+        },
+        wait_for_capacity: true,
+        attached: false,
+        run_id: None,
+    };
+    validate_prompt(&request.prompt)?;
+    validate_preference(config, &request.preference)?;
+    let _ = effective_task_limits(&request.limits, settings)?;
+    Ok(request)
+}
+
+fn preview_issue_from_error(index: usize, error: &WorkerError) -> PreviewIssue {
+    let code = error.public_code();
+    let kind = match code.as_str() {
+        "AGENT_UNSUPPORTED" => "AGENT_UNSUPPORTED",
+        "WORKER_NOT_FOUND" => "WORKER_NOT_FOUND",
+        "TASK_PROMPT_TOO_LARGE" => "TASK_PROMPT_TOO_LARGE",
+        "PUBLISH_REQUIRES_COMMITTED_BASE" => "PUBLISH_REQUIRES_COMMITTED_BASE",
+        "BASE_UNAVAILABLE" => "BASE_UNAVAILABLE",
+        "TASK_CONFIG_INVALID" => "TASK_CONFIG_INVALID",
+        _ => "TASK_CONFIG_INVALID",
+    };
+    PreviewIssue {
+        severity: "error",
+        kind,
+        message: format!("task {index}: {error}"),
+    }
+}
+
+fn setup_preview(setup: Option<&SetupSettings>) -> SetupPreview {
+    match setup {
+        Some(setup) => SetupPreview {
+            present: true,
+            timeout: Some(humantime::format_duration(setup.timeout).to_string()),
+            commands: setup.commands.clone(),
+            check: setup.check.clone(),
+            lockfiles: setup.lockfiles.clone(),
+            inputs: setup.inputs.clone(),
+        },
+        None => SetupPreview {
+            present: false,
+            timeout: None,
+            commands: Vec::new(),
+            check: None,
+            lockfiles: Vec::new(),
+            inputs: Vec::new(),
+        },
+    }
+}
+
+fn task_preview_id(task: &BatchTask, index: usize) -> String {
+    task.id.clone().unwrap_or_else(|| index.to_string())
+}
+
+fn overlapping_paths(left: &[String], right: &[String]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for path in left {
+        if right.iter().any(|other| paths_overlap(path, other)) && !paths.contains(path) {
+            paths.push(path.clone());
+        }
+    }
+    paths
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
+}
+
+fn dependency_issues(tasks: &[BatchTask]) -> Vec<PreviewIssue> {
+    let mut issues = Vec::new();
+    let mut ids = std::collections::BTreeMap::new();
+    for (index, task) in tasks.iter().enumerate() {
+        if let Some(id) = &task.id {
+            if let Err(message) = validate_batch_id(id) {
+                issues.push(PreviewIssue {
+                    severity: "error",
+                    kind: "invalid_id",
+                    message,
+                });
+                continue;
+            }
+            if ids.insert(id.clone(), index).is_some() {
+                issues.push(PreviewIssue {
+                    severity: "error",
+                    kind: "duplicate_id",
+                    message: format!("duplicate batch task id {id}"),
+                });
+            }
+        }
+    }
+    let mut adjacency: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for task in tasks {
+        let Some(id) = &task.id else {
+            if !task.depends_on.is_empty() {
+                issues.push(PreviewIssue {
+                    severity: "error",
+                    kind: "invalid_dependency",
+                    message: "depends_on requires a task id".into(),
+                });
+            }
+            continue;
+        };
+        for dep in &task.depends_on {
+            if !ids.contains_key(dep) {
+                issues.push(PreviewIssue {
+                    severity: "error",
+                    kind: "unknown_dependency",
+                    message: format!("task {id} depends on unknown id {dep}"),
+                });
+            }
+            adjacency.entry(id.clone()).or_default().push(dep.clone());
+        }
+    }
+    if let Some(cycle) = detect_cycle(&adjacency) {
+        issues.push(PreviewIssue {
+            severity: "error",
+            kind: "cycle",
+            message: format!("cyclic depends_on: {}", cycle.join(" -> ")),
+        });
+    }
+    issues
+}
+
+fn detect_cycle(graph: &std::collections::BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
+    #[derive(Clone, Copy)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+    let mut color = std::collections::BTreeMap::new();
+    for node in graph.keys() {
+        color.insert(node.clone(), Color::White);
+    }
+    fn visit(
+        node: &str,
+        graph: &std::collections::BTreeMap<String, Vec<String>>,
+        color: &mut std::collections::BTreeMap<String, Color>,
+        stack: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        color.insert(node.to_owned(), Color::Gray);
+        stack.push(node.to_owned());
+        if let Some(edges) = graph.get(node) {
+            for next in edges {
+                match color.get(next).copied().unwrap_or(Color::White) {
+                    Color::Gray => {
+                        let start = stack.iter().position(|item| item == next).unwrap_or(0);
+                        let mut cycle = stack[start..].to_vec();
+                        cycle.push(next.clone());
+                        return Some(cycle);
+                    }
+                    Color::White => {
+                        if let Some(cycle) = visit(next, graph, color, stack) {
+                            return Some(cycle);
+                        }
+                    }
+                    Color::Black => {}
+                }
+            }
+        }
+        stack.pop();
+        color.insert(node.to_owned(), Color::Black);
+        None
+    }
+    for node in graph.keys() {
+        if matches!(color.get(node), Some(Color::White)) {
+            let mut stack = Vec::new();
+            if let Some(cycle) = visit(node, graph, &mut color, &mut stack) {
+                return Some(cycle);
+            }
+        }
+    }
+    None
+}
+
+fn validate_batch_metadata(task: &BatchTask) -> Result<(), WorkerError> {
+    if let Some(id) = &task.id {
+        validate_batch_id(id).map_err(|message| task_error("TASK_CONFIG_INVALID", message))?;
+    }
+    if task.files.len() > MAX_BATCH_FILES {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "batch task declares too many files",
+        ));
+    }
+    for path in &task.files {
+        crate::project_config::validate_preview_path(path).map_err(|_| {
+            task_error(
+                "TASK_CONFIG_INVALID",
+                "batch files path must be a precise relative path",
+            )
+        })?;
+    }
+    if task.acceptance.len() > MAX_BATCH_ACCEPTANCE {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "batch task declares too many acceptance commands",
+        ));
+    }
+    for command in &task.acceptance {
+        if command.is_empty()
+            || command.len() > MAX_BATCH_ACCEPTANCE_BYTES
+            || command.chars().any(char::is_control)
+        {
+            return Err(task_error(
+                "TASK_CONFIG_INVALID",
+                "acceptance command is empty, too long, or contains a control character",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_batch_id(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > MAX_BATCH_ID_BYTES
+        || !id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+    {
+        return Err("batch task id must be a short lowercase identifier".into());
+    }
+    Ok(())
+}
+
+fn append_declared_acceptance(
+    prompt: String,
+    acceptance: &[String],
+) -> Result<String, WorkerError> {
+    if acceptance.is_empty() {
+        return Ok(prompt);
+    }
+    let mut lines = Vec::new();
+    for command in acceptance {
+        if command.is_empty()
+            || command.len() > MAX_BATCH_ACCEPTANCE_BYTES
+            || command.chars().any(char::is_control)
+        {
+            return Err(task_error(
+                "TASK_CONFIG_INVALID",
+                "acceptance command is empty, too long, or contains a control character",
+            ));
+        }
+        lines.push(format!("- {command}"));
+    }
+    Ok(format!(
+        "{prompt}\n\nDeclared acceptance criteria (you must satisfy these; mac-worker does not verify them and does not treat later agent-reported checks as verified):\n{}\n",
+        lines.join("\n")
+    ))
+}
+
 fn read_batch_prompt(task: &BatchTask, batch_dir: &Path) -> Result<String, WorkerError> {
     match (&task.prompt, &task.prompt_file) {
         (Some(prompt), None) => Ok(prompt.clone()),
@@ -3058,7 +3559,7 @@ fn default_publish_modes() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_batch_max_parallel;
+    use super::*;
 
     #[test]
     fn batch_parallelism_defaults_to_the_configured_worker_count() {
@@ -3070,5 +3571,52 @@ mod tests {
     fn batch_parallelism_rejects_zero_workers_or_a_zero_override() {
         assert!(resolve_batch_max_parallel(None, 0).is_err());
         assert!(resolve_batch_max_parallel(Some(0), 3).is_err());
+    }
+
+    #[test]
+    fn declared_acceptance_is_appended_as_an_unverified_agent_instruction() {
+        let prompt =
+            append_declared_acceptance("Do the work".into(), &["cargo test -p login".into()])
+                .unwrap();
+        assert!(prompt.contains("Do the work"));
+        assert!(prompt.contains("cargo test -p login"));
+        assert!(prompt.contains("Declared acceptance criteria"));
+        assert!(prompt.contains("mac-worker does not verify them"));
+    }
+
+    #[test]
+    fn overlapping_declared_files_are_advisory() {
+        let overlap = overlapping_paths(
+            &["src/login.rs".into(), "src/lib.rs".into()],
+            &["src/login.rs".into(), "src/other.rs".into()],
+        );
+        assert_eq!(overlap, vec!["src/login.rs"]);
+        assert!(paths_overlap("src", "src/login.rs"));
+        assert!(!paths_overlap("src/a.rs", "src/b.rs"));
+    }
+
+    #[test]
+    fn cyclic_depends_on_is_reported_as_preview_metadata() {
+        let batch: BatchFile = toml::from_str(
+            r#"
+[[tasks]]
+id = "a"
+prompt = "a"
+depends_on = ["b"]
+
+[[tasks]]
+id = "b"
+prompt = "b"
+depends_on = ["a"]
+"#,
+        )
+        .unwrap();
+        let issues = dependency_issues(&batch.tasks);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.kind == "cycle" && issue.severity == "error"),
+            "{issues:?}"
+        );
     }
 }

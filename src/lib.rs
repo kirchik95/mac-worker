@@ -88,10 +88,12 @@ pub mod manifest;
 pub mod onboarding;
 pub mod output;
 pub mod paths;
+pub mod prepare_turn;
 pub mod probe;
 pub mod process;
 pub mod project;
 pub mod project_config;
+pub mod project_readiness;
 pub mod project_state;
 pub mod protocol;
 pub mod redaction;
@@ -752,6 +754,43 @@ fn run_task_command(
     let result = (|| -> Result<u8, WorkerError> {
         let paths = discover_paths(cli.config, runtime)?;
         let config = Config::load(&paths.config)?;
+        if let Command::Task {
+            command:
+                TaskCommand::Batch {
+                    file,
+                    preview: true,
+                    ..
+                },
+        } = &cli.command
+        {
+            let report = crate::task_client::preview_batch_plan(
+                runner,
+                &config,
+                file,
+                &runtime.current_dir()?,
+            )?;
+            if json {
+                write_json_line(stdout, &report)?;
+            } else {
+                writeln!(stdout, "batch preview: {} tasks", report.tasks.len())?;
+                writeln!(
+                    stdout,
+                    "This version can preview dependencies but cannot execute them."
+                )?;
+                if report.setup.present {
+                    writeln!(stdout, "setup recipe present")?;
+                }
+                for issue in &report.issues {
+                    writeln!(
+                        stdout,
+                        "{} {}: {}",
+                        issue.severity, issue.kind, issue.message
+                    )?;
+                }
+                stdout.flush()?;
+            }
+            return Ok(if report.has_config_errors() { 1 } else { 0 });
+        }
         let client_state = ClientStateStore::open(&paths.state)?;
         let command = cli.command;
         let inline = matches!(
@@ -905,25 +944,30 @@ fn run_task_subcommand(
             name,
             max_parallel,
             wait,
+            preview,
         } => {
-            let report = client.batch(&file, name, max_parallel, stdout)?;
-            write_run_report(&report, json, stdout)?;
-            if wait {
-                let waited = client.wait(WaitSelector::Run(report.run_id()), None)?;
-                if json {
-                    write_json_line(
-                        stdout,
-                        &serde_json::json!({
-                            "protocol_version": PROTOCOL_VERSION,
-                            "run_id": report.run_id().to_string(),
-                            "task_ids": waited.task_ids(),
-                            "exit_code": waited.exit_code(),
-                        }),
-                    )?;
-                }
-                Ok(waited.exit_code())
+            if preview {
+                unreachable!("batch --preview is handled before client state opens");
             } else {
-                Ok(0)
+                let report = client.batch(&file, name, max_parallel, stdout)?;
+                write_run_report(&report, json, stdout)?;
+                if wait {
+                    let waited = client.wait(WaitSelector::Run(report.run_id()), None)?;
+                    if json {
+                        write_json_line(
+                            stdout,
+                            &serde_json::json!({
+                                "protocol_version": PROTOCOL_VERSION,
+                                "run_id": report.run_id().to_string(),
+                                "task_ids": waited.task_ids(),
+                                "exit_code": waited.exit_code(),
+                            }),
+                        )?;
+                    }
+                    Ok(waited.exit_code())
+                } else {
+                    Ok(0)
+                }
             }
         }
         TaskCommand::List {

@@ -4,13 +4,14 @@ mod support;
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     process::{self, Command},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::{
@@ -29,8 +30,8 @@ use mac_worker::{
     protocol::{MemoryPressure, PROTOCOL_VERSION, SUPERVISION_VERSION},
     supervisor::{
         LaunchPlan, ProcessGroupMembership, ProcessGroupObservation, ProcessInspector,
-        ProcessObservation, ReconciliationRuntime, StdinSource, StdoutSink, Supervisor,
-        SupervisorFaultPoint, SystemProcessInspector,
+        ProcessObservation, ReconciliationRuntime, SUPERVISOR_TERM_GRACE, StdinSource, StdoutSink,
+        Supervisor, SupervisorFaultPoint, SystemProcessInspector, SystemSupervisorLauncher,
     },
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, PushTarget, TaskId, TaskLimits,
@@ -104,13 +105,14 @@ impl SupervisorLauncher for InlineTurnLauncher {
     ) -> Result<LaunchCandidate, WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(process::id())?;
-        match self.fault {
-            Some(point) => {
-                Supervisor::new_with_fault(&self.store, &inspector, point)
-                    .run_with_guard(job_id, guard)?;
-            }
-            None => Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?,
-        }
+        let helper = PathBuf::from(env!("CARGO_BIN_EXE_worker"));
+        let supervisor = match self.fault {
+            Some(point) => Supervisor::new_with_fault(&self.store, &inspector, point),
+            None => Supervisor::new(&self.store, &inspector),
+        };
+        supervisor
+            .with_prepare_turn_helper(helper)
+            .run_with_guard(job_id, guard)?;
         Ok(LaunchCandidate::new(identity))
     }
 }
@@ -199,6 +201,13 @@ impl ReconciliationRuntime for FastReconciliationRuntime {
     }
 }
 
+fn wall_clock_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64
+}
+
 fn prepared_task_turn(
     script: &str,
 ) -> (
@@ -207,7 +216,9 @@ fn prepared_task_turn(
     mac_worker::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
-    prepared_task_turn_with_options(
+    let temp = tempdir().unwrap();
+    let (store, request, cancel) = prepared_task_turn_at(
+        &temp.path().join("host"),
         script,
         TaskSource::Local {
             wip: false,
@@ -216,7 +227,34 @@ fn prepared_task_turn(
         vec![PublishMode::Fetch],
         None,
         None,
-    )
+        30_000,
+    );
+    (temp, store, request, cancel)
+}
+
+fn prepared_task_turn_with_timeout(
+    script: &str,
+    timeout_millis: u64,
+) -> (
+    tempfile::TempDir,
+    HostStore,
+    mac_worker::turn::TaskTurnRequest,
+    TaskCancelRequest,
+) {
+    let temp = tempdir().unwrap();
+    let (store, request, cancel) = prepared_task_turn_at(
+        &temp.path().join("host"),
+        script,
+        TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        vec![PublishMode::Fetch],
+        None,
+        None,
+        timeout_millis,
+    );
+    (temp, store, request, cancel)
 }
 
 fn prepared_push_task_turn(
@@ -228,7 +266,9 @@ fn prepared_push_task_turn(
     mac_worker::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
-    prepared_task_turn_with_options(
+    let temp = tempdir().unwrap();
+    let (store, request, cancel) = prepared_task_turn_at(
+        &temp.path().join("host"),
         script,
         TaskSource::Local {
             wip: false,
@@ -237,7 +277,9 @@ fn prepared_push_task_turn(
         vec![PublishMode::Fetch, PublishMode::Push],
         Some("release-candidate".parse().unwrap()),
         Some(origin.to_owned()),
-    )
+        30_000,
+    );
+    (temp, store, request, cancel)
 }
 
 fn request_with_mismatched_origin(
@@ -252,20 +294,20 @@ fn request_with_mismatched_origin(
     .unwrap()
 }
 
-fn prepared_task_turn_with_options(
+fn prepared_task_turn_at(
+    host: &Path,
     script: &str,
     task_source: TaskSource,
     publish: Vec<PublishMode>,
     publish_branch: Option<BranchName>,
     origin_url: Option<String>,
+    timeout_millis: u64,
 ) -> (
-    tempfile::TempDir,
     HostStore,
     mac_worker::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
-    let temp = tempdir().unwrap();
-    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let store = HostStore::open(host).unwrap();
     let source = GitRepo::init();
     source.write("base.txt", b"base\n");
     source.commit_all("base");
@@ -285,7 +327,7 @@ fn prepared_task_turn_with_options(
     );
 
     let prompt = "turn prompt";
-    let turn_limits = TurnLimits::new(30_000, None, None).unwrap();
+    let turn_limits = TurnLimits::new(timeout_millis, None, None).unwrap();
     let turn = TurnMaterial::from_prompt(
         task_id(),
         1,
@@ -321,13 +363,18 @@ fn prepared_task_turn_with_options(
         WORKTREE_ID.into(),
         turn.digest(),
         String::new(),
-        30_000,
+        timeout_millis,
         "heavy".into(),
         CommandSpec::shell("true".into()).unwrap(),
     )
     .unwrap();
-    let seed_lease =
-        LeaseRecord::new(&seed_material, seed_material.fingerprint(), 100, 30_100).unwrap();
+    let seed_lease = LeaseRecord::new(
+        &seed_material,
+        seed_material.fingerprint(),
+        100,
+        100 + timeout_millis,
+    )
+    .unwrap();
     let projected = turn.v1_material(&seed_lease, &launch).unwrap();
     LeaseService::new(&store)
         .acquire(
@@ -338,7 +385,7 @@ fn prepared_task_turn_with_options(
                 memory_pressure: MemoryPressure::Normal,
                 swap_used_bytes: Some(0),
             },
-            100,
+            wall_clock_millis(),
         )
         .unwrap();
 
@@ -383,7 +430,7 @@ fn prepared_task_turn_with_options(
     )
     .unwrap();
     let cancel = TaskCancelRequest::new(PROJECT_ID, task_id(), job_id);
-    (temp, store, request, cancel)
+    (store, request, cancel)
 }
 
 #[test]
@@ -909,8 +956,20 @@ fn launch_plans_keep_batch_golden_and_turns_use_the_account_environment() {
         section.git_identity(),
     )
     .unwrap();
-    assert_eq!(plan.program(), "/bin/zsh");
-    assert_eq!(plan.args()[1], "-lc");
+    assert_eq!(
+        plan.program(),
+        std::env::current_exe().unwrap().to_str().unwrap()
+    );
+    assert_eq!(plan.args()[1], mac_worker::prepare_turn::ARG);
+    assert_eq!(plan.args()[2], "--");
+    assert_eq!(
+        plan.prepare_turn_agent_args().map(ToOwned::to_owned),
+        Some(vec![
+            "/bin/zsh".into(),
+            "-lc".into(),
+            "exec 'codex' '-'".into(),
+        ])
+    );
     assert_eq!(
         plan.cwd(),
         std::path::Path::new(
@@ -1058,7 +1117,7 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
                 memory_pressure: MemoryPressure::Normal,
                 swap_used_bytes: Some(0),
             },
-            100,
+            wall_clock_millis(),
         )
         .unwrap();
 
@@ -1274,7 +1333,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
         .acquire(
             &LeaseAcquireRequest::new(projected.clone()),
             &admission_facts,
-            200,
+            wall_clock_millis(),
         )
         .unwrap();
 
@@ -1381,7 +1440,7 @@ fn successful_codex_turn_without_a_bound_session_fails_publication() {
                 memory_pressure: MemoryPressure::Normal,
                 swap_used_bytes: Some(0),
             },
-            100,
+            wall_clock_millis(),
         )
         .unwrap();
 
@@ -1525,7 +1584,7 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
                 memory_pressure: MemoryPressure::Normal,
                 swap_used_bytes: Some(0),
             },
-            100,
+            wall_clock_millis(),
         )
         .unwrap();
 
@@ -2156,4 +2215,413 @@ fn herdr_reporter_attaches_the_turn_and_close_removes_its_tab() {
     TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
         .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
         .unwrap();
+}
+
+fn write_workspace_setup(store: &HostStore, body: &str) {
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    fs::write(workspace.join(".worker.toml"), body).unwrap();
+}
+
+fn wait_until_turn_running(store: &HostStore, deadline: Instant) -> PathBuf {
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    loop {
+        let running = fs::read(job_path.join("status.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<JobStatus>(&bytes).ok())
+            .is_some_and(|status| {
+                status.state() == JobState::Running && status.child_identity().is_some()
+            });
+        if running {
+            return job_path;
+        }
+        if Instant::now() >= deadline {
+            panic!("inline supervisor did not publish Running before the deadline");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn pid_alive(pid: libc::pid_t) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn wait_for_grandchild_pid(workspace: &Path) -> libc::pid_t {
+    let path = workspace.join("grandchild.pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(bytes) = fs::read(&path)
+            && let Ok(pid) = String::from_utf8_lossy(&bytes)
+                .trim()
+                .parse::<libc::pid_t>()
+        {
+            return pid;
+        }
+        if Instant::now() >= deadline {
+            panic!("setup grandchild pid was not recorded");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assert_no_setup_receipt(home: &Path) {
+    let cache = home.join(".cache").join("mac-worker").join("project-setup");
+    if !cache.is_dir() {
+        return;
+    }
+    let receipts: Vec<_> = fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".json"))
+        .collect();
+    assert!(receipts.is_empty(), "setup published {receipts:?}");
+}
+
+fn assert_setup_receipt(home: &Path) {
+    let cache = home.join(".cache").join("mac-worker").join("project-setup");
+    let receipt = cache.join(format!("task-{}.json", task_id()));
+    assert!(
+        receipt.is_file(),
+        "successful setup must publish a per-task receipt at {}",
+        receipt.display()
+    );
+}
+
+const SETUP_SLEEP_RECIPE: &str = r#"
+version = 1
+[setup]
+timeout = "20s"
+commands = ["PATH=/bin:/usr/bin printf $$ > leader.pid; /bin/sleep 60 & printf $! > grandchild.pid; wait"]
+"#;
+
+#[test]
+fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt_wrapper() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    support::agent_launch_fixture::assert_subprocess_success(
+        "cancelling_setup_during_recipe_hands_off_without_agent_or_receipt",
+        &[("HOME", home.to_str().unwrap())],
+        false,
+    );
+}
+
+#[test]
+fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt() {
+    if support::agent_launch_fixture::skip_unless_subtest() {
+        return;
+    }
+    let script = "printf ran > agent.ran";
+    let (_temp, store, request, cancel_request) = prepared_task_turn(script);
+    write_workspace_setup(&store, SETUP_SLEEP_RECIPE);
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let submit_store = store.clone();
+    let submit_request = request.clone();
+    let submit = thread::spawn(move || {
+        let launcher = InlineTurnLauncher {
+            store: submit_store.clone(),
+            fault: None,
+        };
+        JobService::new(&submit_store, &launcher).submit_turn(submit_request)
+    });
+
+    let job_path = wait_until_turn_running(&store, Instant::now() + Duration::from_secs(8));
+    let grandchild = wait_for_grandchild_pid(&workspace);
+    let cancel_started = Instant::now();
+    let cancel_store = store.clone();
+    let cancel = thread::spawn(move || {
+        let launcher = InlineTurnLauncher {
+            store: cancel_store.clone(),
+            fault: None,
+        };
+        JobService::new_with_reconciliation(
+            &cancel_store,
+            &launcher,
+            Arc::new(FastReconciliationRuntime {
+                clock: Mutex::new(Duration::ZERO),
+            }),
+        )
+        .cancel_task(cancel_request)
+    });
+    let cancel_result = cancel.join().expect("cancellation thread panicked");
+    let cancel_elapsed = cancel_started.elapsed();
+    let submit_result = submit.join().expect("submit thread panicked");
+
+    assert!(
+        cancel_elapsed < Duration::from_secs(5),
+        "cancellation exceeded the supervisor handoff deadline: {cancel_elapsed:?}"
+    );
+    let cancelled = cancel_result.unwrap_or_else(|error| {
+        panic!(
+            "setup cancellation failed: {} ({})",
+            error.public_code(),
+            error
+        )
+    });
+    let _ = submit_result;
+    assert_eq!(
+        cancelled.status().last_outcome(),
+        Some(&TaskOutcome::Cancelled)
+    );
+    let job_status: JobStatus =
+        serde_json::from_slice(&fs::read(job_path.join("status.json")).unwrap()).unwrap();
+    assert_eq!(job_status.state(), JobState::Cancelled);
+    let setup = fs::read(job_path.join("setup-result.json"))
+        .ok()
+        .and_then(|bytes| {
+            serde_json::from_slice::<mac_worker::project_readiness::SetupStageResult>(&bytes).ok()
+        });
+    if let Some(setup) = setup {
+        assert_eq!(setup.code, "SETUP_CANCELLED");
+    }
+    assert!(!workspace.join("agent.ran").exists());
+    assert!(
+        !pid_alive(grandchild),
+        "setup grandchild {grandchild} survived cancel"
+    );
+    assert_no_setup_receipt(&home);
+}
+
+#[test]
+fn supervisor_death_during_setup_does_not_start_a_second_heavy_job_wrapper() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let data = temp.path().join("data");
+    fs::create_dir_all(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    support::agent_launch_fixture::assert_subprocess_success(
+        "supervisor_death_during_setup_does_not_start_a_second_heavy_job",
+        &[
+            ("HOME", home.to_str().unwrap()),
+            ("XDG_DATA_HOME", data.to_str().unwrap()),
+        ],
+        false,
+    );
+}
+
+#[test]
+fn supervisor_death_during_setup_does_not_start_a_second_heavy_job() {
+    if support::agent_launch_fixture::skip_unless_subtest() {
+        return;
+    }
+    let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").expect("XDG_DATA_HOME"));
+    let host = data.join("mac-worker").join("host");
+    let script = "printf started > agent.started; printf ran > agent.ran";
+    let (store, request, cancel_request) = prepared_task_turn_at(
+        &host,
+        script,
+        TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        vec![PublishMode::Fetch],
+        None,
+        None,
+        30_000,
+    );
+    write_workspace_setup(&store, SETUP_SLEEP_RECIPE);
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    let launcher =
+        SystemSupervisorLauncher::with_executable(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
+            .unwrap();
+    JobService::new(&store, &launcher)
+        .submit_turn(request.clone())
+        .expect("detached supervisor handshake");
+    let job_path = wait_until_turn_running(&store, Instant::now() + Duration::from_secs(8));
+    let grandchild = wait_for_grandchild_pid(&workspace);
+    let job_status: JobStatus =
+        serde_json::from_slice(&fs::read(job_path.join("status.json")).unwrap()).unwrap();
+    let supervisor = job_status
+        .supervisor_identity()
+        .expect("recorded supervisor identity");
+    assert_ne!(
+        supervisor.pid(),
+        process::id(),
+        "recorded supervisor must be a separate process, not the test owner"
+    );
+    let supervisor_pid = libc::pid_t::try_from(supervisor.pid()).unwrap();
+    assert!(
+        pid_alive(supervisor_pid),
+        "detached supervisor exited early"
+    );
+    unsafe {
+        libc::kill(supervisor_pid, libc::SIGKILL);
+    }
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(supervisor_pid, &mut status, libc::WNOHANG) };
+        if waited == supervisor_pid {
+            break;
+        }
+        if waited < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if errno == Some(libc::ECHILD) {
+                break;
+            }
+            panic!(
+                "waitpid({}) failed while reaping killed supervisor: {:?}",
+                supervisor_pid, errno
+            );
+        }
+        if Instant::now() >= reap_deadline {
+            panic!("killed supervisor {supervisor_pid} was not reaped");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let dead_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let observation = SystemProcessInspector.observe(supervisor);
+        if matches!(
+            observation,
+            ProcessObservation::Absent | ProcessObservation::Reused
+        ) {
+            break;
+        }
+        if Instant::now() >= dead_deadline {
+            panic!("supervisor {supervisor_pid} still observed as {observation:?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        pid_alive(grandchild),
+        "setup descendant died with the supervisor before recovery"
+    );
+    assert!(!workspace.join("agent.ran").exists());
+    let launches = Arc::new(AtomicUsize::new(0));
+    let retry = JobService::new(
+        &store,
+        &CountingFailingLauncher {
+            launches: launches.clone(),
+        },
+    )
+    .submit_turn(request);
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        0,
+        "retry launched while setup descendants still run: {retry:?}"
+    );
+    assert!(pid_alive(grandchild), "retry reaped setup descendants");
+    let _ = JobService::new_with_reconciliation(
+        &store,
+        &InlineTurnLauncher {
+            store: store.clone(),
+            fault: None,
+        },
+        Arc::new(FastReconciliationRuntime {
+            clock: Mutex::new(Duration::ZERO),
+        }),
+    )
+    .cancel_task(cancel_request);
+    let gone = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < gone && pid_alive(grandchild) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !pid_alive(grandchild),
+        "cancel left setup grandchild {grandchild}"
+    );
+    assert!(!workspace.join("agent.started").exists());
+    assert!(!workspace.join("agent.ran").exists());
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    assert_no_setup_receipt(&home);
+}
+
+#[test]
+fn setup_and_agent_share_one_total_turn_budget_wrapper() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    support::agent_launch_fixture::assert_subprocess_success(
+        "setup_and_agent_share_one_total_turn_budget",
+        &[("HOME", home.to_str().unwrap())],
+        false,
+    );
+}
+
+#[test]
+fn setup_and_agent_share_one_total_turn_budget() {
+    if support::agent_launch_fixture::skip_unless_subtest() {
+        return;
+    }
+    let script = "printf started > agent.started; sleep 8; printf done > agent.ran";
+    let (_temp, store, request, _cancel) = prepared_task_turn_with_timeout(script, 10_000);
+    write_workspace_setup(
+        &store,
+        r#"
+version = 1
+[setup]
+timeout = "20s"
+commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
+"#,
+    );
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let started = Instant::now();
+    let started_at = SystemTime::now();
+    let launcher = InlineTurnLauncher {
+        store: store.clone(),
+        fault: None,
+    };
+    let result = JobService::new(&store, &launcher).submit_turn(request);
+    let elapsed = started.elapsed();
+    let job_path = store
+        .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
+        .unwrap();
+    let job_status: JobStatus =
+        serde_json::from_slice(&fs::read(job_path.join("status.json")).unwrap()).unwrap();
+    assert_eq!(job_status.state(), JobState::TimedOut);
+    if let Ok(status) = result {
+        assert_eq!(status.task().last_outcome(), Some(&TaskOutcome::TimedOut));
+    }
+    assert!(
+        workspace.join("setup.done").exists(),
+        "setup must complete before the agent starts"
+    );
+    assert!(
+        workspace.join("agent.started").exists(),
+        "agent must start after setup and share the remaining budget"
+    );
+    let setup_at = fs::metadata(workspace.join("setup.done"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let agent_at = fs::metadata(workspace.join("agent.started"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(agent_at >= setup_at, "agent started before setup completed");
+    let execution_deadline = Duration::from_millis(10_000);
+    let setup_age = setup_at
+        .duration_since(started_at)
+        .unwrap_or(Duration::ZERO);
+    let agent_age = agent_at
+        .duration_since(started_at)
+        .unwrap_or(Duration::ZERO);
+    assert!(
+        setup_age < execution_deadline,
+        "setup finished after the original execution deadline: {setup_age:?}"
+    );
+    assert!(
+        agent_age < execution_deadline,
+        "agent started after the original execution deadline: {agent_age:?}"
+    );
+    assert!(
+        !workspace.join("agent.ran").exists(),
+        "agent must be interrupted at the execution deadline, not after setup+agent=16s"
+    );
+    // 21.7s observed elapsed is TERM_GRACE group cleanup after the 10s
+    // execution deadline, plus the pre-existing 1s post-wait pump settle.
+    // That is not extra execution budget: agent.ran would exist if the
+    // second 8s stage had been allowed to finish.
+    assert!(
+        elapsed < execution_deadline + SUPERVISOR_TERM_GRACE + Duration::from_secs(3),
+        "turn waited {elapsed:?}, expected execution deadline plus documented cleanup grace"
+    );
+    assert_setup_receipt(&home);
 }

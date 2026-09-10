@@ -134,6 +134,7 @@ fn task_help_keeps_the_released_option_names_discoverable() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--name <NAME>"))
+        .stdout(predicate::str::contains("--preview"))
         .stdout(predicate::str::contains("--run-name").not());
 
     let mut wait = Command::cargo_bin("worker").unwrap();

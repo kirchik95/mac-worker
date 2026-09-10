@@ -211,14 +211,16 @@ Follow [Get your first branch](../README.md#3-get-your-first-branch). Builds als
 
 Configure your Git name and email on the **laptop**. mac-worker passes the submitter's identity to worker commits; absent an identity, it uses a fixed mac-worker fallback.
 
-For a Rust project under Codex's workspace sandbox, populate the worker account's Cargo registry before a build task. In a worker checkout with the same `Cargo.lock`, run:
+For a Rust project under Codex's workspace sandbox, declare an optional `[setup]` recipe in `.worker.toml` so the worker warms the account Cargo cache in the task workspace before the agent starts. Toolchains stay user-owned; mac-worker does not install packages or copy secrets. Optional `check` must succeed in **this** workspace (a matching lockfile elsewhere is not readiness):
 
-```bash
-cargo fetch --locked
-cargo fetch --locked --offline
+```toml
+[setup]
+commands = ["cargo fetch --locked"]
+check = "cargo fetch --locked --offline"
+lockfiles = ["Cargo.lock"]
 ```
 
-The offline check succeeds once the lockfile's crates are cached. This avoids registry writes outside the task worktree during a sandboxed turn. The [usage reference](usage.md) covers other project options.
+The offline check succeeds once the lockfile's crates are cached. This avoids registry writes outside the task worktree during a sandboxed turn. The [usage reference](usage.md) covers other project options, including `worker task batch FILE --preview`.
 
 ## Updating and installation recovery
 

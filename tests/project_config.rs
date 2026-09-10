@@ -48,6 +48,7 @@ fn absent_project_settings_file_uses_v1_defaults() {
     assert_eq!(settings.task.default_agent, "codex");
     assert_eq!(settings.task.timeout, Duration::from_secs(45 * 60));
     assert_eq!(settings.task.max_followups, 10);
+    assert_eq!(settings.setup, None);
 }
 
 #[test]
@@ -338,6 +339,7 @@ fn project_settings_reject_invalid_values_and_unknown_fields_at_each_level() {
         ("unexpected = true", "unknown root field"),
         ("[snapshot]\nunexpected = true", "unknown snapshot field"),
         ("[artifacts]\nunexpected = true", "unknown artifacts field"),
+        ("[setup]\nunexpected = true", "unknown setup field"),
         (
             "[snapshot]\ninclude_untracked = [\"**/generated\"]",
             "glob first component",
@@ -463,4 +465,241 @@ fn herdr_keys_parse_with_their_defaults_and_reject_unknown_neighbours() {
     let example = Config::parse(include_str!("../config.example.toml")).unwrap();
     assert!(example.notifications.herdr);
     assert!(!example.workers[0].herdr);
+}
+
+fn preview_config() -> Config {
+    Config::parse("version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n")
+        .unwrap()
+}
+
+#[test]
+fn batch_preview_resolves_local_head_and_reports_dag_unsupported() {
+    let repo = GitRepo::init();
+    repo.write("src/lib.rs", b"fn main() {}\n");
+    repo.commit_all("base");
+    let oid = String::from_utf8(repo.git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    repo.write(
+        "tasks.toml",
+        br#"
+version = 1
+agent = "codex"
+
+[[tasks]]
+prompt = "fix login"
+files = ["src/lib.rs"]
+acceptance = ["cargo test"]
+"#,
+    );
+    let report = mac_worker::task_client::preview_batch_plan(
+        &SystemProcessRunner,
+        &preview_config(),
+        &repo.root().join("tasks.toml"),
+        repo.root(),
+    )
+    .unwrap();
+    assert!(!report.has_config_errors(), "{:?}", report.issues);
+    assert!(!report.dag.enforced);
+    assert_eq!(report.dag.status, "unsupported");
+    assert_eq!(
+        report.dag.message,
+        "This version can preview dependencies but cannot execute them."
+    );
+    assert_eq!(report.tasks[0].base, oid);
+    assert_eq!(
+        report.tasks[0].acceptance_role,
+        "declared_agent_instruction"
+    );
+    assert_eq!(oid.len(), 40);
+}
+
+#[test]
+fn batch_preview_reports_unknown_agent_missing_prompt_and_trailing_slash() {
+    let repo = GitRepo::init();
+    repo.write("src/lib.rs", b"fn main() {}\n");
+    repo.commit_all("base");
+    repo.write(
+        "tasks.toml",
+        br#"
+version = 1
+
+[[tasks]]
+agent = "unknown-agent"
+prompt = "x"
+
+[[tasks]]
+files = ["src/"]
+
+[[tasks]]
+prompt = "ok"
+files = ["src/lib.rs/"]
+"#,
+    );
+    let report = mac_worker::task_client::preview_batch_plan(
+        &SystemProcessRunner,
+        &preview_config(),
+        &repo.root().join("tasks.toml"),
+        repo.root(),
+    )
+    .unwrap();
+    assert!(report.has_config_errors());
+    let kinds: Vec<_> = report.issues.iter().map(|issue| issue.kind).collect();
+    assert!(kinds.contains(&"AGENT_UNSUPPORTED"), "{kinds:?}");
+    assert!(
+        kinds.iter().any(|kind| *kind == "TASK_CONFIG_INVALID"),
+        "{kinds:?}"
+    );
+}
+
+#[test]
+fn batch_preview_cli_does_not_open_client_state() {
+    use std::collections::BTreeMap;
+
+    use clap::Parser;
+    use mac_worker::{
+        RuntimeContext,
+        cli::{Cli, Command, TaskCommand},
+    };
+
+    let repo = GitRepo::init();
+    repo.write("src/lib.rs", b"fn main() {}\n");
+    repo.commit_all("base");
+    repo.write(
+        "tasks.toml",
+        br#"
+version = 1
+agent = "codex"
+[[tasks]]
+prompt = "fix login"
+depends_on = ["missing"]
+"#,
+    );
+    let home = tempdir().unwrap();
+    let config_path = home.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+    )
+    .unwrap();
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::new(),
+        home.path().to_path_buf(),
+        repo.root().to_path_buf(),
+    );
+    let cli = Cli::try_parse_from([
+        "worker",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--json",
+        "task",
+        "batch",
+        repo.root().join("tasks.toml").to_str().unwrap(),
+        "--preview",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Task {
+            command: TaskCommand::Batch { preview: true, .. }
+        }
+    ));
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = mac_worker::run_with_io_in_context(
+        cli,
+        &SystemProcessRunner,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 1, "{}", String::from_utf8_lossy(&stderr));
+    let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(report["dag"]["status"], "unsupported");
+    assert!(!home.path().join(".local/state/mac-worker").exists());
+}
+
+#[test]
+fn batch_submit_rejects_depends_on() {
+    let repo = GitRepo::init();
+    repo.write("src/lib.rs", b"fn main() {}\n");
+    repo.commit_all("base");
+    repo.write(
+        "tasks.toml",
+        br#"
+version = 1
+agent = "codex"
+[[tasks]]
+id = "a"
+prompt = "a"
+depends_on = ["b"]
+[[tasks]]
+id = "b"
+prompt = "b"
+"#,
+    );
+    let state_root = tempdir().unwrap();
+    let state_root_path = state_root.path().canonicalize().unwrap();
+    let paths = PathLayout {
+        config: repo.root().join("config.toml"),
+        state: state_root_path.join("state"),
+        cache: state_root_path.join("cache"),
+        data: state_root_path.join("data"),
+    };
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let runner = SystemProcessRunner;
+    let executor = InlineRunnerExecutor;
+    let config = preview_config();
+    let client = TaskClient::new(&runner, &config, &paths, &state, &executor);
+    let error = client
+        .batch(
+            &repo.root().join("tasks.toml"),
+            None,
+            None,
+            &mut std::io::sink(),
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "BATCH_DEPENDENCIES_UNSUPPORTED");
+    assert!(
+        error
+            .to_string()
+            .contains("This version can preview dependencies but cannot execute them.")
+    );
+}
+
+#[test]
+fn project_setup_recipe_is_opt_in_and_requires_lockfiles_to_exist() {
+    let repo = GitRepo::init();
+    repo.write("Cargo.lock", b"lock\n");
+    repo.write(
+        ".worker.toml",
+        br#"version = 1
+[setup]
+timeout = "10m"
+commands = ["cargo fetch --locked"]
+check = "cargo fetch --locked --offline"
+lockfiles = ["Cargo.lock"]
+"#,
+    );
+    let settings = ProjectSettings::load(repo.root(), &[]).unwrap();
+    let setup = settings.setup.expect("setup table");
+    assert_eq!(setup.timeout, Duration::from_secs(600));
+    assert_eq!(setup.commands, vec!["cargo fetch --locked"]);
+    assert_eq!(
+        setup.check.as_deref(),
+        Some("cargo fetch --locked --offline")
+    );
+    assert_eq!(setup.lockfiles, vec!["Cargo.lock"]);
+
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        br#"version = 1
+[setup]
+lockfiles = ["Cargo.lock"]
+"#,
+    );
+    let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
+    assert!(matches!(error, WorkerError::Config(_)), "{error}");
 }

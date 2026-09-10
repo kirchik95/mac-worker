@@ -7,6 +7,9 @@ use clap::{Parser, error::ErrorKind};
 use mac_worker::{cli::Cli, process::SystemProcessRunner, run_with_stdio};
 
 fn main() -> ExitCode {
+    if mac_worker::prepare_turn::requested() {
+        return mac_worker::prepare_turn::run();
+    }
     let stdout = io::stdout();
     let stderr = io::stderr();
     let stdin = io::stdin();

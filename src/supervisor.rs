@@ -31,6 +31,7 @@ use crate::{
         validate_indexed_turn_prelaunch_job,
     },
     lease::LeaseService,
+    project_readiness::load_setup_stage_result,
     rooted_fs::RootedDir,
     turn::{EnvProfile, TerminalPath, TurnSection, TurnTerminalHook},
 };
@@ -48,7 +49,11 @@ const MAX_HOST_JSON_BYTES: u64 = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CHILD_TRANSITION_RETRY: Duration = Duration::from_millis(250);
 const SUPERVISOR_IDENTITY_RETRY: Duration = Duration::from_millis(250);
-const TERM_GRACE: Duration = Duration::from_secs(10);
+/// SIGTERM→SIGKILL grace after the execution deadline. Cleanup, not extra
+/// execution budget. Hidden so JobService fixtures can allow it in elapsed.
+#[doc(hidden)]
+pub const SUPERVISOR_TERM_GRACE: Duration = Duration::from_secs(10);
+const TERM_GRACE: Duration = SUPERVISOR_TERM_GRACE;
 const SUPERVISOR_LOG_NAME: &str = "supervisor.log";
 pub(crate) const MAX_SUPERVISOR_LOG_BYTES: u64 = 1024;
 /// Longest error message kept beside its code in `supervisor.log`.
@@ -251,6 +256,31 @@ impl LaunchPlan {
         turn_dir: &Path,
         task_workspace: &Path,
     ) -> Result<Self, WorkerError> {
+        Self::turn_at_with_helper(
+            command,
+            lease,
+            section,
+            account_home,
+            profile,
+            identity,
+            turn_dir,
+            task_workspace,
+            &prepare_turn_executable()?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn turn_at_with_helper(
+        command: &CommandSpec,
+        lease: &LeaseRecord,
+        section: &TurnSection,
+        account_home: &Path,
+        profile: &EnvProfile,
+        identity: &crate::task::GitIdentity,
+        turn_dir: &Path,
+        task_workspace: &Path,
+        helper: &Path,
+    ) -> Result<Self, WorkerError> {
         command.validate()?;
         let CommandSpec::Shell { shell } = command else {
             return Err(protocol_code(
@@ -283,11 +313,18 @@ impl LaunchPlan {
                 "MAC_WORKER_TURN".into(),
                 section.turn().turn_number().to_string().into(),
             ),
+            (
+                "MAC_WORKER_LEASE_DEADLINE_MILLIS".into(),
+                lease.expires_at_millis().to_string().into(),
+            ),
             ("GIT_AUTHOR_NAME".into(), identity.name().into()),
             ("GIT_AUTHOR_EMAIL".into(), identity.email().into()),
             ("GIT_COMMITTER_NAME".into(), identity.name().into()),
             ("GIT_COMMITTER_EMAIL".into(), identity.email().into()),
         ]);
+        if let Some(name) = section.turn().env_profile() {
+            env.push(("MAC_WORKER_ENV_PROFILE".into(), name.into()));
+        }
         env.extend(profile.entries().iter().cloned());
         for (name, value) in &env {
             if name.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
@@ -297,14 +334,92 @@ impl LaunchPlan {
                 ));
             }
         }
+        Self::turn_with_prepare_helper(env, shell, turn_dir, task_workspace, helper)
+    }
+
+    fn turn_with_prepare_helper(
+        env: Vec<(OsString, OsString)>,
+        shell: &str,
+        _turn_dir: &Path,
+        task_workspace: &Path,
+        helper: &Path,
+    ) -> Result<Self, WorkerError> {
+        let program = helper.to_str().ok_or_else(|| {
+            protocol_code(
+                "INVALID_EXECUTABLE",
+                "prepare-turn helper path is not valid UTF-8",
+            )
+        })?;
+        if program.as_bytes().contains(&0) {
+            return Err(protocol_code(
+                "INVALID_EXECUTABLE",
+                "prepare-turn helper path contains NUL",
+            ));
+        }
         Ok(Self {
-            program: "/bin/zsh".into(),
-            args: vec!["/bin/zsh".into(), "-lc".into(), shell.clone()],
+            program: program.to_owned(),
+            args: vec![
+                program.to_owned(),
+                crate::prepare_turn::ARG.to_owned(),
+                "--".into(),
+                "/bin/zsh".into(),
+                "-lc".into(),
+                shell.to_owned(),
+            ],
             env,
             cwd: task_workspace.to_path_buf(),
             stdin: StdinSource::File("prompt.md".into()),
             stdout: StdoutSink::Pipe,
         })
+    }
+
+    pub fn prepare_turn_agent_args(&self) -> Option<&[String]> {
+        let args = &self.args;
+        if args.get(1).map(String::as_str) == Some(crate::prepare_turn::ARG)
+            && args.get(2).map(String::as_str) == Some("--")
+            && args.len() > 3
+        {
+            Some(&args[3..])
+        } else {
+            None
+        }
+    }
+
+    /// Rewrites this plan so a libtest binary can act as the exec'd helper.
+    /// The child is `current_exe --exact <this test>`, which is the same
+    /// freshly compiled image as the caller—not a searched `target/*/worker`.
+    #[cfg(test)]
+    pub(crate) fn with_libtest_prepare_helper(self, test_name: &str) -> Self {
+        let exe = std::env::current_exe().expect("current test executable");
+        let program = exe
+            .to_str()
+            .expect("test executable path is valid UTF-8")
+            .to_owned();
+        let agent = serde_json::to_string(
+            self.prepare_turn_agent_args()
+                .expect("turn plan wraps an agent argv"),
+        )
+        .expect("agent argv is JSON");
+        assert!(
+            !agent.as_bytes().contains(&0),
+            "POSIX environment cannot contain NUL"
+        );
+        let mut env = self.env;
+        env.push(("MAC_WORKER_PREPARE_TURN_HELPER".into(), "1".into()));
+        env.push(("MAC_WORKER_PREPARE_TURN_AGENT".into(), agent.into()));
+        Self {
+            program: program.clone(),
+            args: vec![
+                program,
+                "--exact".into(),
+                test_name.into(),
+                "--nocapture".into(),
+            ],
+            env,
+            cwd: self.cwd,
+            stdin: self.stdin,
+            stdout: self.stdout,
+        }
     }
 
     pub fn program(&self) -> &str {
@@ -743,7 +858,11 @@ pub struct SystemSupervisorLauncher {
 
 impl SystemSupervisorLauncher {
     pub fn new() -> Result<Self, WorkerError> {
-        let executable_path = std::env::current_exe()?;
+        Self::with_executable(std::env::current_exe()?)
+    }
+
+    #[doc(hidden)]
+    pub fn with_executable(executable_path: PathBuf) -> Result<Self, WorkerError> {
         let executable = CString::new(executable_path.as_os_str().as_bytes()).map_err(|_| {
             protocol_code(
                 "SUPERVISOR_EXECUTABLE_INVALID",
@@ -960,6 +1079,7 @@ pub struct Supervisor<'a> {
     fault: Option<SupervisorFaultPoint>,
     stdout_log_cap: Option<u64>,
     stderr_log_cap: Option<u64>,
+    prepare_turn_helper: Option<PathBuf>,
 }
 
 struct SupervisorErrorLog {
@@ -1072,6 +1192,7 @@ pub enum SupervisorFaultPoint {
     BeforeChildStatusAbortProof,
     BeforeRunningStatus,
     AfterRunningStatus,
+    CrashAfterRunning,
     AfterLogSync,
     AfterTerminalStatus,
 }
@@ -1084,6 +1205,7 @@ impl<'a> Supervisor<'a> {
             fault: None,
             stdout_log_cap: None,
             stderr_log_cap: None,
+            prepare_turn_helper: None,
         }
     }
 
@@ -1099,6 +1221,7 @@ impl<'a> Supervisor<'a> {
             fault: Some(fault),
             stdout_log_cap: None,
             stderr_log_cap: None,
+            prepare_turn_helper: None,
         }
     }
 
@@ -1117,6 +1240,11 @@ impl<'a> Supervisor<'a> {
         StreamPumpConfig::production().with_cap(self.stderr_log_cap)
     }
 
+    #[doc(hidden)]
+    pub fn with_prepare_turn_helper(mut self, helper: PathBuf) -> Self {
+        self.prepare_turn_helper = Some(helper);
+        self
+    }
     pub fn run_with_guard(&self, job_id: JobId, guard: SupervisorGuard) -> Result<(), WorkerError> {
         let mut error_log = SupervisorErrorLog::prepare(self.store, job_id)
             .ok()
@@ -1591,11 +1719,22 @@ impl<'a> Supervisor<'a> {
         drop(guard);
 
         if self.fault == Some(SupervisorFaultPoint::AfterRunningStatus) {
-            let _ = wait_for_child(child_identity, lease.timeout_millis(), self.inspector)?;
+            let _ = wait_for_child(
+                child_identity,
+                remaining_lease_millis(&lease)?,
+                self.inspector,
+            )?;
             return Err(injected_supervisor_fault("running status"));
         }
+        if self.fault == Some(SupervisorFaultPoint::CrashAfterRunning) {
+            return Err(injected_supervisor_fault("running crash"));
+        }
 
-        let outcome = wait_for_child(child_identity, lease.timeout_millis(), self.inspector)?;
+        let outcome = wait_for_child(
+            child_identity,
+            remaining_lease_millis(&lease)?,
+            self.inspector,
+        )?;
 
         // Reacquire through the documented admission -> supervisor order.
         // Cancellation may have won while we were intentionally unlocked,
@@ -1853,7 +1992,11 @@ impl<'a> Supervisor<'a> {
             }
         };
         let turn_path = job.path().to_path_buf();
-        let plan = match LaunchPlan::turn_at(
+        let helper = match &self.prepare_turn_helper {
+            Some(path) => path.clone(),
+            None => prepare_turn_executable()?,
+        };
+        let plan = match LaunchPlan::turn_at_with_helper(
             payload.command(),
             lease,
             &section,
@@ -1862,6 +2005,7 @@ impl<'a> Supervisor<'a> {
             section.git_identity(),
             &turn_path,
             task_workspace.path(),
+            &helper,
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -2222,11 +2366,22 @@ impl<'a> Supervisor<'a> {
         }
 
         if self.fault == Some(SupervisorFaultPoint::AfterRunningStatus) {
-            let _ = wait_for_child(child_identity, lease.timeout_millis(), self.inspector)?;
+            let _ = wait_for_child(
+                child_identity,
+                remaining_lease_millis(lease)?,
+                self.inspector,
+            )?;
             return Err(injected_supervisor_fault("running status"));
         }
+        if self.fault == Some(SupervisorFaultPoint::CrashAfterRunning) {
+            return Err(injected_supervisor_fault("running crash"));
+        }
 
-        let outcome = wait_for_child(child_identity, lease.timeout_millis(), self.inspector)?;
+        let outcome = wait_for_child(
+            child_identity,
+            remaining_lease_millis(lease)?,
+            self.inspector,
+        )?;
         std::thread::sleep(Duration::from_secs(1));
 
         // Reacquire through the documented admission -> supervisor order.
@@ -2311,48 +2466,17 @@ impl<'a> Supervisor<'a> {
         if self.fault == Some(SupervisorFaultPoint::AfterLogSync) {
             return Err(injected_supervisor_fault("log sync"));
         }
-        let (terminal, terminal_kind, exit_code) = match outcome {
-            ChildOutcome::Exited(0) => (
-                current_status.into_succeeded(now_millis()?, stdout_length, stderr_length)?,
-                crate::task::TurnTerminal::Succeeded,
-                Some(0),
-            ),
-            ChildOutcome::Exited(code) => (
-                current_status.into_failed_exit(
-                    now_millis()?,
-                    code,
-                    stdout_length,
-                    stderr_length,
-                )?,
-                crate::task::TurnTerminal::Failed,
-                Some(i32::from(code)),
-            ),
-            ChildOutcome::Signalled(signal) => (
-                current_status.into_failed_signal(
-                    now_millis()?,
-                    signal,
-                    stdout_length,
-                    stderr_length,
-                )?,
-                crate::task::TurnTerminal::Cancelled,
-                None,
-            ),
-            ChildOutcome::TimedOut => (
-                current_status.into_infrastructure_terminal(
-                    JobState::TimedOut,
-                    now_millis()?,
-                    stdout_length,
-                    stderr_length,
-                    "COMMAND_TIMEOUT".into(),
-                )?,
-                crate::task::TurnTerminal::TimedOut,
-                None,
-            ),
-        };
-        let terminal_path = match outcome {
-            ChildOutcome::TimedOut => TerminalPath::Timeout,
-            other => TerminalPath::ChildExit(outcome_code(other)),
-        };
+        let setup = load_setup_stage_result(&current_job)?;
+        let (terminal, terminal_kind, exit_code, terminal_path) = terminal_from_setup_or_outcome(
+            &current_status,
+            outcome,
+            setup,
+            stdout_length,
+            stderr_length,
+        )?;
+        if let Some(code) = terminal.error_code() {
+            append_supervisor_note(&current_job, &format!("error_code={code}"));
+        }
         self.finish_turn_terminal(
             &terminal_lease,
             &current_job,
@@ -2432,7 +2556,11 @@ impl<'a> Supervisor<'a> {
         code: &str,
         original: WorkerError,
     ) -> Result<(), WorkerError> {
-        let wait = wait_for_child(child_identity, lease.timeout_millis(), self.inspector);
+        let wait = wait_for_child(
+            child_identity,
+            remaining_lease_millis(lease)?,
+            self.inspector,
+        );
         std::thread::sleep(Duration::from_secs(1));
         let pump_result = pump.stop_and_join();
         let stderr = job.open_private_append("stderr.log")?;
@@ -3469,6 +3597,12 @@ unsafe fn gated_child_main(
         unsafe { libc::_exit(70) };
     }
     unsafe { libc::close(go) };
+    // Setup and other Rust work must not run here. This function is the
+    // raw post-fork child of a multithreaded supervisor; only async-signal-
+    // safe work is allowed until execve. The prepared argv is a freshly
+    // exec'd helper that may then run setup and exec the agent in this
+    // same recorded PID/process group. exec_result is CLOEXEC, so a
+    // successful helper exec proves launch to the parent.
     unsafe {
         libc::execve(
             command.program.as_ptr(),
@@ -4272,8 +4406,137 @@ fn prelaunch_error_code(error: &WorkerError) -> &'static str {
         WorkerError::Protocol(message) if message.starts_with("CHILD_IDENTITY_AMBIGUOUS:") => {
             "CHILD_IDENTITY_AMBIGUOUS"
         }
+        WorkerError::Task {
+            code: "SETUP_FAILED",
+            ..
+        } => "SETUP_FAILED",
+        WorkerError::Task {
+            code: "SETUP_TIMEOUT",
+            ..
+        } => "SETUP_TIMEOUT",
+        WorkerError::Task {
+            code: "SETUP_CANCELLED",
+            ..
+        } => "SETUP_CANCELLED",
         _ => "COMMAND_PREPARATION_FAILED",
     }
+}
+
+fn remaining_lease_millis(lease: &LeaseRecord) -> Result<u64, WorkerError> {
+    Ok(lease.expires_at_millis().saturating_sub(now_millis()?))
+}
+
+fn terminal_from_setup_or_outcome(
+    current_status: &JobStatus,
+    outcome: ChildOutcome,
+    setup: Option<crate::project_readiness::SetupStageResult>,
+    stdout_length: u64,
+    stderr_length: u64,
+) -> Result<
+    (
+        JobStatus,
+        crate::task::TurnTerminal,
+        Option<i32>,
+        TerminalPath,
+    ),
+    WorkerError,
+> {
+    let now = now_millis()?;
+    if let Some(setup) = setup {
+        return match setup.code.as_str() {
+            "SETUP_TIMEOUT" => Ok((
+                current_status.into_infrastructure_terminal(
+                    JobState::TimedOut,
+                    now,
+                    stdout_length,
+                    stderr_length,
+                    "SETUP_TIMEOUT".into(),
+                )?,
+                crate::task::TurnTerminal::TimedOut,
+                None,
+                TerminalPath::Timeout,
+            )),
+            "SETUP_CANCELLED" => Ok((
+                current_status.into_infrastructure_terminal(
+                    JobState::Cancelled,
+                    now,
+                    stdout_length,
+                    stderr_length,
+                    "SETUP_CANCELLED".into(),
+                )?,
+                crate::task::TurnTerminal::Cancelled,
+                None,
+                TerminalPath::HostCancel,
+            )),
+            "SETUP_FAILED" => Ok((
+                current_status.into_infrastructure_terminal(
+                    JobState::Lost,
+                    now,
+                    stdout_length,
+                    stderr_length,
+                    "SETUP_FAILED".into(),
+                )?,
+                crate::task::TurnTerminal::Lost,
+                None,
+                TerminalPath::PrelaunchFailure,
+            )),
+            _ => outcome_terminal(current_status, outcome, now, stdout_length, stderr_length),
+        };
+    }
+    outcome_terminal(current_status, outcome, now, stdout_length, stderr_length)
+}
+
+fn outcome_terminal(
+    current_status: &JobStatus,
+    outcome: ChildOutcome,
+    now: u64,
+    stdout_length: u64,
+    stderr_length: u64,
+) -> Result<
+    (
+        JobStatus,
+        crate::task::TurnTerminal,
+        Option<i32>,
+        TerminalPath,
+    ),
+    WorkerError,
+> {
+    match outcome {
+        ChildOutcome::Exited(0) => Ok((
+            current_status.into_succeeded(now, stdout_length, stderr_length)?,
+            crate::task::TurnTerminal::Succeeded,
+            Some(0),
+            TerminalPath::ChildExit(0),
+        )),
+        ChildOutcome::Exited(code) => Ok((
+            current_status.into_failed_exit(now, code, stdout_length, stderr_length)?,
+            crate::task::TurnTerminal::Failed,
+            Some(i32::from(code)),
+            TerminalPath::ChildExit(i32::from(code)),
+        )),
+        ChildOutcome::Signalled(signal) => Ok((
+            current_status.into_failed_signal(now, signal, stdout_length, stderr_length)?,
+            crate::task::TurnTerminal::Cancelled,
+            None,
+            TerminalPath::ChildExit(outcome_code(ChildOutcome::Signalled(signal))),
+        )),
+        ChildOutcome::TimedOut => Ok((
+            current_status.into_infrastructure_terminal(
+                JobState::TimedOut,
+                now,
+                stdout_length,
+                stderr_length,
+                "COMMAND_TIMEOUT".into(),
+            )?,
+            crate::task::TurnTerminal::TimedOut,
+            None,
+            TerminalPath::Timeout,
+        )),
+    }
+}
+
+fn prepare_turn_executable() -> Result<PathBuf, WorkerError> {
+    std::env::current_exe().map_err(WorkerError::Io)
 }
 
 #[cfg(test)]
@@ -4293,6 +4556,7 @@ mod tests {
     use crate::{
         agent::{AgentKind, PermissionPolicy, TurnLimits},
         job::RequestFingerprintMaterial,
+        project_readiness::SETUP_STAGE_EXIT_CODE,
         task::{BaseOid, GitIdentity, TaskId},
         turn::TurnMaterial,
     };
@@ -6428,6 +6692,325 @@ mod tests {
 
         assert!(matches!(outcome, ChildOutcome::Exited(code) if code != 0));
         assert_eq!(fs::metadata(planted_path).unwrap().len(), 0);
+    }
+
+    fn pid_alive(pid: libc::pid_t) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    const PREPARE_TURN_HELPER_TEST: &str = "supervisor::tests::prepare_turn_helper_process";
+
+    #[test]
+    fn prepare_turn_helper_process() {
+        if std::env::var_os("MAC_WORKER_PREPARE_TURN_HELPER").is_none() {
+            return;
+        }
+        std::process::exit(i32::from(crate::prepare_turn::run_from_env_agent()));
+    }
+
+    struct GatedSetupFixture {
+        _temp: tempfile::TempDir,
+        workspace: PathBuf,
+        turn_dir: PathBuf,
+        account: PathBuf,
+        outcome: ChildOutcome,
+        elapsed: Duration,
+    }
+
+    fn run_gated_setup_through_worker_helper(setup_toml: &str) -> GatedSetupFixture {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        run_gated_setup_at(setup_toml, now, 20_000)
+    }
+
+    fn run_gated_setup_at(
+        setup_toml: &str,
+        created_at_millis: u64,
+        turn_timeout_millis: u64,
+    ) -> GatedSetupFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join(".worker.toml"), setup_toml).unwrap();
+        let turn_dir = temp.path().join("turn");
+        RootedDir::create(&turn_dir).unwrap();
+        let account = temp.path().join("account");
+        fs::create_dir_all(&account).unwrap();
+        fs::set_permissions(&account, fs::Permissions::from_mode(0o700)).unwrap();
+        let stdio = temp.path().join("stdio");
+        fs::create_dir_all(&stdio).unwrap();
+
+        let command =
+            CommandSpec::shell("PATH=/bin:/usr/bin printf ran > agent.ran".to_owned()).unwrap();
+        let project_id = "aa".repeat(32);
+        let material = RequestFingerprintMaterial::new(
+            "018f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
+            "102f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
+            "202f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
+            created_at_millis,
+            "mini-1".into(),
+            project_id,
+            "bb".repeat(32),
+            "cc".repeat(32),
+            String::new(),
+            turn_timeout_millis,
+            "heavy".into(),
+            command.clone(),
+        )
+        .unwrap();
+        let lease = LeaseRecord::new(
+            &material,
+            material.fingerprint(),
+            created_at_millis,
+            created_at_millis + turn_timeout_millis,
+        )
+        .unwrap();
+        let section = pump_turn_section();
+        let plan = LaunchPlan::turn_at(
+            &command,
+            &lease,
+            &section,
+            &account,
+            &EnvProfile::empty(),
+            section.git_identity(),
+            &turn_dir,
+            &workspace,
+        )
+        .unwrap()
+        .with_libtest_prepare_helper(PREPARE_TURN_HELPER_TEST);
+        assert_eq!(
+            plan.program(),
+            std::env::current_exe().unwrap().to_str().unwrap()
+        );
+        assert_eq!(plan.args()[1], "--exact");
+        assert_eq!(plan.args()[2], PREPARE_TURN_HELPER_TEST);
+        let encoded = plan
+            .env()
+            .iter()
+            .find(|(name, _)| name == "MAC_WORKER_PREPARE_TURN_AGENT")
+            .map(|(_, value)| value.clone())
+            .expect("libtest helper encodes agent argv");
+        assert!(
+            !encoded.as_bytes().contains(&0),
+            "helper argv encoding must be NUL-free"
+        );
+        let decoded: Vec<String> =
+            serde_json::from_str(encoded.to_str().expect("helper argv JSON is UTF-8"))
+                .expect("helper argv is JSON");
+        assert_eq!(
+            decoded,
+            vec![
+                "/bin/zsh".to_owned(),
+                "-lc".into(),
+                "PATH=/bin:/usr/bin printf ran > agent.ran".into(),
+            ]
+        );
+        let prepared = PreparedCommand::from_plan(&plan).unwrap();
+        let cwd = File::open(&workspace).unwrap();
+        let stdout = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(stdio.join("stdout"))
+            .unwrap();
+        let stderr = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(stdio.join("stderr"))
+            .unwrap();
+        let mut child = GatedChild::spawn(
+            &prepared,
+            cwd.as_raw_fd(),
+            stdout.as_raw_fd(),
+            stderr.as_raw_fd(),
+            &SystemProcessInspector,
+        )
+        .unwrap();
+        child.allow_exec(None).unwrap();
+        let started = Instant::now();
+        let outcome = wait_for_child(
+            child.identity(),
+            turn_timeout_millis,
+            &SystemProcessInspector,
+        )
+        .unwrap();
+        GatedSetupFixture {
+            _temp: temp,
+            workspace,
+            turn_dir,
+            account,
+            outcome,
+            elapsed: started.elapsed(),
+        }
+    }
+
+    fn assert_setup_stage_failed_without_agent(fixture: &GatedSetupFixture, expected_code: &str) {
+        assert!(
+            fixture.elapsed < Duration::from_secs(3),
+            "setup waited {:?}, expected recipe-bounded completion",
+            fixture.elapsed
+        );
+        assert!(
+            matches!(
+                fixture.outcome,
+                ChildOutcome::Exited(code) if code == SETUP_STAGE_EXIT_CODE
+            ),
+            "{:?}",
+            fixture.outcome
+        );
+        let grandchild: libc::pid_t = {
+            let path = fixture.workspace.join("grandchild.pid");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(bytes) = fs::read(&path)
+                    && let Ok(pid) = String::from_utf8_lossy(&bytes)
+                        .trim()
+                        .parse::<libc::pid_t>()
+                {
+                    break pid;
+                }
+                if Instant::now() >= deadline {
+                    panic!("setup grandchild pid was not recorded");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let gone = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < gone && pid_alive(grandchild) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !pid_alive(grandchild),
+            "setup grandchild {grandchild} still alive after recorded-child cleanup"
+        );
+        assert!(
+            !fixture.workspace.join("agent.ran").exists(),
+            "agent launched after setup {expected_code}"
+        );
+        let turn = RootedDir::open(&fixture.turn_dir).unwrap();
+        let setup = load_setup_stage_result(&turn)
+            .unwrap()
+            .expect("setup-result");
+        assert_eq!(setup.code, expected_code);
+        let cache = fixture
+            .account
+            .join(".cache")
+            .join("mac-worker")
+            .join("project-setup");
+        if cache.is_dir() {
+            let receipts: Vec<_> = fs::read_dir(&cache)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().ends_with(".json"))
+                .collect();
+            assert!(
+                receipts.is_empty(),
+                "{expected_code} published {receipts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gated_child_setup_timeout_reaps_grandchild_without_agent_or_receipt() {
+        let fixture = run_gated_setup_through_worker_helper(
+            r#"
+[setup]
+timeout = "400ms"
+commands = ["PATH=/bin:/usr/bin printf $$ > leader.pid; /bin/sleep 60 & printf $! > grandchild.pid; wait"]
+"#,
+        );
+        assert_setup_stage_failed_without_agent(&fixture, "SETUP_TIMEOUT");
+    }
+
+    #[test]
+    fn gated_child_setup_output_cap_reaps_grandchild_without_agent_or_receipt() {
+        let fixture = run_gated_setup_through_worker_helper(
+            r#"
+[setup]
+timeout = "10s"
+commands = ["PATH=/bin:/usr/bin /bin/sleep 60 & printf $! > grandchild.pid; while :; do printf 0123456789; done"]
+"#,
+        );
+        assert_setup_stage_failed_without_agent(&fixture, "SETUP_FAILED");
+    }
+
+    #[test]
+    fn epoch_near_lease_does_not_renew_a_full_execution_budget() {
+        let command = CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap();
+        let material = RequestFingerprintMaterial::new(
+            "018f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
+            "102f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
+            "202f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
+            100,
+            "mini-1".into(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+            String::new(),
+            30_000,
+            "heavy".into(),
+            command,
+        )
+        .unwrap();
+        let lease = LeaseRecord::new(&material, material.fingerprint(), 1, 2).unwrap();
+        assert_eq!(
+            remaining_lease_millis(&lease).unwrap(),
+            0,
+            "epoch-near constructor fixtures must not receive timeout_millis as a fresh budget"
+        );
+    }
+
+    #[test]
+    fn expired_wall_clock_lease_does_not_renew_setup_or_agent_budget() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let created = now.saturating_sub(60_000);
+        let timeout = 10_000_u64;
+        let fixture = run_gated_setup_at(
+            r#"
+[setup]
+timeout = "20s"
+commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
+"#,
+            created,
+            timeout,
+        );
+        assert!(
+            fixture.elapsed < Duration::from_secs(3),
+            "expired lease waited {:?}, expected immediate setup timeout",
+            fixture.elapsed
+        );
+        assert!(
+            matches!(
+                fixture.outcome,
+                ChildOutcome::Exited(code) if code == SETUP_STAGE_EXIT_CODE
+            ),
+            "{:?}",
+            fixture.outcome
+        );
+        assert!(!fixture.workspace.join("setup.done").exists());
+        assert!(!fixture.workspace.join("agent.ran").exists());
+        let turn = RootedDir::open(&fixture.turn_dir).unwrap();
+        let setup = load_setup_stage_result(&turn)
+            .unwrap()
+            .expect("setup-result");
+        assert_eq!(setup.code, "SETUP_TIMEOUT");
+        let cache = fixture
+            .account
+            .join(".cache")
+            .join("mac-worker")
+            .join("project-setup");
+        if cache.is_dir() {
+            let receipts: Vec<_> = fs::read_dir(&cache)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().ends_with(".json"))
+                .collect();
+            assert!(receipts.is_empty(), "expired prep published {receipts:?}");
+        }
     }
 
     #[test]

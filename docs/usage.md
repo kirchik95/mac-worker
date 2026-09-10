@@ -34,7 +34,7 @@ Recognised keys include `CURSOR_API_KEY`, and the host-only `MAC_WORKER_KEYCHAIN
 
 ```text
 worker task submit   --agent <a> (--prompt TEXT | --prompt-file PATH) [--wait] [--model M] [--effort E]
-worker task batch    tasks.toml [--max-parallel N] [--wait]      # several tasks as one named run
+worker task batch    tasks.toml [--max-parallel N] [--wait] [--preview]
 worker task list     [--run ID|NAME] [--state open] [--outcome needs-input]
 worker task status   <id>          worker task logs <id> [-f]     worker task diff <id> --stat
 worker task wait     --task-id <id> | --run <ID|NAME> [--timeout 30m]
@@ -86,7 +86,16 @@ source = "local"            # or "origin": start from the exact commit on your G
 publish = ["fetch"]         # add "push" to also push task/<id> to origin
 timeout = "45m"
 max_followups = 10
+
+[setup]
+commands = ["cargo fetch --locked"]
+check = "cargo fetch --locked --offline"   # current workspace only
+lockfiles = ["Cargo.lock"]
 ```
+
+Optional `[setup]` runs in the task workspace with the same account and env-profile as the agent, before the agent starts. Absent `[setup]` keeps today's defaults. `check` proves **this** workspace is ready; a matching identity in another worktree is not skip proof. Toolchains stay user-owned.
+
+`worker task batch FILE --preview` resolves agent/model/worker, declared files, acceptance, and setup without creating tasks, opening client state, or talking to workers. This version can preview `depends_on` but cannot execute them; submit of a non-empty `depends_on` is rejected. Declared `files` are advisory overlap hints. Declared `acceptance` is copied into the agent prompt as instructions, not proven by mac-worker.
 
 To use the exact base commit from your Git remote and push the result branch back to that remote, change these project settings:
 

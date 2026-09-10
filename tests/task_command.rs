@@ -75,6 +75,7 @@ fn task_commands_parse_the_documented_forms() {
         ],
         vec!["worker", "task", "wait", "--timeout", "1s"],
         vec!["worker", "task", "batch", "tasks.toml"],
+        vec!["worker", "task", "batch", "tasks.toml", "--preview"],
     ] {
         Cli::try_parse_from(arguments).expect("documented task form must parse");
     }
@@ -257,6 +258,60 @@ prompt = "x"
         conflicting.is_err(),
         "mixed top-level and [defaults] keys must be rejected"
     );
+}
+
+#[test]
+fn batch_preview_conflicts_with_wait() {
+    assert!(
+        Cli::try_parse_from([
+            "worker",
+            "task",
+            "batch",
+            "tasks.toml",
+            "--preview",
+            "--wait"
+        ])
+        .is_err()
+    );
+    let parsed =
+        Cli::try_parse_from(["worker", "task", "batch", "tasks.toml", "--preview"]).unwrap();
+    assert!(matches!(
+        parsed.command,
+        Command::Task {
+            command: TaskCommand::Batch {
+                preview: true,
+                wait: false,
+                ..
+            }
+        }
+    ));
+}
+
+#[test]
+fn batch_file_carries_declared_files_acceptance_and_depends_on() {
+    let parsed: BatchFile = toml::from_str(
+        r#"
+version = 1
+agent = "codex"
+
+[[tasks]]
+id = "login"
+prompt = "fix login"
+files = ["src/login.rs"]
+acceptance = ["cargo test -p login"]
+
+[[tasks]]
+id = "billing"
+prompt = "extract billing"
+files = ["src/login.rs", "src/billing.rs"]
+depends_on = ["login"]
+"#,
+    )
+    .expect("batch metadata fields must parse");
+    assert_eq!(parsed.tasks[0].id.as_deref(), Some("login"));
+    assert_eq!(parsed.tasks[0].files, vec!["src/login.rs"]);
+    assert_eq!(parsed.tasks[0].acceptance, vec!["cargo test -p login"]);
+    assert_eq!(parsed.tasks[1].depends_on, vec!["login"]);
 }
 
 #[test]

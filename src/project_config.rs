@@ -14,6 +14,11 @@ use crate::error::WorkerError;
 
 const PROJECT_CONFIG: &str = ".worker.toml";
 const DEFAULT_TIMEOUT: &str = "30m";
+const DEFAULT_SETUP_TIMEOUT: &str = "10m";
+const MAX_SETUP_COMMANDS: usize = 16;
+const MAX_SETUP_COMMAND_BYTES: usize = 4096;
+const MAX_SETUP_LOCKFILES: usize = 32;
+const MAX_SETUP_INPUTS: usize = 32;
 const PROJECT_CONFIG_OPEN_FLAGS: libc::c_int =
     libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
@@ -25,6 +30,7 @@ pub struct ProjectSettings {
     pub snapshot: SnapshotSettings,
     pub artifacts: ArtifactSettings,
     pub task: TaskSettings,
+    pub setup: Option<SetupSettings>,
 }
 
 /// The part of `.worker.toml` that controls the phase-five task client.
@@ -62,6 +68,16 @@ pub struct ArtifactSettings {
     pub max_total_bytes: Option<u64>,
 }
 
+/// Optional project setup recipe. Absent means no commands and no cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupSettings {
+    pub timeout: Duration,
+    pub commands: Vec<String>,
+    pub check: Option<String>,
+    pub lockfiles: Vec<String>,
+    pub inputs: Vec<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProjectSettings {
@@ -79,6 +95,8 @@ struct RawProjectSettings {
     artifacts: RawArtifactSettings,
     #[serde(default)]
     task: RawTaskSettings,
+    #[serde(default)]
+    setup: Option<RawSetupSettings>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -99,6 +117,21 @@ struct RawArtifactSettings {
     include: Vec<String>,
     #[serde(default)]
     max_total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSetupSettings {
+    #[serde(default = "default_setup_timeout")]
+    timeout: String,
+    #[serde(default)]
+    commands: Vec<String>,
+    #[serde(default)]
+    check: Option<String>,
+    #[serde(default)]
+    lockfiles: Vec<String>,
+    #[serde(default)]
+    inputs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,10 +186,14 @@ impl ProjectSettings {
             None => default_project_settings(),
         };
 
-        Self::validate(raw, cli_includes)
+        Self::validate(root, raw, cli_includes)
     }
 
-    fn validate(raw: RawProjectSettings, cli_includes: &[String]) -> Result<Self, WorkerError> {
+    fn validate(
+        root: &Path,
+        raw: RawProjectSettings,
+        cli_includes: &[String],
+    ) -> Result<Self, WorkerError> {
         if raw.version != 1 {
             return Err(WorkerError::Config(
                 "unsupported project configuration version".into(),
@@ -186,6 +223,10 @@ impl ProjectSettings {
         validate_patterns(cli_includes, "CLI include")?;
 
         let task = validate_task_settings(raw.task)?;
+        let setup = raw.setup.map(validate_setup_settings).transpose()?;
+        if let Some(setup) = &setup {
+            verify_setup_lockfiles_exist(root, setup)?;
+        }
 
         Ok(Self {
             requires: raw.requires,
@@ -204,6 +245,7 @@ impl ProjectSettings {
                 max_total_bytes: raw.artifacts.max_total_bytes,
             },
             task,
+            setup,
         })
     }
 }
@@ -279,6 +321,10 @@ fn default_timeout() -> String {
     DEFAULT_TIMEOUT.to_owned()
 }
 
+fn default_setup_timeout() -> String {
+    DEFAULT_SETUP_TIMEOUT.to_owned()
+}
+
 fn default_task_source() -> String {
     "local".to_owned()
 }
@@ -306,6 +352,82 @@ fn default_task_permissions() -> BTreeMap<String, String> {
         ("cursor".to_owned(), "unattended".to_owned()),
         ("opencode".to_owned(), "unattended".to_owned()),
     ])
+}
+
+fn validate_setup_settings(raw: RawSetupSettings) -> Result<SetupSettings, WorkerError> {
+    let timeout = humantime::parse_duration(&raw.timeout)
+        .map_err(|_| WorkerError::Config("invalid setup timeout".into()))?;
+    if timeout.is_zero() || timeout > Duration::from_secs(24 * 60 * 60) {
+        return Err(WorkerError::Config(
+            "setup timeout must be greater than zero and at most 24h".into(),
+        ));
+    }
+    if raw.commands.len() > MAX_SETUP_COMMANDS {
+        return Err(WorkerError::Config("too many setup commands".into()));
+    }
+    if raw.lockfiles.len() > MAX_SETUP_LOCKFILES {
+        return Err(WorkerError::Config("too many setup lockfiles".into()));
+    }
+    if raw.inputs.len() > MAX_SETUP_INPUTS {
+        return Err(WorkerError::Config("too many setup inputs".into()));
+    }
+    for command in &raw.commands {
+        validate_setup_command(command, "setup command")?;
+    }
+    if let Some(check) = &raw.check {
+        validate_setup_command(check, "setup check")?;
+    }
+    let lockfiles = unique_setup_paths(raw.lockfiles, "setup lockfile")?;
+    let inputs = unique_setup_paths(raw.inputs, "setup input")?;
+    Ok(SetupSettings {
+        timeout,
+        commands: raw.commands,
+        check: raw.check,
+        lockfiles,
+        inputs,
+    })
+}
+
+fn validate_setup_command(command: &str, field: &str) -> Result<(), WorkerError> {
+    if command.is_empty()
+        || command.len() > MAX_SETUP_COMMAND_BYTES
+        || command.chars().any(char::is_control)
+    {
+        return Err(WorkerError::Config(format!(
+            "{field} is empty, too long, or contains a control character"
+        )));
+    }
+    Ok(())
+}
+
+fn unique_setup_paths(paths: Vec<String>, field: &str) -> Result<Vec<String>, WorkerError> {
+    let mut seen = HashSet::new();
+    for path in &paths {
+        validate_relative_path(path, field)?;
+        if contains_glob_metacharacter(path) {
+            return Err(WorkerError::Config(format!(
+                "{field} path must not contain glob metacharacters"
+            )));
+        }
+        if !seen.insert(path) {
+            return Err(WorkerError::Config(format!("duplicate {field}")));
+        }
+    }
+    Ok(paths)
+}
+
+fn verify_setup_lockfiles_exist(root: &Path, setup: &SetupSettings) -> Result<(), WorkerError> {
+    for path in setup.lockfiles.iter().chain(setup.inputs.iter()) {
+        let metadata = fs::symlink_metadata(root.join(path)).map_err(|_| {
+            WorkerError::Config("setup lockfile or input is missing or not a regular file".into())
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(WorkerError::Config(
+                "setup lockfile or input is missing or not a regular file".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_task_settings(raw: RawTaskSettings) -> Result<TaskSettings, WorkerError> {
@@ -432,10 +554,17 @@ fn validate_exact_paths(paths: &[String], field: &str) -> Result<(), WorkerError
     Ok(())
 }
 
+pub(crate) fn validate_preview_path(value: &str) -> Result<(), WorkerError> {
+    validate_relative_path(value, "batch files")
+}
+
 fn validate_relative_path(value: &str, field: &str) -> Result<(), WorkerError> {
     if value.is_empty()
         || value.starts_with('/')
-        || value.split('/').any(|part| part == "." || part == "..")
+        || value.ends_with('/')
+        || value
+            .split('/')
+            .any(|part| part == "." || part == ".." || part.is_empty())
     {
         return Err(WorkerError::Config(format!(
             "{field} path must be a precise relative path"

@@ -89,12 +89,12 @@ impl ProcessRunner for RecordingRunner {
 
         let stdout = match (program.as_ref(), args.as_slice()) {
             ("zsh", [shell, command])
-                if shell == "-lc" && command == "git config --get user.name" =>
+                if shell == "-lc" && command == "git config --global --get user.name" =>
             {
                 b"Worker Account\n".to_vec()
             }
             ("zsh", [shell, command])
-                if shell == "-lc" && command == "git config --get user.email" =>
+                if shell == "-lc" && command == "git config --global --get user.email" =>
             {
                 b"worker@example.test\n".to_vec()
             }

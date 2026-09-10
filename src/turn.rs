@@ -1967,6 +1967,8 @@ fn worker_controlled_env_name(name: &str) -> bool {
             | "MAC_WORKER_WORKTREE_ID"
             | "MAC_WORKER_TASK_ID"
             | "MAC_WORKER_TURN"
+            | "MAC_WORKER_LEASE_DEADLINE_MILLIS"
+            | "MAC_WORKER_ENV_PROFILE"
             | "GIT_AUTHOR_NAME"
             | "GIT_AUTHOR_EMAIL"
             | "GIT_COMMITTER_NAME"

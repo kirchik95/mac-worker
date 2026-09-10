@@ -21,7 +21,7 @@ use crate::{
     error::{ProcessError, WorkerError},
     herdr::{HerdrClient, HerdrError, HerdrSocket, ListedAgent, RESPONSE_DEADLINE},
     herdr_reporter::DISPLAY_AGENT,
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+    process::{ProcessPolicy, ProcessResult, ProcessRunner},
 };
 
 /// Agent facts remain usable for fifteen minutes before a runner must refresh them.
@@ -1063,7 +1063,7 @@ where
     AgentFacts {
         agents,
         env_profiles,
-        git_identity: collect_git_identity(runner),
+        git_identity: collect_git_identity(runner, account_home),
         collected_at_millis,
         herdr: Some(collect_herdr_facts(runner, account_home, timing)),
     }
@@ -1407,24 +1407,6 @@ fn probe_policy() -> ProcessPolicy {
     }
 }
 
-fn run_process(
-    runner: &dyn ProcessRunner,
-    program: OsString,
-    args: Vec<OsString>,
-    environment: Vec<(OsString, OsString)>,
-) -> Option<ProcessResult> {
-    let request = ProcessRequest {
-        program,
-        args,
-        environment,
-        environment_remove: Vec::new(),
-        stdin: None,
-        policy: probe_policy(),
-        isolate_parent_environment: false,
-    };
-    runner.run(&request).ok()
-}
-
 fn unlock_for_probe(
     runner: &dyn ProcessRunner,
     config: &crate::keychain::KeychainUnlockConfig,
@@ -1510,17 +1492,15 @@ fn truncate_text_to(value: &str, limit: usize) -> String {
     value[..end].to_owned()
 }
 
-fn collect_git_identity(runner: &dyn ProcessRunner) -> bool {
+fn collect_git_identity(runner: &dyn ProcessRunner, account_home: &Path) -> bool {
     ["user.name", "user.email"].into_iter().all(|key| {
-        let Some(result) = run_process(
-            runner,
-            OsString::from("zsh"),
-            vec![
-                OsString::from("-lc"),
-                OsString::from(format!("git config --get {key}")),
-            ],
-            Vec::new(),
-        ) else {
+        let request = account_login_shell_request(
+            account_home,
+            &[],
+            &format!("git config --global --get {key}"),
+            probe_policy(),
+        );
+        let Ok(result) = runner.run(&request) else {
             return false;
         };
         result.status.success()
@@ -1700,6 +1680,41 @@ mod intern_tests {
         assert!(known_auth_reason(crate::auth_incidents::AUTH_INCIDENT_REASON).is_some());
         assert!(
             known_auth_reason(crate::auth_incidents::AUTH_INCIDENTS_UNREADABLE_REASON).is_some()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use tempfile::tempdir;
+
+    use super::collect_git_identity;
+    use crate::process::SystemProcessRunner;
+
+    #[test]
+    fn collect_git_identity_uses_account_home_not_ambient_home() {
+        let temp = tempdir().unwrap();
+        let empty_account = temp.path().join("empty-account");
+        fs::create_dir_all(&empty_account).unwrap();
+        fs::set_permissions(&empty_account, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !collect_git_identity(&SystemProcessRunner, &empty_account),
+            "empty account HOME must not inherit the developer's git identity"
+        );
+
+        let configured = temp.path().join("configured-account");
+        fs::create_dir_all(&configured).unwrap();
+        fs::set_permissions(&configured, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            configured.join(".gitconfig"),
+            "[user]\n    name = Ada Lovelace\n    email = ada@example.test\n",
+        )
+        .unwrap();
+        assert!(
+            collect_git_identity(&SystemProcessRunner, &configured),
+            "account .gitconfig name+email must count as a configured identity"
         );
     }
 }
