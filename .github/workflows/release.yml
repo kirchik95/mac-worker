@@ -9,11 +9,35 @@ permissions:
   contents: write
 
 jobs:
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+        working-directory: ui
+      - run: npm test
+        working-directory: ui
+      - run: npm run lint
+        working-directory: ui
+      - name: Verify embedded dashboard assets
+        shell: bash
+        run: |
+          asset_dir="$(mktemp -d "${RUNNER_TEMP}/dashboard-ui.XXXXXX")"
+          trap 'rm -rf "$asset_dir"' EXIT
+          (cd ui && npm run build -- --outDir "$asset_dir")
+          diff -r "$asset_dir" src/dashboard/static/app
+
   build-draft:
-    runs-on: macos-14
+    needs: ui
+    runs-on: macos-15
     steps:
       - name: Check out the tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust quality components
         run: rustup component add rustfmt clippy
