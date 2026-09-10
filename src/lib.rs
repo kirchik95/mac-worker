@@ -1003,7 +1003,7 @@ fn run_task_subcommand(
             Ok(report.exit_code())
         }
         TaskCommand::Reconcile => {
-            let report = client.reconcile_runners()?;
+            let report = client.operator_reconcile()?;
             if json {
                 write_json_line(
                     stdout,

@@ -163,6 +163,9 @@ impl ClientStateStore {
         if entry.kind() != QueueEntryKind::TaskTurn
             || entry.is_cancel_requested()
             || entry.preacceptance_abandonment_proof().is_some()
+            || entry
+                .replacement_failure()
+                .is_some_and(crate::job::ReplacementFailureBudget::should_park)
             || record.submission_intent_turn_id().is_some()
             || record.submission_rollback_turn_id().is_some()
             || record.abandon_code() == Some("SUBMISSION_ROLLBACK_INCOMPLETE")

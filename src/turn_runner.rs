@@ -256,8 +256,15 @@ impl<'a> TurnRunner<'a> {
                 }
             }
         })();
-        if let Err(error) = &result {
-            let _ = self.write_early_exit_diagnostic(task_id, turn_id, error);
+        if let Err(error) = &result
+            && let (Ok(true), Ok(now)) = (
+                self.write_early_exit_diagnostic(task_id, turn_id, error),
+                now_millis(),
+            )
+        {
+            let _ =
+                self.client_state
+                    .record_replacement_failure(turn_id, &error.public_code(), now);
         }
         result
     }
@@ -306,7 +313,7 @@ impl<'a> TurnRunner<'a> {
         task_id: TaskId,
         turn_id: TurnId,
         error: &WorkerError,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<bool, WorkerError> {
         let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
         let after_acceptance = log.len() > 0;
         let workers = self
@@ -332,7 +339,8 @@ impl<'a> TurnRunner<'a> {
                 &workers,
             )
             .as_bytes(),
-        )
+        )?;
+        Ok(after_acceptance)
     }
 
     fn start_next_parked(&self, owner: ProcessIdentity) -> Result<(), WorkerError> {
@@ -1942,6 +1950,29 @@ fn early_exit_diagnostic_line(
     line
 }
 
+/// Last `exited after acceptance:` public code in a runner journal.
+///
+/// Reconcile uses this when the queue row has no restart budget yet: the
+/// diagnostic is the durable signal that a replacement already died, and
+/// parsing it avoids a second on-disk record besides the queue field.
+pub(crate) fn last_post_acceptance_public_code(log: &[u8]) -> Option<&str> {
+    const PREFIX: &str = "exited after acceptance: ";
+    let text = std::str::from_utf8(log).ok()?;
+    for line in text.lines().rev() {
+        let Some(rest) = line.strip_prefix(PREFIX) else {
+            continue;
+        };
+        let code = rest
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("error="))
+            .or_else(|| rest.split_whitespace().next())?;
+        if crate::error::is_stable_public_code(code) {
+            return Some(code);
+        }
+    }
+    None
+}
+
 fn capacity_busy() -> WorkerError {
     WorkerError::capacity(
         "CAPACITY_BUSY",
@@ -2091,7 +2122,7 @@ fn fallback_process_identity(pid: u32) -> Result<ProcessIdentity, WorkerError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{early_exit_diagnostic_line, turn_exit_code};
+    use super::{early_exit_diagnostic_line, last_post_acceptance_public_code, turn_exit_code};
     use crate::task::TaskOutcome;
 
     #[test]
@@ -2175,6 +2206,17 @@ mod tests {
                 &["mini-1"],
             ),
             "exited after acceptance: PROJECT_MISMATCH message=current project is not the task's project workers=mini-1\n"
+        );
+    }
+
+    #[test]
+    fn last_post_acceptance_code_prefers_the_error_field_on_the_latest_line() {
+        let log = b"exited after acceptance: WAITING_FOR_DISPATCH error=HOST_IO message=x workers=mini-1\n\
+exited after acceptance: HOST_IO message=again workers=mini-1\n";
+        assert_eq!(last_post_acceptance_public_code(log), Some("HOST_IO"));
+        assert_eq!(
+            last_post_acceptance_public_code(b"exited: CAPACITY_BUSY workers=mini-1\n"),
+            None
         );
     }
 

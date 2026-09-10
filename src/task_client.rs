@@ -35,7 +35,10 @@ use crate::{
     },
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
-    turn_runner::{DetachedRunnerExecutor, RunnerExecutor, TurnRunner, adopt_row_with_retry},
+    turn_runner::{
+        DetachedRunnerExecutor, RunnerExecutor, TurnRunner, adopt_row_with_retry,
+        last_post_acceptance_public_code,
+    },
 };
 
 const TASK_COMMAND: &str = "task-turn";
@@ -1201,8 +1204,24 @@ impl<'a> TaskClient<'a> {
     }
 
     pub fn reconcile_runners(&self) -> Result<ReconcileReport, WorkerError> {
+        self.reconcile_runners_inner(false)
+    }
+
+    /// Operator-driven `worker task reconcile`: clears the restart budget and
+    /// retries once instead of waiting out backoff or leaving a parked row.
+    pub fn operator_reconcile(&self) -> Result<ReconcileReport, WorkerError> {
+        self.reconcile_runners_inner(true)
+    }
+
+    fn reconcile_runners_inner(
+        &self,
+        reset_failure_budget: bool,
+    ) -> Result<ReconcileReport, WorkerError> {
         let mut report = ReconcileReport::default();
         let owner = current_process_identity()?;
+        if reset_failure_budget {
+            self.client_state.reset_replacement_failures(owner)?;
+        }
         self.client_state.recover_replacement_residue()?;
 
         // A submit can fail while compensating its locally-created state. The
@@ -1476,6 +1495,24 @@ impl<'a> TaskClient<'a> {
                 {
                     continue;
                 }
+                // An explicit operator reconcile just cleared the budget so
+                // this pass can retry. Old diagnostic lines must not rebuild
+                // it and put the row back into backoff.
+                if !reset_failure_budget {
+                    self.observe_replacement_failure(record.meta().task_id(), turn_id)?;
+                }
+                let Some(current_entry) = self.client_state.queue_entry(turn_id)? else {
+                    continue;
+                };
+                if let Some(budget) = current_entry.replacement_failure() {
+                    if budget.should_park() {
+                        self.park_repeated_replacement_failure(turn_id, record.meta().task_id())?;
+                        continue;
+                    }
+                    if !budget.backoff_elapsed(current_time_millis()?) {
+                        continue;
+                    }
+                }
                 if self.live_runner_count()? < self.config.workers.len() {
                     self.start_runner(record.meta().task_id(), turn_id)?;
                     report.started_runners += 1;
@@ -1691,8 +1728,16 @@ impl<'a> TaskClient<'a> {
                 .retain_task_turn_cancel(turn_id, current_time_millis()?)?
             {
                 Some(entry) if !matches!(entry.state(), QueueState::Dispatching { .. }) => {
-                    self.finish_waiting_cancellation(&record, &entry)?;
-                    return self.report_for(task_id);
+                    // An accepted turn parked after repeated replacement deaths
+                    // still has a remote job. Local pre-acceptance finish would
+                    // reject its journal; cancel it on the worker instead.
+                    if !entry
+                        .replacement_failure()
+                        .is_some_and(|budget| budget.should_park())
+                    {
+                        self.finish_waiting_cancellation(&record, &entry)?;
+                        return self.report_for(task_id);
+                    }
                 }
                 Some(_) => return Err(task_error("TASK_BUSY", "task turn is being dispatched")),
                 None if entry.is_some() => {
@@ -1721,6 +1766,20 @@ impl<'a> TaskClient<'a> {
             self.client_state
                 .update_task_if_current(&record, record.with_status(status)?)?;
         }
+        if self
+            .client_state
+            .queue_entry(turn_id)?
+            .is_some_and(|entry| {
+                matches!(entry.state(), QueueState::Parked)
+                    && entry
+                        .replacement_failure()
+                        .is_some_and(|budget| budget.should_park())
+            })
+        {
+            let _ = self.client_state.record_runner(task_id, None);
+            self.client_state
+                .remove_task_turn_after_terminal(turn_id, current_process_identity()?)?;
+        }
         self.report_for(task_id)
     }
 
@@ -1746,6 +1805,9 @@ impl<'a> TaskClient<'a> {
                 Ok(_) => {}
                 Err(error) if is_queue_job_conflict(&error) => {}
                 Err(error) => return Err(error),
+            }
+            if let Some(error) = self.wait_blocked_error(&task_ids)? {
+                return Err(error);
             }
             let records = task_ids
                 .iter()
@@ -2300,6 +2362,60 @@ impl<'a> TaskClient<'a> {
             return Err(error);
         }
         Ok(identity)
+    }
+
+    /// Initializes the row's restart budget from the journal when a replacement
+    /// already wrote `exited after acceptance:` but the queue field is still
+    /// empty. The runner also writes the field; this covers tests that plant
+    /// only the diagnostic and a runner that died after the log line.
+    fn observe_replacement_failure(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<(), WorkerError> {
+        let Some(entry) = self.client_state.queue_entry(turn_id)? else {
+            return Ok(());
+        };
+        if entry.replacement_failure().is_some() {
+            return Ok(());
+        }
+        let bytes = match self.read_runner_log(task_id, turn_id) {
+            Ok(bytes) => bytes,
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(code) = last_post_acceptance_public_code(&bytes) else {
+            return Ok(());
+        };
+        self.client_state
+            .record_replacement_failure(turn_id, code, current_time_millis()?)?;
+        Ok(())
+    }
+
+    fn park_repeated_replacement_failure(
+        &self,
+        turn_id: TurnId,
+        task_id: TaskId,
+    ) -> Result<(), WorkerError> {
+        let _ = self.client_state.record_runner(task_id, None);
+        self.client_state.park_row(turn_id)?;
+        Ok(())
+    }
+
+    fn wait_blocked_error(&self, task_ids: &[TaskId]) -> Result<Option<WorkerError>, WorkerError> {
+        for task_id in task_ids {
+            let Some(entry) = self.client_state.queue_entry_for_task_turn(*task_id)? else {
+                continue;
+            };
+            if let Some(budget) = entry.replacement_failure()
+                && budget.should_park()
+            {
+                return Ok(Some(task_error("WAIT_BLOCKED", "RUNNER_REPEATED_FAILURE")));
+            }
+        }
+        Ok(None)
     }
 
     fn start_oldest_parked_runner(&self, owner: ProcessIdentity) -> Result<bool, WorkerError> {

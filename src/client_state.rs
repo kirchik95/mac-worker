@@ -33,7 +33,7 @@ use crate::{
         AdmissionObservation, CachedAdmissionObservation, ClientId, JobId, JobState, JobStatus,
         LocalJobRecord, ProcessIdentity, QueueAbandonmentProof, QueueCancel, QueueClaim,
         QueueEntry, QueueEntryKind, QueueSnapshot, QueueState, RemoteUncertainty,
-        ResolveOrAbandonRequest,
+        ReplacementFailureBudget, ResolveOrAbandonRequest,
     },
     rooted_fs::{RootedDir, is_private_replacement_name},
     scheduler::{
@@ -729,14 +729,21 @@ impl ClientStateStore {
         let mut codes = HashMap::new();
         for row in self.queue_rows_with_blocking_reasons(config)? {
             let entry = row.entry();
-            if entry.kind() != QueueEntryKind::TaskTurn
-                || !matches!(entry.state(), QueueState::Waiting { .. })
-            {
+            if entry.kind() != QueueEntryKind::TaskTurn {
                 continue;
             }
             let Some(task_id) = self.task_id_for_turn(entry.job_id())? else {
                 continue;
             };
+            if let Some(budget) = entry.replacement_failure()
+                && budget.should_park()
+            {
+                codes.insert(task_id, budget.blocking_code());
+                continue;
+            }
+            if !matches!(entry.state(), QueueState::Waiting { .. }) {
+                continue;
+            }
             codes.insert(
                 task_id,
                 crate::task_view::task_row_blocking_code(row.blocking_reason()),
@@ -2730,13 +2737,81 @@ impl ClientStateStore {
             let Some(entry) = snapshot
                 .entries
                 .iter_mut()
-                .filter(|entry| matches!(entry.state(), QueueState::Parked))
+                .filter(|entry| {
+                    matches!(entry.state(), QueueState::Parked)
+                        && !entry
+                            .replacement_failure()
+                            .is_some_and(ReplacementFailureBudget::should_park)
+                })
                 .min_by_key(|entry| entry.queue_id())
             else {
                 return Ok((None, false));
             };
             entry.unpark(owner)?;
             Ok((Some(entry.clone()), true))
+        })
+    }
+
+    /// Records a post-acceptance replacement-runner death on the queue row.
+    ///
+    /// Same public code increments the consecutive count; a different code
+    /// starts a new streak at 1. The count and timestamp survive process
+    /// restarts because they live on `queue/state.json`.
+    pub fn record_replacement_failure(
+        &self,
+        job_id: JobId,
+        public_code: &str,
+        at_millis: u64,
+    ) -> Result<QueueEntry, WorkerError> {
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            let budget = match entry.replacement_failure() {
+                Some(existing) => existing.clone().applying(public_code, at_millis)?,
+                None => ReplacementFailureBudget::new(at_millis, public_code.to_owned(), 1)?,
+            };
+            entry.set_replacement_failure(Some(budget))?;
+            Ok((entry.clone(), true))
+        })
+    }
+
+    /// Overwrites the restart budget. Tests plant an aged timestamp so a later
+    /// reconcile can start after backoff without sleeping; operator reconcile
+    /// passes `None` to clear it.
+    pub fn set_replacement_failure(
+        &self,
+        job_id: JobId,
+        budget: Option<ReplacementFailureBudget>,
+    ) -> Result<QueueEntry, WorkerError> {
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, job_id)?;
+            entry.set_replacement_failure(budget)?;
+            Ok((entry.clone(), true))
+        })
+    }
+
+    /// Clears every task-turn restart budget and unparks rows that were parked
+    /// because the budget exhausted. An explicit `worker task reconcile` uses
+    /// this so the operator can retry once without waiting out backoff.
+    pub fn reset_replacement_failures(&self, owner: ProcessIdentity) -> Result<usize, WorkerError> {
+        owner.validate()?;
+        self.update_queue(|snapshot| {
+            let mut reset = 0usize;
+            let mut to_unpark = Vec::new();
+            for (index, entry) in snapshot.entries.iter().enumerate() {
+                if entry.kind() != QueueEntryKind::TaskTurn || entry.replacement_failure().is_none()
+                {
+                    continue;
+                }
+                to_unpark.push((index, matches!(entry.state(), QueueState::Parked)));
+            }
+            for (index, was_parked) in to_unpark {
+                snapshot.entries[index].set_replacement_failure(None)?;
+                if was_parked {
+                    snapshot.entries[index].unpark(owner)?;
+                }
+                reset += 1;
+            }
+            Ok((reset, reset > 0))
         })
     }
 

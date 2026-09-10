@@ -226,12 +226,12 @@ fn agent_exit_kind(code: &str) -> ExitKind {
 fn task_exit_kind(code: &str) -> ExitKind {
     match code {
         "RUNNER_HANDOFF_FAILED" => ExitKind::Io,
-        "WAIT_TIMEOUT" => ExitKind::Infrastructure,
+        "WAIT_TIMEOUT" | "WAIT_BLOCKED" => ExitKind::Infrastructure,
         _ => ExitKind::Usage,
     }
 }
 
-fn is_stable_public_code(code: &str) -> bool {
+pub(crate) fn is_stable_public_code(code: &str) -> bool {
     !code.is_empty()
         && code.len() <= 128
         && code.starts_with(|byte: char| byte.is_ascii_uppercase())
@@ -317,6 +317,14 @@ mod tests {
             error.public_message(),
             "task wait timed out without cancelling the task"
         );
+    }
+
+    #[test]
+    fn task_wait_blocked_uses_the_infrastructure_exit_code() {
+        let error = WorkerError::task("WAIT_BLOCKED", "RUNNER_REPEATED_FAILURE");
+        assert_eq!(error.public_code(), "WAIT_BLOCKED");
+        assert_eq!(error.exit_code(), 70);
+        assert_eq!(error.public_message(), "RUNNER_REPEATED_FAILURE");
     }
 
     #[test]

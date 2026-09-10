@@ -36,8 +36,8 @@ use mac_worker::{
     job::{
         AdmissionObservation, CommandSummary, HostControlError, JobId, JobMeta, JobState,
         JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LogChunk,
-        LogChunkRequest, LogStream, ProcessIdentity, QueueEntry, QueueEntryKind, StatusRequest,
-        StatusResponse, SubmitResponse,
+        LogChunkRequest, LogStream, ProcessIdentity, QueueEntry, QueueEntryKind,
+        ReplacementFailureBudget, StatusRequest, StatusResponse, SubmitResponse,
     },
     lease::SlotState,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
@@ -5601,6 +5601,16 @@ fn a_runner_that_fails_after_acceptance_appends_a_distinct_diagnostic_that_task_
         log.contains("exited after acceptance: PROJECT_MISMATCH"),
         "runner log: {log}"
     );
+    let budget = fixture
+        .state
+        .queue_entry(fixture.turn_id)
+        .unwrap()
+        .unwrap()
+        .replacement_failure()
+        .cloned()
+        .expect("post-acceptance exit records the restart budget");
+    assert_eq!(budget.last_public_code(), "PROJECT_MISMATCH");
+    assert_eq!(budget.consecutive_failures(), 1);
 
     let mut stdout = Vec::new();
     TaskClient::new(
@@ -5624,6 +5634,61 @@ fn a_runner_that_fails_after_acceptance_appends_a_distinct_diagnostic_that_task_
         rendered.contains("exited after acceptance: PROJECT_MISMATCH"),
         "task logs: {rendered}"
     );
+}
+
+#[test]
+fn reconcile_does_not_restart_a_fixture_turn_while_its_post_acceptance_backoff_is_running() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let diagnostic = b"exited after acceptance: HOST_IO message=fixture workers=mini-1\n";
+    let log_path = fixture
+        .paths
+        .state
+        .join("runners")
+        .join(fixture.task_id.to_string())
+        .join(format!("{}.log", fixture.turn_id));
+    let mut body = fs::read(&log_path).unwrap();
+    body.extend_from_slice(diagnostic);
+    fs::write(&log_path, &body).unwrap();
+    let mut checkpoint = fixture_checkpoint(&fixture);
+    checkpoint["committed"]["len"] = serde_json::json!(body.len() as u64);
+    write_fixture_checkpoint(&fixture, &checkpoint);
+    let dead_owner = ProcessIdentity::new(424_246, 4_242_467).unwrap();
+    fixture
+        .state
+        .record_runner(
+            fixture.task_id,
+            Some(mac_worker::task::RunnerIdentity::new(dead_owner)),
+        )
+        .unwrap();
+    let (store, first) = adopt_dead_owner_and_reconcile(&fixture, &fixture.runner, dead_owner);
+    assert_eq!(first.started_runners(), 0);
+    let second = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &store,
+        &fixture.executor,
+    )
+    .reconcile_runners()
+    .unwrap();
+    assert_eq!(second.started_runners(), 0);
+    store
+        .set_replacement_failure(
+            fixture.turn_id,
+            Some(ReplacementFailureBudget::new(1, "HOST_IO".into(), 1).unwrap()),
+        )
+        .unwrap();
+    let later = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &store,
+        &fixture.executor,
+    )
+    .reconcile_runners()
+    .unwrap();
+    assert_eq!(later.started_runners(), 1);
 }
 
 #[test]
