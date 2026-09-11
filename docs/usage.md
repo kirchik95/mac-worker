@@ -387,7 +387,7 @@ Controller Git object transfer uses one global lock for object verification and 
 
 `worker dashboard [--port N] [--no-open] [--no-facts-refresh]` on an enabled laptop is the tunnel described in [Dashboard](#dashboard). Reply and accept still require the current card against the store the dashboard is serving.
 
-After updating the CLI and helpers, restart the controller process and any running dashboard or dashboard tunnel with their existing configuration and port. Already-running processes keep the old code after a binary replacement. A dashboard that reports `INVALID_RESPONSE` while a fresh `worker workers` invocation reports ready workers may need this restart. See [Update or remove](../README.md#update-or-remove).
+After updating the CLI and helpers, restart the controller process and any running dashboard or dashboard tunnel with their existing configuration and port. Already-running processes keep the old code after a binary replacement. A dashboard that reports `INVALID_RESPONSE` while a fresh `worker workers` invocation reports ready workers may need this restart. See [Update or remove](getting-started.md#update-or-remove).
 
 ### Known close-retry limitation
 
