@@ -1853,7 +1853,7 @@ fn seeded_reconcile_does_not_create_laptop_store() {
     assert_eq!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
     assert_eq!(
         stdout,
-        b"runners: 0 replaced, 0 started; task rows: 0 repaired\n"
+        b"runners: 0 replaced, 0 started; task rows: 0 repaired, 0 unverifiable\n"
     );
     assert!(!laptop_task_store_exists(&laptop.paths));
     assert_eq!(request_row_count(&controller.paths), 0);
@@ -1891,13 +1891,13 @@ fn wait_poll_extra_keys_do_not_persist_durable_rows() {
 }
 
 #[test]
-fn enabled_say_wait_stays_unavailable() {
+fn enabled_say_wait_reports_controller_outage() {
     let laptop = IsolatedHome::new();
     write_enabled_config(&laptop.paths);
     let task_id = seeded_ids().0.to_string();
     let (exit, stdout, stderr) = run_laptop_task(
         &laptop,
-        &PanicSsh,
+        &FailingSsh,
         &["say", task_id.as_str(), "--message", "hi", "--wait"],
     );
     assert_ne!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
@@ -1909,20 +1909,9 @@ fn enabled_say_wait_stays_unavailable() {
     let stderr = String::from_utf8_lossy(&stderr);
     assert!(
         stderr.contains("CONTROLLER_UNAVAILABLE"),
-        "say --wait is not independent: {stderr}"
+        "say --wait must surface the controller outage: {stderr}"
     );
     assert!(!laptop_task_store_exists(&laptop.paths));
-}
-
-struct PanicSsh;
-
-impl ProcessRunner for PanicSsh {
-    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-        panic!(
-            "say --wait must stay UNAVAILABLE before SSH: {:?}",
-            request.program
-        );
-    }
 }
 
 struct BusyWaitPoll;
