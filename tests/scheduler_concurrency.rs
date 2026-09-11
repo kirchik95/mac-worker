@@ -1402,10 +1402,10 @@ fn two_slot_production_dispatch_waits_for_a_freed_slot_and_keeps_the_peer() {
         let runtime = CapacityWaitRuntime::new(waiting_tx, resume_rx);
         let follower = SuccessfulRunFollower;
         let result = RunService::with_follower(
-            &*wait_runner,
+            &wait_runner,
             &wait_config,
             &wait_paths,
-            &*wait_store,
+            &wait_store,
             &follower,
         )
         .with_scheduler_runtime(&runtime)
