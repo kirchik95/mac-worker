@@ -17,17 +17,21 @@ use mac_worker::{
     config::Config,
     controller::{
         ActiveResumeConfig, ControllerFault, ControllerStore, ControllerTransfer, OwnedCheckoutMap,
-        TaskSubmitHandler,
-        VerifiedResultMeta, canonical_request_sha256, controller_transfer_git_path,
-        import_controller_result, load_operation_envelope, parse_request,
-        registry::ProjectRegistry,
+        TaskSubmitHandler, VerifiedResultMeta, canonical_request_sha256,
+        controller_transfer_git_path, decode_frame, encode_frame, import_controller_result,
+        load_operation_envelope, parse_request, registry::ProjectRegistry,
     },
     git_transport::GitTransport,
-    job::RequestFingerprint,
+    host_store::HostStore,
+    job::{
+        ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseToken, RequestFingerprint,
+        RequestFingerprintMaterial,
+    },
+    lease::{AdmissionFacts, LeaseService},
     paths::PathLayout,
     prepared_submit::FrozenSubmitBody,
     process::SystemProcessRunner,
-    protocol::PROTOCOL_VERSION,
+    protocol::{MemoryPressure, PROTOCOL_VERSION},
     task::{BaseOid, ClosePolicy, TaskId, TurnId},
     transfer_repo::TransferRepo,
 };
@@ -557,7 +561,11 @@ fn real_no_wait_admission_rejection_terminalises_the_durable_row() {
         error.public_message(),
         "no eligible worker currently has an available heavy slot"
     );
-    assert_eq!(error.exit_code(), 75, "capacity category must reach the caller");
+    assert_eq!(
+        error.exit_code(),
+        75,
+        "capacity category must reach the caller"
+    );
 
     // The rejection is durable and terminal, and no task exists.
     let controller_state = isolated.paths.controller_state_root();
@@ -580,7 +588,10 @@ fn real_no_wait_admission_rejection_terminalises_the_durable_row() {
                 .collect()
         })
         .unwrap_or_default();
-    assert!(pending.is_empty(), "pending receipt must be retired: {pending:?}");
+    assert!(
+        pending.is_empty(),
+        "pending receipt must be retired: {pending:?}"
+    );
     assert!(
         client_state.load_task(body.task_id).is_err(),
         "a rejected submit must not create a task row"
@@ -602,4 +613,305 @@ fn real_no_wait_admission_rejection_terminalises_the_durable_row() {
         client_state.load_task(body.task_id).is_err(),
         "replay must not create a task row"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Occupied-slot regression at the real transport/process seam.
+//
+// The empty-inventory test above proves the handler/journal seam but does NOT
+// prove a full-then-freed slot: with no configured worker there is no
+// occupancy to free. This test configures a real worker, occupies its only
+// slot with a real lease in the isolated host store, proves through the actual
+// `worker host probe` that the slot is full, drives the submit through a real
+// `worker host controller-rpc` child, then frees a slot and proves the
+// rejected request is never executed by a restart or an exact-envelope replay.
+// ---------------------------------------------------------------------------
+
+const OCCUPIED_WORKER: &str = "mini-1";
+
+fn healthy_admission_facts() -> AdmissionFacts {
+    AdmissionFacts {
+        free_disk_bytes: 100 * 1024 * 1024 * 1024,
+        total_disk_bytes: 250 * 1024 * 1024 * 1024,
+        memory_pressure: MemoryPressure::Normal,
+        swap_used_bytes: Some(0),
+    }
+}
+
+/// Writes a controller-host config: one real worker reachable through the
+/// loopback fake SSH, with a client ceiling of two slots.
+fn write_occupied_worker_config(paths: &PathLayout) {
+    fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+    fs::write(
+        &paths.config,
+        format!(
+            "version = 1\n\n[[workers]]\nname = \"{OCCUPIED_WORKER}\"\nssh = \"{FAKE_SSH_DEST}\"\nslots = 2\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Takes a real lease on the isolated host so the worker genuinely has no free
+/// slot while `slot_count` is one.
+fn occupy_single_slot(paths: &PathLayout) {
+    let now: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let material = RequestFingerprintMaterial::new(
+        JobId::new(Uuid::from_u128(0x9a_0001)),
+        ClientId::new(Uuid::from_u128(0x9a_0002)),
+        LeaseToken::new(Uuid::from_u128(0x9a_0003)),
+        now,
+        OCCUPIED_WORKER.into(),
+        "a".repeat(64),
+        "b".repeat(64),
+        "c".repeat(64),
+        String::new(),
+        60_000,
+        "heavy".into(),
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    )
+    .unwrap();
+    let store = HostStore::open(&paths.host_state_root()).unwrap();
+    let service = LeaseService::new(&store);
+    service.set_slot_count(1).unwrap();
+    service
+        .acquire(
+            &LeaseAcquireRequest::new(material),
+            &healthy_admission_facts(),
+            now,
+        )
+        .unwrap();
+    let occupancy = service.occupancy().unwrap();
+    assert_eq!(occupancy.configured_slots, 1);
+    assert_eq!(occupancy.busy_slots, 1, "the only slot must be occupied");
+}
+
+/// Raises the durable host slot count so a free slot appears next to the lease
+/// that is still held. The probe below proves the transition really happened.
+fn free_one_slot(paths: &PathLayout) {
+    let store = HostStore::open(&paths.host_state_root()).unwrap();
+    let service = LeaseService::new(&store);
+    service.set_slot_count(2).unwrap();
+    let occupancy = service.occupancy().unwrap();
+    assert_eq!(occupancy.configured_slots, 2);
+    assert_eq!(occupancy.busy_slots, 1, "one slot stays held, one is free");
+}
+
+fn worker_child(isolated: &Isolated, args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_worker"));
+    for (key, value) in &isolated.environment {
+        command.env(key, value);
+    }
+    command
+        .env("MAC_WORKER_TEST_SSH", &isolated.fake_ssh)
+        .env("HOME", &isolated.home)
+        .args(args);
+    command.output().unwrap()
+}
+
+/// Runs the real `worker host controller-rpc` child over a framed request.
+fn controller_rpc_child(isolated: &Isolated, frame: &[u8]) -> std::process::Output {
+    use std::io::Write as _;
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_worker"));
+    for (key, value) in &isolated.environment {
+        child.env(key, value);
+    }
+    let mut spawned = child
+        .env("MAC_WORKER_TEST_SSH", &isolated.fake_ssh)
+        .env("HOME", &isolated.home)
+        .args(["host", "controller-rpc"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    spawned.stdin.as_mut().unwrap().write_all(frame).unwrap();
+    spawned.wait_with_output().unwrap()
+}
+
+/// Probe the configured worker through the real `workers` command and return
+/// `(configured_slots, busy_slots, slot_state)`.
+fn probe_slots(isolated: &Isolated) -> (u64, u64, String) {
+    let output = worker_child(isolated, &["--json", "workers"]);
+    assert!(
+        output.status.success(),
+        "workers probe failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let worker = value["workers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == OCCUPIED_WORKER)
+        .expect("configured worker must appear in the inventory")
+        .clone();
+    assert_eq!(
+        worker["status"], "ready",
+        "the probe itself must succeed, otherwise the premise is 'unreachable', not 'full': {worker}"
+    );
+    let probe = &worker["probe"];
+    (
+        probe["configured_slots"].as_u64().unwrap(),
+        probe["busy_slots"].as_u64().unwrap(),
+        probe["slot_state"].as_str().unwrap().to_owned(),
+    )
+}
+
+#[test]
+fn occupied_slot_no_wait_rejection_survives_freed_capacity_and_replay() {
+    let isolated = Isolated::new();
+    write_occupied_worker_config(&isolated.paths);
+    occupy_single_slot(&isolated.paths);
+
+    // Premise, proven rather than assumed: the real probe reports a reachable
+    // worker whose only slot is taken.
+    let (configured, busy, state) = probe_slots(&isolated);
+    assert_eq!(
+        (configured, busy),
+        (1, 1),
+        "slot must be full before the submit (state={state})"
+    );
+
+    let repo = GitRepo::init();
+    repo.write("README", b"occupied-slot\n");
+    repo.commit_all("init");
+    let oid = oid_of(&repo);
+    let request_id = format!("{:x}", Uuid::from_u128(0x5b).simple());
+    let mut body = frozen_body(&oid);
+    body.wip = false;
+    body.worker = Some(OCCUPIED_WORKER.into());
+    body.wait_for_capacity = false;
+    let request = submit_request(&request_id, &body);
+    let fingerprint = RequestFingerprint::new(request.payload_sha256().to_owned()).unwrap();
+
+    let identity = {
+        let transfer = ControllerTransfer::open(&isolated.paths.controller_state_root()).unwrap();
+        transfer
+            .prepare_source_receive(
+                &isolated.paths.cache,
+                &RUNNER,
+                &request_id,
+                &fingerprint,
+                PROJECT_ID,
+                WORKTREE_ID,
+                &oid,
+            )
+            .unwrap()
+    };
+    GitTransport::new(&RUNNER)
+        .push_controller_source(
+            isolated.fake_ssh.to_str().unwrap(),
+            FAKE_SSH_DEST,
+            "~/.local/bin/worker",
+            identity.token(),
+            identity.request_id(),
+            identity.fingerprint(),
+            identity.project_id(),
+            identity.worktree_id(),
+            identity.expected_oid(),
+            repo.root(),
+        )
+        .unwrap();
+    {
+        let transfer = ControllerTransfer::open(&isolated.paths.controller_state_root()).unwrap();
+        transfer
+            .finish_source_receive(&isolated.paths.cache, &RUNNER, &identity)
+            .unwrap();
+    }
+
+    let frame = encode_frame(
+        &serde_json::to_vec(&serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "command": "task.submit",
+            "body": body,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Real RPC child against a full slot: a no-wait pin must be rejected.
+    let rejected = controller_rpc_child(&isolated, &frame);
+    assert!(
+        !rejected.status.success(),
+        "a rejected submit must fail the child: {}",
+        String::from_utf8_lossy(&rejected.stdout)
+    );
+    let payload = decode_frame(&rejected.stdout).unwrap();
+    let error: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    assert_eq!(
+        error["error"]["code"], "CAPACITY_BUSY",
+        "unexpected rejection: {error}"
+    );
+    assert_eq!(
+        rejected.status.code(),
+        Some(75),
+        "the controller child must exit with the capacity category"
+    );
+
+    let controller_state = isolated.paths.controller_state_root();
+    let row: serde_json::Value = serde_json::from_slice(
+        &fs::read(controller_state.join(format!("req-{request_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(row["phase"], serde_json::json!("acked"));
+    assert_eq!(
+        row["result"]["controller_rejection"]["code"],
+        serde_json::json!("CAPACITY_BUSY")
+    );
+    let pending: Vec<_> = fs::read_dir(controller_state.join("active"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| !name.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        pending.is_empty(),
+        "the pending receipt must be retired: {pending:?}"
+    );
+    let client_state = ClientStateStore::open(&isolated.paths.state).unwrap();
+    assert!(client_state.load_task(body.task_id).is_err());
+
+    // Capacity frees while the original lease is still held.
+    free_one_slot(&isolated.paths);
+    let (configured, busy, state) = probe_slots(&isolated);
+    assert_eq!(
+        (configured, busy),
+        (2, 1),
+        "a slot must now be free (state={state})"
+    );
+
+    // A fresh controller process replaying the exact envelope must return the
+    // same rejection and must not execute the request now that a slot exists.
+    let replayed = controller_rpc_child(&isolated, &frame);
+    assert!(!replayed.status.success());
+    let payload = decode_frame(&replayed.stdout).unwrap();
+    let error: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    assert_eq!(error["error"]["code"], "CAPACITY_BUSY");
+    assert_eq!(replayed.status.code(), Some(75));
+    assert!(
+        client_state.load_task(body.task_id).is_err(),
+        "freed capacity must not resurrect a rejected request"
+    );
+
+    // A leader tick over the pending index must also find nothing to do.
+    let config = Config::load(&isolated.paths.config).unwrap();
+    let handler = TaskSubmitHandler::new(&RUNNER, &config, &isolated.paths, &client_state);
+    let store = ControllerStore::open(&isolated.paths.controller_state_root()).unwrap();
+    let tick = store
+        .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+        .unwrap();
+    assert!(tick.completed.is_empty());
+    assert!(tick.failed.is_empty());
+    assert!(client_state.load_task(body.task_id).is_err());
 }

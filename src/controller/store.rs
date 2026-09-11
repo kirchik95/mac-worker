@@ -1242,9 +1242,7 @@ fn terminal_rejection_code(command: &str, error: &WorkerError) -> Option<&'stati
     }
     match error {
         WorkerError::Capacity {
-            code,
-            public: true,
-            ..
+            code, public: true, ..
         } if matches!(*code, "CAPACITY_BUSY" | "CAPABILITY_MISSING") => Some(code),
         _ => None,
     }

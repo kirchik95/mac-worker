@@ -1104,10 +1104,8 @@ const ID_R6: &str = "018f0f4a6b5c7d8e9f00112233445575";
 
 const REJECT_TASK_ID: &str = "018f0f4a6b5c7d8e9f0011223344aaa0";
 const REJECT_TURN_ID: &str = "018f0f4a6b5c7d8e9f0011223344aaa1";
-const REJECT_PROJECT_ID: &str =
-    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const REJECT_WORKTREE_ID: &str =
-    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const REJECT_PROJECT_ID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const REJECT_WORKTREE_ID: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 const REJECT_BASE_OID: &str = "1111111111111111111111111111111111111111";
 
 /// The exact public admission reason `capacity_busy()` produces in
@@ -1246,11 +1244,7 @@ fn terminal_capacity_rejection_is_acked_retired_and_never_executed_again() {
     let executor = SwitchableExecutor::rejecting(admission_capacity_busy());
 
     let error = store
-        .handle_with(
-            &submit_request_for(ID_R1),
-            &executor,
-            ControllerFault::None,
-        )
+        .handle_with(&submit_request_for(ID_R1), &executor, ControllerFault::None)
         .expect_err("a no-wait admission rejection must reach the caller as an error");
     assert_eq!(error.public_code(), "CAPACITY_BUSY");
     assert_eq!(error.public_message(), CAPACITY_REASON);
@@ -1299,20 +1293,12 @@ fn replaying_a_rejected_envelope_returns_the_same_rejection_without_executing() 
     let (state, store) = open_store(&temp);
     let executor = SwitchableExecutor::rejecting(admission_capacity_busy());
     let first = store
-        .handle_with(
-            &submit_request_for(ID_R2),
-            &executor,
-            ControllerFault::None,
-        )
+        .handle_with(&submit_request_for(ID_R2), &executor, ControllerFault::None)
         .expect_err("first attempt rejects");
     executor.stop_rejecting();
 
     let replay = store
-        .handle_with(
-            &submit_request_for(ID_R2),
-            &executor,
-            ControllerFault::None,
-        )
+        .handle_with(&submit_request_for(ID_R2), &executor, ControllerFault::None)
         .expect_err("replay must return the saved rejection, not a fresh success");
     assert_eq!(replay.public_code(), first.public_code());
     assert_eq!(replay.public_message(), first.public_message());
@@ -1346,9 +1332,7 @@ fn nonpublic_and_protocol_capacity_errors_are_not_terminalised() {
         ),
         (
             ID_R4,
-            WorkerError::Protocol(
-                "CAPACITY_BUSY: live lease count exceeds the slot bound".into(),
-            ),
+            WorkerError::Protocol("CAPACITY_BUSY: live lease count exceeds the slot bound".into()),
         ),
     ]
     .into_iter()
@@ -1371,7 +1355,10 @@ fn nonpublic_and_protocol_capacity_errors_are_not_terminalised() {
             RequestPhase::Published,
             "case {index} must stay pending"
         );
-        assert!(record.result().is_none(), "case {index} must save no result");
+        assert!(
+            record.result().is_none(),
+            "case {index} must save no result"
+        );
         assert_eq!(
             active_entries(&state),
             vec![format!("{request_id}.json")],
@@ -1405,11 +1392,7 @@ fn infrastructure_failure_stays_pending_and_recovers() {
         "CONTROLLER_UNAVAILABLE: transient".into(),
     ));
     store
-        .handle_with(
-            &submit_request_for(ID_R5),
-            &executor,
-            ControllerFault::None,
-        )
+        .handle_with(&submit_request_for(ID_R5), &executor, ControllerFault::None)
         .expect_err("infrastructure failure surfaces");
     let record = store.load(ID_R5).unwrap().unwrap();
     assert_eq!(record.phase(), RequestPhase::Published);
@@ -1464,7 +1447,11 @@ fn interruption_before_durable_rejection_leaves_the_outcome_ambiguous() {
     let record = store.load(ID_R6).unwrap().unwrap();
     assert_eq!(record.phase(), RequestPhase::Acked);
     assert!(
-        record.result().unwrap().get("controller_rejection").is_none(),
+        record
+            .result()
+            .unwrap()
+            .get("controller_rejection")
+            .is_none(),
         "recovery produced an ordinary success result"
     );
     assert!(active_entries(&state).is_empty());
@@ -1495,12 +1482,30 @@ fn overwrite_saved_result(state: &std::path::Path, request_id: &str, result: Opt
 #[test]
 fn malformed_saved_rejection_fails_closed_and_never_executes() {
     let malformed = [
-        ("unknown version", json!({"controller_rejection": {"version": 99, "code": "CAPACITY_BUSY", "message": "x"}})),
-        ("unknown code", json!({"controller_rejection": {"version": 1, "code": "NOT_A_REJECTION", "message": "x"}})),
-        ("not an object", json!({"controller_rejection": "CAPACITY_BUSY"})),
-        ("missing message", json!({"controller_rejection": {"version": 1, "code": "CAPACITY_BUSY"}})),
-        ("empty message", json!({"controller_rejection": {"version": 1, "code": "CAPACITY_BUSY", "message": ""}})),
-        ("extra field", json!({"controller_rejection": {"version": 1, "code": "CAPACITY_BUSY", "message": "x", "extra": true}})),
+        (
+            "unknown version",
+            json!({"controller_rejection": {"version": 99, "code": "CAPACITY_BUSY", "message": "x"}}),
+        ),
+        (
+            "unknown code",
+            json!({"controller_rejection": {"version": 1, "code": "NOT_A_REJECTION", "message": "x"}}),
+        ),
+        (
+            "not an object",
+            json!({"controller_rejection": "CAPACITY_BUSY"}),
+        ),
+        (
+            "missing message",
+            json!({"controller_rejection": {"version": 1, "code": "CAPACITY_BUSY"}}),
+        ),
+        (
+            "empty message",
+            json!({"controller_rejection": {"version": 1, "code": "CAPACITY_BUSY", "message": ""}}),
+        ),
+        (
+            "extra field",
+            json!({"controller_rejection": {"version": 1, "code": "CAPACITY_BUSY", "message": "x", "extra": true}}),
+        ),
     ];
     for (label, saved) in malformed {
         let temp = tempfile::tempdir().unwrap();
@@ -1508,11 +1513,7 @@ fn malformed_saved_rejection_fails_closed_and_never_executes() {
         let executor = SwitchableExecutor::rejecting(admission_capacity_busy());
         executor.stop_rejecting();
         store
-            .handle_with(
-                &submit_request_for(ID_R7),
-                &executor,
-                ControllerFault::None,
-            )
+            .handle_with(&submit_request_for(ID_R7), &executor, ControllerFault::None)
             .unwrap_or_else(|error| panic!("{label}: seeding a normal row failed: {error}"));
         assert_eq!(executor.calls_for(ID_R7), 1, "{label}");
         overwrite_saved_result(&state, ID_R7, Some(saved));
@@ -1520,11 +1521,7 @@ fn malformed_saved_rejection_fails_closed_and_never_executes() {
         drop(store);
         let store = ControllerStore::open(&state).unwrap();
         let error = store
-            .handle_with(
-                &submit_request_for(ID_R7),
-                &executor,
-                ControllerFault::None,
-            )
+            .handle_with(&submit_request_for(ID_R7), &executor, ControllerFault::None)
             .expect_err("malformed rejection must not read back as a success ACK");
         assert_eq!(
             error.public_code(),
@@ -1564,22 +1561,14 @@ fn ordinary_and_legacy_saved_results_are_unaffected() {
         let executor = SwitchableExecutor::rejecting(admission_capacity_busy());
         executor.stop_rejecting();
         store
-            .handle_with(
-                &submit_request_for(ID_R7),
-                &executor,
-                ControllerFault::None,
-            )
+            .handle_with(&submit_request_for(ID_R7), &executor, ControllerFault::None)
             .unwrap();
         overwrite_saved_result(&state, ID_R7, saved);
 
         drop(store);
         let store = ControllerStore::open(&state).unwrap();
         let ack = store
-            .handle_with(
-                &submit_request_for(ID_R7),
-                &executor,
-                ControllerFault::None,
-            )
+            .handle_with(&submit_request_for(ID_R7), &executor, ControllerFault::None)
             .unwrap_or_else(|error| panic!("{label}: must still ACK: {error}"));
         assert_eq!(ack.status(), "acked", "{label}");
         assert_eq!(ack.result(), expected.as_ref(), "{label}");

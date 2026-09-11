@@ -714,8 +714,11 @@ mod tests {
     #[test]
     fn capacity_codes_decode_back_into_capacity_errors() {
         for code in ["CAPACITY_BUSY", "CAPABILITY_MISSING"] {
-            let wire = HostControlError::new(code, "no eligible worker currently has an available heavy slot")
-                .unwrap();
+            let wire = HostControlError::new(
+                code,
+                "no eligible worker currently has an available heavy slot",
+            )
+            .unwrap();
             let error = host_control_to_worker(&wire);
             assert!(
                 matches!(error, WorkerError::Capacity { .. }),
@@ -735,8 +738,9 @@ mod tests {
     /// and every other error keep today's mapping.
     #[test]
     fn other_host_codes_keep_their_existing_mapping() {
-        let unavailable =
-            host_control_to_worker(&HostControlError::new("CONTROLLER_UNAVAILABLE", "down").unwrap());
+        let unavailable = host_control_to_worker(
+            &HostControlError::new("CONTROLLER_UNAVAILABLE", "down").unwrap(),
+        );
         assert!(matches!(unavailable, WorkerError::Unavailable(_)));
         assert_eq!(unavailable.public_code(), "CONTROLLER_UNAVAILABLE");
 

@@ -3225,7 +3225,11 @@ mod versioned_host_error_tests {
         let wire = serde_json::to_value(&error).unwrap();
         assert_eq!(wire["error"]["code"], "CAPACITY_BUSY");
         assert_eq!(wire["error"]["message"], "worker admission rejected");
-        assert!(!serde_json::to_string(&wire).unwrap().contains("PLANTED_PATH"));
+        assert!(
+            !serde_json::to_string(&wire)
+                .unwrap()
+                .contains("PLANTED_PATH")
+        );
     }
 }
 
