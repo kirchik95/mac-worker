@@ -482,7 +482,8 @@ fn runtime_command_list_and_reconcile_after_enabled_submit() {
 /// still unsubmitted, prove it is polling via the private tap's actual
 /// non-quiescent reply (no timing-only sleeps), close the parent via the
 /// actual CLI, and require wait to admit and await the child before returning
-/// the complete task set.
+/// the complete task set. Parent terminal status is not quiescence; public
+/// `task wait --task-id` on the parent is the precondition before `--run`.
 #[test]
 fn runtime_command_wait_run_admits_child_after_parent_close() {
     let fixture = ProcessFixture::new();
@@ -536,6 +537,50 @@ fn runtime_command_wait_run_admits_child_after_parent_close() {
         fixture.exec_journal()
     );
 
+    // Terminal Open+Done is not operator-idle: close is TASK_BUSY while
+    // runner() is still recorded. Public wait on the parent task (not --run)
+    // is the fixture precondition; it must return before dynamic run wait.
+    let (parent_wait_status, parent_wait_stdout, parent_wait_stderr) = fixture.run_laptop(
+        &[
+            "--json",
+            "task",
+            "wait",
+            "--task-id",
+            &parent_task,
+            "--timeout",
+            "45s",
+        ],
+        Some(repo.root()),
+    );
+    let parent_wait_text = String::from_utf8_lossy(&parent_wait_stdout);
+    let parent_wait_err = String::from_utf8_lossy(&parent_wait_stderr);
+    assert!(
+        parent_wait_status.success(),
+        "blocked FLOW seam: public task wait --task-id must confirm parent quiescence before wait --run; stdout={parent_wait_text} stderr={parent_wait_err} journal={} controller={}",
+        fixture.exec_journal(),
+        dump_controller_authority(&fixture, &parent_task)
+    );
+    let parent_waited = parse_json_value(&parent_wait_stdout);
+    assert_eq!(
+        parent_waited
+            .get("task_ids")
+            .and_then(Value::as_array)
+            .map(|ids| ids.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+        Some(vec![parent_task.as_str()]),
+        "parent wait must return the parent task; stdout={parent_wait_text}"
+    );
+    assert_eq!(
+        parent_waited.get("exit_code").and_then(Value::as_u64),
+        Some(0),
+        "quiescent done parent must exit 0; stdout={parent_wait_text}"
+    );
+    assert_eq!(
+        fixture.journal_task_turns().len(),
+        1,
+        "parent wait --task-id must not start the child; journal={}",
+        fixture.exec_journal()
+    );
+
     // Start the actual `task wait --run` while the child is still unsubmitted.
     // The private tap overrides MAC_WORKER_TEST_SSH on this child only and
     // reaps with the child via OwnedChild Drop on panic/timeout.
@@ -545,6 +590,7 @@ fn runtime_command_wait_run_admits_child_after_parent_close() {
     assert_wait_polling_while_child_pending(&fixture, &mut wait, &tap, &run_id);
 
     // Admit the child through the actual CLI.
+    let pre_close_authority = dump_controller_authority(&fixture, &parent_task);
     let (close_status, close_stdout, close_stderr) = fixture.run_laptop(
         &["--json", "task", "close", &parent_task],
         Some(repo.root()),
@@ -553,7 +599,9 @@ fn runtime_command_wait_run_admits_child_after_parent_close() {
     let close_err = String::from_utf8_lossy(&close_stderr);
     assert!(
         close_status.success(),
-        "blocked FLOW seam: parent accept is actual enabled task close; stdout={close_text} stderr={close_err}"
+        "blocked FLOW seam: parent accept is actual enabled task close; stdout={close_text} stderr={close_err} journal={} controller={}",
+        fixture.exec_journal(),
+        pre_close_authority
     );
     let close = parse_json_value(&close_stdout);
     assert_eq!(
@@ -1035,10 +1083,10 @@ fn terminal_head_oid<'a>(report: &'a Value, expected_turn: Option<&str>) -> Opti
     if json_string(turn, "terminal") != Some("succeeded") {
         return None;
     }
-    if let Some(expected_turn) = expected_turn {
-        if json_string(turn, "turn_id") != Some(expected_turn) {
-            return None;
-        }
+    if let Some(expected_turn) = expected_turn
+        && json_string(turn, "turn_id") != Some(expected_turn)
+    {
+        return None;
     }
     json_string(status, "head_oid")
 }
@@ -1076,6 +1124,92 @@ fn git_is_ancestor(repo: &support::GitRepo, ancestor: &str, oid: &str) -> bool {
     repo.git(&["merge-base", "--is-ancestor", ancestor, oid])
         .status
         .success()
+}
+
+fn dump_controller_authority(fixture: &ProcessFixture, task_id: &str) -> String {
+    let root = fixture.controller_state();
+    let mut files = Vec::new();
+    for name in ["tasks", "queue", "runners"] {
+        collect_regular_files(&root.join(name), &root, &mut files);
+    }
+    files.sort();
+    let mut lines = Vec::new();
+    for rel in files {
+        let path = root.join(&rel);
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        let summary = authority_file_summary(task_id, &body);
+        lines.push(format!("{rel}: {summary}"));
+    }
+    if lines.is_empty() {
+        format!("<empty {}>", root.display())
+    } else {
+        lines.join(" | ")
+    }
+}
+
+fn collect_regular_files(root: &Path, base: &Path, found: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_regular_files(&path, base, found);
+        } else if path.is_file() {
+            found.push(
+                path.strip_prefix(base)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
+        }
+    }
+}
+
+fn authority_file_summary(task_id: &str, body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return format!("bytes={}", body.len());
+    };
+    let state = value
+        .pointer("/status/state")
+        .or_else(|| value.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let runner = value.get("runner").is_some_and(|runner| !runner.is_null());
+    let close_intent = value
+        .get("close_intent")
+        .is_some_and(|intent| !intent.is_null());
+    let queue_states = value
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let state = entry.get("state")?;
+                    if let Some(name) = state.as_str() {
+                        Some(name.to_owned())
+                    } else {
+                        state
+                            .as_object()
+                            .and_then(|object| object.keys().next().cloned())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|states| !states.is_empty());
+    let mentions_task = body.contains(task_id);
+    match queue_states {
+        Some(states) => format!(
+            "state={state} runner={runner} close_intent={close_intent} queue={states} task={mentions_task} bytes={}",
+            body.len()
+        ),
+        None => format!(
+            "state={state} runner={runner} close_intent={close_intent} task={mentions_task} bytes={}",
+            body.len()
+        ),
+    }
 }
 
 fn wait_for_terminal_turn(
