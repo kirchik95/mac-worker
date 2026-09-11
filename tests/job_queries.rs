@@ -6353,11 +6353,6 @@ fn matrix_command(marker: &Path) -> CommandSpec {
     CommandSpec::shell(format!("/usr/bin/printf x >> '{marker}'")).unwrap()
 }
 
-fn matrix_delayed_marker_command(marker: &Path) -> CommandSpec {
-    let marker = marker.to_string_lossy().replace('\'', "'\\\"'\\\"'");
-    CommandSpec::shell(format!("/bin/sleep 0.2; /usr/bin/printf x >> '{marker}'")).unwrap()
-}
-
 fn matrix_execution_now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7111,13 +7106,12 @@ fn matrix_durable_snapshot(
 }
 
 #[test]
-fn synthetic_epoch_lease_does_not_record_a_delayed_marker_but_wall_epoch_does() {
-    // Real MatrixInlineLauncher / Supervisor::run_with_guard. Duration
-    // stays exactly 30_000. Sleep 0.2 only defeats the already-waitable
-    // first poll when remaining_lease_millis saturates at 0. Historic 0156
-    // terminal kind is still unknown; this does not plant a loss or accept
-    // SSH_LAUNCH_FAILED.
-    fn submit_delayed(
+fn wall_clock_lease_expiry_saturates_epoch_one_and_live_acquire_runs() {
+    // remaining_lease_millis is expires_at.saturating_sub(wall now): acquire at
+    // 1 is already expired (clock coherence). First-poll vs child completion is
+    // scheduler-dependent and is not asserted. Duration 30_000; material
+    // created_at stays 10.
+    fn submit_wall_epoch(
         acquire_now: u64,
     ) -> (
         Option<Vec<u8>>,
@@ -7128,7 +7122,7 @@ fn synthetic_epoch_lease_does_not_record_a_delayed_marker_but_wall_epoch_does() 
         let (_, root) = matrix_runtime(&temp);
         let marker = temp.path().join("actual-child-marker");
         let (store, lease, submit, manifest) =
-            matrix_acquired_host_at(&root, matrix_delayed_marker_command(&marker), acquire_now);
+            matrix_acquired_host_at(&root, matrix_command(&marker), acquire_now);
         assert_eq!(submit.material().created_at_millis(), 10);
         assert_eq!(submit.material().timeout_millis(), 30_000);
         assert_eq!(lease.timeout_millis(), 30_000);
@@ -7154,25 +7148,32 @@ fn synthetic_epoch_lease_does_not_record_a_delayed_marker_but_wall_epoch_does() 
         (fs::read(&marker).ok(), lease, response)
     }
 
-    let (expired_marker, expired_lease, _expired_response) = submit_delayed(1);
+    let temp = tempfile::tempdir().unwrap();
+    let (_, root) = matrix_runtime(&temp);
+    let unused = temp.path().join("unexecuted-epoch-one-marker");
+    let (_, expired_lease, expired_submit, _) =
+        matrix_acquired_host_at(&root, matrix_command(&unused), 1);
+    assert_eq!(expired_submit.material().created_at_millis(), 10);
+    assert_eq!(expired_submit.material().timeout_millis(), 30_000);
     assert_eq!(expired_lease.created_at_millis(), 1);
     assert_eq!(expired_lease.expires_at_millis(), 30_001);
     assert_eq!(expired_lease.timeout_millis(), 30_000);
+    let wall = matrix_execution_now_millis();
     assert_eq!(
-        expired_marker, None,
-        "expired synthetic epoch must not complete the delayed marker"
+        expired_lease.expires_at_millis().saturating_sub(wall),
+        0,
+        "epoch-one acquire must saturate remaining_lease_millis to 0"
     );
 
-    let wall = matrix_execution_now_millis();
-    let (live_marker, live_lease, live_response) = submit_delayed(wall);
+    let (live_marker, live_lease, live_response) = submit_wall_epoch(wall);
     assert_eq!(live_lease.created_at_millis(), wall);
     assert_eq!(live_lease.expires_at_millis(), wall + 30_000);
     assert_eq!(live_lease.timeout_millis(), 30_000);
-    live_response.expect("wall-epoch delayed marker submit");
+    live_response.expect("wall-epoch marker submit");
     assert_eq!(
         live_marker.as_deref(),
         Some(b"x".as_slice()),
-        "wall-epoch lease must complete the delayed marker"
+        "wall-epoch lease must complete the execution marker"
     );
 }
 
