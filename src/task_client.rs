@@ -5236,7 +5236,11 @@ fn is_not_found(error: &WorkerError) -> bool {
 }
 
 fn is_already_parked_state_error(error: &WorkerError) -> bool {
-    matches!(error, WorkerError::Protocol(message) if message == "only a waiting task turn can be parked")
+    matches!(
+        error,
+        WorkerError::Protocol(message)
+            if message == "only a waiting or dispatching task turn can be parked"
+    )
 }
 
 fn is_queue_job_conflict(error: &WorkerError) -> bool {
