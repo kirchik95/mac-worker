@@ -168,6 +168,37 @@ impl RunnerExecutor for DetachedRunnerExecutor {
     }
 }
 
+/// Whether a queue row still authorizes this parent's spawn attempt.
+///
+/// Real task cancellation (`retain_task_turn_cancel`) sets only the cancel
+/// flag and leaves state and reservation untouched, so a token-only check
+/// would spawn for a cancelled turn. Likewise `adopt_row` swaps the owner
+/// while keeping the token. Require the full permit: a live TaskTurn row for
+/// this turn, no requested cancellation, the row still owned by the identity
+/// pinned when the handoff started, and a reservation carrying this attempt's
+/// token, still owned by this process, with no child bound yet. A missing row
+/// fails closed as well.
+fn handoff_spawn_admitted(
+    entry: Option<&crate::job::QueueEntry>,
+    turn_id: TurnId,
+    token: Uuid,
+    reserver: ProcessIdentity,
+    owner: Option<ProcessIdentity>,
+) -> bool {
+    let Some(entry) = entry else {
+        return false;
+    };
+    entry.kind() == QueueEntryKind::TaskTurn
+        && entry.job_id() == turn_id
+        && !entry.is_cancel_requested()
+        && entry.owner_opt().copied() == owner
+        && entry.slot_reservation().is_some_and(|reservation| {
+            reservation.token() == token
+                && reservation.child().is_none()
+                && reservation.reserver() == reserver
+        })
+}
+
 /// Bounded pre-spawn journal fence wait for the detached parent.
 ///
 /// A concurrent selected refresh may briefly hold the published journal flock
@@ -177,9 +208,18 @@ impl RunnerExecutor for DetachedRunnerExecutor {
 /// child `ADOPTION_WAIT`). Only `WouldBlock`/`None` retries; every other open
 /// error stays hard, and no lock is held while waiting.
 ///
-/// When the spawn carries a reservation token, the queue row is revalidated
-/// before every attempt so cancelled/stale/retired work never spawns. Bare
-/// starts without a token keep the historical behavior (journal only).
+/// When the spawn carries a reservation token, the spawn permit is
+/// revalidated before every attempt through [`handoff_spawn_admitted`], and
+/// again under the acquired journal through `log.current_entry` (the journal
+/// flock is the finalization fence: refresh/finalizer mutations of this exact
+/// row serialize with it, so only the post-acquire check sees the task's
+/// current turn). The row owner is pinned on first sight: adoption away
+/// mid-handoff keeps the token but voids this attempt's permit. Cancelled,
+/// adopted-away, bound-elsewhere, or retired work therefore returns
+/// `TASK_BUSY` at the flock check; the caller then drops the journal before
+/// spawn, so a later mutation in that residual window is out of this helper's
+/// scope and is caught by the post-bind fence. Bare starts without a token keep
+/// the historical behavior (journal only).
 fn open_handoff_journal_for_spawn(
     store: &ClientStateStore,
     paths: &PathLayout,
@@ -188,20 +228,50 @@ fn open_handoff_journal_for_spawn(
     slot_token: Option<Uuid>,
 ) -> Result<LogWriter, WorkerError> {
     let deadline = Instant::now() + RUNNER_HANDOFF_TIMEOUT;
-    loop {
-        if let Some(token) = slot_token {
-            let reserved = store
+    // The reservation is taken synchronously by this same process, so its
+    // identity is the permit's reserver on every attempt. The row owner is
+    // pinned from the first read: a concurrent adopt keeps the token but
+    // must still void this attempt.
+    let permit = slot_token
+        .map(|token| {
+            let reserver = current_process_identity()?;
+            let owner = store
                 .queue_entry(turn_id)?
-                .filter(|entry| {
-                    entry.kind() == QueueEntryKind::TaskTurn && entry.job_id() == turn_id
-                })
-                .and_then(|entry| entry.slot_reservation());
-            if reserved.is_none_or(|reservation| reservation.token() != token) {
-                return Err(task_error("TASK_BUSY", "task turn changed before handoff"));
-            }
+                .as_ref()
+                .and_then(|entry| entry.owner_opt().copied());
+            Ok::<_, WorkerError>((token, reserver, owner))
+        })
+        .transpose()?;
+    loop {
+        if let Some((token, reserver, owner)) = permit
+            && !handoff_spawn_admitted(
+                store.queue_entry(turn_id)?.as_ref(),
+                turn_id,
+                token,
+                reserver,
+                owner,
+            )
+        {
+            return Err(task_error("TASK_BUSY", "task turn changed before handoff"));
         }
         match LogWriter::try_open(&paths.state, task_id, turn_id)? {
-            Some(log) => return Ok(log),
+            Some(log) => {
+                let admitted = match permit {
+                    Some((token, reserver, owner)) => handoff_spawn_admitted(
+                        log.current_entry(store)?.as_ref(),
+                        turn_id,
+                        token,
+                        reserver,
+                        owner,
+                    ),
+                    None => true,
+                };
+                if admitted {
+                    return Ok(log);
+                }
+                drop(log);
+                return Err(task_error("TASK_BUSY", "task turn changed before handoff"));
+            }
             None if Instant::now() < deadline => {
                 store.runner_log_contention();
                 std::thread::sleep(WAIT_POLL);
@@ -2065,11 +2135,14 @@ pub fn start_runner_with_reservation(
 /// `WouldBlock` through [`LogWriter::try_open`] within
 /// `RUNNER_HANDOFF_TIMEOUT` without rerunning the executor and without
 /// holding state locks while waiting. The fenced row is revalidated before
-/// every attempt: a retired/cancelled turn releases the reservation and goes
-/// `TASK_BUSY` through the existing branch instead of completing stale work.
-/// A genuine timeout keeps the bound reservation (the live child owns it);
-/// releasing it here would double-allocate the permit, so `WouldBlock`
-/// propagates exactly as the old hard open did.
+/// every attempt: a changed or retired turn goes `TASK_BUSY` through the
+/// existing branch instead of completing stale work. The release call there
+/// is intentionally preserved but is a no-op once a child is bound
+/// (`release_runner_slot` only clears childless reservations held by this
+/// reserver), so the bound permit stays with the live child. A genuine
+/// timeout likewise keeps the bound reservation; releasing it here would
+/// double-allocate the permit, so `WouldBlock` propagates exactly as the
+/// old hard open did.
 fn open_handoff_journal_after_bind(
     client_state: &ClientStateStore,
     paths: &PathLayout,
@@ -2465,8 +2538,122 @@ fn fallback_process_identity(pid: u32) -> Result<ProcessIdentity, WorkerError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{early_exit_diagnostic_line, last_post_acceptance_public_code, turn_exit_code};
+    use super::{
+        current_process_identity, early_exit_diagnostic_line, handoff_spawn_admitted,
+        last_post_acceptance_public_code, open_handoff_journal_after_bind,
+        open_handoff_journal_for_spawn, turn_exit_code,
+    };
     use crate::task::TaskOutcome;
+
+    #[test]
+    fn handoff_spawn_permit_rejects_cancelled_adopted_bound_foreign_or_missing_rows() {
+        use crate::job::{
+            ClientId, CommandSummary, QueueEntry, QueueEntryKind, RunnerSlotReservation,
+        };
+        use crate::scheduler::WorkerPreference;
+        use crate::task::TurnId;
+
+        let reserver = current_process_identity().unwrap();
+        let turn = TurnId::generate();
+        let token = uuid::Uuid::new_v4();
+        let owner = crate::job::ProcessIdentity::new(1, 1).unwrap();
+        let mut healthy = QueueEntry::new(
+            turn,
+            ClientId::generate(),
+            "a".repeat(64),
+            "b".repeat(64),
+            CommandSummary::argv(2).unwrap(),
+            Vec::new(),
+            WorkerPreference::Automatic,
+            QueueEntryKind::TaskTurn,
+            None,
+            owner,
+            10,
+        )
+        .unwrap();
+        healthy
+            .set_slot_reservation(Some(RunnerSlotReservation::new(reserver, token).unwrap()))
+            .unwrap();
+        assert!(handoff_spawn_admitted(
+            Some(&healthy),
+            turn,
+            token,
+            reserver,
+            Some(owner)
+        ));
+
+        // Real task cancellation keeps the row and its token: must refuse.
+        let mut cancelled = healthy.clone();
+        cancelled.request_cancel(11).unwrap();
+        assert!(!handoff_spawn_admitted(
+            Some(&cancelled),
+            turn,
+            token,
+            reserver,
+            Some(owner)
+        ));
+
+        // Adopted away with the token intact: must refuse.
+        let mut adopted = healthy.clone();
+        adopted
+            .adopt(crate::job::ProcessIdentity::new(3, 3).unwrap())
+            .unwrap();
+        assert!(!handoff_spawn_admitted(
+            Some(&adopted),
+            turn,
+            token,
+            reserver,
+            Some(owner)
+        ));
+
+        // Already bound to a child elsewhere: must refuse.
+        let mut bound = healthy.clone();
+        let child = crate::job::ProcessIdentity::new(2, 2).unwrap();
+        bound
+            .set_slot_reservation(Some(
+                RunnerSlotReservation::new(reserver, token)
+                    .unwrap()
+                    .with_child(child)
+                    .unwrap(),
+            ))
+            .unwrap();
+        assert!(!handoff_spawn_admitted(
+            Some(&bound),
+            turn,
+            token,
+            reserver,
+            Some(owner)
+        ));
+
+        // Another process holds the reservation: must refuse.
+        let mut foreign = healthy.clone();
+        foreign
+            .set_slot_reservation(Some(RunnerSlotReservation::new(owner, token).unwrap()))
+            .unwrap();
+        assert!(!handoff_spawn_admitted(
+            Some(&foreign),
+            turn,
+            token,
+            reserver,
+            Some(owner)
+        ));
+
+        // Stale token and missing row fail closed as well.
+        assert!(!handoff_spawn_admitted(
+            Some(&healthy),
+            turn,
+            uuid::Uuid::new_v4(),
+            reserver,
+            Some(owner)
+        ));
+        assert!(!handoff_spawn_admitted(
+            None,
+            turn,
+            token,
+            reserver,
+            Some(owner)
+        ));
+    }
 
     #[test]
     fn the_early_exit_line_keeps_the_runner_error_beside_the_blocking_code() {
@@ -2628,5 +2815,287 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
         );
         assert_eq!(turn_exit_code(&TaskOutcome::Blocked), 1);
         assert_eq!(turn_exit_code(&TaskOutcome::Done), 0);
+    }
+
+    struct JournalContentionHook {
+        entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl crate::client_state::ClientStateConcurrencyHook for JournalContentionHook {
+        fn reach(&self, point: crate::client_state::ClientStateConcurrencyPoint) {
+            if point == crate::client_state::ClientStateConcurrencyPoint::RunnerLogContention
+                && let Some(sender) = self.entered.lock().unwrap().take()
+            {
+                sender.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("release journal contention hook");
+            }
+        }
+    }
+
+    struct ResumeOnDrop(Option<std::sync::mpsc::Sender<()>>);
+
+    impl ResumeOnDrop {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for ResumeOnDrop {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn isolated_handoff_paths() -> (tempfile::TempDir, crate::paths::PathLayout) {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().canonicalize().unwrap().join("state");
+        let paths = crate::paths::PathLayout {
+            config: root.path().join("config.toml"),
+            state,
+            cache: root.path().join("cache"),
+            data: root.path().join("data"),
+        };
+        (root, paths)
+    }
+
+    fn plant_reserved_turn(
+        store: &crate::client_state::ClientStateStore,
+        owner: crate::job::ProcessIdentity,
+        with_locator: bool,
+    ) -> (crate::task::TaskId, crate::task::TurnId, uuid::Uuid) {
+        use crate::job::{CommandSummary, QueueEntry, QueueEntryKind};
+        use crate::scheduler::WorkerPreference;
+
+        let task_id = crate::task::TaskId::generate();
+        let turn_id = crate::task::TurnId::generate();
+        if with_locator {
+            store.write_turn_prompt(task_id, turn_id, "prompt").unwrap();
+        }
+        store
+            .enqueue(
+                QueueEntry::new(
+                    turn_id,
+                    store.client_id(),
+                    "a".repeat(64),
+                    "b".repeat(64),
+                    CommandSummary::argv(1).unwrap(),
+                    Vec::new(),
+                    WorkerPreference::Automatic,
+                    QueueEntryKind::TaskTurn,
+                    None,
+                    owner,
+                    10,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let crate::client_state::RunnerSlotDecision::Acquired { token } =
+            store.reserve_runner_slot(turn_id, owner, 8, false).unwrap()
+        else {
+            panic!("expected acquired reservation");
+        };
+        (task_id, turn_id, token)
+    }
+
+    fn wait_confirmed_contention_then_mutate(
+        entered: std::sync::mpsc::Receiver<()>,
+        mut resume: ResumeOnDrop,
+        held: crate::runner_log::RunnerLog,
+        mutate: impl FnOnce(),
+    ) {
+        entered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("helper reached RunnerLogContention under a live flock");
+        mutate();
+        drop(held);
+        resume.release();
+    }
+
+    fn expect_task_busy(result: Result<crate::runner_log::RunnerLog, crate::error::WorkerError>) {
+        match result {
+            Err(error) => assert_eq!(error.public_code(), "TASK_BUSY"),
+            Ok(_) => panic!("expected TASK_BUSY from handoff journal helper"),
+        }
+    }
+
+    #[test]
+    fn handoff_spawn_helper_refuses_cancel_after_confirmed_contention() {
+        let owner = current_process_identity().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (_root, paths) = isolated_handoff_paths();
+        let store = crate::client_state::ClientStateStore::open_with_concurrency_hook(
+            &paths.state,
+            std::sync::Arc::new(JournalContentionHook {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                resume: std::sync::Mutex::new(resume_rx),
+            }),
+        )
+        .unwrap();
+        let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, true);
+        let held = crate::runner_log::RunnerLog::open(&paths.state, task_id, turn_id).unwrap();
+        std::thread::scope(|scope| {
+            let resume = ResumeOnDrop(Some(resume_tx));
+            let helper = scope.spawn(|| {
+                open_handoff_journal_for_spawn(&store, &paths, task_id, turn_id, Some(token))
+            });
+            wait_confirmed_contention_then_mutate(entered_rx, resume, held, || {
+                store.retain_task_turn_cancel(turn_id, 11).unwrap();
+            });
+            expect_task_busy(helper.join().unwrap());
+            assert!(
+                store
+                    .queue_entry(turn_id)
+                    .unwrap()
+                    .unwrap()
+                    .is_cancel_requested(),
+                "retained cancel must survive the refused spawn helper"
+            );
+        });
+    }
+
+    #[test]
+    fn handoff_spawn_helper_refuses_adopt_after_confirmed_contention() {
+        let owner = current_process_identity().unwrap();
+        let replacement = crate::job::ProcessIdentity::new(999_997, 997).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (_root, paths) = isolated_handoff_paths();
+        let store = crate::client_state::ClientStateStore::open_with_concurrency_hook(
+            &paths.state,
+            std::sync::Arc::new(JournalContentionHook {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                resume: std::sync::Mutex::new(resume_rx),
+            }),
+        )
+        .unwrap();
+        let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, true);
+        let held = crate::runner_log::RunnerLog::open(&paths.state, task_id, turn_id).unwrap();
+        std::thread::scope(|scope| {
+            let resume = ResumeOnDrop(Some(resume_tx));
+            let helper = scope.spawn(|| {
+                open_handoff_journal_for_spawn(&store, &paths, task_id, turn_id, Some(token))
+            });
+            wait_confirmed_contention_then_mutate(entered_rx, resume, held, || {
+                store.adopt_row(turn_id, replacement).unwrap();
+            });
+            expect_task_busy(helper.join().unwrap());
+            assert_eq!(
+                store.queue_entry(turn_id).unwrap().unwrap().owner_opt(),
+                Some(&replacement),
+                "adopted owner must survive the refused spawn helper"
+            );
+        });
+    }
+
+    #[test]
+    fn handoff_spawn_helper_refuses_when_journal_task_has_no_turn_locator() {
+        let owner = current_process_identity().unwrap();
+        let (_root, paths) = isolated_handoff_paths();
+        let store = crate::client_state::ClientStateStore::open(&paths.state).unwrap();
+        let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, false);
+        assert!(
+            store.queue_entry(turn_id).unwrap().is_some(),
+            "raw queue lookup still sees the reserved turn"
+        );
+        expect_task_busy(open_handoff_journal_for_spawn(
+            &store,
+            &paths,
+            task_id,
+            turn_id,
+            Some(token),
+        ));
+        assert!(
+            store.queue_entry(turn_id).unwrap().is_some(),
+            "mapping refusal must not delete the reserved row"
+        );
+    }
+
+    #[test]
+    fn handoff_after_bind_helper_refuses_cancel_after_confirmed_contention() {
+        let owner = current_process_identity().unwrap();
+        let child = crate::job::ProcessIdentity::new(8, 8).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (_root, paths) = isolated_handoff_paths();
+        let store = crate::client_state::ClientStateStore::open_with_concurrency_hook(
+            &paths.state,
+            std::sync::Arc::new(JournalContentionHook {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                resume: std::sync::Mutex::new(resume_rx),
+            }),
+        )
+        .unwrap();
+        let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, true);
+        let expected = store.bind_runner_slot_child(turn_id, token, child).unwrap();
+        let held = crate::runner_log::RunnerLog::open(&paths.state, task_id, turn_id).unwrap();
+        std::thread::scope(|scope| {
+            let resume = ResumeOnDrop(Some(resume_tx));
+            let helper = scope.spawn(|| {
+                open_handoff_journal_after_bind(
+                    &store, &paths, task_id, turn_id, token, owner, &expected,
+                )
+            });
+            wait_confirmed_contention_then_mutate(entered_rx, resume, held, || {
+                store.retain_task_turn_cancel(turn_id, 11).unwrap();
+            });
+            expect_task_busy(helper.join().unwrap());
+            let row = store.queue_entry(turn_id).unwrap().unwrap();
+            assert!(row.is_cancel_requested());
+            assert_eq!(
+                row.slot_reservation()
+                    .and_then(|reservation| reservation.child()),
+                Some(child),
+                "bound reservation must remain after post-bind TASK_BUSY"
+            );
+        });
+    }
+
+    #[test]
+    fn handoff_after_bind_helper_refuses_adopt_after_confirmed_contention() {
+        let owner = current_process_identity().unwrap();
+        let child = crate::job::ProcessIdentity::new(8, 8).unwrap();
+        let replacement = crate::job::ProcessIdentity::new(999_997, 997).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (_root, paths) = isolated_handoff_paths();
+        let store = crate::client_state::ClientStateStore::open_with_concurrency_hook(
+            &paths.state,
+            std::sync::Arc::new(JournalContentionHook {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                resume: std::sync::Mutex::new(resume_rx),
+            }),
+        )
+        .unwrap();
+        let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, true);
+        let expected = store.bind_runner_slot_child(turn_id, token, child).unwrap();
+        let held = crate::runner_log::RunnerLog::open(&paths.state, task_id, turn_id).unwrap();
+        std::thread::scope(|scope| {
+            let resume = ResumeOnDrop(Some(resume_tx));
+            let helper = scope.spawn(|| {
+                open_handoff_journal_after_bind(
+                    &store, &paths, task_id, turn_id, token, owner, &expected,
+                )
+            });
+            wait_confirmed_contention_then_mutate(entered_rx, resume, held, || {
+                store.adopt_row(turn_id, replacement).unwrap();
+            });
+            expect_task_busy(helper.join().unwrap());
+            let row = store.queue_entry(turn_id).unwrap().unwrap();
+            assert_eq!(row.owner_opt(), Some(&replacement));
+            assert_eq!(
+                row.slot_reservation()
+                    .and_then(|reservation| reservation.child()),
+                Some(child),
+                "bound reservation must remain after post-bind TASK_BUSY"
+            );
+        });
     }
 }
