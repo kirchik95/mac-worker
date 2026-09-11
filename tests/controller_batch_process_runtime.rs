@@ -964,7 +964,7 @@ fn fakeexec_one_turn(
     let material = plumbing_material(
         job_id,
         client_id,
-        token.clone(),
+        token,
         project_id,
         worktree_id,
         turn.digest(),
@@ -1106,10 +1106,10 @@ fn terminal_head_oid<'a>(report: &'a Value, expected_turn: Option<&str>) -> Opti
     if json_string(turn, "terminal") != Some("succeeded") {
         return None;
     }
-    if let Some(expected_turn) = expected_turn {
-        if json_string(turn, "turn_id") != Some(expected_turn) {
-            return None;
-        }
+    if let Some(expected_turn) = expected_turn
+        && json_string(turn, "turn_id") != Some(expected_turn)
+    {
+        return None;
     }
     json_string(status, "head_oid")
 }
@@ -1146,7 +1146,7 @@ fn decode_rpc_json(stdout: &[u8], stderr: &[u8]) -> Value {
         panic!(
             "rpc stdout was not a controller frame ({error}); stdout={} stderr={}",
             String::from_utf8_lossy(stdout),
-            String::from_utf8_lossy(&stderr)
+            String::from_utf8_lossy(stderr)
         )
     });
     serde_json::from_slice(payload).unwrap_or_else(|_| {

@@ -222,8 +222,7 @@ impl ProcessFixture {
         );
 
         // Spaces + quote so FLOW's POSIX-quoted GIT_SSH_COMMAND/rsync -e is exercised.
-        let ssh_dir = root.join("ssh bin");
-        fs::create_dir_all(&ssh_dir).unwrap();
+        let ssh_dir = crate::support::create_directory(root.join("ssh bin"));
         let fake_ssh = ssh_dir.join("fake'ssh hop");
         write_fake_ssh(
             &fake_ssh,
