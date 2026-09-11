@@ -3835,14 +3835,28 @@ pub fn preview_batch_plan(
                 });
             }
         }
-        let resolved = resolve_batch_task(
-            config,
-            &batch.defaults,
-            task,
-            batch_dir,
-            project,
-            &state.settings.task,
-        );
+        // The controller host owns the dispatch inventory, so a controller-only
+        // laptop config legitimately has no `[[workers]]`. Validating pins
+        // against it would fail a valid batch; the controller checks the pin at
+        // submit through the same resolver the freeze path uses.
+        let resolved = if config.controller.enabled {
+            resolve_batch_task_without_local_workers(
+                &batch.defaults,
+                task,
+                batch_dir,
+                project,
+                &state.settings.task,
+            )
+        } else {
+            resolve_batch_task(
+                config,
+                &batch.defaults,
+                task,
+                batch_dir,
+                project,
+                &state.settings.task,
+            )
+        };
         let (agent, model, effort, mut base, wip, source, publish, worker, env_profile) =
             match &resolved {
                 Ok(request) => (

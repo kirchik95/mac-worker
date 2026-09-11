@@ -1010,10 +1010,7 @@ fn run_task_command(
                 write_json_line(stdout, &report)?;
             } else {
                 writeln!(stdout, "batch preview: {} tasks", report.tasks.len())?;
-                writeln!(
-                    stdout,
-                    "This version can preview dependencies but cannot execute them."
-                )?;
+                writeln!(stdout, "{}", report.dag.message)?;
                 if report.setup.present {
                     writeln!(stdout, "setup recipe present")?;
                 }
