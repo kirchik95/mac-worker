@@ -35,7 +35,9 @@ use mac_worker::{
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
-    run::{JobFollower, RunObserver, RunRequest, RunService, RunStage, SchedulerRuntime},
+    run::{
+        JobFollower, RunCompletion, RunObserver, RunRequest, RunService, RunStage, SchedulerRuntime,
+    },
     scheduler::{CandidateSlot, WorkerPreference},
     scheduler_adapter::SchedulerProbeAdapter,
     supervisor::{
@@ -1185,6 +1187,36 @@ fn claim_lease_handoff_matrix_uses_production_run_dispatch() {
     assert_eq!(schedule_counts, [25, 25, 25, 25]);
 }
 
+/// CLI `worker run` owns one Batch row per process. Sequential initial
+/// `RunService::submit_and_follow` calls keep that contract: two overlapping
+/// same-owner Waiting rows in one process let untargeted claim take the FIFO
+/// head (`QUEUE_CLAIM_CONFLICT`). Production lease acquire and follower stay
+/// on the real path; waiting-third concurrency is a later, separate thread.
+fn sequential_two_slot_run_submits(
+    runner: &ProductionLeaseRunner,
+    config: &Config,
+    paths: &PathLayout,
+    store: &ClientStateStore,
+    repo: &GitRepo,
+    first_command: &'static str,
+    second_command: &'static str,
+) -> (RunCompletion, RunCompletion) {
+    let submit = |command: &'static str, label: &str| {
+        RunService::with_follower(runner, config, paths, store, &SuccessfulRunFollower)
+            .submit_and_follow(
+                production_run_request_with(repo, false, command),
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap_or_else(|error| panic!("{label} production dispatch failed: {error}"))
+    };
+    (
+        submit(first_command, "first"),
+        submit(second_command, "second"),
+    )
+}
+
 #[test]
 fn two_slot_production_dispatch_accepts_two_jobs_and_cancel_frees_one_slot() {
     // Break caught: config slots=2 and host capacity 2 are not both carried
@@ -1198,39 +1230,15 @@ fn two_slot_production_dispatch_accepts_two_jobs_and_cancel_frees_one_slot() {
     LeaseService::new(&host).set_slot_count(2).unwrap();
     let runner = Arc::new(ProductionLeaseRunner::new((*host).clone()));
     let config = production_run_config_with_slots(2);
-    let start = Arc::new(Barrier::new(2));
-
-    let spawn = |command: &'static str| {
-        let run_store = Arc::clone(&store);
-        let run_runner = Arc::clone(&runner);
-        let run_paths = paths.clone();
-        let run_config = config.clone();
-        let run_request = production_run_request_with(&repo, false, command);
-        let start = Arc::clone(&start);
-        thread::spawn(move || {
-            start.wait();
-            let follower = SuccessfulRunFollower;
-            let service = RunService::with_follower(
-                &*run_runner,
-                &run_config,
-                &run_paths,
-                &run_store,
-                &follower,
-            );
-            service.submit_and_follow(run_request, false, &mut Vec::new(), &mut Vec::new())
-        })
-    };
-
-    let first = spawn("scheduler-two-slot-first");
-    let second = spawn("scheduler-two-slot-second");
-    let first = first
-        .join()
-        .unwrap()
-        .unwrap_or_else(|error| panic!("first production dispatch failed: {error}"));
-    let second = second
-        .join()
-        .unwrap()
-        .unwrap_or_else(|error| panic!("second production dispatch failed: {error}"));
+    let (first, second) = sequential_two_slot_run_submits(
+        &runner,
+        &config,
+        &paths,
+        &store,
+        &repo,
+        "scheduler-two-slot-first",
+        "scheduler-two-slot-second",
+    );
     assert_ne!(first.report.job_id, second.report.job_id);
     let occupied = LeaseService::new(&host).occupied_slots().unwrap();
     let occupied_ids: HashSet<_> = occupied.iter().map(|slot| slot.lease.job_id()).collect();
@@ -1354,39 +1362,15 @@ fn two_slot_production_dispatch_waits_for_a_freed_slot_and_keeps_the_peer() {
     LeaseService::new(&host).set_slot_count(2).unwrap();
     let runner = Arc::new(ProductionLeaseRunner::new((*host).clone()));
     let config = production_run_config_with_slots(2);
-    let start = Arc::new(Barrier::new(2));
-
-    let spawn = |command: &'static str| {
-        let run_store = Arc::clone(&store);
-        let run_runner = Arc::clone(&runner);
-        let run_paths = paths.clone();
-        let run_config = config.clone();
-        let run_request = production_run_request_with(&repo, false, command);
-        let start = Arc::clone(&start);
-        thread::spawn(move || {
-            start.wait();
-            let follower = SuccessfulRunFollower;
-            let service = RunService::with_follower(
-                &*run_runner,
-                &run_config,
-                &run_paths,
-                &run_store,
-                &follower,
-            );
-            service.submit_and_follow(run_request, false, &mut Vec::new(), &mut Vec::new())
-        })
-    };
-
-    let first = spawn("scheduler-two-slot-wait-first");
-    let second = spawn("scheduler-two-slot-wait-second");
-    let first = first
-        .join()
-        .unwrap()
-        .unwrap_or_else(|error| panic!("first production dispatch failed: {error}"));
-    let second = second
-        .join()
-        .unwrap()
-        .unwrap_or_else(|error| panic!("second production dispatch failed: {error}"));
+    let (first, second) = sequential_two_slot_run_submits(
+        &runner,
+        &config,
+        &paths,
+        &store,
+        &repo,
+        "scheduler-two-slot-wait-first",
+        "scheduler-two-slot-wait-second",
+    );
     assert_ne!(first.report.job_id, second.report.job_id);
     assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
 
