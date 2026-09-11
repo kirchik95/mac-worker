@@ -2666,7 +2666,10 @@ impl<'a> TaskClient<'a> {
                 .client_state
                 .queue_entry_for_task_turn(record.meta().task_id())?
             {
-                let Ok(Some(log)) = crate::runner_log::RunnerLog::try_open(
+                // Fence only an already initialized journal: creating one
+                // here would race the rightful owner's first-log init with
+                // an exact EEXIST failure at submit handoff.
+                let Ok(Some(log)) = crate::runner_log::RunnerLog::try_open_existing(
                     &self.paths.state,
                     record.meta().task_id(),
                     entry.job_id(),

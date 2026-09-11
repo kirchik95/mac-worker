@@ -6805,3 +6805,239 @@ fn automatic_cold_admission_runs_three_host_probes_before_the_fourth() {
         "expected at least three in-flight admission probes, started {submit:?}"
     );
 }
+
+/// Rendezvous between a paused submitter (inside `start_with_slot`, after
+/// reservation publication and lock release, before native journal init)
+/// and the test driver. Bounded waits auto-release so a failure panics
+/// instead of hanging; Drop releases as well (RAII on panic paths).
+struct SlotPauseGate {
+    state: Arc<(Mutex<SlotPauseState>, std::sync::Condvar)>,
+}
+
+struct SlotPauseState {
+    arrived: bool,
+    released: bool,
+}
+
+impl SlotPauseGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Arc::new((
+                Mutex::new(SlotPauseState {
+                    arrived: false,
+                    released: false,
+                }),
+                std::sync::Condvar::new(),
+            )),
+        })
+    }
+
+    fn arrive_and_wait(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.arrived = true;
+        changed.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !state.released {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.released = true;
+                changed.notify_all();
+                drop(state);
+                panic!("timed out waiting for pause-gate release");
+            }
+            let (next, timeout) = changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if timeout.timed_out() && !state.released {
+                state.released = true;
+                changed.notify_all();
+                drop(state);
+                panic!("timed out waiting for pause-gate release");
+            }
+        }
+    }
+
+    fn wait_for_arrival(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !state.arrived {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.released = true;
+                changed.notify_all();
+                drop(state);
+                panic!("timed out waiting for submit to reach start_with_slot");
+            }
+            let (next, timeout) = changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if timeout.timed_out() && !state.arrived {
+                state.released = true;
+                changed.notify_all();
+                drop(state);
+                panic!("timed out waiting for submit to reach start_with_slot");
+            }
+        }
+    }
+
+    fn release(&self) {
+        let (state, changed) = &*self.state;
+        state.lock().unwrap().released = true;
+        changed.notify_all();
+    }
+}
+
+struct ReleasePauseOnDrop {
+    gate: Arc<SlotPauseGate>,
+}
+
+impl Drop for ReleasePauseOnDrop {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+/// Test-only executor wrapper: pauses at the existing
+/// `RunnerExecutor::start_with_slot` boundary (entered after reservation
+/// publication/lock release, before native first-log initialization), then
+/// delegates to the existing `InlineRunnerExecutor`. Counts delegations as
+/// part of verifying actual handoff behavior.
+struct PausingSlotExecutor {
+    gate: Arc<SlotPauseGate>,
+    starts: AtomicUsize,
+}
+
+impl PausingSlotExecutor {
+    fn new(gate: Arc<SlotPauseGate>) -> Self {
+        Self {
+            gate,
+            starts: AtomicUsize::new(0),
+        }
+    }
+
+    fn starts(&self) -> usize {
+        self.starts.load(Ordering::SeqCst)
+    }
+}
+
+impl RunnerExecutor for PausingSlotExecutor {
+    fn start(
+        &self,
+        paths: &mac_worker::paths::PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        InlineRunnerExecutor.start(paths, task_id, turn_id)
+    }
+
+    fn start_with_slot(
+        &self,
+        paths: &mac_worker::paths::PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+        slot_token: Option<uuid::Uuid>,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.gate.arrive_and_wait();
+        InlineRunnerExecutor.start_with_slot(paths, task_id, turn_id, slot_token)
+    }
+}
+
+#[test]
+fn selected_recovery_must_not_initialize_pending_submit_journal() {
+    // Deterministic regression for the concurrent first-log create race:
+    // while an initial submit has published its queue row and is paused
+    // before its first journal initialization, background selected recovery
+    // must not create a fresh journal for that pending live submit.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let state_root = tempfile::tempdir().unwrap();
+    let state_root_path = state_root.path().canonicalize().unwrap();
+    let paths = support::task_harness::paths(&state_root_path);
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\", \"origin:example.test\"]\n",
+    )
+    .unwrap();
+    let remote = AcceptedThenTerminalRunner::new();
+    let gate = SlotPauseGate::new();
+    let executor = PausingSlotExecutor::new(Arc::clone(&gate));
+    let request = submit_request(
+        repo.root(),
+        None,
+        WorkerPreference::Pinned {
+            worker: "mini-1".into(),
+        },
+        true,
+    );
+    thread::scope(|scope| {
+        let _release_on_panic = ReleasePauseOnDrop {
+            gate: Arc::clone(&gate),
+        };
+        let handle = scope.spawn(|| {
+            TaskClient::new(&remote, &config, &paths, &state, &executor).submit(
+                request,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+        });
+        gate.wait_for_arrival();
+        // Exactly one pending task/turn exists; discover it from live state.
+        let store2 = ClientStateStore::open(&paths.state).unwrap();
+        let tasks = store2.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 1, "one pending submit expected");
+        let task_id = tasks[0].meta().task_id();
+        let row = store2
+            .queue_entry_for_task_turn(task_id)
+            .unwrap()
+            .expect("published queue row");
+        let turn_id = row.job_id();
+        let record_before = store2.load_task(task_id).unwrap();
+        // Background selected recovery, as a leader tick would run it.
+        TaskClient::new(&remote, &config, &paths, &store2, &InlineRunnerExecutor)
+            .reconcile_selected(&[task_id])
+            .unwrap();
+        // THE invariant: no journal initialized for the pending live submit.
+        let log = support::task_harness::runner_log(
+            &state_root_path,
+            &task_id.to_string(),
+            &turn_id.to_string(),
+        );
+        let checkpoint = paths
+            .state
+            .join("runners")
+            .join(task_id.to_string())
+            .join(format!("{turn_id}.checkpoint.json"));
+        assert!(
+            !log.exists() && !checkpoint.exists(),
+            "selected recovery must not initialize the pending submit journal"
+        );
+        // Row/task identity intact: recovery changed nothing.
+        assert_eq!(
+            store2
+                .queue_entry_for_task_turn(task_id)
+                .unwrap()
+                .expect("row"),
+            row
+        );
+        assert_eq!(store2.load_task(task_id).unwrap(), record_before);
+        gate.release();
+        let report = handle
+            .join()
+            .unwrap()
+            .expect("submit finishes after release");
+        assert_eq!(report.task_id(), task_id);
+        assert_eq!(
+            executor.starts(),
+            1,
+            "exactly one handoff delegation, no duplicate spawn"
+        );
+        assert!(
+            log.exists(),
+            "the rightful submitter flow creates the journal on completion"
+        );
+    });
+}
