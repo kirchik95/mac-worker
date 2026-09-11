@@ -110,9 +110,8 @@ impl PreparedTaskMutation {
     }
 }
 
-/// OVERLAPPING/PENDING OpenCode exclusive B: typed body parse only.
-/// Validates the mutation body and returns the targeted task id without
-/// loading or freezing expected state.
+/// Typed body parse only. Validates the mutation body and returns the
+/// targeted task id without loading or freezing expected state.
 pub fn mutation_task_id(request: &ControllerRequest) -> Result<TaskId, WorkerError> {
     match request.command() {
         COMMAND_SAY => Ok(parse_body::<SayBody>(request.body(), COMMAND_SAY)?.task_id),

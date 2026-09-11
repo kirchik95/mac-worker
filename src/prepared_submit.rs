@@ -61,8 +61,8 @@ pub struct FrozenSubmitBody {
     pub cli_includes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    /// OVERLAPPING/PENDING OpenCode exclusive no_wait. Mechanical field so
-    /// the envelope compiles; omitted old bodies default true.
+    /// CLI `--no-wait` inverts this. Omitted old bodies default true so
+    /// queued and fail-fast submits stay digest-stable with prior helpers.
     #[serde(default = "default_true")]
     pub wait_for_capacity: bool,
 }

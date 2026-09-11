@@ -59,8 +59,8 @@ const GIT_DEADLINE: Duration = Duration::from_secs(60);
 
 static DETACHED_EXECUTOR: DetachedRunnerExecutor = DetachedRunnerExecutor;
 
-// OVERLAPPING/PENDING OpenCode exclusive B: bounded selected recovery at
-// prepare. Mechanical compile helper only; not an A/B-test-green leaf.
+// Bounded selected recovery at prepare: retire a completed dead runner
+// before freezing say/close expected.
 fn recover_selected_task_before_prepare(
     handler: &TaskSubmitHandler<'_>,
     task_id: crate::task::TaskId,
@@ -105,8 +105,7 @@ impl ControllerCommandHandler for TaskSubmitHandler<'_> {
             "checkpoint.submit" | "task.submit" => {
                 crate::controller::default_prepare_operation(request)
             }
-            // OVERLAPPING/PENDING OpenCode exclusive B: recover say/close
-            // before freezing expected; cancel stays freeze-only.
+            // Recover say/close before freezing expected; cancel stays freeze-only.
             "task.say" | "task.close" => {
                 let task_id = mutation_task_id(request)?;
                 recover_selected_task_before_prepare(self, task_id)?;
@@ -146,8 +145,7 @@ impl ControllerCommandHandler for TaskSubmitHandler<'_> {
 }
 
 impl TaskSubmitHandler<'_> {
-    // OVERLAPPING/PENDING OpenCode exclusive B: former say/cancel/close
-    // freeze body. Pure encode of prepare_task_mutation; no recapture.
+    // Pure encode of prepare_task_mutation; no recapture.
     fn prepare_frozen_mutation(
         &self,
         request: &ControllerRequest,

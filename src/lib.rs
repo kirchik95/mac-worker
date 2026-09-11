@@ -3733,8 +3733,8 @@ fn run_enabled_controller_task(
                     wait_for_capacity: !no_wait,
                 },
             )?;
-            // OVERLAPPING/PENDING OpenCode exclusive A: `--wait` waits via
-            // controller then writes TaskReport. `--no-wait` ACK unchanged.
+            // `--wait` waits via controller then writes TaskReport.
+            // `--no-wait` ACK unchanged.
             if wait {
                 let task_id: crate::task::TaskId = controller_ack_id(ack.task_id())
                     .parse()
@@ -4063,7 +4063,7 @@ struct ControllerSubmitFields {
     source: Option<String>,
     publish: Vec<String>,
     publish_branch: Option<String>,
-    // OVERLAPPING/PENDING OpenCode exclusive A/no_wait freeze adapter field.
+    // CLI `--no-wait` inverts this freeze adapter field.
     wait_for_capacity: bool,
 }
 
@@ -4879,5 +4879,571 @@ mod tests {
         .expect_err("unknown configuration fields must be rejected");
 
         assert!(matches!(error, WorkerError::Config(_)));
+    }
+}
+
+#[cfg(test)]
+mod enabled_submit_freeze_tests {
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        path::PathBuf,
+        process::Command as SystemCommand,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use serde_json::{Value, json};
+
+    use crate::{
+        RuntimeContext,
+        cli::{Command, TaskCommand},
+        config::Config,
+        controller::{
+            canonical_request_sha256, load_operation_envelope, parse_request,
+            persist_operation_envelope,
+        },
+        error::WorkerError,
+        paths::PathLayout,
+        prepared_submit::FrozenSubmitBody,
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        protocol::PROTOCOL_VERSION,
+        task::{
+            BaseOid, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        },
+    };
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        repo: PathBuf,
+        paths: PathLayout,
+        runtime: RuntimeContext,
+        config: Config,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let home = root.join("home");
+            for dir in ["home", "state", "cache", "config", "data"] {
+                std::fs::create_dir_all(root.join(dir)).unwrap();
+            }
+            let repo = root.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            std::fs::create_dir_all(repo.join("home")).unwrap();
+            git(&repo, &["init", "--initial-branch=main"]);
+            git(&repo, &["config", "user.name", "Fixture"]);
+            git(&repo, &["config", "user.email", "fixture@example.test"]);
+            std::fs::write(repo.join("src.txt"), b"fixture\n").unwrap();
+            git(&repo, &["add", "--all"]);
+            git(&repo, &["commit", "-m", "fixture"]);
+            let environment = BTreeMap::from([
+                (OsString::from("HOME"), home.as_os_str().to_os_string()),
+                (
+                    OsString::from("XDG_STATE_HOME"),
+                    root.join("state").into_os_string(),
+                ),
+                (
+                    OsString::from("XDG_CACHE_HOME"),
+                    root.join("cache").into_os_string(),
+                ),
+                (
+                    OsString::from("XDG_CONFIG_HOME"),
+                    root.join("config").into_os_string(),
+                ),
+                (
+                    OsString::from("XDG_DATA_HOME"),
+                    root.join("data").into_os_string(),
+                ),
+            ]);
+            let paths = PathLayout::discover(None, &environment, &home).unwrap();
+            let runtime = RuntimeContext::isolated(environment, home, root.clone());
+            let config = Config::parse(
+                "version = 1\n[controller]\nenabled = true\nssh = \"fakecontroller\"\nremote_binary = \"~/.local/bin/worker\"\n",
+            )
+            .unwrap();
+            Self {
+                _temp: temp,
+                repo,
+                paths,
+                runtime,
+                config,
+            }
+        }
+    }
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let output = SystemCommand::new("/usr/bin/git")
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repo.join("home"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Mocked controller/message plane: answers framed RPC from the real
+    /// codecs and digests; asserts the controller git-push identity/args and
+    /// succeeds it without a live hop. Proves the CLI boundary shape, not
+    /// execution. Existing streamed/process suites cover actual transfer.
+    struct MockControllerRpc {
+        polls: AtomicUsize,
+        submit_bodies: Mutex<Vec<Value>>,
+        wait_exit: Mutex<u8>,
+        status_exit: Mutex<Option<u8>>,
+    }
+
+    impl MockControllerRpc {
+        fn new() -> Self {
+            Self {
+                polls: AtomicUsize::new(0),
+                submit_bodies: Mutex::new(Vec::new()),
+                wait_exit: Mutex::new(0),
+                status_exit: Mutex::new(Some(0)),
+            }
+        }
+
+        fn set_wait_exit(&self, exit: u8) {
+            *self.wait_exit.lock().unwrap() = exit;
+        }
+
+        fn set_status_exit(&self, exit: Option<u8>) {
+            *self.status_exit.lock().unwrap() = exit;
+        }
+
+        fn reply(&self, command: &str, request_id: &str, body: &Value, result: Value) -> Vec<u8> {
+            let digest = canonical_request_sha256(PROTOCOL_VERSION, command, body).expect("digest");
+            crate::controller::encode_json_frame(&json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "command": command,
+                "request_id": request_id,
+                "payload_sha256": digest,
+                "result": result,
+            }))
+            .expect("frame")
+        }
+    }
+
+    impl ProcessRunner for MockControllerRpc {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            use std::os::unix::process::ExitStatusExt;
+            // Local git is real (freeze inspects actual objects). Only the
+            // controller source push is mocked in-runner with asserted
+            // identity/args; everything else framed is answered below.
+            // Existing streamed/process suites cover actual transfer.
+            if request.program == std::ffi::OsString::from("/usr/bin/git") {
+                if !request.args.iter().any(|arg| arg == "push") {
+                    return crate::process::SystemProcessRunner.run(request);
+                }
+                assert!(
+                    request.args.iter().any(|arg| arg
+                        .to_str()
+                        .is_some_and(|text| text.contains("controller-receive-pack"))),
+                    "push must target controller-receive-pack, got {request:?}"
+                );
+                return Ok(ProcessResult {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: b"Done\n".to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            let stdin = request.stdin.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "unexpected mocked program {:?} args {:?}",
+                    request.program, request.args
+                )
+            });
+            let ok = |stdout: Vec<u8>| ProcessResult {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            };
+            let payload = crate::controller::decode_frame(stdin).expect("request frame");
+            let parsed: Value = serde_json::from_slice(payload).expect("request json");
+            let command = parsed["command"].as_str().unwrap_or_default().to_owned();
+            let request_id = parsed["request_id"].as_str().unwrap_or_default().to_owned();
+            let body = parsed["body"].clone();
+            let stdout = match command.as_str() {
+                "controller.transfer.source.prepare" => self.reply(
+                    &command,
+                    &request_id,
+                    &body,
+                    json!({
+                        "token": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                        "request_id": body["request_id"],
+                        "fingerprint": body["fingerprint"],
+                        "project_id": body["project_id"],
+                        "worktree_id": body["worktree_id"],
+                        "expected_oid": body["expected_oid"],
+                    }),
+                ),
+                "controller.transfer.source.finish" => {
+                    let request_ref = crate::transfer_repo::TransferRepo::frozen_request_ref(
+                        body["request_id"].as_str().unwrap(),
+                    )
+                    .unwrap();
+                    self.reply(
+                        &command,
+                        &request_id,
+                        &body,
+                        json!({
+                            "token": body["token"],
+                            "request_id": body["request_id"],
+                            "oid": body["expected_oid"],
+                            "request_ref": request_ref,
+                        }),
+                    )
+                }
+                "task.submit" => {
+                    self.submit_bodies.lock().unwrap().push(body.clone());
+                    let digest = canonical_request_sha256(PROTOCOL_VERSION, &command, &body)
+                        .expect("digest");
+                    crate::controller::encode_json_frame(&json!({
+                        "protocol_version": PROTOCOL_VERSION,
+                        "status": "accepted",
+                        "request_id": request_id,
+                        "payload_sha256": digest,
+                        "task_id": body["task_id"],
+                        "turn_id": body["turn_id"],
+                        "created_at_millis": body["created_at_millis"],
+                    }))
+                    .expect("frame")
+                }
+                "task.wait.poll" => {
+                    let first = self.polls.fetch_add(1, Ordering::SeqCst) == 0;
+                    let task_id = body["task_id"].as_str().unwrap_or_default().to_owned();
+                    let exit = *self.wait_exit.lock().unwrap();
+                    self.reply(
+                        &command,
+                        &request_id,
+                        &body,
+                        json!({
+                            "task_ids": [task_id],
+                            "quiescent": !first,
+                            "exit_code": exit,
+                        }),
+                    )
+                }
+                "task.status" => {
+                    let task_id: TaskId =
+                        body["task_id"].as_str().unwrap().parse().expect("task id");
+                    let status_exit = *self.status_exit.lock().unwrap();
+                    let status = TaskStatus::new(
+                        TaskState::Open,
+                        Some(TaskOutcome::Done),
+                        Some("mini-1".into()),
+                        false,
+                        Some(fixture_base_hint()),
+                        Some("mocked".into()),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        vec![TurnSummary::new(
+                            1,
+                            turn_hint(),
+                            Some(TurnTerminal::Succeeded),
+                            Some(TaskOutcome::Done),
+                            Some(true),
+                            false,
+                            Some(1),
+                            Some(2),
+                        )],
+                        2,
+                    )
+                    .unwrap();
+                    self.reply(
+                        &command,
+                        &request_id,
+                        &body,
+                        json!({
+                            "task_id": task_id.to_string(),
+                            "run_id": null,
+                            "status": status,
+                            "warnings": [],
+                            "events": [],
+                            "runner": null,
+                            "exit_code": status_exit,
+                        }),
+                    )
+                }
+                other => panic!("unexpected mocked command {other}"),
+            };
+            Ok(ok(stdout))
+        }
+    }
+
+    fn fixture_base_hint() -> BaseOid {
+        "dddddddddddddddddddddddddddddddddddddddd".parse().unwrap()
+    }
+
+    fn turn_hint() -> TurnId {
+        "118f0f4a6b5c7d8e9f00112233445566".parse().unwrap()
+    }
+
+    fn submit_command(project: PathBuf, no_wait: bool, wait: bool) -> Command {
+        Command::Task {
+            command: TaskCommand::Submit {
+                agent: None,
+                model: None,
+                effort: None,
+                prompt: Some("mocked enabled submit".into()),
+                prompt_file: None,
+                title: None,
+                project: Some(project),
+                base: "HEAD".into(),
+                wip: false,
+                includes: Vec::new(),
+                timeout: None,
+                max_turns: None,
+                max_budget: None,
+                max_followups: None,
+                close_on: None,
+                env_profile: None,
+                worker: None,
+                source: None,
+                publish: Vec::new(),
+                publish_branch: None,
+                no_wait,
+                wait,
+            },
+        }
+    }
+
+    #[test]
+    fn enabled_submit_wait_returns_task_report_with_wait_exit() {
+        let fixture = Fixture::new();
+        let mock = MockControllerRpc::new();
+        let mut stdout = Vec::new();
+        let exit = crate::run_enabled_controller_task(
+            submit_command(fixture.repo.clone(), false, true),
+            &mock,
+            &fixture.runtime,
+            &fixture.paths,
+            &fixture.config,
+            true,
+            &mut stdout,
+        )
+        .unwrap();
+        assert_eq!(exit, 0, "wait exit code is preserved");
+        assert_eq!(
+            mock.polls.load(Ordering::SeqCst),
+            2,
+            "wait must poll to quiescence"
+        );
+        let report: Value = serde_json::from_slice(&stdout).expect("report json");
+        assert_eq!(
+            report
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            mock.submit_bodies
+                .lock()
+                .unwrap()
+                .first()
+                .and_then(|body| body.get("task_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            "returned TaskReport must carry the submitted task identity"
+        );
+        let status = report.get("status").expect("TaskReport status");
+        assert_eq!(
+            status.get("state").and_then(Value::as_str),
+            Some("open"),
+            "returned TaskReport must carry the quiescent status, not a WaitReport"
+        );
+        assert_eq!(
+            status
+                .get("last_outcome")
+                .and_then(|outcome| outcome.get("kind"))
+                .and_then(Value::as_str),
+            Some("done")
+        );
+        let turns = status
+            .get("turns")
+            .and_then(Value::as_array)
+            .expect("turns");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            report.get("exit_code").and_then(Value::as_u64),
+            Some(0),
+            "TaskReport exit code must be present"
+        );
+        assert!(
+            report.get("task_ids").is_none(),
+            "must not write a WaitReport shape"
+        );
+    }
+
+    #[test]
+    fn enabled_submit_wait_failure_exit_wins_over_report_exit() {
+        let fixture = Fixture::new();
+        let mock = MockControllerRpc::new();
+        mock.set_wait_exit(1);
+        mock.set_status_exit(None);
+        let mut stdout = Vec::new();
+        let exit = crate::run_enabled_controller_task(
+            submit_command(fixture.repo.clone(), false, true),
+            &mock,
+            &fixture.runtime,
+            &fixture.paths,
+            &fixture.config,
+            true,
+            &mut stdout,
+        )
+        .unwrap();
+        assert_eq!(
+            exit, 1,
+            "CLI exit must come from the waited quiescence, not the status report"
+        );
+        let report: Value = serde_json::from_slice(&stdout).expect("report json");
+        assert!(
+            report.get("task_id").and_then(Value::as_str).is_some(),
+            "a TaskReport must still be written, not a WaitReport: {report}"
+        );
+        assert!(
+            report.get("status").is_some(),
+            "a TaskReport must still be written, not a WaitReport: {report}"
+        );
+        assert_eq!(
+            report.get("exit_code"),
+            Some(&Value::Null),
+            "report exit stays null while the CLI exits 1"
+        );
+    }
+
+    #[test]
+    fn freeze_carries_no_wait_capacity_policy() {
+        for (no_wait, expected) in [(true, false), (false, true)] {
+            let fixture = Fixture::new();
+            let mock = MockControllerRpc::new();
+            let mut stdout = Vec::new();
+            let exit = crate::run_enabled_controller_task(
+                submit_command(fixture.repo.clone(), no_wait, false),
+                &mock,
+                &fixture.runtime,
+                &fixture.paths,
+                &fixture.config,
+                true,
+                &mut stdout,
+            )
+            .unwrap();
+            assert_eq!(exit, 0, "no-wait ACK path stays exit 0");
+            let bodies = mock.submit_bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1);
+            assert_eq!(
+                bodies[0].get("wait_for_capacity").and_then(Value::as_bool),
+                Some(expected),
+                "frozen body must carry wait_for_capacity = !no_wait"
+            );
+            let frozen: FrozenSubmitBody = serde_json::from_value(bodies[0].clone()).unwrap();
+            assert_eq!(frozen.wait_for_capacity, expected);
+            assert_eq!(frozen.prepared().unwrap().wait_for_capacity, expected);
+        }
+    }
+
+    #[test]
+    fn old_frozen_body_without_flag_defaults_true() {
+        let mut body = json!({
+            "task_id": task_hint(),
+            "turn_id": turn_hint(),
+            "created_at_millis": 1_700_000_000_000u64,
+            "prompt": "old",
+            "agent": "codex",
+            "source": "local",
+            "publish": ["fetch"],
+            "close_on": "never",
+            "wip": false,
+            "project_id": "a".repeat(64),
+            "worktree_id": "b".repeat(64),
+            "base_oid": "dddddddddddddddddddddddddddddddddddddddd",
+            "timeout_millis": 1000,
+            "max_followups": 1,
+            "permissions": "workspace",
+            "requires": [],
+            "include_untracked": [],
+            "include_empty_dirs": [],
+            "allow_sensitive": [],
+            "cli_includes": [],
+        });
+        assert!(body.get("wait_for_capacity").is_none());
+        let frozen: FrozenSubmitBody = serde_json::from_value(body.clone()).unwrap();
+        assert!(
+            frozen.wait_for_capacity,
+            "missing flag defaults to prior behavior"
+        );
+        assert!(frozen.prepared().unwrap().wait_for_capacity);
+        let digest_default =
+            canonical_request_sha256(PROTOCOL_VERSION, "task.submit", &body).unwrap();
+        body.as_object_mut()
+            .unwrap()
+            .insert("wait_for_capacity".into(), json!(false));
+        let denied: FrozenSubmitBody = serde_json::from_value(body.clone()).unwrap();
+        assert!(!denied.wait_for_capacity);
+        assert!(!denied.prepared().unwrap().wait_for_capacity);
+        assert_ne!(
+            canonical_request_sha256(PROTOCOL_VERSION, "task.submit", &body).unwrap(),
+            digest_default,
+            "the capacity flag is digest-bound frozen identity: fail-fast and queued submits must not share a digest"
+        );
+    }
+
+    fn task_hint() -> String {
+        "018f0f4a6b5c7d8e9f00112233445566".into()
+    }
+
+    #[test]
+    fn persisted_frozen_envelope_replays_bytes_unchanged() {
+        let fixture = Fixture::new();
+        let request_id = "018f0f4a6b5c7d8e9f00112233445577";
+        let mock = MockControllerRpc::new();
+        let mut stdout = Vec::new();
+        crate::run_enabled_controller_task(
+            submit_command(fixture.repo.clone(), true, false),
+            &mock,
+            &fixture.runtime,
+            &fixture.paths,
+            &fixture.config,
+            true,
+            &mut stdout,
+        )
+        .unwrap();
+        let body = mock.submit_bodies.lock().unwrap()[0].clone();
+        assert_eq!(
+            body.get("wait_for_capacity").and_then(Value::as_bool),
+            Some(false)
+        );
+        let payload = serde_json::to_vec(&json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "command": "task.submit",
+            "body": body,
+        }))
+        .unwrap();
+        let request = parse_request(&payload).unwrap();
+        persist_operation_envelope(&fixture.paths.controller_cache_root(), &request).unwrap();
+        let reloaded = load_operation_envelope(&fixture.paths.controller_cache_root(), request_id)
+            .unwrap()
+            .expect("envelope");
+        assert_eq!(
+            &reloaded.body().clone(),
+            &body,
+            "replay keeps original bytes"
+        );
+        assert_eq!(
+            reloaded
+                .body()
+                .get("wait_for_capacity")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
     }
 }
