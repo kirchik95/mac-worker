@@ -867,9 +867,7 @@ fn failed_collection_keeps_last_good_stale_and_original_generation_time() {
     assert_eq!(stale.collection.freshness, Freshness::Stale);
     assert_eq!(stale.workers[0].hostname.as_deref(), Some("accepted.local"));
     assert!(
-        error_codes(&stale)
-            .iter()
-            .any(|code| *code == "DASHBOARD_REFRESH_ABORTED"),
+        error_codes(&stale).contains(&"DASHBOARD_REFRESH_ABORTED"),
         "{:?}",
         error_codes(&stale)
     );
