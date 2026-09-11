@@ -990,6 +990,17 @@ fn prepared_frozen_dag_mutated(
     hook: Option<Arc<dyn ClientStateConcurrencyHook>>,
     mutate: impl FnOnce(&mut DagNode),
 ) -> FrozenDagFixture {
+    // `ProcessRequest` carries no working directory (`src/process.rs`), so every
+    // Git child this builder spawns - `GitRepo` setup, `ProjectState::load`,
+    // `pin_object` - inherits the PROCESS-GLOBAL cwd. `CWD_LOCK` exists to own
+    // that global, but only the tests that MOVE the cwd took it; a builder that
+    // merely READS it did not. A `CwdLockedRepo` elsewhere could therefore
+    // delete the directory these children had already inherited, and Git failed
+    // with `Unable to read current working directory` even though every object
+    // was present. Participating in the same lock closes that window without
+    // serializing the suite: only fixture construction is excluded against the
+    // cwd movers, and each test body still runs in parallel afterwards.
+    let _cwd_lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let repo = support::GitRepo::init();
     repo.write("base.txt", b"base\n");
     repo.commit_all("base");
@@ -1633,6 +1644,34 @@ fn cwd_locked_repo_restores_cwd_while_the_worktree_still_exists() {
     assert!(root.exists());
     drop(locked);
     assert!(!root.exists());
+}
+
+/// The frozen-DAG fixture spawns Git children that inherit the process-global
+/// cwd, so it must not build while another test owns that global. Proven
+/// directly: with `CWD_LOCK` held here, construction on another thread cannot
+/// complete, and it completes once the lock is released.
+///
+/// Before the fixture participated in the lock this assertion failed, because
+/// construction raced straight through while a `CwdLockedRepo` elsewhere could
+/// delete the very directory its Git children had inherited.
+#[test]
+fn frozen_dag_fixture_does_not_build_while_another_test_owns_the_cwd() {
+    let guard = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (built, observe) = mpsc::channel();
+    let builder = thread::spawn(move || {
+        let fixture = prepared_frozen_dag();
+        let _ = built.send(());
+        drop(fixture);
+    });
+
+    let raced = observe.recv_timeout(Duration::from_secs(3));
+    assert!(
+        raced.is_err(),
+        "fixture construction ran implicit-cwd Git while another test owned the process cwd"
+    );
+
+    drop(guard);
+    builder.join().expect("fixture builder thread");
 }
 
 #[test]
