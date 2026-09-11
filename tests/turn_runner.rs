@@ -5,7 +5,13 @@ use std::{
     ffi::OsStr,
     fs,
     io::{self, Write},
-    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    os::{
+        fd::AsRawFd,
+        unix::{
+            fs::{OpenOptionsExt, PermissionsExt},
+            process::ExitStatusExt,
+        },
+    },
     path::{Path, PathBuf},
     process::{self, ExitStatus},
     str::FromStr,
@@ -7059,6 +7065,515 @@ fn selected_recovery_must_not_initialize_pending_submit_journal() {
         assert!(
             log.exists() && checkpoint.exists(),
             "the rightful submitter flow creates the journal on completion"
+        );
+    });
+}
+
+/// Fail-fast vs retry discriminator. Shorter than `RUNNER_HANDOFF_TIMEOUT`
+/// so an unfixed WouldBlock still surfaces as an assertion, not a 5s wait.
+const TRANSIENT_JOURNAL_FAIL_FAST: Duration = Duration::from_secs(1);
+
+fn hold_published_journal_flock(state_root: &Path, task_id: TaskId, turn_id: TurnId) -> fs::File {
+    let runners = state_root.join("runners");
+    let task_dir = runners.join(task_id.to_string());
+    fs::create_dir_all(&task_dir).unwrap();
+    fs::set_permissions(&runners, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&task_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = task_dir.join(format!("{turn_id}.log"));
+    let file = fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "test must own the published journal flock"
+    );
+    file
+}
+
+fn journal_paths(
+    state_root: &Path,
+    paths: &mac_worker::paths::PathLayout,
+    task_id: TaskId,
+    turn_id: TurnId,
+) -> (PathBuf, PathBuf) {
+    (
+        support::task_harness::runner_log(state_root, &task_id.to_string(), &turn_id.to_string()),
+        paths
+            .state
+            .join("runners")
+            .join(task_id.to_string())
+            .join(format!("{turn_id}.checkpoint.json")),
+    )
+}
+
+/// Production pre-spawn journal init (`DetachedRunnerExecutor`) with the
+/// existing pause seam. Successful starts are counted only after the
+/// journal open returns, so a WouldBlock loser is not a spawn.
+struct PreSpawnJournalExecutor {
+    gate: Arc<SlotPauseGate>,
+    starts: AtomicUsize,
+}
+
+impl PreSpawnJournalExecutor {
+    fn new(gate: Arc<SlotPauseGate>) -> Self {
+        Self {
+            gate,
+            starts: AtomicUsize::new(0),
+        }
+    }
+
+    fn starts(&self) -> usize {
+        self.starts.load(Ordering::SeqCst)
+    }
+}
+
+impl RunnerExecutor for PreSpawnJournalExecutor {
+    fn start(
+        &self,
+        paths: &mac_worker::paths::PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        self.start_with_slot(paths, task_id, turn_id, None)
+    }
+
+    fn start_with_slot(
+        &self,
+        paths: &mac_worker::paths::PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+        slot_token: Option<uuid::Uuid>,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        if self.starts.load(Ordering::SeqCst) == 0 {
+            self.gate.arrive_and_wait();
+        }
+        let identity =
+            DetachedRunnerExecutor.start_with_slot(paths, task_id, turn_id, slot_token)?;
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Ok(identity)
+    }
+}
+
+struct HandoffSubmitSetup {
+    _current_dir: CurrentDirGuard,
+    _repo: support::GitRepo,
+    state_root: tempfile::TempDir,
+    paths: mac_worker::paths::PathLayout,
+    state: ClientStateStore,
+    config: Config,
+    remote: AcceptedThenTerminalRunner,
+}
+
+impl HandoffSubmitSetup {
+    fn new() -> Self {
+        let repo = support::GitRepo::init();
+        repo.write("base.txt", b"base\n");
+        repo.commit_all("base");
+        let state_root = tempfile::tempdir().unwrap();
+        let state_root_path = state_root.path().canonicalize().unwrap();
+        let paths = support::task_harness::paths(&state_root_path);
+        let state = ClientStateStore::open(&paths.state).unwrap();
+        let config = Config::parse(
+            "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\", \"origin:example.test\"]\n",
+        )
+        .unwrap();
+        let current_dir = CurrentDirGuard::enter(repo.root());
+        Self {
+            _current_dir: current_dir,
+            _repo: repo,
+            state_root,
+            paths,
+            state,
+            config,
+            remote: AcceptedThenTerminalRunner::new(),
+        }
+    }
+
+    fn request(&self) -> TaskSubmitRequest {
+        submit_request(
+            self._repo.root(),
+            None,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            true,
+        )
+    }
+}
+
+fn discovered_task_turn(state: &ClientStateStore) -> (TaskId, TurnId) {
+    let tasks = state.list_tasks().unwrap();
+    assert_eq!(tasks.len(), 1, "one pending submit expected");
+    let task_id = tasks[0].meta().task_id();
+    let turn_id = state
+        .queue_entry_for_task_turn(task_id)
+        .unwrap()
+        .expect("published queue row")
+        .job_id();
+    (task_id, turn_id)
+}
+
+fn assert_completed_handoff(
+    state: &ClientStateStore,
+    executor_starts: usize,
+    state_root: &Path,
+    paths: &mac_worker::paths::PathLayout,
+    task_id: TaskId,
+    turn_id: TurnId,
+) {
+    assert_eq!(
+        executor_starts, 1,
+        "exactly one spawn, no duplicate executor start"
+    );
+    let finished = state.load_task(task_id).unwrap();
+    assert_eq!(finished.meta().task_id(), task_id);
+    let runner = finished
+        .runner()
+        .expect("completed handoff must record the runner");
+    let row = state
+        .queue_entry_for_task_turn(task_id)
+        .unwrap()
+        .expect("row");
+    assert_eq!(row.job_id(), turn_id);
+    assert_eq!(
+        row.owner_opt().copied(),
+        Some(runner.process_identity()),
+        "queue owner must match the recorded runner after complete_runner_spawn"
+    );
+    assert!(
+        row.slot_reservation().is_none(),
+        "completed handoff must clear the slot reservation"
+    );
+    let (log, checkpoint) = journal_paths(state_root, paths, task_id, turn_id);
+    assert!(
+        log.exists() && checkpoint.exists(),
+        "handoff must leave a valid initialized journal"
+    );
+}
+
+#[test]
+fn parent_handoff_survives_transient_pre_spawn_journal_fence() {
+    // Refresh can win LOCK_NB after the parent publishes an empty .log and
+    // before DetachedRunnerExecutor's first flock. Transient contention must
+    // not turn a durable queued submit into a hard IO error.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let setup = HandoffSubmitSetup::new();
+    let gate = SlotPauseGate::new();
+    let executor = PreSpawnJournalExecutor::new(Arc::clone(&gate));
+    let request = setup.request();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let _release_on_panic = ReleasePauseOnDrop {
+            gate: Arc::clone(&gate),
+        };
+        scope.spawn(|| {
+            let result = TaskClient::new(
+                &setup.remote,
+                &setup.config,
+                &setup.paths,
+                &setup.state,
+                &executor,
+            )
+            .submit(request, &mut Vec::new(), &mut Vec::new());
+            let _ = result_tx.send(result.map(|report| report.task_id()));
+        });
+        gate.wait_for_arrival();
+        let store2 = ClientStateStore::open(&setup.paths.state).unwrap();
+        let (task_id, turn_id) = discovered_task_turn(&store2);
+        let flock = hold_published_journal_flock(&setup.paths.state, task_id, turn_id);
+        gate.release();
+        match result_rx.recv_timeout(TRANSIENT_JOURNAL_FAIL_FAST) {
+            Ok(result) => {
+                drop(flock);
+                result.expect("transient pre-spawn journal fence must not fail submit");
+            }
+            Err(_) => {
+                drop(flock);
+                result_rx
+                    .recv_timeout(Duration::from_secs(8))
+                    .expect("submit finishes after journal flock is released")
+                    .expect("submit succeeds after transient pre-spawn fence");
+            }
+        }
+        assert_completed_handoff(
+            &store2,
+            executor.starts(),
+            setup.state_root.path(),
+            &setup.paths,
+            task_id,
+            turn_id,
+        );
+    });
+}
+
+#[test]
+fn parent_handoff_survives_transient_post_spawn_journal_fence() {
+    // After executor.start and bind, start_runner_with_reservation opens the
+    // journal again. The same refresh flock must not leak the reservation or
+    // fail a durable handoff.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let setup = HandoffSubmitSetup::new();
+    let gate = SlotPauseGate::new();
+    let executor = PausingSlotExecutor::new(Arc::clone(&gate));
+    let request = setup.request();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let _release_on_panic = ReleasePauseOnDrop {
+            gate: Arc::clone(&gate),
+        };
+        scope.spawn(|| {
+            let result = TaskClient::new(
+                &setup.remote,
+                &setup.config,
+                &setup.paths,
+                &setup.state,
+                &executor,
+            )
+            .submit(request, &mut Vec::new(), &mut Vec::new());
+            let _ = result_tx.send(result.map(|report| report.task_id()));
+        });
+        gate.wait_for_arrival();
+        let store2 = ClientStateStore::open(&setup.paths.state).unwrap();
+        let (task_id, turn_id) = discovered_task_turn(&store2);
+        let flock = hold_published_journal_flock(&setup.paths.state, task_id, turn_id);
+        gate.release();
+        match result_rx.recv_timeout(TRANSIENT_JOURNAL_FAIL_FAST) {
+            Ok(result) => {
+                drop(flock);
+                result.expect("transient post-spawn journal fence must not fail submit");
+            }
+            Err(_) => {
+                drop(flock);
+                result_rx
+                    .recv_timeout(Duration::from_secs(8))
+                    .expect("submit finishes after journal flock is released")
+                    .expect("submit succeeds after transient post-spawn fence");
+            }
+        }
+        assert_completed_handoff(
+            &store2,
+            executor.starts(),
+            setup.state_root.path(),
+            &setup.paths,
+            task_id,
+            turn_id,
+        );
+    });
+}
+
+#[test]
+fn parent_handoff_pre_spawn_journal_fence_timeout_releases_slot() {
+    // A refresh that never releases within RUNNER_HANDOFF_TIMEOUT must still
+    // fail with the same WouldBlock kind: no spawn, no hung submit, and the
+    // reservation released by the existing executor-error branch.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let setup = HandoffSubmitSetup::new();
+    let gate = SlotPauseGate::new();
+    let executor = PreSpawnJournalExecutor::new(Arc::clone(&gate));
+    let request = setup.request();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let _release_on_panic = ReleasePauseOnDrop {
+            gate: Arc::clone(&gate),
+        };
+        scope.spawn(|| {
+            let result = TaskClient::new(
+                &setup.remote,
+                &setup.config,
+                &setup.paths,
+                &setup.state,
+                &executor,
+            )
+            .submit(request, &mut Vec::new(), &mut Vec::new());
+            let _ = result_tx.send(result.map(|report| report.task_id()));
+        });
+        gate.wait_for_arrival();
+        let store2 = ClientStateStore::open(&setup.paths.state).unwrap();
+        let (task_id, turn_id) = discovered_task_turn(&store2);
+        let _flock = hold_published_journal_flock(&setup.paths.state, task_id, turn_id);
+        gate.release();
+        let outcome = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("submitter must time out within the handoff budget");
+        let error = outcome.expect_err("persistent pre-spawn fence must fail submit");
+        assert!(
+            matches!(&error, WorkerError::Io(io) if io.kind() == io::ErrorKind::WouldBlock),
+            "persistent fence must stay WouldBlock, got {error:?}"
+        );
+        assert_eq!(executor.starts(), 0, "no spawn on pre-spawn fence timeout");
+        let row = store2
+            .queue_entry(turn_id)
+            .unwrap()
+            .expect("row survives a fence timeout");
+        assert_eq!(row.job_id(), turn_id);
+        assert!(
+            row.slot_reservation().is_none(),
+            "executor-error branch must release the slot"
+        );
+    });
+}
+
+#[test]
+fn parent_handoff_post_spawn_journal_fence_timeout_keeps_reservation() {
+    // Same persistent fence after spawn+bind: still WouldBlock, exactly one
+    // spawn, and the bound reservation is retained for the live child instead
+    // of being released to another reserver (no double allocation).
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let setup = HandoffSubmitSetup::new();
+    let gate = SlotPauseGate::new();
+    let executor = PausingSlotExecutor::new(Arc::clone(&gate));
+    let request = setup.request();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let _release_on_panic = ReleasePauseOnDrop {
+            gate: Arc::clone(&gate),
+        };
+        scope.spawn(|| {
+            let result = TaskClient::new(
+                &setup.remote,
+                &setup.config,
+                &setup.paths,
+                &setup.state,
+                &executor,
+            )
+            .submit(request, &mut Vec::new(), &mut Vec::new());
+            let _ = result_tx.send(result.map(|report| report.task_id()));
+        });
+        gate.wait_for_arrival();
+        let store2 = ClientStateStore::open(&setup.paths.state).unwrap();
+        let (task_id, turn_id) = discovered_task_turn(&store2);
+        let _flock = hold_published_journal_flock(&setup.paths.state, task_id, turn_id);
+        gate.release();
+        let outcome = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("submitter must time out within the handoff budget");
+        let error = outcome.expect_err("persistent post-spawn fence must fail submit");
+        assert!(
+            matches!(&error, WorkerError::Io(io) if io.kind() == io::ErrorKind::WouldBlock),
+            "persistent fence must stay WouldBlock, got {error:?}"
+        );
+        assert_eq!(executor.starts(), 1, "exactly one spawn, no retry of spawn");
+        let row = store2
+            .queue_entry(turn_id)
+            .unwrap()
+            .expect("row survives a fence timeout");
+        assert_eq!(row.job_id(), turn_id);
+        let reservation = row
+            .slot_reservation()
+            .expect("bound reservation is retained for the live child");
+        assert!(
+            reservation.child().is_some(),
+            "reservation must stay bound to its child"
+        );
+    });
+}
+
+fn cancel_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[test]
+fn parent_handoff_pre_spawn_row_retired_during_fence_goes_busy() {
+    // The queue row is retired while the parent waits at the pre-spawn gate.
+    // The handoff must refuse with TASK_BUSY before any spawn and never
+    // resurrect the row.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let setup = HandoffSubmitSetup::new();
+    let gate = SlotPauseGate::new();
+    let executor = PreSpawnJournalExecutor::new(Arc::clone(&gate));
+    let request = setup.request();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let _release_on_panic = ReleasePauseOnDrop {
+            gate: Arc::clone(&gate),
+        };
+        scope.spawn(|| {
+            let result = TaskClient::new(
+                &setup.remote,
+                &setup.config,
+                &setup.paths,
+                &setup.state,
+                &executor,
+            )
+            .submit(request, &mut Vec::new(), &mut Vec::new());
+            let _ = result_tx.send(result.map(|report| report.task_id()));
+        });
+        gate.wait_for_arrival();
+        let store2 = ClientStateStore::open(&setup.paths.state).unwrap();
+        let (task_id, turn_id) = discovered_task_turn(&store2);
+        store2
+            .request_queue_cancel(turn_id, cancel_millis_now())
+            .unwrap();
+        gate.release();
+        let outcome = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("submitter must answer after the row is retired");
+        let error = outcome.expect_err("retired row must not hand off");
+        assert_eq!(error.public_code(), "TASK_BUSY", "{error:?}");
+        assert_eq!(executor.starts(), 0, "retired work must never spawn");
+        assert!(
+            store2.queue_entry(turn_id).unwrap().is_none(),
+            "retired row must not be resurrected"
+        );
+        assert!(
+            store2.queue_entry_for_task_turn(task_id).unwrap().is_none(),
+            "retired turn must stay gone"
+        );
+    });
+}
+
+#[test]
+fn parent_handoff_post_spawn_row_retired_during_fence_goes_busy() {
+    // Same retirement inside the post-spawn reservation window: bind fences
+    // the stale token, the handoff fails without completing, and the row
+    // stays gone.
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let setup = HandoffSubmitSetup::new();
+    let gate = SlotPauseGate::new();
+    let executor = PausingSlotExecutor::new(Arc::clone(&gate));
+    let request = setup.request();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let _release_on_panic = ReleasePauseOnDrop {
+            gate: Arc::clone(&gate),
+        };
+        scope.spawn(|| {
+            let result = TaskClient::new(
+                &setup.remote,
+                &setup.config,
+                &setup.paths,
+                &setup.state,
+                &executor,
+            )
+            .submit(request, &mut Vec::new(), &mut Vec::new());
+            let _ = result_tx.send(result.map(|report| report.task_id()));
+        });
+        gate.wait_for_arrival();
+        let store2 = ClientStateStore::open(&setup.paths.state).unwrap();
+        let (task_id, turn_id) = discovered_task_turn(&store2);
+        store2
+            .request_queue_cancel(turn_id, cancel_millis_now())
+            .unwrap();
+        gate.release();
+        let outcome = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("submitter must answer after the row is retired");
+        let error = outcome.expect_err("retired row must not hand off");
+        assert_eq!(error.public_code(), "QUEUE_NOT_FOUND", "{error:?}");
+        assert!(
+            store2.queue_entry(turn_id).unwrap().is_none(),
+            "retired row must not be resurrected"
+        );
+        assert!(
+            store2.queue_entry_for_task_turn(task_id).unwrap().is_none(),
+            "retired turn must stay gone"
         );
     });
 }

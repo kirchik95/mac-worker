@@ -126,8 +126,10 @@ impl RunnerExecutor for DetachedRunnerExecutor {
     ) -> Result<RunnerIdentity, WorkerError> {
         // Use the same rooted, locked initialization as the child. Never follow
         // a substituted log or chmod an existing target through a pathname.
-        let _state = ClientStateStore::open(&paths.state)?;
-        drop(LogWriter::open(&paths.state, task_id, turn_id)?);
+        let store = ClientStateStore::open(&paths.state)?;
+        drop(open_handoff_journal_for_spawn(
+            &store, paths, task_id, turn_id, slot_token,
+        )?);
         let executable = std::env::current_exe().map_err(WorkerError::Io)?;
         let mut command = Command::new(executable);
         if !paths.config.as_os_str().is_empty() {
@@ -163,6 +165,53 @@ impl RunnerExecutor for DetachedRunnerExecutor {
         // durable state and owner identity are what reconciliation observes.
         drop(child);
         Ok(RunnerIdentity::new(identity))
+    }
+}
+
+/// Bounded pre-spawn journal fence wait for the detached parent.
+///
+/// A concurrent selected refresh may briefly hold the published journal flock
+/// (`LOCK_EX`) while the parent initializes the same journal. That transient
+/// `WouldBlock` must not fail a durable handoff, so retry through
+/// [`LogWriter::try_open`] within `RUNNER_HANDOFF_TIMEOUT` (strictly below the
+/// child `ADOPTION_WAIT`). Only `WouldBlock`/`None` retries; every other open
+/// error stays hard, and no lock is held while waiting.
+///
+/// When the spawn carries a reservation token, the queue row is revalidated
+/// before every attempt so cancelled/stale/retired work never spawns. Bare
+/// starts without a token keep the historical behavior (journal only).
+fn open_handoff_journal_for_spawn(
+    store: &ClientStateStore,
+    paths: &PathLayout,
+    task_id: TaskId,
+    turn_id: TurnId,
+    slot_token: Option<Uuid>,
+) -> Result<LogWriter, WorkerError> {
+    let deadline = Instant::now() + RUNNER_HANDOFF_TIMEOUT;
+    loop {
+        if let Some(token) = slot_token {
+            let reserved = store
+                .queue_entry(turn_id)?
+                .filter(|entry| {
+                    entry.kind() == QueueEntryKind::TaskTurn && entry.job_id() == turn_id
+                })
+                .and_then(|entry| entry.slot_reservation());
+            if reserved.is_none_or(|reservation| reservation.token() != token) {
+                return Err(task_error("TASK_BUSY", "task turn changed before handoff"));
+            }
+        }
+        match LogWriter::try_open(&paths.state, task_id, turn_id)? {
+            Some(log) => return Ok(log),
+            None if Instant::now() < deadline => {
+                store.runner_log_contention();
+                std::thread::sleep(WAIT_POLL);
+            }
+            None => {
+                return Err(WorkerError::Io(std::io::Error::from(
+                    std::io::ErrorKind::WouldBlock,
+                )));
+            }
+        }
     }
 }
 
@@ -1978,7 +2027,15 @@ pub fn start_runner_with_reservation(
                             return Err(error);
                         }
                     };
-                    let log = LogWriter::open(&paths.state, task_id, turn_id)?;
+                    let log = open_handoff_journal_after_bind(
+                        client_state,
+                        paths,
+                        task_id,
+                        turn_id,
+                        token,
+                        reserver,
+                        &expected,
+                    )?;
                     if log.current_entry(client_state)?.as_ref() != Some(&expected) {
                         let _ = client_state.release_runner_slot(turn_id, token, reserver);
                         return Err(task_error("TASK_BUSY", "task turn changed during handoff"));
@@ -1995,6 +2052,49 @@ pub fn start_runner_with_reservation(
                     let _ = client_state.release_runner_slot(turn_id, token, reserver);
                     Err(error)
                 }
+            }
+        }
+    }
+}
+
+/// Bounded post-bind journal fence wait for the reserving parent.
+///
+/// After spawn and `bind_runner_slot_child` the parent reopens the journal to
+/// prove the exact fenced row before `complete_runner_spawn`. A concurrent
+/// selected refresh may briefly hold that flock; retry the transient
+/// `WouldBlock` through [`LogWriter::try_open`] within
+/// `RUNNER_HANDOFF_TIMEOUT` without rerunning the executor and without
+/// holding state locks while waiting. The fenced row is revalidated before
+/// every attempt: a retired/cancelled turn releases the reservation and goes
+/// `TASK_BUSY` through the existing branch instead of completing stale work.
+/// A genuine timeout keeps the bound reservation (the live child owns it);
+/// releasing it here would double-allocate the permit, so `WouldBlock`
+/// propagates exactly as the old hard open did.
+fn open_handoff_journal_after_bind(
+    client_state: &ClientStateStore,
+    paths: &PathLayout,
+    task_id: TaskId,
+    turn_id: TurnId,
+    token: Uuid,
+    reserver: ProcessIdentity,
+    expected: &crate::job::QueueEntry,
+) -> Result<LogWriter, WorkerError> {
+    let deadline = Instant::now() + RUNNER_HANDOFF_TIMEOUT;
+    loop {
+        if client_state.queue_entry(turn_id)?.as_ref() != Some(expected) {
+            let _ = client_state.release_runner_slot(turn_id, token, reserver);
+            return Err(task_error("TASK_BUSY", "task turn changed during handoff"));
+        }
+        match LogWriter::try_open(&paths.state, task_id, turn_id)? {
+            Some(log) => return Ok(log),
+            None if Instant::now() < deadline => {
+                client_state.runner_log_contention();
+                std::thread::sleep(WAIT_POLL);
+            }
+            None => {
+                return Err(WorkerError::Io(std::io::Error::from(
+                    std::io::ErrorKind::WouldBlock,
+                )));
             }
         }
     }
