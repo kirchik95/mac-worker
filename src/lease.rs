@@ -97,7 +97,8 @@ impl<'a> LeaseService<'a> {
                 "only the heavy resource class is supported".into(),
             ));
         }
-        self.store.validate_layout()?;
+        // First layout check is admission_lock: construction flock, then open
+        // layout.json. An unlocked validate_layout here races refresh unlink as ENOENT.
         let guard = self.store.admission_lock(request.material().job_id())?;
         guard.validate()?;
         if let Some(disposition) = self.store.disposition(request.material().job_id())? {

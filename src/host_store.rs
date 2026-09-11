@@ -7209,6 +7209,10 @@ mod review_regression_tests {
         });
         drop(held);
         barrier.wait();
+        assert!(
+            root.join(HOST_LAYOUT_FILE).is_file(),
+            "upgrade fence is before layout unlink; construction still held"
+        );
         let acquire_store = store.clone();
         let acquire = thread::spawn(move || {
             LeaseService::new(&acquire_store).acquire(&request(304), &healthy_facts(), 1)
