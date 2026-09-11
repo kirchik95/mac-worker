@@ -729,11 +729,21 @@ impl ControllerStore {
             // result (legacy) returns the saved `None` as-is. Never invent a
             // fresh result.
             self.retire_receipt(&current.request_id, fault)?;
-            return Ok(ack_from(&current));
+            return settled(&current);
         }
         // Step A: durable typed result BEFORE ACK.
         if current.result.is_none() {
-            let value = executor.execute(&current)?;
+            // A definitive business rejection is saved through this same
+            // result window, so the row settles instead of staying pending for
+            // the leader tick to execute once the rejection stops applying.
+            // Every other error keeps today's retry semantics untouched.
+            let value = match executor.execute(&current) {
+                Ok(value) => value,
+                Err(error) if terminal_rejection_code(current.command(), &error).is_some() => {
+                    rejection_result(&error)
+                }
+                Err(error) => return Err(error),
+            };
             if fault == ControllerFault::StopAfterExecuteBeforeResult {
                 return Ok(ack_from(&current));
             }
@@ -793,8 +803,10 @@ impl ControllerStore {
             }
         }
         // Step C: retire the pending receipt only after durable result/ACK.
+        // The definitive rejection reaches the caller only from here, once it
+        // is durable and the receipt is gone.
         self.retire_receipt(&current.request_id, fault)?;
-        Ok(ack_from(&current))
+        settled(&current)
     }
 
     fn retire_receipt(&self, request_id: &str, fault: ControllerFault) -> Result<(), WorkerError> {
@@ -1203,6 +1215,99 @@ fn validate_record(name: &str, record: &DurableRequest) -> Result<(), WorkerErro
         ));
     }
     Ok(())
+}
+
+/// Reserved key for a saved terminal business rejection. No command result
+/// uses it: `task.submit` saves `{task_id, turn_id}`, `task.batch` saves
+/// `{run_id, task_ids}`, and mutations save a task status projection.
+const REJECTION_KEY: &str = "controller_rejection";
+const REJECTION_VERSION: u64 = 1;
+
+/// Definitive, no-effect business rejections that must settle instead of being
+/// retried. Deliberately narrow:
+///
+/// * only `task.submit`, the one command whose rejection sites are proven to
+///   precede any task row (`TaskClient::submit_with_ids` returns
+///   `capacity_busy()` / `capability_missing()` from its admission branches,
+///   all of which run before `LocalTaskRecord::new`);
+/// * only the `Capacity` variant with `public: true`, so the `Protocol`-variant
+///   `CAPACITY_BUSY` raised during worker-host lease acquisition, and any
+///   redacted capacity error, keep today's retry behaviour.
+///
+/// Infrastructure and ambiguous failures are never settled here: the executor
+/// may have completed a side effect before failing.
+fn terminal_rejection_code(command: &str, error: &WorkerError) -> Option<&'static str> {
+    if command != "task.submit" {
+        return None;
+    }
+    match error {
+        WorkerError::Capacity {
+            code,
+            public: true,
+            ..
+        } if matches!(*code, "CAPACITY_BUSY" | "CAPABILITY_MISSING") => Some(code),
+        _ => None,
+    }
+}
+
+fn rejection_result(error: &WorkerError) -> Value {
+    serde_json::json!({
+        REJECTION_KEY: {
+            "version": REJECTION_VERSION,
+            "code": error.public_code(),
+            "message": error.public_message(),
+        }
+    })
+}
+
+/// Reads a saved rejection back. A result without the reserved key is an
+/// ordinary result (including legacy `None` and an explicit saved `null`).
+/// Once the reserved key is present the value must be exactly the shape this
+/// kernel writes: anything else is stored corruption and fails closed rather
+/// than being handed back as a successful ACK.
+fn saved_rejection(result: Option<&Value>) -> Result<Option<WorkerError>, WorkerError> {
+    let Some(rejection) = result.and_then(|value| value.get(REJECTION_KEY)) else {
+        return Ok(None);
+    };
+    let fields = rejection.as_object().ok_or_else(invalid_rejection)?;
+    if fields.len() != 3 {
+        return Err(invalid_rejection());
+    }
+    if fields.get("version").and_then(Value::as_u64) != Some(REJECTION_VERSION) {
+        return Err(invalid_rejection());
+    }
+    let code = fields
+        .get("code")
+        .and_then(Value::as_str)
+        .and_then(known_rejection_code)
+        .ok_or_else(invalid_rejection)?;
+    let message = fields
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
+        .ok_or_else(invalid_rejection)?;
+    Ok(Some(WorkerError::capacity_public(code, message.to_owned())))
+}
+
+fn known_rejection_code(code: &str) -> Option<&'static str> {
+    match code {
+        "CAPACITY_BUSY" => Some("CAPACITY_BUSY"),
+        "CAPABILITY_MISSING" => Some("CAPABILITY_MISSING"),
+        _ => None,
+    }
+}
+
+fn invalid_rejection() -> WorkerError {
+    WorkerError::Protocol("CONTROLLER_TRANSPORT: saved controller rejection is invalid".into())
+}
+
+/// Final answer for a row that has reached its durable outcome: the saved
+/// rejection when there is one, otherwise the ordinary ACK.
+fn settled(record: &DurableRequest) -> Result<ControllerAck, WorkerError> {
+    match saved_rejection(record.result.as_ref())? {
+        Some(error) => Err(error),
+        None => Ok(ack_from(record)),
+    }
 }
 
 fn ack_from(record: &DurableRequest) -> ControllerAck {

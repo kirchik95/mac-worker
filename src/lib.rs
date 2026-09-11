@@ -3138,6 +3138,14 @@ fn versioned_host_error(error: &WorkerError) -> HostControlError {
         return error;
     }
     let (code, message) = match error {
+        // A public admission reason is fixed inventory text by the contract on
+        // `WorkerError::capacity`; send it so the laptop can show why. Redacted
+        // capacity messages keep the generic category label.
+        WorkerError::Capacity {
+            code,
+            message,
+            public: true,
+        } => (*code, message.as_ref().to_owned()),
         WorkerError::Capacity { code, .. } => (*code, "worker admission rejected".into()),
         WorkerError::Snapshot { code, .. } => (*code, "snapshot operation failed".into()),
         WorkerError::Git { code, .. } => (*code, "Git operation failed".into()),

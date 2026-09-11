@@ -666,11 +666,27 @@ fn decode_controller_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Worker
 
 fn host_control_to_worker(error: &HostControlError) -> WorkerError {
     let code = error.error().code();
+    // Admission rejections must keep their public category across the RPC.
+    // Collapsing them into `Protocol` costs the documented capacity exit
+    // status 75 and replaces the operator-facing reason with "protocol error".
+    if let Some(code) = capacity_code(code) {
+        return WorkerError::capacity_public(code, error.error().message().to_owned());
+    }
     let message = format!("{code}: {}", error.error().message());
     if code == "CONTROLLER_UNAVAILABLE" {
         WorkerError::Unavailable(message)
     } else {
         WorkerError::Protocol(message)
+    }
+}
+
+/// Narrow allow-list: only codes the controller raises from admission, so no
+/// other error changes category.
+fn capacity_code(code: &str) -> Option<&'static str> {
+    match code {
+        "CAPACITY_BUSY" => Some("CAPACITY_BUSY"),
+        "CAPABILITY_MISSING" => Some("CAPABILITY_MISSING"),
+        _ => None,
     }
 }
 
