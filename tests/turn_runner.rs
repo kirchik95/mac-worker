@@ -5678,6 +5678,23 @@ fn delayed_task_projection_cannot_overwrite_publication(case: ProjectionCase) {
         }
         if case == ProjectionCase::IdleWriteFailure {
             assert_eq!(result.unwrap_err().public_code(), "IO");
+        } else if case == ProjectionCase::CancelSuccessor {
+            // Late cancel after say() published B: CAS fails; cancelled_or_conflict
+            // accepts only the same turn already Cancelled (c932 / prepared_followup).
+            assert!(
+                matches!(
+                    &result,
+                    Err(WorkerError::Task {
+                        code: "TASK_REVISION_CONFLICT",
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+            assert_eq!(
+                result.as_ref().unwrap_err().public_code(),
+                "TASK_REVISION_CONFLICT"
+            );
         } else {
             result.unwrap();
         }
