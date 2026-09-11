@@ -21,10 +21,7 @@ use mac_worker::{
     client_state::ClientStateStore,
     config::Config,
     controller::TaskSubmitHandler,
-    job::{
-        AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry,
-        QueueEntryKind,
-    },
+    job::{AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
     paths::PathLayout,
     process::SystemProcessRunner,
     project_state::ProjectState,
@@ -34,9 +31,9 @@ use mac_worker::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
     },
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
-        TurnSummary, TurnTerminal, RunnerIdentity,
+        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId,
+        TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
+        TurnId, TurnSummary, TurnTerminal,
     },
 };
 use serde_json::{Value, json};
@@ -128,8 +125,8 @@ impl Drop for CurrentDirGuard {
 
 struct Fixture {
     _temp: tempfile::TempDir,
-    _repo: GitRepo,
     _guard: CurrentDirGuard,
+    _repo: GitRepo,
     paths: PathLayout,
     config: Config,
     project_id: String,
@@ -172,8 +169,8 @@ impl Fixture {
         let project = ProjectState::load(&RUNNER, repo.root(), &[]).unwrap();
         Self {
             _temp: temp,
-            _repo: repo,
             _guard: guard,
+            _repo: repo,
             paths,
             config,
             project_id: project.context.project_id.clone(),
@@ -277,7 +274,10 @@ impl Fixture {
             .unwrap()
             .expect("waiting turn must become dispatching");
         assert!(
-            matches!(claimed.entry().state(), mac_worker::job::QueueState::Dispatching { .. }),
+            matches!(
+                claimed.entry().state(),
+                mac_worker::job::QueueState::Dispatching { .. }
+            ),
             "fixture row must be dispatching"
         );
         drop(plain.open_runner_log(task_n(task), turn_n(turn)).unwrap());
@@ -304,11 +304,7 @@ impl Fixture {
             .unwrap(),
         )
         .unwrap();
-        std::fs::set_permissions(
-            &checkpoint,
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        std::fs::set_permissions(&checkpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
         let store = ClientStateStore::open_with_owner_inspector(
             &self.paths.state,
             DeadOwnerReusedInspector {
@@ -370,10 +366,7 @@ fn task_body(task: u128, extra: serde_json::Value) -> serde_json::Value {
     Value::Object(body)
 }
 
-fn row_entry(
-    store: &ClientStateStore,
-    turn: u128,
-) -> Option<mac_worker::job::QueueEntry> {
+fn row_entry(store: &ClientStateStore, turn: u128) -> Option<mac_worker::job::QueueEntry> {
     store.queue_entry(turn_n(turn)).unwrap()
 }
 
@@ -397,7 +390,10 @@ fn say_prepare_recovers_dead_row_before_freeze() {
         task_body(0x1001, json!({ "message": "hello" })),
     )
     .expect("say prepare must succeed after selected recovery");
-    assert_eq!(meta.task_id.as_deref(), Some(task_n(0x1001).to_string()).as_deref());
+    assert_eq!(
+        meta.task_id.as_deref(),
+        Some(task_n(0x1001).to_string()).as_deref()
+    );
     assert!(
         row_entry(&store, 0x1002).is_none(),
         "completed dead row must be retired, not merely adopted"
@@ -433,7 +429,10 @@ fn close_prepare_recovers_dead_row_before_freeze() {
         task_body(0x2001, json!({})),
     )
     .expect("close prepare must succeed after selected recovery");
-    assert_eq!(meta.task_id.as_deref(), Some(task_n(0x2001).to_string()).as_deref());
+    assert_eq!(
+        meta.task_id.as_deref(),
+        Some(task_n(0x2001).to_string()).as_deref()
+    );
     assert!(
         row_entry(&store, 0x2002).is_none(),
         "completed dead row must be retired, not merely adopted"

@@ -45,7 +45,12 @@ fn collect_regular_files(root: &std::path::Path, base: &std::path::Path, found: 
         if path.is_dir() {
             collect_regular_files(&path, base, found);
         } else if path.is_file() {
-            found.push(path.strip_prefix(base).unwrap_or(&path).display().to_string());
+            found.push(
+                path.strip_prefix(base)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
         }
     }
 }

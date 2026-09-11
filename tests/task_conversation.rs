@@ -36,8 +36,9 @@ use mac_worker::{
     },
     task::{
         BaseOid, ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord, OriginDelivery,
-        PublishMode, RunId as TaskRunId, RunRecord, RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary, TurnTerminal,
+        PublishMode, RunId as TaskRunId, RunRecord, RunnerIdentity, RunnerState, TaskId,
+        TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
+        TurnSummary, TurnTerminal,
     },
     task_client::{TaskClient, TaskListFilter, WaitSelector},
     task_store::{

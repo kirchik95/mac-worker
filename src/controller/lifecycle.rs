@@ -17,10 +17,10 @@ use crate::{
     config::ControllerConfig,
     controller::{
         execute::send_controller_read,
-        protocol::{encode_json_frame, ControllerRequest},
+        protocol::{ControllerRequest, encode_json_frame},
         read::{
-            invalid_controller_reply, map_missing_task, optional_string, reject_unknown_keys,
-            ControllerReadIdentity, ControllerReadReply,
+            ControllerReadIdentity, ControllerReadReply, invalid_controller_reply,
+            map_missing_task, optional_string, reject_unknown_keys,
         },
     },
     error::WorkerError,
@@ -28,8 +28,8 @@ use crate::{
     protocol::PROTOCOL_VERSION,
     task::TaskId,
     task_client::{
-        ReconcileReport, TaskClient, WaitReport, WaitSelector, WaitSnapshot, WAIT_MAX_POLL,
-        WAIT_POLL,
+        ReconcileReport, TaskClient, WAIT_MAX_POLL, WAIT_POLL, WaitReport, WaitSelector,
+        WaitSnapshot,
     },
 };
 

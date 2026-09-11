@@ -398,14 +398,12 @@ fn prepare_result_reply(
     // Same fields, same saved snapshot load — no second load, no new locks.
     if record.meta().project_id() != resolved.project_id {
         return Err(WorkerError::Protocol(
-            "CONTROLLER_REQUEST_CONFLICT: local project does not match the frozen original"
-                .into(),
+            "CONTROLLER_REQUEST_CONFLICT: local project does not match the frozen original".into(),
         ));
     }
     if record.meta().worktree_id() != resolved.worktree_id {
         return Err(WorkerError::Protocol(
-            "CONTROLLER_REQUEST_CONFLICT: local worktree does not match the frozen original"
-                .into(),
+            "CONTROLLER_REQUEST_CONFLICT: local worktree does not match the frozen original".into(),
         ));
     }
     if record.status().state() == TaskState::Abandoned {
@@ -414,10 +412,14 @@ fn prepare_result_reply(
             message: "discarded tasks cannot be fetched".into(),
         });
     }
-    let current_turn = record.status().turns().last().ok_or_else(|| WorkerError::Git {
-        code: "RESULT_FETCH_FAILED",
-        message: "controller result turn is not complete yet".into(),
-    })?;
+    let current_turn = record
+        .status()
+        .turns()
+        .last()
+        .ok_or_else(|| WorkerError::Git {
+            code: "RESULT_FETCH_FAILED",
+            message: "controller result turn is not complete yet".into(),
+        })?;
     if current_turn.terminal().is_none() {
         return Err(WorkerError::Git {
             code: "RESULT_FETCH_FAILED",

@@ -1728,11 +1728,7 @@ fn insert_receipt_fields(
     value["residual"] = serde_json::json!(receipt.residual());
 }
 
-fn format_host_io_blocking(
-    code: &str,
-    stage: Option<&str>,
-    residual: Option<&[String]>,
-) -> String {
+fn format_host_io_blocking(code: &str, stage: Option<&str>, residual: Option<&[String]>) -> String {
     let Some(stage) = stage else {
         return code.to_owned();
     };
@@ -5040,7 +5036,7 @@ mod enabled_submit_freeze_tests {
             // controller source push is mocked in-runner with asserted
             // identity/args; everything else framed is answered below.
             // Existing streamed/process suites cover actual transfer.
-            if request.program == std::ffi::OsString::from("/usr/bin/git") {
+            if request.program == "/usr/bin/git" {
                 if !request.args.iter().any(|arg| arg == "push") {
                     return crate::process::SystemProcessRunner.run(request);
                 }

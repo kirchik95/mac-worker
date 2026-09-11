@@ -381,7 +381,6 @@ fn spawn_capture<R: Read + Send + 'static>(
     }
 }
 
-
 fn drain_remaining<R: Read>(reader: &mut R) {
     let mut buffer = [0_u8; 8 * 1024];
     loop {
@@ -479,7 +478,6 @@ fn join_threads(
     }
     Ok(())
 }
-
 
 /// Bounded rolling byte window for later fixed-phrase scanners.
 ///

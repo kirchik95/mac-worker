@@ -22,8 +22,8 @@ use mac_worker::{
     cli::{Cli, Command as WorkerCommand, TaskCommand},
     config::Config,
     controller::{
-        canonical_request_sha256, decode_frame, encode_json_frame, load_operation_envelope,
-        BatchKind, FrozenBatchBody, OperationEnvelope,
+        BatchKind, FrozenBatchBody, OperationEnvelope, canonical_request_sha256, decode_frame,
+        encode_json_frame, load_operation_envelope,
     },
     dag::DagBase,
     job::{
@@ -46,7 +46,7 @@ use mac_worker::{
     turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
 };
 use serde::de::DeserializeOwned;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 const RUNNER: SystemProcessRunner = SystemProcessRunner;
@@ -132,10 +132,12 @@ fn harness_batch_file_parses_two_committed_bases_and_rejects_project() {
     assert_eq!(dag.tasks[0].id.as_deref(), Some("parent"));
     assert_eq!(dag.tasks[0].close_on.as_deref(), Some("never"));
     assert_eq!(dag.tasks[1].base.as_deref(), Some("from:parent"));
-    assert!(std::fs::read_to_string(&dag_path)
-        .unwrap()
-        .lines()
-        .all(|line| !line.contains("project")));
+    assert!(
+        std::fs::read_to_string(&dag_path)
+            .unwrap()
+            .lines()
+            .all(|line| !line.contains("project"))
+    );
 
     let unknown = r#"
 version = 1

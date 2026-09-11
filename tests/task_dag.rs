@@ -3402,7 +3402,11 @@ fn pending_dag_page_advances_later_runs_after_an_earlier_failure() {
     plant_closed_done_import(&harness.store, later_root, later_root_turn, result);
 
     fs::write(
-        harness.paths.state.join("dags").join(format!("{earlier}.json")),
+        harness
+            .paths
+            .state
+            .join("dags")
+            .join(format!("{earlier}.json")),
         b"corrupt-pending-run\n",
     )
     .unwrap();

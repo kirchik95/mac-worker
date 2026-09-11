@@ -17,14 +17,15 @@ use std::{
 
 use clap::Parser;
 use mac_worker::{
+    RuntimeContext,
     agent::{AgentKind, PermissionPolicy},
     cli::{Cli, Command as WorkerCommand, HostCommand},
     client_state::ClientStateStore,
     config::Config,
     controller::{
-        canonical_request_sha256, decode_frame, encode_frame, encode_json_frame,
-        protocol::MAX_FRAME_BYTES, serve_rpc_with_runtime, ControllerFault, ControllerReadReply,
-        ControllerStore, ControllerTaskLogsResult, ControllerTaskStatusResult,
+        ControllerFault, ControllerReadReply, ControllerStore, ControllerTaskLogsResult,
+        ControllerTaskStatusResult, canonical_request_sha256, decode_frame, encode_frame,
+        encode_json_frame, protocol::MAX_FRAME_BYTES, serve_rpc_with_runtime,
     },
     error::WorkerError,
     job::{JobId, MAX_LOG_CHUNK_BYTES},
@@ -39,9 +40,9 @@ use mac_worker::{
     },
     task_store::{TaskDiffRequest, TaskDiffResponse},
     transfer::HostOperation,
-    turn_log, RuntimeContext,
+    turn_log,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 const SEEDED_TASK: u128 = 0x018f_0f4a_6b5c_7d8e_9f00_1122_3344_5566;

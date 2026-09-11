@@ -290,7 +290,7 @@ mod tests {
 
     impl ProcessRunner for ProjectMismatchPrepare {
         fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-            if request.program == OsString::from("/usr/bin/ssh") {
+            if request.program == "/usr/bin/ssh" {
                 let payload =
                     crate::controller::decode_frame(request.stdin.as_ref().unwrap()).unwrap();
                 let parsed: Value = serde_json::from_slice(payload).unwrap();
@@ -423,15 +423,17 @@ mod tests {
             &worktree,
             oid.as_str(),
         );
-        assert!(require_source_bind(
-            &mismatched,
-            operation.request_id(),
-            operation.payload_sha256(),
-            &project,
-            &worktree,
-            &oid,
-        )
-        .is_err());
+        assert!(
+            require_source_bind(
+                &mismatched,
+                operation.request_id(),
+                operation.payload_sha256(),
+                &project,
+                &worktree,
+                &oid,
+            )
+            .is_err()
+        );
         let matched = source_prepare_identity(
             operation.request_id(),
             operation.payload_sha256(),
@@ -439,15 +441,17 @@ mod tests {
             &worktree,
             oid.as_str(),
         );
-        assert!(require_source_bind(
-            &matched,
-            operation.request_id(),
-            operation.payload_sha256(),
-            &project,
-            &worktree,
-            &oid,
-        )
-        .is_ok());
+        assert!(
+            require_source_bind(
+                &matched,
+                operation.request_id(),
+                operation.payload_sha256(),
+                &project,
+                &worktree,
+                &oid,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

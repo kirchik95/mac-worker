@@ -373,9 +373,9 @@ impl ProcessFixture {
         });
         match rx.recv_timeout(LEADER_READY_TIMEOUT) {
             Ok(line) if line.contains(LEADER_READY) => line,
-            Ok(line) => child.fail_leader_startup(&format!(
-                "unexpected controller stdout: {line:?}"
-            )),
+            Ok(line) => {
+                child.fail_leader_startup(&format!("unexpected controller stdout: {line:?}"))
+            }
             Err(_) => child.fail_leader_startup("controller run should print a readiness line"),
         }
     }
@@ -633,11 +633,7 @@ impl ProcessFixture {
             .get("status")
             .and_then(|status| status.get("worker"))
             .and_then(|value| value.as_str())
-            .or_else(|| {
-                record
-                    .get("pinned_worker")
-                    .and_then(|value| value.as_str())
-            });
+            .or_else(|| record.get("pinned_worker").and_then(|value| value.as_str()));
         let Some(worker) = worker else {
             return false;
         };

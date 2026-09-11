@@ -13,8 +13,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLimits, result_instruction},
     client_state::{
-        ActiveTaskConfig, ClientStateConcurrencyPoint, ClientStateStore, RUNNER_ABSENCE_CONFIRMATION,
-        RunnerLivenessVerdict,
+        ActiveTaskConfig, ClientStateConcurrencyPoint, ClientStateStore,
+        RUNNER_ABSENCE_CONFIRMATION, RunnerLivenessVerdict,
     },
     config::{Config, WorkerEntry},
     dag::{
@@ -36,7 +36,7 @@ use crate::{
     project_config::{SetupSettings, TaskSettings},
     project_state::ProjectState,
     scheduler::{CandidateObservation, SchedulerPolicy, Selection, WorkerPreference},
-    supervisor::{SystemProcessInspector},
+    supervisor::SystemProcessInspector,
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, OriginDelivery,
         PublishMode, PushTarget, RunId, RunRecord, RunnerState, TaskCloseIntent, TaskId,
@@ -473,7 +473,10 @@ pub struct WaitReport {
 
 impl WaitReport {
     pub(crate) fn new(task_ids: Vec<TaskId>, exit_code: u8) -> Self {
-        Self { task_ids, exit_code }
+        Self {
+            task_ids,
+            exit_code,
+        }
     }
 
     pub fn task_ids(&self) -> &[TaskId] {
@@ -1046,301 +1049,311 @@ impl<'a> TaskClient<'a> {
             controller_cache,
         ) = match frozen {
             Some(FrozenSubmit::Dag(node)) => {
-            let spec = &node.frozen;
-            let (context, controller_cache) = if let Some(checkout) =
-                crate::controller::registry::mapped_controller_checkout(
-                    self.paths,
-                    &spec.project_id,
-                    &spec.worktree_id,
-                )? {
-                let mut context = ProjectInspector::new(self.runner)
-                    .inspect_with_pinned_project_id(&checkout, &spec.project_id)?;
-                context.worktree_id = spec.worktree_id.clone();
-                if spec.branch.is_some() {
-                    context.branch = spec.branch.clone();
-                }
-                (context, true)
-            } else {
-                let context = ProjectInspector::new(self.runner).inspect_with_pinned_project_id(
-                    Path::new(&spec.project_path),
-                    &spec.project_id,
+                let spec = &node.frozen;
+                let (context, controller_cache) = if let Some(checkout) =
+                    crate::controller::registry::mapped_controller_checkout(
+                        self.paths,
+                        &spec.project_id,
+                        &spec.worktree_id,
+                    )? {
+                    let mut context = ProjectInspector::new(self.runner)
+                        .inspect_with_pinned_project_id(&checkout, &spec.project_id)?;
+                    context.worktree_id = spec.worktree_id.clone();
+                    if spec.branch.is_some() {
+                        context.branch = spec.branch.clone();
+                    }
+                    (context, true)
+                } else {
+                    let context = ProjectInspector::new(self.runner)
+                        .inspect_with_pinned_project_id(
+                            Path::new(&spec.project_path),
+                            &spec.project_id,
+                        )?;
+                    if context.worktree_id != spec.worktree_id {
+                        return Err(task_error(
+                            "TASK_CONFIG_INVALID",
+                            "frozen DAG project identity does not match the worktree",
+                        ));
+                    }
+                    (context, false)
+                };
+                let limits = spec.limits()?;
+                let env_profile = spec.env_profile.clone();
+                let model = spec.model.clone();
+                let effort = spec.effort.clone();
+                let publish = parse_publish_modes(&spec.publish)?;
+                let origin_url = spec.origin_url.clone().unwrap_or_default();
+                let source = parse_task_source(
+                    &spec.source,
+                    spec.wip,
+                    &origin_url,
+                    publish.contains(&PublishMode::Push),
                 )?;
-                if context.worktree_id != spec.worktree_id {
+                let publish_branch =
+                    parse_publish_branch(spec.publish_branch.as_deref(), &publish)?;
+                if spec.wip && publish.contains(&PublishMode::Push) {
                     return Err(task_error(
-                        "TASK_CONFIG_INVALID",
-                        "frozen DAG project identity does not match the worktree",
+                        "PUBLISH_REQUIRES_COMMITTED_BASE",
+                        "publish push requires a committed base",
                     ));
                 }
-                (context, false)
-            };
-            let limits = spec.limits()?;
-            let env_profile = spec.env_profile.clone();
-            let model = spec.model.clone();
-            let effort = spec.effort.clone();
-            let publish = parse_publish_modes(&spec.publish)?;
-            let origin_url = spec.origin_url.clone().unwrap_or_default();
-            let source = parse_task_source(
-                &spec.source,
-                spec.wip,
-                &origin_url,
-                publish.contains(&PublishMode::Push),
-            )?;
-            let publish_branch = parse_publish_branch(spec.publish_branch.as_deref(), &publish)?;
-            if spec.wip && publish.contains(&PublishMode::Push) {
-                return Err(task_error(
-                    "PUBLISH_REQUIRES_COMMITTED_BASE",
-                    "publish push requires a committed base",
-                ));
-            }
-            let requirements = spec.requires.clone();
-            let policy = spec.permission_policy()?;
-            let observations = self.observe_admission(&request.preference)?;
-            let affinity = self
-                .client_state
-                .affinity_hints(&context.project_id, &context.worktree_id)?;
-            if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
-                &observations,
-                &requirements,
-                &request.preference,
-                &affinity,
-            ) {
-                if let WorkerPreference::Pinned { worker } = &request.preference
-                    && let Some(missing) = rejections.iter().find_map(|rejection| match rejection {
-                        crate::scheduler::CandidateRejection::MissingCapabilities {
-                            name,
-                            missing,
-                        } if name == worker => Some(missing.as_slice()),
-                        _ => None,
-                    })
-                {
-                    return Err(capability_missing(worker, missing));
+                let requirements = spec.requires.clone();
+                let policy = spec.permission_policy()?;
+                let observations = self.observe_admission(&request.preference)?;
+                let affinity = self
+                    .client_state
+                    .affinity_hints(&context.project_id, &context.worktree_id)?;
+                if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
+                    &observations,
+                    &requirements,
+                    &request.preference,
+                    &affinity,
+                ) {
+                    if let WorkerPreference::Pinned { worker } = &request.preference
+                        && let Some(missing) =
+                            rejections.iter().find_map(|rejection| match rejection {
+                                crate::scheduler::CandidateRejection::MissingCapabilities {
+                                    name,
+                                    missing,
+                                } if name == worker => Some(missing.as_slice()),
+                                _ => None,
+                            })
+                    {
+                        return Err(capability_missing(worker, missing));
+                    }
+                    if !request.wait_for_capacity {
+                        return Err(capacity_busy());
+                    }
                 }
-                if !request.wait_for_capacity {
-                    return Err(capacity_busy());
-                }
-            }
-            let oid = node.execution_oid().cloned().ok_or_else(|| {
-                task_error(
-                    "TASK_CONFIG_INVALID",
-                    "DAG node has no frozen or bound base OID",
+                let oid = node.execution_oid().cloned().ok_or_else(|| {
+                    task_error(
+                        "TASK_CONFIG_INVALID",
+                        "DAG node has no frozen or bound base OID",
+                    )
+                })?;
+                // Bound from: objects live in the local TransferRepo. Rewrite Origin
+                // to Local so host prepare consumes the pushed cache object instead of
+                // fetching an unpublished OID. Keep push_target and frozen requires.
+                let imported_from_parent = node.from_parent().is_some() && node.bound_oid.is_some();
+                let source = if imported_from_parent {
+                    execution_source_for_bound_from(source, &publish)?
+                } else {
+                    if let TaskSource::Origin { url } = &source {
+                        GitTransport::new(self.runner).preflight_origin(url, &oid)?;
+                    }
+                    source
+                };
+                let prepared_base = PreparedSubmitBase::Ready(
+                    crate::transfer_repo::BaseCommit::from_pinned(oid, spec.wip),
+                );
+                let settings = ProjectState::settings_from_frozen(spec);
+                (
+                    context,
+                    limits,
+                    env_profile,
+                    model,
+                    effort,
+                    publish,
+                    publish_branch,
+                    source,
+                    requirements,
+                    policy,
+                    prepared_base,
+                    settings,
+                    node.task_id,
+                    node.turn_id,
+                    spec.title.clone().or(title),
+                    controller_cache,
                 )
-            })?;
-            // Bound from: objects live in the local TransferRepo. Rewrite Origin
-            // to Local so host prepare consumes the pushed cache object instead of
-            // fetching an unpublished OID. Keep push_target and frozen requires.
-            let imported_from_parent = node.from_parent().is_some() && node.bound_oid.is_some();
-            let source = if imported_from_parent {
-                execution_source_for_bound_from(source, &publish)?
-            } else {
-                if let TaskSource::Origin { url } = &source {
-                    GitTransport::new(self.runner).preflight_origin(url, &oid)?;
-                }
-                source
-            };
-            let prepared_base = PreparedSubmitBase::Ready(
-                crate::transfer_repo::BaseCommit::from_pinned(oid, spec.wip),
-            );
-            let settings = ProjectState::settings_from_frozen(spec);
-            (
-                context,
-                limits,
-                env_profile,
-                model,
-                effort,
-                publish,
-                publish_branch,
-                source,
-                requirements,
-                policy,
-                prepared_base,
-                settings,
-                node.task_id,
-                node.turn_id,
-                spec.title.clone().or(title),
-                controller_cache,
-            )
             }
             Some(FrozenSubmit::Prepared(prepared)) => {
-            let mut context = ProjectInspector::new(self.runner)
-                .inspect_with_pinned_project_id(&request.project, &prepared.project_id)?;
-            context.worktree_id = prepared.worktree_id.clone();
-            if prepared.branch.is_some() {
-                context.branch = prepared.branch.clone();
-            }
-            let limits = prepared.limits.clone();
-            let env_profile = prepared.env_profile.clone();
-            let model = prepared.model.clone();
-            let effort = prepared.effort.clone();
-            let publish = parse_publish_modes(&prepared.publish)?;
-            let origin_url = prepared.origin_url.clone().unwrap_or_default();
-            let source = parse_task_source(
-                &prepared.source,
-                prepared.wip,
-                &origin_url,
-                publish.contains(&PublishMode::Push),
-            )?;
-            let publish_branch =
-                parse_publish_branch(prepared.publish_branch.as_deref(), &publish)?;
-            if prepared.wip && publish.contains(&PublishMode::Push) {
-                return Err(task_error(
-                    "PUBLISH_REQUIRES_COMMITTED_BASE",
-                    "publish push requires a committed base",
-                ));
-            }
-            let requirements = prepared.requires.clone();
-            let policy = prepared.policy;
-            let observations = self.observe_admission(&request.preference)?;
-            let affinity = self
-                .client_state
-                .affinity_hints(&context.project_id, &context.worktree_id)?;
-            if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
-                &observations,
-                &requirements,
-                &request.preference,
-                &affinity,
-            ) {
-                if let WorkerPreference::Pinned { worker } = &request.preference
-                    && let Some(missing) = rejections.iter().find_map(|rejection| match rejection {
-                        crate::scheduler::CandidateRejection::MissingCapabilities {
-                            name,
-                            missing,
-                        } if name == worker => Some(missing.as_slice()),
-                        _ => None,
-                    })
-                {
-                    return Err(capability_missing(worker, missing));
+                let mut context = ProjectInspector::new(self.runner)
+                    .inspect_with_pinned_project_id(&request.project, &prepared.project_id)?;
+                context.worktree_id = prepared.worktree_id.clone();
+                if prepared.branch.is_some() {
+                    context.branch = prepared.branch.clone();
                 }
-                if !request.wait_for_capacity {
-                    return Err(capacity_busy());
-                }
-            }
-            if let TaskSource::Origin { url } = &source {
-                GitTransport::new(self.runner).preflight_origin(url, &prepared.base_oid)?;
-            }
-            let prepared_base =
-                PreparedSubmitBase::Ready(crate::transfer_repo::BaseCommit::from_pinned(
-                    prepared.base_oid.clone(),
+                let limits = prepared.limits.clone();
+                let env_profile = prepared.env_profile.clone();
+                let model = prepared.model.clone();
+                let effort = prepared.effort.clone();
+                let publish = parse_publish_modes(&prepared.publish)?;
+                let origin_url = prepared.origin_url.clone().unwrap_or_default();
+                let source = parse_task_source(
+                    &prepared.source,
                     prepared.wip,
-                ));
-            let settings = ProjectState::settings_from_prepared(prepared);
-            (
-                context,
-                limits,
-                env_profile,
-                model,
-                effort,
-                publish,
-                publish_branch,
-                source,
-                requirements,
-                policy,
-                prepared_base,
-                settings,
-                prepared.task_id,
-                prepared.turn_id,
-                prepared.title.clone().or(title),
-                true,
-            )
+                    &origin_url,
+                    publish.contains(&PublishMode::Push),
+                )?;
+                let publish_branch =
+                    parse_publish_branch(prepared.publish_branch.as_deref(), &publish)?;
+                if prepared.wip && publish.contains(&PublishMode::Push) {
+                    return Err(task_error(
+                        "PUBLISH_REQUIRES_COMMITTED_BASE",
+                        "publish push requires a committed base",
+                    ));
+                }
+                let requirements = prepared.requires.clone();
+                let policy = prepared.policy;
+                let observations = self.observe_admission(&request.preference)?;
+                let affinity = self
+                    .client_state
+                    .affinity_hints(&context.project_id, &context.worktree_id)?;
+                if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
+                    &observations,
+                    &requirements,
+                    &request.preference,
+                    &affinity,
+                ) {
+                    if let WorkerPreference::Pinned { worker } = &request.preference
+                        && let Some(missing) =
+                            rejections.iter().find_map(|rejection| match rejection {
+                                crate::scheduler::CandidateRejection::MissingCapabilities {
+                                    name,
+                                    missing,
+                                } if name == worker => Some(missing.as_slice()),
+                                _ => None,
+                            })
+                    {
+                        return Err(capability_missing(worker, missing));
+                    }
+                    if !request.wait_for_capacity {
+                        return Err(capacity_busy());
+                    }
+                }
+                if let TaskSource::Origin { url } = &source {
+                    GitTransport::new(self.runner).preflight_origin(url, &prepared.base_oid)?;
+                }
+                let prepared_base =
+                    PreparedSubmitBase::Ready(crate::transfer_repo::BaseCommit::from_pinned(
+                        prepared.base_oid.clone(),
+                        prepared.wip,
+                    ));
+                let settings = ProjectState::settings_from_prepared(prepared);
+                (
+                    context,
+                    limits,
+                    env_profile,
+                    model,
+                    effort,
+                    publish,
+                    publish_branch,
+                    source,
+                    requirements,
+                    policy,
+                    prepared_base,
+                    settings,
+                    prepared.task_id,
+                    prepared.turn_id,
+                    prepared.title.clone().or(title),
+                    true,
+                )
             }
             None => {
-            let initial = ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
-            let settings = &initial.settings.task;
-            let limits = effective_task_limits(&request.limits, settings)?;
-            let env_profile = request
-                .env_profile
-                .clone()
-                .or_else(|| settings.env_profile.clone());
-            let model = request.model.clone().or_else(|| settings.model.clone());
-            let effort = request.effort.clone().or_else(|| settings.effort.clone());
-            let publish_names = request.publish.as_deref().unwrap_or(&settings.publish);
-            let publish = parse_publish_modes(publish_names)?;
-            let source_name = request.source.as_deref().unwrap_or(&settings.source);
-            let needs_origin = source_name == "origin" || publish.contains(&PublishMode::Push);
-            let origin_url = if needs_origin {
-                initial.origin.clone().ok_or_else(|| {
-                    task_error("INVALID_ORIGIN", "project origin is not configured")
-                })?
-            } else {
-                String::new()
-            };
-            let source = parse_task_source(
-                source_name,
-                request.wip,
-                &origin_url,
-                publish.contains(&PublishMode::Push),
-            )?;
-            let publish_branch = parse_publish_branch(request.publish_branch.as_deref(), &publish)?;
-            if request.wip && publish.contains(&PublishMode::Push) {
-                return Err(task_error(
-                    "PUBLISH_REQUIRES_COMMITTED_BASE",
-                    "publish push requires a committed base",
-                ));
-            }
-            let requirements = task_requirements(
-                &initial.requirements,
-                request.agent,
-                env_profile.as_deref(),
-                source.origin_requirement()?.as_deref(),
-            );
-            let observations = self.observe_admission(&request.preference)?;
-            let affinity = self
-                .client_state
-                .affinity_hints(&initial.context.project_id, &initial.context.worktree_id)?;
-            if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
-                &observations,
-                &requirements,
-                &request.preference,
-                &affinity,
-            ) {
-                if let WorkerPreference::Pinned { worker } = &request.preference
-                    && let Some(missing) = rejections.iter().find_map(|rejection| match rejection {
-                        crate::scheduler::CandidateRejection::MissingCapabilities {
-                            name,
-                            missing,
-                        } if name == worker => Some(missing.as_slice()),
-                        _ => None,
-                    })
-                {
-                    return Err(capability_missing(worker, missing));
+                let initial =
+                    ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
+                let settings = &initial.settings.task;
+                let limits = effective_task_limits(&request.limits, settings)?;
+                let env_profile = request
+                    .env_profile
+                    .clone()
+                    .or_else(|| settings.env_profile.clone());
+                let model = request.model.clone().or_else(|| settings.model.clone());
+                let effort = request.effort.clone().or_else(|| settings.effort.clone());
+                let publish_names = request.publish.as_deref().unwrap_or(&settings.publish);
+                let publish = parse_publish_modes(publish_names)?;
+                let source_name = request.source.as_deref().unwrap_or(&settings.source);
+                let needs_origin = source_name == "origin" || publish.contains(&PublishMode::Push);
+                let origin_url = if needs_origin {
+                    initial.origin.clone().ok_or_else(|| {
+                        task_error("INVALID_ORIGIN", "project origin is not configured")
+                    })?
+                } else {
+                    String::new()
+                };
+                let source = parse_task_source(
+                    source_name,
+                    request.wip,
+                    &origin_url,
+                    publish.contains(&PublishMode::Push),
+                )?;
+                let publish_branch =
+                    parse_publish_branch(request.publish_branch.as_deref(), &publish)?;
+                if request.wip && publish.contains(&PublishMode::Push) {
+                    return Err(task_error(
+                        "PUBLISH_REQUIRES_COMMITTED_BASE",
+                        "publish push requires a committed base",
+                    ));
                 }
-                if !request.wait_for_capacity {
-                    return Err(capacity_busy());
+                let requirements = task_requirements(
+                    &initial.requirements,
+                    request.agent,
+                    env_profile.as_deref(),
+                    source.origin_requirement()?.as_deref(),
+                );
+                let observations = self.observe_admission(&request.preference)?;
+                let affinity = self
+                    .client_state
+                    .affinity_hints(&initial.context.project_id, &initial.context.worktree_id)?;
+                if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
+                    &observations,
+                    &requirements,
+                    &request.preference,
+                    &affinity,
+                ) {
+                    if let WorkerPreference::Pinned { worker } = &request.preference
+                        && let Some(missing) =
+                            rejections.iter().find_map(|rejection| match rejection {
+                                crate::scheduler::CandidateRejection::MissingCapabilities {
+                                    name,
+                                    missing,
+                                } if name == worker => Some(missing.as_slice()),
+                                _ => None,
+                            })
+                    {
+                        return Err(capability_missing(worker, missing));
+                    }
+                    if !request.wait_for_capacity {
+                        return Err(capacity_busy());
+                    }
                 }
-            }
 
-            let task_id = task_id_override.unwrap_or_else(TaskId::generate);
-            let turn_id = turn_id_override.unwrap_or_else(TurnId::generate);
-            let prepared_base = if let TaskSource::Origin { url } = &source {
-                let oid =
-                    TransferRepo::resolve_base_oid(self.runner, &initial.context, &request.base)?;
-                GitTransport::new(self.runner).preflight_origin(url, &oid)?;
-                PreparedSubmitBase::Ready(crate::transfer_repo::BaseCommit::from_origin(oid))
-            } else {
-                PreparedSubmitBase::Resolve {
-                    wip: request.wip,
-                    request_base: request.base.clone(),
-                }
-            };
-            let policy = permission_policy(settings, request.agent);
-            (
-                initial.context,
-                limits,
-                env_profile,
-                model,
-                effort,
-                publish,
-                publish_branch,
-                source,
-                requirements,
-                policy,
-                prepared_base,
-                initial.settings,
-                task_id,
-                turn_id,
-                title,
-                false,
-            )
-        }
+                let task_id = task_id_override.unwrap_or_else(TaskId::generate);
+                let turn_id = turn_id_override.unwrap_or_else(TurnId::generate);
+                let prepared_base = if let TaskSource::Origin { url } = &source {
+                    let oid = TransferRepo::resolve_base_oid(
+                        self.runner,
+                        &initial.context,
+                        &request.base,
+                    )?;
+                    GitTransport::new(self.runner).preflight_origin(url, &oid)?;
+                    PreparedSubmitBase::Ready(crate::transfer_repo::BaseCommit::from_origin(oid))
+                } else {
+                    PreparedSubmitBase::Resolve {
+                        wip: request.wip,
+                        request_base: request.base.clone(),
+                    }
+                };
+                let policy = permission_policy(settings, request.agent);
+                (
+                    initial.context,
+                    limits,
+                    env_profile,
+                    model,
+                    effort,
+                    publish,
+                    publish_branch,
+                    source,
+                    requirements,
+                    policy,
+                    prepared_base,
+                    initial.settings,
+                    task_id,
+                    turn_id,
+                    title,
+                    false,
+                )
+            }
         };
         let now = current_time_millis()?;
         let created_at = original_created_at.unwrap_or(now);
@@ -2233,11 +2246,8 @@ impl<'a> TaskClient<'a> {
         }
         let worker = task_worker(self.config, record.status())?;
         let project = self.load_project_for_record(&record)?;
-        let transfer = crate::controller::registry::open_transfer_repo(
-            self.paths,
-            &project,
-            record.meta(),
-        )?;
+        let transfer =
+            crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())?;
         let _remote_receipt = GitTransport::new(self.runner).fetch_result(
             worker,
             self.client_state.client_id(),
@@ -2599,11 +2609,8 @@ impl<'a> TaskClient<'a> {
             let Some(task_id) = self.selection_task_for_turn(&selection, entry.job_id())? else {
                 continue;
             };
-            let Some(log) = crate::runner_log::RunnerLog::try_open(
-                &self.paths.state,
-                task_id,
-                entry.job_id(),
-            )?
+            let Some(log) =
+                crate::runner_log::RunnerLog::try_open(&self.paths.state, task_id, entry.job_id())?
             else {
                 continue;
             };
@@ -4181,10 +4188,7 @@ impl<'a> TaskClient<'a> {
         let start = PENDING_DAG_CURSOR.with(|cursor| {
             cursor
                 .get()
-                .and_then(|last| {
-                    ids.iter()
-                        .position(|id| id.to_string() > last.to_string())
-                })
+                .and_then(|last| ids.iter().position(|id| id.to_string() > last.to_string()))
                 .unwrap_or(0)
         });
         let page: Vec<RunId> = ids
@@ -4265,75 +4269,74 @@ impl<'a> TaskClient<'a> {
 
     fn bind_ready_for_dag(&self, dag: &DagRecord) -> Result<(), WorkerError> {
         let candidates: Vec<(String, DagNode)> = dag
-                .nodes
-                .iter()
-                .filter(|(_, node)| {
-                    node.from_parent().is_some()
-                        && node.bound_oid.is_none()
-                        && node.state != DagNodeState::Blocked
-                })
-                .map(|(batch_id, node)| (batch_id.clone(), node.clone()))
-                .collect();
-            for (batch_id, node) in candidates {
-                let Some(parent_id) = node.from_parent() else {
-                    continue;
-                };
-                let Some(parent_node) = dag.nodes.get(parent_id) else {
-                    continue;
-                };
-                let Some(parent_record) =
-                    self.client_state.load_task_optional(parent_node.task_id)?
-                else {
-                    continue;
-                };
-                if parent_gate(&parent_record) != ParentGate::Ready {
-                    continue;
-                }
-                let Some(last) = parent_record.status().turns().last() else {
-                    continue;
-                };
-                let last_turn_id = last.turn_id();
-                let queue_busy = self
-                    .client_state
-                    .queue_entry_for_task_turn(parent_record.meta().task_id())?
-                    .is_some();
-                let journal_complete = match crate::runner_log::RunnerLog::try_open_existing(
-                    &self.paths.state,
-                    parent_record.meta().task_id(),
-                    last_turn_id,
-                )? {
-                    Some(log) => {
-                        let complete = log.completion().is_some();
-                        drop(log);
-                        complete
-                    }
-                    None => false,
-                };
-                let transfer = self.transfer_for_record(&parent_record)?;
-                let object_exists = parent_record
-                    .fetched_head()
-                    .is_some_and(|oid| transfer.has_object(oid));
-                let Some(oid) = accepted_import_oid(
-                    &parent_record,
-                    last_turn_id,
-                    queue_busy,
-                    journal_complete,
-                    object_exists,
-                ) else {
-                    drop(transfer);
-                    continue;
-                };
-                let pin_ref = dag_pin_ref(dag.run_id, &batch_id);
-                transfer.pin_object(self.runner, &pin_ref, &oid)?;
-                drop(transfer);
-                self.client_state.publish_dag_binding(
-                    dag.run_id,
-                    &batch_id,
-                    oid,
-                    last_turn_id,
-                    pin_ref,
-                )?;
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.from_parent().is_some()
+                    && node.bound_oid.is_none()
+                    && node.state != DagNodeState::Blocked
+            })
+            .map(|(batch_id, node)| (batch_id.clone(), node.clone()))
+            .collect();
+        for (batch_id, node) in candidates {
+            let Some(parent_id) = node.from_parent() else {
+                continue;
+            };
+            let Some(parent_node) = dag.nodes.get(parent_id) else {
+                continue;
+            };
+            let Some(parent_record) = self.client_state.load_task_optional(parent_node.task_id)?
+            else {
+                continue;
+            };
+            if parent_gate(&parent_record) != ParentGate::Ready {
+                continue;
             }
+            let Some(last) = parent_record.status().turns().last() else {
+                continue;
+            };
+            let last_turn_id = last.turn_id();
+            let queue_busy = self
+                .client_state
+                .queue_entry_for_task_turn(parent_record.meta().task_id())?
+                .is_some();
+            let journal_complete = match crate::runner_log::RunnerLog::try_open_existing(
+                &self.paths.state,
+                parent_record.meta().task_id(),
+                last_turn_id,
+            )? {
+                Some(log) => {
+                    let complete = log.completion().is_some();
+                    drop(log);
+                    complete
+                }
+                None => false,
+            };
+            let transfer = self.transfer_for_record(&parent_record)?;
+            let object_exists = parent_record
+                .fetched_head()
+                .is_some_and(|oid| transfer.has_object(oid));
+            let Some(oid) = accepted_import_oid(
+                &parent_record,
+                last_turn_id,
+                queue_busy,
+                journal_complete,
+                object_exists,
+            ) else {
+                drop(transfer);
+                continue;
+            };
+            let pin_ref = dag_pin_ref(dag.run_id, &batch_id);
+            transfer.pin_object(self.runner, &pin_ref, &oid)?;
+            drop(transfer);
+            self.client_state.publish_dag_binding(
+                dag.run_id,
+                &batch_id,
+                oid,
+                last_turn_id,
+                pin_ref,
+            )?;
+        }
         Ok(())
     }
 
@@ -4924,11 +4927,8 @@ impl<'a> TaskClient<'a> {
 
     fn release_task_base(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
         let project = self.load_project_for_record(record)?;
-        let transfer = crate::controller::registry::open_transfer_repo(
-            self.paths,
-            &project,
-            record.meta(),
-        )?;
+        let transfer =
+            crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())?;
         transfer.release_base(self.runner, record.meta().task_id())
     }
 
@@ -5230,7 +5230,6 @@ fn task_turn_in_snapshot(
         })
         .cloned()
 }
-
 
 fn is_not_found(error: &WorkerError) -> bool {
     matches!(error, WorkerError::Io(error) if error.kind() == io::ErrorKind::NotFound)

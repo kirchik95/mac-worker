@@ -1610,8 +1610,14 @@ impl<'a> TurnRunner<'a> {
             .iter()
             .map(|w| w.name.as_str())
             .collect::<Vec<_>>();
-        let line =
-            early_exit_diagnostic_line(false, Some("CAPACITY_BUSY"), "CAPACITY_BUSY", "", &workers, None);
+        let line = early_exit_diagnostic_line(
+            false,
+            Some("CAPACITY_BUSY"),
+            "CAPACITY_BUSY",
+            "",
+            &workers,
+            None,
+        );
         let completion = Completion {
             outcome: TaskOutcome::failed("CAPACITY_BUSY"),
             drained: false,
@@ -2387,7 +2393,14 @@ mod tests {
             "exited: CAPACITY_BUSY workers=a,b\n"
         );
         assert_eq!(
-            early_exit_diagnostic_line(false, None, "PROJECT_MISMATCH", "PROJECT_MISMATCH: x", &[], None),
+            early_exit_diagnostic_line(
+                false,
+                None,
+                "PROJECT_MISMATCH",
+                "PROJECT_MISMATCH: x",
+                &[],
+                None
+            ),
             "exited: PROJECT_MISMATCH message=x\n"
         );
     }
@@ -2395,7 +2408,14 @@ mod tests {
     #[test]
     fn the_early_exit_line_adds_the_message_when_it_says_more_than_the_code() {
         assert_eq!(
-            early_exit_diagnostic_line(false, None, "IO", "IO: permission denied", &["mini-1"], None),
+            early_exit_diagnostic_line(
+                false,
+                None,
+                "IO",
+                "IO: permission denied",
+                &["mini-1"],
+                None
+            ),
             "exited: IO message=permission denied workers=mini-1\n"
         );
         assert_eq!(

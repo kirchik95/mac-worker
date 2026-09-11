@@ -8,11 +8,7 @@
 mod support;
 
 use std::{
-    collections::BTreeMap,
-    ffi::OsString,
-    io::Cursor,
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    collections::BTreeMap, ffi::OsString, io::Cursor, os::unix::fs::PermissionsExt, path::PathBuf,
 };
 
 use mac_worker::{
@@ -20,14 +16,14 @@ use mac_worker::{
     agent::{AgentKind, PermissionPolicy},
     cli::{Cli, Command as WorkerCommand, HostCommand},
     client_state::ClientStateStore,
+    controller::batch::{BatchKind, FrozenBatchBody},
     controller::{
-        ControllerCommandHandler, ControllerFault, ControllerStore,
-        OperationMeta, canonical_request_sha256,
+        ControllerCommandHandler, ControllerFault, ControllerStore, OperationMeta,
+        canonical_request_sha256,
         protocol::{ControllerRequest, decode_frame, encode_frame},
         registry::ProjectRegistry,
     },
     dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState},
-    controller::batch::{BatchKind, FrozenBatchBody},
     error::WorkerError,
     git_transport::GitTransport,
     job::RequestFingerprint,
@@ -106,14 +102,22 @@ impl Isolated {
         std::fs::set_permissions(&fake_ssh, permissions).unwrap();
         let environment = BTreeMap::from([
             (OsString::from("HOME"), home.as_os_str().to_os_string()),
-            (OsString::from("XDG_STATE_HOME"), state_home.into_os_string()),
-            (OsString::from("XDG_CACHE_HOME"), cache_home.into_os_string()),
-            (OsString::from("XDG_CONFIG_HOME"), config_home.into_os_string()),
+            (
+                OsString::from("XDG_STATE_HOME"),
+                state_home.into_os_string(),
+            ),
+            (
+                OsString::from("XDG_CACHE_HOME"),
+                cache_home.into_os_string(),
+            ),
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                config_home.into_os_string(),
+            ),
             (OsString::from("XDG_DATA_HOME"), data_home.into_os_string()),
         ]);
         let paths = PathLayout::discover(None, &environment, &home).unwrap();
-        let runtime =
-            RuntimeContext::isolated(environment.clone(), home.clone(), root.clone());
+        let runtime = RuntimeContext::isolated(environment.clone(), home.clone(), root.clone());
         Self {
             _temp: temp,
             _home: home,
@@ -172,12 +176,7 @@ fn persist_durable(
     (request_id.to_owned(), fingerprint)
 }
 
-fn bind_task(
-    isolated: &Isolated,
-    task_id: TaskId,
-    request_id: &str,
-    fingerprint: &str,
-) {
+fn bind_task(isolated: &Isolated, task_id: TaskId, request_id: &str, fingerprint: &str) {
     ProjectRegistry::open(&isolated.paths.controller_state_root())
         .unwrap()
         .bind_task_request(task_id, request_id, fingerprint)
@@ -366,11 +365,7 @@ struct PlantRecord {
     turns: Vec<TurnSummary>,
 }
 
-fn plant_record(
-    isolated: &Isolated,
-    oid: &BaseOid,
-    plant: PlantRecord,
-) -> LocalTaskRecord {
+fn plant_record(isolated: &Isolated, oid: &BaseOid, plant: PlantRecord) -> LocalTaskRecord {
     plant_record_in(isolated, oid, plant, PROJECT_ID, WORKTREE_ID)
 }
 
@@ -468,11 +463,7 @@ fn prepare_frame(task_id: TaskId, request_id: &str) -> Vec<u8> {
     .unwrap()
 }
 
-fn run_prepare(
-    isolated: &Isolated,
-    task_id: TaskId,
-    request_id: &str,
-) -> (u8, Vec<u8>, Vec<u8>) {
+fn run_prepare(isolated: &Isolated, task_id: TaskId, request_id: &str) -> (u8, Vec<u8>, Vec<u8>) {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let frame = prepare_frame(task_id, request_id);
@@ -551,11 +542,13 @@ fn ordinary_terminal_imported_prepares_exact_receipt() {
         prepared.get("imported_oid").and_then(Value::as_str),
         Some(result.as_str())
     );
-    assert!(!prepared
-        .get("token")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .is_empty());
+    assert!(
+        !prepared
+            .get("token")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -925,8 +918,7 @@ fn retry_same_completed_triple_reuses_receipt() {
     );
     let (first_exit, first_out, _) = run_prepare(&isolated, task_n(0x9001), &request_hex(0x99));
     assert_eq!(first_exit, 0);
-    let (second_exit, second_out, _) =
-        run_prepare(&isolated, task_n(0x9001), &request_hex(0x98));
+    let (second_exit, second_out, _) = run_prepare(&isolated, task_n(0x9001), &request_hex(0x98));
     assert_eq!(second_exit, 0, "exact retry must reuse the receipt");
     let first_token = decode_ok(&first_out)
         .get("result")
@@ -967,7 +959,10 @@ fn mismatched_bound_task_fails_closed() {
         },
     );
     let (exit, stdout, _) = run_prepare(&isolated, task_n(0xb001), &request_hex(0x99));
-    assert_ne!(exit, 0, "task bound to another frozen envelope must not prepare");
+    assert_ne!(
+        exit, 0,
+        "task bound to another frozen envelope must not prepare"
+    );
     assert_eq!(decode_error_code(&stdout), "CONTROLLER_REQUEST_CONFLICT");
 }
 

@@ -87,8 +87,7 @@ impl MacWorkerTaskSource {
         &self,
         record: &LocalTaskRecord,
     ) -> Result<(LocalTaskRecord, TaskFreshness), ApiError> {
-        if record.close_intent().is_some()
-            || record.abandon_code() == Some("LOG_DRAIN_UNAVAILABLE")
+        if record.close_intent().is_some() || record.abandon_code() == Some("LOG_DRAIN_UNAVAILABLE")
         {
             return Ok((record.clone(), TaskFreshness::Current));
         }

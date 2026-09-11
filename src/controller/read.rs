@@ -657,7 +657,11 @@ fn optional_u64(body: &Value, key: &str, command: &str) -> Result<Option<u64>, W
     }
 }
 
-pub(crate) fn reject_unknown_keys(body: &Value, allowed: &[&str], command: &str) -> Result<(), WorkerError> {
+pub(crate) fn reject_unknown_keys(
+    body: &Value,
+    allowed: &[&str],
+    command: &str,
+) -> Result<(), WorkerError> {
     let Some(object) = body.as_object() else {
         return Err(WorkerError::Protocol(format!(
             "CONTROLLER_TRANSPORT: {command} body must be a JSON object"

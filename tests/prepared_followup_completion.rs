@@ -38,9 +38,7 @@ use mac_worker::{
     prepared_followup::PreparedFollowup,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project_state::ProjectState,
-    protocol::{
-        CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
-    },
+    protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     task::{
         BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId,
         TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
@@ -205,7 +203,9 @@ impl CompletingHost {
             },
             isolate_parent_environment: false,
         };
-        SystemProcessRunner.run(&fetch).expect("plant result objects")
+        SystemProcessRunner
+            .run(&fetch)
+            .expect("plant result objects")
     }
 }
 
@@ -438,15 +438,18 @@ impl ProcessRunner for CompletingHost {
 fn decode_request<T: serde::de::DeserializeOwned>(
     request: &ProcessRequest,
 ) -> Result<T, WorkerError> {
-    serde_json::from_slice(request.stdin.as_deref().ok_or_else(|| {
-        WorkerError::Protocol("worker request had no stdin".into())
-    })?)
+    serde_json::from_slice(
+        request
+            .stdin
+            .as_deref()
+            .ok_or_else(|| WorkerError::Protocol("worker request had no stdin".into()))?,
+    )
     .map_err(|error| WorkerError::Protocol(error.to_string()))
 }
 
 fn canonical_process<T: serde::Serialize>(value: &T) -> Result<ProcessResult, WorkerError> {
-    let mut stdout = serde_json::to_vec(value)
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    let mut stdout =
+        serde_json::to_vec(value).map_err(|error| WorkerError::Protocol(error.to_string()))?;
     stdout.push(b'\n');
     Ok(ProcessResult {
         status: ExitStatus::from_raw(0),
@@ -481,7 +484,10 @@ fn commit_result_without_moving_head(repo: &support::GitRepo) -> BaseOid {
         repo.git(&["reset", "--hard", &base]).status.success(),
         "restore frozen base HEAD"
     );
-    assert_ne!(result, base, "result commit must differ from the frozen base");
+    assert_ne!(
+        result, base,
+        "result commit must differ from the frozen base"
+    );
     result.parse().unwrap()
 }
 
@@ -544,18 +550,8 @@ fn plant_open_first_turn(
     )
     .unwrap();
     let repo_id = repo_id_for(&project.context.common_dir).unwrap();
-    let record = LocalTaskRecord::new(
-        meta,
-        status,
-        None,
-        None,
-        None,
-        repo_id,
-        None,
-        true,
-        None,
-    )
-    .unwrap();
+    let record =
+        LocalTaskRecord::new(meta, status, None, None, None, repo_id, None, true, None).unwrap();
     store.create_task(record.clone()).unwrap();
     store
         .write_task_project_path(&record, &project.context.root)

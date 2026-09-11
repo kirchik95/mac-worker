@@ -21,7 +21,14 @@ use crate::{
     client_state::ClientStateStore,
     config::Config,
     controller::{
+        batch::{
+            BatchExecuteContext, ControllerCheckoutMap, PreparedTaskBatch, execute_task_batch,
+            prepare_task_batch,
+        },
+        leader::now_millis,
+        lifecycle::{is_lifecycle_command, serve_lifecycle_command},
         protocol::ControllerRequest,
+        read::ControllerTaskStatusResult,
         read::{
             ControllerReadIdentity, invalid_controller_reply, is_read_command, serve_read_command,
         },
@@ -31,17 +38,10 @@ use crate::{
             ControllerStore, OperationMeta,
         },
         stream_rpc::{is_transfer_command, serve_transfer_command},
-        transfer::{ControllerTransfer, SourceSubmitBind},
-        lifecycle::{is_lifecycle_command, serve_lifecycle_command},
         task_mutations::{
             PreparedTaskMutation, execute_task_mutation, mutation_task_id, prepare_task_mutation,
         },
-        batch::{
-            BatchExecuteContext, ControllerCheckoutMap, PreparedTaskBatch, execute_task_batch,
-            prepare_task_batch,
-        },
-        leader::now_millis,
-        read::ControllerTaskStatusResult,
+        transfer::{ControllerTransfer, SourceSubmitBind},
     },
     error::WorkerError,
     job::{HostControlError, RequestFingerprint},
@@ -192,11 +192,9 @@ impl TaskSubmitHandler<'_> {
         &self,
         record: &crate::controller::DurableRequest,
     ) -> Result<Value, WorkerError> {
-        let prepared: PreparedTaskMutation =
-            serde_json::from_value(record.prepared().clone()).map_err(|_| {
-                WorkerError::Protocol(
-                    "CONTROLLER_TRANSPORT: prepared mutation is invalid".into(),
-                )
+        let prepared: PreparedTaskMutation = serde_json::from_value(record.prepared().clone())
+            .map_err(|_| {
+                WorkerError::Protocol("CONTROLLER_TRANSPORT: prepared mutation is invalid".into())
             })?;
         let client = TaskClient::new(
             self.runner,
@@ -217,8 +215,8 @@ impl TaskSubmitHandler<'_> {
         &self,
         record: &crate::controller::DurableRequest,
     ) -> Result<Value, WorkerError> {
-        let prepared: PreparedTaskBatch =
-            serde_json::from_value(record.prepared().clone()).map_err(|_| {
+        let prepared: PreparedTaskBatch = serde_json::from_value(record.prepared().clone())
+            .map_err(|_| {
                 WorkerError::Protocol("CONTROLLER_TRANSPORT: prepared batch is invalid".into())
             })?;
         let registry = ProjectRegistry::open(&self.paths.controller_state_root())?;
@@ -695,7 +693,6 @@ mod tests {
     use crate::agent::{AgentKind, PermissionPolicy};
     use crate::dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState};
     use crate::task::{GitIdentity, PublishMode};
-    use std::os::unix::fs::PermissionsExt;
     use crate::{
         paths::PathLayout,
         process::SystemProcessRunner,
@@ -706,6 +703,7 @@ mod tests {
         },
         transfer_repo::TransferRepo,
     };
+    use std::os::unix::fs::PermissionsExt;
 
     const REQUEST_A: &str = "018f0f4a6b5c7d8e9f00112233445566";
     const REQUEST_B: &str = "018f0f4a6b5c7d8e9f00112233445577";

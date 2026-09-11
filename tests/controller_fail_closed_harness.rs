@@ -321,12 +321,7 @@ pub fn run_worker(
 pub fn host_controller_rpc(homes: &IsolatedHomes, stdin: &[u8]) -> ChildOutput {
     let mut command = Command::new(env!("CARGO_BIN_EXE_worker"));
     apply_controller_env(&mut command, homes);
-    run_configured_worker(
-        &mut command,
-        &["host", "controller-rpc"],
-        None,
-        Some(stdin),
-    )
+    run_configured_worker(&mut command, &["host", "controller-rpc"], None, Some(stdin))
 }
 
 pub fn frame_json(value: &Value) -> Vec<u8> {

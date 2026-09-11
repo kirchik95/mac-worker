@@ -61,8 +61,8 @@ pub struct FrozenSubmitBody {
     pub cli_includes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    /// CLI `--no-wait` inverts this. Omitted old bodies default true so
-    /// queued and fail-fast submits stay digest-stable with prior helpers.
+    /// CLI `--no-wait` inverts this. Omitted old bodies default true, preserving
+    /// capacity behavior.
     #[serde(default = "default_true")]
     pub wait_for_capacity: bool,
 }
@@ -236,4 +236,3 @@ mod tests {
         let _turn_id: TurnId = body.turn_id;
     }
 }
-

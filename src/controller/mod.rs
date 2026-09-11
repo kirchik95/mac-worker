@@ -16,14 +16,14 @@ pub mod batch_freeze;
 pub mod envelope;
 pub mod execute;
 pub mod leader;
+pub mod lifecycle;
 pub mod protocol;
 pub mod read;
 pub mod registry;
 pub mod store;
-pub mod task_mutations;
-pub mod lifecycle;
 pub mod stream_client;
 pub mod stream_rpc;
+pub mod task_mutations;
 pub mod transfer;
 
 use std::time::Duration;
@@ -34,18 +34,15 @@ pub use batch::{
 };
 pub use batch_freeze::{LaptopBatchSourceStream, LaptopFrozenBatch, freeze_laptop_batch};
 pub use envelope::{OperationEnvelope, load_operation_envelope, persist_operation_envelope};
-pub use lifecycle::{
-    ControllerReconcileResult, ControllerWaitPollResult, ControllerWaitSelector,
-    reconcile_via_controller, wait_via_controller,
-};
-pub use task_mutations::{
-    PreparedTaskMutation, execute_task_mutation, prepare_task_mutation,
-};
 pub use execute::{
     TaskSubmitHandler, send_controller_read, send_controller_request, serve_rpc_with_runtime,
     tick_controller_leader,
 };
 pub use leader::ControllerLeader;
+pub use lifecycle::{
+    ControllerReconcileResult, ControllerWaitPollResult, ControllerWaitSelector,
+    reconcile_via_controller, wait_via_controller,
+};
 pub use protocol::{
     ControllerRequest, MAX_FRAME_BYTES, MAX_STORED_REQUEST_BYTES, canonical_request_sha256,
     decode_frame, decode_request, encode_frame, encode_json_frame, parse_request, read_frame,
@@ -62,15 +59,13 @@ pub use store::{
     ControllerCommandHandler, ControllerFault, ControllerStore, DurableRequest,
     FakeControllerExecutor, OperationMeta, RequestPhase, serve_rpc,
 };
-pub use stream_client::{
-    fetch_via_controller, stream_nested_source, stream_source_receive,
-};
+pub use stream_client::{fetch_via_controller, stream_nested_source, stream_source_receive};
+pub use task_mutations::{PreparedTaskMutation, execute_task_mutation, prepare_task_mutation};
 pub use transfer::{
     CONTROLLER_TRANSFER_CACHE_DOMAIN, ControllerReceiveIdentity, ControllerResultIdentity,
     ControllerSourceReceipt, ControllerTransfer, SourceSubmitBind, VerifiedResultMeta,
-    controller_transfer_cache_id,
-    controller_transfer_git_path, frozen_result_ref, import_controller_result, result_digest,
-    source_digest,
+    controller_transfer_cache_id, controller_transfer_git_path, frozen_result_ref,
+    import_controller_result, result_digest, source_digest,
 };
 
 use crate::{

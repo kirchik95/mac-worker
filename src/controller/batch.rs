@@ -23,14 +23,14 @@ use crate::{
         transfer::{ControllerTransfer, SourceSubmitBind},
     },
     dag::{
-        dag_pin_ref, validate_batch_graph, DagBase, DagNode, DagNodeState, DagRecord, GraphNode,
+        DagBase, DagNode, DagNodeState, DagRecord, GraphNode, dag_pin_ref, validate_batch_graph,
     },
     error::WorkerError,
     job::RequestFingerprint,
     paths::PathLayout,
     process::ProcessRunner,
     task::{BaseOid, RunId, RunRecord, TaskId, TurnId},
-    task_client::{resolve_batch_max_parallel, RunReport, TaskClient},
+    task_client::{RunReport, TaskClient, resolve_batch_max_parallel},
     transfer_repo::TransferRepo,
 };
 
