@@ -6897,11 +6897,12 @@ impl Drop for ReleasePauseOnDrop {
     }
 }
 
-/// Test-only executor wrapper: pauses at the existing
-/// `RunnerExecutor::start_with_slot` boundary (entered after reservation
-/// publication/lock release, before native first-log initialization), then
-/// delegates to the existing `InlineRunnerExecutor`. Counts delegations as
-/// part of verifying actual handoff behavior.
+/// Test-only executor wrapper: pauses ONLY its first `start_with_slot`
+/// call at the existing boundary (after reservation publication/lock
+/// release, before native first-log initialization), then delegates to the
+/// existing `InlineRunnerExecutor`. Shared by submitter and background
+/// recovery alike, so any unexpected second start is counted (not gated)
+/// and fails the handoff assertions. No production hook required.
 struct PausingSlotExecutor {
     gate: Arc<SlotPauseGate>,
     starts: AtomicUsize,
@@ -6937,8 +6938,12 @@ impl RunnerExecutor for PausingSlotExecutor {
         turn_id: TurnId,
         slot_token: Option<uuid::Uuid>,
     ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
-        self.starts.fetch_add(1, Ordering::SeqCst);
-        self.gate.arrive_and_wait();
+        // Only the first call pauses: it is the submitter reaching handoff.
+        // Any later call (e.g. an unexpected background start) delegates
+        // straight through so it is counted, never gated.
+        if self.starts.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.gate.arrive_and_wait();
+        }
         InlineRunnerExecutor.start_with_slot(paths, task_id, turn_id, slot_token)
     }
 }
@@ -6996,8 +7001,9 @@ fn selected_recovery_must_not_initialize_pending_submit_journal() {
             .expect("published queue row");
         let turn_id = row.job_id();
         let record_before = store2.load_task(task_id).unwrap();
-        // Background selected recovery, as a leader tick would run it.
-        TaskClient::new(&remote, &config, &paths, &store2, &InlineRunnerExecutor)
+        // Background selected recovery, as a leader tick would run it,
+        // sharing the counted executor so any background start is caught.
+        TaskClient::new(&remote, &config, &paths, &store2, &executor)
             .reconcile_selected(&[task_id])
             .unwrap();
         // THE invariant: no journal initialized for the pending live submit.
@@ -7035,8 +7041,23 @@ fn selected_recovery_must_not_initialize_pending_submit_journal() {
             1,
             "exactly one handoff delegation, no duplicate spawn"
         );
+        // Actual handoff completed: runner present, slot reservation cleared.
+        let finished = store2.load_task(task_id).unwrap();
         assert!(
-            log.exists(),
+            finished.runner().is_some(),
+            "completed handoff must record the runner"
+        );
+        assert!(
+            store2
+                .queue_entry_for_task_turn(task_id)
+                .unwrap()
+                .expect("row")
+                .slot_reservation()
+                .is_none(),
+            "completed handoff must clear the slot reservation"
+        );
+        assert!(
+            log.exists() && checkpoint.exists(),
             "the rightful submitter flow creates the journal on completion"
         );
     });
